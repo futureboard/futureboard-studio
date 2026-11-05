@@ -20,15 +20,14 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, size, App, AppContext, Bounds, ClipboardItem, Context, FocusHandle,
+    div, px, size, svg, App, AppContext, Bounds, ClipboardItem, Context, FocusHandle,
     InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render,
     StatefulInteractiveElement, Styled, Window, WindowBackgroundAppearance, WindowBounds,
     WindowHandle, WindowKind,
 };
 
 use crate::components::controls::{
-    fb_badge, fb_button, fb_checkbox, fb_section_header, fb_segment, fb_segmented_track,
-    FbButtonKind, FbSegment,
+    fb_button, fb_checkbox, fb_segment, fb_segmented_track, FbButtonKind, FbSegment,
 };
 use crate::components::text_input::{
     bind_mouse_selection, text_field_with_callbacks, TextInputState,
@@ -44,8 +43,12 @@ use crate::jam::{
 use crate::theme::{self, elevation, radius, size as size_token, space, typography, Colors};
 use crate::window_position::{apply_owner_display, centered_window_bounds};
 
-pub const JAM_WINDOW_WIDTH: f32 = 460.0;
-pub const JAM_WINDOW_HEIGHT: f32 = 620.0;
+pub const JAM_WINDOW_WIDTH: f32 = 520.0;
+pub const JAM_WINDOW_HEIGHT: f32 = 680.0;
+/// Smallest size at which the header's four readouts and a stream row still
+/// fit without overlapping.
+const JAM_WINDOW_MIN_WIDTH: f32 = 440.0;
+const JAM_WINDOW_MIN_HEIGHT: f32 = 420.0;
 
 /// How often the panel re-reads the jam snapshot.
 ///
@@ -128,10 +131,13 @@ pub struct JamWindow {
     /// The link most recently copied, and when. Keyed by the link itself so a
     /// freshly minted invite does not inherit the previous link's confirmation.
     copied: Option<(String, Instant)>,
+    /// Whether this window draws its own titlebar. Not when the platform
+    /// frames it (Studio's jam window on Windows).
+    drawn_titlebar: bool,
 }
 
 impl JamWindow {
-    fn new(handlers: JamWindowHandlers, cx: &mut Context<Self>) -> Self {
+    fn new(handlers: JamWindowHandlers, drawn_titlebar: bool, cx: &mut Context<Self>) -> Self {
         Self::spawn_refresh(cx);
         let focus_handle = cx.focus_handle();
         Self {
@@ -144,6 +150,30 @@ impl JamWindow {
             jam_name: default_jam_name(),
             busy: None,
             copied: None,
+            drawn_titlebar,
+        }
+    }
+
+    /// Preview only: the panel over a fixed state, with no refresh loop to
+    /// replace it with the (empty) live snapshot.
+    #[cfg(feature = "ui-preview")]
+    pub fn preview(state: JamUiState, cx: &mut Context<Self>) -> Self {
+        let focus_handle = cx.focus_handle();
+        Self {
+            link_input: TextInputState::new("jam-join-link-input", focus_handle.clone())
+                .with_placeholder("Paste a jam link or code")
+                .with_accessible_label("Jam link or code"),
+            focus_handle,
+            state,
+            handlers: JamWindowHandlers {
+                create_track: Arc::new(|_, _| {}),
+                publish_track: Arc::new(|_, _| {}),
+                multitrack_tracks: Arc::new(|_| Vec::new()),
+            },
+            jam_name: default_jam_name(),
+            busy: None,
+            copied: None,
+            drawn_titlebar: false,
         }
     }
 
@@ -160,7 +190,10 @@ impl JamWindow {
                         let changed = next.state_label != this.state.state_label
                             || next.streams.len() != this.state.streams.len()
                             || next.participants.len() != this.state.participants.len()
-                            || next.publishing != this.state.publishing;
+                            || next.publishing != this.state.publishing
+                            // A refused action says so in the banner; the
+                            // footer's "Joining…" must not outlive it.
+                            || next.last_error != this.state.last_error;
                         this.state = next;
                         if changed {
                             this.busy = None;
@@ -190,7 +223,7 @@ impl JamWindow {
         cx.background_executor()
             .spawn(async move {
                 if let Err(error) =
-                    jam::with_controller(|controller| controller.create_and_join(&name).map(|_| ()))
+                    jam::run_action(|controller| controller.create_and_join(&name).map(|_| ()))
                 {
                     eprintln!("[jam] create failed: {error}");
                 }
@@ -202,7 +235,7 @@ impl JamWindow {
         self.set_status("Leaving…");
         cx.background_executor()
             .spawn(async move {
-                if let Err(error) = jam::with_controller(|controller| controller.leave()) {
+                if let Err(error) = jam::run_action(|controller| controller.leave()) {
                     eprintln!("[jam] leave failed: {error}");
                 }
             })
@@ -213,7 +246,7 @@ impl JamWindow {
         self.set_status(if send { "Publishing…" } else { "Stopping…" });
         cx.background_executor()
             .spawn(async move {
-                let result = jam::with_controller(|controller| {
+                let result = jam::run_action(|controller| {
                     if send {
                         controller.publish_master()
                     } else {
@@ -245,8 +278,7 @@ impl JamWindow {
         self.set_status(if send { "Sharing…" } else { "Stopping…" });
         cx.background_executor()
             .spawn(async move {
-                let result =
-                    jam::with_controller(|controller| controller.publish_multitrack(&tracks));
+                let result = jam::run_action(|controller| controller.publish_multitrack(&tracks));
                 if let Err(error) = result {
                     eprintln!("[jam] multitrack share failed: {}", error.user_message());
                 }
@@ -263,9 +295,7 @@ impl JamWindow {
         self.set_status("Joining…");
         cx.background_executor()
             .spawn(async move {
-                if let Err(error) =
-                    jam::with_controller(|controller| controller.join_with_link(&link))
-                {
+                if let Err(error) = jam::run_action(|controller| controller.join_with_link(&link)) {
                     eprintln!("[jam] join failed: {}", error.user_message());
                 }
             })
@@ -292,7 +322,7 @@ impl JamWindow {
         self.set_status("Minting invite…");
         cx.background_executor()
             .spawn(async move {
-                match jam::with_controller(|controller| controller.create_invite("performer")) {
+                match jam::run_action(|controller| controller.create_invite("performer")) {
                     // The link is a bearer secret: it is shown once so it can be
                     // copied and is never written to a log.
                     Ok(_) => {}
@@ -352,7 +382,7 @@ impl Render for JamWindow {
             .size_full()
             .flex()
             .flex_col()
-            .bg(Colors::surface_base())
+            .bg(Colors::surface_window())
             .text_color(Colors::text_primary())
             .font(theme::ui_font())
             .track_focus(&self.focus_handle)
@@ -376,25 +406,29 @@ impl Render for JamWindow {
                     _ => {}
                 }
             }))
-            .child(external_window_titlebar(
-                "Audio Jam",
-                "jam-window-close",
-                move |window, _cx| {
-                    window.remove_window();
-                },
-            ))
+            // On Windows the platform frame draws the caption and its buttons;
+            // the drawn titlebar is only for the other platforms and for the
+            // standalone client's own root window.
+            .when(self.drawn_titlebar, |this| {
+                this.child(external_window_titlebar(
+                    "Audio Jam",
+                    "jam-window-close",
+                    move |window, _cx| {
+                        window.remove_window();
+                    },
+                ))
+            })
             .child(self.header(&state))
-            .child(self.banners(&state, window, cx))
-            .child(self.body(&state, cx))
+            .child(self.body(&state, window, cx))
             .child(self.footer(&state, cx))
     }
 }
 
 impl JamWindow {
-    /// Name, connection state, and the four readouts that answer "is this
-    /// usable right now". The link diagnostics sit under them at caption
-    /// weight: they matter while something is wrong, and should not compete
-    /// with the room's identity while it is fine.
+    /// The room's identity and the four readouts that answer "is this usable
+    /// right now". The link diagnostics sit under them at caption weight: they
+    /// matter while something is wrong, and should not compete with the
+    /// room's identity while it is fine.
     fn header(&self, state: &JamUiState) -> impl IntoElement {
         let (tone, label) = status_tone(state);
         let rtt = if state.rtt_ms > 0.0 {
@@ -402,14 +436,26 @@ impl JamWindow {
         } else {
             "—".to_string()
         };
+        let subtitle = if state.connected {
+            if state.participants.len() == 1 {
+                "1 person in the room".to_string()
+            } else {
+                format!("{} people in the room", state.participants.len())
+            }
+        } else if state.state_label.starts_with("Reconnect") {
+            "The link dropped — trying to get back in".to_string()
+        } else {
+            "Not in a jam".to_string()
+        };
 
         div()
             .flex()
             .flex_col()
             .flex_none()
-            .gap(px(space::BASE))
+            .gap(px(space::LOOSE))
             .px(px(space::SECTION))
-            .py(px(space::LOOSE))
+            .py(px(space::SECTION))
+            .bg(Colors::surface_panel())
             .border_b(px(1.0))
             .border_color(Colors::border_subtle())
             .child(
@@ -417,32 +463,51 @@ impl JamWindow {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .justify_between()
-                    .gap(px(space::BASE))
+                    .gap(px(space::LOOSE))
+                    .child(icon_tile(
+                        crate::assets::ICON_AUDIO_LINES_PATH,
+                        if state.connected {
+                            Colors::accent_primary()
+                        } else {
+                            Colors::text_muted()
+                        },
+                    ))
                     .child(
                         div()
+                            .flex()
+                            .flex_col()
                             .flex_1()
                             .min_w(px(0.0))
-                            .truncate()
-                            .text_size(px(typography::UI_TITLE))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child(if state.jam_name.is_empty() {
-                                "No jam".to_string()
-                            } else {
-                                state.jam_name.clone()
-                            }),
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(typography::UI_LG))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(if state.jam_name.is_empty() {
+                                        "Audio Jam".to_string()
+                                    } else {
+                                        state.jam_name.clone()
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(typography::UI_XS))
+                                    .text_color(Colors::text_muted())
+                                    .child(subtitle),
+                            ),
                     )
-                    .child(div().flex_none().child(fb_badge(label, tone))),
+                    .child(status_pill(label, tone)),
             )
             .child(
                 div()
                     .flex()
                     .flex_row()
-                    .gap(px(space::SECTION))
+                    .gap(px(space::BASE))
                     .child(stat("Code", &or_dash(&state.public_id)))
                     .child(stat("Region", &or_dash(&state.region_label)))
                     .child(stat("Transport", &or_dash(&state.transport_label)))
-                    .child(stat("RTT", &rtt)),
+                    .child(stat("Round trip", &rtt)),
             )
             .when(state.connected, |this| {
                 this.child(
@@ -455,20 +520,11 @@ impl JamWindow {
             })
     }
 
-    /// Everything that needs saying before the room itself: what went wrong,
-    /// what is missing, and the link that lets someone else in.
-    ///
-    /// Fixed rather than scrolled with the participant list. An error that
-    /// scrolls out of sight while someone reads the room is an error they act
-    /// on twice.
-    fn banners(
-        &self,
-        state: &JamUiState,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    /// What needs saying before anything else: what went wrong and what is
+    /// missing. Pinned above the scroller — an error that scrolls out of sight
+    /// while someone reads the room is an error they act on twice.
+    fn notices(&self, state: &JamUiState) -> Vec<gpui::AnyElement> {
         let mut children: Vec<gpui::AnyElement> = Vec::new();
-
         if let Some(error) = state.last_error.as_ref() {
             children.push(notice("Error", error, Colors::status_error()).into_any_element());
         }
@@ -476,52 +532,13 @@ impl JamWindow {
             children.push(
                 notice(
                     "Sign in",
-                    "Sign in to your Futureboard account to join a jam.",
+                    "Sign in to your Futureboard account to create or join a jam.",
                     Colors::status_warning(),
                 )
                 .into_any_element(),
             );
         }
-        if let Some(link) = state.invite_link.as_ref() {
-            children.push(
-                self.link_field(
-                    "jam-invite-link",
-                    "Invite link",
-                    "anyone with it can join",
-                    link.clone(),
-                    cx,
-                )
-                .into_any_element(),
-            );
-        } else if state.connected && !state.join_url.is_empty() {
-            children.push(
-                self.link_field(
-                    "jam-join-link",
-                    "Room link",
-                    "opens the listener page",
-                    state.join_url.clone(),
-                    cx,
-                )
-                .into_any_element(),
-            );
-        }
-        if !state.connected {
-            children.push(self.join_field(state, window, cx).into_any_element());
-        }
-
-        let filled = !children.is_empty();
-        div()
-            .flex()
-            .flex_col()
-            .flex_none()
-            .gap(px(space::BASE))
-            .when(filled, |this| {
-                this.px(px(space::SECTION))
-                    .py(px(space::LOOSE))
-                    .border_b(px(1.0))
-                    .border_color(Colors::border_subtle())
-            })
-            .children(children)
+        children
     }
 
     /// A link, and one gesture to take it away with.
@@ -545,35 +562,10 @@ impl JamWindow {
         let focus = Colors::state_focus_ring();
         let clicked = link.clone();
 
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(space::TIGHT))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(space::SNUG))
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(px(typography::UI_XS))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(Colors::text_muted())
-                            .child(label),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .truncate()
-                            .text_size(px(typography::UI_XS))
-                            .text_color(Colors::text_faint())
-                            .child(format!("— {note}")),
-                    ),
-            )
-            .child(
+        card(
+            label,
+            Some(note),
+            div().child(
                 div()
                     .id(id)
                     .role(gpui::Role::Button)
@@ -585,8 +577,8 @@ impl JamWindow {
                     .flex_row()
                     .items_center()
                     .gap(px(space::BASE))
-                    .h(px(size_token::COMFORTABLE))
-                    .px(px(space::BASE))
+                    .h(px(size_token::PROMINENT))
+                    .px(px(space::LOOSE))
                     .rounded(px(radius::CONTROL))
                     .bg(rest)
                     .border_1()
@@ -597,6 +589,13 @@ impl JamWindow {
                     .on_click(cx.listener(move |this, _event, _window, cx| {
                         this.copy_link(clicked.clone(), cx);
                     }))
+                    .child(
+                        svg()
+                            .path(crate::assets::ICON_LINK_PATH)
+                            .flex_none()
+                            .size(px(14.0))
+                            .text_color(Colors::text_muted()),
+                    )
                     .child(
                         div()
                             .flex_1()
@@ -613,114 +612,180 @@ impl JamWindow {
                         div()
                             .flex_none()
                             .text_size(px(typography::UI_XS))
-                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(if copied {
                                 Colors::status_success()
                             } else {
-                                Colors::text_muted()
+                                Colors::accent_primary()
                             })
                             .child(if copied { "Copied" } else { "Copy" }),
                     ),
-            )
+            ),
+        )
     }
 
-    /// Somebody else's room, and the one gesture that gets into it.
+    /// The two ways into a jam, side by side as equals: start one, or follow
+    /// a link somebody sent.
     ///
     /// A field and a button rather than a dialog: the link arrives in a chat
     /// message and is pasted, and a modal between the clipboard and the room
     /// would be a step that exists only to be dismissed. The same field takes a
     /// bare code, because that is what gets read out loud.
-    fn join_field(
+    fn start_cards(
         &self,
         state: &JamUiState,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let can_join = state.signed_in && !self.link_input.value.trim().is_empty();
+        // A session on its way in is not a second chance to start another.
+        let busy = in_session(state);
+
+        let start = card(
+            "Start a jam",
+            Some("a new room, and an invite link to send"),
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(space::LOOSE))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_size(px(typography::UI_SM))
+                        .text_color(Colors::text_secondary())
+                        .child(
+                            "Your master mix is sent as soon as the room is up; \
+                             switch it off or send tracks instead from here.",
+                        ),
+                )
+                .child(div().flex_none().child(fb_button(
+                    "jam-create",
+                    "Create Jam",
+                    FbButtonKind::Primary,
+                    state.signed_in && !busy,
+                    cx.listener(|this, _event, _window, cx| {
+                        this.create_jam(cx);
+                        cx.notify();
+                    }),
+                ))),
+        );
+
+        let join = card(
+            "Join a jam",
+            Some("paste an invite link or a room code"),
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(space::BASE))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .child(text_field_with_callbacks(
+                            &self.link_input,
+                            self.link_input.is_focused(window),
+                            bind_mouse_selection(cx.entity().clone(), |this| &mut this.link_input),
+                        )),
+                )
+                .child(div().flex_none().child(fb_button(
+                    "jam-join",
+                    "Join",
+                    FbButtonKind::Default,
+                    can_join && !busy,
+                    cx.listener(|this, _event, _window, cx| {
+                        this.join_with_link(cx);
+                        cx.notify();
+                    }),
+                ))),
+        );
 
         div()
             .flex()
             .flex_col()
-            .gap(px(space::TIGHT))
-            .child(
-                div()
-                    .text_size(px(typography::UI_XS))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(Colors::text_muted())
-                    .child("Join a jam"),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(space::BASE))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .child(text_field_with_callbacks(
-                                &self.link_input,
-                                self.link_input.is_focused(window),
-                                bind_mouse_selection(cx.entity().clone(), |this| {
-                                    &mut this.link_input
-                                }),
-                            )),
-                    )
-                    .child(div().flex_none().child(fb_button(
-                        "jam-join",
-                        "Join",
-                        FbButtonKind::Primary,
-                        can_join,
-                        cx.listener(|this, _event, _window, cx| {
-                            this.join_with_link(cx);
-                            cx.notify();
-                        }),
-                    ))),
-            )
+            .gap(px(space::LOOSE))
+            .child(start)
+            .child(join)
     }
 
-    /// What this Studio is sending, and the room it is sending it to.
-    fn body(&self, state: &JamUiState, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Everything below the header, in one scroller.
+    fn body(
+        &self,
+        state: &JamUiState,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let mut list = div()
             .id("jam-participants")
             .flex()
             .flex_col()
             .flex_1()
             .min_h(px(0.0))
-            .gap(px(space::SECTION))
+            .gap(px(space::LOOSE))
             .px(px(space::SECTION))
-            .py(px(space::LOOSE))
-            .overflow_y_scroll();
+            .py(px(space::SECTION))
+            .overflow_y_scroll()
+            .children(self.notices(state));
 
-        if state.connected {
-            list = list.child(self.sharing_section(state, cx));
-            list = list.child(self.flow_section(state));
-            list = list.child(self.quality_section(state, cx));
+        if !state.connected {
+            return list.child(self.start_cards(state, window, cx));
         }
 
+        if let Some(link) = state.invite_link.as_ref() {
+            list = list.child(self.link_field(
+                "jam-invite-link",
+                "Invite link",
+                "anyone with it can join",
+                link.clone(),
+                cx,
+            ));
+        } else if !state.join_url.is_empty() {
+            list = list.child(self.link_field(
+                "jam-join-link",
+                "Room link",
+                "opens the listener page",
+                state.join_url.clone(),
+                cx,
+            ));
+        }
+
+        list = list
+            .child(card(
+                "Sending from this Studio",
+                None,
+                self.sharing_section(state, cx),
+            ))
+            .child(card(
+                "Leaving this Studio",
+                Some(&match state.sending.len() {
+                    0 => "nothing".to_string(),
+                    1 => "1 stream".to_string(),
+                    count => format!("{count} streams"),
+                }),
+                self.flow_section(state),
+            ))
+            .child(card(
+                "Stream quality",
+                None,
+                self.quality_section(state, cx),
+            ));
+
+        let mut people = div().flex().flex_col();
         if state.participants.is_empty() {
-            return list.child(
+            people = people.child(
                 div()
-                    .py(px(space::BLOCK))
+                    .py(px(space::BASE))
                     .text_size(px(typography::UI_SM))
                     .text_color(Colors::text_muted())
-                    .child(if state.connected {
-                        "Nobody else is here yet. Invite someone with the link above."
-                    } else {
-                        "Create a jam, or paste a link above, to start playing together."
-                    }),
+                    .child("Nobody else is here yet. Send them the invite link above."),
             );
         }
-
-        let mut people = div().flex().flex_col().child(fb_section_header(format!(
-            "Participants · {}",
-            state.participants.len()
-        )));
         for (index, (participant, streams)) in state.by_participant().into_iter().enumerate() {
             people = people.child(self.participant_row(participant, &streams, index > 0, cx));
         }
-        list.child(people)
+        list.child(card("In the room", None, people))
     }
 
     /// What this Studio can put into the room, each row showing what it is
@@ -738,11 +803,11 @@ impl JamWindow {
         let mode = state.quality.stream_mode;
         let quality = state.quality.clone();
 
-        let mut section = div()
-            .flex()
-            .flex_col()
-            .child(fb_section_header("Sending from this Studio"))
-            .child(self.mode_selector(mode, publishing_master || publishing_multitrack, cx));
+        let mut section = div().flex().flex_col().child(self.mode_selector(
+            mode,
+            publishing_master || publishing_multitrack,
+            cx,
+        ));
 
         section = match mode {
             JamStreamMode::MasterStereo => section
@@ -931,10 +996,7 @@ impl JamWindow {
     /// nothing feeds is announced, listed, and silent. A level that never moves
     /// is the symptom, so the level is the row.
     fn flow_section(&self, state: &JamUiState) -> impl IntoElement {
-        let mut section = div().flex().flex_col().child(fb_section_header(format!(
-            "Leaving this Studio · {}",
-            state.sending.len()
-        )));
+        let mut section = div().flex().flex_col();
 
         if state.sending.is_empty() {
             return section.child(
@@ -1050,7 +1112,6 @@ impl JamWindow {
             .flex()
             .flex_col()
             .gap(px(space::SNUG))
-            .child(fb_section_header("Stream quality"))
             .child(quality_row("Depth", depth))
             .child(quality_row("Rate", rate))
             .child(
@@ -1137,31 +1198,56 @@ impl JamWindow {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(space::SNUG))
+                    .gap(px(space::BASE))
+                    // Initials on a plate, with the presence dot on its
+                    // corner: who it is reads before whether they are here.
                     .child(
                         div()
+                            .relative()
+                            .flex()
                             .flex_none()
-                            .w(px(6.0))
-                            .h(px(6.0))
+                            .items_center()
+                            .justify_center()
+                            .size(px(size_token::COMFORTABLE))
                             .rounded(px(radius::PILL))
-                            .bg(dot),
+                            .bg(Colors::surface_raised())
+                            .text_size(px(typography::UI_XS))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(Colors::text_secondary())
+                            .child(monogram(&participant.user.label()))
+                            .child(
+                                div()
+                                    .absolute()
+                                    .right(px(-1.0))
+                                    .bottom(px(-1.0))
+                                    .size(px(9.0))
+                                    .rounded(px(radius::PILL))
+                                    .border_2()
+                                    .border_color(Colors::surface_panel())
+                                    .bg(dot),
+                            ),
                     )
                     .child(
                         div()
+                            .flex()
+                            .flex_col()
                             .flex_1()
                             .min_w(px(0.0))
-                            .truncate()
-                            .text_size(px(typography::UI_SM))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .child(participant.user.handle()),
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(typography::UI_SM))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .child(participant.user.label()),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(typography::UI_XS))
+                                    .text_color(Colors::text_muted())
+                                    .child(meta.join(" · ")),
+                            ),
                     ),
-            )
-            .child(
-                div()
-                    .truncate()
-                    .text_size(px(typography::UI_XS))
-                    .text_color(Colors::text_muted())
-                    .child(meta.join(" · ")),
             );
 
         if streams.is_empty() {
@@ -1258,12 +1344,12 @@ impl JamWindow {
             )
     }
 
-    /// Status on the left, one primary action on the right. The publish
-    /// controls live with the state they change, up in the body, so this row
-    /// keeps a single meaning: what the session is doing, and how to start or
-    /// end it.
+    /// What the session is doing on the left; while in a session, Invite and
+    /// Leave on the right. Out of a session the ways in are the body's two
+    /// cards, so the footer keeps one meaning: status, and how to end it.
     fn footer(&self, state: &JamUiState, cx: &mut Context<Self>) -> impl IntoElement {
         let connected = state.connected;
+        let in_session = in_session(state);
 
         div()
             .flex()
@@ -1272,8 +1358,9 @@ impl JamWindow {
             .justify_between()
             .flex_none()
             .gap(px(space::BASE))
+            .h(px(size_token::PROMINENT + 2.0 * space::BASE))
             .px(px(space::SECTION))
-            .py(px(space::LOOSE))
+            .bg(Colors::surface_panel())
             .border_t(px(1.0))
             .border_color(Colors::border_subtle())
             .child(
@@ -1290,27 +1377,27 @@ impl JamWindow {
                             .unwrap_or_else(|| state.state_label.clone()),
                     ),
             )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .flex_none()
-                    .gap(px(space::BASE))
-                    .child(fb_button(
-                        "jam-invite",
-                        "Invite",
-                        FbButtonKind::Default,
-                        connected,
-                        cx.listener(|this, _event, _window, cx| {
-                            this.create_invite(cx);
-                            cx.notify();
-                        }),
-                    ))
-                    // One primary slot, two meanings: `fb_button` returns two
-                    // different closure types, so the branch is resolved to
-                    // `AnyElement` rather than left for the `if` to unify.
-                    .child(if connected {
-                        fb_button(
+            .when(in_session, |footer| {
+                footer.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .flex_none()
+                        .gap(px(space::BASE))
+                        .child(fb_button(
+                            "jam-invite",
+                            "Invite",
+                            FbButtonKind::Default,
+                            connected,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.create_invite(cx);
+                                cx.notify();
+                            }),
+                        ))
+                        // Leave is offered while connecting or reconnecting
+                        // too: a session that cannot get back in is one the
+                        // user must be able to walk away from.
+                        .child(fb_button(
                             "jam-leave",
                             "Leave",
                             FbButtonKind::Danger,
@@ -1319,42 +1406,148 @@ impl JamWindow {
                                 this.leave(cx);
                                 cx.notify();
                             }),
-                        )
-                        .into_any_element()
-                    } else {
-                        fb_button(
-                            "jam-create",
-                            "Create Jam",
-                            FbButtonKind::Primary,
-                            state.signed_in,
-                            cx.listener(|this, _event, _window, cx| {
-                                this.create_jam(cx);
-                                cx.notify();
-                            }),
-                        )
-                        .into_any_element()
-                    }),
-            )
+                        )),
+                )
+            })
     }
 }
 
-/// A label over a tabular value, the way every other Studio readout is built.
+/// Whether a session exists that Leave would end: connected, or on its way
+/// in or back in.
+fn in_session(state: &JamUiState) -> bool {
+    matches!(
+        state.state_label.as_str(),
+        "Connecting" | "Authenticating" | "Joining" | "Connected" | "Reconnecting"
+    )
+}
+
+/// A titled surface in the body. The title says what the card is about and
+/// the note, at caption weight, says what it is for.
+fn card(title: &str, note: Option<&str>, body: impl IntoElement) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .flex_none()
+        .gap(px(space::BASE))
+        .p(px(space::LOOSE))
+        .rounded(px(radius::SURFACE))
+        .bg(Colors::surface_panel())
+        .border_1()
+        .border_color(Colors::border_subtle())
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_baseline()
+                .gap(px(space::SNUG))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(typography::UI_MD))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(Colors::text_primary())
+                        .child(title.to_string()),
+                )
+                .children(note.map(|note| {
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .text_size(px(typography::UI_XS))
+                        .text_color(Colors::text_muted())
+                        .child(note.to_string())
+                })),
+        )
+        .child(body)
+}
+
+/// A square plate holding one icon — the room's mark in the header.
+fn icon_tile(icon: &'static str, tint: gpui::Rgba) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(px(40.0))
+        .rounded(px(radius::SURFACE))
+        .bg(Colors::surface_input())
+        .border_1()
+        .border_color(Colors::border_subtle())
+        .child(svg().path(icon).size(px(20.0)).text_color(tint))
+}
+
+/// Connection state as a tinted pill: a dot and the word share the hue, so
+/// the state is carried on two channels rather than colour alone.
+fn status_pill(label: &'static str, tone: gpui::Rgba) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .flex_none()
+        .items_center()
+        .gap(px(space::SNUG - 1.0))
+        .h(px(size_token::DENSE))
+        .px(px(space::BASE))
+        .rounded(px(radius::PILL))
+        .bg(Colors::with_alpha(tone, 0.14))
+        .child(
+            div()
+                .flex_none()
+                .size(px(6.0))
+                .rounded(px(radius::PILL))
+                .bg(tone),
+        )
+        .child(
+            div()
+                .text_size(px(typography::UI_XS))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(tone)
+                .child(label),
+        )
+}
+
+/// A participant's initials in a round plate, until there is a picture to
+/// show — never a blank hole.
+fn monogram(label: &str) -> String {
+    let letters: String = label
+        .trim_start_matches('@')
+        .split(|c: char| c.is_whitespace() || c == '_' || c == '.' || c == '-')
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.chars().next())
+        .take(2)
+        .flat_map(char::to_uppercase)
+        .collect();
+    if letters.is_empty() {
+        "?".to_string()
+    } else {
+        letters
+    }
+}
+
+/// A label over a tabular value, on a recessed tile, the way every other
+/// Studio readout is built. The four share the row equally.
 fn stat(label: &str, value: &str) -> impl IntoElement {
     div()
         .flex()
         .flex_col()
+        .flex_1()
         .min_w(px(0.0))
+        .gap(px(space::HAIR))
+        .px(px(space::BASE))
+        .py(px(space::SNUG))
+        .rounded(px(radius::CONTROL))
+        .bg(Colors::surface_input())
         .child(
             div()
                 .text_size(px(typography::UI_XS))
-                .text_color(Colors::text_faint())
+                .text_color(Colors::text_muted())
                 .child(label.to_string()),
         )
         .child(
             div()
                 .truncate()
                 .text_size(px(typography::UI_SM))
-                .text_color(Colors::text_secondary())
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(Colors::text_primary())
                 .child(value.to_string()),
         )
 }
@@ -1615,30 +1808,44 @@ pub fn open_jam_main_window(
     )));
 
     cx.open_window(options, move |_window, cx| {
-        cx.new(|cx| JamWindow::new(handlers, cx))
+        cx.new(|cx| JamWindow::new(handlers, true, cx))
     })
     .map_err(|error| error.to_string())
 }
 
+/// Open the jam panel beside a project.
+///
+/// On Windows it takes the platform's own frame — caption, caption buttons,
+/// snap and resize borders — and draws no titlebar of its own; elsewhere it
+/// keeps the shared drawn dialog chrome.
 pub fn open_jam_window(
     owner_bounds: Option<Bounds<gpui::Pixels>>,
     handlers: JamWindowHandlers,
     cx: &mut App,
 ) -> Result<WindowHandle<JamWindow>, String> {
+    let native_frame = crate::platform_chrome::native_tool_window_frame();
     let window_bounds = centered_window_bounds(
         owner_bounds,
         size(px(JAM_WINDOW_WIDTH), px(JAM_WINDOW_HEIGHT)),
         cx,
     );
-    let mut options = crate::platform_chrome::external_dialog_window_options_partial();
+    let mut options = if native_frame {
+        let mut options = crate::platform_chrome::native_tool_window_options_partial("Audio Jam");
+        options.window_background = WindowBackgroundAppearance::Opaque;
+        options
+    } else {
+        let mut options = crate::platform_chrome::external_dialog_window_options_partial();
+        options.window_background = WindowBackgroundAppearance::Transparent;
+        options
+    };
     options.window_bounds = Some(WindowBounds::Windowed(window_bounds));
     options.kind = WindowKind::Normal;
     options.is_resizable = true;
-    options.window_background = WindowBackgroundAppearance::Transparent;
+    options.window_min_size = Some(size(px(JAM_WINDOW_MIN_WIDTH), px(JAM_WINDOW_MIN_HEIGHT)));
     apply_owner_display(&mut options, owner_bounds, cx);
 
     cx.open_window(options, move |_window, cx| {
-        cx.new(|cx| JamWindow::new(handlers, cx))
+        cx.new(|cx| JamWindow::new(handlers, !native_frame, cx))
     })
     .map_err(|error| error.to_string())
 }
@@ -1862,10 +2069,25 @@ mod standalone_chrome_tests {
     #[test]
     fn both_openers_build_the_same_panel() {
         let source = implementation_source();
-        let constructions = source.matches("JamWindow::new(handlers, cx)").count();
+        let constructions = source.matches("JamWindow::new(handlers, ").count();
         assert_eq!(
             constructions, 2,
             "the dialog and the root window must construct one and the same view"
+        );
+    }
+
+    /// Beside a project on Windows the jam panel takes the platform's frame
+    /// and must not draw a second titlebar inside it.
+    #[test]
+    fn the_studio_jam_window_takes_the_native_frame_on_windows() {
+        let source = implementation_source();
+        let (_, opener) = source
+            .split_once("pub fn open_jam_window")
+            .expect("the Studio opener");
+        assert!(opener.contains("native_tool_window_options_partial(\"Audio Jam\")"));
+        assert!(
+            opener.contains("JamWindow::new(handlers, !native_frame, cx)"),
+            "the drawn titlebar is off exactly when the platform frames it"
         );
     }
 }
