@@ -2302,17 +2302,27 @@ impl StudioLayout {
                         // A slider drag: its samples fold into one step.
                         this.commit_track_edit_folded("Send Level", edit, cx);
                         if changed {
-                            this.mark_dirty();
-                            this.audio_bridge.project_dirty = true;
-                            // Not forced. A send fader reports a value per
-                            // pointer sample, and a forced sync rebuilds the
-                            // whole runtime graph for each one — sixty full
-                            // project rebuilds a second on the UI thread, which
-                            // is the stutter. Unforced, the burst window
-                            // coalesces them; `project_dirty` stays set, so the
-                            // 60 Hz engine poll publishes the value the drag
-                            // ended on. See `sync_should_build_now`.
-                            this.schedule_audio_project_sync(cx, false, "mixer_send_gain");
+                            // Live, like the channel fader: the level reaches
+                            // the running graph through `SetTrackSendLevel`
+                            // and the engine's stored snapshot takes it too,
+                            // so a drag costs no project sync at all. It used
+                            // to mark the engine dirty per pointer sample,
+                            // which rebuilt and serialized the whole snapshot
+                            // on the UI thread and swapped the graph with
+                            // `load_project` every burst window for as long
+                            // as the drag lasted — the stutter. View-only
+                            // dirty keeps the level in the saved project.
+                            if this.play_send_level_live(&track_id, &send_id, cx) {
+                                this.mark_dirty_view_only();
+                            } else {
+                                // No such send in the running graph yet (one
+                                // added since the last sync): only a sync can
+                                // carry it. Unforced, so the burst window
+                                // still coalesces a drag.
+                                this.mark_dirty();
+                                this.audio_bridge.project_dirty = true;
+                                this.schedule_audio_project_sync(cx, false, "mixer_send_gain");
+                            }
                             this.push_mixer_snapshot_to_window(cx);
                             cx.notify();
                         }

@@ -1004,6 +1004,13 @@ pub fn drain_commands(
             EngineCommand::SetClipGain { clip_index, gain } => {
                 runtime.update_clip_gain(clip_index, gain);
             }
+            EngineCommand::SetTrackSendLevel {
+                track_index,
+                send_index,
+                level,
+            } => {
+                runtime.update_track_send_level(track_index, send_index, level);
+            }
             EngineCommand::SetTrackListen {
                 track_index,
                 listen,

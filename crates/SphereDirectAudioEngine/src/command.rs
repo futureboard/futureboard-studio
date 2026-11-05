@@ -57,6 +57,14 @@ pub enum EngineCommand {
     /// Set the gain one clip plays toward (linear, 0..4). `clip_index` is
     /// resolved by the control thread so the payload owns no allocation.
     SetClipGain { clip_index: usize, gain: f32 },
+    /// Set one send's level (linear, 0..2). Both indices are resolved by the
+    /// control thread so the payload owns no allocation and the callback does
+    /// no id lookup.
+    SetTrackSendLevel {
+        track_index: usize,
+        send_index: usize,
+        level: f32,
+    },
     /// Set one channel's Pre/After-Fader Listen state. `track_index` is
     /// resolved by the control thread so the payload owns no allocation.
     SetTrackListen {

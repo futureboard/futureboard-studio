@@ -4994,6 +4994,19 @@ impl RuntimeProject {
         }
     }
 
+    /// Live send level (linear, 0..2) by resolved indices; an index the graph
+    /// does not have is ignored.
+    #[inline]
+    pub fn update_track_send_level(&mut self, track_index: usize, send_index: usize, level: f32) {
+        if let Some(send) = self
+            .tracks
+            .get_mut(track_index)
+            .and_then(|track| track.sends.get_mut(send_index))
+        {
+            send.level = level.clamp(0.0, 2.0);
+        }
+    }
+
     pub fn update_track_spatial(
         &mut self,
         track_index: usize,

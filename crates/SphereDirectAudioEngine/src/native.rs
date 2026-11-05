@@ -1267,6 +1267,17 @@ impl AudioEngine {
         self.inner.set_clip_gain(clip_id, gain)
     }
 
+    /// Set one send's level (linear, 0..2), live. `Ok(false)` when the
+    /// running graph has no such send yet.
+    pub fn set_track_send_level(
+        &self,
+        track_id: &str,
+        send_id: &str,
+        level: f32,
+    ) -> Result<bool, SphereAudioError> {
+        self.inner.set_track_send_level(track_id, send_id, level)
+    }
+
     /// Move one channel in the spatial mix's room, live.
     pub fn set_track_spatial(
         &self,
