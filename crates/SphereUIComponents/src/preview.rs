@@ -468,6 +468,122 @@ pub fn scenes() -> Vec<Scene> {
             open: mixer::mixer,
         },
         Scene {
+            name: "midi-tools",
+            width: 1_200.0,
+            height: 760.0,
+            open: midi_tools_scene,
+        },
+        Scene {
+            name: "midi-tools-pitch",
+            width: 1_200.0,
+            height: 760.0,
+            open: midi_tools_pitch_scene,
+        },
+        Scene {
+            name: "midi-tools-perform",
+            width: 1_200.0,
+            height: 760.0,
+            open: midi_tools_perform_scene,
+        },
+        Scene {
+            name: "midi-tool-strum",
+            width: crate::components::piano_roll::advanced_tools::AdvancedTool::Strum
+                .window_size()
+                .0,
+            height: crate::components::piano_roll::advanced_tools::AdvancedTool::Strum
+                .window_size()
+                .1,
+            open: midi_tool_strum_scene,
+        },
+        Scene {
+            name: "midi-tool-humanize",
+            width: crate::components::piano_roll::advanced_tools::AdvancedTool::Humanize
+                .window_size()
+                .0,
+            height: crate::components::piano_roll::advanced_tools::AdvancedTool::Humanize
+                .window_size()
+                .1,
+            open: midi_tool_humanize_scene,
+        },
+        Scene {
+            name: "midi-tool-length",
+            width: crate::components::piano_roll::advanced_tools::AdvancedTool::Length
+                .window_size()
+                .0,
+            height: crate::components::piano_roll::advanced_tools::AdvancedTool::Length
+                .window_size()
+                .1,
+            open: midi_tool_length_scene,
+        },
+        Scene {
+            name: "midi-tool-velocity",
+            width: crate::components::piano_roll::advanced_tools::AdvancedTool::Velocity
+                .window_size()
+                .0,
+            height: crate::components::piano_roll::advanced_tools::AdvancedTool::Velocity
+                .window_size()
+                .1,
+            open: midi_tool_velocity_scene,
+        },
+        Scene {
+            name: "midi-tool-cleanup",
+            width: crate::components::piano_roll::advanced_tools::AdvancedTool::CleanUp
+                .window_size()
+                .0,
+            height: crate::components::piano_roll::advanced_tools::AdvancedTool::CleanUp
+                .window_size()
+                .1,
+            open: midi_tool_cleanup_scene,
+        },
+        Scene {
+            name: "inspector",
+            width: crate::components::panel::INSPECTOR_WIDTH,
+            height: 1_120.0,
+            open: inspector_scene,
+        },
+        Scene {
+            name: "inspector-folded",
+            width: crate::components::panel::INSPECTOR_WIDTH,
+            height: 560.0,
+            open: inspector_folded_scene,
+        },
+        Scene {
+            name: "tool-bars",
+            width: 900.0,
+            height: 220.0,
+            open: tool_bars_scene,
+        },
+        Scene {
+            name: "icons",
+            width: 980.0,
+            height: 580.0,
+            open: icons_scene,
+        },
+        Scene {
+            name: "jam",
+            width: crate::components::jam_window::JAM_WINDOW_WIDTH,
+            height: crate::components::jam_window::JAM_WINDOW_HEIGHT,
+            open: jam_idle_scene,
+        },
+        Scene {
+            name: "jam-live",
+            width: crate::components::jam_window::JAM_WINDOW_WIDTH,
+            height: 1_180.0,
+            open: jam_live_scene,
+        },
+        Scene {
+            name: "audio-connections",
+            width: 1_040.0,
+            height: 460.0,
+            open: audio_connections_scene,
+        },
+        Scene {
+            name: "audio-connections-empty",
+            width: 1_040.0,
+            height: 460.0,
+            open: audio_connections_empty_scene,
+        },
+        Scene {
             name: "audio-clips",
             width: 1_100.0,
             height: 260.0,
@@ -1357,8 +1473,551 @@ impl gpui::Render for AudioClipsPreview {
     }
 }
 
+/// The MIDI editor with its tools column open on a chord progression, on
+/// the Timing page.
+fn midi_tools_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_midi_tools(options, cx, 0, false)
+}
+
+/// The Pitch page, with the Chord Track shown under the ruler.
+fn midi_tools_pitch_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_midi_tools(options, cx, 1, true)
+}
+
+/// The Perform page.
+fn midi_tools_perform_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_midi_tools(options, cx, 2, false)
+}
+
+fn open_midi_tools(
+    options: WindowOptions,
+    cx: &mut App,
+    tab: usize,
+    chord_strip: bool,
+) -> Result<AnyWindowHandle> {
+    use crate::components::piano_roll::PianoRoll;
+    let handle = cx.open_window(options, |_, cx| {
+        let timeline = preview_midi_timeline(cx);
+        cx.new(|cx| {
+            let mut roll = PianoRoll::new(timeline, cx);
+            roll.set_tools_panel_open(true, cx);
+            roll.preview_tools(tab, chord_strip);
+            roll
+        })
+    })?;
+    Ok(handle.into())
+}
+
+fn midi_tool_strum_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_midi_tool(
+        options,
+        cx,
+        crate::components::piano_roll::advanced_tools::AdvancedTool::Strum,
+    )
+}
+
+fn midi_tool_humanize_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_midi_tool(
+        options,
+        cx,
+        crate::components::piano_roll::advanced_tools::AdvancedTool::Humanize,
+    )
+}
+
+fn midi_tool_length_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_midi_tool(
+        options,
+        cx,
+        crate::components::piano_roll::advanced_tools::AdvancedTool::Length,
+    )
+}
+
+fn midi_tool_velocity_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_midi_tool(
+        options,
+        cx,
+        crate::components::piano_roll::advanced_tools::AdvancedTool::Velocity,
+    )
+}
+
+fn midi_tool_cleanup_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_midi_tool(
+        options,
+        cx,
+        crate::components::piano_roll::advanced_tools::AdvancedTool::CleanUp,
+    )
+}
+
+/// One tool window, live on the preview progression's notes (the editor
+/// itself is not shown; the window only reads it).
+fn open_midi_tool(
+    options: WindowOptions,
+    cx: &mut App,
+    tool: crate::components::piano_roll::advanced_tools::AdvancedTool,
+) -> Result<AnyWindowHandle> {
+    use crate::components::midi_tools_dialog::MidiToolWindow;
+    use crate::components::piano_roll::PianoRoll;
+    let timeline = preview_midi_timeline(cx);
+    let roll = cx.new(|cx| {
+        let mut roll = PianoRoll::new(timeline, cx);
+        roll.preview_begin_tool(tool, cx);
+        roll
+    });
+    // The window holds the editor weakly; in the app the layout owns it.
+    // Nothing owns it here, so keep it for the life of the preview.
+    std::mem::forget(roll.clone());
+    let handle = cx.open_window(options, move |_, cx| {
+        cx.new(|cx| MidiToolWindow::new(roll, tool, cx))
+    })?;
+    Ok(handle.into())
+}
+
+/// A MIDI track holding a four-chord progression (C Am F G, each with a bass
+/// note), selected, with the same chords on the Chord Track.
+fn preview_midi_timeline(
+    cx: &mut App,
+) -> gpui::Entity<crate::components::timeline::timeline::Timeline> {
+    use crate::components::timeline::timeline::Timeline;
+    use crate::components::timeline::timeline_state::ChordPlacement;
+    use sphere_midi_service::chords::{Chord, ChordQuality};
+    {
+        cx.new(|_| {
+            let mut timeline = Timeline::new();
+            let state = &mut timeline.state;
+            let track = state.create_midi_track();
+            if let Some(clip) = state.create_midi_clip(&track, 0.0, 16.0) {
+                let chords: [(u8, [u8; 3]); 4] = [
+                    (0, [60, 64, 67]),
+                    (9, [57, 60, 64]),
+                    (5, [53, 57, 60]),
+                    (7, [55, 59, 62]),
+                ];
+                for (bar, (_, pitches)) in chords.iter().enumerate() {
+                    for (k, pitch) in pitches.iter().enumerate() {
+                        let start = bar as f32 * 4.0 + k as f32 * 0.04;
+                        state.add_midi_note(&clip, *pitch, start, 3.5, 96 - k as u8 * 8);
+                    }
+                    state.add_midi_note(&clip, pitches[0] - 12, bar as f32 * 4.0, 1.0, 110);
+                }
+                state.select_clip(&clip);
+            }
+            let quality = [
+                ChordQuality::Major,
+                ChordQuality::Minor,
+                ChordQuality::Major,
+                ChordQuality::Major,
+            ];
+            let placements: Vec<ChordPlacement> = chords_roots()
+                .iter()
+                .zip(quality)
+                .map(|(root, quality)| ChordPlacement {
+                    chord: Chord::new(*root, quality),
+                    flats: false,
+                    length_beats: 4.0,
+                })
+                .collect();
+            state.place_chords(0.0, &placements);
+            timeline
+        })
+    }
+}
+
+fn chords_roots() -> [u8; 4] {
+    [0, 9, 5, 7]
+}
+
 fn audio_clips_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
     let handle = cx.open_window(options, |_, cx| cx.new(|_| AudioClipsPreview::new()))?;
+    Ok(handle.into())
+}
+
+// ── Inspector ───────────────────────────────────────────────────────────────
+
+/// The track Inspector on an instrument track: a loaded synth, two effects
+/// (the second bypassed), solo and input lit, a volume a little under unity.
+struct InspectorPreview {
+    tracks: Vec<crate::components::timeline::timeline_state::TrackState>,
+    track_id: String,
+    name_input: crate::components::text_input::TextInputState,
+    clip_name_input: crate::components::text_input::TextInputState,
+    color: crate::components::ColorPickerState,
+    folded: &'static [&'static str],
+}
+
+impl InspectorPreview {
+    fn new(folded: &'static [&'static str], cx: &mut Context<Self>) -> Self {
+        use crate::components::timeline::timeline_state::{
+            volume, CreateTrackOptions, InputMonitorMode, InsertLoadStatus, TimelineState,
+            TrackType,
+        };
+        let mut state = TimelineState::default();
+        let color = crate::theme::Colors::track_color_for_index(0);
+        let track_id = state.create_track(CreateTrackOptions {
+            track_type: TrackType::Instrument,
+            name: "Instrument Track 3".to_string(),
+            color,
+            volume: volume::db_to_norm(-3.0),
+            pan: -0.2,
+            armed: false,
+            input_monitor: InputMonitorMode::Always,
+        });
+        for name in ["WrapSynth", "EQUZ8", "BurnLimit"] {
+            if let Some(slot_id) = state.add_insert(&track_id) {
+                if let Some(track) = state.tracks.iter_mut().find(|t| t.id == track_id) {
+                    if let Some(slot) = track.inserts.iter_mut().find(|s| s.id == slot_id) {
+                        slot.display_name = name.to_string();
+                        slot.load_status = InsertLoadStatus::Ready;
+                        slot.bypassed = name == "BurnLimit";
+                    }
+                }
+            }
+        }
+        if let Some(track) = state.tracks.iter_mut().find(|t| t.id == track_id) {
+            track.solo = true;
+        }
+        let name_input =
+            crate::components::text_input::TextInputState::new("preview-name", cx.focus_handle());
+        let clip_name_input =
+            crate::components::text_input::TextInputState::new("preview-clip", cx.focus_handle());
+        let color = crate::components::ColorPickerState::new(
+            "preview-hex",
+            cx.focus_handle(),
+            crate::components::ColorPickerValue::custom(color),
+            color,
+            Vec::new(),
+        );
+        Self {
+            tracks: state.tracks,
+            track_id,
+            name_input,
+            clip_name_input,
+            color,
+            folded,
+        }
+    }
+}
+
+impl gpui::Render for InspectorPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+        use crate::components::panel::{inspector_panel, InspectorCallbacks, InspectorColorPicker};
+        use crate::components::text_input::TextInputCallbacks;
+        let callbacks = InspectorCallbacks::preview_noop(self.folded);
+        let noop = || Arc::new(|_: &mut Window, _: &mut App| {});
+        let picker = InspectorColorPicker {
+            state: &self.color,
+            hex_focused: false,
+            hex_callbacks: TextInputCallbacks::default(),
+            callbacks: crate::components::ColorPickerCallbacks {
+                on_toggle: noop(),
+                on_close: noop(),
+                on_pick: Arc::new(|_, _, _| {}),
+                on_hue: Arc::new(|_, _, _| {}),
+                on_sv: Arc::new(|_, _, _, _| {}),
+                on_auto: Arc::new(|_, _, _| {}),
+            },
+        };
+        inspector_panel(
+            &self.tracks,
+            &crate::audio_connections::AudioConnectionRegistry::default(),
+            Some(&self.track_id),
+            None,
+            None,
+            None,
+            &self.name_input,
+            false,
+            TextInputCallbacks::default(),
+            &self.clip_name_input,
+            false,
+            TextInputCallbacks::default(),
+            picker,
+            true,
+            solfege_spatialaudio::SpatialFormat::Stereo,
+            &callbacks,
+            crate::i18n::I18n::new("en-US"),
+        )
+    }
+}
+
+fn inspector_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    let handle = cx.open_window(options, |_, cx| cx.new(|cx| InspectorPreview::new(&[], cx)))?;
+    Ok(handle.into())
+}
+
+fn inspector_folded_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    let handle = cx.open_window(options, |_, cx| {
+        cx.new(|cx| InspectorPreview::new(&["routing", "program", "mpe", "instrument"], cx))
+    })?;
+    Ok(handle.into())
+}
+
+/// The two tool bar styles: the Classic strip on top, as the shell docks it
+/// above the ruler, and the Floating bar where it floats.
+struct ToolBarsPreview {
+    strip: gpui::Entity<crate::components::timeline::tool_strip::ClassicToolStrip>,
+}
+
+impl gpui::Render for ToolBarsPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+        use crate::components::timeline::floating_tools_bar::floating_tools_bar;
+        use crate::components::timeline::timeline_state::TimelineTool;
+        use crate::theme::Colors;
+        use gpui::{div, px, ParentElement, Styled};
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(Colors::surface_base())
+            .child(
+                gpui::AnyView::from(self.strip.clone()).cached(
+                    crate::components::timeline::tool_strip::ClassicToolStrip::cached_style(),
+                ),
+            )
+            .child(
+                div().flex_1().relative().child(
+                    div()
+                        .absolute()
+                        .left(px(16.0))
+                        .bottom(px(16.0))
+                        .child(floating_tools_bar(
+                            TimelineTool::Pen,
+                            Arc::new(|_, _, _| {}),
+                            Arc::new(|_, _, _| {}),
+                            1.0,
+                            Arc::new(|_, _, _| {}),
+                        )),
+                ),
+            )
+    }
+}
+
+fn tool_bars_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    let handle = cx.open_window(options, |_, cx| {
+        let timeline = cx.new(|_| crate::components::timeline::Timeline::with_demo_content());
+        let strip = cx.new(|cx| {
+            crate::components::timeline::tool_strip::ClassicToolStrip::new(&timeline, cx)
+        });
+        cx.new(|_| ToolBarsPreview { strip })
+    })?;
+    Ok(handle.into())
+}
+
+/// Every Futureboard icon at 14, 16, 20 and 40 px, as Studio tints them, with the
+/// path it answers to.
+struct IconSheetPreview;
+
+impl gpui::Render for IconSheetPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+        use crate::theme::Colors;
+        use gpui::{div, px, svg, ParentElement, Styled};
+        let mut grid = div()
+            .size_full()
+            .p(px(16.0))
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .gap(px(8.0))
+            .bg(Colors::surface_panel());
+        for (path, _) in crate::assets::FUTUREBOARD_ICONS {
+            let name = path
+                .trim_start_matches("icons/")
+                .trim_end_matches(".svg")
+                .to_string();
+            grid = grid.child(
+                div()
+                    .w(px(150.0))
+                    .h(px(84.0))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(6.0))
+                    .rounded(px(6.0))
+                    .bg(Colors::surface_input())
+                    .child(div().flex().flex_row().items_end().gap(px(8.0)).children(
+                        [14.0, 16.0, 20.0, 40.0].map(|edge| {
+                            svg()
+                                .path(path)
+                                .size(px(edge))
+                                .text_color(Colors::text_primary())
+                        }),
+                    ))
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(Colors::text_muted())
+                            .child(name),
+                    ),
+            );
+        }
+        grid
+    }
+}
+
+fn icons_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    let handle = cx.open_window(options, |_, cx| cx.new(|_| IconSheetPreview))?;
+    Ok(handle.into())
+}
+
+/// The jam panel signed in and out of a jam, with nothing typed yet.
+fn jam_idle_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    use crate::components::jam_window::JamWindow;
+    let state = crate::jam::JamUiState {
+        configured: true,
+        signed_in: true,
+        state_label: "Disconnected".to_string(),
+        ..Default::default()
+    };
+    let handle = cx.open_window(options, |_, cx| cx.new(|cx| JamWindow::preview(state, cx)))?;
+    Ok(handle.into())
+}
+
+/// The jam panel in a live three-person room: Master going out, a guitar
+/// stream routed and playing, a vocal stream not yet routed, an invite link
+/// minted.
+fn jam_live_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    use crate::components::jam_window::JamWindow;
+    use crate::jam::{JamSendView, JamStreamView, JamUiState};
+    use sphere_jam_client::protocol::{ParticipantSummary, UserSummary};
+
+    let person =
+        |id: &str, username: &str, display: &str, device: &str, state: &str| ParticipantSummary {
+            id: format!("par_{id}"),
+            user: UserSummary {
+                id: format!("usr_{id}"),
+                username: username.to_string(),
+                display_name: display.to_string(),
+                ..Default::default()
+            },
+            device_id: device.to_string(),
+            device_name: device.to_string(),
+            role: "performer".into(),
+            connection_state: state.into(),
+            ..Default::default()
+        };
+    let stream = |id: &str, user: &str, name: &str, routed: bool, receiving: bool| JamStreamView {
+        stream_id: format!("str_{id}"),
+        user_id: format!("usr_{user}"),
+        device_id: "studio".to_string(),
+        handle: format!("@{user}"),
+        display_name: String::new(),
+        avatar_url: String::new(),
+        stream_name: name.to_string(),
+        channels: 2,
+        channel_labels: vec!["L".to_string(), "R".to_string()],
+        sample_rate: 48_000,
+        codec: "pcm".to_string(),
+        receiving,
+        peak: if receiving { 0.62 } else { 0.0 },
+        rtt_ms: 38.0,
+        routed,
+        buffering: false,
+        dropouts: if receiving { 2 } else { 0 },
+        arrival_latency_ms: receiving.then_some(46.0),
+    };
+    let state = JamUiState {
+        configured: true,
+        signed_in: true,
+        state_label: "Connected".to_string(),
+        connected: true,
+        jam_id: "jam_1".to_string(),
+        jam_name: "Friday Session".to_string(),
+        public_id: "K7Q-2MX".to_string(),
+        join_url: "https://jam.futureboard.studio/j/K7Q-2MX".to_string(),
+        region_label: "Singapore".to_string(),
+        transport_label: "QUIC".to_string(),
+        rtt_ms: 38.4,
+        clock_offset_ms: 1.2,
+        clock_drift_ppm: -3.1,
+        clock_locked: true,
+        packets_in: 18_204,
+        packets_out: 17_990,
+        participants: vec![
+            person("1", "arizkami", "Ariz", "Studio PC", "connected"),
+            person("2", "mint", "Mint", "MacBook", "connected"),
+            person("3", "ploy", "", "Studio", "reconnecting"),
+        ],
+        streams: vec![
+            stream("g", "2", "Guitar", true, true),
+            stream("v", "3", "Vocal", false, false),
+        ],
+        publishing: vec!["master".to_string()],
+        sending: vec![JamSendView {
+            key: "master".to_string(),
+            name: "Master".to_string(),
+            tap: "Master bus".to_string(),
+            level: 0.48,
+        }],
+        invite_link: Some("https://jam.futureboard.studio/j/K7Q-2MX#s3cr3t".to_string()),
+        ..Default::default()
+    };
+    let handle = cx.open_window(options, |_, cx| cx.new(|cx| JamWindow::preview(state, cx)))?;
+    Ok(handle.into())
+}
+
+/// The Audio Connections window over an 8-in/8-out interface's default
+/// buses, one turned off and one whose device is unplugged, the first row
+/// selected.
+fn audio_connections_window_preview(
+    populated: bool,
+    cx: &mut Context<crate::components::audio_connections_window::AudioConnectionsWindow>,
+) -> crate::components::audio_connections_window::AudioConnectionsWindow {
+    use crate::audio_connections::{
+        AudioConnectionDirection, AudioConnectionRegistry, AvailablePorts, ChannelLayout,
+    };
+    use crate::components::audio_connections_window::{
+        AudioConnectionsSnapshot, AudioConnectionsWindow,
+    };
+    let ports = AvailablePorts::for_device("dev-1", "Studio 24c USB ASIO", 8, 8);
+    let registry = if populated {
+        let mut registry = AudioConnectionRegistry::default_template(&ports, "dev-1");
+        let inputs = registry.by_direction(AudioConnectionDirection::Input);
+        if let Some(last) = inputs.last().map(|connection| connection.id.clone()) {
+            registry.set_enabled(&last, false);
+        }
+        let (missing, _) = registry.add_connection(
+            AudioConnectionDirection::Input,
+            ChannelLayout::Stereo,
+            &ports,
+        );
+        registry.update_name(&missing, "Field Recorder");
+        registry.update_device(&missing, Some("dev-1"), &ports);
+        if let Some(connection) = registry.get_mut(&missing) {
+            connection.device_id = Some("zoom-f3".to_string());
+        }
+        registry.revalidate(&ports);
+        registry
+    } else {
+        AudioConnectionRegistry::new()
+    };
+    let snapshot = AudioConnectionsSnapshot {
+        registry,
+        ports,
+        input_device: "Studio 24c USB ASIO".to_string(),
+        output_device: "Studio 24c USB ASIO".to_string(),
+        has_project: true,
+        references: Default::default(),
+    };
+    let mut window = AudioConnectionsWindow::new(
+        snapshot,
+        Arc::new(|_, _, _| {}),
+        Arc::new(|_, _| {}),
+        cx.focus_handle(),
+    );
+    window.preview_select_first();
+    window
+}
+
+fn audio_connections_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    let handle = cx.open_window(options, |_, cx| {
+        cx.new(|cx| audio_connections_window_preview(true, cx))
+    })?;
+    Ok(handle.into())
+}
+
+fn audio_connections_empty_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    let handle = cx.open_window(options, |_, cx| {
+        cx.new(|cx| audio_connections_window_preview(false, cx))
+    })?;
     Ok(handle.into())
 }
 
