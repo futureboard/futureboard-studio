@@ -1482,6 +1482,7 @@ impl Render for StudioLayout {
                             .cached(shell_regions::BrowserSidebarView::cached_style()),
                     );
                 }
+                let classic_tool_bar = self.classic_tool_bar(cx);
                 main_row = main_row.child({
                     let owner = cx.entity().clone();
                     // Cached, with its per-frame layers beside it rather than
@@ -1494,7 +1495,7 @@ impl Render for StudioLayout {
                             timeline.ensure_overlay_layers(cx);
                             timeline.overlay_layers().collect()
                         });
-                    div()
+                    let arrangement = div()
                         .flex_1()
                         .min_w_0()
                         .min_h_0()
@@ -1508,7 +1509,29 @@ impl Render for StudioLayout {
                             gpui::AnyView::from(self.timeline.clone())
                                 .cached(components::timeline::Timeline::cached_style()),
                         )
-                        .children(overlay_layers)
+                        .children(overlay_layers);
+                    if classic_tool_bar {
+                        // The Classic tool bar: the edit tools docked in a strip
+                        // directly above the ruler, across the arrangement's
+                        // width. It sits outside the arrangement (and its
+                        // overlay layers), which measures its own origin and so
+                        // simply starts one strip lower.
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .min_h_0()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                gpui::AnyView::from(self.classic_tool_strip.clone()).cached(
+                                    components::timeline::tool_strip::ClassicToolStrip::cached_style(),
+                                ),
+                            )
+                            .child(arrangement)
+                            .into_any_element()
+                    } else {
+                        arrangement.into_any_element()
+                    }
                 });
                 if show_inspector {
                     // Cached: the dock rebuilds when the shell changes, not

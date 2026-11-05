@@ -3,6 +3,56 @@
 use super::*;
 
 impl Timeline {
+    /// Where the edit tools are drawn; see [`crate::settings::ToolBarStyle`].
+    /// Returns whether it changed, so the caller notifies only then.
+    pub fn set_tool_bar_style(&mut self, style: crate::settings::ToolBarStyle) -> bool {
+        if self.tool_bar_style == style {
+            return false;
+        }
+        self.tool_bar_style = style;
+        true
+    }
+
+    pub fn tool_bar_style(&self) -> crate::settings::ToolBarStyle {
+        self.tool_bar_style
+    }
+
+    /// The edit tool in use.
+    pub fn active_tool(&self) -> TimelineTool {
+        self.state.active_tool
+    }
+
+    /// The view-only waveform zoom factor.
+    pub fn waveform_zoom(&self) -> f32 {
+        self.state.waveform_zoom
+    }
+
+    /// Switch the edit tool. The one path both the floating bar and the
+    /// classic column take, so the two cannot disagree about what a tool
+    /// change cancels.
+    pub fn select_tool(
+        &mut self,
+        tool: TimelineTool,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.log_input_state("tool-change");
+        // A tool change mid-drag cancels a clip gain / fade / crossfade
+        // gesture or a clip move: its clips go back and its drag stops.
+        self.cancel_clip_handle_gesture(Some(window), cx);
+        self.cancel_clip_drag(Some(window), cx);
+        self.reset_input_state();
+        self.state.active_tool = tool;
+        cx.notify();
+    }
+
+    /// Step the waveform zoom by `steps` (0 resets it to 1×).
+    pub fn step_waveform_zoom(&mut self, steps: i32, cx: &mut gpui::Context<Self>) {
+        if self.state.step_waveform_zoom(steps) {
+            cx.notify();
+        }
+    }
+
     pub(super) fn hit_test_debug_enabled() -> bool {
         static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *FLAG.get_or_init(|| std::env::var_os("FUTUREBOARD_HITTEST_DEBUG").is_some())
@@ -282,6 +332,7 @@ impl Timeline {
             cut_guide: Default::default(),
             cut_guide_overlay: None,
             cut_hover: None,
+            tool_bar_style: crate::settings::ToolBarStyle::default(),
             timeline_origin_probe: std::rc::Rc::new(std::cell::Cell::new(None)),
             marquee_frame: Default::default(),
             marquee_overlay: None,
@@ -386,6 +437,7 @@ impl Timeline {
             cut_guide: Default::default(),
             cut_guide_overlay: None,
             cut_hover: None,
+            tool_bar_style: crate::settings::ToolBarStyle::default(),
             timeline_origin_probe: std::rc::Rc::new(std::cell::Cell::new(None)),
             marquee_frame: Default::default(),
             marquee_overlay: None,

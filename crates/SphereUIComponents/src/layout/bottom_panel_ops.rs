@@ -206,6 +206,43 @@ impl StudioLayout {
         }
     }
 
+    /// Whether Appearance → Tool Bar is Classic (tools docked in a strip above
+    /// the arrangement's ruler) rather than Floating.
+    pub(crate) fn classic_tool_bar(&self, cx: &gpui::App) -> bool {
+        self.settings
+            .read(cx)
+            .current
+            .appearance
+            .arrangement
+            .tool_bar
+            == crate::settings::ToolBarStyle::Classic
+    }
+
+    /// Hand the tool bar style to the arrangement and re-lay the shell around
+    /// it. Cheap when nothing changed.
+    pub(crate) fn sync_tool_bar_style(&mut self, cx: &mut Context<Self>) {
+        let style = self
+            .settings
+            .read(cx)
+            .current
+            .appearance
+            .arrangement
+            .tool_bar;
+        let changed = self.timeline.update(cx, |timeline, cx| {
+            let changed = timeline.set_tool_bar_style(style);
+            if changed {
+                cx.notify();
+            }
+            changed
+        });
+        if changed {
+            // The strip takes the arrangement's top; the arrangement measures
+            // its own new origin on the next frame, so only the shell has to
+            // re-lay out.
+            cx.notify();
+        }
+    }
+
     pub(crate) fn sync_timeline_chrome_metrics(&self, cx: &mut Context<Self>) {
         // One source of truth: this width flows into
         // `TimelineChromeMetrics.browser_width` → `viewport.panel_origin_x` →

@@ -734,6 +734,10 @@ pub struct StudioLayout {
     /// Title/transport chrome, cached and repainted on its own for the
     /// bar.beat readout.
     app_chrome: gpui::Entity<shell_regions::AppChromeView>,
+    /// The edit tools docked above the arrangement's ruler, shown when
+    /// Appearance → Tool Bar is Classic. Cached, and repainted only when the
+    /// tool or the waveform zoom changes.
+    classic_tool_strip: gpui::Entity<components::timeline::tool_strip::ClassicToolStrip>,
     effect_editor_tab: gpui::Entity<components::EffectEditorTabView>,
 
     // ── Project file system ───────────────────────────────────────────────────
@@ -1011,6 +1015,9 @@ impl StudioLayout {
         });
         let app_chrome = cx.new(|cx| {
             shell_regions::AppChromeView::new(studio_entity.clone(), &timeline, &settings, cx)
+        });
+        let classic_tool_strip = cx.new(|cx| {
+            components::timeline::tool_strip::ClassicToolStrip::new(&timeline, cx)
         });
         let chord_display_panel = cx.new(|cx| {
             components::SongTextPanelView::new(
@@ -1537,6 +1544,7 @@ impl StudioLayout {
             browser_sidebar,
             right_dock,
             app_chrome,
+            classic_tool_strip,
             effect_editor_tab,
             paths,
             project_session: crate::project::ProjectSession::default(),
@@ -1623,6 +1631,11 @@ impl StudioLayout {
                 this.restore_secondary_windows_from_layout(cx);
             });
         });
+        // The tool bar style applies live: a change in Settings moves the tools
+        // between the floating bar and the docked strip straight away.
+        cx.observe(&layout.settings, |this, _, cx| this.sync_tool_bar_style(cx))
+            .detach();
+        layout.sync_tool_bar_style(cx);
         layout.sync_timeline_chrome_metrics(cx);
         // Editors the arrangement owns (the track header rename) hand the
         // keyboard back to the shortcut anchor when they close.

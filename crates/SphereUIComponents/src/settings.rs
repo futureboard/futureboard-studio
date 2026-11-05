@@ -388,6 +388,9 @@ pub struct HardwareSettings {
 pub struct ArrangementAppearanceSettings {
     pub grid_line_intensity: f32,
     pub clip_color_mode: String,
+    /// Where the arrangement's edit tools live; see [`ToolBarStyle`].
+    #[serde(default)]
+    pub tool_bar: ToolBarStyle,
 }
 
 impl Default for ArrangementAppearanceSettings {
@@ -395,8 +398,25 @@ impl Default for ArrangementAppearanceSettings {
         Self {
             grid_line_intensity: 0.4,
             clip_color_mode: "TrackAccent".to_string(),
+            tool_bar: ToolBarStyle::default(),
         }
     }
+}
+
+/// Where the arrangement's edit tools (Select, Draw, Cut, …) and the waveform
+/// zoom live.
+///
+/// Both are the same controls over the same timeline state; only the place
+/// differs. Applies live — the tools are view chrome, not part of the project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToolBarStyle {
+    /// A small bar floating over the lanes, which can be dragged anywhere.
+    #[default]
+    Floating,
+    /// A fixed bar docked across the top of the arrangement, directly above
+    /// the ruler, the way a classic DAW keeps its tools.
+    Classic,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1670,28 +1690,6 @@ mod text_rendering_settings_tests {
     }
 
     #[test]
-    fn every_backend_has_a_label_and_a_token() {
-        for backend in TextRenderingBackend::ALL {
-            assert!(!backend.label().is_empty());
-            assert!(!backend.as_token().is_empty());
-        }
-        assert_eq!(TextRenderingBackend::Gdi.label(), "GDI+");
-        assert_eq!(TextRenderingBackend::DirectWrite.as_token(), "directwrite");
-    }
-
-    #[test]
-    fn playback_transport_fields_default_when_missing() {
-        let parsed: PlaybackSettings =
-            serde_json::from_str(r#"{"latency_compensation":true}"#).expect("deserialize");
-        assert_eq!(parsed.spacebar_action, SpacebarAction::PlayPause);
-        assert!(!parsed.return_playhead_on_stop);
-        assert_eq!(
-            serde_json::to_string(&SpacebarAction::PlayStop).unwrap(),
-            "\"play-stop\""
-        );
-    }
-
-    #[test]
     fn the_studio_window_is_borderless_unless_chosen_otherwise() {
         assert_eq!(
             SettingsSchema::default().appearance.window_style,
@@ -1726,6 +1724,28 @@ mod text_rendering_settings_tests {
     }
 
     #[test]
+    fn every_backend_has_a_label_and_a_token() {
+        for backend in TextRenderingBackend::ALL {
+            assert!(!backend.label().is_empty());
+            assert!(!backend.as_token().is_empty());
+        }
+        assert_eq!(TextRenderingBackend::Gdi.label(), "GDI+");
+        assert_eq!(TextRenderingBackend::DirectWrite.as_token(), "directwrite");
+    }
+
+    #[test]
+    fn playback_transport_fields_default_when_missing() {
+        let parsed: PlaybackSettings =
+            serde_json::from_str(r#"{"latency_compensation":true}"#).expect("deserialize");
+        assert_eq!(parsed.spacebar_action, SpacebarAction::PlayPause);
+        assert!(!parsed.return_playhead_on_stop);
+        assert_eq!(
+            serde_json::to_string(&SpacebarAction::PlayStop).unwrap(),
+            "\"play-stop\""
+        );
+    }
+
+    #[test]
     fn jam_auto_offset_is_on_for_settings_saved_before_it_existed() {
         let parsed: AudioRecordingSettings = serde_json::from_str(
             r#"{"format":"wav","bit_depth":24,"recording_path":"","recording_offset_ms":-3}"#,
@@ -1742,5 +1762,31 @@ mod text_rendering_settings_tests {
         assert!(parsed.show_mixer_on_add_track);
         assert!(EditingSettings::default().show_mixer_on_add_track);
         assert!(SettingsSchema::default().editing.show_mixer_on_add_track);
+    }
+}
+
+#[cfg(test)]
+mod tool_bar_style_tests {
+    use super::*;
+
+    /// Floating is the default, and a settings file written before the choice
+    /// existed still loads — as Floating.
+    #[test]
+    fn an_older_settings_file_loads_with_the_floating_tool_bar() {
+        assert_eq!(ToolBarStyle::default(), ToolBarStyle::Floating);
+        let older: ArrangementAppearanceSettings =
+            serde_json::from_str(r#"{"grid_line_intensity":0.4,"clip_color_mode":"TrackAccent"}"#)
+                .expect("an arrangement block without tool_bar parses");
+        assert_eq!(older.tool_bar, ToolBarStyle::Floating);
+    }
+
+    #[test]
+    fn the_tool_bar_choice_round_trips() {
+        let mut settings = ArrangementAppearanceSettings::default();
+        settings.tool_bar = ToolBarStyle::Classic;
+        let text = serde_json::to_string(&settings).expect("serialize");
+        assert!(text.contains(r#""tool_bar":"classic""#), "{text}");
+        let parsed: ArrangementAppearanceSettings = serde_json::from_str(&text).expect("parse");
+        assert_eq!(parsed.tool_bar, ToolBarStyle::Classic);
     }
 }

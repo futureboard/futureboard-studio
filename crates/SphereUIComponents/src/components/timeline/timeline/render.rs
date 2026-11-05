@@ -850,14 +850,7 @@ impl Render for Timeline {
         });
 
         let on_select_tool = cx.listener(|this, tool: &TimelineTool, window, cx| {
-            this.log_input_state("tool-change");
-            // A tool change mid-drag cancels a clip gain / fade / crossfade
-            // gesture or a clip move: its clips go back and its drag stops.
-            this.cancel_clip_handle_gesture(Some(window), cx);
-            this.cancel_clip_drag(Some(window), cx);
-            this.reset_input_state();
-            this.state.active_tool = *tool;
-            cx.notify();
+            this.select_tool(*tool, window, cx);
         });
 
         // Smooth, continuous zoom factor — small per-click multiplier so the
@@ -3033,8 +3026,12 @@ impl Render for Timeline {
             .children(cut_guide_overlay)
             // The hovered clip's fade handles; empty unless over an audio clip.
             .child(fade_handle_overlay)
-            // 4. Floating Tools Bar (above playhead)
-            .child(
+            // 4. Floating Tools Bar (above playhead). In the Classic style the
+            // shell docks the same tools in a strip above the ruler instead
+            // (`tool_strip`), so nothing floats over the lanes.
+            .when(
+                self.tool_bar_style == crate::settings::ToolBarStyle::Floating,
+                |this| this.child(
                 div()
                     .absolute()
                     .left(px(toolbar_position.0))
@@ -3053,14 +3050,12 @@ impl Render for Timeline {
                             std::sync::Arc::new(move |steps: &i32, _window, cx| {
                                 let steps = *steps;
                                 let _ = target.update(cx, |this, cx| {
-                                    if this.state.step_waveform_zoom(steps) {
-                                        cx.notify();
-                                    }
+                                    this.step_waveform_zoom(steps, cx);
                                 });
                             })
                         },
                     )),
-            )
+            ))
             // 5. Vertical scrollbar (right edge, over the lane area)
             .child(vertical_scrollbar(
                 cx,

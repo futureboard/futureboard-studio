@@ -11,6 +11,7 @@ pub mod crossfade_overlay;
 pub mod cut_guide;
 pub mod fade_handle_overlay;
 pub mod floating_tools_bar;
+pub mod tool_strip;
 pub mod folder_lane;
 pub mod global_lane_header;
 pub mod marker_flag;

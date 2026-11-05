@@ -337,6 +337,9 @@ pub struct Timeline {
     /// View-only floating-toolbar placement. It deliberately never enters the
     /// project snapshot: moving tools must not make a session dirty.
     floating_toolbar_position: Option<(f32, f32)>,
+    /// Where the edit tools are drawn. Floating draws the bar over the lanes;
+    /// Classic leaves it to the shell's strip above the ruler (`tool_strip`).
+    tool_bar_style: crate::settings::ToolBarStyle,
     floating_toolbar_drag_anchor: Option<(gpui::Point<gpui::Pixels>, (f32, f32))>,
     on_context_menu: Option<TimelineContextMenuCb>,
     on_playhead_scrub_begin:

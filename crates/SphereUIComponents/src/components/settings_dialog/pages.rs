@@ -869,7 +869,36 @@ fn appearance(cx: &PageCtx) -> Vec<PrefGroup> {
             ))
             .note(RESTART_NOTE);
     }
-    vec![interface]
+    // Applies live: the tools move between the floating bar and the docked
+    // column as soon as the choice changes.
+    let arrangement =
+        PrefGroup::new(cx.tr("settings.section.arrangement-appearance")).row(PrefRow::described(
+            cx.tr("settings.field.tool-bar"),
+            cx.tr("settings.hint.tool-bar"),
+            &[
+                "tool",
+                "toolbar",
+                "tools",
+                "floating",
+                "classic",
+                "docked",
+                "column",
+                "pointer",
+                "pencil",
+                "arrangement",
+            ],
+            choice(
+                "settings-tool-bar",
+                vec![
+                    (ToolBarStyle::Floating, cx.tr("settings.tool-bar.floating")),
+                    (ToolBarStyle::Classic, cx.tr("settings.tool-bar.classic")),
+                ],
+                s.appearance.arrangement.tool_bar,
+                &up,
+                |s, v| s.appearance.arrangement.tool_bar = v,
+            ),
+        ));
+    vec![interface, arrangement]
 }
 
 /// Said once under a group whose rows carry the `*` restart marker.

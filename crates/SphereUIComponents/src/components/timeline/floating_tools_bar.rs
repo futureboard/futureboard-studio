@@ -6,6 +6,52 @@ use gpui::{
     Styled,
 };
 
+/// The arrangement's edit tools, in bar order: the tool, its tooltip (with
+/// its shortcut), its glyph, and whether a group divider follows it.
+///
+/// One list for both places the tools can live — the floating bar and the
+/// classic strip above the ruler — so the two never disagree about order, labels or
+/// shortcuts.
+pub const TIMELINE_TOOLS: [(TimelineTool, &str, &str, bool); 7] = [
+    (
+        TimelineTool::Pointer,
+        "Select [1]",
+        assets::ICON_MOUSE_POINTER_PATH,
+        true,
+    ),
+    (
+        TimelineTool::Pen,
+        "Draw [2]",
+        assets::ICON_PENCIL_PATH,
+        false,
+    ),
+    (
+        TimelineTool::Cut,
+        "Cut [3]",
+        assets::ICON_SCISSORS_PATH,
+        false,
+    ),
+    (TimelineTool::Glue, "Glue [4]", assets::ICON_LINK_PATH, true),
+    (
+        TimelineTool::Mute,
+        "Mute [5]",
+        assets::ICON_VOLUME_X_PATH,
+        false,
+    ),
+    (
+        TimelineTool::Time,
+        "Stretch [6]",
+        assets::ICON_CLOCK_PATH,
+        false,
+    ),
+    (
+        TimelineTool::Automation,
+        "Automation [7]",
+        assets::ICON_AUTOMATION_PATH,
+        false,
+    ),
+];
+
 pub fn floating_tools_bar(
     active_tool: TimelineTool,
     on_select_tool: std::sync::Arc<
@@ -15,45 +61,7 @@ pub fn floating_tools_bar(
     waveform_zoom: f32,
     on_waveform_zoom: std::sync::Arc<dyn Fn(&i32, &mut gpui::Window, &mut gpui::App) + 'static>,
 ) -> impl IntoElement {
-    let tools = [
-        (
-            TimelineTool::Pointer,
-            "Select [1]",
-            assets::ICON_MOUSE_POINTER_PATH,
-            true,
-        ),
-        (
-            TimelineTool::Pen,
-            "Draw [2]",
-            assets::ICON_PENCIL_PATH,
-            false,
-        ),
-        (
-            TimelineTool::Cut,
-            "Cut [3]",
-            assets::ICON_SCISSORS_PATH,
-            false,
-        ),
-        (TimelineTool::Glue, "Glue [4]", assets::ICON_LINK_PATH, true),
-        (
-            TimelineTool::Mute,
-            "Mute [5]",
-            assets::ICON_VOLUME_X_PATH,
-            false,
-        ),
-        (
-            TimelineTool::Time,
-            "Stretch [6]",
-            assets::ICON_CLOCK_PATH,
-            false,
-        ),
-        (
-            TimelineTool::Automation,
-            "Automation [7]",
-            assets::ICON_AUTOMATION_PATH,
-            false,
-        ),
-    ];
+    let tools = TIMELINE_TOOLS;
 
     div()
         .flex()
