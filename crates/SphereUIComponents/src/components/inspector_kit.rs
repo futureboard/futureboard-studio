@@ -619,6 +619,325 @@ pub fn ins_empty(
         )
 }
 
+// ── Fold layout (the Inspector) ──────────────────────────────────────────────
+//
+// The Inspector is a flat stack rather than a column of cards: an identity
+// block, then one fold section per concern, each separated from the next by a
+// single hairline. A section folds to its header, and a folded header carries
+// a one-line summary, so a long instrument track still reads top to bottom
+// without scrolling past the parts not being worked on.
+//
+// ```txt
+// ┌───────────────────────────────────────────┐
+// │ ▣  Instrument Track 3                     │  ← identity block
+// │    Instrument · WrapSynth                 │
+// │ [M Mute] [S Solo] [I Input] [R Rec]       │
+// ├───────────────────────────────────────────┤
+// │ ▾ ◫ Track                                 │  ← open fold
+// │   Volume                         −3.0 dB  │
+// │   ─────────────●──────────────            │
+// ├───────────────────────────────────────────┤
+// │ ▸ ⇄ Routing        All inputs · Master    │  ← folded, with summary
+// └───────────────────────────────────────────┘
+// ```
+
+/// Height of a fold section's header row.
+pub const FOLD_HEADER_H: f32 = size::PROMINENT + space::BASE;
+/// Label column of a form row inside a fold section.
+pub const FOLD_LABEL_COL: f32 = LABEL_COL + space::SNUG;
+/// Chevron glyph in a fold header.
+pub const FOLD_CHEVRON: f32 = 10.0;
+/// Edge of the identity block's colour swatch.
+pub const IDENTITY_SWATCH: f32 = size::COMFORTABLE;
+
+/// The Inspector's scroll body: the panel's only vertical scroller and its
+/// only horizontal clip. Unlike [`ins_body`] it adds no padding or gap — the
+/// blocks inside own their insets and separate by hairlines.
+pub fn ins_flat_body(id: &'static str) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex_1()
+        .min_h_0()
+        .overflow_y_scroll()
+        .overflow_x_hidden()
+        .flex()
+        .flex_col()
+}
+
+/// The block at the top of the Inspector that says what is selected.
+pub fn ins_identity_block() -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .flex_shrink_0()
+        .gap(px(space::LOOSE))
+        .p(px(space::LOOSE))
+        .border_b(px(1.0))
+        .border_color(Colors::border_subtle())
+}
+
+/// One fold section: a header that opens and closes it, and its body.
+///
+/// `summary` is shown on the header only while the section is folded, so the
+/// value the body would have shown is still readable at a glance.
+#[allow(clippy::too_many_arguments)]
+pub fn ins_fold(
+    id: impl Into<gpui::ElementId>,
+    icon: Option<&'static str>,
+    title: impl Into<String>,
+    summary: impl Into<String>,
+    open: bool,
+    on_toggle: impl Fn(&mut Window, &mut App) + 'static,
+    body: impl IntoElement,
+) -> gpui::AnyElement {
+    let summary = summary.into();
+    let hover = Colors::composite(Colors::surface_panel(), Colors::state_hover());
+    let pressed = Colors::composite(Colors::surface_panel(), Colors::state_recessed());
+    let header = div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(space::BASE))
+        .h(px(FOLD_HEADER_H))
+        .flex_shrink_0()
+        .px(px(space::LOOSE))
+        .cursor(gpui::CursorStyle::PointingHand)
+        .hover(move |style| style.bg(hover))
+        .active(move |style| style.bg(pressed))
+        .on_click(move |_, window, cx| on_toggle(window, cx))
+        .child(
+            svg()
+                .path(if open {
+                    crate::assets::ICON_CHEVRON_DOWN_PATH
+                } else {
+                    crate::assets::ICON_CHEVRON_RIGHT_PATH
+                })
+                .w(px(FOLD_CHEVRON))
+                .h(px(FOLD_CHEVRON))
+                .flex_shrink_0()
+                .text_color(Colors::text_muted()),
+        )
+        .children(icon.map(|icon| {
+            svg()
+                .path(icon)
+                .w(px(ICON))
+                .h(px(ICON))
+                .flex_shrink_0()
+                .text_color(Colors::text_muted())
+        }))
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_size(px(typography::UI_MD))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(Colors::text_primary())
+                .child(title.into()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_row()
+                .justify_end()
+                .when(!open && !summary.is_empty(), |slot| {
+                    slot.child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(typography::UI_XS))
+                            .text_color(Colors::text_muted())
+                            .child(summary),
+                    )
+                }),
+        );
+    div()
+        .flex()
+        .flex_col()
+        .flex_shrink_0()
+        .border_b(px(1.0))
+        .border_color(Colors::border_subtle())
+        .child(header)
+        .when(open, |section| {
+            section.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(space::BASE))
+                    .px(px(space::LOOSE))
+                    .pt(px(space::HAIR))
+                    .pb(px(space::LOOSE))
+                    .child(body),
+            )
+        })
+        .into_any_element()
+}
+
+/// Label column, then the control — the row shape of every fold section.
+pub fn ins_form_row(label: impl Into<String>, child: impl IntoElement) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(space::BASE))
+        .min_h(px(ROW_MIN_HEIGHT))
+        .child(
+            div()
+                .w(px(FOLD_LABEL_COL))
+                .min_w(px(LABEL_COL_MIN))
+                .truncate()
+                .text_size(px(typography::UI_SM))
+                .text_color(Colors::text_muted())
+                .child(label.into()),
+        )
+        .child(div().flex_1().min_w_0().child(child))
+}
+
+/// A wide slider with its name and value on the line above it, and an
+/// optional scale under it.
+pub fn ins_slider_field(
+    label: impl Into<String>,
+    value: impl IntoElement,
+    slider: impl IntoElement,
+    scale: Option<SliderScale>,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(space::SNUG))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(px(space::BASE))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(typography::UI_SM))
+                        .text_color(Colors::text_muted())
+                        .child(label.into()),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(space::SNUG))
+                        .min_w_0()
+                        .text_size(px(typography::UI_SM))
+                        .text_color(Colors::text_primary())
+                        .child(value),
+                ),
+        )
+        .child(slider)
+        .when_some(scale, |field, scale| field.child(slider_scale(scale)))
+}
+
+/// Ticks printed under a slider: both ends, and an optional mark between
+/// them at `mark.0` (0..1 of the rail).
+#[derive(Clone, Copy)]
+pub struct SliderScale {
+    pub left: &'static str,
+    pub mark: Option<(f32, &'static str)>,
+    pub right: &'static str,
+}
+
+/// Width of the box a scale mark is centred in.
+const SCALE_MARK_W: f32 = 24.0;
+
+fn slider_scale(scale: SliderScale) -> impl IntoElement {
+    let text = |label: &'static str| {
+        div()
+            .text_size(px(typography::DENSE_LABEL))
+            .text_color(Colors::text_faint())
+            .child(label)
+    };
+    div()
+        .relative()
+        .h(px(space::LOOSE))
+        .child(div().absolute().left_0().top_0().child(text(scale.left)))
+        .children(scale.mark.map(|(at, label)| {
+            div()
+                .absolute()
+                .top_0()
+                .left(gpui::relative(at.clamp(0.0, 1.0)))
+                .ml(px(-SCALE_MARK_W / 2.0))
+                .w(px(SCALE_MARK_W))
+                .flex()
+                .justify_center()
+                .child(text(label))
+        }))
+        .child(div().absolute().right_0().top_0().child(text(scale.right)))
+}
+
+/// One of the four track switches (M / S / I / R), as an equal-width tile
+/// carrying its letter and its word.
+///
+/// Lit in the switch's own semantic hue — the same one the mixer and the
+/// track header use — and bordered in it too, so a lit tile is told apart by
+/// fill and edge rather than by hue alone.
+pub fn ins_state_tile(
+    id: impl Into<gpui::ElementId>,
+    letter: &'static str,
+    word: impl Into<String>,
+    on: bool,
+    semantic: gpui::Rgba,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let fill = if on {
+        semantic
+    } else {
+        Colors::surface_input()
+    };
+    let hover = Colors::composite(fill, Colors::state_hover());
+    let pressed = Colors::composite(fill, Colors::state_recessed());
+    div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .flex_1()
+        .min_w_0()
+        .items_center()
+        .justify_center()
+        .gap(px(space::SNUG))
+        .h(px(size::COMFORTABLE))
+        .rounded(px(radius::CONTROL))
+        .bg(fill)
+        .border(px(1.0))
+        .border_color(if on {
+            semantic
+        } else {
+            Colors::border_normal()
+        })
+        .text_color(if on {
+            Colors::on_color(semantic)
+        } else {
+            Colors::text_secondary()
+        })
+        .cursor(gpui::CursorStyle::PointingHand)
+        .hover(move |style| style.bg(hover))
+        .active(move |style| style.bg(pressed))
+        .on_click(on_click)
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_size(px(typography::UI_SM))
+                .font_weight(gpui::FontWeight::BOLD)
+                .child(letter),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .text_size(px(typography::DENSE_LABEL))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .child(word.into()),
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

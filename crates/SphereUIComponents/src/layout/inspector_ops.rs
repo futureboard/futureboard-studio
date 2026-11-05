@@ -525,6 +525,19 @@ impl StudioLayout {
             on_open_soundfont_player,
             open_routing_combo,
             on_toggle_routing_combo,
+            folded_sections: Arc::new(self.inspector_folded.clone()),
+            on_toggle_section: {
+                let owner = owner.clone();
+                Arc::new(move |key: &str, _w, cx| {
+                    let key = key.to_string();
+                    StudioLayout::defer_update(&owner, cx, move |this, cx| {
+                        if !this.inspector_folded.remove(&key) {
+                            this.inspector_folded.insert(key);
+                        }
+                        cx.notify();
+                    });
+                })
+            },
         }
     }
 

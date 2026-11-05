@@ -72,6 +72,9 @@ pub mod typography {
     pub const UI_MD: f32 = 13.0;
     /// Semibold section / panel titles.
     pub const UI_TITLE: f32 = 13.0;
+    /// The name of the object a panel inspects (the Inspector's track or clip
+    /// name) — the one line in a panel that reads before everything else.
+    pub const UI_LG: f32 = 16.0;
     /// Dense captions used only where 11 px cannot fit without increasing a
     /// compact control's height (meter legends, narrow strip metadata).
     pub const DENSE_CAPTION: f32 = 9.5;

@@ -804,7 +804,101 @@ pub fn color_picker_field(
 ) -> impl IntoElement {
     let value = state.value();
     let trigger = color_picker_trigger(id, value, state.open, callbacks.on_toggle.clone());
+    with_color_popover(
+        trigger.into_any_element(),
+        state,
+        presets,
+        allow_auto,
+        placement,
+        hex_focused,
+        hex_field_callbacks,
+        callbacks,
+    )
+}
 
+/// [`color_picker_field`] whose trigger is the colour itself: a square swatch
+/// of `edge` px, for an identity header where the colour stands for the
+/// object (the Inspector's track colour). `glyph` is drawn on the swatch in
+/// the colour's own contrast tone — what kind of object it is. Same popover,
+/// same state.
+#[allow(clippy::too_many_arguments)]
+pub fn color_picker_swatch_field(
+    id: impl Into<gpui::ElementId>,
+    edge: f32,
+    glyph: Option<&'static str>,
+    state: &ColorPickerState,
+    presets: &[Rgba],
+    placement: ColorPickerPlacement,
+    hex_focused: bool,
+    hex_field_callbacks: TextInputCallbacks,
+    callbacks: ColorPickerCallbacks,
+) -> impl IntoElement {
+    let value = state.value();
+    let color = value
+        .color
+        .unwrap_or_else(|| color::auto_color_for_index(0));
+    let on_toggle = callbacks.on_toggle.clone();
+    let hover = Colors::composite(color, Colors::state_hover());
+    let trigger = div()
+        .id(id.into())
+        .w(px(edge))
+        .h(px(edge))
+        .flex_shrink_0()
+        .rounded(px(crate::theme::radius::CONTROL))
+        .border(px(1.0))
+        .border_color(if state.open {
+            Colors::border_focus()
+        } else {
+            Colors::border_normal()
+        })
+        .bg(color)
+        .flex()
+        .items_center()
+        .justify_center()
+        .children(glyph.map(|glyph| {
+            svg()
+                .path(glyph)
+                .w(px(edge * SWATCH_GLYPH_RATIO))
+                .h(px(edge * SWATCH_GLYPH_RATIO))
+                .text_color(Colors::on_color(color))
+        }))
+        .cursor(gpui::CursorStyle::PointingHand)
+        .hover(move |s| s.bg(hover))
+        .tooltip(crate::components::controls::fb_tooltip(format!(
+            "Track colour {}",
+            rgba_to_hex(color)
+        )))
+        .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
+            cx.stop_propagation();
+            on_toggle(window, cx);
+            window.prevent_default();
+        });
+    with_color_popover(
+        trigger.into_any_element(),
+        state,
+        presets,
+        false,
+        placement,
+        hex_focused,
+        hex_field_callbacks,
+        callbacks,
+    )
+}
+
+/// A swatch glyph's edge as a share of the swatch's.
+pub const SWATCH_GLYPH_RATIO: f32 = 0.55;
+
+#[allow(clippy::too_many_arguments)]
+fn with_color_popover(
+    trigger: gpui::AnyElement,
+    state: &ColorPickerState,
+    presets: &[Rgba],
+    allow_auto: bool,
+    placement: ColorPickerPlacement,
+    hex_focused: bool,
+    hex_field_callbacks: TextInputCallbacks,
+    callbacks: ColorPickerCallbacks,
+) -> impl IntoElement {
     div()
         .relative()
         .child(trigger)

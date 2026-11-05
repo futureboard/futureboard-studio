@@ -21,7 +21,7 @@ use gpui::{
 use crate::assets;
 use crate::audio_connections::AudioConnectionRegistry;
 use crate::components::color_picker::{
-    color_picker_field, default_presets, ColorPickerCallbacks, ColorPickerPlacement,
+    color_picker_swatch_field, default_presets, ColorPickerCallbacks, ColorPickerPlacement,
     ColorPickerState,
 };
 use crate::components::combo_box::{combo_box_string_menu, combo_box_trigger};
@@ -229,6 +229,74 @@ pub struct InspectorCallbacks {
     pub on_open_soundfont_player: StrCb,
     pub open_routing_combo: Option<InspectorRoutingCombo>,
     pub on_toggle_routing_combo: RoutingComboToggleCb,
+    /// Fold sections the user has folded, by key (`"routing"`,
+    /// `"clip:Source"`, …). Owned by the layout; every other section is open.
+    pub folded_sections: Arc<std::collections::HashSet<String>>,
+    /// Fold or unfold the section with this key.
+    pub on_toggle_section: Arc<dyn Fn(&str, &mut Window, &mut App) + 'static>,
+}
+
+#[cfg(feature = "ui-preview")]
+impl InspectorCallbacks {
+    /// Callbacks that do nothing, for the preview renderer. `folded` names
+    /// the sections drawn folded.
+    pub fn preview_noop(folded: &[&str]) -> Self {
+        fn noop<T: ?Sized + 'static>() -> Arc<dyn Fn(&T, &mut Window, &mut App) + 'static> {
+            Arc::new(|_, _, _| {})
+        }
+        Self {
+            on_volume: noop(),
+            on_volume_drag_start: noop(),
+            on_volume_drag_preview: noop(),
+            on_volume_drag_commit: noop(),
+            on_toggle_volume_automation_read: noop(),
+            on_pan: noop(),
+            on_pan_drag_start: noop(),
+            on_pan_drag_preview: noop(),
+            on_pan_drag_commit: noop(),
+            on_spatial_drag_start: noop(),
+            on_spatial_drag_preview: noop(),
+            on_spatial_drag_commit: noop(),
+            on_toggle_mute: noop(),
+            on_toggle_solo: noop(),
+            on_toggle_arm: noop(),
+            on_toggle_input: noop(),
+            on_set_input_routing: noop(),
+            on_set_output_routing: noop(),
+            on_set_audio_format: noop(),
+            on_set_midi_input: noop(),
+            on_set_midi_channel: noop(),
+            on_set_mpe_configuration: noop(),
+            on_set_program_selection: noop(),
+            on_open_insert_picker: noop(),
+            on_remove_insert: noop(),
+            on_toggle_insert_bypass: noop(),
+            on_toggle_insert_enabled: noop(),
+            on_toggle_insert_output_channel: noop(),
+            on_drop_insert: noop(),
+            on_open_insert_editor: noop(),
+            on_set_clip_start: noop(),
+            on_set_clip_length: noop(),
+            on_set_clip_gain: noop(),
+            on_set_clip_muted: noop(),
+            on_set_clip_stretch: noop(),
+            on_preview_clip_stretch: noop(),
+            on_begin_clip_property_drag: noop(),
+            on_commit_clip_property_drag: noop(),
+            on_preview_clip_start: noop(),
+            on_preview_clip_length: noop(),
+            on_preview_clip_gain: noop(),
+            on_clip_stretch_auto_find_bpm: noop(),
+            on_clip_warp_clear: noop(),
+            on_open_clip_bottom_editor: noop(),
+            on_open_clip_external_midi_editor: noop(),
+            on_open_soundfont_player: noop(),
+            open_routing_combo: None,
+            on_toggle_routing_combo: Arc::new(|_, _, _, _| {}),
+            folded_sections: Arc::new(folded.iter().map(|key| key.to_string()).collect()),
+            on_toggle_section: Arc::new(|_, _, _| {}),
+        }
+    }
 }
 
 /// Width of the docked Inspector column. Mirrors the constant in
@@ -344,6 +412,20 @@ fn track_type_badge(t: TrackType) -> &'static str {
         TrackType::Group => "Group",
         TrackType::Master => "Master",
         TrackType::Video => "Video Track",
+    }
+}
+
+/// The glyph a track's kind wears — the same one Add Track offers it under.
+fn track_type_icon(t: TrackType) -> &'static str {
+    match t {
+        TrackType::Audio => assets::ICON_MIC_PATH,
+        TrackType::Instrument => assets::ICON_CPU_PATH,
+        TrackType::Midi => assets::ICON_MUSIC_PATH,
+        TrackType::Bus => assets::ICON_GIT_MERGE_PATH,
+        TrackType::Return => assets::ICON_CORNER_DOWN_LEFT_PATH,
+        TrackType::Group => assets::ICON_GIT_FORK_PATH,
+        TrackType::Master => assets::ICON_VOLUME_2_PATH,
+        TrackType::Video => assets::ICON_FILM_PATH,
     }
 }
 
@@ -470,23 +552,26 @@ fn inspector_shell(_active: bool, i18n: I18n) -> gpui::Div {
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(7.0))
-                .h(px(32.0))
-                .px(px(10.0))
+                .gap(px(space::BASE))
+                .h(px(crate::theme::size::PROMINENT))
+                .px(px(space::LOOSE))
                 .border_b(px(1.0))
                 .border_color(Colors::border_subtle())
                 .child(
                     svg()
                         .path(assets::ICON_SLIDERS_HORIZONTAL_PATH)
-                        .w(px(13.0))
-                        .h(px(13.0))
+                        .w(px(inspector_kit::ICON))
+                        .h(px(inspector_kit::ICON))
                         .text_color(Colors::text_muted()),
                 )
                 .child(
                     div()
-                        .text_color(Colors::tab_text())
-                        .text_size(px(typography::DENSE_LABEL))
-                        .font_weight(gpui::FontWeight::BOLD)
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(Colors::text_secondary())
+                        .text_size(px(typography::UI_SM))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
                         .child(i18n.tr("panel.inspector")),
                 )
                 .child(fb_shortcut_hint(crate::keymap::accel_display("Ctrl+2"))),
@@ -653,11 +738,160 @@ fn format_pan(i18n: I18n, pan: f32) -> String {
 fn section_card(
     id: &'static str,
     title: impl Into<String>,
-    _callbacks: &InspectorCallbacks,
+    summary: impl Into<String>,
+    callbacks: &InspectorCallbacks,
     body: impl IntoElement,
+) -> gpui::AnyElement {
+    fold_section(
+        id.to_string(),
+        section_icon(id),
+        title,
+        summary,
+        callbacks,
+        body,
+    )
+}
+
+/// The glyph a track section carries in its header.
+fn section_icon(id: &str) -> Option<&'static str> {
+    Some(match id {
+        "track" => assets::ICON_VOLUME_2_PATH,
+        "spatial" => assets::ICON_AUDIO_LINES_PATH,
+        "routing" => assets::ICON_ROUTE_PATH,
+        "program" => assets::ICON_LIST_MUSIC_PATH,
+        "mpe" => assets::ICON_LAYERS_PATH,
+        "instrument" => assets::ICON_KEYBOARD_PATH,
+        "inserts" => assets::ICON_PLUG_PATH,
+        _ => return None,
+    })
+}
+
+/// One fold section of the Inspector, open unless the user folded it.
+///
+/// The fold is view state keyed by `key`, so a section stays folded as the
+/// selection moves between tracks — what the user put away stays away.
+fn fold_section(
+    key: String,
+    icon: Option<&'static str>,
+    title: impl Into<String>,
+    summary: impl Into<String>,
+    callbacks: &InspectorCallbacks,
+    body: impl IntoElement,
+) -> gpui::AnyElement {
+    let open = !callbacks.folded_sections.contains(&key);
+    let toggle = callbacks.on_toggle_section.clone();
+    let id = gpui::SharedString::from(format!("inspector-fold-{key}"));
+    inspector_kit::ins_fold(
+        id,
+        icon,
+        title,
+        summary,
+        open,
+        move |window, cx| toggle(&key, window, cx),
+        body,
+    )
+}
+
+/// The Inspector's scroll body for the track and clip views.
+fn flat_body() -> gpui::Stateful<gpui::Div> {
+    inspector_kit::ins_flat_body("inspector-scroll")
+}
+
+/// The identity block's text column: the name (or its rename field) over
+/// what kind of object it is.
+fn identity_text(name: gpui::AnyElement, subtitle: String) -> impl IntoElement {
+    div()
+        .flex_1()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap(px(space::HAIR))
+        .child(name)
+        .when(!subtitle.is_empty(), |col| {
+            col.child(
+                div()
+                    .truncate()
+                    .text_size(px(typography::UI_SM))
+                    .text_color(Colors::text_muted())
+                    .child(subtitle),
+            )
+        })
+}
+
+fn identity_name(name: impl Into<String>) -> gpui::Div {
+    div()
+        .w_full()
+        .min_w_0()
+        .truncate()
+        .text_size(px(typography::UI_LG))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(Colors::text_primary())
+        .child(name.into())
+}
+
+/// A clip's identity block: its kind's colour, its name, where it lives.
+fn clip_identity(
+    accent: gpui::Rgba,
+    glyph: &'static str,
+    name: String,
+    subtitle: String,
 ) -> impl IntoElement {
-    let _ = id;
-    inspector_kit::ins_card(title, body)
+    inspector_kit::ins_identity_block().child(
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(space::BASE))
+            .child(
+                div()
+                    .w(px(inspector_kit::IDENTITY_SWATCH))
+                    .h(px(inspector_kit::IDENTITY_SWATCH))
+                    .flex_shrink_0()
+                    .rounded(px(crate::theme::radius::CONTROL))
+                    .border(px(1.0))
+                    .border_color(Colors::border_normal())
+                    .bg(accent)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        svg()
+                            .path(glyph)
+                            .w(px(inspector_kit::IDENTITY_SWATCH
+                                * crate::components::color_picker::SWATCH_GLYPH_RATIO))
+                            .h(px(inspector_kit::IDENTITY_SWATCH
+                                * crate::components::color_picker::SWATCH_GLYPH_RATIO))
+                            .text_color(Colors::on_color(accent)),
+                    ),
+            )
+            .child(identity_text(
+                identity_name(name).into_any_element(),
+                subtitle,
+            )),
+    )
+}
+
+/// What the instrument slot holds, by the name the Inspector shows for it.
+/// `None` on a track that cannot hold an instrument.
+fn instrument_name(track: &TrackState) -> Option<String> {
+    if track.track_type != TrackType::Instrument {
+        return None;
+    }
+    let slot = track.instrument_insert();
+    Some(if track.solfege.is_some() {
+        "Solfege Engine".to_string()
+    } else if slot.is_none() && track.builtin_soundfont_player {
+        match track.soundfont_mode {
+            crate::soundfont_player::SoundfontPlayerMode::Multi => {
+                "Built-in Soundfont Multi · 16 channels".to_string()
+            }
+            crate::soundfont_player::SoundfontPlayerMode::Single => {
+                "Built-in Soundfont Player".to_string()
+            }
+        }
+    } else {
+        plugin_slot_name(slot, "No Instrument")
+    })
 }
 
 /// A stack of rows, for a card body built up one child at a time.
@@ -680,15 +914,17 @@ pub struct InspectorColorPicker<'a> {
     pub callbacks: ColorPickerCallbacks,
 }
 
-fn color_field(picker: &InspectorColorPicker<'_>) -> impl IntoElement {
-    color_picker_field(
+/// The identity block's swatch. Auto Colour is an Add Track concern: an
+/// existing track always has a concrete stored colour, and offering "Auto"
+/// here would have to mean "recolour by index", which `set_track_color` does
+/// not do — so the swatch field offers none.
+fn color_swatch(picker: &InspectorColorPicker<'_>, track_type: TrackType) -> impl IntoElement {
+    color_picker_swatch_field(
         "inspector-color-picker",
+        inspector_kit::IDENTITY_SWATCH,
+        Some(track_type_icon(track_type)),
         picker.state,
         &default_presets(),
-        // Auto Colour is an Add Track concern: an existing track always has a
-        // concrete stored colour, and offering "Auto" here would have to mean
-        // "recolour by index", which `set_track_color` does not do.
-        false,
         ColorPickerPlacement::Below,
         picker.hex_focused,
         picker.hex_callbacks.clone(),
@@ -1481,6 +1717,22 @@ fn routing_section(
     callbacks: &InspectorCallbacks,
 ) -> impl IntoElement {
     let mut rows = section_rows();
+    let output_label =
+        || audio_output_combo_label(&track.routing.output, track.routing.audio_format);
+    let summary = match track.track_type {
+        TrackType::Audio => format!(
+            "{} · {}",
+            audio_input_combo_label(track, connections),
+            output_label()
+        ),
+        TrackType::Instrument => format!("{midi_input_label} · {}", output_label()),
+        TrackType::Midi => format!(
+            "{midi_input_label} · {}",
+            midi_output_combo_label(&track.routing.output, instrument_targets)
+        ),
+        TrackType::Video => String::new(),
+        _ => output_label(),
+    };
 
     match track.track_type {
         TrackType::Audio => {
@@ -1526,7 +1778,7 @@ fn routing_section(
         TrackType::Video => {}
     }
 
-    section_card("routing", "Routing", callbacks, rows)
+    section_card("routing", "Routing", summary, callbacks, rows)
 }
 
 const PATCH_FORMAT_OPTIONS: &[InspectorSelectOption<MidiPatchFormat>] = &[
@@ -1670,7 +1922,7 @@ fn program_section(track: &TrackState, callbacks: &InspectorCallbacks) -> impl I
         "Program",
         combo(
             "inspector-program-combo",
-            program_label,
+            program_label.clone(),
             InspectorRoutingCombo::Program,
         ),
     ));
@@ -1683,9 +1935,21 @@ fn program_section(track: &TrackState, callbacks: &InspectorCallbacks) -> impl I
             format!("Bank Select (CC 0, CC 32), then Program Change, on channel {channel}.")
         }
     };
+    let summary = match selection.program {
+        None => "Off".to_string(),
+        Some(_) => {
+            let format = PATCH_FORMAT_OPTIONS
+                .iter()
+                .find(|option| option.value == selection.format)
+                .map(|option| option.label)
+                .unwrap_or("GM");
+            format!("{format} · {program_label}")
+        }
+    };
     section_card(
         "program",
-        "Program",
+        "Program change",
+        summary,
         callbacks,
         rows.child(inspector_hint_text(hint)),
     )
@@ -1793,9 +2057,15 @@ fn mpe_section(track: &TrackState, callbacks: &InspectorCallbacks) -> impl IntoE
         MpeOutputMode::Upper => "All notes use Upper Zone member channels 1–15.",
     };
 
+    let summary = MPE_MODE_OPTIONS
+        .iter()
+        .find(|option| option.value == config.mode)
+        .map(|option| option.label)
+        .unwrap_or("Off");
     section_card(
         "mpe",
         "MPE",
+        summary,
         callbacks,
         section_rows()
             .child(field_row("Mode", mode))
@@ -1928,7 +2198,7 @@ fn plugin_slot_row(
         plugin_state_label(slot)
     );
 
-    let rest = Colors::composite(Colors::surface_card(), Colors::state_recessed());
+    let rest = Colors::surface_input();
     let hover = Colors::composite(rest, Colors::state_hover());
 
     // The row's look. The interactive element around it is transparent and
@@ -1943,6 +2213,8 @@ fn plugin_slot_row(
         .px(px(space::SNUG))
         .rounded(px(crate::theme::radius::CONTROL))
         .bg(rest)
+        .border(px(1.0))
+        .border_color(Colors::border_normal())
         .hover(move |style| style.bg(hover))
         .cursor(gpui::CursorStyle::PointingHand)
         // Bypass. A power symbol, not a word: it is the one control on the row
@@ -2065,19 +2337,12 @@ fn slot_icon_button(
 
 fn instrument_section(track: &TrackState, callbacks: &InspectorCallbacks) -> gpui::AnyElement {
     let slot = track.instrument_insert();
-    let slot_name = if track.solfege.is_some() {
-        "Solfege Engine".to_string()
-    } else if slot.is_none() && track.builtin_soundfont_player {
-        match track.soundfont_mode {
-            crate::soundfont_player::SoundfontPlayerMode::Multi => {
-                "Built-in Soundfont Multi · 16 channels".to_string()
-            }
-            crate::soundfont_player::SoundfontPlayerMode::Single => {
-                "Built-in Soundfont Player".to_string()
-            }
-        }
-    } else {
-        plugin_slot_name(slot, "No Instrument")
+    let slot_name = instrument_name(track).unwrap_or_default();
+    let summary = match slot {
+        Some(slot) if slot.bypassed || !slot.enabled => format!("{slot_name} (off)"),
+        Some(_) => slot_name.clone(),
+        None if track.solfege.is_some() || track.builtin_soundfont_player => slot_name.clone(),
+        None => "Empty".to_string(),
     };
     let mut section = section_rows();
     if let Some(slot) = slot {
@@ -2106,15 +2371,19 @@ fn instrument_section(track: &TrackState, callbacks: &InspectorCallbacks) -> gpu
     } else {
         let track_id = track.id.clone();
         let picker = callbacks.on_open_insert_picker.clone();
-        section = section.child(compact_action_button(
-            "instrument-add",
-            "Add Instrument",
-            true,
-            move |_, w, cx| picker(&(track_id.clone(), 0, true), w, cx),
-        ));
+        section = section
+            .child(inspector_hint_text(
+                "No instrument loaded, so this track makes no sound when it plays MIDI.",
+            ))
+            .child(compact_action_button(
+                "instrument-add",
+                "Add Instrument",
+                true,
+                move |_, w, cx| picker(&(track_id.clone(), 0, true), w, cx),
+            ));
     }
 
-    section_card("instrument", "Instrument", callbacks, section).into_any_element()
+    section_card("instrument", "Instrument", summary, callbacks, section)
 }
 
 /// Dedicated right-dock panel for the native Solfege instrument. Keeping this
@@ -2536,7 +2805,9 @@ fn insert_effects_section(track: &TrackState, callbacks: &InspectorCallbacks) ->
     };
     let end_zone = div().id("fx-drop-end");
     let end_zone = if effects.is_empty() {
-        end_zone.child(inspector_kit::ins_value_muted("No effects"))
+        end_zone.child(inspector_hint_text(
+            "No insert effects yet. Effects process the signal in order, top to bottom.",
+        ))
     } else {
         end_zone.h(px(8.0))
     };
@@ -2550,21 +2821,50 @@ fn insert_effects_section(track: &TrackState, callbacks: &InspectorCallbacks) ->
     let track_id = track.id.clone();
     let next_slot = track.inserts.len().max(effect_start);
     let picker = callbacks.on_open_insert_picker.clone();
-    // Add Effect is the end of the chain as well.
+    // Add Effect is the end of the chain as well: a dashed slot where the
+    // next effect goes.
+    let add_hover = Colors::composite(Colors::surface_panel(), Colors::state_hover());
     let add = insert_drop_target(
-        div().id("effect-add-drop").child(compact_action_button(
-            "effect-add",
-            "Add Effect",
-            true,
-            move |_, w, cx| picker(&(track_id.clone(), next_slot, false), w, cx),
-        )),
+        div().id("effect-add-drop").child(
+            div()
+                .id("effect-add")
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_center()
+                .gap(px(space::SNUG))
+                .h(px(crate::theme::size::PROMINENT))
+                .rounded(px(crate::theme::radius::CONTROL))
+                .border(px(1.0))
+                .border_dashed()
+                .border_color(Colors::border_strong())
+                .text_size(px(typography::UI_SM))
+                .text_color(Colors::text_secondary())
+                .cursor(gpui::CursorStyle::PointingHand)
+                .hover(move |style| style.bg(add_hover))
+                .on_click(move |_, w, cx| picker(&(track_id.clone(), next_slot, false), w, cx))
+                .child(
+                    svg()
+                        .path(assets::ICON_PLUS_PATH)
+                        .w(px(inspector_kit::ICON))
+                        .h(px(inspector_kit::ICON))
+                        .text_color(Colors::text_secondary()),
+                )
+                .child("Add insert effect"),
+        ),
         InsertDropTarget::for_track(track, end, "inspector").with_key_suffix("add"),
         DropIndicator::Row { gap: 0.0 },
         callbacks.on_drop_insert.clone(),
     );
+    let summary = match effects.len() {
+        0 => "None".to_string(),
+        1 => "1 effect".to_string(),
+        n => format!("{n} effects"),
+    };
     section_card(
         "inserts",
-        "Insert Effects",
+        "Insert effects",
+        summary,
         callbacks,
         section_rows().child(chain).child(add),
     )
@@ -2592,21 +2892,28 @@ fn track_inspector(
     let placed = in_room && !matches!(track.routing.output, TrackOutputRouting::Bus { .. });
     let tid = track.id.clone();
 
-    // ── Volume slider + dB readout ──────────────────────────────────────
+    // ── Volume: name and value over a full-width slider, scale under it ──
     // When Track Volume automation is reading, the slider/readout follow the
-    // effective (automation) value and an `[A]` marker plus a separate base
+    // effective (automation) value and an `A` marker plus a separate base
     // readout make the manual value clear. Otherwise it shows the base only.
-    let volume_row = {
+    let has_volume_automation = track.has_active_volume_automation();
+    let display_vol = track.display_volume();
+    let volume_text = i18n.tr_vars(
+        "inspector.volume.db",
+        &[("db", volume::format_db(display_vol))],
+    );
+    let volume_field = {
         let start = callbacks.on_volume_drag_start.clone();
         let preview = callbacks.on_volume_drag_preview.clone();
         let commit = callbacks.on_volume_drag_commit.clone();
+        // `on_volume` records one volume edit — what a double-click reset to
+        // unity should leave in the history.
+        let reset = callbacks.on_volume.clone();
         let tid_start = tid.clone();
         let tid_preview = tid.clone();
         let tid_commit = tid.clone();
-        let has_volume_automation = track.has_active_volume_automation();
-        let automation_active = track.volume_automation_read && has_volume_automation;
-        let display_vol = track.display_volume();
-        // `[A]` automation-read toggle — only meaningful when a volume lane
+        let tid_reset = tid.clone();
+        // `A` automation-read toggle — only meaningful when a volume lane
         // exists. Lit when reading, dim when bypassed.
         let auto_toggle = has_volume_automation.then(|| {
             let read_cb = callbacks.on_toggle_volume_automation_read.clone();
@@ -2620,37 +2927,55 @@ fn track_inspector(
                 .justify_center()
                 .w(px(18.0))
                 .h(px(16.0))
-                .rounded(px(crate::theme::radius::CONTROL))
+                .rounded(px(crate::theme::radius::CONTROL_SM))
                 .border(px(1.0))
                 .border_color(if on {
-                    Colors::accent_primary()
+                    Colors::state_automation()
                 } else {
                     Colors::border_default()
                 })
                 .bg(if on {
-                    Colors::with_alpha(Colors::accent_primary(), 0.18)
+                    Colors::with_alpha(Colors::state_automation(), 0.18)
                 } else {
                     Colors::with_alpha(Colors::surface_canvas(), 0.3)
                 })
                 .text_size(px(typography::DENSE_CAPTION))
                 .font_weight(gpui::FontWeight::SEMIBOLD)
                 .text_color(if on {
-                    Colors::accent_primary()
+                    Colors::state_automation()
                 } else {
                     Colors::text_muted()
                 })
                 .cursor(gpui::CursorStyle::PointingHand)
+                .tooltip(crate::components::controls::fb_tooltip(if on {
+                    "Volume follows its automation. Click to play the base value."
+                } else {
+                    "Volume automation is off. Click to read it."
+                }))
                 .child("A")
                 .on_mouse_down(gpui::MouseButton::Left, move |_ev, w, cx| {
                     read_cb(&tid_a, w, cx)
                 })
         });
-        div()
+        let value = div()
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(8.0))
-            .child(slider_with_drag_callbacks(
+            .gap(px(space::SNUG))
+            .when(has_volume_automation, |value| {
+                value.child(
+                    div()
+                        .text_size(px(typography::UI_XS))
+                        .text_color(Colors::text_faint())
+                        .child(format!("Base {}", volume::format_db(track.volume))),
+                )
+            })
+            .child(volume_text.clone())
+            .when_some(auto_toggle, |value, toggle| value.child(toggle));
+        inspector_kit::ins_slider_field(
+            i18n.tr("inspector.field.volume"),
+            value,
+            slider_with_drag_callbacks(
                 "inspector-volume",
                 display_vol,
                 track.color,
@@ -2661,45 +2986,25 @@ fn track_inspector(
                     preview(&(tid_preview.clone(), *v), w, cx)
                 }),
                 Some(move |w: &mut Window, cx: &mut App| commit(&tid_commit, w, cx)),
-                None::<fn(&mut Window, &mut App)>,
-            ))
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .flex()
-                    .flex_col()
-                    .items_end()
-                    .min_w(px(48.0))
-                    .text_size(px(typography::DENSE_LABEL))
-                    .text_color(Colors::text_secondary())
-                    .child({
-                        let mut label = i18n.tr_vars(
-                            "inspector.volume.db",
-                            &[("db", volume::format_db(display_vol))],
-                        );
-                        if automation_active {
-                            label.push_str(" [A]");
-                        }
-                        label
-                    })
-                    .when(has_volume_automation, |this| {
-                        this.child(
-                            div()
-                                .text_size(px(8.0))
-                                .text_color(Colors::text_faint())
-                                .child(format!("Base {} dB", volume::format_db(track.volume))),
-                        )
-                    }),
-            )
-            .when_some(auto_toggle, |row, toggle| row.child(toggle))
+                Some(move |w: &mut Window, cx: &mut App| {
+                    reset(&(tid_reset.clone(), volume::db_to_norm(0.0)), w, cx)
+                }),
+            ),
+            Some(inspector_kit::SliderScale {
+                left: "-∞",
+                mark: Some((volume::db_to_norm(0.0), "0")),
+                right: "+6",
+            }),
+        )
     };
 
-    // ── Pan slider (bipolar, centre-detented) + readout ─────────────────
+    // ── Pan (bipolar, centre-detented) ──────────────────────────────────
     //
     // The value travels in real -1..1 pan units end to end: the control fills
     // outward from the rail centre, so neutral reads as an empty rail rather
     // than a half-full one, and no 0..1 remapping happens at this call site.
-    let pan_row = {
+    let pan_readout = format_pan(i18n, track.pan);
+    let pan_field = {
         let start = callbacks.on_pan_drag_start.clone();
         let preview = callbacks.on_pan_drag_preview.clone();
         let commit = callbacks.on_pan_drag_commit.clone();
@@ -2711,13 +3016,10 @@ fn track_inspector(
         let tid_preview = tid.clone();
         let tid_commit = tid.clone();
         let tid_reset = tid.clone();
-        let pan_readout = format_pan(i18n, track.pan);
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(space::BASE))
-            .child(bipolar_slider_with_drag_callbacks(
+        inspector_kit::ins_slider_field(
+            i18n.tr("inspector.field.pan"),
+            pan_readout.clone(),
+            bipolar_slider_with_drag_callbacks(
                 "inspector-pan",
                 track.pan,
                 track.color,
@@ -2728,19 +3030,9 @@ fn track_inspector(
                 }),
                 Some(move |w: &mut Window, cx: &mut App| commit(&tid_commit, w, cx)),
                 Some(move |w: &mut Window, cx: &mut App| reset(&(tid_reset.clone(), 0.0), w, cx)),
-            ))
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .flex()
-                    .justify_end()
-                    // Right-aligned on the same 48 px column as the volume
-                    // readout above, so the two numbers in this form line up.
-                    .min_w(px(48.0))
-                    .text_size(px(typography::DENSE_LABEL))
-                    .text_color(Colors::text_secondary())
-                    .child(pan_readout),
-            )
+            ),
+            None,
+        )
     };
 
     // ── M / S / I / R ───────────────────────────────────────────────────
@@ -2758,67 +3050,87 @@ fn track_inspector(
         div()
             .flex()
             .flex_row()
-            .gap(px(space::SNUG))
-            .child(inspector_kit::ins_state_button(
-                "inspector-mute".into(),
-                i18n.tr("inspector.badge.mute"),
+            .gap(px(space::TIGHT))
+            .child(inspector_kit::ins_state_tile(
+                "inspector-mute",
+                "M",
+                i18n.tr("inspector.state.mute"),
                 track.muted,
                 Colors::state_mute(),
                 move |_, w, cx| mute(&t1, w, cx),
             ))
-            .child(inspector_kit::ins_state_button(
-                "inspector-solo".into(),
-                i18n.tr("inspector.badge.solo"),
+            .child(inspector_kit::ins_state_tile(
+                "inspector-solo",
+                "S",
+                i18n.tr("inspector.state.solo"),
                 track.solo,
                 Colors::state_solo(),
                 move |_, w, cx| solo(&t2, w, cx),
             ))
-            .child(inspector_kit::ins_state_button(
-                "inspector-input".into(),
-                i18n.tr("inspector.badge.input"),
+            .child(inspector_kit::ins_state_tile(
+                "inspector-input",
+                "I",
+                i18n.tr("inspector.state.input"),
                 track.input_monitor.is_active(track.armed),
                 Colors::state_monitor(),
                 move |_, w, cx| input(&t4, w, cx),
             ))
-            .child(inspector_kit::ins_state_button(
-                "inspector-arm".into(),
-                i18n.tr("inspector.badge.record"),
+            .child(inspector_kit::ins_state_tile(
+                "inspector-arm",
+                "R",
+                i18n.tr("inspector.state.record"),
                 track.armed,
                 Colors::state_arm(),
                 move |_, w, cx| arm(&t3, w, cx),
             ))
     };
 
+    // ── Identity: colour swatch, name (click to rename), kind ───────────
     let type_label = track_type_label(i18n, track.track_type);
-    scroll_body()
-        // Who this is — the track's own colour, its name, its kind — and the
-        // four switches it is played with, before any section.
+    let subtitle = match instrument_name(track) {
+        Some(name) => format!("{type_label} · {name}"),
+        None => type_label,
+    };
+    let name: gpui::AnyElement = if name_focused {
+        text_field_with_callbacks(name_input, name_focused, name_callbacks).into_any_element()
+    } else {
+        let focus = name_input.focus_handle.clone();
+        identity_name(track.name.clone())
+            .id("inspector-track-name")
+            .cursor(gpui::CursorStyle::IBeam)
+            .tooltip(crate::components::controls::fb_tooltip("Rename track"))
+            .on_click(move |_, window, cx| focus.focus(window, cx))
+            .into_any_element()
+    };
+    let identity = inspector_kit::ins_identity_block()
         .child(
             div()
                 .flex()
-                .flex_col()
+                .flex_row()
+                .items_center()
                 .gap(px(space::BASE))
-                .child(inspector_kit::ins_identity(
-                    track.color,
-                    track.name.clone(),
-                    type_label,
-                ))
-                .child(state_row),
+                .child(color_swatch(color_picker, track.track_type))
+                .child(identity_text(name, subtitle)),
         )
+        .child(state_row);
+
+    let pan_summary = if placed {
+        "Room".to_string()
+    } else {
+        pan_readout
+    };
+    flat_body()
+        .child(identity)
         .child(section_card(
             "track",
-            &i18n.tr("inspector.section.track"),
+            i18n.tr("inspector.section.track"),
+            format!("{volume_text} · {pan_summary}"),
             callbacks,
             section_rows()
-                .child(field_row(
-                    "Name",
-                    text_field_with_callbacks(name_input, name_focused, name_callbacks),
-                ))
-                .child(field_row(i18n.tr("inspector.field.volume"), volume_row))
-                .when(!placed, |rows| {
-                    rows.child(field_row(i18n.tr("inspector.field.pan"), pan_row))
-                })
-                .child(field_row("Color", color_field(color_picker))),
+                .gap(px(space::LOOSE))
+                .child(volume_field)
+                .when(!placed, |rows| rows.child(pan_field))
+                .child(inspector_hint_text("Double-click a slider to reset it.")),
         ))
         .when(in_room, |this| {
             this.child(spatial_section(track, spatial_format, placed, callbacks))
@@ -2862,6 +3174,7 @@ fn spatial_section(
         return section_card(
             "spatial",
             title,
+            "Bus",
             callbacks,
             section_rows().child(inspector_hint_text(
                 "Sent to a bus: the bus is placed in the room, not this channel.",
@@ -2893,6 +3206,7 @@ fn spatial_section(
     section_card(
         "spatial",
         title,
+        "",
         callbacks,
         section_rows()
             .child(field_row(
@@ -3042,18 +3356,24 @@ fn spatial_slider(
 /// Same card as a track's, minus the fold: a clip inspector is three short
 /// sections that all fit at once, so a switch on each would be a control with
 /// nothing to gain by pressing it.
-fn inspector_section(label: impl Into<String>, child: impl IntoElement) -> impl IntoElement {
-    inspector_kit::ins_card(label, child)
+/// A clip-inspector fold section, keyed by its title.
+fn inspector_section(
+    callbacks: &InspectorCallbacks,
+    label: impl Into<String>,
+    child: impl IntoElement,
+) -> gpui::AnyElement {
+    let label = label.into();
+    fold_section(format!("clip:{label}"), None, label, "", callbacks, child)
 }
 
 fn compact_property_row(label: impl Into<String>, child: impl IntoElement) -> impl IntoElement {
-    inspector_kit::ins_row(label, child)
+    inspector_kit::ins_form_row(label, child)
 }
 
 /// Label on the left, control on the right — the one row shape every section
 /// of this panel uses.
 fn field_row(label: impl Into<String>, child: impl IntoElement) -> impl IntoElement {
-    inspector_kit::ins_row(label, child)
+    inspector_kit::ins_form_row(label, child)
 }
 
 fn readonly_value(text: impl Into<String>) -> impl IntoElement {
@@ -3825,13 +4145,15 @@ fn clip_inspector(
             n.dirty = true;
             n
         };
-        let mut body = scroll_body()
-            .child(inspector_kit::ins_identity(
+        let mut body = flat_body()
+            .child(clip_identity(
                 Colors::track_audio(),
+                assets::ICON_AUDIO_LINES_PATH,
                 clip.name.to_string(),
                 format!("Audio clip · {}", clip.track_name),
             ))
             .child(inspector_section(
+                callbacks,
                 i18n.tr("inspector.section.clip"),
                 section_rows()
                     .child(compact_property_row(
@@ -3870,6 +4192,7 @@ fn clip_inspector(
                     )),
             ))
             .child(inspector_section(
+                callbacks,
                 "Audio",
                 section_rows()
                     .child(compact_property_row(
@@ -3930,10 +4253,12 @@ fn clip_inspector(
                     })),
             ))
             .child(inspector_section(
+                callbacks,
                 "Time & Pitch",
                 stretch_section_body(&clip, s, clip.project_bpm, &tempo, &stretch_cb, callbacks),
             ))
             .child(inspector_section(
+                callbacks,
                 "Source",
                 section_rows()
                     .child(compact_property_row("File", truncate_value(file_name)))
@@ -3949,6 +4274,7 @@ fn clip_inspector(
 
         if std::env::var_os("FUTUREBOARD_INSPECTOR_DEBUG").is_some() {
             body = body.child(inspector_section(
+                callbacks,
                 "DEBUG",
                 div()
                     .flex()
@@ -3963,18 +4289,37 @@ fn clip_inspector(
 
     let muted_id = clip.clip_id.to_string();
     let mute_cb = callbacks.on_set_clip_muted.clone();
-    let (accent, kind_label) = match clip.kind {
-        "MIDI" => (Colors::track_midi(), i18n.tr("inspector.clip.type.midi")),
-        "Audio" => (Colors::track_audio(), i18n.tr("inspector.clip.type.audio")),
-        other => (Colors::text_muted(), other.to_string()),
+    let (accent, glyph, kind_label) = match clip.kind {
+        "MIDI" => (
+            Colors::track_midi(),
+            assets::ICON_MUSIC_PATH,
+            i18n.tr("inspector.clip.type.midi"),
+        ),
+        "Audio" => (
+            Colors::track_audio(),
+            assets::ICON_AUDIO_LINES_PATH,
+            i18n.tr("inspector.clip.type.audio"),
+        ),
+        "Video" => (
+            Colors::text_muted(),
+            assets::ICON_FILM_PATH,
+            "Video".to_string(),
+        ),
+        other => (
+            Colors::text_muted(),
+            assets::ICON_LAYERS_PATH,
+            other.to_string(),
+        ),
     };
-    let mut body = scroll_body()
-        .child(inspector_kit::ins_identity(
+    let mut body = flat_body()
+        .child(clip_identity(
             accent,
+            glyph,
             clip.name.to_string(),
             format!("{kind_label} · {}", clip.track_name),
         ))
         .child(inspector_section(
+            callbacks,
             i18n.tr("inspector.section.clip"),
             section_rows()
                 .child(field_row(
@@ -4022,6 +4367,7 @@ fn clip_inspector(
     if clip.kind == "MIDI" {
         let bottom_id = clip_id.clone();
         body = body.child(inspector_section(
+            callbacks,
             "Notes",
             section_rows()
                 .child(kv_row(
@@ -4050,6 +4396,7 @@ fn clip_inspector(
         ));
     } else {
         body = body.child(inspector_section(
+            callbacks,
             "Source",
             section_rows()
                 .child(kv_row(

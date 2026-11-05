@@ -578,6 +578,9 @@ pub struct StudioLayout {
     /// are currently bound to. Grouped into
     /// [`input_ops::InspectorNameEditState`] (decomposition slice).
     inspector_name_edit: input_ops::InspectorNameEditState,
+    /// Inspector fold sections the user folded, by section key. View state
+    /// only: it is not saved with the project and never marks it dirty.
+    inspector_folded: std::collections::HashSet<String>,
     /// UI-only selected plugin insert `(track_id, insert_id)` driving the
     /// Plugin Insert inspector target. Pure selection — never marks dirty.
     selected_insert: Option<(String, String)>,
@@ -1470,6 +1473,7 @@ impl StudioLayout {
             mixer_tree_filter_input: TextInputState::new("mixer-tree-filter", cx.focus_handle())
                 .with_placeholder("Filter channels…"),
             inspector_name_edit: input_ops::InspectorNameEditState::new(cx),
+            inspector_folded: std::collections::HashSet::new(),
             selected_insert: None,
             plugin_picker: PluginPickerState::closed(),
             plugin_picker_search_input: TextInputState::new(
