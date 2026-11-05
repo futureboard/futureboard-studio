@@ -1356,7 +1356,10 @@ impl PianoRoll {
                         return;
                     }
                     if let Some((lx, ly)) = this.cc_local(ev.position) {
-                        this.open_cc_curve_menu = Some((lx, ly));
+                        let click_beat = this.x_to_clip_beat(lx);
+                        if !this.open_native_cc_curve_menu(click_beat, window, cx) {
+                            this.open_cc_curve_menu = Some((lx, ly));
+                        }
                         cx.notify();
                     }
                 }),

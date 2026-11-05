@@ -197,6 +197,37 @@ pub fn menu_bar(
     bar
 }
 
+/// The overflow picker as a native popup menu: one submenu per menu that did
+/// not fit on the bar, holding that menu's items. `prepare` gives each menu
+/// its runtime state (checkmarks, enabled, undo detail) as the dropdown of an
+/// open menu gets it.
+pub fn native_menu_picker(
+    anchor: OverlayAnchor,
+    viewport_width: f32,
+    prepare: impl Fn(&crate::menu::Menu) -> crate::menu::Menu,
+    on_command: crate::components::menu_dropdown::CommandCb,
+    on_close: crate::components::menu_dropdown::CloseCb,
+    i18n: I18n,
+) -> gpui::AnyElement {
+    let manifest = MenuManifest::load();
+    let overflow = overflow_menu_range(menu_bar_available_width(viewport_width), i18n);
+    let items = manifest.menus[overflow]
+        .iter()
+        .map(|menu| crate::native_popup_menu::PopupItem::Submenu {
+            label: i18n.tr_menu(&menu.id, &menu.label),
+            enabled: true,
+            items: crate::components::menu_dropdown::popup_items(&prepare(menu).items, i18n),
+        })
+        .collect();
+    crate::components::menu_dropdown::native_menu_element(
+        anchor.bounds.bottom_left(),
+        Some(anchor.bounds),
+        items,
+        on_command,
+        on_close,
+    )
+}
+
 /// Overflow panel: the menu titles that did not fit on the bar.
 ///
 /// The same rows the compact hamburger used to list, but only the ones that

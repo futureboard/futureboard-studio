@@ -53,7 +53,142 @@ pub type ToggleSubmenuCb = Arc<dyn Fn(&(usize, String), &mut Window, &mut App) +
 /// top level — i.e. `submenu_path[0]` is the id of the submenu open in the
 /// root panel, `submenu_path[1]` the id of the submenu open in *that*
 /// panel, etc.
+///
+/// Where the platform has native popup menus
+/// ([`crate::native_popup_menu::available`]) the dropdown is the system's,
+/// dropping from the label (`anchor`); submenus are native too, so
+/// `submenu_path` and `on_toggle_submenu` go unused. `on_close` runs once the
+/// menu closes, after `on_command` for a choice.
+#[allow(clippy::too_many_arguments)]
 pub fn menu_dropdown(
+    menu: &Menu,
+    anchor: OverlayAnchor,
+    viewport_width: f32,
+    viewport_height: f32,
+    submenu_path: &[String],
+    on_toggle_submenu: ToggleSubmenuCb,
+    on_command: CommandCb,
+    on_close: CloseCb,
+    i18n: I18n,
+) -> gpui::AnyElement {
+    if crate::native_popup_menu::available() {
+        return native_dropdown(menu, anchor, on_command, on_close, i18n);
+    }
+    drawn_dropdown(
+        menu,
+        anchor,
+        viewport_width,
+        viewport_height,
+        submenu_path,
+        on_toggle_submenu,
+        on_command,
+        on_close,
+        i18n,
+    )
+    .into_any_element()
+}
+
+/// The manifest's `items` as native popup rows: labels translated, live
+/// shortcuts, checkmarks and enabled state as patched for this render.
+pub fn popup_items(items: &[MenuItem], i18n: I18n) -> Vec<crate::native_popup_menu::PopupItem> {
+    use crate::native_popup_menu::PopupItem;
+    items
+        .iter()
+        .filter(|item| item.visible)
+        .map(|item| {
+            let label = i18n.tr_menu(&item.id, item.label.as_deref().unwrap_or(""));
+            match item.kind {
+                MenuItemKind::Separator => PopupItem::Separator,
+                MenuItemKind::Submenu => PopupItem::Submenu {
+                    label,
+                    enabled: item.enabled,
+                    items: popup_items(&item.children, i18n),
+                },
+                MenuItemKind::Normal | MenuItemKind::Checkbox | MenuItemKind::Radio => {
+                    let command = item.command.clone().filter(|c| !c.is_empty());
+                    PopupItem::Command {
+                        // What the item acts on right now ("Undo Paste FX
+                        // Chain") reads as part of the label.
+                        label: match &item.detail {
+                            Some(detail) => format!("{label} {detail}"),
+                            None => label,
+                        },
+                        enabled: item.enabled && command.is_some(),
+                        command: command.unwrap_or_default(),
+                        shortcut: item.live_shortcut(),
+                        checked: item.kind != MenuItemKind::Normal && item.checked,
+                    }
+                }
+            }
+        })
+        .collect()
+}
+
+fn native_dropdown(
+    menu: &Menu,
+    anchor: OverlayAnchor,
+    on_command: CommandCb,
+    on_close: CloseCb,
+    i18n: I18n,
+) -> gpui::AnyElement {
+    native_menu_element(
+        anchor.bounds.bottom_left(),
+        Some(anchor.bounds),
+        popup_items(&menu.items, i18n),
+        on_command,
+        on_close,
+    )
+}
+
+/// An element that brings up `items` as a native popup menu at `position`
+/// (window coordinates) when first painted, and draws nothing itself.
+/// `exclude` is kept clear (the label a dropdown falls from). `on_command`
+/// runs for a choice, then `on_close` however the menu was left.
+pub fn native_menu_element(
+    position: gpui::Point<gpui::Pixels>,
+    exclude: Option<gpui::Bounds<gpui::Pixels>>,
+    items: Vec<crate::native_popup_menu::PopupItem>,
+    on_command: CommandCb,
+    on_close: CloseCb,
+) -> gpui::AnyElement {
+    gpui::canvas(
+        |_, _, _| (),
+        move |_, _, window, cx| {
+            // Repaints while the menu is up land here too.
+            if crate::native_popup_menu::is_open(window) {
+                return;
+            }
+            let close = on_close.clone();
+            let shown = crate::native_popup_menu::show(
+                window,
+                cx,
+                position,
+                exclude,
+                items,
+                Box::new(move |chosen, window, cx| {
+                    if let Some(command) = chosen {
+                        on_command(&command, window, cx);
+                    }
+                    close(&(), window, cx);
+                }),
+            );
+            if !shown {
+                // Nothing native came up: drop the open state rather than
+                // leave an invisible menu holding it.
+                window.defer(cx, move |window, cx| on_close(&(), window, cx));
+            }
+        },
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .w(px(1.0))
+    .h(px(1.0))
+    .into_any_element()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drawn_dropdown(
     menu: &Menu,
     anchor: OverlayAnchor,
     viewport_width: f32,

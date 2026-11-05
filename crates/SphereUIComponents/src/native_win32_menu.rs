@@ -298,6 +298,16 @@ fn apply_theme(hwnd: HWND) {
     }
 }
 
+/// Popup menus `hwnd` opens (`TrackPopupMenuEx`, see
+/// [`crate::native_popup_menu`]) in the app theme's appearance. Touches no
+/// frame attribute, so a borderless window stays as GPUI drew it.
+pub(crate) fn theme_popups_for(hwnd: HWND) {
+    let dark = crate::theme::is_dark();
+    uxtheme::set_app_dark(dark);
+    uxtheme::allow_dark_for_window(hwnd, dark);
+    uxtheme::flush_menu_themes();
+}
+
 /// uxtheme's dark-mode entry points, exported by ordinal only (Windows 10
 /// 1809 and later). Each is looked up once; a missing one is skipped.
 mod uxtheme {

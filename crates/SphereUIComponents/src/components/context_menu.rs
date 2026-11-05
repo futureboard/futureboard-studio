@@ -122,7 +122,155 @@ pub fn backfill_shortcuts(
         .collect()
 }
 
+/// The context menu at `x, y` (window coordinates).
+///
+/// Where the platform has native popup menus
+/// ([`crate::native_popup_menu::available`]) the menu is the system's: this
+/// element draws nothing and, when first painted, brings the native menu up
+/// at the same point. The caller's open state stays as it is until the menu
+/// closes; then `on_command` runs for a choice, and `on_close` always runs
+/// after it, so the state comes down however the menu was left.
 pub fn context_menu_overlay(
+    entries: Vec<ContextMenuEntry>,
+    x: f32,
+    y: f32,
+    viewport_width: f32,
+    viewport_height: f32,
+    on_command: ContextCommandCb,
+    on_close: ContextCloseCb,
+) -> gpui::AnyElement {
+    if crate::native_popup_menu::available() {
+        return native_context_menu(entries, x, y, on_command, on_close);
+    }
+    drawn_context_menu(
+        entries,
+        x,
+        y,
+        viewport_width,
+        viewport_height,
+        on_command,
+        on_close,
+    )
+    .into_any_element()
+}
+
+/// `entries` as native popup rows.
+///
+/// A drawn menu groups its rows under `Header` captions; a native one nests
+/// them instead. Each captioned group of two or more rows becomes a submenu
+/// named by its caption ("ARA ▸", "Track Height ▸"), which keeps a long menu
+/// short. A group of one row stays inline (a submenu holding one row is a
+/// detour), and so does a menu that is nothing but one group — there the
+/// caption stays as a caption.
+pub fn popup_items(entries: Vec<ContextMenuEntry>) -> Vec<crate::native_popup_menu::PopupItem> {
+    use crate::native_popup_menu::PopupItem;
+
+    fn row(entry: ContextMenuEntry) -> Option<PopupItem> {
+        match entry {
+            ContextMenuEntry::Header(label) => Some(PopupItem::Header(label)),
+            ContextMenuEntry::Separator => Some(PopupItem::Separator),
+            ContextMenuEntry::Item {
+                label,
+                command,
+                shortcut,
+                checked,
+                disabled,
+                danger: _,
+            } => Some(PopupItem::Command {
+                label,
+                command,
+                shortcut,
+                checked,
+                enabled: !disabled,
+            }),
+        }
+    }
+
+    // Split into runs: a caption and the rows under it (up to the next
+    // separator or caption), or loose rows and separators.
+    enum Run {
+        Group(String, Vec<ContextMenuEntry>),
+        Loose(ContextMenuEntry),
+    }
+    let mut runs: Vec<Run> = Vec::new();
+    let mut open_group = false;
+    for entry in entries {
+        match entry {
+            ContextMenuEntry::Header(caption) => {
+                runs.push(Run::Group(caption, Vec::new()));
+                open_group = true;
+            }
+            ContextMenuEntry::Separator => {
+                open_group = false;
+                runs.push(Run::Loose(ContextMenuEntry::Separator));
+            }
+            item => match runs.last_mut() {
+                Some(Run::Group(_, rows)) if open_group => rows.push(item),
+                _ => runs.push(Run::Loose(item)),
+            },
+        }
+    }
+
+    let only_one_group = runs
+        .iter()
+        .filter(|run| !matches!(run, Run::Loose(ContextMenuEntry::Separator)))
+        .count()
+        == 1
+        && matches!(
+            runs.iter()
+                .find(|run| !matches!(run, Run::Loose(ContextMenuEntry::Separator))),
+            Some(Run::Group(..))
+        );
+
+    let mut items = Vec::new();
+    for run in runs {
+        match run {
+            Run::Loose(entry) => items.extend(row(entry)),
+            Run::Group(caption, rows) if only_one_group => {
+                items.push(PopupItem::Header(caption));
+                items.extend(rows.into_iter().filter_map(row));
+            }
+            Run::Group(_, rows) if rows.len() < 2 => {
+                items.extend(rows.into_iter().filter_map(row));
+            }
+            Run::Group(caption, rows) => {
+                let enabled = rows.iter().any(|row| {
+                    matches!(
+                        row,
+                        ContextMenuEntry::Item {
+                            disabled: false,
+                            ..
+                        }
+                    )
+                });
+                items.push(PopupItem::Submenu {
+                    label: caption,
+                    enabled,
+                    items: rows.into_iter().filter_map(row).collect(),
+                });
+            }
+        }
+    }
+    items
+}
+
+fn native_context_menu(
+    entries: Vec<ContextMenuEntry>,
+    x: f32,
+    y: f32,
+    on_command: ContextCommandCb,
+    on_close: ContextCloseCb,
+) -> gpui::AnyElement {
+    crate::components::menu_dropdown::native_menu_element(
+        gpui::point(px(x), px(y)),
+        None,
+        popup_items(entries),
+        on_command,
+        on_close,
+    )
+}
+
+fn drawn_context_menu(
     entries: Vec<ContextMenuEntry>,
     x: f32,
     y: f32,
@@ -382,4 +530,76 @@ fn item_row(
     }
 
     row
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::native_popup_menu::PopupItem;
+
+    fn labels(items: &[PopupItem]) -> Vec<String> {
+        items
+            .iter()
+            .map(|item| match item {
+                PopupItem::Command { label, .. } => label.clone(),
+                PopupItem::Header(label) => format!("# {label}"),
+                PopupItem::Separator => "-".to_string(),
+                PopupItem::Submenu { label, items, .. } => {
+                    format!("{label} > [{}]", labels(items).join(", "))
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn captioned_groups_nest_as_submenus() {
+        let items = popup_items(vec![
+            ContextMenuEntry::item("Rename", "rename"),
+            ContextMenuEntry::Separator,
+            ContextMenuEntry::Header("Folder".into()),
+            ContextMenuEntry::item("Group Selected", "group"),
+            ContextMenuEntry::Separator,
+            ContextMenuEntry::Header("ARA".into()),
+            ContextMenuEntry::item("Melodyne", "ara:1"),
+            ContextMenuEntry::item("RePitch", "ara:2"),
+            ContextMenuEntry::Separator,
+            ContextMenuEntry::item("Add Audio Track", "add"),
+        ]);
+        assert_eq!(
+            labels(&items),
+            vec![
+                "Rename",
+                "-",
+                "Group Selected",
+                "-",
+                "ARA > [Melodyne, RePitch]",
+                "-",
+                "Add Audio Track"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_menu_that_is_one_group_stays_flat() {
+        let items = popup_items(vec![
+            ContextMenuEntry::Header("Pad".into()),
+            ContextMenuEntry::item("Load", "load"),
+            ContextMenuEntry::item("Clear", "clear"),
+        ]);
+        assert_eq!(labels(&items), vec!["# Pad", "Load", "Clear"]);
+    }
+
+    #[test]
+    fn a_group_of_disabled_rows_is_a_disabled_submenu() {
+        let items = popup_items(vec![
+            ContextMenuEntry::item("Rename", "rename"),
+            ContextMenuEntry::Header("ARA".into()),
+            ContextMenuEntry::disabled_item("Melodyne", "ara:1"),
+            ContextMenuEntry::disabled_item("RePitch", "ara:2"),
+        ]);
+        assert!(matches!(
+            items.last(),
+            Some(PopupItem::Submenu { enabled: false, .. })
+        ));
+    }
 }

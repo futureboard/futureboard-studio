@@ -46,6 +46,7 @@ mod articulation_lane;
 mod cc_lane;
 mod cc_lane_render;
 mod grid_render;
+mod native_menus;
 pub mod playhead;
 mod render;
 pub mod scope;
@@ -3327,6 +3328,10 @@ impl PianoRoll {
         }
         self.open_velocity_menu = None;
         self.open_select_menu = None;
+        if self.open_native_note_menu(window, cx) {
+            cx.notify();
+            return;
+        }
         self.open_note_menu = Some((lx, ly));
         cx.notify();
     }
@@ -3947,6 +3952,10 @@ impl PianoRoll {
         }
         if self.selection.is_empty() {
             self.open_velocity_menu = None;
+            return;
+        }
+        if self.open_native_velocity_menu(window, cx) {
+            cx.notify();
             return;
         }
         self.open_velocity_menu = Some((lx, ly));

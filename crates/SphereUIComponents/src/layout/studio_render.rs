@@ -354,7 +354,25 @@ impl Render for StudioLayout {
         let chrome_policy = crate::platform_chrome::PlatformChromePolicy::current();
         let dropdown_overlay = if chrome_policy.show_in_window_menubar {
             open_menu_id.as_ref().and_then(|id| {
-                if id == components::menu_bar::MENU_PICKER_ID {
+                if id == components::menu_bar::MENU_PICKER_ID
+                    && crate::native_popup_menu::available()
+                {
+                    let checks = self.menu_check_states(cx);
+                    let history = self.history_menu_states(cx);
+                    Some(components::menu_bar::native_menu_picker(
+                        menu_anchor,
+                        viewport_width,
+                        |menu| {
+                            let mut runtime_menu = menu.clone();
+                            crate::menu::patch_checkbox_states(&mut runtime_menu.items, &checks);
+                            crate::menu::patch_command_states(&mut runtime_menu.items, &history);
+                            runtime_menu
+                        },
+                        on_menu_command.clone(),
+                        on_close_menu.clone(),
+                        i18n,
+                    ))
+                } else if id == components::menu_bar::MENU_PICKER_ID {
                     Some(
                         components::menu_bar::menu_picker_dropdown(
                             menu_anchor,
