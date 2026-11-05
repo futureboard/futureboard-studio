@@ -4,8 +4,6 @@ pub struct SvgIcon {
 }
 
 pub mod icons {
-    pub const PLAY: &str = include_str!("../../../packages/shared/lucide/icons/play.svg");
-    pub const LAYERS: &str = include_str!("../../../packages/shared/lucide/icons/layers.svg");
     pub const PALETTE: &str = include_str!("../../../packages/shared/lucide/icons/palette.svg");
     pub const MOVE_HORIZONTAL: &str =
         include_str!("../../../packages/shared/lucide/icons/move-horizontal.svg");
@@ -13,14 +11,8 @@ pub mod icons {
     pub const LIST_MUSIC: &str =
         include_str!("../../../packages/shared/lucide/icons/list-music.svg");
     pub const GAUGE: &str = include_str!("../../../packages/shared/lucide/icons/gauge.svg");
-    pub const PAUSE: &str = include_str!("../../../packages/shared/lucide/icons/pause.svg");
-    pub const SQUARE: &str = include_str!("../../../packages/shared/lucide/icons/square.svg");
-    pub const CIRCLE: &str = include_str!("../../../packages/shared/lucide/icons/circle.svg");
-    pub const SKIP_BACK: &str = include_str!("../../../packages/shared/lucide/icons/skip-back.svg");
-    pub const REPEAT: &str = include_str!("../../../packages/shared/lucide/icons/repeat.svg");
     pub const REPEAT2: &str = include_str!("../../../packages/shared/lucide/icons/repeat-2.svg");
     pub const TIMER: &str = include_str!("../../../packages/shared/lucide/icons/timer.svg");
-    pub const METRONOME: &str = include_str!("../../../packages/shared/lucide/icons/metronome.svg");
     pub const SAVE: &str = include_str!("../../../packages/shared/lucide/icons/save.svg");
     pub const FOLDER: &str = include_str!("../../../packages/shared/lucide/icons/folder.svg");
     pub const FOLDER_OPEN: &str =
@@ -43,14 +35,12 @@ pub mod icons {
     pub const LOCK_OPEN: &str = include_str!("../../../packages/shared/lucide/icons/lock-open.svg");
     pub const EYE: &str = include_str!("../../../packages/shared/lucide/icons/eye.svg");
     pub const EYE_OFF: &str = include_str!("../../../packages/shared/lucide/icons/eye-off.svg");
-    pub const SNOWFLAKE: &str = include_str!("../../../packages/shared/lucide/icons/snowflake.svg");
     pub const DICES: &str = include_str!("../../../packages/shared/lucide/icons/dices.svg");
     pub const REFRESH_CW: &str =
         include_str!("../../../packages/shared/lucide/icons/refresh-cw.svg");
     pub const ARROW_LEFT_RIGHT: &str =
         include_str!("../../../packages/shared/lucide/icons/arrow-left-right.svg");
     pub const X: &str = include_str!("../../../packages/shared/lucide/icons/x.svg");
-    pub const POWER: &str = include_str!("../../../packages/shared/lucide/icons/power.svg");
     pub const TRASH: &str = include_str!("../../../packages/shared/lucide/icons/trash-2.svg");
     pub const CHEVRON_LEFT: &str =
         include_str!("../../../packages/shared/lucide/icons/chevron-left.svg");
@@ -70,44 +60,20 @@ pub mod icons {
         include_str!("../../../packages/shared/icons/generic_close.svg");
 
     // Additional icons
-    pub const MOUSE_POINTER: &str =
-        include_str!("../../../packages/shared/lucide/icons/mouse-pointer.svg");
-    pub const PENCIL: &str = include_str!("../../../packages/shared/lucide/icons/pencil.svg");
-    pub const SCISSORS: &str = include_str!("../../../packages/shared/lucide/icons/scissors.svg");
     pub const UNDO: &str = include_str!("../../../packages/shared/lucide/icons/undo-2.svg");
     pub const REDO: &str = include_str!("../../../packages/shared/lucide/icons/redo-2.svg");
     pub const HISTORY: &str = include_str!("../../../packages/shared/lucide/icons/history.svg");
     pub const LINK: &str = include_str!("../../../packages/shared/lucide/icons/link.svg");
-    pub const VOLUME_X: &str = include_str!("../../../packages/shared/lucide/icons/volume-x.svg");
     pub const CLOCK: &str = include_str!("../../../packages/shared/lucide/icons/clock.svg");
     pub const USER: &str = include_str!("../../../packages/shared/lucide/icons/user.svg");
     pub const LOG_OUT: &str = include_str!("../../../packages/shared/lucide/icons/log-out.svg");
-    pub const SLIDERS_HORIZONTAL: &str =
-        include_str!("../../../packages/shared/lucide/icons/sliders-horizontal.svg");
     pub const SPARKLES: &str = include_str!("../../../packages/shared/lucide/icons/sparkles.svg");
     pub const PLUS: &str = include_str!("../../../packages/shared/lucide/icons/plus.svg");
-    pub const PLUG: &str = include_str!("../../../packages/shared/lucide/icons/plug.svg");
-    pub const ROUTE: &str = include_str!("../../../packages/shared/lucide/icons/route.svg");
-    pub const MIC: &str = include_str!("../../../packages/shared/lucide/icons/mic.svg");
-    pub const FILM: &str = include_str!("../../../packages/shared/lucide/icons/film.svg");
     pub const CPU: &str = include_str!("../../../packages/shared/lucide/icons/cpu.svg");
     pub const MEMORY_STICK: &str =
         include_str!("../../../packages/shared/lucide/icons/memory-stick.svg");
-    pub const AUDIO_LINES: &str =
-        include_str!("../../../packages/shared/lucide/icons/audio-lines.svg");
     pub const HARD_DRIVE: &str =
         include_str!("../../../packages/shared/lucide/icons/hard-drive.svg");
-    pub const MUSIC: &str = include_str!("../../../packages/shared/lucide/icons/music.svg");
-    pub const KEYBOARD: &str =
-        include_str!("../../../packages/shared/lucide/icons/keyboard-music.svg");
-    pub const GIT_MERGE: &str = include_str!("../../../packages/shared/lucide/icons/git-merge.svg");
-    pub const GIT_FORK: &str = include_str!("../../../packages/shared/lucide/icons/git-fork.svg");
-    pub const CORNER_DOWN_LEFT: &str =
-        include_str!("../../../packages/shared/lucide/icons/corner-down-left.svg");
-    pub const VOLUME_2: &str = include_str!("../../../packages/shared/lucide/icons/volume-2.svg");
-    pub const CIRCLE_DOT: &str =
-        include_str!("../../../packages/shared/lucide/icons/circle-dot.svg");
-    pub const MAGNET: &str = include_str!("../../../packages/shared/lucide/icons/magnet.svg");
     pub const GRIP_VERTICAL: &str =
         include_str!("../../../packages/shared/lucide/icons/grip-vertical.svg");
     pub const FILE: &str = include_str!("../../../packages/shared/lucide/icons/file.svg");
@@ -117,10 +83,7 @@ pub mod icons {
     pub const CHECK: &str = include_str!("../../../packages/shared/lucide/icons/check.svg");
     pub const STAR: &str = include_str!("../../../packages/shared/lucide/icons/star.svg");
     pub const NEWSPAPER: &str = include_str!("../../../packages/shared/lucide/icons/newspaper.svg");
-    pub const ERASER: &str = include_str!("../../../packages/shared/lucide/icons/eraser.svg");
     pub const PEN_LINE: &str = include_str!("../../../packages/shared/lucide/icons/pen-line.svg");
-    pub const ZOOM_IN: &str = include_str!("../../../packages/shared/lucide/icons/zoom-in.svg");
-    pub const ZOOM_OUT: &str = include_str!("../../../packages/shared/lucide/icons/zoom-out.svg");
     pub const SCAN: &str = include_str!("../../../packages/shared/lucide/icons/scan.svg");
     pub const CHEVRON_UP: &str =
         include_str!("../../../packages/shared/lucide/icons/chevron-up.svg");
@@ -128,8 +91,6 @@ pub mod icons {
         include_str!("../../../packages/shared/lucide/icons/square-arrow-out-up-right.svg");
 
     // Tabler outline
-    pub const AUTOMATION: &str =
-        include_str!("../../../packages/shared/tabler-icons/icons/outline/automation.svg");
 
     // Playhead downward-pointing triangle
     pub const PLAYHEAD_HANDLE: &str = r#"<svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg"><polygon points="0,0 12,0 6,12" fill="currentColor"/></svg>"#;
@@ -250,6 +211,150 @@ pub const ICON_REPAIR_DE_BLEED_PATH: &str = "icons/audio_repair/de_bleed.svg";
 pub const ICON_REPAIR_DE_FEEDBACK_PATH: &str = "icons/audio_repair/de_feedback.svg";
 pub const ICON_REPAIR_DRUM_SILENCER_PATH: &str = "icons/audio_repair/drum_silencer.svg";
 
+/// The Futureboard icon set: original 16 px drawings for the DAW's own
+/// vocabulary — transport, edit tools, track and signal types, mixer and
+/// routing — replacing the general-purpose Lucide / Tabler glyphs that stood
+/// in for them. Keyed by the same virtual paths, so every call site picks
+/// them up unchanged. See `packages/shared/icons/futureboard/README.md`.
+pub const FUTUREBOARD_ICONS: [(&str, &str); 32] = [
+    (
+        ICON_PLAY_PATH,
+        include_str!("../../../packages/shared/icons/futureboard/play.svg"),
+    ),
+    (
+        ICON_PAUSE_PATH,
+        include_str!("../../../packages/shared/icons/futureboard/pause.svg"),
+    ),
+    (
+        ICON_SQUARE_PATH,
+        include_str!("../../../packages/shared/icons/futureboard/stop.svg"),
+    ),
+    (
+        ICON_CIRCLE_PATH,
+        include_str!("../../../packages/shared/icons/futureboard/record.svg"),
+    ),
+    (
+        ICON_SKIP_BACK_PATH,
+        include_str!("../../../packages/shared/icons/futureboard/skip-back.svg"),
+    ),
+    (
+        ICON_REPEAT_PATH,
+        include_str!("../../../packages/shared/icons/futureboard/cycle.svg"),
+    ),
+    (
+        ICON_METRONOME_PATH,
+        include_str!("../../../packages/shared/icons/futureboard/metronome.svg"),
+    ),
+    (
+        ICON_MOUSE_POINTER_PATH,
+        include_str!("../../../packages/shared/icons/futureboard/pointer.svg"),
+    ),
+    (
+        ICON_PENCIL_PATH,
+        include_str!("../../../packages/shared/icons/futureboard/pencil.svg"),
+    ),
+    (
+        ICON_SCISSORS_PATH,
+        include_str!("../../../packages/shared/icons/futureboard/scissors.svg"),
+    ),
+    (
+        ICON_ERASER_PATH,
+        include_str!("../../../packages/shared/icons/futureboard/eraser.svg"),
+    ),
+    (
+        ICON_ZOOM_IN_PATH,
+        include_str!("../../../packages/shared/icons/futureboard/zoom-in.svg"),
+    ),
+    (
+        ICON_ZOOM_OUT_PATH,
+        include_str!("../../../packages/shared/icons/futureboard/zoom-out.svg"),
+    ),
+    (
+        ICON_MAGNET_PATH,
+        include_str!("../../../packages/shared/icons/futureboard/snap.svg"),
+    ),
+    (
+        ICON_MIC_PATH,
+        include_str!("../../../packages/shared/icons/futureboard/mic.svg"),
+    ),
+    (
+        ICON_KEYBOARD_PATH,
+        include_str!("../../../packages/shared/icons/futureboard/instrument.svg"),
+    ),
+    (
+        ICON_MUSIC_PATH,
+        include_str!("../../../packages/shared/icons/futureboard/midi-note.svg"),
+    ),
+    (
+        ICON_AUDIO_LINES_PATH,
+        include_str!("../../../packages/shared/icons/futureboard/waveform.svg"),
+    ),
+    (
+        ICON_VOLUME_2_PATH,
+        include_str!("../../../packages/shared/icons/futureboard/speaker.svg"),
+    ),
+    (
+        ICON_VOLUME_X_PATH,
+        include_str!("../../../packages/shared/icons/futureboard/mute.svg"),
+    ),
+    (
+        ICON_GIT_MERGE_PATH,
+        include_str!("../../../packages/shared/icons/futureboard/bus.svg"),
+    ),
+    (
+        ICON_GIT_FORK_PATH,
+        include_str!("../../../packages/shared/icons/futureboard/group.svg"),
+    ),
+    (
+        ICON_CORNER_DOWN_LEFT_PATH,
+        include_str!("../../../packages/shared/icons/futureboard/return.svg"),
+    ),
+    (
+        ICON_FILM_PATH,
+        include_str!("../../../packages/shared/icons/futureboard/video.svg"),
+    ),
+    (
+        ICON_SLIDERS_HORIZONTAL_PATH,
+        include_str!("../../../packages/shared/icons/futureboard/mixer.svg"),
+    ),
+    (
+        ICON_AUTOMATION_PATH,
+        include_str!("../../../packages/shared/icons/futureboard/automation.svg"),
+    ),
+    (
+        ICON_PLUG_PATH,
+        include_str!("../../../packages/shared/icons/futureboard/insert.svg"),
+    ),
+    (
+        ICON_ROUTE_PATH,
+        include_str!("../../../packages/shared/icons/futureboard/routing.svg"),
+    ),
+    (
+        ICON_SNOWFLAKE_PATH,
+        include_str!("../../../packages/shared/icons/futureboard/freeze.svg"),
+    ),
+    (
+        ICON_POWER_PATH,
+        include_str!("../../../packages/shared/icons/futureboard/power.svg"),
+    ),
+    (
+        ICON_CIRCLE_DOT_PATH,
+        include_str!("../../../packages/shared/icons/futureboard/mono.svg"),
+    ),
+    (
+        ICON_LAYERS_PATH,
+        include_str!("../../../packages/shared/icons/futureboard/stack.svg"),
+    ),
+];
+
+/// Resolve a Futureboard icon by its virtual asset path.
+pub fn futureboard_icon(path: &str) -> Option<&'static str> {
+    FUTUREBOARD_ICONS
+        .iter()
+        .find(|(candidate, _)| *candidate == path)
+        .map(|(_, svg)| *svg)
+}
+
 /// The Audio Repair glyph family, registered once.
 ///
 /// Adding a repair module means adding an SVG file and one row here; the
@@ -328,4 +433,61 @@ pub fn register_fonts(_cx: &mut gpui::App) {
         "[UI] default_font_size={}",
         crate::theme::typography::UI_SM as u32
     );
+}
+
+#[cfg(test)]
+mod futureboard_icon_tests {
+    use super::*;
+    use gpui::AssetSource;
+
+    /// Every Futureboard icon is what the asset source hands out for its path,
+    /// so no call site can still be drawing the glyph it replaced.
+    #[test]
+    fn every_futureboard_icon_is_served_for_its_path() {
+        let source = crate::embedded_assets::EmbeddedAssets::new();
+        for (path, svg) in FUTUREBOARD_ICONS {
+            let served = source
+                .load(path)
+                .expect("load")
+                .unwrap_or_else(|| panic!("{path} is not served"));
+            assert_eq!(
+                served.as_ref(),
+                svg.as_bytes(),
+                "{path} serves another glyph"
+            );
+        }
+    }
+
+    /// The grid and colour rules from the set's README: a 16 px canvas, and
+    /// every paint `currentColor` so the theme tints it. The only literal
+    /// colours allowed are the mask's black and white.
+    #[test]
+    fn futureboard_icons_follow_the_grid_and_tint_from_the_theme() {
+        for (path, svg) in FUTUREBOARD_ICONS {
+            assert!(
+                svg.contains(r#"viewBox="0 0 16 16""#),
+                "{path}: not on the 16 px grid"
+            );
+            assert!(
+                svg.contains("currentColor"),
+                "{path}: paints nothing tintable"
+            );
+            let stripped = svg.replace("#fff", "").replace("#000", "");
+            assert!(
+                !stripped.contains('#') || stripped.contains("url(#"),
+                "{path}: literal colour"
+            );
+            for literal in stripped.split("url(#").skip(1) {
+                assert!(literal.starts_with('k'), "{path}: unexpected reference");
+            }
+        }
+        let mut paths: Vec<&str> = FUTUREBOARD_ICONS.iter().map(|(path, _)| *path).collect();
+        paths.sort_unstable();
+        paths.dedup();
+        assert_eq!(
+            paths.len(),
+            FUTUREBOARD_ICONS.len(),
+            "two icons claim one path"
+        );
+    }
 }

@@ -67,6 +67,9 @@ impl AssetSource for EmbeddedAssets {
         if let Some(svg) = crate::components::voxtune::icons::svg(path) {
             return Ok(Some(Cow::Borrowed(svg.as_bytes())));
         }
+        if let Some(svg) = assets::futureboard_icon(path) {
+            return Ok(Some(Cow::Borrowed(svg.as_bytes())));
+        }
         if let Some(svg) = assets::audio_repair_icon(path) {
             return Ok(Some(Cow::Borrowed(svg.as_bytes())));
         }
@@ -74,21 +77,13 @@ impl AssetSource for EmbeddedAssets {
             return Ok(Some(Cow::Borrowed(assets::WHITESHARP_WORDMARK.as_bytes())));
         }
         let bytes = match path {
-            assets::ICON_PLAY_PATH => Some(assets::icons::PLAY.as_bytes()),
-            assets::ICON_LAYERS_PATH => Some(assets::icons::LAYERS.as_bytes()),
             assets::ICON_PALETTE_PATH => Some(assets::icons::PALETTE.as_bytes()),
             assets::ICON_MOVE_HORIZONTAL_PATH => Some(assets::icons::MOVE_HORIZONTAL.as_bytes()),
             assets::ICON_TYPE_PATH => Some(assets::icons::TYPE.as_bytes()),
             assets::ICON_LIST_MUSIC_PATH => Some(assets::icons::LIST_MUSIC.as_bytes()),
             assets::ICON_GAUGE_PATH => Some(assets::icons::GAUGE.as_bytes()),
-            assets::ICON_PAUSE_PATH => Some(assets::icons::PAUSE.as_bytes()),
-            assets::ICON_SQUARE_PATH => Some(assets::icons::SQUARE.as_bytes()),
-            assets::ICON_CIRCLE_PATH => Some(assets::icons::CIRCLE.as_bytes()),
-            assets::ICON_SKIP_BACK_PATH => Some(assets::icons::SKIP_BACK.as_bytes()),
-            assets::ICON_REPEAT_PATH => Some(assets::icons::REPEAT.as_bytes()),
             assets::ICON_REPEAT2_PATH => Some(assets::icons::REPEAT2.as_bytes()),
             assets::ICON_TIMER_PATH => Some(assets::icons::TIMER.as_bytes()),
-            assets::ICON_METRONOME_PATH => Some(assets::icons::METRONOME.as_bytes()),
             assets::ICON_SAVE_PATH => Some(assets::icons::SAVE.as_bytes()),
             assets::ICON_FOLDER_PATH => Some(assets::icons::FOLDER.as_bytes()),
             assets::ICON_FOLDER_OPEN_PATH => Some(assets::icons::FOLDER_OPEN.as_bytes()),
@@ -110,56 +105,30 @@ impl AssetSource for EmbeddedAssets {
             assets::ICON_LOCK_OPEN_PATH => Some(assets::icons::LOCK_OPEN.as_bytes()),
             assets::ICON_EYE_PATH => Some(assets::icons::EYE.as_bytes()),
             assets::ICON_EYE_OFF_PATH => Some(assets::icons::EYE_OFF.as_bytes()),
-            assets::ICON_SNOWFLAKE_PATH => Some(assets::icons::SNOWFLAKE.as_bytes()),
             assets::ICON_DICES_PATH => Some(assets::icons::DICES.as_bytes()),
             assets::ICON_REFRESH_CW_PATH => Some(assets::icons::REFRESH_CW.as_bytes()),
             assets::ICON_ARROW_LEFT_RIGHT_PATH => Some(assets::icons::ARROW_LEFT_RIGHT.as_bytes()),
-            assets::ICON_POWER_PATH => Some(assets::icons::POWER.as_bytes()),
             assets::ICON_TRASH_PATH => Some(assets::icons::TRASH.as_bytes()),
             assets::ICON_CHEVRON_LEFT_PATH => Some(assets::icons::CHEVRON_LEFT.as_bytes()),
             assets::ICON_CLOSE_SMALL_PATH => Some(assets::icons::X.as_bytes()),
 
             // New ones
-            assets::ICON_MOUSE_POINTER_PATH => Some(assets::icons::MOUSE_POINTER.as_bytes()),
-            assets::ICON_PENCIL_PATH => Some(assets::icons::PENCIL.as_bytes()),
-            assets::ICON_SCISSORS_PATH => Some(assets::icons::SCISSORS.as_bytes()),
             assets::ICON_UNDO_PATH => Some(assets::icons::UNDO.as_bytes()),
             assets::ICON_REDO_PATH => Some(assets::icons::REDO.as_bytes()),
             assets::ICON_HISTORY_PATH => Some(assets::icons::HISTORY.as_bytes()),
-            assets::ICON_ERASER_PATH => Some(assets::icons::ERASER.as_bytes()),
             assets::ICON_PEN_LINE_PATH => Some(assets::icons::PEN_LINE.as_bytes()),
-            assets::ICON_ZOOM_IN_PATH => Some(assets::icons::ZOOM_IN.as_bytes()),
-            assets::ICON_ZOOM_OUT_PATH => Some(assets::icons::ZOOM_OUT.as_bytes()),
             assets::ICON_SCAN_PATH => Some(assets::icons::SCAN.as_bytes()),
             assets::ICON_CHEVRON_UP_PATH => Some(assets::icons::CHEVRON_UP.as_bytes()),
             assets::ICON_POP_OUT_PATH => Some(assets::icons::POP_OUT.as_bytes()),
             assets::ICON_LINK_PATH => Some(assets::icons::LINK.as_bytes()),
-            assets::ICON_VOLUME_X_PATH => Some(assets::icons::VOLUME_X.as_bytes()),
             assets::ICON_CLOCK_PATH => Some(assets::icons::CLOCK.as_bytes()),
-            assets::ICON_AUTOMATION_PATH => Some(assets::icons::AUTOMATION.as_bytes()),
             assets::ICON_USER_PATH => Some(assets::icons::USER.as_bytes()),
             assets::ICON_LOG_OUT_PATH => Some(assets::icons::LOG_OUT.as_bytes()),
-            assets::ICON_SLIDERS_HORIZONTAL_PATH => {
-                Some(assets::icons::SLIDERS_HORIZONTAL.as_bytes())
-            }
             assets::ICON_SPARKLES_PATH => Some(assets::icons::SPARKLES.as_bytes()),
             assets::ICON_PLUS_PATH => Some(assets::icons::PLUS.as_bytes()),
-            assets::ICON_PLUG_PATH => Some(assets::icons::PLUG.as_bytes()),
-            assets::ICON_ROUTE_PATH => Some(assets::icons::ROUTE.as_bytes()),
-            assets::ICON_MIC_PATH => Some(assets::icons::MIC.as_bytes()),
-            assets::ICON_FILM_PATH => Some(assets::icons::FILM.as_bytes()),
             assets::ICON_CPU_PATH => Some(assets::icons::CPU.as_bytes()),
             assets::ICON_MEMORY_STICK_PATH => Some(assets::icons::MEMORY_STICK.as_bytes()),
-            assets::ICON_AUDIO_LINES_PATH => Some(assets::icons::AUDIO_LINES.as_bytes()),
             assets::ICON_HARD_DRIVE_PATH => Some(assets::icons::HARD_DRIVE.as_bytes()),
-            assets::ICON_MUSIC_PATH => Some(assets::icons::MUSIC.as_bytes()),
-            assets::ICON_KEYBOARD_PATH => Some(assets::icons::KEYBOARD.as_bytes()),
-            assets::ICON_GIT_MERGE_PATH => Some(assets::icons::GIT_MERGE.as_bytes()),
-            assets::ICON_GIT_FORK_PATH => Some(assets::icons::GIT_FORK.as_bytes()),
-            assets::ICON_CORNER_DOWN_LEFT_PATH => Some(assets::icons::CORNER_DOWN_LEFT.as_bytes()),
-            assets::ICON_VOLUME_2_PATH => Some(assets::icons::VOLUME_2.as_bytes()),
-            assets::ICON_CIRCLE_DOT_PATH => Some(assets::icons::CIRCLE_DOT.as_bytes()),
-            assets::ICON_MAGNET_PATH => Some(assets::icons::MAGNET.as_bytes()),
             assets::ICON_GRIP_VERTICAL_PATH => Some(assets::icons::GRIP_VERTICAL.as_bytes()),
             assets::ICON_FILE_PATH => Some(assets::icons::FILE.as_bytes()),
             assets::ICON_CHEVRON_RIGHT_PATH => Some(assets::icons::CHEVRON_RIGHT.as_bytes()),
