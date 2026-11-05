@@ -37,32 +37,79 @@ pub fn decode_audio_file_to_mono(
     path: &Path,
     target_sample_rate: u32,
 ) -> Result<DecodedAudio, String> {
+    finalize_decoded(read_audio_file(path)?, target_sample_rate)
+}
+
+/// Stereo audio decoded at the engine rate: a backing track, which keeps its
+/// stereo image (vocals are analysed mono).
+#[derive(Debug, Clone)]
+pub struct DecodedStereo {
+    /// Interleaved L/R frames at `sample_rate`.
+    pub samples: Vec<f32>,
+    pub sample_rate: u32,
+    pub duration_sec: f64,
+    /// Downsampled peak envelope (`0.0..=1.0`) of both channels.
+    pub waveform_peaks: Vec<f32>,
+}
+
+/// Decodes an audio file from disk into stereo at `target_sample_rate`. Mono
+/// files play on both sides; files with more channels keep their first two.
+pub fn decode_audio_file_to_stereo(
+    path: &Path,
+    target_sample_rate: u32,
+) -> Result<DecodedStereo, String> {
+    let raw = read_audio_file(path)?;
+    if raw.frames == 0 || raw.channels == 0 || raw.sample_rate == 0 {
+        return Err("Decoded audio buffer is empty".to_string());
+    }
+    let side = |channel: usize| -> Vec<f32> {
+        let channel = channel.min(raw.channels - 1);
+        raw.samples
+            .chunks_exact(raw.channels)
+            .map(|frame| frame[channel])
+            .collect()
+    };
+    let target_sr = target_sample_rate.max(8_000);
+    let (left, right) = (
+        resample_mono_cubic(&side(0), raw.sample_rate, target_sr),
+        resample_mono_cubic(&side(1), raw.sample_rate, target_sr),
+    );
+    let mut samples = Vec::with_capacity(left.len() * 2);
+    let mut louder = Vec::with_capacity(left.len());
+    for (&l, &r) in left.iter().zip(&right) {
+        samples.extend_from_slice(&[l, r]);
+        louder.push(if l.abs() >= r.abs() { l } else { r });
+    }
+    Ok(DecodedStereo {
+        duration_sec: left.len() as f64 / target_sr as f64,
+        waveform_peaks: compute_waveform_peaks(&louder, 240),
+        samples,
+        sample_rate: target_sr,
+    })
+}
+
+fn read_audio_file(path: &Path) -> Result<RawInterleavedBuffer, String> {
     let ext = path
         .extension()
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    let raw = if matches!(ext.as_str(), "wav" | "wave") {
+    if matches!(ext.as_str(), "wav" | "wave") {
         let mut bytes = Vec::new();
         File::open(path)
             .map_err(|e| format!("Failed to open '{}': {e}", path.display()))?
             .read_to_end(&mut bytes)
             .map_err(|e| format!("Failed to read '{}': {e}", path.display()))?;
         match decode_wav_bytes(&bytes) {
-            Ok(buf) => buf,
-            Err(_) => decode_via_symphonia_reader(
-                Box::new(Cursor::new(bytes)),
-                Some(ext.as_str()),
-            )?,
+            Ok(buf) => Ok(buf),
+            Err(_) => decode_via_symphonia_reader(Box::new(Cursor::new(bytes)), Some(ext.as_str())),
         }
     } else {
-        let file = File::open(path)
-            .map_err(|e| format!("Failed to open '{}': {e}", path.display()))?;
-        decode_via_symphonia_reader(Box::new(file), Some(ext.as_str()))?
-    };
-
-    finalize_decoded(raw, target_sample_rate)
+        let file =
+            File::open(path).map_err(|e| format!("Failed to open '{}': {e}", path.display()))?;
+        decode_via_symphonia_reader(Box::new(file), Some(ext.as_str()))
+    }
 }
 
 /// Decodes audio from an in-memory byte slice into mono `f32` samples at `target_sample_rate`.

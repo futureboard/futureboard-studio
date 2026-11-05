@@ -261,6 +261,32 @@ class SynthEngine {
     dsp.setTransport(playing: playing, loopEnabled: loop, bypass: bypass);
   }
 
+  NativeBacking? _sentBacking;
+  double? _sentBackingGain;
+  double? _sentBackingOffset;
+
+  /// Plays [backing] under the vocal at linear [gain] (0 mutes), this take
+  /// starting [offsetSec] into it; null plays the vocal alone. Unchanged
+  /// settings are not resent. Does nothing before the engine exists (a file
+  /// not opened yet); the next sync after it opens attaches it.
+  void setBacking(
+    NativeBacking? backing, {
+    required double gain,
+    required double offsetSec,
+  }) {
+    final dsp = _rustDsp;
+    if (dsp == null || !dsp.isLoaded) return;
+    if (identical(backing, _sentBacking) &&
+        gain == _sentBackingGain &&
+        offsetSec == _sentBackingOffset) {
+      return;
+    }
+    dsp.setBacking(backing, gain: gain, offsetSec: offsetSec);
+    _sentBacking = backing;
+    _sentBackingGain = gain;
+    _sentBackingOffset = offsetSec;
+  }
+
   /// Replaces the engine's note list after a structural edit (cut, join,
   /// undo of either).
   void replaceNotes(List<VocalNote> notes) {
@@ -352,6 +378,7 @@ class SynthEngine {
     _idleTimer = null;
     _rustDsp?.dispose(); // also stops and closes the native stream
     _rustDsp = null;
+    _sentBacking = null;
     if (_fallbackStarted) _invoke('stop');
     _fallbackStarted = false;
     _native = null;

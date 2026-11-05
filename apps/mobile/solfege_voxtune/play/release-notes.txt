@@ -1,14 +1,12 @@
 <th>
-• สเกลเพิ่มเป็น 11 แบบ: เมเจอร์, ไมเนอร์, ฮาร์โมนิกไมเนอร์, เมโลดิกไมเนอร์, โดเรียน, ฟรีเจียน, ลิเดียน, มิกโซลิเดียน, เมเจอร์/ไมเนอร์เพนทาโทนิก และบลูส์
-• วิเคราะห์สเกลจากเสียงร้องได้ละเอียดขึ้น ตรวจจับโหมด เมโลดิก/ฮาร์โมนิกไมเนอร์ เพนทาโทนิก และบลูส์ได้
-• ถ่างนิ้วขึ้นลงเพื่อซูมแนวตั้ง (ช่วงพิตช์) ได้แล้ว
-• แท็บเล็ตแนวนอน: ย้ายแถบเล่นเสียงไปไว้ใต้หน้าแก้ไข
-• หน้าตั้งค่าแสดงเวอร์ชันจริงของแอป
+• ดนตรีประกอบ: ใส่ไฟล์ดนตรีให้โปรเจกต์ แล้วเล่นคลอไปกับเสียงร้องแบบตรงจังหวะขณะจูน
+• ปรับความดัง ปิดเสียง และตั้งจุดเริ่มของแต่ละเทคในเพลงได้ (ทีละ 10 มิลลิวินาที หรือ 1 วินาที)
+• ปุ่มดนตรีประกอบข้างปุ่มบายพาส: แตะเพื่อปิด/เปิดเสียง กดค้างเพื่อเปิดการตั้งค่า
+• ไฟล์ที่ส่งออกยังเป็นเสียงร้องอย่างเดียว
 </th>
 <en-US>
-• 11 scales: major, minor, harmonic minor, melodic minor, Dorian, Phrygian, Lydian, Mixolydian, major and minor pentatonic, and blues
-• Smarter scale detection: finds modes, melodic and harmonic minor, pentatonics and blues in what you sang
-• Pinch up and down to zoom the pitch range
-• Landscape tablets: the transport now sits under the editor
-• Settings shows the app's real version
+• Backing track: add an instrumental to a project and it plays in time under the vocal while you tune
+• Set its volume, mute it, and set where each take starts in the song (10 ms or 1 s steps)
+• Backing button next to Bypass: tap to mute, hold for its settings
+• Exports are still the vocal alone
 </en-US>

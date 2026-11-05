@@ -308,6 +308,56 @@ class AppLocalizationsTh extends AppLocalizations {
   }
 
   @override
+  String get backingTrack => 'ดนตรีประกอบ';
+
+  @override
+  String get backingAdd => 'เพิ่มดนตรีประกอบ';
+
+  @override
+  String get backingAddHint => 'ฟังดนตรีไปพร้อมเสียงร้องระหว่างจูน';
+
+  @override
+  String get backingLoading => 'กำลังโหลดดนตรีประกอบ…';
+
+  @override
+  String backingFailed(String error) {
+    return 'เปิดไม่ได้: $error';
+  }
+
+  @override
+  String get backingPlaySemantic => 'เล่นดนตรีประกอบพร้อมเสียงร้อง';
+
+  @override
+  String get backingVolume => 'ระดับเสียง';
+
+  @override
+  String get backingOffset => 'เทคนี้เริ่มที่';
+
+  @override
+  String get backingOffsetHint =>
+      'ตำแหน่งในเพลงที่เทคนี้เริ่ม ใช้ 0:00 ถ้าเสียงร้องส่งออกมาจากต้นเพลง';
+
+  @override
+  String get backingOffsetReset => 'รีเซ็ต';
+
+  @override
+  String get backingNoTake => 'เปิดเทคก่อน แล้วจัดตำแหน่งให้ตรงกับเพลง';
+
+  @override
+  String get backingReplace => 'เปลี่ยนดนตรีประกอบ';
+
+  @override
+  String get backingReplaceHint =>
+      'เลือกไฟล์อื่น ระดับเสียงและตำแหน่งของเทคยังอยู่เหมือนเดิม';
+
+  @override
+  String get backingRemove => 'เอาดนตรีประกอบออก';
+
+  @override
+  String get backingRemoveHint =>
+      'เทคและการแก้ไขยังอยู่ครบ ไฟล์ที่ส่งออกเป็นเสียงร้องอย่างเดียวเสมอ';
+
+  @override
   String get defaultSnap => 'สแนปพิตช์เริ่มต้น';
 
   @override

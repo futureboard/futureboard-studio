@@ -590,6 +590,96 @@ abstract class AppLocalizations {
   /// **'Export failed: {error}'**
   String exportFailed(String error);
 
+  /// No description provided for @backingTrack.
+  ///
+  /// In en, this message translates to:
+  /// **'Backing track'**
+  String get backingTrack;
+
+  /// No description provided for @backingAdd.
+  ///
+  /// In en, this message translates to:
+  /// **'Add backing track'**
+  String get backingAdd;
+
+  /// No description provided for @backingAddHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Hear the instrumental under your vocal while you tune'**
+  String get backingAddHint;
+
+  /// No description provided for @backingLoading.
+  ///
+  /// In en, this message translates to:
+  /// **'Loading the backing track…'**
+  String get backingLoading;
+
+  /// No description provided for @backingFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Couldn\'t open it: {error}'**
+  String backingFailed(String error);
+
+  /// No description provided for @backingPlaySemantic.
+  ///
+  /// In en, this message translates to:
+  /// **'Play the backing track with the vocal'**
+  String get backingPlaySemantic;
+
+  /// No description provided for @backingVolume.
+  ///
+  /// In en, this message translates to:
+  /// **'Volume'**
+  String get backingVolume;
+
+  /// No description provided for @backingOffset.
+  ///
+  /// In en, this message translates to:
+  /// **'This take starts at'**
+  String get backingOffset;
+
+  /// No description provided for @backingOffsetHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Where this take begins in the song. 0:00 for a vocal exported from the start of the song.'**
+  String get backingOffsetHint;
+
+  /// No description provided for @backingOffsetReset.
+  ///
+  /// In en, this message translates to:
+  /// **'Reset'**
+  String get backingOffsetReset;
+
+  /// No description provided for @backingNoTake.
+  ///
+  /// In en, this message translates to:
+  /// **'Open a take to line it up with the song.'**
+  String get backingNoTake;
+
+  /// No description provided for @backingReplace.
+  ///
+  /// In en, this message translates to:
+  /// **'Replace backing track'**
+  String get backingReplace;
+
+  /// No description provided for @backingReplaceHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Pick another file. Volume and take positions stay.'**
+  String get backingReplaceHint;
+
+  /// No description provided for @backingRemove.
+  ///
+  /// In en, this message translates to:
+  /// **'Remove backing track'**
+  String get backingRemove;
+
+  /// No description provided for @backingRemoveHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Your takes and edits stay as they are. Exports are always the vocal alone.'**
+  String get backingRemoveHint;
+
   /// No description provided for @defaultSnap.
   ///
   /// In en, this message translates to:

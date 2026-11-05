@@ -295,6 +295,96 @@ void main() {
     expect(bytes.length, 44 + 2 * 48000 * 2);
   });
 
+  testWidgets('a backing track plays under the takes, lines up and is saved', (
+    WidgetTester tester,
+  ) async {
+    final store = tempStore();
+    final project = store.create('Backing');
+    final state = await pumpEditor(tester, store, project);
+    state.loadAudioBytes(_buildTestVocalWav(), fileName: 'lead.wav');
+    await settle(tester);
+
+    /// Lets the native decode finish while the UI's 60 ms poll ticks.
+    Future<void> settleBacking() async {
+      final editor = find.byType(CantoScreen);
+      for (var i = 0; i < 300; i++) {
+        final s = tester.state<CantoScreenState>(editor);
+        if (!s.backingViewForTest.loading) break;
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 5)),
+        );
+        await tester.pump(const Duration(milliseconds: 60));
+      }
+      await tester.pump();
+    }
+
+    final source = File(
+      '${Directory.systemTemp.createTempSync().path}/band.wav',
+    )..writeAsBytesSync(_buildTestVocalWav());
+    state.addBackingPath(source.path, name: 'band.wav');
+    await settleBacking();
+    var view = state.backingViewForTest;
+    expect(view.name, 'band.wav');
+    expect(view.error, isNull);
+    expect(view.duration, closeTo(2.0, 0.01));
+    expect(view.offset, 0);
+    expect(File('${project.dir}/Backing/band.wav').existsSync(), isTrue);
+
+    // The transport toggle mutes and unmutes it.
+    await tester.tap(find.byKey(const Key('backing-btn')));
+    await tester.pump();
+    expect(state.backingViewForTest.muted, isTrue);
+    await tester.tap(find.byKey(const Key('backing-btn')));
+    await tester.pump();
+    expect(state.backingViewForTest.muted, isFalse);
+
+    // The sheet lines the take up with the song.
+    await tester.longPress(find.byKey(const Key('backing-btn')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('backing-sheet')), findsOneWidget);
+    await tester.tap(find.byKey(const Key('backing-offset-plus-1s')));
+    await tester.pump();
+    await tester.tap(find.byKey(const Key('backing-offset-plus-10ms')));
+    await tester.pump();
+    expect(find.text('0:01.010'), findsOneWidget);
+    await tester.pump(const Duration(seconds: 1)); // autosave debounce
+
+    final json = jsonDecode(
+      File('${project.dir}/project.json').readAsStringSync(),
+    ) as Map<String, dynamic>;
+    expect((json['backing'] as Map)['name'], 'band.wav');
+    expect(((json['files'] as List).single as Map)['backingOffset'], 1.01);
+
+    // Exports stay the vocal alone: same length as the take.
+    await tester.runAsync(
+      () => state.exportSessions(List.of(state.sessionsForTest)),
+    );
+    await tester.pump();
+    final out = File('${project.dir}/Exports/lead (tuned).wav');
+    expect(out.lengthSync(), 44 + 2 * 48000 * 2);
+
+    // Reopened, the project loads the track again with the take's offset.
+    await tester.pumpWidget(const SizedBox());
+    final reopened = store.list().single;
+    final again = await pumpEditor(tester, store, reopened);
+    await settleBacking();
+    view = again.backingViewForTest;
+    expect(view.name, 'band.wav');
+    expect(view.offset, 1.01);
+    expect(find.byKey(const Key('backing-btn')), findsOneWidget);
+
+    // Removing it deletes the copy and keeps the take.
+    await tester.longPress(find.byKey(const Key('backing-btn')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('backing-remove')));
+    await tester.pump();
+    expect(again.backingViewForTest.name, isNull);
+    expect(File('${project.dir}/Backing/band.wav').existsSync(), isFalse);
+    expect(reopened.backing, isNull);
+    expect(reopened.files.single.name, 'lead.wav');
+    expect(find.byKey(const Key('backing-btn')), findsNothing);
+  });
+
   testWidgets('home lists projects; new project opens the editor', (
     WidgetTester tester,
   ) async {

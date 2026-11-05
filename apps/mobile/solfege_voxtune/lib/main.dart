@@ -24,6 +24,7 @@ import 'session.dart';
 import 'ui/advanced_tools.dart';
 import 'rust_dsp.dart';
 import 'theme.dart';
+import 'ui/backing_sheet.dart';
 import 'ui/components.dart';
 import 'ui/expression_sheet.dart';
 import 'ui/history_sheet.dart';
@@ -396,6 +397,16 @@ class CantoScreenState extends State<CantoScreen>
   final GlobalKey _editorKey = GlobalKey();
   bool _exporting = false;
 
+  // The project's backing track, decoded once and shared by every take's
+  // engine (see `_applyBacking`).
+  BackingTrackLoad? _backingLoad;
+  Timer? _backingTimer;
+  NativeBacking? _backing;
+  String? _backingError;
+  final ValueNotifier<BackingView> _backingView = ValueNotifier(
+    BackingView.none,
+  );
+
   List<VocalNote> get _notes => _s.notes;
   List<double> get _waveformPeaks => _s.waveformPeaks;
   set _waveformPeaks(List<double> v) => _s.waveformPeaks = v;
@@ -560,6 +571,11 @@ class CantoScreenState extends State<CantoScreen>
     WidgetsBinding.instance.addObserver(this);
     _sessions.addAll(_project.files.map(FileSession.new));
     _projectOpening = _sessions.isNotEmpty;
+    if (_project.backing != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _startBackingLoad();
+      });
+    }
     if (_sessions.isNotEmpty) {
       // Analyse after the first frame so the editor appears immediately.
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -600,10 +616,15 @@ class CantoScreenState extends State<CantoScreen>
     // alive until it has stopped, so the sessions can go right away.
     _load?.timer?.cancel();
     _load?.job.free();
+    _backingTimer?.cancel();
+    _backingLoad?.free();
     _ticker.dispose();
     for (final s in _sessions) {
       s.dispose();
     }
+    // Engines hold their own reference; this one is the editor's.
+    _backing?.free();
+    _backingView.dispose();
     _emptySession.dispose();
     _playheadVN.dispose();
     _levelVN.dispose();
@@ -1361,6 +1382,7 @@ class CantoScreenState extends State<CantoScreen>
   }
 
   void _syncRustEngine() {
+    _applyBacking();
     _synth.syncState(
       notes: _notes,
       keyName: _key,
@@ -3188,6 +3210,14 @@ class CantoScreenState extends State<CantoScreen>
                   label: l.addAudioFile,
                   onTap: _analyzing ? null : () => closeThen(pickAndLoadAudio),
                 ),
+                _SidebarItem(
+                  key: const Key('sidebar-backing'),
+                  icon: LucideIcons.fileMusic,
+                  label: _project.backing == null
+                      ? l.backingAdd
+                      : l.backingTrack,
+                  onTap: () => closeThen(_openBackingSheet),
+                ),
               ],
             ),
           ),
@@ -3242,6 +3272,207 @@ class CantoScreenState extends State<CantoScreen>
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  // ---- Backing track ---------------------------------------------------------
+  // An instrumental played under the takes for reference. It is decoded once
+  // on a native worker; each take's engine plays it at the project's volume
+  // and the take's own offset into the song. Exports stay vocal only.
+
+  @visibleForTesting
+  BackingView get backingViewForTest => _backingView.value;
+
+  /// Decodes the project's backing track in the background.
+  void _startBackingLoad() {
+    final backing = _project.backing;
+    if (backing == null) return;
+    _backingTimer?.cancel();
+    _backingLoad?.free();
+    _backingError = null;
+    _backingLoad = BackingTrackLoad.start(
+      _project.backingPath(backing),
+      sampleRate: SynthEngine.sampleRate,
+    );
+    if (_backingLoad == null) {
+      _backingError = _l.loadFailed;
+    } else {
+      _backingTimer = Timer.periodic(
+        const Duration(milliseconds: 60),
+        (_) => _pollBacking(),
+      );
+    }
+    _publishBacking();
+  }
+
+  void _pollBacking() {
+    final load = _backingLoad;
+    final res = load?.take();
+    if (load == null || res == null) return;
+    _backingTimer?.cancel();
+    _backingTimer = null;
+    load.free();
+    _backingLoad = null;
+    _backing?.free();
+    _backing = res.backing;
+    _backingError = res.error;
+    _applyBacking();
+    _publishBacking();
+    setState(() {}); // the transport's backing button
+  }
+
+  /// Linear gain of the backing track (0 when muted).
+  double get _backingGain {
+    final backing = _project.backing;
+    if (backing == null || backing.muted) return 0;
+    return math.pow(10, backing.gainDb / 20).toDouble();
+  }
+
+  /// Hands the backing track to the edited take's engine (unchanged
+  /// settings are not resent). Called with every engine sync.
+  void _applyBacking() {
+    _synth.setBacking(
+      _project.backing == null ? null : _backing,
+      gain: _backingGain,
+      offsetSec: _s.file?.backingOffset ?? 0,
+    );
+  }
+
+  /// Takes every engine off the current track, so a replaced or removed
+  /// one is not kept in memory by takes that are not being edited.
+  void _detachBackingEverywhere() {
+    for (final s in [..._sessions, _emptySession]) {
+      s.synth.setBacking(null, gain: 0, offsetSec: 0);
+    }
+    _backing?.free();
+    _backing = null;
+  }
+
+  void _publishBacking() {
+    final backing = _project.backing;
+    _backingView.value = backing == null
+        ? BackingView.none
+        : BackingView(
+            name: backing.name,
+            loading: _backingLoad != null,
+            error: _backingError,
+            duration: _backing?.duration ?? 0,
+            gainDb: backing.gainDb,
+            muted: backing.muted,
+            offset: _s.file?.backingOffset,
+          );
+  }
+
+  Future<void> _pickBacking() async {
+    final picked = await _synth.pickAudioFile();
+    if (picked == null || !mounted) return;
+    addBackingPath(picked.path, name: picked.name);
+  }
+
+  /// Copies [path] into the project as its backing track (replacing any
+  /// earlier one) and starts decoding it.
+  void addBackingPath(String path, {String? name}) {
+    final label = (name != null && name.isNotEmpty)
+        ? name
+        : path.split(RegExp(r'[/\\]')).last;
+    try {
+      _store.setBacking(_project, path, label);
+    } catch (e) {
+      _backingError = '$e';
+      _publishBacking();
+      return;
+    }
+    _detachBackingEverywhere();
+    _startBackingLoad();
+    setState(() {});
+  }
+
+  void _removeBacking() {
+    _backingTimer?.cancel();
+    _backingTimer = null;
+    _backingLoad?.free();
+    _backingLoad = null;
+    _backingError = null;
+    _detachBackingEverywhere();
+    try {
+      _store.removeBacking(_project);
+    } catch (_) {
+      // The copy stays on disk; the project no longer refers to it.
+      _project.backing = null;
+    }
+    _publishBacking();
+    setState(() {});
+  }
+
+  /// Volume, mute and offset changes apply at once (also while playing).
+  void _editBacking(void Function(ProjectBacking b) change) {
+    final backing = _project.backing;
+    if (backing == null) return;
+    change(backing);
+    _applyBacking();
+    _publishBacking();
+    _scheduleSave();
+  }
+
+  void _setBackingOffset(double sec) {
+    final file = _s.file;
+    if (file == null) return;
+    file.backingOffset = sec;
+    _applyBacking();
+    _publishBacking();
+    _scheduleSave();
+  }
+
+  void _toggleBackingMuted() {
+    _editBacking((b) => b.muted = !b.muted);
+    setState(() {});
+  }
+
+  void _openBackingSheet() {
+    _publishBacking();
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      builder: (_) => BackingSheet(
+        view: _backingView,
+        onPick: _pickBacking,
+        onRemove: _removeBacking,
+        onPlay: (play) {
+          _editBacking((b) => b.muted = !play);
+          setState(() {});
+        },
+        onGainDb: (db) => _editBacking(
+          (b) => b.gainDb = db.clamp(kBackingMinDb, kBackingMaxDb),
+        ),
+        onOffset: _setBackingOffset,
+      ),
+    );
+  }
+
+  Widget _buildBackingButton() {
+    final muted = _project.backing?.muted ?? true;
+    return Pressable(
+      key: const Key('backing-btn'),
+      onTap: _toggleBackingMuted,
+      onLongPress: _openBackingSheet,
+      semanticLabel: _l.backingPlaySemantic,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 140),
+        width: 36,
+        height: 36,
+        decoration: BoxDecoration(
+          color: muted ? CantoColors.raised : CantoColors.accentSoft,
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(
+            color: muted ? CantoColors.lineStrong : CantoColors.accentLine,
+          ),
+        ),
+        child: Icon(
+          muted ? LucideIcons.volumeX : LucideIcons.music,
+          size: 15,
+          color: muted ? CantoColors.muted : CantoColors.accent,
+        ),
       ),
     );
   }
@@ -4435,11 +4666,22 @@ class CantoScreenState extends State<CantoScreen>
                   textDirection: TextDirection.ltr,
                   textScaler: MediaQuery.textScalerOf(context),
                 )..layout()).width;
-                final showLabel =
-                    10 + 14 + 5 + labelWidth + 10 + 2 <= constraints.maxWidth;
+                // The backing-track toggle sits beside it once a track plays.
+                final backing = _backing != null && _project.backing != null;
+                final room = constraints.maxWidth - (backing ? 36 + 8 : 0);
+                final showLabel = 10 + 14 + 5 + labelWidth + 10 + 2 <= room;
                 return Align(
                   alignment: Alignment.centerRight,
-                  child: _buildBypassButton(showLabel: showLabel),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (backing) ...[
+                        _buildBackingButton(),
+                        const SizedBox(width: 8),
+                      ],
+                      _buildBypassButton(showLabel: showLabel),
+                    ],
+                  ),
                 );
               },
             ),

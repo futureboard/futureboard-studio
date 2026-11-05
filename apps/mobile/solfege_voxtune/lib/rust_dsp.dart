@@ -968,6 +968,41 @@ class RustCantoDsp {
     }
   }
 
+  late final void Function(
+    ffi.Pointer<ffi.Void>,
+    ffi.Pointer<ffi.Void>,
+    double,
+    double,
+  )
+  _setBacking = _lib
+      .lookupFunction<
+        ffi.Void Function(
+          ffi.Pointer<ffi.Void>,
+          ffi.Pointer<ffi.Void>,
+          ffi.Float,
+          ffi.Double,
+        ),
+        void Function(
+          ffi.Pointer<ffi.Void>,
+          ffi.Pointer<ffi.Void>,
+          double,
+          double,
+        )
+      >('canto_engine_set_backing');
+
+  /// Plays [backing] under the vocal at linear [gain] (0 mutes), the take
+  /// starting [offsetSec] into the track; null plays the vocal alone. The
+  /// engine keeps its own reference, so [backing] may be freed afterwards.
+  void setBacking(
+    NativeBacking? backing, {
+    double gain = 1,
+    double offsetSec = 0,
+  }) {
+    if (!isLoaded) return;
+    final ptr = backing == null || backing.isFreed ? ffi.nullptr : backing._ptr;
+    _setBacking(_handle, ptr, gain, offsetSec);
+  }
+
   void dispose() {
     if (_handle != ffi.nullptr) {
       _engineFree(_handle);
@@ -982,6 +1017,180 @@ class RustCantoDsp {
       malloc.free(_pcmBuf);
       _pcmBuf = ffi.nullptr;
       _pcmBufCapacity = 0;
+    }
+  }
+}
+
+/// A decoded backing track (the instrumental), shared by every take's
+/// engine it is attached to ([RustCantoDsp.setBacking]). [free] releases
+/// this reference only; attached engines keep theirs.
+class NativeBacking {
+  final ffi.Pointer<ffi.Void> _ptr;
+  final _BackingFns _fns;
+  bool _freed = false;
+
+  /// Length in seconds.
+  final double duration;
+
+  /// Peak envelope (0..1), for drawing.
+  final List<double> peaks;
+
+  NativeBacking._(this._ptr, this._fns, this.duration, this.peaks);
+
+  bool get isFreed => _freed;
+
+  void free() {
+    if (_freed) return;
+    _freed = true;
+    _fns.free(_ptr);
+  }
+}
+
+/// Decoding a backing track on a native worker thread. Poll [take] from the
+/// UI; [free] it when done (freeing early discards the result).
+class BackingTrackLoad {
+  final ffi.Pointer<ffi.Void> _job;
+  final _BackingFns _fns;
+  bool _freed = false;
+
+  BackingTrackLoad._(this._job, this._fns);
+
+  /// Starts decoding [path] at [sampleRate]; null when the native library
+  /// is unavailable.
+  static BackingTrackLoad? start(String path, {double sampleRate = 48000}) {
+    final fns = _BackingFns.instance;
+    if (fns == null) return null;
+    final pathPtr = path.toNativeUtf8();
+    try {
+      final job = fns.loadStart(pathPtr, sampleRate);
+      return job == ffi.nullptr ? null : BackingTrackLoad._(job, fns);
+    } finally {
+      malloc.free(pathPtr);
+    }
+  }
+
+  bool get isDone => _freed || _fns.loadDone(_job);
+
+  /// Once done: the track, or the error. Null while decoding. Returned once.
+  ({NativeBacking? backing, String? error})? take() {
+    if (_freed || !_fns.loadDone(_job)) return null;
+    final errorOut = calloc<ffi.Pointer<Utf8>>();
+    try {
+      final ptr = _fns.loadTake(_job, errorOut);
+      if (ptr == ffi.nullptr) {
+        final err = errorOut.value;
+        if (err == ffi.nullptr) {
+          return (backing: null, error: 'Decoding failed');
+        }
+        final message = err.toDartString();
+        _fns.freeString(err);
+        return (backing: null, error: message);
+      }
+      return (backing: _fns.wrap(ptr), error: null);
+    } finally {
+      calloc.free(errorOut);
+    }
+  }
+
+  void free() {
+    if (_freed) return;
+    _freed = true;
+    _fns.loadFree(_job);
+  }
+}
+
+class _BackingFns {
+  final ffi.Pointer<ffi.Void> Function(ffi.Pointer<Utf8>, double) loadStart;
+  final bool Function(ffi.Pointer<ffi.Void>) loadDone;
+  final ffi.Pointer<ffi.Void> Function(
+    ffi.Pointer<ffi.Void>,
+    ffi.Pointer<ffi.Pointer<Utf8>>,
+  )
+  loadTake;
+  final void Function(ffi.Pointer<ffi.Void>) loadFree;
+  final void Function(ffi.Pointer<ffi.Void>) free;
+  final double Function(ffi.Pointer<ffi.Void>) duration;
+  final int Function(ffi.Pointer<ffi.Void>, ffi.Pointer<ffi.Float>, int) peaks;
+  final void Function(ffi.Pointer<Utf8>) freeString;
+
+  _BackingFns(ffi.DynamicLibrary lib)
+    : loadStart = lib
+          .lookupFunction<
+            ffi.Pointer<ffi.Void> Function(ffi.Pointer<Utf8>, ffi.Float),
+            ffi.Pointer<ffi.Void> Function(ffi.Pointer<Utf8>, double)
+          >('canto_backing_load_start'),
+      loadDone = lib
+          .lookupFunction<
+            ffi.Bool Function(ffi.Pointer<ffi.Void>),
+            bool Function(ffi.Pointer<ffi.Void>)
+          >('canto_backing_load_done'),
+      loadTake = lib
+          .lookupFunction<
+            ffi.Pointer<ffi.Void> Function(
+              ffi.Pointer<ffi.Void>,
+              ffi.Pointer<ffi.Pointer<Utf8>>,
+            ),
+            ffi.Pointer<ffi.Void> Function(
+              ffi.Pointer<ffi.Void>,
+              ffi.Pointer<ffi.Pointer<Utf8>>,
+            )
+          >('canto_backing_load_take'),
+      loadFree = lib
+          .lookupFunction<
+            ffi.Void Function(ffi.Pointer<ffi.Void>),
+            void Function(ffi.Pointer<ffi.Void>)
+          >('canto_backing_load_free'),
+      free = lib
+          .lookupFunction<
+            ffi.Void Function(ffi.Pointer<ffi.Void>),
+            void Function(ffi.Pointer<ffi.Void>)
+          >('canto_backing_free'),
+      duration = lib
+          .lookupFunction<
+            ffi.Double Function(ffi.Pointer<ffi.Void>),
+            double Function(ffi.Pointer<ffi.Void>)
+          >('canto_backing_duration'),
+      peaks = lib
+          .lookupFunction<
+            ffi.Uint32 Function(
+              ffi.Pointer<ffi.Void>,
+              ffi.Pointer<ffi.Float>,
+              ffi.Uint32,
+            ),
+            int Function(ffi.Pointer<ffi.Void>, ffi.Pointer<ffi.Float>, int)
+          >('canto_backing_peaks'),
+      freeString = lib.lookupFunction<_FreeStringNative, _FreeStringDart>(
+        'canto_free_string',
+      );
+
+  static bool _tried = false;
+  static _BackingFns? _instance;
+
+  /// Null when the native library (or these symbols) is unavailable.
+  static _BackingFns? get instance {
+    if (!_tried) {
+      _tried = true;
+      try {
+        final lib = RustCantoDsp.openLibrary();
+        if (lib != null) _instance = _BackingFns(lib);
+      } catch (_) {}
+    }
+    return _instance;
+  }
+
+  NativeBacking wrap(ffi.Pointer<ffi.Void> ptr) {
+    const capacity = 512;
+    final buf = malloc<ffi.Float>(capacity);
+    try {
+      final n = peaks(ptr, buf, capacity);
+      return NativeBacking._(
+        ptr,
+        this,
+        duration(ptr),
+        List<double>.unmodifiable(buf.asTypedList(n)),
+      );
+    } finally {
+      malloc.free(buf);
     }
   }
 }

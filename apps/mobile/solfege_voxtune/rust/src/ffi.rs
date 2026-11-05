@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use crate::audio_io::{decode_audio_bytes_to_mono, decode_audio_file_to_mono};
+use crate::backing::{Backing, BackingAudio, BackingLoad};
 use crate::engine::{CantoAnalysisResult, CantoEngine};
 use crate::load_job::{JobKind, LoadJob, STAGE_DONE};
 use crate::output::Shared;
@@ -711,6 +712,145 @@ pub unsafe extern "C" fn canto_engine_export_wav(
         Ok(()) => std::ptr::null_mut(),
         Err(e) => error(format!("Could not write {path}: {e}")),
     }
+}
+
+// ---- Backing track ------------------------------------------------------------
+//
+// The instrumental is decoded once per project into a `BackingRef` (shared
+// audio) and handed to each take's engine with its gain and offset.
+
+/// Decoded backing audio, shared by every engine it is attached to.
+pub struct BackingRef(Arc<BackingAudio>);
+
+/// Starts decoding a backing track at `sample_rate` on a worker thread.
+/// Null on a bad path argument.
+///
+/// # Safety
+/// `path_ptr` must be a valid null-terminated UTF-8 string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn canto_backing_load_start(
+    path_ptr: *const c_char,
+    sample_rate: f32,
+) -> *mut BackingLoad {
+    if path_ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+    let Ok(path) = unsafe { CStr::from_ptr(path_ptr) }.to_str() else {
+        return std::ptr::null_mut();
+    };
+    Box::into_raw(Box::new(BackingLoad::start(
+        path.into(),
+        sample_rate.max(8_000.0) as u32,
+    )))
+}
+
+/// # Safety
+/// `job` must come from `canto_backing_load_start` and not be freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn canto_backing_load_done(job: *const BackingLoad) -> bool {
+    unsafe { job.as_ref() }.is_none_or(BackingLoad::is_done)
+}
+
+/// Once done: the decoded track (free it with `canto_backing_free`), or null
+/// with `*error_out` set to a message to free with `canto_free_string`.
+/// Null with no error while still decoding. Returned once.
+///
+/// # Safety
+/// `job` must come from `canto_backing_load_start` and not be freed;
+/// `error_out` must be valid to write.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn canto_backing_load_take(
+    job: *const BackingLoad,
+    error_out: *mut *mut c_char,
+) -> *mut BackingRef {
+    let Some(job) = (unsafe { job.as_ref() }) else {
+        return std::ptr::null_mut();
+    };
+    match job.take_result() {
+        Some(Ok(audio)) => Box::into_raw(Box::new(BackingRef(audio))),
+        Some(Err(e)) => {
+            if !error_out.is_null() {
+                unsafe { *error_out = c_error(e) };
+            }
+            std::ptr::null_mut()
+        }
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Frees the load (a still running decode finishes and is discarded).
+///
+/// # Safety
+/// `job` must come from `canto_backing_load_start`, freed once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn canto_backing_load_free(job: *mut BackingLoad) {
+    if !job.is_null() {
+        unsafe { drop(Box::from_raw(job)) };
+    }
+}
+
+/// Releases this reference; engines it was attached to keep their own.
+///
+/// # Safety
+/// `backing` must come from `canto_backing_load_take`, freed once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn canto_backing_free(backing: *mut BackingRef) {
+    if !backing.is_null() {
+        unsafe { drop(Box::from_raw(backing)) };
+    }
+}
+
+/// # Safety
+/// `backing` must be a live `BackingRef`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn canto_backing_duration(backing: *const BackingRef) -> f64 {
+    unsafe { backing.as_ref() }.map_or(0.0, |b| b.0.duration_sec)
+}
+
+/// Copies up to `capacity` waveform peaks into `out`; returns how many.
+///
+/// # Safety
+/// `backing` must be a live `BackingRef`; `out` valid for `capacity` floats.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn canto_backing_peaks(
+    backing: *const BackingRef,
+    out: *mut f32,
+    capacity: u32,
+) -> u32 {
+    let Some(b) = (unsafe { backing.as_ref() }) else {
+        return 0;
+    };
+    if out.is_null() {
+        return 0;
+    }
+    let n = b.0.waveform_peaks.len().min(capacity as usize);
+    unsafe { slice::from_raw_parts_mut(out, n) }.copy_from_slice(&b.0.waveform_peaks[..n]);
+    n as u32
+}
+
+/// Plays `backing` under this engine's vocal at linear `gain` (0 mutes), the
+/// take starting `offset_sec` into the track. Null `backing` detaches it.
+///
+/// # Safety
+/// `ptr` must be a valid handle; `backing` a live `BackingRef` or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn canto_engine_set_backing(
+    ptr: *mut CantoHandle,
+    backing: *const BackingRef,
+    gain: f32,
+    offset_sec: f64,
+) {
+    let Some(handle) = (unsafe { ptr.as_ref() }) else {
+        return;
+    };
+    let backing = unsafe { backing.as_ref() }.map(|b| Backing {
+        audio: Arc::clone(&b.0),
+        gain: gain.clamp(0.0, 2.0),
+        offset_sec,
+    });
+    // Swapped under the lock; the old one is dropped after releasing it.
+    let old = handle.engine().set_backing(backing);
+    drop(old);
 }
 
 // ---- Live recording ---------------------------------------------------------

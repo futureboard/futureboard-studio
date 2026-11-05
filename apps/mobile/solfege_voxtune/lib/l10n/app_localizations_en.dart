@@ -313,6 +313,57 @@ class AppLocalizationsEn extends AppLocalizations {
   }
 
   @override
+  String get backingTrack => 'Backing track';
+
+  @override
+  String get backingAdd => 'Add backing track';
+
+  @override
+  String get backingAddHint =>
+      'Hear the instrumental under your vocal while you tune';
+
+  @override
+  String get backingLoading => 'Loading the backing track…';
+
+  @override
+  String backingFailed(String error) {
+    return 'Couldn\'t open it: $error';
+  }
+
+  @override
+  String get backingPlaySemantic => 'Play the backing track with the vocal';
+
+  @override
+  String get backingVolume => 'Volume';
+
+  @override
+  String get backingOffset => 'This take starts at';
+
+  @override
+  String get backingOffsetHint =>
+      'Where this take begins in the song. 0:00 for a vocal exported from the start of the song.';
+
+  @override
+  String get backingOffsetReset => 'Reset';
+
+  @override
+  String get backingNoTake => 'Open a take to line it up with the song.';
+
+  @override
+  String get backingReplace => 'Replace backing track';
+
+  @override
+  String get backingReplaceHint =>
+      'Pick another file. Volume and take positions stay.';
+
+  @override
+  String get backingRemove => 'Remove backing track';
+
+  @override
+  String get backingRemoveHint =>
+      'Your takes and edits stay as they are. Exports are always the vocal alone.';
+
+  @override
   String get defaultSnap => 'Default pitch snap';
 
   @override

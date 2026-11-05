@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use serde::{Deserialize, Serialize};
 
 use crate::audio_io::{DecodedAudio, decode_audio_bytes_to_mono, decode_audio_file_to_mono};
+use crate::backing::Backing;
 use crate::dsp_core::{
     SoftKneeCompressor, StereoEffect, clamp, db_to_linear,
 };
@@ -490,6 +491,9 @@ pub struct CantoEngine {
     scratch: Vec<f32>,
     /// The sung pitch of the loaded audio (see [`PitchTrack`]).
     pitch_track: PitchTrack,
+    /// The instrumental mixed under the vocal during playback (not in
+    /// note previews or exports).
+    backing: Option<Backing>,
 }
 
 impl CantoEngine {
@@ -535,7 +539,19 @@ impl CantoEngine {
             active_hint: 0,
             scratch: Vec::new(),
             pitch_track: PitchTrack::default(),
+            backing: None,
         }
+    }
+
+    /// Plays `backing` under the vocal from now on (None: the vocal alone).
+    /// Returns the previous one, for the caller to drop outside any lock
+    /// shared with an audio thread.
+    pub fn set_backing(&mut self, backing: Option<Backing>) -> Option<Backing> {
+        std::mem::replace(&mut self.backing, backing)
+    }
+
+    pub fn backing(&self) -> Option<&Backing> {
+        self.backing.as_ref()
     }
 
     pub fn sample_rate(&self) -> f32 {
@@ -831,6 +847,8 @@ impl CantoEngine {
         }
         let mut e = self.clone();
         e.clear_audition();
+        // The export is the tuned vocal; the backing track is only a guide.
+        e.backing = None;
         e.bypass = false;
         e.loop_enabled = false;
         e.playing = true;
@@ -1204,6 +1222,13 @@ impl CantoEngine {
         let dt = 1.0 / self.sample_rate as f64;
         let total_dur = self.duration_sec;
         let mut block_peak = 0.0f32;
+        // The vocal heard now went into the shifter this long ago (bypass
+        // plays the source directly); the backing plays that same moment.
+        let heard_lag = if self.bypass {
+            0.0
+        } else {
+            self.shifter.latency() as f64 * dt
+        };
 
         // Allocation-free per-sample loop: notes are read by index and the
         // pitch/formant math runs only on control ticks inside `shift_sample`.
@@ -1272,7 +1297,15 @@ impl CantoEngine {
             };
             frame[0] = out_l;
             frame[1] = out_r;
+            // The meter shows the vocal alone.
             block_peak = block_peak.max(out_l.abs().max(out_r.abs()));
+            if self.playing {
+                if let Some(backing) = &self.backing {
+                    let (bl, br) = backing.at(self.playhead_sec - heard_lag);
+                    frame[0] = (out_l + bl).clamp(-1.0, 1.0);
+                    frame[1] = (out_r + br).clamp(-1.0, 1.0);
+                }
+            }
         }
 
         self.meter_level += (block_peak - self.meter_level) * 0.45;
@@ -1933,4 +1966,83 @@ fn estimate_bpm_from_frames(frames: &[PitchFrame]) -> f32 {
     }
 
     best_bpm
+}
+
+#[cfg(test)]
+mod backing_tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::backing::BackingAudio;
+
+    /// Output frame of the first sample louder than half scale.
+    fn first_click(engine: &mut CantoEngine, frames: usize) -> Option<usize> {
+        let mut out = vec![0.0f32; frames * 2];
+        engine.render_stereo_f32(&mut out);
+        out.chunks_exact(2).position(|f| f[0].abs() > 0.5)
+    }
+
+    /// A silent take and a backing track with one click at `click` frames.
+    fn engine_with_click(click: usize, offset_sec: f64, bypass: bool) -> CantoEngine {
+        let sr = 48_000u32;
+        let mut engine = CantoEngine::new(sr as f32);
+        engine
+            .load_mono_samples(vec![0.0; sr as usize], sr)
+            .unwrap();
+        let mut samples = vec![0.0f32; sr as usize * 2];
+        samples[click * 2] = 0.9;
+        samples[click * 2 + 1] = 0.9;
+        engine.set_backing(Some(Backing {
+            audio: Arc::new(BackingAudio::from_interleaved(&samples, sr, Vec::new())),
+            gain: 1.0,
+            offset_sec,
+        }));
+        engine.bypass = bypass;
+        engine.loop_enabled = false;
+        engine.set_playing(true);
+        engine
+    }
+
+    #[test]
+    fn the_backing_is_delayed_by_the_shifter_like_the_vocal() {
+        let mut engine = engine_with_click(12_000, 0.0, false);
+        let latency = engine.shifter.latency() as usize;
+        let at = first_click(&mut engine, 24_000).expect("the click is heard");
+        // A vocal sample at take frame t is heard at t + latency (see
+        // `render_offline`); the backing frame of that moment comes with it.
+        assert!(
+            at.abs_diff(12_000 + latency) <= 1,
+            "{at} vs {}",
+            12_000 + latency
+        );
+
+        let mut bypassed = engine_with_click(12_000, 0.0, true);
+        let at = first_click(&mut bypassed, 24_000).expect("the click is heard");
+        assert!(at.abs_diff(12_000) <= 1, "{at}");
+    }
+
+    #[test]
+    fn the_offset_moves_the_take_into_the_song() {
+        // The take starts 0.1 s into the track: the click at 0.25 s of the
+        // track is heard 0.15 s into the take.
+        let mut engine = engine_with_click(12_000, 0.1, true);
+        let at = first_click(&mut engine, 24_000).expect("the click is heard");
+        assert!(at.abs_diff(7_200) <= 1, "{at}");
+    }
+
+    #[test]
+    fn previews_meters_and_exports_leave_the_backing_out() {
+        let mut engine = engine_with_click(100, 0.0, true);
+        let mut out = vec![0.0f32; 400];
+        engine.render_stereo_f32(&mut out);
+        assert!(out.iter().any(|s| s.abs() > 0.5));
+        assert_eq!(engine.meter_level(), 0.0, "the meter shows the vocal");
+        assert!(engine.render_offline().iter().all(|&s| s == 0.0));
+
+        engine.set_playing(false);
+        engine.seek(0.0);
+        let mut out = vec![1.0f32; 400];
+        engine.render_stereo_f32(&mut out);
+        assert!(out.iter().all(|&s| s == 0.0), "stopped: no backing");
+    }
 }

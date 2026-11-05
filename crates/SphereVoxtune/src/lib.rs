@@ -8,6 +8,7 @@
 //! engine directly) from their audio callback.
 //!
 //! - `audio_io`: multi-format decoder (WAV/MP3/FLAC/OGG/M4A/AAC/AIFF) and cubic resampler
+//! - `backing`: the backing track played under the vocal for reference
 //! - `dsp_core`: denormal-safe filters, delay rings, allpass and soft-knee compressor
 //! - `detect`: decimated + full-rate parabolic-refined YIN pitch detector
 //! - `shifter`: stereo TD-PSOLA pitch and formant shifter
@@ -23,6 +24,7 @@
 //! - `shared`: the engine shared between a UI thread and an audio callback
 
 pub mod audio_io;
+pub mod backing;
 pub mod detect;
 pub mod dsp_core;
 pub mod edit;

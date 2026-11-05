@@ -66,6 +66,10 @@ class ProjectFile {
   /// cut/joined notes can't be recreated by re-analysis. Null if never saved.
   List<Map<String, dynamic>>? notes;
 
+  /// Where this take starts in the project's backing track, in seconds: 0
+  /// for a vocal exported from the start of the song.
+  double backingOffset;
+
   ProjectFile({
     required this.id,
     required this.name,
@@ -75,6 +79,7 @@ class ProjectFile {
     this.correct = 0,
     Map<String, NoteEdit>? edits,
     this.notes,
+    this.backingOffset = 0,
   }) : edits = edits ?? {};
 
   factory ProjectFile.fromJson(Map<String, dynamic> j) => ProjectFile(
@@ -90,6 +95,7 @@ class ProjectFile {
     notes: (j['notes'] as List<dynamic>?)
         ?.map((e) => (e as Map).cast<String, dynamic>())
         .toList(),
+    backingOffset: (j['backingOffset'] as num? ?? 0).toDouble(),
   );
 
   Map<String, dynamic> toJson() => {
@@ -101,6 +107,38 @@ class ProjectFile {
     'correct': correct,
     if (edits.isNotEmpty) 'edits': edits.map((k, v) => MapEntry(k, v.toJson())),
     if (notes != null) 'notes': notes,
+    if (backingOffset != 0) 'backingOffset': backingOffset,
+  };
+}
+
+/// The project's backing track: an instrumental played under every take
+/// while tuning, for reference. Copied into the project's `Backing/` folder.
+class ProjectBacking {
+  /// Path relative to the project folder, e.g. `Backing/song.mp3`.
+  final String audio;
+  final String name;
+  double gainDb;
+  bool muted;
+
+  ProjectBacking({
+    required this.audio,
+    required this.name,
+    this.gainDb = 0,
+    this.muted = false,
+  });
+
+  factory ProjectBacking.fromJson(Map<String, dynamic> j) => ProjectBacking(
+    audio: j['audio'] as String,
+    name: j['name'] as String,
+    gainDb: (j['gainDb'] as num? ?? 0).toDouble(),
+    muted: j['muted'] as bool? ?? false,
+  );
+
+  Map<String, dynamic> toJson() => {
+    'audio': audio,
+    'name': name,
+    'gainDb': gainDb,
+    'muted': muted,
   };
 }
 
@@ -115,18 +153,25 @@ class Project {
   DateTime modified;
   final List<ProjectFile> files;
 
+  /// The instrumental played under the takes, if one was added.
+  ProjectBacking? backing;
+
   Project({
     required this.dir,
     required this.name,
     required this.created,
     required this.modified,
     List<ProjectFile>? files,
+    this.backing,
   }) : files = files ?? [];
 
   String get audioDir => '$dir${Platform.pathSeparator}Audio';
+  String get backingDir => '$dir${Platform.pathSeparator}Backing';
   String get exportDir => '$dir${Platform.pathSeparator}Exports';
-  String pathOf(ProjectFile f) =>
-      '$dir${Platform.pathSeparator}${f.audio.replaceAll('/', Platform.pathSeparator)}';
+  String pathOf(ProjectFile f) => _absolute(f.audio);
+  String backingPath(ProjectBacking b) => _absolute(b.audio);
+  String _absolute(String relative) =>
+      '$dir${Platform.pathSeparator}${relative.replaceAll('/', Platform.pathSeparator)}';
 
   factory Project.fromJson(String dir, Map<String, dynamic> j) => Project(
     dir: dir,
@@ -136,6 +181,9 @@ class Project {
     files: ((j['files'] as List<dynamic>?) ?? const [])
         .map((e) => ProjectFile.fromJson(e as Map<String, dynamic>))
         .toList(),
+    backing: j['backing'] == null
+        ? null
+        : ProjectBacking.fromJson(j['backing'] as Map<String, dynamic>),
   );
 
   Map<String, dynamic> toJson() => {
@@ -145,6 +193,7 @@ class Project {
     'created': created.toIso8601String(),
     'modified': modified.toIso8601String(),
     'files': files.map((f) => f.toJson()).toList(),
+    if (backing != null) 'backing': backing!.toJson(),
   };
 
   /// Unique id for a new file within this project.
@@ -299,6 +348,42 @@ class ProjectStore {
     final audio = File(project.pathOf(file));
     if (audio.existsSync()) audio.deleteSync();
     save(project);
+  }
+
+  /// Copies [sourcePath] into `Backing/` as the project's backing track,
+  /// replacing (and deleting) the previous one. Takes keep their offsets.
+  ProjectBacking setBacking(Project project, String sourcePath, String name) {
+    Directory(project.backingDir).createSync(recursive: true);
+    final target = _uniquePath(project.backingDir, _safeName(name));
+    File(sourcePath).copySync(target);
+    final old = project.backing;
+    final backing = ProjectBacking(
+      audio: target
+          .substring(project.dir.length + 1)
+          .replaceAll(Platform.pathSeparator, '/'),
+      name: name,
+      gainDb: old?.gainDb ?? 0,
+    );
+    project.backing = backing;
+    save(project);
+    if (old != null) _deleteInside(project, project.backingPath(old));
+    return backing;
+  }
+
+  /// Removes the backing track and its copy in the project.
+  void removeBacking(Project project) {
+    final old = project.backing;
+    if (old == null) return;
+    project.backing = null;
+    save(project);
+    _deleteInside(project, project.backingPath(old));
+  }
+
+  static void _deleteInside(Project project, String path) {
+    final file = File(path);
+    if (file.existsSync() && file.path.startsWith(project.dir)) {
+      file.deleteSync();
+    }
   }
 
   /// Unused export path for [file]: `Exports/<name> (tuned).wav`.
