@@ -27,6 +27,7 @@ fn main() {
         "src/editorplatform/macos/editor_mac_internal.hpp",
         "src/editor_chrome_stub.cpp",
         "src/editor_linux.cpp",
+        "include/linux_editor_transport_key.hpp",
     ] {
         println!(
             "cargo:rerun-if-changed={}",
@@ -106,6 +107,7 @@ fn build_clap_bridge(manifest_dir: &std::path::Path, vst3_bridge_root: &std::pat
         "src/clap_editor_windows.cpp",
         "src/clap_editor_mac.mm",
         "src/clap_editor_linux.cpp",
+        "../vst3bridge/include/linux_editor_transport_key.hpp",
         "src/clap_editor_stub.cpp",
     ] {
         println!("cargo:rerun-if-changed={}", root.join(name).display());
@@ -150,6 +152,7 @@ fn build_clap_bridge(manifest_dir: &std::path::Path, vst3_bridge_root: &std::pat
 
             println!("cargo:rustc-link-lib=dl");
             println!("cargo:rustc-link-lib=X11");
+            println!("cargo:rustc-link-lib=Xi");
         }
         _ => {
             // Anything else: CLAP plug-ins still load and process; only the
@@ -280,9 +283,10 @@ fn apply_vst3_platform_config(
             }
 
             println!("cargo:rustc-link-lib=dl");
-            // editor_linux.cpp uses XGrabKey so Space reaches the host even when
-            // an XEmbed plug-in child holds focus.
+            // editor_linux.cpp grabs Space (core X and XInput2) so the key
+            // reaches the host even when an XEmbed plug-in child holds focus.
             println!("cargo:rustc-link-lib=X11");
+            println!("cargo:rustc-link-lib=Xi");
         }
         _ => {}
     }

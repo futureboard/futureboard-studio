@@ -46,7 +46,8 @@ use crate::components::drum_sampler_panel::{
     RegionEdge, DRAG_SLOP_PX, EDGE_GRAB_PX,
 };
 use crate::components::native_plugin_shell::{
-    native_plugin_shell, NativeBuiltinEditor, ShellIdentity, ShellMeter, SHELL_METER_INTERVAL,
+    claim_editor_transport_key, native_plugin_shell, swallow_editor_transport_key_up,
+    NativeBuiltinEditor, ShellIdentity, ShellMeter, SHELL_METER_INTERVAL,
 };
 use crate::components::quick_sampler_window::SAMPLE_EXTENSIONS;
 use crate::components::text_input::{
@@ -981,8 +982,13 @@ impl Render for DrumSamplerEditorWindow {
             .size_full()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                if !this.search.is_focused(window) && claim_editor_transport_key(event, window, cx)
+                {
+                    return;
+                }
                 this.on_key_down(event, window, cx)
             }))
+            .on_key_up(|_event, window, cx| swallow_editor_transport_key_up(window, cx))
             // A region-edge or pad drag follows the pointer anywhere in the
             // window and ends wherever the button comes up — as does a pad
             // being heard.

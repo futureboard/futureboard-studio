@@ -174,6 +174,50 @@ fn identity_strip(identity: &ShellIdentity, level: ShellMeter) -> AnyElement {
         .into_any_element()
 }
 
+/// Bare Space in a native plug-in editor is the DAW transport.
+///
+/// These windows are separate from the arrangement, so the arrangement's key
+/// handler never sees the press. A text caret that installed an input handler
+/// keeps the key. Returns whether this press was claimed.
+pub fn claim_editor_transport_key(
+    event: &gpui::KeyDownEvent,
+    window: &mut gpui::Window,
+    cx: &mut gpui::App,
+) -> bool {
+    if event.is_held || window.has_text_input_handler() {
+        return false;
+    }
+    let mods = &event.keystroke.modifiers;
+    if mods.control || mods.alt || mods.platform || mods.secondary() {
+        return false;
+    }
+    let key = event.keystroke.key.as_str();
+    let bare_space = matches!(
+        key,
+        "space" | " " | "spacebar" | "Space" | "Spacebar" | "kp-space"
+    ) || event.keystroke.key_char.as_deref() == Some(" ");
+    if !bare_space {
+        return false;
+    }
+    window.prevent_default();
+    cx.stop_propagation();
+    crate::components::transport_key::claim_space_key_up();
+    crate::components::transport_key::claim(
+        crate::components::transport_key::TransportKeySource::EditorShell,
+        None,
+    );
+    true
+}
+
+/// Swallow the key-up that follows [`claim_editor_transport_key`], so it does
+/// not also activate whichever control holds focus.
+pub fn swallow_editor_transport_key_up(window: &mut gpui::Window, cx: &mut gpui::App) {
+    if crate::components::transport_key::take_space_key_up_claim() {
+        window.prevent_default();
+        cx.stop_propagation();
+    }
+}
+
 /// The whole shell around `content`.
 pub fn native_plugin_shell(
     close_id: &'static str,

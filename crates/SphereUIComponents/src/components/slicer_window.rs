@@ -37,7 +37,8 @@ use crate::components::builtin_plugin_editor_window::{
 use crate::components::builtin_plugin_files::{self as files, BuiltinFileKind};
 use crate::components::context_menu::{context_menu_overlay, ContextMenuEntry};
 use crate::components::native_plugin_shell::{
-    native_plugin_shell, NativeBuiltinEditor, ShellIdentity, ShellMeter, SHELL_METER_INTERVAL,
+    claim_editor_transport_key, native_plugin_shell, swallow_editor_transport_key_up,
+    NativeBuiltinEditor, ShellIdentity, ShellMeter, SHELL_METER_INTERVAL,
 };
 use crate::components::quick_sampler_panel::SampleSummary;
 use crate::components::quick_sampler_window::SAMPLE_EXTENSIONS;
@@ -956,10 +957,14 @@ impl Render for SlicerEditorWindow {
             .track_focus(&self.focus_handle)
             .on_key_down({
                 let entity = entity.clone();
-                move |event: &gpui::KeyDownEvent, _window, cx| {
+                move |event: &gpui::KeyDownEvent, window, cx| {
+                    if claim_editor_transport_key(event, window, cx) {
+                        return;
+                    }
                     let _ = entity.update(cx, |this, cx| this.on_key_down(event, cx));
                 }
             })
+            .on_key_up(|_event, window, cx| swallow_editor_transport_key_up(window, cx))
             // A flag drag follows the pointer anywhere in the window and ends
             // wherever the button comes up — as does a slice being heard.
             .on_mouse_move({
