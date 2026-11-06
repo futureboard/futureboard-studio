@@ -275,6 +275,10 @@ pub(crate) struct ExternalWindows {
     /// Performance Monitor — engine latency and PDC, cores, memory and drives.
     pub performance:
         Option<gpui::WindowHandle<crate::components::performance_window::PerformanceWindow>>,
+    /// Process Explorer — what each plug-in, and each plug-in host, costs.
+    pub process_explorer: Option<
+        gpui::WindowHandle<crate::components::process_explorer_window::ProcessExplorerWindow>,
+    >,
     /// Virtual Speaker — the Control Room's listening simulation.
     pub virtual_speaker:
         Option<gpui::WindowHandle<crate::components::virtual_speaker_window::VirtualSpeakerWindow>>,
@@ -2388,6 +2392,125 @@ impl StudioLayout {
         ) {
             Ok(handle) => self.external_windows.performance = Some(handle),
             Err(err) => eprintln!("[performance] failed to open window: {err}"),
+        }
+    }
+
+    pub(super) fn open_process_explorer_window(
+        &mut self,
+        owner_bounds: Option<Bounds<gpui::Pixels>>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(handle) = self.external_windows.process_explorer.clone() {
+            if handle
+                .update(cx, |_view, window, _cx| window.activate_window())
+                .is_ok()
+            {
+                return;
+            }
+            self.external_windows.process_explorer = None;
+        }
+        // Read through the owner on the window's own tick, outside any lease —
+        // the same arrangement as the Performance Monitor.
+        let reader_owner = cx.entity().downgrade();
+        let read: crate::components::process_explorer_window::ProcessExplorerReader =
+            Arc::new(move |app: &mut gpui::App| {
+                reader_owner
+                    .update(app, |layout, cx| layout.process_explorer_reading(cx))
+                    .unwrap_or_default()
+            });
+        let close_owner = cx.entity().downgrade();
+        let on_close: Arc<dyn Fn(&mut gpui::Window, &mut gpui::App) + 'static> =
+            Arc::new(move |_window, app| {
+                if let Some(owner) = close_owner.upgrade() {
+                    StudioLayout::defer_update(&owner, app, |layout, _cx| {
+                        layout.external_windows.process_explorer = None;
+                    });
+                }
+            });
+        let reading = self.process_explorer_reading(cx);
+        match crate::components::process_explorer_window::open_process_explorer_window(
+            owner_bounds,
+            reading,
+            read,
+            on_close,
+            cx,
+        ) {
+            Ok(handle) => self.external_windows.process_explorer = Some(handle),
+            Err(err) => eprintln!("[process-explorer] failed to open window: {err}"),
+        }
+    }
+
+    /// Every loaded plug-in, with what the engine measures of it. Control
+    /// thread: `insert_load` takes the engine's runtime lock, once per insert,
+    /// twice a second while the window is open.
+    pub(crate) fn process_explorer_reading(
+        &self,
+        cx: &gpui::App,
+    ) -> crate::components::process_explorer_window::ProcessExplorerReading {
+        use crate::components::process_explorer_window::{
+            PluginKind, PluginProcessRow, ProcessExplorerReading,
+        };
+        use crate::components::timeline::timeline_state::{
+            InsertLoadStatus, InsertPluginFormat, InsertSlotState, PluginRuntimeState,
+            MASTER_TRACK_ID,
+        };
+        let state = &self.timeline.read(cx).state;
+        let engine = self.audio_bridge.engine.as_ref();
+        let row = |track_id: &str, track_name: &str, color: gpui::Rgba, slot: &InsertSlotState| {
+            let plugin_id = slot.plugin_id.as_deref().unwrap_or_default();
+            let kind = if SpherePluginHost::resolve_builtin_stem(plugin_id).is_some() {
+                PluginKind::BuiltIn
+            } else {
+                match slot.plugin_format {
+                    Some(InsertPluginFormat::Vst3) => PluginKind::Vst3,
+                    Some(InsertPluginFormat::Vst2) => PluginKind::Vst2,
+                    Some(InsertPluginFormat::Clap) => PluginKind::Clap,
+                    _ => PluginKind::Other,
+                }
+            };
+            let measured = engine.and_then(|engine| engine.insert_load(track_id, &slot.id));
+            let problem = match (&slot.load_status, &slot.runtime_state) {
+                (InsertLoadStatus::Missing(_), _) | (_, PluginRuntimeState::Missing(_)) => {
+                    Some("Missing".to_string())
+                }
+                (InsertLoadStatus::Failed(_), _) => Some("Failed".to_string()),
+                (InsertLoadStatus::Loading, _) | (_, PluginRuntimeState::Loading) => {
+                    Some("Loading".to_string())
+                }
+                (_, PluginRuntimeState::Crashed) => Some("Crashed".to_string()),
+                _ => None,
+            };
+            PluginProcessRow {
+                insert_id: slot.id.clone(),
+                plugin_name: slot.display_name.clone(),
+                vendor: slot.vendor.clone(),
+                track_name: track_name.to_string(),
+                track_color: color,
+                kind,
+                host_pid: slot.host_pid,
+                dsp_load: measured.map(|(share, _)| share),
+                latency_samples: measured.map_or(0, |(_, latency)| latency),
+                bypassed: slot.bypassed || !slot.enabled,
+                problem,
+            }
+        };
+        let mut rows = Vec::new();
+        for track in &state.tracks {
+            for slot in track.inserts.iter().filter(|slot| !slot.is_empty()) {
+                rows.push(row(&track.id, &track.name, track.color, slot));
+            }
+        }
+        for slot in state.master.inserts.iter().filter(|slot| !slot.is_empty()) {
+            rows.push(row(
+                MASTER_TRACK_ID,
+                "Master",
+                crate::theme::Colors::text_secondary(),
+                slot,
+            ));
+        }
+        ProcessExplorerReading {
+            rows,
+            sample_rate: self.current_audio_sample_rate(),
         }
     }
 

@@ -1480,6 +1480,21 @@
           "children": []
         },
         {
+          "id": "window.process_explorer",
+          "kind": "normal",
+          "label": "Process Explorer",
+          "icon": "activity",
+          "shortcut": null,
+          "command": "window:process-explorer",
+          "role": null,
+          "enabled": true,
+          "visible": true,
+          "checked": false,
+          "danger": false,
+          "description": "What each plug-in costs: DSP share, latency, and its host process's memory and CPU",
+          "children": []
+        },
+        {
           "id": "window.virtual_speaker",
           "kind": "normal",
           "label": "Virtual Speaker",

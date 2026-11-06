@@ -240,6 +240,7 @@ mod tests {
             "window:audio-jam",
             "window:extensions",
             "window:performance",
+            "window:process-explorer",
             "window:virtual-speaker",
             "panel:toggle-bottom",
         ] {

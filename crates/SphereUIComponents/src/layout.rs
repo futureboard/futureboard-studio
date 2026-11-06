@@ -2918,6 +2918,7 @@ impl StudioLayout {
             "window:performance" | "view:performance" => {
                 self.open_performance_window(owner_bounds, cx)
             }
+            "window:process-explorer" => self.open_process_explorer_window(owner_bounds, cx),
             "window:virtual-speaker" => self.open_virtual_speaker_window(owner_bounds, cx),
             #[cfg(feature = "gpu-renderer")]
             command

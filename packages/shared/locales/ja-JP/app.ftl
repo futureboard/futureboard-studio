@@ -508,6 +508,7 @@ menu.window-lyric_editor_panel = 右ドックに歌詞エディター
 menu.window-maximize = 最大化
 menu.window-minimize = 最小化
 menu.window-performance = パフォーマンスモニター
+menu.window-process_explorer = プロセスエクスプローラー
 menu.window-virtual_speaker = バーチャルスピーカー
 menu.window-visualizer = ビジュアライザー
 menu.window-visualizer-spectrum = スペクトラム

@@ -512,6 +512,7 @@ menu.window-lyric_editor_panel = Lyric Editor in Right Dock
 menu.window-maximize = Maximize
 menu.window-minimize = Minimize
 menu.window-performance = Performance Monitor
+menu.window-process_explorer = Process Explorer
 menu.window-virtual_speaker = Virtual Speaker
 menu.window-visualizer = Visualizer
 menu.window-visualizer-spectrum = Spectrum

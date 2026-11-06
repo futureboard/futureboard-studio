@@ -508,6 +508,7 @@ menu.window-lyric_editor_panel = Lyric Editor ใน Dock ขวา
 menu.window-maximize = ขยายหน้าต่าง
 menu.window-minimize = ย่อ
 menu.window-performance = Performance Monitor
+menu.window-process_explorer = Process Explorer
 menu.window-virtual_speaker = Virtual Speaker
 menu.window-visualizer = Visualizer
 menu.window-visualizer-spectrum = Spectrum

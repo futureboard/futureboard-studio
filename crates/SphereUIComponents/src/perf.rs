@@ -1216,6 +1216,18 @@ impl ResourceSampler {
     }
 }
 
+/// Working set (bytes) and total CPU time (kernel + user, in 100 ns units) of
+/// process `pid`, read now. For the Process Explorer, which turns two readings
+/// into a CPU share itself. `None` when the process cannot be opened.
+pub fn process_counters(pid: u32) -> Option<(u64, u64)> {
+    read_pid_counters(pid).map(|(memory, counters)| (memory, counters.cpu_100ns))
+}
+
+/// Logical cores, the denominator of a process's share of the machine.
+pub fn logical_cores() -> usize {
+    cpu_core_count()
+}
+
 /// Cores to divide CPU time by. Queried once — it does not change.
 fn cpu_core_count() -> usize {
     static CORES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();

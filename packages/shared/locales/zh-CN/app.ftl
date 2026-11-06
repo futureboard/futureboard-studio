@@ -508,6 +508,7 @@ menu.window-lyric_editor_panel = 右侧停靠歌词编辑器
 menu.window-maximize = 最大化
 menu.window-minimize = 最小化
 menu.window-performance = 性能监视器
+menu.window-process_explorer = 进程资源管理器
 menu.window-virtual_speaker = 虚拟扬声器
 menu.window-visualizer = 可视化器
 menu.window-visualizer-spectrum = 频谱

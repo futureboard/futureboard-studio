@@ -109,6 +109,7 @@ pub mod numeric_edit;
 pub mod panel;
 mod performance_overlay;
 pub mod performance_window;
+pub mod process_explorer_window;
 pub mod piano_roll;
 pub(crate) mod pitch_wheel;
 #[cfg(feature = "builtin-plugin-editor")]
