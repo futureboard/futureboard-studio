@@ -1398,6 +1398,7 @@ impl SessionPlugin for LivePlugin {
             eprintln!("[ARA] {plugin_name}: unbinding track {track_id}'s instance: {error}");
         }
         member.processor.set_destroy_reason("ara-member-left");
+        release_ara_instance(member.processor);
     }
 
     fn instance_for(&self, track_id: &str) -> Option<&DirectAudio::Vst3RuntimeProcessor> {
@@ -1482,9 +1483,43 @@ impl SessionPlugin for LivePlugin {
         drop(factory);
         for member in members {
             member.processor.set_destroy_reason("ara-unbound");
+            release_ara_instance(member.processor);
         }
         closed
     }
+}
+
+thread_local! {
+    /// ARA instances Studio has let go of, kept until no one else holds them
+    /// (see [`release_ara_instance`]).
+    static ARA_RELEASES: std::cell::RefCell<Vec<DirectAudio::Vst3RuntimeProcessor>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Let an ARA instance go, destroying it on this (the main) thread.
+///
+/// The engine holds handles to the same instance (its graph, its control
+/// thread's copy, the renderer graveyard), and the instance is destroyed by
+/// whichever drops last. Melodyne crashes when that is a worker thread, after
+/// its document is closed — which is what deleting an ARA clip did. So the
+/// main thread keeps a handle until it is the only one, and drops it then
+/// ([`drain_ara_releases`]).
+fn release_ara_instance(processor: DirectAudio::Vst3RuntimeProcessor) {
+    if processor.shared_handles() <= 1 {
+        drop(processor);
+        return;
+    }
+    ARA_RELEASES.with(|held| held.borrow_mut().push(processor));
+}
+
+/// Destroy the released ARA instances nothing else holds any more. Returns
+/// how many are still waiting. Main thread; from the ARA poll.
+pub(crate) fn drain_ara_releases() -> usize {
+    ARA_RELEASES.with(|held| {
+        let mut held = held.borrow_mut();
+        held.retain(|processor| processor.shared_handles() > 1);
+        held.len()
+    })
 }
 
 /// One ARA plug-in hosted on one track.

@@ -756,6 +756,9 @@ impl StudioLayout {
             self.ara_editor_popped_out = false;
             cx.notify();
         }
+        // Instances let go of earlier are destroyed here, on this thread, once
+        // the engine has dropped its handles too.
+        super::ara_ops::drain_ara_releases();
         if !self.ara.is_active() {
             return;
         }

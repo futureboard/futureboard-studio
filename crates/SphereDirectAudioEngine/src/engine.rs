@@ -1931,6 +1931,14 @@ impl EngineInner {
         track_id: String,
         renderers: Vec<crate::runtime::RuntimeAraRenderer>,
     ) -> Result<(), SphereAudioError> {
+        // The control thread's copy of the graph follows at once. It used to
+        // keep the old renderers until the next project sync replaced it, so
+        // an instance its host had already let go was destroyed there, on a
+        // sync worker thread and after its ARA document was closed — the
+        // crash deleting an ARA clip ended in.
+        self.runtime
+            .lock()
+            .set_ara_renderers(&track_id, renderers.clone());
         let mut mirror = self.ara_renderers.lock();
         if renderers.is_empty() {
             mirror.remove(&track_id);

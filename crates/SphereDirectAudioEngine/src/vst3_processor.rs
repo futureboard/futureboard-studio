@@ -1128,6 +1128,15 @@ impl Vst3RuntimeProcessor {
         self.inner.raw as usize
     }
 
+    /// How many handles share this instance, this one included. The instance
+    /// is destroyed, on whichever thread drops it, when the last one goes; a
+    /// host that must destroy it on a particular thread keeps one until this
+    /// reads 1.
+    #[inline]
+    pub fn shared_handles(&self) -> usize {
+        Arc::strong_count(&self.inner)
+    }
+
     #[inline]
     pub fn process_count(&self) -> u64 {
         if self.inner.raw.is_null() {
