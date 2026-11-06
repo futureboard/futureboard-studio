@@ -526,6 +526,7 @@ const components = [
   ["bottom-panel.tab.editor", "Editor"],
   ["bottom-panel.tab.effect-editor", "Effect Editor"],
   ["bottom-panel.mix-level", "Mix: 80%"],
+  ["bottom-panel.mixer-pop-out", "Open Mixer in a window"],
   ["bottom-panel.plugin.equalizer", "Equalizer"],
   ["bottom-panel.plugin.compressor", "Compressor"],
   ["bottom-panel.plugin.delay", "Delay Unit"],

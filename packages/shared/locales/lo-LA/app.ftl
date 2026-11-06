@@ -84,6 +84,7 @@ add-track.title = ແທຣັກໃໝ່
 ## Panels & Timeline
 
 bottom-panel.mix-level = ລະດັບການປະສົມ\: 80%
+bottom-panel.mixer-pop-out = ເປີດມິກເຊີໃນໜ້າຕ່າງແຍກ
 bottom-panel.plugin.compressor = ຄອມເພຣສເຊີ
 bottom-panel.plugin.delay = ເຄື່ອງເຮັດສຽງດີເລ
 bottom-panel.plugin.equalizer = ອີຄວໍໄລເຊີ

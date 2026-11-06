@@ -1,7 +1,9 @@
 //! Routes the bottom editor panel between AudioEditor, MidiEditor, and empty state.
 
+use std::rc::Rc;
+
 use gpui::{
-    div, px, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
+    div, px, App, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
     StatefulInteractiveElement, Styled, Subscription, Window,
 };
 use sphere_audio_editor::{editor_kind_for_clip, ClipEditorKind};
@@ -58,6 +60,12 @@ pub struct ClipEditorPanel {
     /// Last branch reported by the trace, so the choice is logged on change
     /// rather than every frame.
     traced: Option<&'static str>,
+    /// The MIDI editor is open in its own window. The dock does not show a
+    /// second piano roll of the same clip then — only where it went, and a
+    /// way to bring it back.
+    midi_popped_out: bool,
+    /// Brings the popped-out MIDI editor back into the dock.
+    on_dock_midi_editor: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
     _timeline_observer: Subscription,
 }
 
@@ -82,8 +90,23 @@ impl ClipEditorPanel {
             active_surface_tab: EditorSurfaceTab::default(),
             last_selection_target: None,
             traced: None,
+            midi_popped_out: false,
+            on_dock_midi_editor: None,
             _timeline_observer,
         }
+    }
+
+    /// Whether the MIDI editor is open in its own window (see
+    /// [`Self::midi_popped_out`]). Repaints only on a change.
+    pub(crate) fn set_midi_popped_out(&mut self, popped_out: bool, cx: &mut Context<Self>) {
+        if self.midi_popped_out != popped_out {
+            self.midi_popped_out = popped_out;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn set_on_dock_midi_editor(&mut self, on_dock: Rc<dyn Fn(&mut Window, &mut App)>) {
+        self.on_dock_midi_editor = Some(on_dock);
     }
 
     /// Used by the dock shell so the ARA pop-out affordance only appears when
@@ -175,17 +198,11 @@ impl ClipEditorPanel {
                     .and_then(|track_id| state.tracks.iter().find(|track| track.id == track_id))
             })
             .is_some_and(|track| track.ara.is_some());
-        let default_tab =
-            if audio_clip_selected && self.active_surface_tab == EditorSurfaceTab::Voxtune {
-                // Tuning one take after another: stay on the tuner.
-                EditorSurfaceTab::Voxtune
-            } else if audio_clip_selected {
-                EditorSurfaceTab::AudioEditor
-            } else if ara_track_selected {
-                EditorSurfaceTab::Ara
-            } else {
-                EditorSurfaceTab::AudioEditor
-            };
+        let default_tab = default_surface_tab(
+            audio_clip_selected,
+            ara_track_selected,
+            self.active_surface_tab,
+        );
         if self.active_surface_tab != default_tab {
             self.active_surface_tab = default_tab;
             if default_tab != EditorSurfaceTab::Ara {
@@ -312,6 +329,10 @@ impl Render for ClipEditorPanel {
                 self.trace("solfege");
                 self.solfege_editor.clone().into_any_element()
             }
+            ClipEditorKind::Midi if self.midi_popped_out => {
+                self.trace("midi-popped-out");
+                midi_popped_out_panel(self.on_dock_midi_editor.clone()).into_any_element()
+            }
             ClipEditorKind::Midi => {
                 self.trace("midi");
                 self.piano_roll.clone().into_any_element()
@@ -322,6 +343,98 @@ impl Render for ClipEditorPanel {
             }
         }
     }
+}
+
+/// The sub-tab a new selection lands on.
+///
+/// A clip on an ARA track is the plug-in's to edit — its document holds the
+/// clip's edits — so it opens on the ARA page, and so does every other clip
+/// picked or dragged on that track afterwards. Off ARA, audio opens the Audio
+/// Editor, unless the user is tuning take after take on the Voxtune tab.
+fn default_surface_tab(
+    audio_clip_selected: bool,
+    ara_track_selected: bool,
+    current: EditorSurfaceTab,
+) -> EditorSurfaceTab {
+    if ara_track_selected {
+        EditorSurfaceTab::Ara
+    } else if audio_clip_selected && current == EditorSurfaceTab::Voxtune {
+        EditorSurfaceTab::Voxtune
+    } else {
+        EditorSurfaceTab::AudioEditor
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_clip_on_an_ara_track_opens_the_ara_page() {
+        for current in EditorSurfaceTab::ALL {
+            assert_eq!(
+                default_surface_tab(true, true, current),
+                EditorSurfaceTab::Ara,
+                "from {current:?}"
+            );
+        }
+        assert_eq!(
+            default_surface_tab(false, true, EditorSurfaceTab::AudioEditor),
+            EditorSurfaceTab::Ara,
+            "a selected ARA track with no clip"
+        );
+    }
+
+    #[test]
+    fn plain_audio_opens_the_audio_editor_unless_tuning() {
+        assert_eq!(
+            default_surface_tab(true, false, EditorSurfaceTab::Ara),
+            EditorSurfaceTab::AudioEditor
+        );
+        assert_eq!(
+            default_surface_tab(true, false, EditorSurfaceTab::Voxtune),
+            EditorSurfaceTab::Voxtune
+        );
+    }
+}
+
+/// What the Editor tab shows while the MIDI editor is in its own window.
+fn midi_popped_out_panel(on_dock: Option<Rc<dyn Fn(&mut Window, &mut App)>>) -> impl IntoElement {
+    use crate::theme::{radius, space, typography};
+    let rest = Colors::surface_raised();
+    let hover = Colors::composite(rest, Colors::state_hover());
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(px(space::BASE))
+        .size_full()
+        .bg(Colors::surface_base())
+        .child(
+            div()
+                .text_size(px(typography::DENSE_LABEL))
+                .text_color(Colors::text_muted())
+                .child("The MIDI Editor is open in its own window."),
+        )
+        .children(on_dock.map(|on_dock| {
+            div()
+                .id("editor-dock-midi")
+                .flex()
+                .items_center()
+                .h(px(24.0))
+                .px(px(space::BASE))
+                .rounded(px(radius::CONTROL_SM))
+                .bg(rest)
+                .border(px(1.0))
+                .border_color(Colors::border_default())
+                .text_size(px(typography::DENSE_LABEL))
+                .text_color(Colors::text_primary())
+                .cursor(gpui::CursorStyle::PointingHand)
+                .hover(move |style| style.bg(hover))
+                .on_click(move |_, window, cx| on_dock(window, cx))
+                .child("Dock it here")
+        }))
 }
 
 fn empty_editor_panel() -> impl IntoElement {

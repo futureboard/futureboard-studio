@@ -138,6 +138,16 @@ impl Render for BottomPanelShell {
                 });
             });
 
+        // The mixer can leave the dock for a window of its own.
+        let mixer_owner = owner_entity.clone();
+        let on_pop_out_mixer: Arc<dyn Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static> =
+            Arc::new(move |_event, window, cx| {
+                let bounds = window.bounds();
+                let _ = mixer_owner.update(cx, |layout, cx| {
+                    layout.pop_out_docked_mixer(Some(bounds), cx);
+                });
+            });
+
         let owner_resize = self.owner.clone();
         let on_resize_start: Arc<dyn Fn(&gpui::MouseDownEvent, &mut Window, &mut App) + 'static> =
             Arc::new(move |event, window, cx| {
@@ -194,6 +204,7 @@ impl Render for BottomPanelShell {
                 on_tab_click,
                 on_close_panel,
                 show_ara_pop.then_some((ara_popped_out, on_toggle_ara_pop)),
+                matches!(active_tab, BottomTab::Mixer).then_some(on_pop_out_mixer),
                 I18n::from_app(cx),
             ))
             .child(
@@ -273,6 +284,7 @@ fn render_tab_bar(
         bool,
         Arc<dyn Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static>,
     )>,
+    mixer_pop: Option<Arc<dyn Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static>>,
     i18n: I18n,
 ) -> impl IntoElement {
     let _scope = crate::perf::PerfScope::enter("BottomPanelTabBar");
@@ -308,6 +320,26 @@ fn render_tab_bar(
                 .items_center()
                 .h_full()
                 .gap(px(space::HAIR))
+                .children(mixer_pop.map(|on_pop| {
+                    let label = i18n.tr_or("bottom-panel.mixer-pop-out", "Open Mixer in a window");
+                    icon_button(
+                        Some(assets::ICON_POP_OUT_PATH),
+                        "Open Mixer in a window",
+                        px(20.0),
+                        px(20.0),
+                        px(12.0),
+                        Colors::text_muted(),
+                    )
+                    .id("bottom-panel-mixer-pop")
+                    .role(Role::Button)
+                    .aria_label(label.clone())
+                    .tooltip(crate::components::controls::fb_tooltip(label))
+                    .focusable()
+                    .tab_stop(true)
+                    .focus_visible(|style| style.bg(Colors::surface_control_hover()))
+                    .cursor(gpui::CursorStyle::PointingHand)
+                    .on_click(move |event, window, cx| on_pop(event, window, cx))
+                }))
                 .children(ara_pop.map(|(popped_out, on_toggle)| {
                     let label = if popped_out {
                         "Dock plug-in editor"

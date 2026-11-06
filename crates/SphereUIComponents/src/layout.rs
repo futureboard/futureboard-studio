@@ -962,6 +962,16 @@ impl StudioLayout {
                 cx,
             )
         });
+        {
+            let layout = cx.entity();
+            let _ = clip_editor_panel.update(cx, |panel, _cx| {
+                panel.set_on_dock_midi_editor(std::rc::Rc::new(move |_window, cx| {
+                    StudioLayout::defer_update(&layout, cx, |this, cx| {
+                        this.dock_midi_editor(cx);
+                    });
+                }));
+            });
+        }
         let studio_entity = cx.entity();
         let mixer_tree_sidebar = cx.new(|cx| {
             components::MixerTreeSidebar::new(
@@ -1291,6 +1301,13 @@ impl StudioLayout {
                 })));
             });
         }
+        // A click on an audio clip brings the dock's Editor to the front (the
+        // ARA page on an ARA track). The observer runs after the timeline's
+        // update, so changing tabs here never nests entity updates.
+        cx.observe(&timeline, |this, _timeline, cx| {
+            this.follow_clip_selection_in_dock(cx);
+        })
+        .detach();
         {
             let target = cx.entity().clone();
             let _ = timeline.update(cx, |timeline, _cx| {

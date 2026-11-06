@@ -84,6 +84,7 @@ add-track.title = New Track
 ## Panels & Timeline
 
 bottom-panel.mix-level = Mix: 80%
+bottom-panel.mixer-pop-out = Open Mixer in a window
 bottom-panel.plugin.compressor = Compressor
 bottom-panel.plugin.delay = Delay Unit
 bottom-panel.plugin.equalizer = Equalizer

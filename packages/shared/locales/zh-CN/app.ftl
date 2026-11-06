@@ -84,6 +84,7 @@ add-track.title = 新建轨道
 ## Panels & Timeline
 
 bottom-panel.mix-level = 混音：80%
+bottom-panel.mixer-pop-out = 在新窗口中打开混音器
 bottom-panel.plugin.compressor = 压缩器
 bottom-panel.plugin.delay = 延迟单位
 bottom-panel.plugin.equalizer = 均衡器

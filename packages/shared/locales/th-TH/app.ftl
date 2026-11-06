@@ -84,6 +84,7 @@ add-track.title = เพิ่มแทร็กใหม่
 ## Panels & Timeline
 
 bottom-panel.mix-level = มิกซ์\: 80%
+bottom-panel.mixer-pop-out = เปิดมิกเซอร์ในหน้าต่างแยก
 bottom-panel.plugin.compressor = คอมเพรสเซอร์
 bottom-panel.plugin.delay = Delay
 bottom-panel.plugin.equalizer = อีควอไลเซอร์

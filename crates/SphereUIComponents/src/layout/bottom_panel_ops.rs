@@ -129,7 +129,46 @@ impl StudioLayout {
     /// silently die until the user clicks a control. See the reclaim guard in
     /// `studio_render`.
     pub(crate) fn docked_midi_editor_visible(&self) -> bool {
-        self.panels.bottom_docked && self.active_bottom_tab == BottomTab::Editor
+        // While the editor is in its own window the dock shows a placeholder
+        // there, not the docked piano roll.
+        self.panels.bottom_docked
+            && self.active_bottom_tab == BottomTab::Editor
+            && self.midi_editor.window.is_none()
+    }
+
+    /// Bring the dock's Editor to the front when the user selects an audio
+    /// clip.
+    ///
+    /// Runs on every timeline notify, so it only acts when the first selected
+    /// clip changes: the same selection re-notified (playback, a drag of the
+    /// clip) leaves a tab the user picked since alone. A hidden dock stays
+    /// hidden — a click selects, the double-click opens — and the Editor tab
+    /// itself chooses the ARA page for a clip on an ARA track
+    /// (`ClipEditorPanel::sync_surface_tab_to_selection`).
+    pub(crate) fn follow_clip_selection_in_dock(&mut self, cx: &mut Context<Self>) {
+        use crate::components::timeline::timeline_state::ClipType;
+        let (clip_id, is_audio) = {
+            let state = &self.timeline.read(cx).state;
+            match state.selection.selected_clip_ids.first() {
+                Some(clip_id) => {
+                    let is_audio = state
+                        .find_clip(clip_id)
+                        .is_some_and(|(_, clip)| matches!(clip.clip_type, ClipType::Audio { .. }));
+                    if self.dock_followed_clip.as_ref() == Some(clip_id) {
+                        return;
+                    }
+                    (Some(clip_id.clone()), is_audio)
+                }
+                None if self.dock_followed_clip.is_none() => return,
+                None => (None, false),
+            }
+        };
+        self.dock_followed_clip = clip_id;
+        if !is_audio || !self.panels.bottom_docked || self.active_bottom_tab == BottomTab::Editor {
+            return;
+        }
+        self.set_active_bottom_tab(BottomTab::Editor, cx);
+        cx.notify();
     }
 
     pub(crate) fn bottom_panel_state(&self) -> BottomPanelState {
@@ -158,6 +197,22 @@ impl StudioLayout {
         self.sync_timeline_chrome_metrics(cx);
         self.notify_status_bar(cx);
         cx.notify();
+    }
+
+    /// Move the mixer from the dock into its own window.
+    ///
+    /// The dock lets go of it — one mixer on screen, where the user put it —
+    /// and is hidden when the mixer was what it showed. The Mixer tab still
+    /// brings the docked one back.
+    pub(crate) fn pop_out_docked_mixer(
+        &mut self,
+        owner_bounds: Option<gpui::Bounds<gpui::Pixels>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_mixer_external_window(owner_bounds, cx);
+        if self.panels.bottom_docked && self.active_bottom_tab == BottomTab::Mixer {
+            self.close_bottom_panel(cx);
+        }
     }
 
     pub(crate) fn mixer_tree_sidebar_enabled(&self) -> bool {

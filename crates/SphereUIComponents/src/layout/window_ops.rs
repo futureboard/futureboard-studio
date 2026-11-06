@@ -3409,7 +3409,22 @@ impl StudioLayout {
             self.unregister_virtual_keyboard_window(handle.window_id(), cx);
             let _ = handle.update(cx, |_w, window, _cx| window.remove_window());
         }
+        self.sync_midi_editor_pop_out(cx);
         cx.notify();
+    }
+
+    /// Bring the popped-out MIDI editor back into the dock's Editor tab.
+    pub(crate) fn dock_midi_editor(&mut self, cx: &mut Context<Self>) {
+        self.close_midi_editor_window(cx);
+        self.show_bottom_panel_tab(crate::components::BottomTab::Editor, cx);
+    }
+
+    /// Tell the dock's Editor whether the MIDI editor is in its own window.
+    pub(super) fn sync_midi_editor_pop_out(&mut self, cx: &mut Context<Self>) {
+        let popped_out = self.midi_editor.window.is_some();
+        let _ = self
+            .clip_editor_panel
+            .update(cx, |panel, cx| panel.set_midi_popped_out(popped_out, cx));
     }
 
     pub(super) fn note_midi_editor_window_closed(
@@ -3426,6 +3441,7 @@ impl StudioLayout {
         ));
         self.unregister_virtual_keyboard_window(window_id, cx);
         self.midi_editor.window = None;
+        self.sync_midi_editor_pop_out(cx);
         cx.notify();
     }
 
@@ -3435,6 +3451,7 @@ impl StudioLayout {
         };
         if handle.update(cx, |_w, _window, _cx| ()).is_err() {
             self.midi_editor.window = None;
+            self.sync_midi_editor_pop_out(cx);
         }
     }
 }
