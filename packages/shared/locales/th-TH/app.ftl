@@ -848,6 +848,11 @@ settings.field.plugin-path-latency = เส้นทางปลั๊กอิ�
 settings.field.master-plugin-latency = ปลั๊กอินมาสเตอร์
 settings.field.pdc-status = การชดเชยดีเลย์
 settings.field.latency-compensation = การชดเชยดีเลย์ปลั๊กอิน
+settings.field.audioguard = Solfege Audioguard
+settings.hint.audioguard = ป้องกันเสียงขาดหาย\: เรนเดอร์ล่วงหน้าเมื่อไม่มีอะไรเล่นสด ปิดเสียงเมื่อเอาต์พุตผิดปกติหรือดังเกินควบคุม และข้ามปลั๊กอินที่ผิดพลาดซ้ำ ๆ ปิด \= เรนเดอร์ทุกบล็อกขณะเล่น
+settings.audioguard.off = ปิด
+settings.audioguard.normal = ปกติ (แนะนำ)
+settings.audioguard.high = สูง
 settings.section.latency-report = รายงานเลเทนซี
 settings.section.playback-latency = การเล่น > เลเทนซี
 settings.ltc.enable = เปิดตัวอ่าน LTC ที่อินพุต
