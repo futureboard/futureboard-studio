@@ -253,9 +253,12 @@ does the mounting; the mixer asks it on `/run/livestage/storage.sock`.
 
 ## Users and lock
 
-Until a user exists the web UI has no login: anyone who can reach port 8730
-controls the mixer. **Setup → Users** adds users, each with a name, a PIN
-(4–32 characters) and a role:
+Until a user exists there is no log-in, but a browser on another machine
+must first enter the **setup code**, shown on the console's home screen
+(tty1). The code is new at each boot, kept in `/run/livestage-setup-code`
+and rate-limited like a PIN. Enter it, then make the first user straight
+away. **Setup → Users** adds users, each with a name, a PIN (4–32
+characters) and a role:
 
 | Role | May |
 |------|-----|
@@ -303,8 +306,14 @@ The settings are kept in `/data/livestage/remote.json` (`--remote FILE`).
 
 ## Security
 
-With no users, the web UI has no login: anyone who can reach port 8730
-controls the mixer. Add users (above), keep the machine on the show's own
-network, or close the web UI to this machine in the setup ("Open to: This
-machine only"). The web UI and OSC are plain, unencrypted HTTP and UDP: PINs
-cross the network in the clear.
+With no users, anyone who has the setup code controls the mixer. Add users
+(above), keep the machine on the show's own network, or close the web UI to
+this machine in the setup ("Open to: This machine only"). The web UI and OSC
+are plain, unencrypted HTTP and UDP, so PINs and the setup code cross the
+network in the clear. OSC needs no log-in at all.
+
+The web UI answers only to its IP addresses, `NAME.local`, the machine's name
+and `localhost`. That stops a website from pointing its own name at the
+mixer (DNS rebinding). To reach it by another name (a DNS name, a reverse
+proxy), add `--web-host NAME` to `LIVESTAGE_ARGS` in
+`/var/lib/livestage/livestage.conf`.

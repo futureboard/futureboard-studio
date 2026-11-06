@@ -17,7 +17,7 @@ import {
 import { HistoryButtons, SaveControls, useUndoKeys } from './EditBar.tsx'
 import { EffectPicker, InsertEditor } from './Inserts.tsx'
 import { LockButton, LockOverlay, UserChip } from './Lock.tsx'
-import { LoginScreen } from './Login.tsx'
+import { LoginScreen, SetupCodeScreen } from './Login.tsx'
 import type { InsertTarget } from './Mixer.tsx'
 import { Mixer } from './Mixer.tsx'
 import { MyMixPage, mixFromHash, mixHash } from './MyMix.tsx'
@@ -124,6 +124,14 @@ function clock(seconds: number): string {
 export function App() {
   const auth = useStore((s) => s.auth)
   const notice = useStore((s) => s.notice)
+  if (auth?.mode === 'setup') {
+    return (
+      <>
+        <SetupCodeScreen />
+        <Toast notice={notice} />
+      </>
+    )
+  }
   if (auth?.mode === 'users' && !auth.user) {
     return (
       <>

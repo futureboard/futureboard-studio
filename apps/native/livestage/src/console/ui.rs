@@ -121,6 +121,8 @@ struct Status {
     links: Vec<(String, Option<(String, Option<f32>)>)>,
     mixer: ServiceState,
     mixer_line: Option<String>,
+    /// What a browser elsewhere enters while there are no web users.
+    setup_code: Option<String>,
     storage: StorageState,
     config: SetupConfig,
     password: PasswordState,
@@ -141,6 +143,7 @@ impl Status {
             links,
             mixer: system.service("livestage"),
             mixer_line: system.mixer_summary(),
+            setup_code: system.setup_code(),
             storage: storage.state(system),
             config: system.load_config().unwrap_or_default(),
             password: system.password(),
@@ -722,6 +725,22 @@ impl App {
                 "",
                 vec![Span::raw(format!("http://{}.local:{port}/", status.name))],
             ));
+        }
+        // Until a web user exists, a browser on another machine is let in
+        // only with this code.
+        if config.web_open {
+            if let Some(code) = &status.setup_code {
+                lines.push(row(
+                    "Setup code",
+                    vec![
+                        Span::styled(code.clone(), Style::new().bold()),
+                        Span::styled(
+                            "  (first visit, until a web user is made)",
+                            Style::new().fg(DIM),
+                        ),
+                    ],
+                ));
+            }
         }
         lines.push(Line::raw(""));
 

@@ -15,6 +15,10 @@ pub const SETUP_CONF: &str = "/var/lib/livestage/setup.conf";
 const LIVESTAGE_CONF: &str = "/var/lib/livestage/livestage.conf";
 const DEFAULT_SESSION: &str = "/data/livestage/show.json";
 pub const LOG: &str = "/var/log/livestage.log";
+/// The web UI's setup code for this boot, made by the service's start
+/// (`/etc/init.d/livestage`): what a browser on another machine enters
+/// while the mixer has no users.
+pub const SETUP_CODE: &str = "/run/livestage-setup-code";
 const ZONEINFO: &str = "/usr/share/zoneinfo";
 
 #[derive(Clone)]
@@ -587,6 +591,24 @@ impl System {
     }
 
     /// The server's line about the interface it opened, the latest one.
+    /// This boot's setup code (see [`SETUP_CODE`]), as `1234 5678`; `None`
+    /// before the service made one, or when the file is not a code.
+    pub fn setup_code(&self) -> Option<String> {
+        let text = self.read(SETUP_CODE)?;
+        let code = text.trim();
+        if !(6..=32).contains(&code.len()) || !code.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let mut out = String::with_capacity(code.len() + code.len() / 4);
+        for (i, c) in code.chars().enumerate() {
+            if i > 0 && i % 4 == 0 {
+                out.push(' ');
+            }
+            out.push(c);
+        }
+        Some(out)
+    }
+
     pub fn mixer_summary(&self) -> Option<String> {
         let log = self.read(LOG)?;
         log.lines()

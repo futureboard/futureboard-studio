@@ -6,9 +6,9 @@
 // it. A kept token logs a reload straight back in (store.ts `resume`).
 
 import { useEffect, useRef, useState } from 'react'
-import { AudioLines, ChevronLeft, CircleAlert, Delete, LoaderCircle, LogIn, UserRound, WifiOff } from 'lucide-react'
+import { AudioLines, ChevronLeft, CircleAlert, Delete, KeyRound, LoaderCircle, LogIn, UserRound, WifiOff } from 'lucide-react'
 import type { Role, UserSummary } from './protocol.ts'
-import { login, useStore } from './store.ts'
+import { login, sendSetupCode, useStore } from './store.ts'
 import './access.css'
 
 export const PIN_MIN = 4
@@ -116,6 +116,70 @@ export function PinPad(props: {
         >
           {busy ? <LoaderCircle size={18} className="spin" /> : props.submitLabel}
         </button>
+      </div>
+    </div>
+  )
+}
+
+/** No users yet, and this page is on another machine than a server open to
+ *  the network: the setup code shown on the LiveStage machine (its screen,
+ *  or the server's log) lets it in, to make the first admin. */
+export function SetupCodeScreen() {
+  const connection = useStore((s) => s.connection)
+  const [code, setCode] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const submit = async () => {
+    if (busy) return
+    setBusy(true)
+    setError(null)
+    const refused = await sendSetupCode(code)
+    setBusy(false)
+    setCode('')
+    if (refused) setError(refused)
+  }
+
+  return (
+    <div className="login">
+      <div className="login-card">
+        <header className="login-head">
+          <span className="brand-mark">
+            <AudioLines size={16} strokeWidth={2.25} />
+          </span>
+          <div className="login-title">
+            <strong>LiveStage</strong>
+            <span>Enter the setup code</span>
+          </div>
+          <span className={`status-pill link link-${connection}`}>
+            <span className="link-dot" />
+            {connection === 'open' ? 'Live' : connection === 'connecting' ? 'Connecting' : 'Offline'}
+          </span>
+        </header>
+        {connection !== 'open' ? (
+          <div className="login-wait">
+            <WifiOff size={18} /> Waiting for the LiveStage server…
+          </div>
+        ) : (
+          <div className="login-pin">
+            <PinPad
+              value={code}
+              onChange={(v) => {
+                setCode(v)
+                if (v.length > 0) setError(null)
+              }}
+              onSubmit={() => void submit()}
+              busy={busy}
+              error={error}
+              submitLabel="Continue"
+              label="Setup code"
+            />
+          </div>
+        )}
+        <p className="login-foot">
+          <KeyRound size={12} /> There are no users yet. The code is on the LiveStage machine&apos;s screen (or in its
+          log). Once in, create an admin user in Setup → Users.
+        </p>
       </div>
     </div>
   )

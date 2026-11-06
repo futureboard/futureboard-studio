@@ -417,14 +417,14 @@ export function keepToken(token: string | null) {
 function takeAuth(message: AuthMessage) {
   const auth: AuthMessage = {
     type: 'auth',
-    mode: message.mode === 'users' ? 'users' : 'open',
+    mode: message.mode === 'users' || message.mode === 'setup' ? message.mode : 'open',
     users: Array.isArray(message.users) ? message.users : [],
     user: message.user ? { ...message.user, mixes: Array.isArray(message.user.mixes) ? message.user.mixes : [] } : null,
     locked: message.locked === true,
   }
   const patch: Partial<State> = { auth }
   // Logged out (or never in): what an earlier login showed must not linger.
-  if (auth.mode === 'users' && !auth.user) {
+  if ((auth.mode === 'users' && !auth.user) || auth.mode === 'setup') {
     lastSessionText = null
     Object.assign(patch, {
       session: null,
@@ -440,6 +440,29 @@ function takeAuth(message: AuthMessage) {
     meters.clear()
   }
   setState(patch)
+  // A reconnect asks for the code again: send the one that worked, once.
+  if (auth.mode === 'setup' && setupCode !== null && !setupResending) {
+    const code = setupCode
+    setupResending = true
+    void request({ cmd: 'setup', code }).then((reply) => {
+      setupResending = false
+      if (!reply.ok && reply.error !== 'disconnected' && reply.error !== 'not connected') setupCode = null
+    })
+  }
+}
+
+/** The setup code that let this page in, for reconnects; never stored on
+ *  the device (a reload asks for it again). */
+let setupCode: string | null = null
+let setupResending = false
+
+/** Send the setup code (open mode, a server open to the network). Null, or
+ *  why not. */
+export async function sendSetupCode(code: string): Promise<string | null> {
+  const reply = await request({ cmd: 'setup', code })
+  if (!reply.ok) return explain(reply.error)
+  setupCode = code
+  return null
 }
 
 /** Offer the kept token: logs this connection back in (and back into a

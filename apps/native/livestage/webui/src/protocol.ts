@@ -422,8 +422,10 @@ export interface AuthUser {
 /** `{"type":"auth",…}`: sent on connect and whenever it changes. */
 export interface AuthMessage {
   type: 'auth'
-  /** `open`: no users exist, every client is an admin without a login. */
-  mode: 'open' | 'users'
+  /** `open`: no users exist, every client is an admin without a login.
+   *  `setup`: no users exist, but this page is on another machine than a
+   *  server open to the network: it sends the setup code first. */
+  mode: 'open' | 'users' | 'setup'
   users: UserSummary[]
   user: AuthUser | null
   locked: boolean
@@ -870,6 +872,7 @@ export type Command =
   // Users, roles and lock (Phase 4).
   | { cmd: 'auth' }
   | { cmd: 'login'; name: string; pin: string }
+  | { cmd: 'setup'; code: string }
   | { cmd: 'resume'; token: string }
   | { cmd: 'logout' }
   | { cmd: 'users' }
@@ -917,6 +920,7 @@ export const READ_ONLY_COMMANDS: ReadonlySet<string> = new Set([
   'auth',
   'users',
   'login',
+  'setup',
   'resume',
   'logout',
   'unlock',

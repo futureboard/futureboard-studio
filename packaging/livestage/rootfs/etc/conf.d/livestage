@@ -10,10 +10,17 @@
 # /data/livestage/recordings. Set, this folder always, whatever is chosen.
 #LIVESTAGE_RECORDINGS="/data/livestage/recordings"
 
-# The web UI's address. 0.0.0.0 is every network interface: anyone who can
-# reach this machine on the network can control the mixer. 127.0.0.1 keeps it
-# to this machine.
+# The web UI's address. 0.0.0.0 is every network interface; 127.0.0.1 keeps
+# it to this machine. On the network, until a web user exists, a browser
+# needs the setup code shown on tty1 to get in: create an admin user (Setup
+# → Users) first thing, then everyone logs in with a name and PIN.
 #LIVESTAGE_HTTP="0.0.0.0:8730"
+
+# A browser must reach the web UI by an IP address, NAME.local or this
+# machine's name; any other name is refused (that stops a website from
+# pointing its own name here). Add other names, one --web-host each, to
+# LIVESTAGE_ARGS, for example:
+#   --web-host mixer.example.org
 
 # More livestage-server arguments, for example:
 #   --output "hw:CARD=USB" --input "hw:CARD=USB" --rate 48000 --buffer 128

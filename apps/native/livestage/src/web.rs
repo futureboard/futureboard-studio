@@ -7,18 +7,26 @@
 //! [`Inbound`] messages, and what the loop has to say comes back through a
 //! bounded outbox. A client that stops reading fills its outbox and is
 //! dropped rather than holding up the loop; the page reconnects and starts
-//! over from a fresh snapshot.
+//! over from a fresh snapshot. The other way round, a client that sends
+//! faster than the loop takes its frames is dropped too (see [`Queued`]).
+//!
+//! Every request must name this server in its `Host`: an IP address,
+//! `localhost`, this machine's own name (and `NAME.local`), or a name given
+//! with `--web-host`. A page on some website that points its own name at
+//! this machine (DNS rebinding) sends that name, and is refused before the
+//! `Origin` check could be fooled by it.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Sender, SyncSender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use builtin_ui_embed::EmbeddedUiAssetTable;
 use tungstenite::Message;
+use tungstenite::protocol::WebSocketConfig;
 
 mod assets {
     include!(concat!(env!("OUT_DIR"), "/embedded_ui_assets.rs"));
@@ -34,8 +42,9 @@ pub enum Inbound {
     Stdin(String),
     /// stdin closed: whoever drove the server is gone.
     StdinClosed,
-    /// A text frame from a web client.
-    Web(ClientId, String),
+    /// A text frame from a web client, counted against its backlog until
+    /// the [`Queued`] is dropped.
+    Web(ClientId, String, Queued),
     /// A web client connected from that address; what is sent into the
     /// outbox reaches it.
     Joined(ClientId, SyncSender<String>, Option<IpAddr>),
@@ -55,18 +64,114 @@ const POLL: Duration = Duration::from_millis(8);
 const MAX_HEAD: usize = 16 * 1024;
 /// Connections served at once; more are turned away.
 const MAX_CONNECTIONS: usize = 64;
+/// Connections from one address at once (this machine's own excepted), so
+/// one client cannot take every slot.
+const MAX_PER_PEER: usize = 16;
+/// The largest WebSocket message (and frame) taken. Commands are small
+/// JSON; nothing the page sends comes near this.
+const MAX_MESSAGE: usize = 1024 * 1024;
+/// Bytes of one client's frames waiting for the command loop. More than
+/// this and the client is sending faster than the loop can take: dropped.
+const MAX_BACKLOG: usize = 4 * 1024 * 1024;
 
 /// Whether the page was embedded into this build.
 pub fn has_assets() -> bool {
     ASSETS.index().is_some()
 }
 
+/// A frame on its way to the command loop: its bytes count against the
+/// sending connection's backlog until this is dropped (when the loop is
+/// done with it).
+pub struct Queued {
+    backlog: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl Queued {
+    /// Count `bytes` more against `backlog`; `None` when that would go past
+    /// [`MAX_BACKLOG`].
+    fn take(backlog: &Arc<AtomicUsize>, bytes: usize) -> Option<Self> {
+        let before = backlog.fetch_add(bytes, Ordering::AcqRel);
+        if before.saturating_add(bytes) > MAX_BACKLOG {
+            backlog.fetch_sub(bytes, Ordering::AcqRel);
+            return None;
+        }
+        Some(Self {
+            backlog: backlog.clone(),
+            bytes,
+        })
+    }
+}
+
+impl Drop for Queued {
+    fn drop(&mut self) {
+        self.backlog.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+/// The names a request's `Host` may carry besides IP addresses, `localhost`
+/// and this machine's own name: `--web-host`'s, lower-cased.
+type Names = Arc<Vec<String>>;
+
+/// Open connections per peer address, for [`MAX_PER_PEER`].
+type PerPeer = Arc<Mutex<HashMap<IpAddr, usize>>>;
+
+/// One open connection from `peer`, counted in [`PerPeer`] until dropped.
+struct PeerSlot {
+    counts: PerPeer,
+    peer: Option<IpAddr>,
+}
+
+impl PeerSlot {
+    /// `None`: `peer` already has [`MAX_PER_PEER`] connections open.
+    fn take(counts: &PerPeer, peer: Option<IpAddr>) -> Option<Self> {
+        let peer = peer.map(|p| p.to_canonical());
+        // This machine (a browser here, or a proxy in front) is never
+        // limited this way.
+        let counted = peer.filter(|p| !p.is_loopback());
+        if let Some(peer) = counted {
+            let mut map = counts.lock().unwrap_or_else(|e| e.into_inner());
+            let n = map.entry(peer).or_insert(0);
+            if *n >= MAX_PER_PEER {
+                return None;
+            }
+            *n += 1;
+        }
+        Some(Self {
+            counts: counts.clone(),
+            peer: counted,
+        })
+    }
+}
+
+impl Drop for PeerSlot {
+    fn drop(&mut self) {
+        let Some(peer) = self.peer else {
+            return;
+        };
+        let mut map = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = map.get_mut(&peer) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                map.remove(&peer);
+            }
+        }
+    }
+}
+
 /// Listen on `addr` and serve until the process ends. Returns the address
-/// actually bound (port 0 picks one).
-pub fn serve(addr: SocketAddr, inbound: Sender<Inbound>) -> io::Result<SocketAddr> {
+/// actually bound (port 0 picks one). `names`: what `--web-host` added to
+/// the names a request may reach this server by.
+pub fn serve(
+    addr: SocketAddr,
+    inbound: Sender<Inbound>,
+    names: Vec<String>,
+) -> io::Result<SocketAddr> {
     let listener = TcpListener::bind(addr)?;
     let bound = listener.local_addr()?;
     let open = Arc::new(AtomicUsize::new(0));
+    let names: Names = Arc::new(names);
+    let per_peer: PerPeer = Arc::default();
     std::thread::Builder::new()
         .name("livestage-web".to_string())
         .spawn(move || {
@@ -79,16 +184,23 @@ pub fn serve(addr: SocketAddr, inbound: Sender<Inbound>) -> io::Result<SocketAdd
                     let _ = respond(&mut stream, 503, "Service Unavailable", &[], b"busy");
                     continue;
                 }
+                let Some(slot) = PeerSlot::take(&per_peer, stream.peer_addr().ok().map(|a| a.ip()))
+                else {
+                    let _ = respond(&mut stream, 503, "Service Unavailable", &[], b"busy");
+                    continue;
+                };
                 let id = next_id;
                 next_id += 1;
                 let inbound = inbound.clone();
+                let names = names.clone();
                 open.fetch_add(1, Ordering::Relaxed);
                 let spawned = std::thread::Builder::new()
                     .name("livestage-web-conn".to_string())
                     .spawn({
                         let open = open.clone();
                         move || {
-                            connection(stream, id, &inbound);
+                            connection(stream, id, &inbound, &names);
+                            drop(slot);
                             open.fetch_sub(1, Ordering::Relaxed);
                         }
                     });
@@ -100,7 +212,89 @@ pub fn serve(addr: SocketAddr, inbound: Sender<Inbound>) -> io::Result<SocketAdd
     Ok(bound)
 }
 
-fn connection(mut stream: TcpStream, id: ClientId, inbound: &Sender<Inbound>) {
+/// The host part of a `Host` header (or of `--web-host`): no port, no
+/// brackets around an IPv6 address, no trailing dot, lower-cased. `None`:
+/// not a host.
+pub fn host_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    let host = if let Some(rest) = value.strip_prefix('[') {
+        // [v6] or [v6]:port
+        let (inside, after) = rest.split_once(']')?;
+        if !(after.is_empty() || after.starts_with(':')) {
+            return None;
+        }
+        inside
+    } else {
+        match value.rsplit_once(':') {
+            // A bare IPv6 address has more than one colon: no port to take.
+            Some((host, port)) if !host.contains(':') => {
+                if !port.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                host
+            }
+            _ => value,
+        }
+    };
+    let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+    let valid = host
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':' | b'%'));
+    valid.then_some(host)
+}
+
+/// Whether a request's `Host` names this server (see the module notes).
+/// No `Host` at all is not a browser (every browser sends one): let in.
+fn host_allowed(host: Option<&str>, names: &[String], machine: Option<&str>) -> bool {
+    let Some(host) = host else {
+        return true;
+    };
+    let Some(host) = host_name(host) else {
+        return false;
+    };
+    if host.parse::<IpAddr>().is_ok() || host == "localhost" {
+        return true;
+    }
+    if let Some(machine) = machine.map(str::to_ascii_lowercase) {
+        if host == machine || host.strip_suffix(".local") == Some(machine.as_str()) {
+            return true;
+        }
+    }
+    names.iter().any(|name| *name == host)
+}
+
+/// This machine's name, as the network knows it (the appliance's setup
+/// sets it; `NAME.local` is what its mDNS answers to).
+fn machine_name() -> Option<String> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let mut buf = [0u8; 256];
+        // SAFETY: the buffer is as long as said; gethostname writes at most
+        // that much and the name ends at the first NUL (or the buffer's end).
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+        if rc != 0 {
+            return None;
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        let name = std::str::from_utf8(&buf[..end]).ok()?.trim();
+        // A fully qualified name: its first label is the machine's.
+        let name = name.split('.').next().unwrap_or(name);
+        (!name.is_empty()).then(|| name.to_string())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        std::env::var("COMPUTERNAME")
+            .ok()
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty())
+    }
+}
+
+const WRONG_HOST_PAGE: &[u8] =
+    b"This LiveStage server does not answer to that name. Open it by its \
+IP address or NAME.local, or start the server with --web-host NAME for this name.";
+
+fn connection(mut stream: TcpStream, id: ClientId, inbound: &Sender<Inbound>, names: &[String]) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_nodelay(true);
@@ -111,6 +305,17 @@ fn connection(mut stream: TcpStream, id: ClientId, inbound: &Sender<Inbound>) {
         let _ = respond(&mut stream, 400, "Bad Request", &[], b"bad request");
         return;
     };
+    // Asked for by name each time: the appliance's setup may rename it.
+    if !host_allowed(request.header("host"), names, machine_name().as_deref()) {
+        let _ = respond(
+            &mut stream,
+            421,
+            "Misdirected Request",
+            &[("Content-Type", "text/plain; charset=utf-8")],
+            WRONG_HOST_PAGE,
+        );
+        return;
+    }
     if request.path == "/ws" && request.wants_websocket() {
         // A page on another site must not drive the mixer through the
         // browser of someone who has it open.
@@ -270,7 +475,12 @@ fn write_head(
     for (name, value) in headers {
         head.push_str(&format!("{name}: {value}\r\n"));
     }
-    head.push_str("X-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n");
+    // Never inside another site's frame, where a page could trick a click
+    // onto the mixer.
+    head.push_str(
+        "X-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\n\
+         Content-Security-Policy: frame-ancestors 'none'\r\nConnection: close\r\n\r\n",
+    );
     stream.write_all(head.as_bytes())
 }
 
@@ -321,9 +531,13 @@ fn is_timeout(error: &tungstenite::Error) -> bool {
 }
 
 fn websocket(stream: Replay, id: ClientId, inbound: &Sender<Inbound>) {
-    let Ok(mut ws) = tungstenite::accept(stream) else {
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(MAX_MESSAGE))
+        .max_frame_size(Some(MAX_MESSAGE));
+    let Ok(mut ws) = tungstenite::accept_with_config(stream, Some(config)) else {
         return;
     };
+    let backlog = Arc::new(AtomicUsize::new(0));
     // Short reads from here on: between frames the thread drains its outbox.
     let _ = ws.get_ref().stream.set_read_timeout(Some(POLL));
     let (outbox, pending) = std::sync::mpsc::sync_channel::<String>(OUTBOX);
@@ -335,7 +549,15 @@ fn websocket(stream: Replay, id: ClientId, inbound: &Sender<Inbound>) {
     'connection: loop {
         match ws.read() {
             Ok(Message::Text(text)) => {
-                if inbound.send(Inbound::Web(id, text.to_string())).is_err() {
+                // Sending faster than the loop takes it in: drop the client
+                // rather than let its frames pile up in memory.
+                let Some(queued) = Queued::take(&backlog, text.len()) else {
+                    break;
+                };
+                if inbound
+                    .send(Inbound::Web(id, text.to_string(), queued))
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -397,5 +619,82 @@ mod tests {
         let other =
             request("GET /ws HTTP/1.1\r\nHost: 127.0.0.1:8730\r\nOrigin: https://evil.example\r\n");
         assert!(!other.same_origin());
+    }
+
+    #[test]
+    fn host_names_lose_their_port_brackets_and_case() {
+        assert_eq!(host_name("10.0.0.5:8730").as_deref(), Some("10.0.0.5"));
+        assert_eq!(
+            host_name("LiveStage.local.:8730").as_deref(),
+            Some("livestage.local")
+        );
+        assert_eq!(host_name("[::1]:8730").as_deref(), Some("::1"));
+        assert_eq!(host_name("::1").as_deref(), Some("::1"));
+        assert_eq!(host_name("localhost").as_deref(), Some("localhost"));
+        assert_eq!(host_name("evil.example:80x"), None);
+        assert_eq!(host_name("a b"), None);
+        assert_eq!(host_name("[::1]x"), None);
+    }
+
+    #[test]
+    fn only_names_of_this_server_are_answered() {
+        let names = vec!["mixer.example.org".to_string()];
+        let machine = Some("LiveStage");
+        let allowed = |host: Option<&str>| host_allowed(host, &names, machine);
+        // Addresses, this machine's name, and what --web-host added.
+        for host in [
+            "10.0.0.5:8730",
+            "127.0.0.1:8730",
+            "[fe80::1]:8730",
+            "localhost:8730",
+            "livestage:8730",
+            "LIVESTAGE.local:8730",
+            "mixer.example.org",
+        ] {
+            assert!(allowed(Some(host)), "{host}");
+        }
+        // Not a browser.
+        assert!(allowed(None));
+        // A rebinding page sends its own name, whatever it resolves to.
+        for host in [
+            "evil.example:8730",
+            "livestage.evil.example",
+            "localhost.evil.example",
+            "other.local:8730",
+            "",
+        ] {
+            assert!(!allowed(Some(host)), "{host}");
+        }
+        assert!(!host_allowed(Some("livestage.local"), &[], None));
+    }
+
+    #[test]
+    fn a_backlog_refuses_past_its_limit_and_frees_as_frames_are_handled() {
+        let backlog = Arc::new(AtomicUsize::new(0));
+        let first = Queued::take(&backlog, MAX_BACKLOG - 10).unwrap();
+        assert!(Queued::take(&backlog, 11).is_none());
+        assert_eq!(backlog.load(Ordering::Relaxed), MAX_BACKLOG - 10);
+        let second = Queued::take(&backlog, 10).unwrap();
+        drop(first);
+        drop(second);
+        assert_eq!(backlog.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn one_address_cannot_take_every_connection() {
+        let counts: PerPeer = Arc::default();
+        let peer: IpAddr = "10.0.0.9".parse().unwrap();
+        let slots: Vec<_> = (0..MAX_PER_PEER)
+            .map(|_| PeerSlot::take(&counts, Some(peer)).unwrap())
+            .collect();
+        assert!(PeerSlot::take(&counts, Some(peer)).is_none());
+        assert!(PeerSlot::take(&counts, Some("10.0.0.10".parse().unwrap())).is_some());
+        // This machine is never limited.
+        let local: Vec<_> = (0..MAX_PER_PEER + 1)
+            .map(|_| PeerSlot::take(&counts, Some("127.0.0.1".parse().unwrap())))
+            .collect();
+        assert!(local.iter().all(Option::is_some));
+        drop(slots);
+        assert!(PeerSlot::take(&counts, Some(peer)).is_some());
     }
 }

@@ -112,12 +112,18 @@ struct Options {
     users: Option<PathBuf>,
     /// The remote (OSC/MIDI) settings file; `None`: next to the session file.
     remote: Option<PathBuf>,
+    /// Names, besides IP addresses, `localhost` and this machine's own name,
+    /// that browsers may use to reach the web UI (`--web-host`).
+    web_hosts: Vec<String>,
+    /// Where the setup code is read from (`--setup-code-file`); `None`: a
+    /// new one each start.
+    setup_code_file: Option<PathBuf>,
 }
 
 const USAGE: &str = "usage: livestage-server [--session FILE] [--host NAME] [--input DEVICE] \
 [--output DEVICE] [--rate HZ] [--buffer FRAMES] [--record-dir DIR] [--http ADDR:PORT | --no-http] \
-[--library FILE] [--users FILE] [--remote FILE] [--autosave-seconds N] [--daemon] [--no-autosave] \
-[--list-devices]
+[--library FILE] [--users FILE] [--remote FILE] [--web-host NAME]... [--setup-code-file FILE] \
+[--autosave-seconds N] [--daemon] [--no-autosave] [--list-devices]
 
   --session FILE        the show: loaded at start, saved atomically (FILE.bak keeps the one before)
   --library FILE        the strip library, kept across shows (default: library.json next to the
@@ -131,6 +137,12 @@ const USAGE: &str = "usage: livestage-server [--session FILE] [--host NAME] [--i
                         it is also saved right after a scene is stored, and on the way out
   --no-autosave         never save the session without being asked
   --http ADDR:PORT      the web UI (default 127.0.0.1:8730); --no-http for none
+  --web-host NAME       another name browsers reach the web UI by (a DNS name, a reverse proxy's);
+                        IP addresses, localhost, this machine's name and NAME.local always work.
+                        Any other name in a request is refused, which stops DNS rebinding
+  --setup-code-file FILE  the setup code (6-32 digits) a browser on another machine enters before
+                        it is let in while there are no users; without it, a new code is made at
+                        each start and printed here. Only used when --http is not loopback
   --daemon              no stdin; stop with SIGINT or SIGTERM";
 
 fn parse_args() -> Result<Options, String> {
@@ -150,6 +162,8 @@ fn parse_args() -> Result<Options, String> {
         library: None,
         users: None,
         remote: None,
+        web_hosts: Vec::new(),
+        setup_code_file: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -193,6 +207,16 @@ fn parse_args() -> Result<Options, String> {
             "--library" => options.library = Some(PathBuf::from(value("--library")?)),
             "--users" => options.users = Some(PathBuf::from(value("--users")?)),
             "--remote" => options.remote = Some(PathBuf::from(value("--remote")?)),
+            "--web-host" => {
+                let name = value("--web-host")?;
+                let name = web::host_name(&name)
+                    .filter(|n| !n.is_empty())
+                    .ok_or("--web-host needs a name like mixer.example.org")?;
+                options.web_hosts.push(name);
+            }
+            "--setup-code-file" => {
+                options.setup_code_file = Some(PathBuf::from(value("--setup-code-file")?))
+            }
             "-h" | "--help" => return Err(USAGE.to_string()),
             other => return Err(format!("unknown argument {other}\n{USAGE}")),
         }
@@ -284,7 +308,8 @@ fn main() {
     }
     // A users file that cannot be read stops the server: going on in open
     // mode would hand the mixer to anyone on the network.
-    let users = match users::Users::open(beside_session(&options, &options.users, "users.json")) {
+    let mut users = match users::Users::open(beside_session(&options, &options.users, "users.json"))
+    {
         Ok(users) => users,
         Err(error) => {
             eprintln!("[livestage] {error} (fix it, or remove it to let every web client in)");
@@ -292,7 +317,10 @@ fn main() {
         }
     };
     if users.open_mode() {
-        eprintln!("[livestage] no users: every web client has full control");
+        eprintln!(
+            "[livestage] no users: every web client has full control (on the network, after the \
+             setup code)"
+        );
     } else {
         eprintln!(
             "[livestage] {} users: the web UI asks for a name and PIN",
@@ -315,14 +343,29 @@ fn main() {
         spawn_stdin_reader(inbound_tx.clone());
     }
     if let Some(addr) = options.http {
-        match web::serve(addr, inbound_tx.clone()) {
+        match web::serve(addr, inbound_tx.clone(), options.web_hosts.clone()) {
             Ok(bound) => {
                 eprintln!("[livestage] web UI on http://{bound}/");
                 if !bound.ip().is_loopback() {
-                    eprintln!(
-                        "[livestage] the web UI is open to the network: anyone who can reach \
-                         {bound} controls this mixer"
-                    );
+                    // Open to the network: with no users yet, whoever is
+                    // first there must not get the mixer (or make the first
+                    // admin) without the code shown on this machine.
+                    let code = match setup_code(options.setup_code_file.as_deref()) {
+                        Ok(code) => code,
+                        Err(error) => {
+                            eprintln!("[livestage] {error}");
+                            std::process::exit(1);
+                        }
+                    };
+                    if users.open_mode() {
+                        eprintln!(
+                            "[livestage] the web UI is open to the network and there are no \
+                             users: a browser on another machine needs the setup code {} \
+                             before it gets in; create an admin user there next",
+                            spaced_code(&code)
+                        );
+                    }
+                    users.require_setup_code(code);
                 }
                 if !web::has_assets() {
                     eprintln!("[livestage] (this build has no web UI page; /ws still works)");
@@ -446,7 +489,9 @@ fn main() {
                 }
             }
             Ok(Inbound::StdinClosed) => break,
-            Ok(Inbound::Web(id, text)) => {
+            // `_queued` counts against the connection's backlog until this
+            // arm is done with the frame.
+            Ok(Inbound::Web(id, text, _queued)) => {
                 let request = serde_json::from_str::<Value>(&text).ok();
                 let request_id = request.as_ref().and_then(request_tag);
                 // Logging in and out, the lock, and who may do what — before
@@ -526,6 +571,30 @@ fn library_path(options: &Options) -> Option<PathBuf> {
             .as_ref()
             .map(|session| session.with_file_name("library.json"))
     })
+}
+
+/// The setup code: read from `file` (`--setup-code-file`), else a new one.
+/// A file that is there but unreadable or not a code is an error: going on
+/// with another code would leave the one shown to the operator not working.
+fn setup_code(file: Option<&Path>) -> Result<String, String> {
+    let Some(file) = file else {
+        return Ok(users::new_setup_code());
+    };
+    let text = std::fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
+    users::parse_setup_code(&text)
+        .ok_or_else(|| format!("{}: not a setup code (6 to 32 digits)", file.display()))
+}
+
+/// `12345678` as `1234 5678`, easier to read off a screen.
+fn spaced_code(code: &str) -> String {
+    let mut out = String::with_capacity(code.len() + code.len() / 4);
+    for (i, c) in code.chars().enumerate() {
+        if i > 0 && i % 4 == 0 {
+            out.push(' ');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// `explicit` (from `--users`, `--remote`), else `name` next to the session
@@ -1828,6 +1897,8 @@ mod tests {
             library: None,
             users: None,
             remote: None,
+            web_hosts: Vec::new(),
+            setup_code_file: None,
         }
     }
 

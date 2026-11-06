@@ -6,6 +6,12 @@
 //! must be an admin; from then on a web client sees nothing but `auth`
 //! messages until it logs in (or resumes a token). stdin is always an admin.
 //!
+//! A server whose web UI is open to the network also has a **setup code**
+//! (see [`Users::require_setup_code`]): in open mode a client on another
+//! machine is let in only after it sends that code, so whoever is first on
+//! the network cannot take the mixer, or make the first admin, without it.
+//! Clients on this machine (loopback) need no code.
+//!
 //! PINs are kept as PBKDF2-HMAC-SHA256 hashes with a random salt, checked
 //! in constant time, and never sent back. Failed log-ins and unlocks are
 //! rate limited per peer address and per user name. Tokens live in this
@@ -42,6 +48,9 @@ const NAME_MAX: usize = 32;
 
 const WRONG_LOGIN: &str = "wrong name or PIN";
 const WRONG_PIN: &str = "wrong PIN";
+const WRONG_CODE: &str = "wrong setup code";
+/// Digits in a setup code made by [`new_setup_code`].
+pub const SETUP_CODE_DIGITS: usize = 8;
 const TOO_MANY: &str = "too many attempts \u{2014} wait 30 s";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +120,8 @@ struct Client {
     sent: Option<Value>,
     /// Whether it was last let in (sent the session and the rest).
     admitted: bool,
+    /// It sent the setup code (see [`Users::require_setup_code`]).
+    setup: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -182,6 +193,8 @@ pub struct Users {
     clients: HashMap<ClientId, Client>,
     failures: HashMap<Key, Vec<Instant>>,
     rounds: u32,
+    /// What a client on another machine sends before open mode lets it in.
+    setup_code: Option<String>,
 }
 
 impl Users {
@@ -211,6 +224,26 @@ impl Users {
             clients: HashMap::new(),
             failures: HashMap::new(),
             rounds,
+            setup_code: None,
+        }
+    }
+
+    /// From now on, while there are no users, a client that is not on this
+    /// machine must send `code` (`{"cmd":"setup","code":…}`) before it is
+    /// let in. Set when the web UI listens on the network.
+    pub fn require_setup_code(&mut self, code: String) {
+        self.setup_code = Some(code);
+    }
+
+    /// Open mode, a setup code, and `client` is elsewhere and has not sent
+    /// it: it waits at the setup-code screen.
+    fn setup_pending(&self, client: ClientId) -> bool {
+        if !self.open_mode() || self.setup_code.is_none() {
+            return false;
+        }
+        match self.clients.get(&client) {
+            Some(c) => !c.setup && !c.peer.is_some_and(|p| p.to_canonical().is_loopback()),
+            None => true,
         }
     }
 
@@ -240,6 +273,7 @@ impl Users {
                 token: None,
                 sent: None,
                 admitted: false,
+                setup: false,
             },
         );
     }
@@ -257,6 +291,9 @@ impl Users {
             .and_then(|t| self.tokens.get(t));
         let locked = token.is_some_and(|t| t.locked);
         if self.open_mode() {
+            if self.setup_pending(client) {
+                return None;
+            }
             return Some(Principal {
                 role: Role::Admin,
                 mixes: Vec::new(),
@@ -273,7 +310,7 @@ impl Users {
 
     /// Whether `client` is sent the session, the meters and the rest.
     pub fn admitted(&self, client: ClientId) -> bool {
-        self.open_mode() || self.principal(client).is_some()
+        self.principal(client).is_some()
     }
 
     fn client_user(&self, client: ClientId) -> Option<&User> {
@@ -282,15 +319,24 @@ impl Users {
     }
 
     /// `{"type":"auth","mode","users","user","locked"}` as `client` sees it.
+    /// `mode` is `open`, `users`, or `setup` (open mode, but this client
+    /// has to send the setup code first).
     pub fn auth_message(&self, client: ClientId) -> Value {
         let user = if self.open_mode() {
             None
         } else {
             self.client_user(client)
         };
+        let mode = if self.setup_pending(client) {
+            "setup"
+        } else if self.open_mode() {
+            "open"
+        } else {
+            "users"
+        };
         json!({
             "type": "auth",
-            "mode": if self.open_mode() { "open" } else { "users" },
+            "mode": mode,
             "users": self
                 .users
                 .iter()
@@ -380,7 +426,7 @@ impl Users {
         }
         // Before logging in: only log in.
         if let Some(client) = client {
-            if !self.admitted(client) && !matches!(cmd, "login" | "resume" | "auth") {
+            if !self.admitted(client) && !matches!(cmd, "login" | "resume" | "auth" | "setup") {
                 return Some(Outcome::reply(
                     json!({"ok": false, "error": "log in first", "denied": true}),
                 ));
@@ -401,13 +447,14 @@ impl Users {
                 json!({"ok": true, "mode": if self.open_mode() { "open" } else { "users" }}),
             ),
             ("login", Some(client)) => self.login(client, text("name"), text("pin"), now),
+            ("setup", Some(client)) => self.setup(client, text("code"), now),
             ("resume", Some(client)) => self.resume(client, text("token"), now),
             ("logout", Some(client)) => self.logout(client),
             ("lock", Some(client)) => {
                 self.lock(client, value.get("pin").and_then(Value::as_str), now)
             }
             ("unlock", Some(client)) => self.unlock(client, text("pin"), now),
-            ("login" | "resume" | "logout" | "lock" | "unlock", None) => web_only(cmd),
+            ("login" | "resume" | "logout" | "lock" | "unlock" | "setup", None) => web_only(cmd),
             ("users", _) => match self.admin(client) {
                 Ok(()) => Outcome::reply(json!({
                     "ok": true,
@@ -516,6 +563,35 @@ impl Users {
         self.succeeded(&keys);
         let token = self.new_token(client, Some(name), now);
         Outcome::changed(json!({"ok": true, "token": token, "user": view}))
+    }
+
+    /// The setup code: lets this client in while there are no users. Rate
+    /// limited like a PIN.
+    fn setup(&mut self, client: ClientId, code: &str, now: Instant) -> Outcome {
+        if !self.open_mode() {
+            return Outcome::error("there are users: log in with a name and PIN");
+        }
+        if !self.setup_pending(client) {
+            return Outcome::reply(json!({"ok": true}));
+        }
+        let keys = self.keys(client, None);
+        if self.blocked(&keys, now) {
+            return Outcome::error(TOO_MANY);
+        }
+        let expected = self.setup_code.as_deref().unwrap_or_default();
+        let given: String = code
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '-')
+            .collect();
+        if expected.is_empty() || !constant_time_eq(given.as_bytes(), expected.as_bytes()) {
+            self.failed(&keys, now);
+            return Outcome::error(WRONG_CODE);
+        }
+        self.succeeded(&keys);
+        if let Some(c) = self.clients.get_mut(&client) {
+            c.setup = true;
+        }
+        Outcome::changed(json!({"ok": true}))
     }
 
     fn resume(&mut self, client: ClientId, token: &str, now: Instant) -> Outcome {
@@ -863,6 +939,7 @@ impl Users {
 pub const FAMILY: &[&str] = &[
     "auth",
     "login",
+    "setup",
     "resume",
     "logout",
     "lock",
@@ -966,6 +1043,31 @@ fn musician_may(mixes: &[MixRef], cmd: &str, value: &Value) -> bool {
 }
 
 // ----- PIN hashing ------------------------------------------------------------
+
+/// A fresh setup code: [`SETUP_CODE_DIGITS`] random digits.
+pub fn new_setup_code() -> String {
+    let mut code = String::with_capacity(SETUP_CODE_DIGITS);
+    while code.len() < SETUP_CODE_DIGITS {
+        for b in random_bytes::<16>() {
+            // 250 is the largest multiple of 10 under 256: dropping the rest
+            // keeps every digit equally likely.
+            if b < 250 && code.len() < SETUP_CODE_DIGITS {
+                code.push(char::from(b'0' + b % 10));
+            }
+        }
+    }
+    code
+}
+
+/// A setup code read from a file or the environment: digits only (spaces
+/// and dashes dropped), 6 to 32 of them. `None`: not usable.
+pub fn parse_setup_code(text: &str) -> Option<String> {
+    let code: String = text
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .collect();
+    ((6..=32).contains(&code.len()) && code.bytes().all(|b| b.is_ascii_digit())).then_some(code)
+}
 
 fn check_pin(pin: &str) -> Result<(), String> {
     let n = pin.chars().count();
@@ -1143,6 +1245,99 @@ mod tests {
         }
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
         assert_eq!(base64_encode(b"fo"), "Zm8=");
+    }
+
+    #[test]
+    fn a_setup_code_keeps_other_machines_out_of_open_mode_until_sent() {
+        let now = Instant::now();
+        let mut u = users();
+        u.require_setup_code("12345678".to_string());
+        u.join(1, Some("10.0.0.7".parse().unwrap()));
+        u.join(2, Some("127.0.0.1".parse().unwrap()));
+        u.join(3, Some("::ffff:127.0.0.1".parse().unwrap()));
+        u.join(4, None);
+        // Another machine: nothing but the setup screen.
+        assert!(u.open_mode());
+        assert!(u.principal(1).is_none());
+        assert!(!u.admitted(1));
+        assert_eq!(u.auth_message(1)["mode"], "setup");
+        assert!(u.check(1, "set_audio", &json!({})).is_err());
+        let add = json!({"name": "Ann", "role": "admin", "pin": "1111"});
+        assert!(!ok(&u.command(Some(1), "user_add", &add, now).unwrap()));
+        assert!(!ok(&u
+            .command(Some(1), "lock", &json!({"pin": "9999"}), now)
+            .unwrap()));
+        // No peer address at all is not taken for this machine.
+        assert!(!u.admitted(4));
+        // This machine needs no code.
+        assert!(u.admitted(2) && u.admitted(3));
+        assert_eq!(u.auth_message(2)["mode"], "open");
+
+        let wrong = u
+            .command(Some(1), "setup", &json!({"code": "87654321"}), now)
+            .unwrap();
+        assert_eq!(wrong.reply["error"], WRONG_CODE);
+        assert!(!u.admitted(1));
+        // Spaces and dashes, as the code is shown, are fine.
+        let right = u
+            .command(Some(1), "setup", &json!({"code": "1234-5678"}), now)
+            .unwrap();
+        assert!(ok(&right) && right.changed);
+        assert!(u.admitted(1));
+        assert_eq!(u.auth_message(1)["mode"], "open");
+        assert_eq!(u.principal(1).unwrap().role, Role::Admin);
+        // Only that client: the next one from that machine sends it again.
+        u.join(5, Some("10.0.0.7".parse().unwrap()));
+        assert!(!u.admitted(5));
+
+        // Once there is a user, the code means nothing: log in instead.
+        assert!(ok(&u.command(Some(1), "user_add", &add, now).unwrap()));
+        assert!(!u.open_mode());
+        assert_eq!(u.auth_message(5)["mode"], "users");
+        assert!(!ok(&u
+            .command(Some(5), "setup", &json!({"code": "12345678"}), now)
+            .unwrap()));
+        assert!(!u.admitted(5));
+    }
+
+    #[test]
+    fn setup_codes_are_rate_limited_like_pins() {
+        let now = Instant::now();
+        let mut u = users();
+        u.require_setup_code("12345678".to_string());
+        u.join(1, Some("10.0.0.7".parse().unwrap()));
+        for _ in 0..FAIL_LIMIT {
+            let wrong = u
+                .command(Some(1), "setup", &json!({"code": "00000000"}), now)
+                .unwrap();
+            assert_eq!(wrong.reply["error"], WRONG_CODE);
+        }
+        let blocked = u
+            .command(Some(1), "setup", &json!({"code": "12345678"}), now)
+            .unwrap();
+        assert_eq!(blocked.reply["error"], TOO_MANY);
+        assert!(!u.admitted(1));
+        let later = now + FAIL_WAIT + Duration::from_secs(1);
+        assert!(ok(&u
+            .command(Some(1), "setup", &json!({"code": "12345678"}), later)
+            .unwrap()));
+    }
+
+    #[test]
+    fn setup_codes_are_digits() {
+        for _ in 0..50 {
+            let code = new_setup_code();
+            assert_eq!(code.len(), SETUP_CODE_DIGITS);
+            assert!(code.bytes().all(|b| b.is_ascii_digit()));
+            assert_eq!(parse_setup_code(&code).as_deref(), Some(code.as_str()));
+        }
+        assert_eq!(
+            parse_setup_code(" 1234-5678\n").as_deref(),
+            Some("12345678")
+        );
+        assert_eq!(parse_setup_code("12345"), None);
+        assert_eq!(parse_setup_code("1234567a"), None);
+        assert_eq!(parse_setup_code(""), None);
     }
 
     #[test]

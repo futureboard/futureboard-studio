@@ -61,7 +61,24 @@ start_pre() {
 	# chown.
 	mkdir -p /data/livestage "${LIVESTAGE_RECORDINGS}" &&
 		checkpath -f -m 0640 -o livestage:audio /var/log/livestage.log || return 1
+	# The web UI's setup code: while the mixer has no users, a browser on
+	# another machine gets in only with it, so whoever is first on the
+	# network cannot take the mixer or make the first admin. One per boot
+	# (/run is emptied at boot), shown on tty1's home screen; root's, and
+	# readable by the service's group.
+	# Should that fail, the server makes its own and writes it to its log
+	# instead: a show must not be kept from starting by this.
+	setup_code=/run/livestage-setup-code
+	if [ ! -s "${setup_code}" ]; then
+		(umask 077 && tr -dc 0-9 </dev/urandom | head -c 8 >"${setup_code}")
+	fi
+	code_arg=""
+	if [ -s "${setup_code}" ] && chgrp audio "${setup_code}" && chmod 0640 "${setup_code}"; then
+		code_arg=" --setup-code-file ${setup_code}"
+	else
+		ewarn "No setup code file: the web UI's code is in ${output_log}"
+	fi
 	# OpenRC evals command_args: the quotes keep a folder with spaces in it
 	# ("LiveStage Recordings") one argument.
-	command_args="--session \"${LIVESTAGE_SESSION}\" --record-dir \"${LIVESTAGE_RECORDINGS}\" --http ${LIVESTAGE_HTTP} --daemon${first_audio} ${LIVESTAGE_ARGS}"
+	command_args="--session \"${LIVESTAGE_SESSION}\" --record-dir \"${LIVESTAGE_RECORDINGS}\" --http ${LIVESTAGE_HTTP}${code_arg} --daemon${first_audio} ${LIVESTAGE_ARGS}"
 }

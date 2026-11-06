@@ -117,9 +117,10 @@ impl Page {
                  not at Apply."
             }
             Page::Web => {
-                "The web UI has no login: anyone who can reach it controls the mixer. \
-                 Keep the machine on the show's own network, or close the web UI to this \
-                 machine only."
+                "Until a web user exists, a browser needs the setup code shown on the \
+                 home screen; create an admin user (Setup, Users) first thing. There is \
+                 no encryption: keep the machine on the show's own network, or close the \
+                 web UI to this machine only."
             }
             Page::Time => "Recordings are named and dated with this machine's clock.",
             Page::Password => {
