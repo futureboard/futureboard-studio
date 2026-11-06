@@ -157,7 +157,8 @@ impl SharedRegionSink {
         if host_alive && done == last && bridge.request_seq.load(Ordering::Acquire) != 0 {
             // A block Audioguard renders ahead has the ring's headroom, not
             // the device callback's, so it may wait up to a period for it.
-            let grace = DirectAudio::plugin_bridge::render_ahead_grace().unwrap_or_else(|| {
+            let ahead = DirectAudio::plugin_bridge::render_ahead_grace();
+            let grace = ahead.unwrap_or_else(|| {
                 output_handoff_grace(
                     bridge.block_frames.load(Ordering::Relaxed),
                     bridge.sample_rate.load(Ordering::Relaxed),
@@ -165,9 +166,26 @@ impl SharedRegionSink {
             });
             if !grace.is_zero() {
                 let deadline = Instant::now() + grace;
-                while done == last && Instant::now() < deadline {
-                    std::hint::spin_loop();
-                    done = bridge.done_seq.load(Ordering::Acquire);
+                if ahead.is_some() {
+                    // The guard thread waits here, not the device callback.
+                    // It runs at the same SCHED_FIFO priority as the host
+                    // producer, so a spin for a whole period keeps that
+                    // producer off the core: every plug-in times out, and
+                    // High then bypasses them all. Sleeping blocks this
+                    // thread and lets the producer publish the block.
+                    while done == last && Instant::now() < deadline {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            break;
+                        }
+                        std::thread::sleep(remaining.min(Duration::from_micros(100)));
+                        done = bridge.done_seq.load(Ordering::Acquire);
+                    }
+                } else {
+                    while done == last && Instant::now() < deadline {
+                        std::hint::spin_loop();
+                        done = bridge.done_seq.load(Ordering::Acquire);
+                    }
                 }
             }
         }
