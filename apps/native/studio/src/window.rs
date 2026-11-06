@@ -31,7 +31,8 @@ pub fn welcome_window_options(cx: &App) -> WindowOptions {
             y: px(100.0),
         });
 
-    let mut options = platform_chrome::studio_window_options();
+    // The OS frame on Windows; the drawn chrome band elsewhere.
+    let mut options = platform_chrome::welcome_window_options();
     options.window_bounds = Some(WindowBounds::Windowed(Bounds {
         origin,
         size: welcome_size,

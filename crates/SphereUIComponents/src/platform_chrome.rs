@@ -290,6 +290,28 @@ pub fn apply_studio_window_style(options: &mut WindowOptions) {
     }
 }
 
+/// Whether the Welcome window takes the platform's own frame. Always on
+/// Windows: the start screen is a launcher, not the workspace, so it follows
+/// the platform rather than the Studio window style setting.
+pub fn welcome_native_frame() -> bool {
+    native_tool_window_frame()
+}
+
+/// The Welcome window's options: [`studio_window_options`], with the OS caption
+/// titled after the app where [`welcome_native_frame`] holds.
+pub fn welcome_window_options() -> WindowOptions {
+    let mut options = studio_window_options();
+    if welcome_native_frame() {
+        options.titlebar = Some(TitlebarOptions {
+            title: Some(APP_WINDOW_TITLE.into()),
+            appears_transparent: false,
+            traffic_light_position: None,
+        });
+        options.window_decorations = None;
+    }
+    options
+}
+
 /// Studio window options (main Futureboard window).
 pub fn studio_window_options() -> WindowOptions {
     WindowOptions {

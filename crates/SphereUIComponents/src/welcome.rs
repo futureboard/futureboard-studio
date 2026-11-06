@@ -1,22 +1,25 @@
 //! Futureboard Studio start screen.
 //!
-//! Three regions, each with exactly one owner: a 32 px chrome band (drag +
-//! caption controls + wordmark + account chip), a quiet navigation rail, and one
-//! centre pane per rail entry. Recent projects live in exactly one place — the
-//! Start pane's second column — so the screen never shows the same list twice
-//! with two different selection models.
+//! Two regions, each with exactly one owner: an identity-and-action sidebar
+//! (wordmark, the primary New Project action, Open, Continue, navigation, and
+//! the machine's audio status) and one main pane per navigation entry. On
+//! Windows the window takes the platform's own frame — the OS draws the
+//! caption — and elsewhere a 32 px drawn chrome band does. The Start pane leads
+//! with the templates as tiles and gives the rest of its height to Recent
+//! projects, the list a returning user came for.
 //!
 //! Three rules the whole file follows, stated once:
 //!
-//! * **Rows are full-bleed and square.** A list row is a lane, not a card. Only
-//!   the inset well behind a list rounds ([`theme::radius::SURFACE`]), and every
-//!   row state — rest, hover, pressed, selected — paints on that same row
-//!   rectangle, so a row never has two state geometries.
+//! * **List rows are full-bleed and square.** A recent row is a lane, not a
+//!   card. Only the inset well behind a list rounds ([`theme::radius::SURFACE`]),
+//!   and every row state — rest, hover, pressed, selected — paints on that same
+//!   row rectangle, so a row never has two state geometries. Template tiles are
+//!   surfaces, and round as surfaces do.
 //! * **State layers, never fill swaps.** A GPUI div has exactly one background,
 //!   so hover/pressed/selected colours are composited up front by [`row_paint`]
 //!   and handed to the style closures as resolved values.
 //! * **One activation path.** Mouse click, `Enter`, and the printed Ctrl/Cmd
-//!   shortcut all call the same `activate_*` method, so a row cannot do one
+//!   shortcut all call the same `activate_*` method, so an entry cannot do one
 //!   thing under the pointer and another under the keyboard.
 
 use std::path::PathBuf;
@@ -64,17 +67,23 @@ use crate::theme::{self, elevation, radius, size, space, typography, Colors};
 // widths are therefore named here, the way `components/project_switcher.rs`
 // names its panel width, rather than repeated as literals.
 
-/// Fixed width of the navigation rail.
-const RAIL_WIDTH: f32 = 180.0;
-/// Width of the Recent column when the Start pane runs two columns.
-const RECENT_COLUMN_WIDTH: f32 = 320.0;
+/// Fixed width of the sidebar.
+const SIDEBAR_WIDTH: f32 = 248.0;
+/// Narrowest a template tile gets before the row of four wraps to two.
+const TILE_MIN_WIDTH: f32 = 150.0;
+/// Height of a template tile: its glyph plate row, title and description at
+/// the tile's padding.
+const TILE_HEIGHT: f32 = 112.0;
+/// Glyph plate on a tile, and the monogram on a recent row: one
+/// `size::COMFORTABLE` square, so the two read as the same object.
+const PLATE: f32 = size::COMFORTABLE;
+/// The wordmark at the head of the sidebar: the chrome band's mark scaled by a
+/// third, aspect kept.
+const SIDEBAR_LOGO_WIDTH: f32 = LOGO_WIDTH * 4.0 / 3.0;
+const SIDEBAR_LOGO_HEIGHT: f32 = LOGO_HEIGHT * 4.0 / 3.0;
 /// Reading-width cap for the form and prose panes. Wider than this and a
 /// label/value form stops scanning as one column.
 const PANE_MAX_WIDTH: f32 = 640.0;
-/// Below this centre-pane width the Start pane stacks its two columns instead
-/// of placing them side by side. Chosen so the Start column keeps a usable
-/// ~360 px next to the 320 px Recent column plus the gap between them.
-const START_STACK_BREAKPOINT: f32 = 720.0;
 
 /// A two-line list row: one `size::PROMINENT` control band plus the
 /// `space::LOOSE` the second line needs. One height for the start, recent and
@@ -574,40 +583,46 @@ impl WelcomeWindow {
         if self.active_nav != StartupNav::Start {
             return;
         }
+        // Up and Down run between the template tiles and the Recent list
+        // below them, and along that list.
         let recent_len = self.recent_projects.len();
         let next = match self.selected {
+            Some(WelcomeSelection::Recent(0)) if delta < 0 => WelcomeSelection::Start(0),
             Some(WelcomeSelection::Recent(index)) if recent_len > 0 => {
                 let last = recent_len as isize - 1;
                 let target = (index as isize + delta).clamp(0, last) as usize;
                 WelcomeSelection::Recent(target)
             }
-            Some(WelcomeSelection::Start(index)) => {
-                let last = START_ROW_COUNT as isize - 1;
-                let target = (index as isize + delta).clamp(0, last) as usize;
-                WelcomeSelection::Start(target)
+            Some(WelcomeSelection::Start(_)) if delta > 0 && recent_len > 0 => {
+                WelcomeSelection::Recent(0)
             }
+            Some(WelcomeSelection::Start(index)) => WelcomeSelection::Start(index),
             // Continue, an out-of-range recent index, or nothing selected: land
-            // on the first start row rather than guess.
+            // on the first tile rather than guess.
             _ => WelcomeSelection::Start(0),
         };
         self.selected = Some(next);
         cx.notify();
     }
 
-    /// Left/Right cross between the Start pane's two columns, which is the only
-    /// way to reach the Recent list from the keyboard without Tab.
-    fn move_selection_column(&mut self, to_recent: bool, cx: &mut Context<Self>) {
+    /// Left/Right move along the row of template tiles.
+    fn move_selection_column(&mut self, to_right: bool, cx: &mut Context<Self>) {
         if self.active_nav != StartupNav::Start {
             return;
         }
-        let in_recent = matches!(self.selected, Some(WelcomeSelection::Recent(_)));
-        if to_recent && !in_recent && !self.recent_projects.is_empty() {
-            self.selected = Some(WelcomeSelection::Recent(0));
-            cx.notify();
-        } else if !to_recent && in_recent {
-            self.selected = Some(WelcomeSelection::Start(0));
-            cx.notify();
-        }
+        let last = TEMPLATE_TILE_COUNT - 1;
+        let next = match self.selected {
+            Some(WelcomeSelection::Start(index)) if index <= last => {
+                if to_right {
+                    (index + 1).min(last)
+                } else {
+                    index.saturating_sub(1)
+                }
+            }
+            _ => 0,
+        };
+        self.selected = Some(WelcomeSelection::Start(next));
+        cx.notify();
     }
 
     /// `sanitize_project_name` never returns empty — it substitutes
@@ -827,6 +842,7 @@ impl Render for WelcomeWindow {
         let target = cx.entity().clone();
         let project_name_callbacks =
             bind_mouse_selection(target.clone(), |this| &mut this.project_name_input);
+        let native_frame = crate::platform_chrome::welcome_native_frame();
         div()
             .id("futureboard-welcome-root")
             .role(Role::Application)
@@ -852,17 +868,26 @@ impl Render for WelcomeWindow {
             .on_mouse_down(MouseButton::Left, |_event, window, _cx| {
                 window.prevent_default();
             })
-            .child(welcome_chrome(window))
+            // On Windows the OS draws the caption; elsewhere the drawn band does.
+            .when(!native_frame, |root| root.child(welcome_chrome(window)))
             .child(self.render_welcome(window, cx, project_name_callbacks, i18n))
             // The account menu belongs to the window that draws the chip. It is
             // anchored from this element — whose origin is the window's
-            // top-left — so the dismiss backdrop covers the window rather than
-            // the 32 px band the chip sits in. The anchor is the chrome band's
-            // height: there is no second header below it.
+            // top-left — so the dismiss backdrop covers the window. With the
+            // drawn band the chip sits in it; under the native frame it sits at
+            // the main pane's top-right corner.
             .children(crate::components::app_chrome::account_menu_overlay(
                 window,
-                PlatformChromePolicy::current().titlebar_height_px,
-                space::BASE,
+                if native_frame {
+                    space::SECTION + size::DEFAULT + space::TIGHT
+                } else {
+                    PlatformChromePolicy::current().titlebar_height_px
+                },
+                if native_frame {
+                    space::SECTION
+                } else {
+                    space::BASE
+                },
             ))
     }
 }
@@ -877,14 +902,12 @@ impl WelcomeWindow {
     ) -> gpui::AnyElement {
         // Layout owner for the whole body. The rail is fixed; the centre pane
         // takes the rest and is the only region that scrolls.
-        let viewport_width: f32 = window.viewport_size().width.into();
-        let side_by_side = (viewport_width - RAIL_WIDTH) >= START_STACK_BREAKPOINT;
 
         // Bound to a local first: a `match` arm below takes `&mut self`, which
         // it cannot do while the scrutinee is still a place expression on self.
         let nav = self.active_nav;
         let center = match nav {
-            StartupNav::Start => self.start_pane(cx, side_by_side, i18n),
+            StartupNav::Start => self.start_pane(cx, i18n),
             StartupNav::NewProject => new_project_pane(
                 cx,
                 &self.project_name_input,
@@ -921,16 +944,37 @@ impl WelcomeWindow {
             .flex_1()
             .min_h_0()
             .bg(Colors::surface_base())
-            .child(left_rail(
+            .child(sidebar(
                 cx,
                 self.active_nav,
+                self.selected,
                 &self.callbacks,
                 self.audio_backend.clone(),
                 self.audio_device_out.clone(),
                 self.edition_line.clone(),
                 i18n,
             ))
-            .child(center)
+            .child(
+                // The main pane, with the account chip at its top-right corner
+                // when the OS frame leaves no band to carry it.
+                div()
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .child(center)
+                    .when(crate::platform_chrome::welcome_native_frame(), |main| {
+                        main.children(crate::components::app_chrome::account_chip().map(|chip| {
+                            div()
+                                .absolute()
+                                .top(px(space::SECTION))
+                                .right(px(space::SECTION))
+                                .child(chip)
+                        }))
+                    }),
+            )
             .when(menu_open, |root| {
                 root.child(select_dismiss_backdrop(Arc::new(
                     move |_: &(), _window, cx| {
@@ -1024,27 +1068,71 @@ fn welcome_chrome(window: &Window) -> impl IntoElement {
 
 // ── Navigation rail ──────────────────────────────────────────────────────────
 
+/// The sidebar: who this is and what to do first, then where to go, then what
+/// the machine will play through.
+///
+/// One primary action on the whole screen — New Project — and it lives here,
+/// at the top of the sidebar, so the accent is spent once. Open and Continue
+/// are quieter actions beside it. The navigation below switches the main pane.
 #[allow(clippy::too_many_arguments)]
-fn left_rail(
+fn sidebar(
     cx: &mut Context<WelcomeWindow>,
     active: StartupNav,
+    selected: Option<WelcomeSelection>,
     callbacks: &WelcomeCallbacks,
     audio_backend: SharedString,
     audio_device_out: SharedString,
     edition_line: SharedString,
     i18n: I18n,
 ) -> impl IntoElement {
-    div()
+    let new_target = cx.entity().clone();
+    let open_target = cx.entity().clone();
+    let continue_target = cx.entity().clone();
+    let open_index = START_ROW_COUNT - 1;
+    let actions = div()
         .flex()
         .flex_col()
-        .w(px(RAIL_WIDTH))
-        .flex_none()
-        .min_h_0()
-        .border_r(px(1.0))
-        .border_color(Colors::border_subtle())
-        .bg(Colors::surface_sidebar())
-        .px(px(space::SNUG))
-        .py(px(space::BASE))
+        .gap(px(space::SNUG))
+        .child(side_button(
+            "welcome-new-project",
+            assets::ICON_PLUS_PATH,
+            i18n.tr_or("welcome.action.new-project", "New Project"),
+            Some(shortcut_label(0)),
+            SideButton::Primary,
+            active == StartupNav::NewProject,
+            move |window, cx| {
+                let _ = new_target.update(cx, |this, cx| this.activate_start_row(0, window, cx));
+            },
+        ))
+        .child(side_button(
+            "welcome-open-project",
+            assets::ICON_FOLDER_OPEN_PATH,
+            i18n.tr("welcome.open-project"),
+            Some(shortcut_label(open_index)),
+            SideButton::Default,
+            active == StartupNav::OpenProject
+                || selected == Some(WelcomeSelection::Start(open_index)),
+            move |window, cx| {
+                let _ = open_target.update(cx, |this, cx| {
+                    this.activate_start_row(open_index, window, cx)
+                });
+            },
+        ))
+        .child(side_button(
+            "welcome-continue",
+            assets::ICON_CHEVRON_RIGHT_PATH,
+            i18n.tr("welcome.button.continue-without-project"),
+            None,
+            SideButton::Ghost,
+            selected == Some(WelcomeSelection::Continue),
+            move |window, cx| {
+                let _ = continue_target.update(cx, |this, cx| this.activate_continue(window, cx));
+            },
+        ));
+
+    let nav = div()
+        .flex()
+        .flex_col()
         .gap(px(space::HAIR))
         .child(rail_item(
             cx,
@@ -1055,24 +1143,8 @@ fn left_rail(
             active,
             None,
         ))
-        .child(rail_item(
-            cx,
-            StartupNav::NewProject,
-            "welcome-rail-new",
-            i18n.tr("welcome.nav.new"),
-            assets::ICON_PLUS_PATH,
-            active,
-            None,
-        ))
-        .child(rail_item(
-            cx,
-            StartupNav::OpenProject,
-            "welcome-rail-open",
-            i18n.tr("welcome.open-project"),
-            assets::ICON_FOLDER_OPEN_PATH,
-            active,
-            None,
-        ))
+        // New Project and Open are the actions above, which show when their
+        // pane is the one open; the list carries only the places.
         .child(rail_item(
             cx,
             StartupNav::Feed,
@@ -1081,17 +1153,233 @@ fn left_rail(
             assets::ICON_NEWSPAPER_PATH,
             active,
             None,
-        ))
-        .child(div().flex_1())
-        .child(rail_foot(
-            cx,
-            callbacks,
-            audio_backend,
-            audio_device_out,
-            edition_line,
-            active,
-            i18n,
-        ))
+        ));
+
+    div()
+        .flex()
+        .flex_col()
+        .w(px(SIDEBAR_WIDTH))
+        .flex_none()
+        .min_h_0()
+        .border_r(px(1.0))
+        .border_color(Colors::border_subtle())
+        .bg(Colors::surface_sidebar())
+        .px(px(space::LOOSE))
+        .pt(px(space::BLOCK))
+        .pb(px(space::LOOSE))
+        .gap(px(space::BLOCK))
+        .child(
+            // Identity: the wordmark, and exactly which build this is.
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(space::SNUG))
+                .px(px(space::SNUG))
+                .child(
+                    img(SharedString::from(LOGO_TEXT_PATH))
+                        .w(px(SIDEBAR_LOGO_WIDTH))
+                        .h(px(SIDEBAR_LOGO_HEIGHT))
+                        .flex_none(),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(typography::DENSE_LABEL))
+                        .font_features(tabular_features())
+                        .text_color(Colors::text_faint())
+                        .child(edition_line),
+                ),
+        )
+        .child(actions)
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(space::SNUG))
+                .child(
+                    div()
+                        .px(px(space::SNUG))
+                        .child(fb_section_header(i18n.tr_or("welcome.nav.go-to", "GO TO"))),
+                )
+                .child(nav),
+        )
+        .child(div().flex_1().min_h_0())
+        .child(audio_card(audio_backend, audio_device_out, i18n))
+        .when_some(callbacks.footer_action.clone(), |side, action| {
+            side.child(rail_item(
+                cx,
+                StartupNav::Start,
+                "welcome-rail-footer",
+                action.label.to_string(),
+                action.icon,
+                active,
+                Some(action.on_click),
+            ))
+        })
+}
+
+/// How a sidebar action reads at rest.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SideButton {
+    /// The screen's one primary action: accent fill.
+    Primary,
+    /// A filled control on the sidebar plane.
+    Default,
+    /// Text only until hovered.
+    Ghost,
+}
+
+/// One full-width sidebar action: glyph, label, and its shortcut when it has
+/// one. `selected` marks it as the keyboard's current target (an accent
+/// border on the same geometry), for the entries the keyboard can reach.
+fn side_button(
+    id: &'static str,
+    icon: &'static str,
+    label: String,
+    shortcut: Option<String>,
+    kind: SideButton,
+    selected: bool,
+    on_click: impl Fn(&mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let plane = Colors::surface_sidebar();
+    let (rest, hover, pressed, text, border) = match kind {
+        SideButton::Primary => (
+            Colors::accent_primary(),
+            Colors::accent_primary_hover(),
+            Colors::accent_pressed(),
+            Colors::text_inverse(),
+            Colors::with_alpha(Colors::accent_primary(), 0.0),
+        ),
+        SideButton::Default => {
+            let rest = Colors::button_bg();
+            (
+                rest,
+                Colors::composite(rest, Colors::state_hover()),
+                Colors::composite(rest, Colors::state_recessed()),
+                Colors::text_primary(),
+                Colors::border_subtle(),
+            )
+        }
+        SideButton::Ghost => (
+            Colors::with_alpha(plane, 0.0),
+            Colors::composite(plane, Colors::state_hover()),
+            Colors::composite(plane, Colors::state_recessed()),
+            Colors::text_secondary(),
+            Colors::with_alpha(plane, 0.0),
+        ),
+    };
+    // The keyboard's target, or the pane this action opened: an outline on
+    // the same geometry — the accent on a filled button, a light one on the
+    // accent-filled primary, where the accent would not show.
+    let border = match (selected, kind) {
+        (true, SideButton::Primary) => Colors::with_alpha(Colors::text_primary(), 0.55),
+        (true, _) => Colors::with_alpha(Colors::accent_primary(), 0.7),
+        (false, _) => border,
+    };
+    let height = if kind == SideButton::Ghost {
+        size::DEFAULT
+    } else {
+        size::PROMINENT
+    };
+    let quiet = if kind == SideButton::Primary {
+        Colors::with_alpha(Colors::text_inverse(), 0.7)
+    } else {
+        Colors::text_faint()
+    };
+    let focus = Colors::state_focus_ring();
+    div()
+        .id(id)
+        .role(Role::Button)
+        .aria_label(label.clone())
+        .focusable()
+        .tab_stop(true)
+        .focus_visible(move |style| style.shadow(elevation::focus_ring(focus)))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(space::BASE))
+        .w_full()
+        .h(px(height))
+        .flex_none()
+        .px(px(space::LOOSE))
+        .rounded(px(radius::CONTROL))
+        .border(px(1.0))
+        .border_color(border)
+        .bg(rest)
+        .cursor(gpui::CursorStyle::PointingHand)
+        .hover(move |style| style.bg(hover))
+        .active(move |style| style.bg(pressed))
+        .on_click(move |_event, window, cx| on_click(window, cx))
+        .child(
+            svg()
+                .path(icon)
+                .w(px(ROW_ICON))
+                .h(px(ROW_ICON))
+                .flex_none()
+                .text_color(text),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(px(typography::UI_SM))
+                .font_weight(if kind == SideButton::Ghost {
+                    FontWeight::NORMAL
+                } else {
+                    FontWeight::SEMIBOLD
+                })
+                .text_color(text)
+                .child(label),
+        )
+        .children(shortcut.map(|shortcut| {
+            div()
+                .flex_none()
+                .text_size(px(typography::DENSE_CAPTION))
+                .font_features(tabular_features())
+                .text_color(quiet)
+                .child(shortcut)
+        }))
+}
+
+/// What the machine will play through: the configured backend and output,
+/// read from settings — real, read-only status.
+fn audio_card(backend: SharedString, device: SharedString, i18n: I18n) -> impl IntoElement {
+    let device = if device.trim().is_empty() {
+        SharedString::from(i18n.tr_or("welcome.audio.default-device", "System default"))
+    } else {
+        device
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(space::TIGHT))
+        .p(px(space::BASE))
+        .rounded(px(radius::SURFACE))
+        .border(px(1.0))
+        .border_color(Colors::border_subtle())
+        .bg(Colors::surface_panel())
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(space::SNUG))
+                .px(px(space::SNUG))
+                .child(
+                    svg()
+                        .path(assets::ICON_VOLUME_2_PATH)
+                        .w(px(RAIL_ICON))
+                        .h(px(RAIL_ICON))
+                        .flex_none()
+                        .text_color(Colors::text_muted()),
+                )
+                .child(fb_section_header(
+                    i18n.tr("welcome.nav.audio").to_uppercase(),
+                )),
+        )
+        .child(status_line(i18n.tr("settings.field.backend"), backend))
+        .child(status_line(i18n.tr("settings.field.output-device"), device))
 }
 
 /// One rail entry.
@@ -1194,65 +1482,6 @@ fn rail_item(
         )
 }
 
-/// The quiet foot of the rail: what the machine will play through, what build
-/// this is, and the edition's own action. All read-only status except the last,
-/// and all of it real — the audio pair is the configured device from settings,
-/// the version pair comes from the edition provider.
-#[allow(clippy::too_many_arguments)]
-fn rail_foot(
-    cx: &mut Context<WelcomeWindow>,
-    callbacks: &WelcomeCallbacks,
-    audio_backend: SharedString,
-    audio_device_out: SharedString,
-    edition_line: SharedString,
-    active: StartupNav,
-    i18n: I18n,
-) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(space::HAIR))
-        .pt(px(space::BASE))
-        .child(div().px(px(space::SNUG)).child(fb_section_header(
-            i18n.tr("welcome.nav.audio").to_uppercase(),
-        )))
-        .child(status_line(
-            i18n.tr("settings.field.backend"),
-            audio_backend,
-        ))
-        .child(status_line(
-            i18n.tr("settings.field.output-device"),
-            audio_device_out,
-        ))
-        .child(
-            div()
-                .my(px(space::SNUG))
-                .mx(px(space::SNUG))
-                .h(px(1.0))
-                .bg(Colors::divider()),
-        )
-        .child(
-            div()
-                .px(px(space::SNUG))
-                .truncate()
-                .text_size(px(typography::DENSE_CAPTION))
-                .font_features(tabular_features())
-                .text_color(Colors::text_faint())
-                .child(edition_line),
-        )
-        .when_some(callbacks.footer_action.clone(), |foot, action| {
-            foot.child(rail_item(
-                cx,
-                StartupNav::Start,
-                "welcome-rail-footer",
-                action.label.to_string(),
-                action.icon,
-                active,
-                Some(action.on_click),
-            ))
-        })
-}
-
 /// A read-only `label / value` pair in the rail foot. The value truncates
 /// rather than wraps; device names are long and the rail width is fixed.
 fn status_line(label: impl Into<SharedString>, value: impl Into<SharedString>) -> impl IntoElement {
@@ -1350,82 +1579,30 @@ fn shortcut_label(index: usize) -> String {
 }
 
 impl WelcomeWindow {
-    /// Start pane: two lists side by side, or stacked under one scroller when
-    /// the centre is too narrow to carry both.
+    /// The Start pane: a heading, the templates as one row of tiles, and the
+    /// recent projects filling the rest of the height in their own scroller.
     ///
-    /// No `FbButtonKind::Primary` lives here — the rows *are* the actions, and
-    /// the accent is spent on selection and focus alone.
-    fn start_pane(
-        &mut self,
-        cx: &mut Context<Self>,
-        side_by_side: bool,
-        i18n: I18n,
-    ) -> gpui::AnyElement {
-        let start_column = self.start_column(cx, side_by_side, i18n);
-        let recent_column = self.recent_column(cx, side_by_side, i18n);
-
-        let body = if side_by_side {
-            // Two columns, each list its own scroll owner, both stretched to
-            // the body's height by the flex default.
-            div()
-                .id("welcome-start-body")
-                .flex()
-                .flex_row()
-                .gap(px(space::BLOCK))
-                .flex_1()
-                .min_h_0()
-                .child(start_column)
-                .child(recent_column)
-        } else {
-            // Too narrow for two columns: stack them under one scroll owner,
-            // and let the lists take their natural height inside it.
-            div()
-                .id("welcome-start-body")
-                .flex()
-                .flex_col()
-                .gap(px(space::BLOCK))
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .child(start_column)
-                .child(recent_column)
-        };
-
-        div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_w_0()
-            .min_h_0()
-            .p(px(space::BLOCK))
-            .bg(Colors::surface_base())
-            .child(body)
-            .into_any_element()
-    }
-
-    fn start_column(
-        &mut self,
-        cx: &mut Context<Self>,
-        side_by_side: bool,
-        i18n: I18n,
-    ) -> gpui::AnyElement {
-        let paint = row_paint(Colors::surface_input());
+    /// No primary button here — that is New Project in the sidebar; the tiles
+    /// and rows are the actions, and the accent is spent on selection and
+    /// focus.
+    fn start_pane(&mut self, cx: &mut Context<Self>, i18n: I18n) -> gpui::AnyElement {
         let selected = self.selected;
-
-        let mut well = list_well("welcome-start-list").when(side_by_side, |well| {
-            well.flex_1().min_h_0().overflow_y_scroll()
-        });
-        for (index, row) in start_rows(i18n).into_iter().enumerate() {
-            let is_selected = selected == Some(WelcomeSelection::Start(index));
+        let mut tiles = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .gap(px(space::BASE))
+            .w_full();
+        for (index, row) in start_rows(i18n)
+            .into_iter()
+            .enumerate()
+            .take(TEMPLATE_TILE_COUNT)
+        {
             let target = cx.entity().clone();
-            if index > 0 {
-                well = well.child(row_divider());
-            }
-            well = well.child(start_row(
+            tiles = tiles.child(template_tile(
                 index,
                 row,
-                is_selected,
-                paint,
+                selected == Some(WelcomeSelection::Start(index)),
                 move |window, cx| {
                     let _ =
                         target.update(cx, |this, cx| this.activate_start_row(index, window, cx));
@@ -1433,66 +1610,15 @@ impl WelcomeWindow {
             ));
         }
 
-        let continue_target = cx.entity().clone();
-
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(space::LOOSE))
-            .when(side_by_side, |column| column.flex_1().min_w_0().min_h_0())
-            .when(!side_by_side, |column| column.w_full().flex_none())
-            .child(fb_section_header(
-                i18n.tr("welcome.nav.start").to_uppercase(),
-            ))
-            .child(well)
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(space::BASE))
-                    .child(fb_button(
-                        "welcome-continue",
-                        i18n.tr("welcome.button.continue-without-project"),
-                        FbButtonKind::Default,
-                        true,
-                        move |_event, window, cx| {
-                            let _ = continue_target
-                                .update(cx, |this, cx| this.activate_continue(window, cx));
-                        },
-                    ))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(typography::DENSE_CAPTION))
-                            .text_color(Colors::text_faint())
-                            .child(i18n.tr_or(
-                                "welcome.continue.description",
-                                "Work in an unsaved session until you save",
-                            )),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    fn recent_column(
-        &mut self,
-        cx: &mut Context<Self>,
-        side_by_side: bool,
-        i18n: I18n,
-    ) -> gpui::AnyElement {
         let paint = row_paint(Colors::surface_input());
-        let selected = self.selected;
-
-        let mut well = list_well("welcome-recent-list").when(side_by_side, |well| {
-            well.flex_1().min_h_0().overflow_y_scroll()
-        });
+        let mut well = list_well("welcome-recent-list")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll();
         if self.recent_projects.is_empty() {
             well = well.child(empty_state(i18n.tr("menu.file-open_recent-empty")));
         } else {
             for (index, item) in self.recent_projects.iter().enumerate() {
-                let is_selected = selected == Some(WelcomeSelection::Recent(index));
                 let target = cx.entity().clone();
                 if index > 0 {
                     well = well.child(row_divider());
@@ -1500,7 +1626,7 @@ impl WelcomeWindow {
                 well = well.child(recent_row(
                     index,
                     item,
-                    is_selected,
+                    selected == Some(WelcomeSelection::Recent(index)),
                     paint,
                     i18n,
                     move |window, cx| {
@@ -1510,88 +1636,182 @@ impl WelcomeWindow {
                 ));
             }
         }
+        let recent_count = self.recent_projects.len();
 
         div()
             .flex()
             .flex_col()
-            .gap(px(space::LOOSE))
+            .flex_1()
+            .min_w_0()
             .min_h_0()
-            .when(side_by_side, |column| {
-                column.w(px(RECENT_COLUMN_WIDTH)).flex_none()
-            })
-            .when(!side_by_side, |column| column.w_full().flex_none())
-            .child(fb_section_header(
-                i18n.tr("welcome.nav.recent").to_uppercase(),
-            ))
-            .child(well)
+            .gap(px(space::BLOCK))
+            .p(px(space::BLOCK))
+            .bg(Colors::surface_base())
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(space::TIGHT))
+                    // Clear of the account chip in the top-right corner.
+                    .pr(px(space::PAGE * 3.0))
+                    .child(
+                        div()
+                            .text_size(px(typography::UI_LG))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(Colors::text_primary())
+                            .child(i18n.tr_or("welcome.start.title", "Start a session")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(typography::UI_XS))
+                            .text_color(Colors::text_muted())
+                            .child(i18n.tr_or(
+                                "welcome.start.subtitle",
+                                "Begin from a template, or pick up where you left off.",
+                            )),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(space::BASE))
+                    .child(fb_section_header(
+                        i18n.tr_or("welcome.start.templates", "TEMPLATES"),
+                    ))
+                    .child(tiles),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(space::BASE))
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(space::SNUG))
+                            .child(fb_section_header(
+                                i18n.tr("welcome.nav.recent").to_uppercase(),
+                            ))
+                            .when(recent_count > 0, |header| {
+                                header.child(
+                                    div()
+                                        .text_size(px(typography::DENSE_CAPTION))
+                                        .font_features(tabular_features())
+                                        .text_color(Colors::text_faint())
+                                        .child(recent_count.to_string()),
+                                )
+                            }),
+                    )
+                    .child(well),
+            )
             .into_any_element()
     }
 }
 
-/// A start row: glyph, title, description, shortcut badge.
+/// How many of the Start rows are template tiles: every one but the last,
+/// Open Project, which is a sidebar action.
+const TEMPLATE_TILE_COUNT: usize = START_ROW_COUNT - 1;
+
+/// A template tile: glyph plate and shortcut, then title and description.
 ///
-/// Full-bleed and square (`radius::NONE`). Every state paints on this same
-/// rectangle: hover and pressed as composited fills, selection as a
-/// `state.selected` fill plus the leading accent bar.
-fn start_row(
+/// A surface, so it rounds as one (`radius::SURFACE`). Selection is the
+/// `state.selected` fill plus an accent border on the same geometry, and the
+/// glyph plate takes the accent tint: two channels, no reflow.
+fn template_tile(
     index: usize,
     row: StartRow,
     selected: bool,
-    paint: RowPaint,
     on_activate: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let shortcut = shortcut_label(index);
     let accessible_label = format!("{}. {}. {}", row.title, row.description, shortcut);
-    let rest = paint.rest_for(selected);
-    let hover = paint.hover_for(selected);
-    let pressed = paint.pressed_for(selected);
-    let focus = Colors::state_focus_ring();
-    let tint = if selected {
-        Colors::text_primary()
+    let plane = Colors::surface_panel();
+    let rest = if selected {
+        Colors::composite(plane, Colors::state_selected())
     } else {
-        Colors::text_muted()
+        plane
     };
+    let hover = Colors::composite(rest, Colors::state_hover());
+    let pressed = Colors::composite(rest, Colors::state_recessed());
+    let border = if selected {
+        Colors::with_alpha(Colors::accent_primary(), 0.6)
+    } else {
+        Colors::border_subtle()
+    };
+    let (plate, glyph) = if selected {
+        Colors::latched(Colors::surface_raised(), Colors::accent_primary())
+    } else {
+        (Colors::surface_raised(), Colors::text_secondary())
+    };
+    let focus = Colors::state_focus_ring();
 
     div()
-        .id(("welcome-start-row", index))
+        .id(("welcome-template", index))
         .role(Role::Button)
         .aria_label(accessible_label)
         .aria_selected(selected)
         .focusable()
         .tab_stop(true)
         .focus_visible(move |style| style.shadow(elevation::focus_ring(focus)))
-        .relative()
         .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(space::LOOSE))
-        .w_full()
-        .h(px(LIST_ROW_HEIGHT))
-        // Rows are a fixed band: without this a full list inside a fixed-height
-        // well would flex-shrink every row instead of scrolling.
-        .flex_none()
-        .px(px(space::LOOSE))
-        .rounded(px(radius::NONE))
+        .flex_col()
+        .justify_between()
+        .flex_1()
+        .min_w(px(TILE_MIN_WIDTH))
+        .h(px(TILE_HEIGHT))
+        .p(px(space::LOOSE))
+        .rounded(px(radius::SURFACE))
+        .border(px(1.0))
+        .border_color(border)
         .bg(rest)
         .cursor(gpui::CursorStyle::PointingHand)
         .hover(move |style| style.bg(hover))
         .active(move |style| style.bg(pressed))
         .on_click(move |_event, window, cx| on_activate(window, cx))
-        .when(selected, |item| item.child(selection_marker()))
         .child(
-            svg()
-                .path(row.icon)
-                .w(px(ROW_ICON))
-                .h(px(ROW_ICON))
-                .flex_none()
-                .text_color(tint),
+            div()
+                .flex()
+                .flex_row()
+                .items_start()
+                .justify_between()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .w(px(PLATE))
+                        .h(px(PLATE))
+                        .flex_none()
+                        .rounded(px(radius::CONTROL))
+                        .bg(plate)
+                        .child(
+                            svg()
+                                .path(row.icon)
+                                .w(px(ROW_ICON))
+                                .h(px(ROW_ICON))
+                                .text_color(glyph),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(typography::DENSE_CAPTION))
+                        .font_features(tabular_features())
+                        .text_color(Colors::text_faint())
+                        .child(shortcut),
+                ),
         )
         .child(
             div()
                 .flex()
                 .flex_col()
+                .gap(px(space::HAIR))
                 .min_w_0()
-                .flex_1()
                 .child(
                     div()
                         .truncate()
@@ -1608,17 +1828,22 @@ fn start_row(
                         .child(row.description),
                 ),
         )
-        .child(
-            div()
-                .flex_none()
-                .text_size(px(typography::DENSE_CAPTION))
-                .font_features(tabular_features())
-                .text_color(Colors::text_faint())
-                .child(shortcut),
-        )
 }
 
-/// A recent-project row: name and relative date, then the full path.
+/// The letter a recent row's monogram shows: the name's first letter, upper
+/// case. Thai writes the vowels เ แ โ ใ ไ before the consonant they follow in
+/// speech, so a Thai name shows its first consonant rather than a lone vowel.
+fn monogram(name: &str) -> String {
+    const THAI_LEADING_VOWELS: [char; 5] =
+        ['\u{0E40}', '\u{0E41}', '\u{0E42}', '\u{0E43}', '\u{0E44}'];
+    name.chars()
+        .filter(|ch| !ch.is_whitespace() && !THAI_LEADING_VOWELS.contains(ch))
+        .find(|ch| ch.is_alphanumeric())
+        .map(|ch| ch.to_uppercase().collect())
+        .unwrap_or_else(|| "?".to_string())
+}
+
+/// A recent-project row: monogram, name and folder, then when it was opened.
 ///
 /// A missing project is carried on two channels — a warning badge *and* a
 /// disabled label — rather than by dimming the whole row, and it takes no
@@ -1632,18 +1857,28 @@ fn recent_row(
     on_activate: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let name = recent.name.clone();
-    let path_label = recent.path.to_string_lossy().to_string();
+    let folder = recent
+        .path
+        .parent()
+        .map(|parent| parent.to_string_lossy().to_string())
+        .unwrap_or_else(|| recent.path.to_string_lossy().to_string());
     let missing = recent.missing;
     let last_opened = format_last_opened(recent.last_opened_at, i18n);
     let accessible_label = if missing {
         format!("{name}. {}", i18n.tr("project.file.missing"))
     } else {
-        format!("{name}. {path_label}")
+        format!("{name}. {}", recent.path.to_string_lossy())
     };
+    let initial = monogram(&name);
     let rest = paint.rest_for(selected);
     let hover = paint.hover_for(selected);
     let pressed = paint.pressed_for(selected);
     let focus = Colors::state_focus_ring();
+    let name_color = if missing {
+        Colors::text_disabled()
+    } else {
+        Colors::text_primary()
+    };
 
     div()
         .id(("welcome-recent-row", index))
@@ -1656,8 +1891,9 @@ fn recent_row(
         .focus_visible(move |style| style.shadow(elevation::focus_ring(focus)))
         .relative()
         .flex()
-        .flex_col()
-        .justify_center()
+        .flex_row()
+        .items_center()
+        .gap(px(space::LOOSE))
         .w_full()
         .h(px(LIST_ROW_HEIGHT))
         .flex_none()
@@ -1675,52 +1911,65 @@ fn recent_row(
         .child(
             div()
                 .flex()
-                .flex_row()
                 .items_center()
-                .gap(px(space::BASE))
-                .child(
-                    div()
-                        .truncate()
-                        .min_w_0()
-                        .flex_1()
-                        .text_size(px(typography::UI_SM))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(if missing {
-                            Colors::text_disabled()
-                        } else {
-                            Colors::text_primary()
-                        })
-                        .child(name),
-                )
-                .when(missing, |row| {
-                    row.child(div().flex_none().child(fb_badge(
-                        i18n.tr("project.file.missing"),
-                        Colors::semantic_warning(),
-                    )))
-                })
-                .when(!missing && !last_opened.is_empty(), |row| {
-                    row.child(
-                        div()
-                            .flex_none()
-                            .text_size(px(typography::DENSE_CAPTION))
-                            .font_features(tabular_features())
-                            .text_color(Colors::text_muted())
-                            .child(last_opened.clone()),
-                    )
-                }),
-        )
-        .child(
-            div()
-                .truncate()
-                .text_size(px(typography::UI_XS))
-                .font_features(tabular_features())
+                .justify_center()
+                .w(px(PLATE))
+                .h(px(PLATE))
+                .flex_none()
+                .rounded(px(radius::CONTROL))
+                .bg(Colors::surface_raised())
+                .text_size(px(typography::UI_SM))
+                .font_weight(FontWeight::SEMIBOLD)
                 .text_color(if missing {
                     Colors::text_disabled()
                 } else {
-                    Colors::text_faint()
+                    Colors::text_secondary()
                 })
-                .child(path_label),
+                .child(initial),
         )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .justify_center()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(typography::UI_SM))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(name_color)
+                        .child(name),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(typography::UI_XS))
+                        .text_color(if missing {
+                            Colors::text_disabled()
+                        } else {
+                            Colors::text_faint()
+                        })
+                        .child(folder),
+                ),
+        )
+        .when(missing, |row| {
+            row.child(div().flex_none().child(fb_badge(
+                i18n.tr("project.file.missing"),
+                Colors::semantic_warning(),
+            )))
+        })
+        .when(!missing && !last_opened.is_empty(), |row| {
+            row.child(
+                div()
+                    .flex_none()
+                    .text_size(px(typography::DENSE_LABEL))
+                    .font_features(tabular_features())
+                    .text_color(Colors::text_muted())
+                    .child(last_opened),
+            )
+        })
 }
 
 // ── New Project pane ─────────────────────────────────────────────────────────
@@ -2665,4 +2914,21 @@ fn trim_feed_excerpt(input: &str) -> String {
     let mut trimmed: String = normalized.chars().take(MAX_CHARS).collect();
     trimmed.push('…');
     trimmed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_monogram_is_the_first_letter_a_reader_sees() {
+        assert_eq!(monogram("untitled"), "U");
+        assert_eq!(monogram("  011169"), "0");
+        // "โปรเจกต์": the leading vowel is skipped for the consonant after it.
+        assert_eq!(
+            monogram("\u{0E42}\u{0E1B}\u{0E23}\u{0E40}\u{0E08}\u{0E01}\u{0E15}\u{0E4C}"),
+            "\u{0E1B}"
+        );
+        assert_eq!(monogram(""), "?");
+    }
 }
