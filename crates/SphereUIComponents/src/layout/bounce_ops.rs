@@ -14,7 +14,7 @@ use gpui::{Context, WindowHandle};
 use sphere_encoder::{AudioEncodeOptions, AudioFileFormat, AudioSampleFormat};
 use DirectAudio::types::EngineProjectSnapshot;
 use DirectAudio::{
-    beats_to_samples, export_render_job_with_bridges, render_block_size_for_sample_rate,
+    beats_to_samples, export_render_job_with_plugins, render_block_size_for_sample_rate,
     ArrangementExportRequest, ExportCancelToken, ExportNormalizeMode, ExportTailMode,
     OfflineRenderRequest, RenderJob, TrackExportTarget,
 };
@@ -487,7 +487,7 @@ impl StudioLayout {
             .name("fb-bounce".to_string())
             .spawn(move || {
                 let result = {
-                    let _handoff =
+                    let handoff =
                         crate::export::BridgeSinkHandoff::detach(engine.as_ref(), &bridge_sinks);
                     render_targets(
                         &snapshot,
@@ -495,7 +495,7 @@ impl StudioLayout {
                         sample_rate,
                         tail,
                         &worker_cancel,
-                        &bridge_sinks,
+                        handoff.plugins(),
                         &worker_shared,
                     )
                 };
@@ -881,7 +881,7 @@ fn render_targets(
     sample_rate: u32,
     tail: ExportTailMode,
     cancel: &ExportCancelToken,
-    bridge_sinks: &DirectAudio::plugin_bridge::PluginBridgeSinkMap,
+    plugins: DirectAudio::OfflinePlugins<'_>,
     shared: &Arc<Mutex<BounceShared>>,
 ) -> Result<Vec<BounceResult>, String> {
     let count = targets.len().max(1) as f32;
@@ -904,7 +904,7 @@ fn render_targets(
             }
         };
         let summaries =
-            export_render_job_with_bridges(snapshot, &job, cancel, Some(bridge_sinks), on_progress)
+            export_render_job_with_plugins(snapshot, &job, cancel, plugins, on_progress)
                 .map_err(|error| format!("{}: {error}", target.track_name))?;
         let summary = summaries
             .into_iter()

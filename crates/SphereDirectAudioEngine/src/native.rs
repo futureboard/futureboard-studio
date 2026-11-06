@@ -1400,6 +1400,18 @@ impl AudioEngine {
         self.inner.set_ara_renderers(track_id, renderers)
     }
 
+    /// Take the ARA renderers out of the realtime graph for an offline render
+    /// (see [`crate::export::OfflinePlugins`]); give them back with
+    /// [`Self::return_ara_renderers`].
+    pub fn lend_ara_renderers(&self) -> crate::export::AraRendererMap {
+        self.inner.lend_ara_renderers()
+    }
+
+    /// Give the lent ARA renderers back to the realtime graph.
+    pub fn return_ara_renderers(&self) {
+        self.inner.return_ara_renderers();
+    }
+
     /// Poll meter atomics and runtime track meters for UI display.
     pub fn meters(&self) -> JsMeterSnapshot {
         self.inner.get_meters()

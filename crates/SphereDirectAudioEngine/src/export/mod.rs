@@ -24,7 +24,7 @@ mod render_request;
 
 pub use exporter::{
     export_arrangement, export_arrangement_with_bridges, export_render_job,
-    export_render_job_with_bridges, export_tracks_single_pass,
+    export_render_job_with_bridges, export_render_job_with_plugins, export_tracks_single_pass,
     export_tracks_single_pass_with_bridges, partial_path_for, record_render_job,
     ArrangementExportRequest, ArrangementExportSummary, RenderJob, TrackExportTarget,
 };
@@ -38,8 +38,9 @@ pub(crate) fn live_render_latency_frames(
     offline_renderer::export_warmup_frames(latency_graph, pdc_enabled)
 }
 pub use offline_renderer::{
-    render_offline, render_offline_tracks, render_offline_tracks_with_bridges,
-    render_offline_with_bridges, OfflineRenderSummary,
+    render_offline, render_offline_mix_and_tracks_with_plugins, render_offline_tracks,
+    render_offline_tracks_with_bridges, render_offline_with_bridges, render_offline_with_plugins,
+    AraRendererMap, OfflinePlugins, OfflineRenderSummary,
 };
 pub use render_progress::{ExportCancelToken, ExportProgress, ExportStage};
 pub use render_request::{

@@ -12,7 +12,7 @@ use crate::types::EngineProjectSnapshot;
 
 use super::level_meter::{LevelMeter, LevelReport};
 use super::offline_renderer::{
-    render_offline_mix_and_tracks_with_bridges, render_offline_with_bridges,
+    render_offline_mix_and_tracks_with_plugins, render_offline_with_plugins, OfflinePlugins,
 };
 use super::render_progress::{ExportCancelToken, ExportProgress, ExportStage};
 use super::render_request::{ExportNormalizeMode, ExportTailMode, OfflineRenderRequest};
@@ -169,6 +169,27 @@ pub fn export_render_job_with_bridges(
     job: &RenderJob,
     cancel: &ExportCancelToken,
     bridge_sinks: Option<&PluginBridgeSinkMap>,
+    on_progress: impl FnMut(ExportProgress),
+) -> Result<Vec<ArrangementExportSummary>, ExportError> {
+    export_render_job_with_plugins(
+        snapshot,
+        job,
+        cancel,
+        OfflinePlugins {
+            bridge_sinks,
+            ara_renderers: None,
+        },
+        on_progress,
+    )
+}
+
+/// [`export_render_job_with_bridges`] with the ARA renderers lent by the live
+/// engine too, so ARA tracks are heard in the files.
+pub fn export_render_job_with_plugins(
+    snapshot: &EngineProjectSnapshot,
+    job: &RenderJob,
+    cancel: &ExportCancelToken,
+    plugins: OfflinePlugins<'_>,
     mut on_progress: impl FnMut(ExportProgress),
 ) -> Result<Vec<ArrangementExportSummary>, ExportError> {
     let Some(render) = job.render().cloned() else {
@@ -232,12 +253,12 @@ pub fn export_render_job_with_bridges(
                 ExportStage::AnalyzingPeak,
                 total,
             ));
-            let analysis = render_offline_with_bridges(
+            let analysis = render_offline_with_plugins(
                 snapshot,
                 &render,
                 cancel,
                 1.0,
-                bridge_sinks,
+                plugins,
                 |_block| Ok(()),
                 |_p| {},
             )?;
@@ -267,12 +288,12 @@ pub fn export_render_job_with_bridges(
     let mut mono_scratch = vec![Vec::<f32>::new(); job.tracks.len()];
     let (mix_encoders, track_encoders) = encoders.split_at_mut(track_offset);
     let (mix_meters, track_meters) = meters.split_at_mut(track_offset);
-    let render_result = render_offline_mix_and_tracks_with_bridges(
+    let render_result = render_offline_mix_and_tracks_with_plugins(
         snapshot,
         &render,
         cancel,
         gain,
-        bridge_sinks,
+        plugins,
         !job.tracks.is_empty(),
         &mut |block| {
             if let (Some(encoder), Some(meter)) = (mix_encoders.first_mut(), mix_meters.first_mut())

@@ -1085,6 +1085,11 @@ pub struct EngineInner {
     /// would vanish on the next project sync and every live ARA binding would be
     /// destroyed behind the user's back.
     ara_renderers: Mutex<HashMap<String, Vec<crate::runtime::RuntimeAraRenderer>>>,
+    /// The renderers are lent to an offline render (see
+    /// [`Self::lend_ara_renderers`]): the realtime graph holds none of them,
+    /// and changes reach only the mirror until they are given back. Read and
+    /// written under the `ara_renderers` lock.
+    ara_lent: AtomicBool,
     /// The realtime render being recorded and the track ids its lanes carry,
     /// so every graph built while it runs is mapped to it. Also the control
     /// thread's own reference to the capture (see `SetRenderCapture`).
@@ -1256,6 +1261,7 @@ impl EngineInner {
             last_sent_time_signature_map: Mutex::new(default_time_signature_map),
             plugin_bridge_sinks: Mutex::new(Default::default()),
             ara_renderers: Mutex::new(HashMap::new()),
+            ara_lent: AtomicBool::new(false),
             render_capture: Mutex::new(None),
             monitor_mirror: Mutex::new(MonitorMirror::default()),
             audio_cache: Mutex::new(HashMap::new()),
@@ -1917,18 +1923,68 @@ impl EngineInner {
         track_id: String,
         renderers: Vec<crate::runtime::RuntimeAraRenderer>,
     ) -> Result<(), SphereAudioError> {
-        {
-            let mut mirror = self.ara_renderers.lock();
-            if renderers.is_empty() {
-                mirror.remove(&track_id);
-            } else {
-                mirror.insert(track_id.clone(), renderers.clone());
-            }
+        let mut mirror = self.ara_renderers.lock();
+        if renderers.is_empty() {
+            mirror.remove(&track_id);
+        } else {
+            mirror.insert(track_id.clone(), renderers.clone());
+        }
+        // Lent to an offline render: the graph gets them when they come back.
+        // Sent under the lock, so a give-back cannot overtake this change.
+        if self.ara_lent.load(Ordering::SeqCst) {
+            return Ok(());
         }
         self.send_command(EngineCommand::SetAraRenderers {
             track_id,
             renderers,
         })
+    }
+
+    /// Take every ARA playback renderer out of the realtime graph and hand
+    /// them to an offline render, by track id.
+    ///
+    /// An ARA track's clips are rendered by its plug-in instance, bound to the
+    /// document, and that one instance must never be processed by the audio
+    /// callback and an export worker at once. Blocks the calling control
+    /// thread until the callback has dropped them (bounded). Until
+    /// [`Self::return_ara_renderers`], the live graph plays those tracks
+    /// silent; an export pauses playback anyway.
+    pub fn lend_ara_renderers(&self) -> crate::export::AraRendererMap {
+        let lent = {
+            let mirror = self.ara_renderers.lock();
+            self.ara_lent.store(true, Ordering::SeqCst);
+            for track_id in mirror.keys() {
+                let _ = self.send_command(EngineCommand::SetAraRenderers {
+                    track_id: track_id.clone(),
+                    renderers: Vec::new(),
+                });
+            }
+            mirror.clone()
+        };
+        if !lent.is_empty()
+            && !self.wait_for_command_barrier(std::time::Duration::from_millis(500))
+        {
+            // No open stream, or a stalled callback: the same grace the bridge
+            // handoff falls back to.
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        lent
+    }
+
+    /// Give the renderers [`Self::lend_ara_renderers`] took back to the
+    /// realtime graph — as the mirror has them now, so a change made while
+    /// they were lent is kept.
+    pub fn return_ara_renderers(&self) {
+        let mirror = self.ara_renderers.lock();
+        if !self.ara_lent.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        for (track_id, renderers) in mirror.iter() {
+            let _ = self.send_command(EngineCommand::SetAraRenderers {
+                track_id: track_id.clone(),
+                renderers: renderers.clone(),
+            });
+        }
     }
 
     pub fn set_bridge_editor_active(
@@ -3848,7 +3904,9 @@ impl EngineInner {
         // re-creating it would throw them away and restart analysis.
         {
             let mirror = self.ara_renderers.lock();
-            if !mirror.is_empty() {
+            // Lent to an offline render: the rebuilt graph must not take them
+            // back while the export processes them.
+            if !mirror.is_empty() && !self.ara_lent.load(Ordering::SeqCst) {
                 for track in runtime.tracks.iter_mut() {
                     if let Some(renderers) = mirror.get(&track.id) {
                         track.ara_renderers = renderers.clone();

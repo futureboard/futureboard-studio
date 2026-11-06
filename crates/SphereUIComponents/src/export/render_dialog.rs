@@ -20,7 +20,7 @@ use gpui::{
 use DirectAudio::plugin_bridge::PluginBridgeSinkMap;
 use DirectAudio::types::EngineProjectSnapshot;
 use DirectAudio::{
-    export_render_job_with_bridges, record_render_job, ArrangementExportSummary, ExportCancelToken,
+    export_render_job_with_plugins, record_render_job, ArrangementExportSummary, ExportCancelToken,
     ExportProgress, ExportStage, RenderJob,
 };
 
@@ -124,14 +124,17 @@ struct RenderShared {
     done: Option<Result<Vec<ArrangementExportSummary>, String>>,
 }
 
-/// Detaches the live realtime plugin-bridge sinks for the duration of an
-/// offline render and guarantees they are re-installed when the guard leaves
-/// scope — success, error, or worker panic (Drop runs during unwind). Losing
-/// the restore would leave every bridged insert silent in realtime playback
-/// after the render.
+/// Detaches the live realtime plugin-bridge sinks and ARA renderers for the
+/// duration of an offline render and guarantees they are re-installed when the
+/// guard leaves scope — success, error, or worker panic (Drop runs during
+/// unwind). Losing the restore would leave every bridged insert and every ARA
+/// track silent in realtime playback after the render.
 pub(crate) struct BridgeSinkHandoff<'a> {
     engine: Option<&'a DirectAudio::AudioEngine>,
     sinks: &'a PluginBridgeSinkMap,
+    /// The ARA tracks' renderers, lent by the realtime graph: an ARA track's
+    /// clips are rendered by its plug-in, so without them it renders silent.
+    ara: DirectAudio::AraRendererMap,
 }
 
 impl<'a> BridgeSinkHandoff<'a> {
@@ -139,6 +142,10 @@ impl<'a> BridgeSinkHandoff<'a> {
         engine: Option<&'a DirectAudio::AudioEngine>,
         sinks: &'a PluginBridgeSinkMap,
     ) -> Self {
+        // Waits for the callback to let go of them before the worker renders.
+        let ara = engine
+            .map(DirectAudio::AudioEngine::lend_ara_renderers)
+            .unwrap_or_default();
         if let Some(engine) = engine {
             if !sinks.is_empty() {
                 for id in sinks.keys() {
@@ -154,7 +161,16 @@ impl<'a> BridgeSinkHandoff<'a> {
                 }
             }
         }
-        Self { engine, sinks }
+        Self { engine, sinks, ara }
+    }
+
+    /// The live plug-ins the render may drive: the bridges and the lent ARA
+    /// renderers.
+    pub(crate) fn plugins(&self) -> DirectAudio::OfflinePlugins<'_> {
+        DirectAudio::OfflinePlugins {
+            bridge_sinks: Some(self.sinks),
+            ara_renderers: Some(&self.ara),
+        }
     }
 }
 
@@ -164,6 +180,10 @@ impl Drop for BridgeSinkHandoff<'_> {
             for (id, sink) in self.sinks {
                 let _ = engine.set_plugin_bridge_sink(id.clone(), Some(sink.clone()));
             }
+            // The worker's clones go first, so the graph takes them back
+            // knowing nothing else processes them.
+            self.ara.clear();
+            engine.return_ara_renderers();
         }
     }
 }
@@ -282,15 +302,15 @@ impl RenderDialog {
                 // (guard Drop) before the result is published — and on any
                 // panic path, since Drop runs during unwind.
                 let result = {
-                    let _handoff = BridgeSinkHandoff::detach(
+                    let handoff = BridgeSinkHandoff::detach(
                         launch.audio_engine.as_ref(),
                         &launch.bridge_sinks,
                     );
-                    export_render_job_with_bridges(
+                    export_render_job_with_plugins(
                         &launch.snapshot,
                         &launch.job,
                         &cancel,
-                        Some(&launch.bridge_sinks),
+                        handoff.plugins(),
                         on_progress,
                     )
                     .map_err(|error| error.to_string())

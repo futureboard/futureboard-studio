@@ -89,6 +89,7 @@ pub use crate::export::{
     arrangement_bounds_samples, beats_to_samples, export_arrangement,
     render_block_size_for_sample_rate,
     export_arrangement_with_bridges, export_render_job, export_render_job_with_bridges,
+    export_render_job_with_plugins, AraRendererMap, OfflinePlugins,
     export_tracks_single_pass, export_tracks_single_pass_with_bridges, partial_path_for,
     record_render_job, render_offline,
     render_offline_tracks, ArrangementExportRequest,

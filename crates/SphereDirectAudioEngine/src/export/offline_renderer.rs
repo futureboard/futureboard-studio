@@ -223,6 +223,47 @@ pub fn render_offline_with_bridges(
     cancel: &ExportCancelToken,
     gain: f32,
     bridge_sinks: Option<&PluginBridgeSinkMap>,
+    on_block: impl FnMut(&[f32]) -> Result<(), ExportError>,
+    on_progress: impl FnMut(ExportProgress),
+) -> Result<OfflineRenderSummary, ExportError> {
+    render_offline_with_plugins(
+        snapshot,
+        request,
+        cancel,
+        gain,
+        OfflinePlugins {
+            bridge_sinks,
+            ara_renderers: None,
+        },
+        on_block,
+        on_progress,
+    )
+}
+
+/// The live plug-ins an offline render borrows: the bridged hosts' sinks, and
+/// the ARA playback renderers by track id.
+///
+/// An ARA track's clips are rendered by its plug-in, which read the sources
+/// out of band, so the graph skips their files; without the track's renderer
+/// the track is silent. The renderers are the live, document-bound instances,
+/// so the caller must have taken them out of the realtime graph first
+/// (`AudioEngine::lend_ara_renderers`) — two threads must never process one.
+#[derive(Clone, Copy, Default)]
+pub struct OfflinePlugins<'a> {
+    pub bridge_sinks: Option<&'a PluginBridgeSinkMap>,
+    pub ara_renderers: Option<&'a AraRendererMap>,
+}
+
+/// ARA playback renderers by track id, as `AudioEngine::lend_ara_renderers`
+/// hands them out.
+pub type AraRendererMap = HashMap<String, Vec<crate::runtime::RuntimeAraRenderer>>;
+
+pub fn render_offline_with_plugins(
+    snapshot: &EngineProjectSnapshot,
+    request: &OfflineRenderRequest,
+    cancel: &ExportCancelToken,
+    gain: f32,
+    plugins: OfflinePlugins<'_>,
     mut on_block: impl FnMut(&[f32]) -> Result<(), ExportError>,
     mut on_progress: impl FnMut(ExportProgress),
 ) -> Result<OfflineRenderSummary, ExportError> {
@@ -231,7 +272,7 @@ pub fn render_offline_with_bridges(
         request,
         cancel,
         gain,
-        bridge_sinks,
+        plugins,
         false,
         &mut on_block,
         &mut |_taps, _frames| Ok(()),
@@ -265,7 +306,10 @@ pub fn render_offline_tracks_with_bridges(
         request,
         cancel,
         1.0,
-        bridge_sinks,
+        OfflinePlugins {
+            bridge_sinks,
+            ara_renderers: None,
+        },
         true,
         &mut |_block| Ok(()),
         &mut on_track_block,
@@ -288,12 +332,41 @@ pub fn render_offline_mix_and_tracks_with_bridges(
     on_track_block: TrackBlockCallback,
     on_progress: &mut dyn FnMut(ExportProgress),
 ) -> Result<OfflineRenderSummary, ExportError> {
+    render_offline_mix_and_tracks_with_plugins(
+        snapshot,
+        request,
+        cancel,
+        gain,
+        OfflinePlugins {
+            bridge_sinks,
+            ara_renderers: None,
+        },
+        capture_tracks,
+        on_block,
+        on_track_block,
+        on_progress,
+    )
+}
+
+/// [`render_offline_mix_and_tracks_with_bridges`] with the ARA renderers too.
+#[allow(clippy::too_many_arguments)]
+pub fn render_offline_mix_and_tracks_with_plugins(
+    snapshot: &EngineProjectSnapshot,
+    request: &OfflineRenderRequest,
+    cancel: &ExportCancelToken,
+    gain: f32,
+    plugins: OfflinePlugins<'_>,
+    capture_tracks: bool,
+    on_block: &mut dyn FnMut(&[f32]) -> Result<(), ExportError>,
+    on_track_block: TrackBlockCallback,
+    on_progress: &mut dyn FnMut(ExportProgress),
+) -> Result<OfflineRenderSummary, ExportError> {
     render_offline_impl(
         snapshot,
         request,
         cancel,
         gain,
-        bridge_sinks,
+        plugins,
         capture_tracks,
         on_block,
         on_track_block,
@@ -311,13 +384,14 @@ fn render_offline_impl(
     request: &OfflineRenderRequest,
     cancel: &ExportCancelToken,
     gain: f32,
-    bridge_sinks: Option<&PluginBridgeSinkMap>,
+    plugins: OfflinePlugins<'_>,
     capture_tracks: bool,
     on_block: &mut dyn FnMut(&[f32]) -> Result<(), ExportError>,
     on_track_block: TrackBlockCallback,
     on_progress: &mut dyn FnMut(ExportProgress),
 ) -> Result<OfflineRenderSummary, ExportError> {
     request.validate().map_err(ExportError::Settings)?;
+    let bridge_sinks = plugins.bridge_sinks;
 
     on_progress(ExportProgress::stage_only(
         ExportStage::Preparing,
@@ -363,6 +437,9 @@ fn render_offline_impl(
             })
             .collect();
         runtime.resolve_bridge_sinks();
+    }
+    if let Some(renderers) = plugins.ara_renderers {
+        install_offline_ara_renderers(&mut runtime, renderers, request.sample_rate)?;
     }
     if let Some((track_id, insert_id)) = runtime.tracks.iter().find_map(|track| {
         track.inserts.iter().find_map(|insert| {
@@ -879,6 +956,42 @@ pub(crate) fn silence_snapshot(sample_rate: u32) -> EngineProjectSnapshot {
             buffer_size: 512,
         },
     }
+}
+
+/// Put the lent ARA renderers on their tracks in the offline graph, the way a
+/// live project sync carries them into a rebuilt graph (latency included, so
+/// delay compensation and the warmup see them).
+///
+/// An ARA instance renders at the rate it was set up at; this graph runs at
+/// the export's. A track whose clips the plug-in renders cannot be exported
+/// at another rate without coming out at the wrong pitch and speed, so that
+/// fails with a reason instead.
+fn install_offline_ara_renderers(
+    runtime: &mut RuntimeProject,
+    renderers: &AraRendererMap,
+    sample_rate: u32,
+) -> Result<(), ExportError> {
+    for track in runtime.tracks.iter_mut() {
+        let Some(lent) = renderers.get(&track.id).filter(|lent| !lent.is_empty()) else {
+            continue;
+        };
+        if let Some(rate) = lent
+            .iter()
+            .map(|renderer| renderer.processor.sample_rate())
+            .find(|&rate| rate != sample_rate)
+        {
+            return Err(ExportError::Settings(format!(
+                "an ARA plug-in in this project runs at {rate} Hz, so it can only be rendered \
+                 at {rate} Hz"
+            )));
+        }
+        track.ara_renderers = lent.clone();
+        track.ara_latency_samples = lent.iter().map(|renderer| renderer.latency_samples).sum();
+        track.plugin_latency_samples = track
+            .plugin_latency_samples
+            .saturating_add(track.ara_latency_samples);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
