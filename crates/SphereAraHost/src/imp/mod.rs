@@ -238,6 +238,86 @@ unsafe fn load_factory(
     Err(last)
 }
 
+/// One initialized ARA factory, shared by every session open on it.
+///
+/// A plug-in binary exposes one static `ARAFactory`, and ARA allows exactly one
+/// `initializeARAWithConfiguration` .. `uninitializeARA` span over it. Opening
+/// a session per track initialized the same Melodyne factory once for each
+/// track, and closing either track's session uninitialized it while the other
+/// track's document controller was still alive — every later call from that
+/// track, a pitch edit included, ran on an uninitialized factory.
+struct SharedFactory {
+    loaded: *mut LoadedFactory<'static>,
+    generation: ApiGeneration,
+    sessions: usize,
+}
+
+// SAFETY: the pointer is only dereferenced by sessions, which are `!Send` and
+// live on the model thread; the registry merely holds and counts it.
+unsafe impl Send for SharedFactory {}
+
+fn factories() -> &'static std::sync::Mutex<HashMap<usize, SharedFactory>> {
+    static FACTORIES: std::sync::OnceLock<std::sync::Mutex<HashMap<usize, SharedFactory>>> =
+        std::sync::OnceLock::new();
+    FACTORIES.get_or_init(Default::default)
+}
+
+/// The initialized factory at `factory`, loading it for the first session and
+/// counting every further one.
+///
+/// # Safety
+///
+/// As [`load_factory`].
+unsafe fn acquire_factory(
+    factory: *const c_void,
+) -> AraResult<(*mut LoadedFactory<'static>, ApiGeneration)> {
+    let key = factory as usize;
+    let mut registry = factories()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if let Some(shared) = registry.get_mut(&key) {
+        shared.sessions += 1;
+        trace(&format!(
+            "ARA factory 0x{key:x} shared by {} sessions",
+            shared.sessions
+        ));
+        return Ok((shared.loaded, shared.generation));
+    }
+    // SAFETY: forwarded from the caller.
+    let (loaded, generation) = unsafe { load_factory(factory) }?;
+    let loaded = Box::into_raw(Box::new(loaded));
+    registry.insert(
+        key,
+        SharedFactory {
+            loaded,
+            generation,
+            sessions: 1,
+        },
+    );
+    Ok((loaded, generation))
+}
+
+/// One session is done with the factory at `key`; the last one uninitializes
+/// it. Call only once nothing that session owns borrows the factory.
+fn release_factory(key: usize) {
+    let mut registry = factories()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let Some(shared) = registry.get_mut(&key) else {
+        return;
+    };
+    shared.sessions = shared.sessions.saturating_sub(1);
+    if shared.sessions > 0 {
+        return;
+    }
+    let loaded = shared.loaded;
+    registry.remove(&key);
+    drop(registry);
+    // SAFETY: the box came from `acquire_factory`, and the count just reached
+    // zero, so no live session or controller borrows it any more.
+    unsafe { drop(Box::from_raw(loaded)) };
+}
+
 /// # Safety
 ///
 /// See [`crate::vst3_ara_factory`].
@@ -359,24 +439,34 @@ fn restore_filter(planned: &PlannedFilter) -> AraResult<RestoreFilter> {
 }
 
 /// Clips whose region and modification must go before the graph is rebuilt:
-/// those no longer wanted, and those that moved to another source or track.
+/// those no longer wanted, those that moved to another source, and those
+/// whose track leaves the document.
 ///
 /// ARA creates a modification on its source for good, and an audio source
 /// cannot be destroyed while a modification still sits on it. A clip whose
 /// audio changed therefore loses its region and modification first and gets
 /// new ones on the new source; updating the region in place left the
 /// modification on the old source and made its teardown fail.
+///
+/// A clip that moves to another track of the same document keeps both: its
+/// region is updated onto the other track's sequence, and the modification —
+/// the user's edits in the plug-in — stays. Only when the track it left is
+/// itself going does the region go first, since that track's sequence is
+/// destroyed in the same edit and a region may not outlive its sequence.
 fn doomed_clips<'a>(
     held: impl Iterator<Item = (&'a AraClipKey, &'a AraPlaybackRegionDesc)>,
     wanted: &[AraPlaybackRegionDesc],
+    wanted_tracks: &[AraRegionSequenceDesc],
 ) -> Vec<AraClipKey> {
     let wanted: HashMap<&AraClipKey, &AraPlaybackRegionDesc> =
         wanted.iter().map(|desc| (&desc.key, desc)).collect();
+    let track_stays = |track: &AraTrackKey| wanted_tracks.iter().any(|seq| seq.key == *track);
     let mut doomed: Vec<AraClipKey> = held
         .filter(|(key, held)| {
-            wanted
-                .get(key)
-                .is_none_or(|desc| desc.source != held.source || desc.track != held.track)
+            wanted.get(key).is_none_or(|desc| {
+                desc.source != held.source
+                    || (desc.track != held.track && !track_stays(&held.track))
+            })
         })
         .map(|(key, _)| key.clone())
         .collect();
@@ -413,7 +503,9 @@ pub(crate) struct Session {
     /// Leaked so the borrow checker sees `'static`; reclaimed in `Drop` strictly
     /// after `document`, which holds the controller that borrows both.
     services_ptr: *mut HostServices,
-    factory_ptr: *mut LoadedFactory<'static>,
+    /// The plug-in binary's factory, shared with every other session on it;
+    /// see [`SharedFactory`]. Released, not freed, in `Drop`.
+    factory_key: usize,
     document: Option<DocumentSession<'static, 'static>>,
     info: AraFactoryInfo,
     /// The negotiated generation, which decides whether keys are published.
@@ -454,8 +546,12 @@ impl Session {
     /// See [`crate::AraSession::open`].
     pub(crate) unsafe fn open(factory: *const c_void, config: AraSessionConfig) -> AraResult<Self> {
         // SAFETY: the caller forwards the live-factory contract.
-        let (loaded, generation) = unsafe { load_factory(factory) }?;
-        let info = describe(&loaded, generation);
+        let (factory_ptr, generation) = unsafe { acquire_factory(factory) }?;
+        let factory_key = factory as usize;
+        // SAFETY: the registry keeps the factory alive until this session
+        // releases it.
+        let loaded = unsafe { &*factory_ptr };
+        let info = describe(loaded, generation);
         let notes_analysable = loaded
             .metadata()
             .analyzable_content_types()
@@ -477,37 +573,40 @@ impl Session {
             .playback(TransportService::new(config.transport))
             .content(SharedContent(Arc::clone(&content)))
             .build(generation)
-            .map_err(map_error)?;
+            .map_err(|error| {
+                release_factory(factory_key);
+                map_error(error)
+            })?;
 
         let properties =
-            DocumentProperties::new(config.document_name.as_deref()).map_err(map_error)?;
+            DocumentProperties::new(config.document_name.as_deref()).map_err(|error| {
+                release_factory(factory_key);
+                map_error(error)
+            })?;
 
         // The controller borrows both the factory and the services for its whole
         // life, which cannot be expressed inside one owning struct. Leaking both
         // and reclaiming them in `Drop` — after the document, in this exact
         // order — keeps that invariant explicit and checkable in one place.
         let services_ptr = Box::into_raw(Box::new(services));
-        let factory_ptr = Box::into_raw(Box::new(loaded));
 
-        // SAFETY: both boxes were just created here, are not aliased, and stay
-        // live until `Drop` reclaims them after `document` is gone.
+        // SAFETY: the services box was just created here and is not aliased;
+        // the factory stays registered until `Drop` releases it.
         let (services_ref, factory_ref) = unsafe { (&*services_ptr, &*factory_ptr) };
 
         let document = match DocumentSession::new(factory_ref, services_ref, properties) {
             Ok(document) => document,
             Err(error) => {
-                // SAFETY: nothing borrows either box on this path.
-                unsafe {
-                    drop(Box::from_raw(factory_ptr));
-                    drop(Box::from_raw(services_ptr));
-                }
+                // SAFETY: nothing borrows the services box on this path.
+                unsafe { drop(Box::from_raw(services_ptr)) };
+                release_factory(factory_key);
                 return Err(map_error(error));
             }
         };
 
         Ok(Self {
             services_ptr,
-            factory_ptr,
+            factory_key,
             document: Some(document),
             info,
             generation,
@@ -764,6 +863,7 @@ impl Session {
         let doomed_clips = doomed_clips(
             self.clips.iter().map(|(key, entry)| (key, &entry.desc)),
             &graph.regions,
+            &graph.sequences,
         );
 
         // An open editor view is holding the regions it was last shown. Before
@@ -965,6 +1065,8 @@ impl Session {
                     edit.update_audio_source(entry.handle, properties)
                         .map_err(map_error)?;
                     if reshaped {
+                        // A reader opened from now on serves the new shape.
+                        index.insert_source(entry.address, desc.key.clone(), source_shape(desc));
                         edit.set_audio_source_samples_access(entry.handle, true)
                             .map_err(map_error)?;
                     }
@@ -979,7 +1081,7 @@ impl Session {
                     // often only -- request to read the audio is refused.
                     let address =
                         edit.audio_source_ref(handle).map_err(map_error)?.as_raw() as usize;
-                    index.insert_source(address, desc.key.clone());
+                    index.insert_source(address, desc.key.clone(), source_shape(desc));
                     // The plug-in may only read samples once access is enabled;
                     // without this every analysis request comes back empty.
                     edit.set_audio_source_samples_access(handle, true)
@@ -1025,7 +1127,9 @@ impl Session {
 
             match clips.get_mut(&desc.key) {
                 Some(entry) if entry.desc == *desc => {}
-                // Same source and track: `doomed_clips` took every other one.
+                // Same source, and a track still in the document:
+                // `doomed_clips` took every other one. A new track is a new
+                // sequence reference in the properties.
                 Some(entry) => {
                     edit.update_playback_region(entry.region, region_properties)
                         .map_err(map_error)?;
@@ -1846,12 +1950,20 @@ impl Drop for Session {
         // and only then the host services the controller was calling into.
         self.renderers.clear();
         drop(self.document.take());
-        // SAFETY: both pointers came from `Box::into_raw` in `open`, are never
-        // aliased elsewhere, and nothing borrows them once `document` is gone.
-        unsafe {
-            drop(Box::from_raw(self.factory_ptr));
-            drop(Box::from_raw(self.services_ptr));
-        }
+        // The factory is shared: this session lets go of it, and only the last
+        // one to close uninitializes ARA.
+        release_factory(self.factory_key);
+        // SAFETY: the pointer came from `Box::into_raw` in `open`, is never
+        // aliased elsewhere, and nothing borrows it once `document` is gone.
+        unsafe { drop(Box::from_raw(self.services_ptr)) };
+    }
+}
+
+/// The shape `desc` is published to the plug-in with.
+fn source_shape(desc: &AraAudioSourceDesc) -> services::SourceShape {
+    services::SourceShape {
+        channels: usize::try_from(desc.channel_count).unwrap_or(0),
+        frames: desc.frame_count,
     }
 }
 
@@ -2077,8 +2189,17 @@ mod tests {
         }
     }
 
+    fn sequence(track: &str) -> AraRegionSequenceDesc {
+        AraRegionSequenceDesc {
+            key: AraTrackKey(track.to_owned()),
+            name: track.to_owned(),
+            order_index: 0,
+            color: None,
+        }
+    }
+
     #[test]
-    fn a_clip_that_moves_to_other_audio_or_another_track_is_rebuilt() {
+    fn a_clip_that_moves_to_other_audio_is_rebuilt() {
         let held = [
             region("kept", "a.wav", "track-1"),
             region("moved-later", "a.wav", "track-1"),
@@ -2094,15 +2215,28 @@ mod tests {
             region("retargeted", "Assets/Audio/b.wav", "track-1"),
             region("rehomed", "a.wav", "track-2"),
         ];
-        let doomed = doomed_clips(held.iter().map(|desc| (&desc.key, desc)), &wanted);
+        let tracks = [sequence("track-1"), sequence("track-2")];
+        let doomed = doomed_clips(held.iter().map(|desc| (&desc.key, desc)), &wanted, &tracks);
+        // "rehomed" moved between two tracks of one document: it keeps its
+        // region and its edits.
         assert_eq!(
             doomed,
-            vec![
-                AraClipKey::from("deleted"),
-                AraClipKey::from("rehomed"),
-                AraClipKey::from("retargeted"),
-            ]
+            vec![AraClipKey::from("deleted"), AraClipKey::from("retargeted")]
         );
+    }
+
+    /// A clip whose old track leaves the document goes with it: that track's
+    /// sequence is destroyed in the same edit.
+    #[test]
+    fn a_clip_whose_track_leaves_the_document_is_rebuilt() {
+        let held = [region("rehomed", "a.wav", "track-1")];
+        let wanted = [region("rehomed", "a.wav", "track-2")];
+        let doomed = doomed_clips(
+            held.iter().map(|desc| (&desc.key, desc)),
+            &wanted,
+            &[sequence("track-2")],
+        );
+        assert_eq!(doomed, vec![AraClipKey::from("rehomed")]);
     }
 
     #[test]

@@ -38,21 +38,35 @@ use crate::model::{
 /// The maps are small (one entry per asset / clip) and are read on plug-in
 /// threads, so a plain mutex is the right tool: no allocation happens under the
 /// lock on the read path, and none of these calls sit on an audio thread.
+/// What a source was published to the plug-in as: its channel count and its
+/// length in frames. ARA's reads are defined against this shape, not against
+/// whatever the host's decoder later produces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SourceShape {
+    pub(crate) channels: usize,
+    pub(crate) frames: i64,
+}
+
 #[derive(Default)]
 pub(crate) struct GraphIndex {
-    sources: Mutex<HashMap<usize, AraSourceKey>>,
+    sources: Mutex<HashMap<usize, (AraSourceKey, SourceShape)>>,
     modifications: Mutex<HashMap<usize, AraClipKey>>,
     regions: Mutex<HashMap<usize, AraClipKey>>,
     musical_context: Mutex<Option<usize>>,
 }
 
 impl GraphIndex {
-    pub(crate) fn insert_source(&self, address: usize, key: AraSourceKey) {
+    pub(crate) fn insert_source(&self, address: usize, key: AraSourceKey, shape: SourceShape) {
         trace(&format!(
-            "indexed audio source '{}' at 0x{address:x}",
-            key.as_str()
+            "indexed audio source '{}' at 0x{address:x} channels={} frames={}",
+            key.as_str(),
+            shape.channels,
+            shape.frames
         ));
-        let _ = self.sources.lock().map(|mut map| map.insert(address, key));
+        let _ = self
+            .sources
+            .lock()
+            .map(|mut map| map.insert(address, (key, shape)));
     }
 
     /// Comma-separated list of the addresses currently indexed, for diagnostics.
@@ -101,6 +115,10 @@ impl GraphIndex {
     }
 
     fn source_key(&self, source: AudioSourceId) -> Option<AraSourceKey> {
+        self.source_entry(source).map(|(key, _)| key)
+    }
+
+    fn source_entry(&self, source: AudioSourceId) -> Option<(AraSourceKey, SourceShape)> {
         self.sources
             .lock()
             .ok()
@@ -202,7 +220,7 @@ impl AudioAccessProvider for AudioService {
             "plug-in asked for a reader: source=0x{:x} 64bit={use_64_bit_samples}",
             source.as_usize()
         ));
-        let Some(key) = self.index.source_key(source) else {
+        let Some((key, shape)) = self.index.source_entry(source) else {
             trace(&format!(
                 "no host key for source=0x{:x}; known={}",
                 source.as_usize(),
@@ -217,15 +235,22 @@ impl AudioAccessProvider for AudioService {
             ));
             AraError::Peer("host could not open the ARA audio source")
         })?;
-        let channels = reader.channel_count();
+        let decoded_channels = reader.channel_count();
         trace(&format!(
-            "plug-in opened a reader for '{}' channels={channels} frames={}",
+            "plug-in opened a reader for '{}' published channels={} frames={} decoded channels={decoded_channels} frames={}",
             key.as_str(),
+            shape.channels,
+            shape.frames,
             reader.frame_count()
         ));
+        if decoded_channels == 0 || shape.channels == 0 {
+            return Err(AraError::Peer("ARA audio source has no channels"));
+        }
         Ok(Box::new(SampleReaderAdapter {
             reader,
-            channels,
+            channels: shape.channels,
+            decoded_channels,
+            frames: shape.frames,
             // Planar scratch is grown once per reader on the first read of a
             // given block size and reused afterwards, so steady-state reads do
             // not allocate.
@@ -235,18 +260,36 @@ impl AudioAccessProvider for AudioService {
     }
 }
 
-/// Adapts Futureboard's f32 planar reader to ARA's f32/f64 reader contract.
+/// Adapts Futureboard's f32 planar reader to ARA's f32/f64 reader contract,
+/// in the shape the source was published as.
+///
+/// The plug-in hands over exactly as many channel buffers as the source was
+/// published with (`channels`), sized by that published length (`frames`).
+/// The host's decoder can disagree — a file whose codec reports no channel
+/// count is probed as mono and decoded as stereo — and reading the decoder's
+/// channel count of pointers out of the plug-in's array then wrote through a
+/// pointer the plug-in never passed: memory corruption inside Melodyne, on the
+/// regions whose files happened to disagree. The decoded planes are mapped to
+/// the published ones instead: a channel the decoder lacks repeats its last
+/// one, one it has extra is left out, and frames past the decoded end are
+/// silence.
 struct SampleReaderAdapter {
     reader: Box<dyn crate::model::AraSampleReader>,
+    /// Channels as published to the plug-in.
     channels: usize,
+    /// Channels the host's reader fills.
+    decoded_channels: usize,
+    /// Length as published to the plug-in.
+    frames: i64,
     scratch: Vec<f32>,
     wants_f64: bool,
 }
 
 impl SampleReaderAdapter {
-    /// Reads into `self.scratch` laid out as `channels` contiguous planes.
+    /// Reads into `self.scratch` laid out as `decoded_channels` contiguous
+    /// planes of `frames` each.
     fn fill_scratch(&mut self, sample_position: i64, frames: usize) -> Result<(), AraError> {
-        let needed = self.channels * frames;
+        let needed = self.decoded_channels * frames;
         if self.scratch.len() < needed {
             self.scratch.resize(needed, 0.0);
         }
@@ -256,6 +299,12 @@ impl SampleReaderAdapter {
             .read_planar_f32(sample_position, &mut planes)
             .map_err(|_| AraError::Peer("host audio read failed"))
     }
+
+    /// The decoded plane that feeds published channel `channel`.
+    fn decoded_plane(&self, channel: usize, frames: usize) -> &[f32] {
+        let source = channel.min(self.decoded_channels - 1);
+        &self.scratch[source * frames..(source + 1) * frames]
+    }
 }
 
 impl HostAudioReader for SampleReaderAdapter {
@@ -264,7 +313,7 @@ impl HostAudioReader for SampleReaderAdapter {
     }
 
     fn sample_count(&self) -> i64 {
-        self.reader.frame_count()
+        self.frames
     }
 
     fn read_f32(
@@ -279,9 +328,17 @@ impl HostAudioReader for SampleReaderAdapter {
         if frames == 0 {
             return Ok(());
         }
-        self.reader
-            .read_planar_f32(sample_position, buffers)
-            .map_err(|_| AraError::Peer("host audio read failed"))
+        if self.decoded_channels == self.channels {
+            return self
+                .reader
+                .read_planar_f32(sample_position, buffers)
+                .map_err(|_| AraError::Peer("host audio read failed"));
+        }
+        self.fill_scratch(sample_position, frames)?;
+        for (channel, plane) in buffers.iter_mut().enumerate() {
+            plane.copy_from_slice(self.decoded_plane(channel, frames));
+        }
+        Ok(())
     }
 
     fn read_f64(
@@ -301,8 +358,7 @@ impl HostAudioReader for SampleReaderAdapter {
         }
         self.fill_scratch(sample_position, frames)?;
         for (channel, plane) in buffers.iter_mut().enumerate() {
-            let start = channel * frames;
-            for (out, sample) in plane.iter_mut().zip(&self.scratch[start..start + frames]) {
+            for (out, sample) in plane.iter_mut().zip(self.decoded_plane(channel, frames)) {
                 *out = f64::from(*sample);
             }
         }
@@ -795,6 +851,87 @@ mod tests {
             name: Some("A Natural Minor".to_owned()),
             quarter_position: 0.0,
         }
+    }
+
+    /// A mono decode of a source published as stereo.
+    struct MonoReader;
+
+    impl crate::model::AraSampleReader for MonoReader {
+        fn channel_count(&self) -> usize {
+            1
+        }
+
+        fn frame_count(&self) -> i64 {
+            4
+        }
+
+        fn read_planar_f32(
+            &mut self,
+            start_frame: i64,
+            out: &mut [&mut [f32]],
+        ) -> crate::error::AraResult<()> {
+            assert_eq!(
+                out.len(),
+                1,
+                "the host reader is asked for its own channels"
+            );
+            for (i, sample) in out[0].iter_mut().enumerate() {
+                let frame = start_frame + i as i64;
+                *sample = if (0..4).contains(&frame) {
+                    frame as f32 + 1.0
+                } else {
+                    0.0
+                };
+            }
+            Ok(())
+        }
+    }
+
+    fn adapter(channels: usize, frames: i64, wants_f64: bool) -> SampleReaderAdapter {
+        SampleReaderAdapter {
+            reader: Box::new(MonoReader),
+            channels,
+            decoded_channels: 1,
+            frames,
+            scratch: Vec::new(),
+            wants_f64,
+        }
+    }
+
+    /// The plug-in passes as many buffers as the source was published with.
+    /// Each is filled from the decode, which has fewer, and none past them is
+    /// touched — the read that used to write through a pointer the plug-in
+    /// never passed.
+    #[test]
+    fn a_read_fills_the_published_channels_from_a_narrower_decode() {
+        let mut reader = adapter(2, 6, false);
+        assert_eq!(reader.channel_count(), 2);
+        assert_eq!(
+            reader.sample_count(),
+            6,
+            "the published length, not the decoded one"
+        );
+        let (mut left, mut right) = ([9.0f32; 6], [9.0f32; 6]);
+        reader
+            .read_f32(0, &mut [&mut left[..], &mut right[..]])
+            .expect("read");
+        assert_eq!(left, [1.0, 2.0, 3.0, 4.0, 0.0, 0.0]);
+        assert_eq!(right, left, "the missing channel repeats the decoded one");
+
+        let mut wide = adapter(2, 6, true);
+        let (mut left, mut right) = ([9.0f64; 3], [9.0f64; 3]);
+        wide.read_f64(2, &mut [&mut left[..], &mut right[..]])
+            .expect("read");
+        assert_eq!(left, [3.0, 4.0, 0.0]);
+        assert_eq!(right, left);
+    }
+
+    /// A read with the wrong number of buffers is refused, not walked.
+    #[test]
+    fn a_read_with_another_channel_count_is_refused() {
+        let mut reader = adapter(2, 6, false);
+        let mut only = [0.0f32; 4];
+        assert!(reader.read_f32(0, &mut [&mut only[..]]).is_err());
     }
 
     fn service(generation: ApiGeneration, keys: Vec<AraKeySignature>) -> ContentService {

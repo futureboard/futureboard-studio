@@ -949,11 +949,15 @@ fn probe_via_symphonia(
         .codec_params
         .sample_rate
         .ok_or_else(|| SphereAudioError::NativeError("Track has no sample rate".to_string()))?;
+    // An unreported channel count is assumed the way the decoder assumes it
+    // (`decode_symphonia_source`, stereo). The probe used to say mono for the same
+    // file, and an ARA source published from the probe then disagreed with
+    // the audio its reader decoded.
     let channels = track
         .codec_params
         .channels
         .map(|c| c.count() as u16)
-        .unwrap_or(1)
+        .unwrap_or(2)
         .max(1);
 
     let total_frames = match track.codec_params.n_frames {

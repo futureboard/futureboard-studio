@@ -295,6 +295,9 @@ pub(crate) mod ffi {
         ) -> *mut SphereDauxVst3Processor;
         pub(crate) fn sphere_daux_vst3_activate(processor: *mut SphereDauxVst3Processor) -> i32;
         pub(crate) fn sphere_daux_vst3_stop_processing(processor: *mut SphereDauxVst3Processor);
+        pub(crate) fn sphere_daux_vst3_resume_processing(
+            processor: *mut SphereDauxVst3Processor,
+        ) -> i32;
         // Rust-owned view host: the caller owns the window, these drive only
         // the plug-in's `IPlugView`.
         pub(crate) fn sphere_daux_vst3_view_attach(
@@ -1238,6 +1241,20 @@ impl Vst3RuntimeProcessor {
         }
         // SAFETY: `raw` is a live VST3 processor for as long as this handle is.
         unsafe { ffi::sphere_daux_vst3_stop_processing(self.inner.raw) };
+    }
+
+    /// Back into the processing state after [`Self::stop_processing`].
+    ///
+    /// For an ARA host changing a renderer's playback regions, which ARA
+    /// allows only while the instance is not active. The caller keeps the
+    /// instance out of the audio graph until this returns. `false` when the
+    /// plug-in refused, or the instance was never activated.
+    pub fn resume_processing(&self) -> bool {
+        if self.inner.raw.is_null() || self.inner.format != PluginModuleFormat::Vst3 {
+            return false;
+        }
+        // SAFETY: `raw` is a live VST3 processor for as long as this handle is.
+        unsafe { ffi::sphere_daux_vst3_resume_processing(self.inner.raw) != 0 }
     }
 
     /// Attaches the plug-in's editor view to a window **the caller owns**.

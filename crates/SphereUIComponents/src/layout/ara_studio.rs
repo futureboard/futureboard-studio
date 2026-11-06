@@ -175,10 +175,14 @@ impl StudioLayout {
             return;
         }
 
-        let key = AraSessionKey {
-            plugin_id: choice.id.clone(),
-            track_id: track_id.to_string(),
-        };
+        // One document per plug-in: a track bound to a plug-in that already
+        // has one joins it, and the plug-in's editor shows both.
+        let key = self
+            .ara_document_key(&choice.id, cx)
+            .unwrap_or_else(|| AraSessionKey {
+                plugin_id: choice.id.clone(),
+                track_id: track_id.to_string(),
+            });
         self.sync_ara_session(&key, &choice, cx);
         // The engine must stop mixing this track's clip files in the same pass,
         // or every clip plays twice until the next unrelated sync.
@@ -250,10 +254,27 @@ impl StudioLayout {
             }
         });
 
-        let key = AraSessionKey {
-            plugin_id,
-            track_id: track_id.to_string(),
-        };
+        let key = self
+            .ara
+            .document_for_track(&plugin_id, track_id)
+            .unwrap_or(AraSessionKey {
+                plugin_id,
+                track_id: track_id.to_string(),
+            });
+        let remaining = Self::ara_members_in(&self.timeline.read(cx).state, &key.plugin_id);
+        if !remaining.is_empty() {
+            self.mark_engine_project_dirty();
+            if key.track_id != track_id {
+                // A member, not the lead: the document stays, and the sync
+                // takes this track's instance out of it.
+                self.sync_ara_document(&key, cx);
+            } else {
+                // The lead leaves: the next member takes the document over.
+                self.hand_over_ara_document(key, cx);
+            }
+            cx.notify();
+            return;
+        }
         self.close_ara_editor(&key, cx);
         self.ara_editor_popped_out = false;
         self.ara_editor
@@ -311,6 +332,149 @@ impl StudioLayout {
         .detach();
     }
 
+    /// Tracks bound to `plugin_id`, in project order: the members of its
+    /// document.
+    fn ara_members_in(
+        state: &crate::components::timeline::timeline_state::TimelineState,
+        plugin_id: &str,
+    ) -> Vec<String> {
+        state
+            .tracks
+            .iter()
+            .filter(|track| {
+                track
+                    .ara
+                    .as_ref()
+                    .is_some_and(|binding| binding.plugin_id == plugin_id)
+            })
+            .map(|track| track.id.clone())
+            .collect()
+    }
+
+    /// The key of `plugin_id`'s document: the live one when it is open, else
+    /// the one a loaded project parked for one of its tracks, else its first
+    /// bound track's. `None` when no track is bound to it.
+    fn ara_document_key(&self, plugin_id: &str, cx: &gpui::App) -> Option<AraSessionKey> {
+        let members = Self::ara_members_in(&self.timeline.read(cx).state, plugin_id);
+        if let Some(live) = members
+            .iter()
+            .find_map(|track| self.ara.document_for_track(plugin_id, track))
+        {
+            return Some(live);
+        }
+        let pending = self.ara.pending_keys();
+        members
+            .iter()
+            .find(|track| {
+                pending
+                    .iter()
+                    .any(|key| key.plugin_id == plugin_id && key.track_id == **track)
+            })
+            .or(members.first())
+            .map(|track| AraSessionKey {
+                plugin_id: plugin_id.to_string(),
+                track_id: track.clone(),
+            })
+    }
+
+    /// [`Self::sync_ara_session`] for `key`'s document, with its plug-in
+    /// looked up in the catalog.
+    fn sync_ara_document(&mut self, key: &AraSessionKey, cx: &mut Context<Self>) {
+        if let Some(choice) = self.ara_choice_for(&key.plugin_id, cx) {
+            self.sync_ara_session(key, &choice, cx);
+        }
+    }
+
+    /// The plug-in a document runs: the catalog's entry when the scan has it,
+    /// else what a bound track's binding names — its file and class — as long
+    /// as that file is there. A project opens its ARA documents with that,
+    /// without waiting for the catalog.
+    fn ara_choice_for(&self, plugin_id: &str, cx: &gpui::App) -> Option<AraPluginChoice> {
+        if let Some(choice) = self
+            .ara_plugin_choices()
+            .into_iter()
+            .find(|choice| choice.id == plugin_id)
+        {
+            return Some(choice);
+        }
+        if !super::ara_ops::AraState::is_supported() {
+            return None;
+        }
+        let state = &self.timeline.read(cx).state;
+        let binding = state
+            .tracks
+            .iter()
+            .filter_map(|track| track.ara.as_ref())
+            .find(|binding| binding.plugin_id == plugin_id)?;
+        let path = Path::new(&binding.plugin_path);
+        if binding.class_id.is_empty() || !path.exists() {
+            return None;
+        }
+        let name = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| plugin_id.to_string());
+        Some(AraPluginChoice {
+            id: plugin_id.to_string(),
+            name,
+            path: binding.plugin_path.clone(),
+            class_id: binding.class_id.clone(),
+        })
+    }
+
+    /// The document's lead track has left it while other tracks are still
+    /// bound: the next one takes it over, with every edit in it.
+    ///
+    /// The lead's instance is the one editors attach to, so its view comes
+    /// down first, the way an unbind waits for it; only then is the document
+    /// re-keyed to the new lead and synced, which takes the old lead's
+    /// instance out of it.
+    fn hand_over_ara_document(&mut self, key: AraSessionKey, cx: &mut Context<Self>) {
+        if !self.ara.begin_handover(&key) {
+            return;
+        }
+        self.close_ara_editor(&key, cx);
+        self.ara_editor_popped_out = false;
+        self.ara_editor
+            .update(cx, |host, cx| host.request_detach(cx));
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            for _ in 0..VIEW_RELEASE_POLLS {
+                let released = this
+                    .update(cx, |layout, cx| {
+                        !layout.ara_editor.read(cx).is_attached()
+                            && !layout.ara.view_is_attached(&key)
+                    })
+                    .unwrap_or(true);
+                if released {
+                    break;
+                }
+                executor.timer(VIEW_RELEASE_POLL_INTERVAL).await;
+            }
+            let _ = this.update(cx, |layout, cx| {
+                layout.ara.end_handover(&key);
+                let members = Self::ara_members_in(&layout.timeline.read(cx).state, &key.plugin_id);
+                match members.first() {
+                    Some(lead) => {
+                        let next = AraSessionKey {
+                            plugin_id: key.plugin_id.clone(),
+                            track_id: lead.clone(),
+                        };
+                        layout.ara.rekey(&key, &next);
+                        layout.sync_ara_document(&next, cx);
+                    }
+                    None => {
+                        let engine = layout.audio_bridge.engine.clone();
+                        layout.ara.close(engine.as_ref(), &key);
+                    }
+                }
+                layout.mark_engine_project_dirty();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Rebuilds and re-applies the ARA document for one session.
     fn sync_ara_session(
         &mut self,
@@ -338,7 +502,16 @@ impl StudioLayout {
                 None
             }
         };
-        let view = ara_graph::project_view(&state, key, &mut shape_of);
+        // Every track bound to the plug-in, the key's own first among them
+        // even when its binding is on its way out.
+        let mut members = Self::ara_members_in(&state, &key.plugin_id);
+        if !members.contains(&key.track_id) {
+            members.insert(0, key.track_id.clone());
+        } else {
+            members.retain(|track| *track != key.track_id);
+            members.insert(0, key.track_id.clone());
+        }
+        let view = ara_graph::document_view(&state, key, &members, &mut shape_of);
         ara_trace(&format!(
             "graph: sources={} regions={} sequences={} media={}",
             view.graph.sources.len(),
@@ -357,6 +530,7 @@ impl StudioLayout {
             &view.graph,
             view.media_paths,
             &view.offline,
+            &members,
         );
         self.show_ara_notices(cx);
         if let Err(error) = applied {
@@ -385,15 +559,35 @@ impl StudioLayout {
             return;
         }
         let mut keys: Vec<AraSessionKey> = self.ara.keys().cloned().collect();
-        let choices = self.ara_plugin_choices();
+        let choices: Vec<AraPluginChoice> = {
+            let mut plugins: Vec<String> = keys.iter().map(|key| key.plugin_id.clone()).collect();
+            plugins.dedup();
+            plugins
+                .iter()
+                .filter_map(|plugin_id| self.ara_choice_for(plugin_id, cx))
+                .collect()
+        };
         // A session whose track no longer names it is on its way out — see
         // `unbind_track_from_ara`, which clears the binding first and closes
         // the session once the plug-in's view has let go. Re-applying it here
         // would edit a model that is being torn down.
+        let mut orphaned_leads = Vec::new();
         keys.retain(|key| {
-            self.ara_binding_for_track(&key.track_id, cx)
-                .is_some_and(|(plugin_id, _)| plugin_id == key.plugin_id)
+            let lead_bound = self
+                .ara_binding_for_track(&key.track_id, cx)
+                .is_some_and(|(plugin_id, _)| plugin_id == key.plugin_id);
+            if !lead_bound
+                && !Self::ara_members_in(&self.timeline.read(cx).state, &key.plugin_id).is_empty()
+            {
+                // The lead left some other way than an unbind (its track was
+                // deleted, say) while other tracks still use the document.
+                orphaned_leads.push(key.clone());
+            }
+            lead_bound
         });
+        for key in orphaned_leads {
+            self.hand_over_ara_document(key, cx);
+        }
         // Every session that is losing a clip, or whose clip was just split or
         // copied, stores its document before any session syncs: a clip moved
         // to another track takes its edits with it, and a copy takes over its
@@ -415,12 +609,15 @@ impl StudioLayout {
                 })
                 .collect();
             for key in &keys {
+                // A clip moving between two tracks of the document stays in
+                // it: only one leaving every member track departs.
+                let members = Self::ara_members_in(state, &key.plugin_id);
                 let on_track: HashSet<&str> = state
                     .tracks
                     .iter()
-                    .find(|track| track.id == key.track_id)
-                    .map(|track| track.clips.iter().map(|clip| clip.id.as_str()).collect())
-                    .unwrap_or_default();
+                    .filter(|track| track.id == key.track_id || members.contains(&track.id))
+                    .flat_map(|track| track.clips.iter().map(|clip| clip.id.as_str()))
+                    .collect();
                 self.ara.capture_departures(key, &on_track, &copies);
             }
         }
@@ -453,10 +650,13 @@ impl StudioLayout {
             ara_trace("open_ara_editor: clip has no track");
             return;
         };
-        let key = AraSessionKey {
-            plugin_id,
-            track_id,
-        };
+        let key = self
+            .ara
+            .document_for_track(&plugin_id, &track_id)
+            .unwrap_or(AraSessionKey {
+                plugin_id,
+                track_id,
+            });
         if self.ara.processor(&key).is_none() {
             self.ara.last_error = Some(format!("{plugin_name} is not running for this clip."));
             cx.notify();
@@ -490,10 +690,13 @@ impl StudioLayout {
         let Some(track_id) = self.track_of_clip(clip_id, cx) else {
             return false;
         };
-        let key = AraSessionKey {
-            plugin_id,
-            track_id,
-        };
+        let key = self
+            .ara
+            .document_for_track(&plugin_id, &track_id)
+            .unwrap_or(AraSessionKey {
+                plugin_id,
+                track_id,
+            });
         let Some(processor) = self.ara.processor(&key) else {
             self.ara.last_error = Some(format!("{plugin_name} is not running for this clip."));
             cx.notify();
@@ -880,46 +1083,60 @@ impl StudioLayout {
     /// that plug-in stays parked and is saved back untouched rather than
     /// silently discarded.
     pub(crate) fn open_pending_ara_sessions(&mut self, cx: &mut Context<Self>) {
+        // One document per plug-in. A plug-in whose tracks have none open
+        // yet gets one, keyed by the track a saved document was parked for
+        // when there is one; documents a project saved per track (before
+        // they were shared) fold into it.
         let pending: Vec<AraSessionKey> = {
             let state = &self.timeline.read(cx).state;
-            let mut keys: Vec<AraSessionKey> = Vec::new();
+            let mut plugins: Vec<String> = Vec::new();
             for track in &state.tracks {
                 let Some(binding) = track.ara.as_ref() else {
                     continue;
                 };
-                let key = AraSessionKey {
-                    plugin_id: binding.plugin_id.clone(),
-                    track_id: track.id.clone(),
-                };
-                if self.ara.processor(&key).is_none() && !keys.contains(&key) {
-                    keys.push(key);
+                if !plugins.contains(&binding.plugin_id) {
+                    plugins.push(binding.plugin_id.clone());
                 }
             }
-            keys
+            plugins
+                .iter()
+                .filter(|plugin_id| {
+                    Self::ara_members_in(state, plugin_id)
+                        .iter()
+                        .all(|track| self.ara.document_for_track(plugin_id, track).is_none())
+                })
+                .filter_map(|plugin_id| self.ara_document_key(plugin_id, cx))
+                .collect()
         };
+        for key in &pending {
+            let members = Self::ara_members_in(&self.timeline.read(cx).state, &key.plugin_id);
+            for parked in self.ara.pending_keys() {
+                if parked.plugin_id == key.plugin_id
+                    && parked.track_id != key.track_id
+                    && members.contains(&parked.track_id)
+                {
+                    self.ara.merge_into(key, &parked);
+                }
+            }
+        }
         if pending.is_empty() {
             return;
         }
-        // Not failures yet — just early. The catalog load and the engine
-        // start both call back in here.
-        if self.plugin_catalog.available.is_none() || self.audio_bridge.engine.is_none() {
+        // Not a failure yet — just early: the engine start calls back in
+        // here. The plug-in catalog is not waited for: each track's binding
+        // names its plug-in's file and class itself, so the documents open
+        // with the project rather than whenever the scan finishes.
+        if self.audio_bridge.engine.is_none() {
             ara_trace(&format!(
-                "{} ARA session(s) waiting for the {}",
-                pending.len(),
-                if self.plugin_catalog.available.is_none() {
-                    "plug-in catalog"
-                } else {
-                    "audio engine"
-                }
+                "{} ARA session(s) waiting for the audio engine",
+                pending.len()
             ));
             return;
         }
-        let choices = self.ara_plugin_choices();
         let mut opened = false;
         for key in pending {
-            match choices.iter().find(|choice| choice.id == key.plugin_id) {
+            match self.ara_choice_for(&key.plugin_id, cx) {
                 Some(choice) => {
-                    let choice = choice.clone();
                     self.sync_ara_session(&key, &choice, cx);
                     opened |= self.ara.processor(&key).is_some();
                 }
@@ -950,8 +1167,8 @@ impl StudioLayout {
         &self,
         snapshot: &mut DirectAudio::types::EngineProjectSnapshot,
     ) {
-        let live: std::collections::HashSet<&str> =
-            self.ara.keys().map(|key| key.track_id.as_str()).collect();
+        let tracks = self.ara.live_tracks();
+        let live: std::collections::HashSet<&str> = tracks.iter().map(String::as_str).collect();
         clear_ara_rendering_without_session(snapshot, &live);
     }
 }
@@ -1005,7 +1222,13 @@ impl StudioLayout {
     /// current track must be used as the fallback for the docked Editor tab.
     fn selected_ara_session_key(&self, cx: &gpui::App) -> Option<AraSessionKey> {
         let state = &self.timeline.read(cx).state;
-        Self::selected_ara_session_key_from_state(state)
+        let key = Self::selected_ara_session_key_from_state(state)?;
+        // The track's document, which may be keyed by another track of it.
+        Some(
+            self.ara
+                .document_for_track(&key.plugin_id, &key.track_id)
+                .unwrap_or(key),
+        )
     }
 
     fn selected_ara_session_key_from_state(

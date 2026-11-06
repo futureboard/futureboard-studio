@@ -2706,6 +2706,39 @@ sphere_daux_vst3_stop_processing(SphereDauxVst3Processor *processor) {
                "[SphereVST3] processing stopped (instance kept alive)\n");
 }
 
+// Back into the processing state after `sphere_daux_vst3_stop_processing`.
+// An ARA host leaves the render state around changes to a renderer's playback
+// regions (ARA allows them only while the instance is not active), then
+// resumes here. Idempotent: an instance already processing is left alone.
+extern "C" int
+sphere_daux_vst3_resume_processing(SphereDauxVst3Processor *processor) {
+  if (!processor || !processor->component)
+    return 0;
+  if (!processor->activated)
+    return 0;
+  if (processor->processing)
+    return 1;
+  const auto active_res = processor->component->setActive(true);
+  if (active_res != Steinberg::kResultOk &&
+      active_res != Steinberg::kNotImplemented) {
+    std::fprintf(stderr, "[SphereVST3] resume: setActive(true) failed (%d)\n",
+                 (int)active_res);
+    return 0;
+  }
+  if (processor->processor) {
+    const auto proc_res = processor->processor->setProcessing(true);
+    if (proc_res != Steinberg::kResultOk &&
+        proc_res != Steinberg::kNotImplemented) {
+      std::fprintf(stderr,
+                   "[SphereVST3] resume: setProcessing(true) failed (%d)\n",
+                   (int)proc_res);
+      return 0;
+    }
+  }
+  processor->processing = true;
+  return 1;
+}
+
 extern "C" void sphere_daux_vst3_destroy(SphereDauxVst3Processor *processor) {
   if (!processor)
     return;

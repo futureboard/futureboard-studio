@@ -302,6 +302,14 @@ SPHERE_DAUX_VST3_API int sphere_daux_vst3_view_key(
 SPHERE_DAUX_VST3_API void
 sphere_daux_vst3_stop_processing(SphereDauxVst3Processor *processor);
 
+/// Back into the processing state after `sphere_daux_vst3_stop_processing`:
+/// `setActive(true)` then `setProcessing(true)`. For an ARA host changing a
+/// renderer's playback regions, which ARA allows only while the instance is not
+/// active. Returns 1 on success, 0 when the plug-in refused or the instance was
+/// never activated. Idempotent.
+SPHERE_DAUX_VST3_API int
+sphere_daux_vst3_resume_processing(SphereDauxVst3Processor *processor);
+
 /// 1 when the loaded module registers an ARA main-factory class matching this
 /// instance's audio-module class, 0 otherwise. Cheap: reads factory class info
 /// that is already loaded, and instantiates nothing.

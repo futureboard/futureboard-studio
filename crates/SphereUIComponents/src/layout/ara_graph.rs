@@ -218,18 +218,34 @@ pub fn musical_timeline(state: &TimelineState) -> AraMusicalTimeline {
     }
 }
 
-/// Builds the ARA graph for one (plug-in, track) session.
+/// Builds the ARA graph for one session: `key`'s track alone.
 ///
-/// Only clips bound to this plug-in on this track are included: a session
-/// renders exactly the regions assigned to it, so listing a clip another
-/// plug-in owns would put two renderers on the same audio.
+/// The one-track form of [`document_view`], kept for callers (and tests) that
+/// describe a single track.
+pub fn project_view(
+    state: &TimelineState,
+    key: &AraSessionKey,
+    shape_of: &mut dyn FnMut(&str) -> Option<SourceShape>,
+) -> AraProjectView {
+    document_view(state, key, &[key.track_id.clone()], shape_of)
+}
+
+/// Builds the ARA graph for one plug-in's document: one region sequence per
+/// member track, in project order, and one playback region per audio clip on
+/// each, with the sources they share described once.
+///
+/// Only tracks bound to this plug-in contribute clips: a document renders
+/// exactly the regions assigned to its instances, so listing a clip another
+/// plug-in owns would put two renderers on the same audio. A member that is
+/// not (or no longer) bound keeps its sequence but brings no regions.
 ///
 /// `shape_of` resolves a media path to the file's native shape; a clip whose
 /// source cannot be probed is skipped rather than described with invented
 /// numbers.
-pub fn project_view(
+pub fn document_view(
     state: &TimelineState,
     key: &AraSessionKey,
+    members: &[String],
     shape_of: &mut dyn FnMut(&str) -> Option<SourceShape>,
 ) -> AraProjectView {
     let mut sources: HashMap<AraSourceKey, AraAudioSourceDesc> = HashMap::new();
@@ -239,99 +255,107 @@ pub fn project_view(
     let mut offline: Vec<(AraClipKey, AraSourceKey)> = Vec::new();
     let base_bpm = state.bpm.max(1.0) as f64;
 
-    let Some((order, track)) = state
+    let mut lead_name: Option<String> = None;
+    for (order, track) in state
         .tracks
         .iter()
         .enumerate()
-        .find(|(_, track)| track.id == key.track_id)
-    else {
-        return AraProjectView::default();
-    };
-
-    sequences.push(AraRegionSequenceDesc {
-        key: AraTrackKey(track.id.clone()),
-        name: track.name.clone(),
-        order_index: order as i32,
-        color: None,
-    });
-
-    // ARA is a track processor, so the plug-in gets every audio clip on the
-    // track — not a hand-picked subset. A track bound to a different plug-in
-    // contributes nothing to this session.
-    if track
-        .ara
-        .as_ref()
-        .is_none_or(|binding| binding.plugin_id != key.plugin_id)
+        .filter(|(_, track)| members.iter().any(|member| *member == track.id))
     {
-        return AraProjectView {
-            graph: AraGraph {
-                name: Some(track.name.clone()),
-                sequences,
-                ..AraGraph::default()
-            },
-            media_paths,
-            offline,
-        };
-    }
-
-    for clip in &track.clips {
-        let Some((file_id, source_path)) = clip_source(clip) else {
-            continue;
-        };
-        let source_key = AraSourceKey(file_id.clone());
-
-        if !sources.contains_key(&source_key) {
-            let Some((sample_rate, frame_count, channel_count)) = shape_of(source_path) else {
-                offline.push((AraClipKey(clip.id.clone()), source_key));
-                continue;
-            };
-            sources.insert(
-                source_key.clone(),
-                AraAudioSourceDesc {
-                    key: source_key.clone(),
-                    name: clip.name.clone(),
-                    sample_rate,
-                    frame_count,
-                    channel_count,
-                },
-            );
-            media_paths.insert(source_key.clone(), PathBuf::from(source_path));
+        if track.id == key.track_id {
+            lead_name = Some(track.name.clone());
         }
-
-        // Both ends go through the tempo map so a clip over a tempo change lands
-        // where the engine puts it, rather than at a fixed-tempo approximation.
-        let start_in_playback = state
-            .tempo_map
-            .seconds_at_beat(clip.start_beat.max(0.0) as f64, base_bpm);
-        let end_in_playback = state.tempo_map.seconds_at_beat(
-            (clip.start_beat.max(0.0) + clip.duration_beats.max(0.0)) as f64,
-            base_bpm,
-        );
-        let duration_in_playback = (end_in_playback - start_in_playback).max(f64::EPSILON);
-
-        regions.push(AraPlaybackRegionDesc {
-            key: AraClipKey(clip.id.clone()),
-            source: source_key,
-            track: AraTrackKey(track.id.clone()),
-            name: clip.name.clone(),
-            start_in_modification: source_offset_seconds(state, clip),
-            // 1:1 with playback time, and no transformation requested: the
-            // engine's own stretch path still owns non-ARA clips, and asking the
-            // plug-in to stretch as well would apply the ratio twice.
-            duration_in_modification: duration_in_playback,
-            start_in_playback,
-            duration_in_playback,
-            transform: AraPlaybackTransform::NONE,
+        sequences.push(AraRegionSequenceDesc {
+            key: AraTrackKey(track.id.clone()),
+            name: track.name.clone(),
+            order_index: order as i32,
             color: None,
         });
+
+        // ARA is a track processor, so the plug-in gets every audio clip on
+        // the track — not a hand-picked subset. A track bound to a different
+        // plug-in contributes nothing to this document.
+        if track
+            .ara
+            .as_ref()
+            .is_none_or(|binding| binding.plugin_id != key.plugin_id)
+        {
+            continue;
+        }
+
+        for clip in &track.clips {
+            let Some((file_id, source_path)) = clip_source(clip) else {
+                continue;
+            };
+            let source_key = AraSourceKey(file_id.clone());
+
+            if !sources.contains_key(&source_key) {
+                let Some((sample_rate, frame_count, channel_count)) = shape_of(source_path) else {
+                    offline.push((AraClipKey(clip.id.clone()), source_key));
+                    continue;
+                };
+                sources.insert(
+                    source_key.clone(),
+                    AraAudioSourceDesc {
+                        key: source_key.clone(),
+                        name: clip.name.clone(),
+                        sample_rate,
+                        frame_count,
+                        channel_count,
+                    },
+                );
+                media_paths.insert(source_key.clone(), PathBuf::from(source_path));
+            }
+
+            // Both ends go through the tempo map so a clip over a tempo change
+            // lands where the engine puts it, rather than at a fixed-tempo
+            // approximation.
+            let start_in_playback = state
+                .tempo_map
+                .seconds_at_beat(clip.start_beat.max(0.0) as f64, base_bpm);
+            let end_in_playback = state.tempo_map.seconds_at_beat(
+                (clip.start_beat.max(0.0) + clip.duration_beats.max(0.0)) as f64,
+                base_bpm,
+            );
+            let duration_in_playback = (end_in_playback - start_in_playback).max(f64::EPSILON);
+
+            regions.push(AraPlaybackRegionDesc {
+                key: AraClipKey(clip.id.clone()),
+                source: source_key,
+                track: AraTrackKey(track.id.clone()),
+                name: clip.name.clone(),
+                start_in_modification: source_offset_seconds(state, clip),
+                // 1:1 with playback time, and no transformation requested: the
+                // engine's own stretch path still owns non-ARA clips, and
+                // asking the plug-in to stretch as well would apply the ratio
+                // twice.
+                duration_in_modification: duration_in_playback,
+                start_in_playback,
+                duration_in_playback,
+                transform: AraPlaybackTransform::NONE,
+                color: None,
+            });
+        }
     }
 
+    // A document of one track is named after it, as before; one of several
+    // belongs to the project, not to any one of them.
+    let name = if sequences.len() > 1 {
+        Some("Futureboard".to_string())
+    } else {
+        lead_name
+    };
+
+    if sequences.is_empty() {
+        return AraProjectView::default();
+    }
     AraProjectView {
         graph: AraGraph {
-            name: Some(track.name.clone()),
+            name,
             sources: sources.into_values().collect(),
             sequences,
             regions,
+            ..AraGraph::default()
         },
         media_paths,
         offline,
@@ -383,6 +407,43 @@ mod tests {
             plugin_id: "vst3:melodyne".to_string(),
             track_id: state.tracks[0].id.clone(),
         }
+    }
+
+    /// Two tracks bound to one plug-in are one document: a sequence for each,
+    /// in project order, each with its own clip's region, and a source they
+    /// share described once.
+    #[test]
+    fn a_document_spans_every_member_track() {
+        let mut state = timeline_with_ara_track();
+        let second = state.create_audio_track();
+        let binding = state.tracks[0].ara.clone();
+        let mut clip = state.tracks[0].clips[0].clone();
+        clip.id = "clip-2".to_string();
+        let track = state
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == second)
+            .expect("just created");
+        track.name = "Harmony".to_string();
+        track.ara = binding;
+        track.clips = vec![clip];
+        let members = vec![state.tracks[0].id.clone(), second.clone()];
+
+        let mut shape = |_: &str| Some((48_000.0, 192_000, 2));
+        let view = document_view(&state, &key(&state), &members, &mut shape);
+
+        assert!(view.graph.validate().is_ok());
+        assert_eq!(view.graph.sequences.len(), 2);
+        assert_eq!(view.graph.regions.len(), 2);
+        assert_eq!(view.graph.sources.len(), 1, "the shared take is one source");
+        let harmony = view
+            .graph
+            .regions
+            .iter()
+            .find(|region| region.key == AraClipKey::from("clip-2"))
+            .expect("the second track's clip");
+        assert_eq!(harmony.track, AraTrackKey(second));
+        assert_eq!(view.graph.name.as_deref(), Some("Futureboard"));
     }
 
     #[test]

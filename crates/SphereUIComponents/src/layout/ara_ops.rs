@@ -1116,6 +1116,59 @@ trait SessionPlugin {
     /// teardown in [`AraState::close`], whose step 1 (out of the engine) has
     /// to have run.
     fn tear_down(self: Box<Self>, plugin_name: &str) -> AraResult<()>;
+
+    // ── One document, several tracks ─────────────────────────────────────────
+    //
+    // A document belongs to a plug-in, not to one track: every track bound to
+    // the plug-in is a member, rendered by an instance of its own that is
+    // bound to the one document controller, so the plug-in's editor shows
+    // them all. A test double is a document of one track, which the defaults
+    // below describe.
+
+    /// The tracks this document renders, lead first; empty for a document of
+    /// its session key's track alone.
+    fn member_tracks(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Brings `track_id` into the document: an instance of its own, bound to
+    /// this document's controller before it is activated.
+    fn add_member(
+        &mut self,
+        _engine: &DirectAudio::AudioEngine,
+        _track_id: &str,
+        _plugin_path: &str,
+        _class_id: &str,
+    ) -> AraResult<()> {
+        Ok(())
+    }
+    /// Takes `track_id`'s instance out of the document and lets it go. Its
+    /// renderer has to be out of the engine already, and no editor may hold a
+    /// view on it. The document itself stays.
+    fn remove_member(&mut self, _track_id: &str, _plugin_name: &str) {}
+    /// Which clips each member track's instance renders: each region on
+    /// exactly one instance, its own track's.
+    fn set_member_regions(&mut self, by_track: &[(String, Vec<AraClipKey>)]) -> AraResult<()> {
+        let clips: Vec<AraClipKey> = by_track
+            .iter()
+            .flat_map(|(_, clips)| clips.iter().cloned())
+            .collect();
+        self.set_renderer_regions(&clips)
+    }
+    /// The instance rendering `track_id`.
+    fn instance_for(&self, _track_id: &str) -> Option<&DirectAudio::Vst3RuntimeProcessor> {
+        self.instance()
+    }
+    /// The latency of the instance rendering `track_id`.
+    fn latency_for(&self, _track_id: &str) -> u32 {
+        self.latency_samples()
+    }
+    /// Takes every instance out of its render state, for a change to the
+    /// renderers' playback regions: ARA allows those only while the plug-in
+    /// is not active (in VST3 terms). Their renderers must be out of the
+    /// engine already.
+    fn pause_rendering(&mut self) {}
+    /// Back into the render state after [`Self::pause_rendering`].
+    fn resume_rendering(&mut self) {}
 }
 
 /// A plug-in hosted in this process on an ARA document: the production
@@ -1123,12 +1176,32 @@ trait SessionPlugin {
 struct LivePlugin {
     session: AraSession,
     /// Keeps the ARA main-factory class instance alive. Released before
-    /// `processor`, whose module provides it.
+    /// the members' processors, whose module provides it.
     factory: DirectAudio::AraMainFactory,
-    /// The in-process VST3 instance the engine renders. Cloned into the engine's
-    /// renderer list; both handles share one C++ processor.
+    /// One instance per track of the document, lead first; never empty. The
+    /// lead is the one editors attach to.
+    members: Vec<AraMember>,
+}
+
+/// One track of a document: the in-process VST3 instance that renders that
+/// track, bound to the document's controller. Cloned into the engine's
+/// renderer list for the track; both handles share one C++ processor.
+struct AraMember {
+    track_id: String,
     processor: DirectAudio::Vst3RuntimeProcessor,
     renderer: AraRendererId,
+}
+
+impl LivePlugin {
+    fn lead(&self) -> &AraMember {
+        &self.members[0]
+    }
+
+    fn member(&self, track_id: &str) -> Option<&AraMember> {
+        self.members
+            .iter()
+            .find(|member| member.track_id == track_id)
+    }
 }
 
 impl SessionPlugin for LivePlugin {
@@ -1165,11 +1238,39 @@ impl SessionPlugin for LivePlugin {
     }
 
     fn set_rendering(&mut self, enabled: bool) -> AraResult<()> {
-        self.session.set_rendering(self.renderer, enabled)
+        for renderer in self
+            .members
+            .iter()
+            .map(|member| member.renderer)
+            .collect::<Vec<_>>()
+        {
+            self.session.set_rendering(renderer, enabled)?;
+        }
+        Ok(())
     }
 
     fn set_renderer_regions(&mut self, clips: &[AraClipKey]) -> AraResult<()> {
-        self.session.set_renderer_regions(self.renderer, clips)
+        let lead = self.lead().renderer;
+        self.session.set_renderer_regions(lead, clips)
+    }
+
+    fn set_member_regions(&mut self, by_track: &[(String, Vec<AraClipKey>)]) -> AraResult<()> {
+        // Every member is assigned, an empty list included: a track whose
+        // last clip left must let go of the regions it rendered.
+        for (track_id, renderer) in self
+            .members
+            .iter()
+            .map(|member| (member.track_id.clone(), member.renderer))
+            .collect::<Vec<_>>()
+        {
+            let clips = by_track
+                .iter()
+                .find(|(track, _)| *track == track_id)
+                .map(|(_, clips)| clips.as_slice())
+                .unwrap_or(&[]);
+            self.session.set_renderer_regions(renderer, clips)?;
+        }
+        Ok(())
     }
 
     fn notify_editor_selection(
@@ -1177,8 +1278,10 @@ impl SessionPlugin for LivePlugin {
         clips: &[AraClipKey],
         tracks: &[AraTrackKey],
     ) -> AraResult<()> {
-        self.session
-            .notify_editor_selection(self.renderer, clips, tracks)
+        // The lead's view is the one editors open, and it shows the whole
+        // document: every track's clips and sequences.
+        let lead = self.lead().renderer;
+        self.session.notify_editor_selection(lead, clips, tracks)
     }
 
     fn store_archive(&mut self) -> AraResult<AraStoredArchive> {
@@ -1190,23 +1293,122 @@ impl SessionPlugin for LivePlugin {
     }
 
     fn instance(&self) -> Option<&DirectAudio::Vst3RuntimeProcessor> {
-        Some(&self.processor)
+        Some(&self.lead().processor)
     }
 
     fn view_is_attached(&self) -> bool {
-        self.processor.view_is_attached()
+        self.members
+            .iter()
+            .any(|member| member.processor.view_is_attached())
     }
 
     fn latency_samples(&self) -> u32 {
-        self.processor.get_latency_samples().max(0) as u32
+        self.lead().processor.get_latency_samples().max(0) as u32
+    }
+
+    fn member_tracks(&self) -> Vec<String> {
+        self.members
+            .iter()
+            .map(|member| member.track_id.clone())
+            .collect()
+    }
+
+    fn add_member(
+        &mut self,
+        engine: &DirectAudio::AudioEngine,
+        track_id: &str,
+        plugin_path: &str,
+        class_id: &str,
+    ) -> AraResult<()> {
+        if self.member(track_id).is_some() {
+            return Ok(());
+        }
+        let processor = engine
+            .create_ara_processor(plugin_path, class_id)
+            .ok_or_else(|| {
+                AraHostError::unsupported(format!(
+                    "a second instance for track {track_id} could not be loaded for ARA"
+                ))
+            })?;
+        // SAFETY: the component belongs to `processor`, which this member owns
+        // and which outlives the binding: `remove_member` and `tear_down`
+        // unbind or close before it is dropped.
+        let renderer = unsafe {
+            self.session
+                .bind_renderer(processor.ara_component_unknown(), AraRoles::ALL)
+        }?;
+        // Bound first, then activated: ARA forbids `setActive()` before the
+        // binding, as for the lead.
+        if !processor.activate() {
+            let _ = self.session.unbind_renderer(renderer);
+            return Err(AraHostError::Plugin(format!(
+                "the instance for track {track_id} could not be prepared for processing"
+            )));
+        }
+        self.members.push(AraMember {
+            track_id: track_id.to_owned(),
+            processor,
+            renderer,
+        });
+        Ok(())
+    }
+
+    fn remove_member(&mut self, track_id: &str, plugin_name: &str) {
+        // The last member is the document: it goes with `tear_down`.
+        if self.members.len() <= 1 {
+            return;
+        }
+        let Some(index) = self
+            .members
+            .iter()
+            .position(|member| member.track_id == track_id)
+        else {
+            return;
+        };
+        let member = self.members.remove(index);
+        // The same order as a whole teardown, for one instance: its view down,
+        // out of the render state, unbound, then gone.
+        member.processor.view_detach();
+        member.processor.embed_detach();
+        member.processor.stop_processing();
+        if let Err(error) = self.session.unbind_renderer(member.renderer) {
+            eprintln!("[ARA] {plugin_name}: unbinding track {track_id}'s instance: {error}");
+        }
+        member.processor.set_destroy_reason("ara-member-left");
+    }
+
+    fn instance_for(&self, track_id: &str) -> Option<&DirectAudio::Vst3RuntimeProcessor> {
+        self.member(track_id).map(|member| &member.processor)
+    }
+
+    fn latency_for(&self, track_id: &str) -> u32 {
+        self.member(track_id)
+            .map(|member| member.processor.get_latency_samples().max(0) as u32)
+            .unwrap_or(0)
+    }
+
+    fn pause_rendering(&mut self) {
+        for member in &self.members {
+            member.processor.stop_processing();
+        }
+    }
+
+    fn resume_rendering(&mut self) {
+        for member in &self.members {
+            if !member.processor.resume_processing() {
+                eprintln!(
+                    "[ARA] the instance for track {} did not resume processing",
+                    member.track_id
+                );
+            }
+        }
     }
 
     fn tear_down(self: Box<Self>, plugin_name: &str) -> AraResult<()> {
         let LivePlugin {
             session,
             factory,
-            processor,
-            ..
+            members,
         } = *self;
         // 2. Release the plug-in's editor view, through *both* paths a view can
         //    have been attached by. Last line of defence for a view that has not
@@ -1230,14 +1432,18 @@ impl SessionPlugin for LivePlugin {
         //    the instance is still whole is also just the ordinary case: it is
         //    what closing an editor window during playback does every day.
         step(plugin_name, "2/4 releasing the editor view", || {
-            processor.view_detach();
-            processor.embed_detach();
+            for member in &members {
+                member.processor.view_detach();
+                member.processor.embed_detach();
+            }
         });
         // 3. Leave the processing state. A plug-in whose renderer is still
         //    active is entitled to hold its render lock, and step 4 then waits
         //    on it from the main thread — which is the hang, not a crash.
         step(plugin_name, "3/4 stopping processing", || {
-            processor.stop_processing()
+            for member in &members {
+                member.processor.stop_processing();
+            }
         });
         // 4. Destroy the ARA binding and the document controller.
         //
@@ -1251,7 +1457,9 @@ impl SessionPlugin for LivePlugin {
         //    processor drops with the last handle, which terminates the
         //    companion instance.
         drop(factory);
-        processor.set_destroy_reason("ara-unbound");
+        for member in members {
+            member.processor.set_destroy_reason("ara-unbound");
+        }
         closed
     }
 }
@@ -1294,6 +1502,10 @@ struct AraTrackSession {
     installed_latency: Option<u32>,
     /// Undo and redo of the edits made in the plug-in's own editor.
     history: AraHistory,
+    /// What the editor was last told is active: the clips and tracks the
+    /// user has selected in Studio. Every track stays in the editor; this is
+    /// only which of them it works on.
+    selection: Option<(Vec<AraClipKey>, Vec<AraTrackKey>)>,
 }
 
 impl AraTrackSession {
@@ -1318,6 +1530,7 @@ impl AraTrackSession {
             settled: false,
             installed_latency: None,
             history: AraHistory::default(),
+            selection: None,
         }
     }
 }
@@ -1460,6 +1673,9 @@ pub struct AraState {
     /// What the user has to be told about saved documents, for the status
     /// bar.
     notices: Vec<String>,
+    /// Documents whose lead track left, waiting for its editor view to let go
+    /// before the next member takes them over.
+    handovers: HashSet<AraSessionKey>,
     /// Last error surfaced to the user, if any.
     pub last_error: Option<String>,
 }
@@ -1480,6 +1696,7 @@ impl Default for AraState {
             generation: 0,
             instance: NEXT_ARA_STATE.fetch_add(1, Ordering::Relaxed),
             notices: Vec::new(),
+            handovers: HashSet::new(),
             last_error: None,
         }
     }
@@ -2165,7 +2382,7 @@ impl AraState {
         let audio = Arc::new(AudioLibrary::default());
         let signals = Arc::new(ModelSignals::default());
         let config = AraSessionConfig {
-            document_name: Some(format!("Futureboard — {}", key.track_id)),
+            document_name: Some("Futureboard".to_string()),
             audio: Arc::clone(&audio) as Arc<dyn AraAudioAccess>,
             transport: Arc::new(TransportBridge {
                 inbox: Arc::clone(&self.transport_inbox),
@@ -2195,8 +2412,11 @@ impl AraState {
         let plugin = LivePlugin {
             session,
             factory,
-            processor,
-            renderer,
+            members: vec![AraMember {
+                track_id: key.track_id.clone(),
+                processor,
+                renderer,
+            }],
         };
         self.sessions.insert(
             key.clone(),
@@ -2241,11 +2461,13 @@ impl AraState {
         graph: &AraGraph,
         media_paths: HashMap<AraSourceKey, PathBuf>,
         offline: &[(AraClipKey, AraSourceKey)],
+        members: &[String],
     ) -> AraResult<()> {
         // A session that cannot open leaves its parked document where it is:
         // it waits for the next attempt, and is saved back untouched
         // meanwhile.
         self.ensure_session(engine, key, plugin_name, plugin_path, class_id)?;
+        self.reconcile_members(engine, key, plugin_name, plugin_path, class_id, members);
         self.sync_open(
             Some(engine),
             key,
@@ -2255,6 +2477,167 @@ impl AraState {
             media_paths,
             offline,
         )
+    }
+
+    /// Starts handing `key`'s document over to its next member; `false` when
+    /// that is already under way.
+    pub fn begin_handover(&mut self, key: &AraSessionKey) -> bool {
+        self.handovers.insert(key.clone())
+    }
+
+    /// The handover of `key`'s document is done.
+    pub fn end_handover(&mut self, key: &AraSessionKey) {
+        self.handovers.remove(key);
+    }
+
+    /// Keys of the documents parked from the loaded project, waiting for
+    /// their session to open.
+    pub fn pending_keys(&self) -> Vec<AraSessionKey> {
+        let mut keys: Vec<AraSessionKey> = self.pending_archives.keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
+    /// Every track a live document renders.
+    pub fn live_tracks(&self) -> Vec<String> {
+        self.sessions
+            .iter()
+            .flat_map(|(key, session)| Self::session_tracks(key, session))
+            .collect()
+    }
+
+    /// Folds `member`'s parked document into `document`'s, for a project saved
+    /// when every track had a document of its own.
+    ///
+    /// Those documents become one per plug-in now. The member's edits travel
+    /// the way a clip moved between two tracks always has: each of its clips
+    /// is held as departed, with the document it left, and restored into the
+    /// shared document when that is built with the clip in it (see
+    /// [`Self::arrivals`]). The archive is kept as an orphan as well, saved
+    /// verbatim with the project, so a document that cannot be split per clip
+    /// (one written before archives said what they hold) is not lost either.
+    pub fn merge_into(&mut self, document: &AraSessionKey, member: &AraSessionKey) {
+        if document == member {
+            return;
+        }
+        let Some(archive) = self.pending_archives.remove(member) else {
+            return;
+        };
+        self.awaiting_media.remove(member);
+        if let Some(identity) = archive.written_with.as_ref() {
+            let shared = Arc::new(archive.clone());
+            for modification in &identity.modifications {
+                let clip = AraClipKey::from(modification.clip_id.as_str());
+                self.departed.retain(|held| held.clip != clip);
+                self.departed.push(DepartedClip {
+                    clip,
+                    plugin_id: document.plugin_id.clone(),
+                    archive: Arc::clone(&shared),
+                    source_pid: modification.source_persistent_id.clone(),
+                });
+            }
+            let excess = self.departed.len().saturating_sub(DEPARTED_CAPACITY);
+            self.departed.drain(..excess);
+        }
+        if let Some(held) = self.deferred.remove(member) {
+            self.keep_orphan(member, held.archive);
+        }
+        self.keep_orphan(member, archive);
+    }
+
+    /// The tracks a session renders: its members, or its key's track alone.
+    fn session_tracks(key: &AraSessionKey, session: &AraTrackSession) -> Vec<String> {
+        let members = session.plugin.member_tracks();
+        if members.is_empty() {
+            vec![key.track_id.clone()]
+        } else {
+            members
+        }
+    }
+
+    /// The session whose document renders `track_id`, if any: the one keyed
+    /// by it, or the one that has it as a member.
+    pub fn document_for_track(&self, plugin_id: &str, track_id: &str) -> Option<AraSessionKey> {
+        self.sessions
+            .iter()
+            .filter(|(key, _)| key.plugin_id == plugin_id)
+            .find(|(key, session)| {
+                key.track_id == track_id
+                    || session
+                        .plugin
+                        .member_tracks()
+                        .iter()
+                        .any(|member| member == track_id)
+            })
+            .map(|(key, _)| key.clone())
+    }
+
+    /// Moves a live document to a new key, when the track it was keyed by
+    /// leaves it and another member leads. Its saved state moves with it, so
+    /// nothing is orphaned by the change of name.
+    pub fn rekey(&mut self, from: &AraSessionKey, to: &AraSessionKey) {
+        if from == to || self.sessions.contains_key(to) {
+            return;
+        }
+        let Some(session) = self.sessions.remove(from) else {
+            return;
+        };
+        self.sessions.insert(to.clone(), session);
+        if let Some(pending) = self.pending_archives.remove(from) {
+            self.pending_archives.insert(to.clone(), pending);
+        }
+        if self.awaiting_media.remove(from) {
+            self.awaiting_media.insert(to.clone());
+        }
+        if let Some(held) = self.deferred.remove(from) {
+            self.deferred.insert(to.clone(), held);
+        }
+    }
+
+    /// Makes the document's member tracks exactly `members` (beside its own
+    /// key's track): a new member gets an instance bound to the document, and
+    /// one that left is taken out of the engine first, then let go. A member
+    /// that cannot be brought in is reported and left out; the rest of the
+    /// document carries on.
+    fn reconcile_members(
+        &mut self,
+        engine: &DirectAudio::AudioEngine,
+        key: &AraSessionKey,
+        plugin_name: &str,
+        plugin_path: &str,
+        class_id: &str,
+        members: &[String],
+    ) {
+        let Some(session) = self.sessions.get_mut(key) else {
+            return;
+        };
+        let current = session.plugin.member_tracks();
+        for leaving in current
+            .iter()
+            .filter(|track| **track != key.track_id && !members.contains(track))
+        {
+            Self::suspend_renderers(Some(engine), leaving);
+            session.plugin.remove_member(leaving, plugin_name);
+            session.settled = false;
+        }
+        for joining in members
+            .iter()
+            .filter(|track| **track != key.track_id && !current.contains(track))
+        {
+            match session
+                .plugin
+                .add_member(engine, joining, plugin_path, class_id)
+            {
+                // Its regions are assigned by the full sync this forces.
+                Ok(()) => session.settled = false,
+                Err(error) => {
+                    eprintln!(
+                        "[ARA] {plugin_name}: track {joining} cannot join the document: {error}"
+                    );
+                    self.last_error = Some(format!("{plugin_name}: {error}"));
+                }
+            }
+        }
     }
 
     /// Brings an open session's document in line with `graph`: everything
@@ -2334,7 +2717,7 @@ impl AraState {
             // due now takes the full path): it stays parked.
             self.repark(key, parked.map(|parked| parked.archive));
             if reinstall {
-                Self::install_renderers(engine, &mut self.sessions, &key.track_id);
+                Self::install_session_renderers(engine, &mut self.sessions, key);
             }
             return outcome;
         }
@@ -2344,7 +2727,15 @@ impl AraState {
         // does not allow the region set to change under a live `process()`, so
         // the track's renderers leave the engine first; `finish_apply` puts them
         // back once the model is whole again.
-        Self::suspend_renderers(engine, &key.track_id);
+        let tracks = Self::session_tracks(key, session);
+        for track in &tracks {
+            Self::suspend_renderers(engine, track);
+        }
+        // Out of the engine, and now out of the render state too: ARA lets a
+        // renderer's playback regions change only while the plug-in is not
+        // active, and the edit below adds and removes them. `finish_apply`
+        // resumes before it puts the renderers back.
+        session.plugin.pause_rendering();
         let outcome = self.apply_model(
             engine,
             key,
@@ -2360,7 +2751,14 @@ impl AraState {
         if outcome.is_err() {
             // A failed edit must not leave the track silent until some later,
             // unrelated sync happens to reinstall it.
-            Self::install_renderers(engine, &mut self.sessions, &key.track_id);
+            if let Some(session) = self.sessions.get_mut(key) {
+                session.plugin.resume_rendering();
+            }
+            Self::install_session_renderers(engine, &mut self.sessions, key);
+            // A track that left the document by now gets an empty list.
+            for track in &tracks {
+                Self::install_renderers(engine, &mut self.sessions, track);
+            }
         }
         if let Some(session) = self.sessions.get_mut(key) {
             session
@@ -3065,27 +3463,84 @@ impl AraState {
             .iter()
             .map(|region| region.key.clone())
             .collect();
-        session.plugin.set_renderer_regions(&session.clips)?;
-        // What the plug-in renders and what its editor shows are separate in
-        // ARA 2; without this the docked editor opens on an empty canvas.
-        let tracks: Vec<AraTrackKey> = graph
-            .sequences
-            .iter()
-            .map(|sequence| sequence.key.clone())
+        // Each member renders its own track's regions, and only those.
+        let mut by_track: Vec<(String, Vec<AraClipKey>)> = Self::session_tracks(key, session)
+            .into_iter()
+            .map(|track| (track, Vec::new()))
             .collect();
-        if let Err(error) = session
-            .plugin
-            .notify_editor_selection(&session.clips, &tracks)
-        {
+        for region in &graph.regions {
+            if let Some((_, clips)) = by_track
+                .iter_mut()
+                .find(|(track, _)| *track == region.track.0)
+            {
+                clips.push(region.key.clone());
+            }
+        }
+        session.plugin.set_member_regions(&by_track)?;
+        // What the plug-in renders and what its editor shows are separate in
+        // ARA 2; without this the docked editor opens on an empty canvas. The
+        // editor holds every track of the document; the selection says which
+        // it works on: what the user last selected in Studio, as far as the
+        // graph still holds it, else the lead track.
+        let (clips, tracks) = editor_selection(key, graph, session.selection.as_ref());
+        if let Err(error) = session.plugin.notify_editor_selection(&clips, &tracks) {
             // A plug-in without the editor-view role is not an error worth
             // failing the whole apply over; it just has no view to tell.
             eprintln!("[ARA] editor selection not published: {error}");
         }
+        session.selection = Some((clips, tracks));
         session.plugin.set_rendering(true)?;
+        session.plugin.resume_rendering();
         session.settled = true;
 
-        Self::install_renderers(engine, &mut self.sessions, &key.track_id);
+        Self::install_session_renderers(engine, &mut self.sessions, key);
         Ok(())
+    }
+
+    /// Tells `key`'s editor which clips and tracks are active: the user's
+    /// selection in Studio, the way selecting a region in the arrangement
+    /// selects it in the plug-in. Nothing is sent when it has not changed, so
+    /// this is cheap to call every frame. Clips the document does not hold are
+    /// left out; with none left, the tracks alone are selected.
+    pub fn select_in_editor(
+        &mut self,
+        key: &AraSessionKey,
+        clips: Vec<AraClipKey>,
+        tracks: Vec<AraTrackKey>,
+    ) {
+        let Some(session) = self.sessions.get_mut(key) else {
+            return;
+        };
+        let clips: Vec<AraClipKey> = clips
+            .into_iter()
+            .filter(|clip| session.clips.contains(clip))
+            .collect();
+        let wanted = (clips, tracks);
+        if session.selection.as_ref() == Some(&wanted) {
+            return;
+        }
+        // An apply under way publishes it when it finishes.
+        if session.settled {
+            if let Err(error) = session.plugin.notify_editor_selection(&wanted.0, &wanted.1) {
+                trace(&format!("editor selection not published: {error}"));
+            }
+        }
+        session.selection = Some(wanted);
+    }
+
+    /// [`Self::install_renderers`] for every track `key`'s document renders.
+    fn install_session_renderers(
+        engine: Option<&DirectAudio::AudioEngine>,
+        sessions: &mut HashMap<AraSessionKey, AraTrackSession>,
+        key: &AraSessionKey,
+    ) {
+        let tracks = sessions
+            .get(key)
+            .map(|session| Self::session_tracks(key, session))
+            .unwrap_or_else(|| vec![key.track_id.clone()]);
+        for track in tracks {
+            Self::install_renderers(engine, sessions, &track);
+        }
     }
 
     /// Rebuilds and installs the engine's renderer list for one track.
@@ -3104,13 +3559,19 @@ impl AraState {
         };
         let renderers: Vec<DirectAudio::RuntimeAraRenderer> = sessions
             .iter_mut()
-            .filter(|(key, _)| key.track_id == track_id)
+            .filter(|(key, session)| {
+                Self::session_tracks(key, session)
+                    .iter()
+                    .any(|t| t == track_id)
+            })
             .filter_map(|(key, session)| {
-                let processor = session.plugin.instance()?.clone();
-                let latency_samples = session.plugin.latency_samples();
-                session.installed_latency = Some(latency_samples);
+                let processor = session.plugin.instance_for(track_id)?.clone();
+                let latency_samples = session.plugin.latency_for(track_id);
+                if key.track_id == track_id {
+                    session.installed_latency = Some(latency_samples);
+                }
                 Some(DirectAudio::RuntimeAraRenderer {
-                    instance_id: format!("ara:{}:{}", key.plugin_id, key.track_id),
+                    instance_id: format!("ara:{}:{track_id}", key.plugin_id),
                     latency_samples,
                     processor,
                 })
@@ -3140,6 +3601,7 @@ impl AraState {
         key: &AraSessionKey,
     ) -> Option<AraTrackSession> {
         let session = self.sessions.remove(key)?;
+        let tracks = Self::session_tracks(key, &session);
         self.awaiting_media.remove(key);
         if let Some(pending) = self.pending_archives.remove(key) {
             self.keep_orphan(key, pending);
@@ -3152,7 +3614,9 @@ impl AraState {
         let plugin_name = session.plugin_name.as_str();
         let confirmed = match engine {
             Some(engine) => step(plugin_name, "1/4 removing renderers", || {
-                Self::install_renderers(Some(engine), &mut self.sessions, &key.track_id);
+                for track in &tracks {
+                    Self::install_renderers(Some(engine), &mut self.sessions, track);
+                }
                 engine.wait_for_command_barrier(RENDERER_BARRIER_TIMEOUT)
             }),
             None => {
@@ -3354,6 +3818,38 @@ impl AraState {
         self.retire_all(engine, now);
         self.finish_retired(now, Duration::ZERO, |_| true);
     }
+}
+
+/// The selection an apply publishes to the editor: `last`, as far as `graph`
+/// still holds its clips and tracks, else the lead track with its clips.
+fn editor_selection(
+    key: &AraSessionKey,
+    graph: &AraGraph,
+    last: Option<&(Vec<AraClipKey>, Vec<AraTrackKey>)>,
+) -> (Vec<AraClipKey>, Vec<AraTrackKey>) {
+    if let Some((clips, tracks)) = last {
+        let tracks: Vec<AraTrackKey> = tracks
+            .iter()
+            .filter(|track| graph.sequences.iter().any(|seq| seq.key == **track))
+            .cloned()
+            .collect();
+        if !tracks.is_empty() {
+            let clips = clips
+                .iter()
+                .filter(|clip| graph.regions.iter().any(|region| region.key == **clip))
+                .cloned()
+                .collect();
+            return (clips, tracks);
+        }
+    }
+    let lead = AraTrackKey(key.track_id.clone());
+    let clips = graph
+        .regions
+        .iter()
+        .filter(|region| region.track == lead)
+        .map(|region| region.key.clone())
+        .collect();
+    (clips, vec![lead])
 }
 
 #[cfg(test)]
@@ -3656,6 +4152,53 @@ mod tests {
         }
     }
 
+    /// Two tracks of one document: `clip-a` on track-1, `clip-b` on track-2.
+    fn two_track_graph() -> AraGraph {
+        let mut graph = track_graph(&[("clip-a", "asset-1"), ("clip-b", "asset-1")]);
+        graph.regions[1].track = AraTrackKey("track-2".to_owned());
+        graph.sequences = ["track-1", "track-2"]
+            .iter()
+            .map(|track| sphere_ara_host::AraRegionSequenceDesc {
+                key: AraTrackKey((*track).to_owned()),
+                name: (*track).to_owned(),
+                order_index: 0,
+                color: None,
+            })
+            .collect();
+        graph
+    }
+
+    /// The editor holds every track but works on the one selected: a rebuild
+    /// keeps what was selected, and only falls back to the lead track when the
+    /// graph no longer holds it.
+    #[test]
+    fn a_rebuild_keeps_the_editor_on_the_selected_track() {
+        let key = session_key("vst3:melodyne", "track-1");
+        let graph = two_track_graph();
+        let on_b = (
+            vec![AraClipKey::from("clip-b")],
+            vec![AraTrackKey("track-2".to_owned())],
+        );
+        assert_eq!(editor_selection(&key, &graph, Some(&on_b)), on_b);
+
+        let gone = (
+            vec![AraClipKey::from("clip-x")],
+            vec![AraTrackKey("track-9".to_owned())],
+        );
+        assert_eq!(
+            editor_selection(&key, &graph, Some(&gone)),
+            (
+                vec![AraClipKey::from("clip-a")],
+                vec![AraTrackKey("track-1".to_owned())]
+            ),
+            "the lead track and its clips, not the whole document"
+        );
+        assert_eq!(
+            editor_selection(&key, &graph, None),
+            editor_selection(&key, &graph, Some(&gone))
+        );
+    }
+
     /// One sync of an open session, exactly as `apply` runs it once the
     /// session exists, with no audio engine.
     fn sync(
@@ -3721,6 +4264,40 @@ mod tests {
             written_with: Some(ara_restore_plan::project_identity(&host_record(clips))),
             ..evidence_archive()
         }
+    }
+
+    /// A project saved when every track had a document of its own opens
+    /// with one per plug-in: the second track's document is folded into the
+    /// first's, its clips held to arrive in the shared document, and the
+    /// archive itself kept and saved back verbatim.
+    #[test]
+    fn a_document_saved_per_track_folds_into_the_plugins_shared_one() {
+        let mut state = AraState::default();
+        let lead = AraSessionKey {
+            plugin_id: "vst3:melodyne".to_string(),
+            track_id: "track-a".to_string(),
+        };
+        let member = AraSessionKey {
+            plugin_id: "vst3:melodyne".to_string(),
+            track_id: "track-b".to_string(),
+        };
+        state.load_archives(
+            documents(vec![
+                (lead.clone(), evidence_archive()),
+                (member.clone(), recorded_archive(&[("clip-b1", "asset-b")])),
+            ]),
+            HashMap::new(),
+        );
+        state.merge_into(&lead, &member);
+
+        assert_eq!(state.pending_keys(), vec![lead.clone()]);
+        assert!(state.departed.iter().any(
+            |held| held.clip == AraClipKey::from("clip-b1") && held.plugin_id == lead.plugin_id
+        ));
+        assert!(state.orphans.iter().any(|(key, _)| *key == member));
+        // Folding a document into itself changes nothing.
+        state.merge_into(&lead, &lead);
+        assert_eq!(state.pending_keys(), vec![lead]);
     }
 
     fn unconfirmed_report() -> AraRestoreReport {
