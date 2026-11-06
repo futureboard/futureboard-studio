@@ -39,6 +39,11 @@ const BODY_PAD: f32 = space::SECTION;
 const FOOTER_HEIGHT: f32 = size::PROMINENT + 2.0 * space::BASE;
 /// The kind token (i / ! / ?) beside the message.
 const KIND_TOKEN_SIZE: f32 = size::COMFORTABLE;
+/// Width a button's label takes per character, for deciding whether a row of
+/// buttons fits; deliberately generous, so a row that only just fits stacks.
+const BUTTON_CHAR_W: f32 = 7.4;
+/// Gap between stacked buttons.
+const STACK_GAP: f32 = space::SNUG;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MessageBoxKind {
@@ -143,7 +148,43 @@ fn estimated_height(options: &MessageBoxOptions) -> f32 {
         body += space::SNUG + lines(detail, typography::UI_SM) * line_height(typography::UI_SM);
     }
     let body = body.max(KIND_TOKEN_SIZE).min(MESSAGE_BODY_MAX_HEIGHT);
-    TITLEBAR_HEIGHT + 2.0 * BODY_PAD + body + FOOTER_HEIGHT
+    TITLEBAR_HEIGHT + 2.0 * BODY_PAD + body + footer_height(options)
+}
+
+/// Whether the buttons go in a column, full width, the way macOS stacks an
+/// alert's buttons: when there are more than three, or their labels do not
+/// fit on one row.
+fn stacks_buttons(options: &MessageBoxOptions) -> bool {
+    let buttons = normalized_buttons(options);
+    if buttons.len() > 3 {
+        return true;
+    }
+    let row: f32 = buttons
+        .iter()
+        .map(|label| (label.chars().count() as f32 * BUTTON_CHAR_W + 2.0 * space::LOOSE).max(96.0))
+        .sum::<f32>()
+        + space::BASE * buttons.len().saturating_sub(1) as f32;
+    row > MESSAGE_BOX_WIDTH - 2.0 * space::LOOSE
+}
+
+/// The buttons in the order a column shows them: the default first, the
+/// cancel button last, the rest as given between them.
+fn stacked_order(options: &MessageBoxOptions) -> Vec<usize> {
+    let len = normalized_buttons(options).len();
+    let default = clamp_index(Some(options.default_id), len);
+    let cancel = clamp_index(options.cancel_id, len).filter(|&cancel| Some(cancel) != default);
+    let mut order: Vec<usize> = default.into_iter().collect();
+    order.extend((0..len).filter(|&index| Some(index) != default && Some(index) != cancel));
+    order.extend(cancel);
+    order
+}
+
+fn footer_height(options: &MessageBoxOptions) -> f32 {
+    if !stacks_buttons(options) {
+        return FOOTER_HEIGHT;
+    }
+    let count = normalized_buttons(options).len() as f32;
+    count * size::PROMINENT + (count - 1.0).max(0.0) * STACK_GAP + 2.0 * space::BASE
 }
 
 fn normalized_buttons(options: &MessageBoxOptions) -> Vec<String> {
@@ -256,29 +297,47 @@ fn message_box_footer(
 ) -> impl IntoElement {
     let buttons = normalized_buttons(options);
     let len = buttons.len();
-    div()
+    let stacked = stacks_buttons(options);
+    let order: Vec<usize> = if stacked {
+        stacked_order(options)
+    } else {
+        (0..len).collect()
+    };
+    let button = |index: usize| {
+        let label = buttons[index].clone();
+        let kind = button_kind(index, &label, options, len);
+        let on_response = on_response.clone();
+        fb_button(
+            ("message-box-btn", index),
+            label,
+            kind,
+            true,
+            move |_, window, cx| on_response(index, window, cx),
+        )
+    };
+    let band = div()
         .flex_shrink_0()
         .flex()
-        .flex_row()
-        .items_center()
-        .justify_end()
-        .gap(px(space::BASE))
-        .h(px(FOOTER_HEIGHT))
+        .h(px(footer_height(options)))
         .px(px(space::LOOSE))
         .border_t(px(1.0))
         .border_color(Colors::border_subtle())
-        .bg(Colors::surface_titlebar())
-        .children(buttons.into_iter().enumerate().map(|(index, label)| {
-            let kind = button_kind(index, &label, options, len);
-            let on_response = on_response.clone();
-            fb_button(
-                ("message-box-btn", index),
-                label,
-                kind,
-                true,
-                move |_, window, cx| on_response(index, window, cx),
-            )
-        }))
+        .bg(Colors::surface_titlebar());
+    if stacked {
+        // A column of full-width buttons: the flex column stretches each one
+        // across the band.
+        band.flex_col()
+            .justify_center()
+            .gap(px(STACK_GAP))
+            .py(px(space::BASE))
+            .children(order.into_iter().map(button))
+    } else {
+        band.flex_row()
+            .items_center()
+            .justify_end()
+            .gap(px(space::BASE))
+            .children(order.into_iter().map(button))
+    }
 }
 
 pub struct MessageBoxWindow {
@@ -478,6 +537,22 @@ fn open_message_box_window_with_kind(
     .map_err(|e| e.to_string())
 }
 
+/// [`open_message_box_window`] without an owner, for a preview: the same
+/// dialog window, frame and fit as the app opens.
+#[cfg(feature = "ui-preview")]
+pub fn open_message_box_for_preview(
+    options: MessageBoxOptions,
+    cx: &mut App,
+) -> Result<WindowHandle<MessageBoxWindow>, String> {
+    open_message_box_window_with_kind(
+        None,
+        options,
+        Arc::new(|_, _, _| {}),
+        gpui::WindowKind::Normal,
+        cx,
+    )
+}
+
 /// Preset matching web unsaved-changes guard (`projectLifecycle.ts`).
 pub fn unsaved_changes_options(project_name: &str, detail: &str) -> MessageBoxOptions {
     MessageBoxOptions {
@@ -492,5 +567,57 @@ pub fn unsaved_changes_options(project_name: &str, detail: &str) -> MessageBoxOp
         ],
         default_id: 0,
         cancel_id: Some(2),
+    }
+}
+
+#[cfg(test)]
+mod stacking_tests {
+    use super::*;
+
+    fn options(buttons: &[&str], default_id: usize, cancel_id: Option<usize>) -> MessageBoxOptions {
+        MessageBoxOptions {
+            buttons: buttons.iter().map(|b| b.to_string()).collect(),
+            default_id,
+            cancel_id,
+            ..MessageBoxOptions::default()
+        }
+    }
+
+    /// Short rows stay rows: the everyday OK, and Save / Don't Save / Cancel.
+    #[test]
+    fn a_short_row_of_buttons_stays_a_row() {
+        assert!(!stacks_buttons(&options(&["OK"], 0, None)));
+        assert!(!stacks_buttons(&options(
+            &["Save", "Don't Save", "Cancel"],
+            0,
+            Some(2)
+        )));
+    }
+
+    /// More than three buttons, or labels that do not fit, go in a column with
+    /// the default on top and Cancel at the bottom, as macOS stacks them.
+    #[test]
+    fn many_or_long_buttons_stack_default_first() {
+        let overload = options(
+            &[
+                "Use Audioguard High",
+                "Audio Settings…",
+                "Process Explorer…",
+                "OK",
+            ],
+            3,
+            Some(3),
+        );
+        assert!(stacks_buttons(&overload));
+        assert_eq!(stacked_order(&overload), vec![3, 0, 1, 2]);
+        assert!(footer_height(&overload) > FOOTER_HEIGHT);
+
+        let long = options(
+            &["Replace the Existing File", "Keep Both Files", "Cancel"],
+            0,
+            Some(2),
+        );
+        assert!(stacks_buttons(&long));
+        assert_eq!(stacked_order(&long), vec![0, 1, 2]);
     }
 }

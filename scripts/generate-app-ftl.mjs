@@ -532,6 +532,8 @@ const components = [
   ["settings.audioguard.off", "Off"],
   ["settings.audioguard.normal", "Normal (Recommended)"],
   ["settings.audioguard.high", "High"],
+  ["settings.field.overload-warning", "Warn When the System Is Overloaded"],
+  ["settings.hint.overload-warning", "Show the System Overloaded dialog, with what to do about it, when playback keeps dropping out."],
   ["bottom-panel.plugin.equalizer", "Equalizer"],
   ["bottom-panel.plugin.compressor", "Compressor"],
   ["bottom-panel.plugin.delay", "Delay Unit"],

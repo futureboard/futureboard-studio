@@ -68,7 +68,7 @@ mod missing_media_ops;
 mod mixer_ops;
 mod stem_extract_ops;
 pub(crate) use mixer_ops::{clone_track_for_mixer, clone_track_for_mixer_summary};
-mod audioguard_ops;
+pub(crate) mod audioguard_ops;
 mod automation_edit_ops;
 mod chain_preset_ops;
 mod folder_ops;

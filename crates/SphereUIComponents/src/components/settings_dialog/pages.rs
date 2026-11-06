@@ -732,6 +732,18 @@ fn playback(cx: &PageCtx) -> Vec<PrefGroup> {
                     &up,
                     |s, v| s.playback.audioguard = v,
                 ),
+            ))
+            .row(PrefRow::described(
+                cx.tr("settings.field.overload-warning"),
+                cx.tr("settings.hint.overload-warning"),
+                &["overload", "dropout", "warning", "cpu", "glitch", "xrun"],
+                pref_switch(
+                    "playback-overload-warning",
+                    s.playback.warn_on_overload,
+                    apply(&up, |s| {
+                        s.playback.warn_on_overload = !s.playback.warn_on_overload
+                    }),
+                ),
             )),
     ]
 }

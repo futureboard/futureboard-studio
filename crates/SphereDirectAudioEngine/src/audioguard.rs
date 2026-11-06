@@ -380,6 +380,10 @@ pub struct AudioguardStatus {
     pub ahead_ms: f32,
     /// Device blocks the ring could not supply.
     pub ring_misses: u64,
+    /// Blocks the device did not get in time, every cause together: a block
+    /// rendered in the callback past its deadline, a ring miss, an underrun
+    /// the device itself reported. What a System Overloaded warning counts.
+    pub overruns: u64,
     /// Times the output guard muted the output, and why it last did.
     pub output_mutes: u64,
     pub last_output_reason: OutputGuardReason,
@@ -400,6 +404,9 @@ impl AudioguardStatus {
                 0.0
             },
             ring_misses: shared.guard_misses.load(Ordering::Relaxed),
+            overruns: shared.callback_overruns.load(Ordering::Relaxed)
+                + shared.guard_misses.load(Ordering::Relaxed)
+                + shared.device_xruns.load(Ordering::Relaxed),
             output_mutes: shared.guard_output_mutes.load(Ordering::Relaxed),
             last_output_reason: OutputGuardReason::from_u8(
                 shared.guard_output_reason.load(Ordering::Relaxed),

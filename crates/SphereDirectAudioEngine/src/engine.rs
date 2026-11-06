@@ -365,6 +365,9 @@ pub(crate) fn record_output_callback_timing(
     // A block rendered ahead by Audioguard has the ring's headroom, not one
     // period: its time is published for the load meter, and only a block the
     // device then misses counts as a dropout (`audioguard::GuardedRenderer`).
+    if deadline_us > 0 && count_dropouts && elapsed_us >= deadline_us {
+        shared.callback_overruns.fetch_add(1, Ordering::Relaxed);
+    }
     if deadline_us > 0 && count_dropouts {
         let mode =
             DropoutProtectionMode::from_u8(shared.dropout_protection_mode.load(Ordering::Relaxed));
@@ -640,6 +643,10 @@ pub struct SharedState {
     pub guard_ahead_frames: AtomicU64,
     /// Device blocks the ring could not supply in time.
     pub guard_misses: AtomicU64,
+    /// Blocks rendered in the device callback that took longer than the block
+    /// lasts: the device ran out of audio, whatever the protection level. The
+    /// at-risk count (`dropout_count`) also holds blocks merely close to it.
+    pub callback_overruns: AtomicU64,
     /// Times the output guard muted the device output, and why it last did
     /// (an [`crate::audioguard::OutputGuardReason`] as `u8`).
     pub guard_output_mutes: AtomicU64,
@@ -787,6 +794,7 @@ impl Default for SharedState {
             guard_engaged: AtomicBool::new(false),
             guard_ahead_frames: AtomicU64::new(0),
             guard_misses: AtomicU64::new(0),
+            callback_overruns: AtomicU64::new(0),
             guard_output_mutes: AtomicU64::new(0),
             guard_output_reason: AtomicU8::new(0),
             live_events: AtomicU64::new(0),
@@ -9469,6 +9477,9 @@ mod dropout_tests {
         // not one period, is its headroom.
         record_output_callback_timing(&shared, 12_000, FRAMES, SR, false);
         assert_eq!(shared.dropout_count.load(Ordering::Relaxed), 1);
+        // Only the block that really ran past its deadline in the callback is
+        // an overrun; the near-miss at 9 ms and the block rendered ahead are not.
+        assert_eq!(shared.callback_overruns.load(Ordering::Relaxed), 1);
     }
 }
 

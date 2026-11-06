@@ -1103,6 +1103,10 @@ pub struct PlaybackSettings {
     /// Protection, so settings files keep working in both directions.
     #[serde(default, rename = "dropout_protection")]
     pub audioguard: AudioguardLevel,
+    /// Say so, with what to do about it, when playback keeps dropping out
+    /// (the System Overloaded dialog).
+    #[serde(default = "default_true")]
+    pub warn_on_overload: bool,
     /// Spacebar play/pause vs play/stop.
     #[serde(default)]
     pub spacebar_action: SpacebarAction,
@@ -1144,6 +1148,7 @@ impl Default for PlaybackSettings {
         Self {
             latency_compensation: default_true(),
             audioguard: AudioguardLevel::default(),
+            warn_on_overload: default_true(),
             spacebar_action: SpacebarAction::default(),
             return_playhead_on_stop: false,
             follow_playhead: default_true(),
@@ -1817,6 +1822,15 @@ mod audioguard_setting_tests {
 
     fn level_from(value: &str) -> AudioguardLevel {
         serde_json::from_str(&format!(r#""{value}""#)).expect("a level parses")
+    }
+
+    /// A settings file from before the overload warning existed turns it on.
+    #[test]
+    fn the_overload_warning_is_on_for_an_older_settings_file() {
+        let playback: PlaybackSettings =
+            serde_json::from_str(r#"{"dropout_protection":"Medium"}"#).expect("older playback");
+        assert!(playback.warn_on_overload);
+        assert!(PlaybackSettings::default().warn_on_overload);
     }
 
     /// The four former Dropout Protection modes still load, as the three levels.

@@ -566,6 +566,12 @@ pub fn scenes() -> Vec<Scene> {
             open: arrangement_meters_scene,
         },
         Scene {
+            name: "system-overloaded",
+            width: crate::components::message_box_dialog::MESSAGE_BOX_WIDTH,
+            height: 380.0,
+            open: system_overloaded_scene,
+        },
+        Scene {
             name: "automation",
             width: 1_100.0,
             height: 560.0,
@@ -1906,6 +1912,31 @@ fn arrangement_meters_scene(options: WindowOptions, cx: &mut App) -> Result<AnyW
         });
         cx.new(|_| ArrangementMetersPreview { timeline })
     })?;
+    Ok(handle.into())
+}
+
+/// The System Overloaded dialog as a busy session raises it: four blocks
+/// missed while a take records, at 256 samples, Audioguard on Normal.
+fn system_overloaded_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    use crate::layout::audioguard_ops::OverloadReport;
+    let report = OverloadReport {
+        missed_blocks: 4,
+        window_seconds: 5,
+        buffer_frames: 256,
+        sample_rate: 48_000,
+        peak_block_ms: 7.1,
+        block_ms: 256.0 * 1000.0 / 48_000.0,
+        level: DirectAudio::AudioguardLevel::Normal,
+        recording: true,
+    };
+    // Through the app's own dialog path, so the preview has the dialog's real
+    // frame (the platform caption on Windows) and its fitted height.
+    let _ = options;
+    let handle = crate::components::message_box_dialog::open_message_box_for_preview(
+        report.message_box(),
+        cx,
+    )
+    .map_err(gpui::private::anyhow::Error::msg)?;
     Ok(handle.into())
 }
 
