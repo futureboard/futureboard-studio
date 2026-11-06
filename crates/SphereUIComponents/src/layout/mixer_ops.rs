@@ -806,13 +806,34 @@ impl StudioLayout {
             clamp_mixer_tree_sidebar_width(self.mixer_view.tree_resize_start_width_px + delta);
         if (new_w - self.mixer_view.tree_sidebar_width_px).abs() > 0.25 {
             self.mixer_view.tree_sidebar_width_px = new_w;
-            self.refresh_mixer_tree_sidebar_entity(cx);
-            cx.notify();
+            // Only what the width moves repaints: the sidebar, and the strips
+            // beside it (their virtualised range is measured from the width).
+            // Notifying the studio here rebuilt the whole window — arrangement
+            // chrome, panel syncs and all — on every pointer move of the drag,
+            // which is what made the resize trail the pointer. The routing
+            // and tree model do not change with the width, so nothing is
+            // re-derived either.
+            let collapsed = self.mixer_view.tree_sidebar_collapsed;
+            let show_only = self.mixer_view.tree_show_only_selected_group;
+            let _ = self.mixer_tree_sidebar.update(cx, |sidebar, cx| {
+                sidebar.sync_chrome(collapsed, new_w, show_only);
+                cx.notify();
+            });
+            let _ = self.mixer_panel.update(cx, |_, cx| cx.notify());
+            if self.mixer_window_handle().is_some() {
+                self.push_mixer_snapshot_to_window(cx);
+            }
         }
     }
 
     pub(crate) fn apply_mixer_tree_resize_end(&mut self, cx: &mut Context<Self>) {
+        if !self.mixer_view.tree_resizing {
+            return;
+        }
         self.mixer_view.tree_resizing = false;
+        // Settle once at the end: anything else that reads the width catches
+        // up now rather than per pointer move.
+        self.refresh_mixer_tree_sidebar_entity(cx);
         cx.notify();
     }
 
