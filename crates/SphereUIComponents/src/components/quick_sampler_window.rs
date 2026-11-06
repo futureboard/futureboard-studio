@@ -34,7 +34,8 @@ use crate::components::builtin_plugin_editor_window::{
 use crate::components::builtin_plugin_files::{self as files, BuiltinFileKind};
 use crate::components::context_menu::{context_menu_overlay, ContextMenuEntry};
 use crate::components::native_plugin_shell::{
-    native_plugin_shell, NativeBuiltinEditor, ShellIdentity, ShellMeter, SHELL_METER_INTERVAL,
+    claim_editor_transport_key, native_plugin_shell, swallow_editor_transport_key_up,
+    NativeBuiltinEditor, ShellIdentity, ShellMeter, SHELL_METER_INTERVAL,
 };
 use crate::components::quick_sampler_panel::{
     quick_sampler_panel, QuickSamplerCallbacks, QuickSamplerPanelState, SampleMarker, SampleSummary,
@@ -631,6 +632,10 @@ impl Render for QuickSamplerEditorWindow {
             .relative()
             .size_full()
             .track_focus(&self.focus_handle)
+            .capture_key_down(|event, window, cx| {
+                claim_editor_transport_key(event, window, cx);
+            })
+            .on_key_up(|_event, window, cx| swallow_editor_transport_key_up(window, cx))
             // A marker drag follows the pointer anywhere in the window and
             // ends wherever the button comes up.
             .on_mouse_move({

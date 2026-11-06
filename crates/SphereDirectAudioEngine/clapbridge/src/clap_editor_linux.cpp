@@ -28,6 +28,7 @@
 #endif
 
 #include "clap_processor_internal.hpp"
+#include "linux_editor_transport_key.hpp"
 
 #include <condition_variable>
 #include <cstdint>
@@ -378,6 +379,9 @@ gboolean idle_open_editor(gpointer user_data) {
     }
 
     gtk_window_present(GTK_WINDOW(window));
+    // Same Space → transport claim the VST3 editor installs. CLAP had none,
+    // so a focused CLAP editor swallowed the key.
+    sphere_linux_transport::watch_editor_window(window);
 
     if (p->ext_gui->show) {
       p->ext_gui->show(p->plugin);
@@ -473,6 +477,7 @@ void close_editor_on_gtk_thread(SphereDauxClapProcessor *proc) {
     return;
   }
   auto *window = static_cast<GtkWidget *>(proc->editor_native_window);
+  sphere_linux_transport::unwatch_editor_window(window);
 
   if (proc->gui_created && proc->plugin && proc->ext_gui) {
     if (proc->ext_gui->hide) {

@@ -44,7 +44,8 @@ use crate::components::builtin_plugin_editor_window::{
     BuiltinEditorHostOps, BuiltinIrLoadRequest, BuiltinNamLoadRequest, PluginInstanceKey,
 };
 use crate::components::native_plugin_shell::{
-    native_plugin_shell, NativeBuiltinEditor, ShellIdentity, ShellMeter, SHELL_METER_INTERVAL,
+    claim_editor_transport_key, native_plugin_shell, swallow_editor_transport_key_up,
+    NativeBuiltinEditor, ShellIdentity, ShellMeter, SHELL_METER_INTERVAL,
 };
 use crate::components::plate;
 use crate::components::rodhareist_panel::{
@@ -843,9 +844,16 @@ impl Render for RodhareistEditorWindow {
             .relative()
             .size_full()
             .track_focus(&self.focus_handle)
-            .on_key_down(
-                cx.listener(|this, event: &KeyDownEvent, _window, cx| this.on_key_down(event, cx)),
-            )
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                // Explore search owns Space while its caret is up. Everywhere
+                // else in this window Space is play/pause.
+                let typing = this.ui.search_focus && this.ui.page == Page::Explore;
+                if !typing && claim_editor_transport_key(event, window, cx) {
+                    return;
+                }
+                this.on_key_down(event, cx);
+            }))
+            .on_key_up(|_event, window, cx| swallow_editor_transport_key_up(window, cx))
             .child(native_plugin_shell(
                 "rodhareist-window-close",
                 &self.identity,

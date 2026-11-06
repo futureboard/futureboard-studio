@@ -23,7 +23,8 @@ use gpui::{
 
 use crate::components::builtin_plugin_editor_window::{BuiltinEditorHostOps, PluginInstanceKey};
 use crate::components::native_plugin_shell::{
-    native_plugin_shell, NativeBuiltinEditor, ShellIdentity, ShellMeter, SHELL_METER_INTERVAL,
+    claim_editor_transport_key, native_plugin_shell, swallow_editor_transport_key_up,
+    NativeBuiltinEditor, ShellIdentity, ShellMeter, SHELL_METER_INTERVAL,
 };
 use crate::components::wrap_synth_panel::{
     wrap_synth_panel, SynthPage, WrapSynthCallbacks, WrapSynthPanelState,
@@ -246,6 +247,10 @@ impl Render for WrapSynthEditorWindow {
         div()
             .size_full()
             .track_focus(&self.focus_handle)
+            .capture_key_down(|event, window, cx| {
+                claim_editor_transport_key(event, window, cx);
+            })
+            .on_key_up(|_event, window, cx| swallow_editor_transport_key_up(window, cx))
             // A key is held while the button is down; let go anywhere — off
             // the key, off the keyboard — and it stops, so a sustained patch
             // is never left droning.

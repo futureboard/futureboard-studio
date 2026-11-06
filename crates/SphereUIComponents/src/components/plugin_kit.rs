@@ -38,7 +38,8 @@ use crate::components::controls::{
 use crate::components::fx_model::KnobSpec;
 use crate::components::knob::{knob_bipolar, knob_with_default};
 use crate::components::native_plugin_shell::{
-    native_plugin_shell, NativeBuiltinEditor, ShellIdentity, ShellMeter, SHELL_METER_INTERVAL,
+    claim_editor_transport_key, native_plugin_shell, swallow_editor_transport_key_up,
+    NativeBuiltinEditor, ShellIdentity, ShellMeter, SHELL_METER_INTERVAL,
 };
 use crate::components::plugin_live::Live;
 use crate::components::quick_sampler_panel::knob_cell;
@@ -841,9 +842,13 @@ impl<M: KitModel> Render for KitWindow<M> {
             .relative()
             .size_full()
             .track_focus(&self.focus_handle)
-            .on_key_down(
-                cx.listener(|this, event: &KeyDownEvent, _window, cx| this.on_key_down(event, cx)),
-            )
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if claim_editor_transport_key(event, window, cx) {
+                    return;
+                }
+                this.on_key_down(event, cx);
+            }))
+            .on_key_up(|_event, window, cx| swallow_editor_transport_key_up(window, cx))
             // Gestures that start on a display follow the pointer anywhere
             // over the window.
             .on_mouse_move(move |event: &MouseMoveEvent, window, cx| {

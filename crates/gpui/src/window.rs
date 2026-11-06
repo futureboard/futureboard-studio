@@ -1909,6 +1909,21 @@ impl Window {
         self.removed = true;
     }
 
+    /// Whether a text field installed an input handler for this window.
+    ///
+    /// Does not ask the field whether it currently accepts text. Callers that
+    /// only need to leave Space with a caret use this so they do not re-enter
+    /// the field's view while already inside its update.
+    pub fn has_text_input_handler(&mut self) -> bool {
+        match self.platform_window.take_input_handler() {
+            Some(handler) => {
+                self.platform_window.set_input_handler(handler);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Obtain the currently focused [`FocusHandle`]. If no elements are focused, returns `None`.
     pub fn focused(&self, cx: &App) -> Option<FocusHandle> {
         self.focus
