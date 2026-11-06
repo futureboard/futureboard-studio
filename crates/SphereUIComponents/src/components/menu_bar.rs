@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, App, InteractiveElement, IntoElement, ParentElement, Role, StatefulInteractiveElement,
-    Styled, Window,
+    canvas, div, px, App, InteractiveElement, IntoElement, ParentElement, Role,
+    StatefulInteractiveElement, Styled, Window,
 };
 
 use crate::i18n::I18n;
@@ -16,6 +16,42 @@ use super::title_bar::{CHROME_TEXT_SIZE, TITLEBAR_HEIGHT};
 
 pub type MenuOpenCb = Arc<dyn Fn(&(String, f32), &mut Window, &mut App) + 'static>;
 pub type MenuCloseCb = Arc<dyn Fn(&(), &mut Window, &mut App) + 'static>;
+
+thread_local! {
+    /// Where each title actually drew last frame, in window x, by menu id.
+    ///
+    /// A dropdown opens under its title. The bar used to place it from
+    /// estimated label widths summed left to right, and the estimate is only
+    /// an estimate: in Thai each title drew a little wider than it was
+    /// counted, the error added up along the bar, and the Help menu opened
+    /// well to the right of its title. The estimate now only decides what
+    /// fits; where a menu opens comes from the title's own laid-out bounds.
+    static TITLE_LEFT: std::cell::RefCell<std::collections::HashMap<String, f32>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// The window x a title drew at, falling back to `estimated` before it has
+/// been painted once.
+fn title_left(menu_id: &str, estimated: f32) -> f32 {
+    TITLE_LEFT.with(|lefts| lefts.borrow().get(menu_id).copied().unwrap_or(estimated))
+}
+
+/// A title, and an invisible probe the size of it that records where it drew.
+fn measured_title(menu_id: String, title: impl IntoElement) -> impl IntoElement {
+    div().relative().flex_none().child(title).child(
+        canvas(
+            move |bounds, _window, _cx| {
+                let left: f32 = bounds.origin.x.into();
+                TITLE_LEFT.with(|lefts| {
+                    lefts.borrow_mut().insert(menu_id.clone(), left);
+                });
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .inset_0(),
+    )
+}
 
 /// `open_menu_id` value while the overflow picker is shown.
 pub const MENU_PICKER_ID: &str = "__menu_picker__";
@@ -156,19 +192,24 @@ pub fn menu_bar(
         let hover_cb = on_open_menu.clone();
         let can_hover_switch = open_id_owned.is_some() && !is_open;
 
-        bar = bar.child(menu_label_button(
-            ("top-menu", i),
-            label,
-            is_open,
-            can_hover_switch,
-            move |hovered, window, cx| {
-                if *hovered {
-                    hover_cb(&(hover_menu_id.clone(), anchor_x), window, cx);
-                }
-            },
-            move |_event, window, cx| {
-                cb(&(menu_id.clone(), anchor_x), window, cx);
-            },
+        bar = bar.child(measured_title(
+            menu.id.clone(),
+            menu_label_button(
+                ("top-menu", i),
+                label,
+                is_open,
+                can_hover_switch,
+                move |hovered, window, cx| {
+                    if *hovered {
+                        let x = title_left(&hover_menu_id, anchor_x);
+                        hover_cb(&(hover_menu_id.clone(), x), window, cx);
+                    }
+                },
+                move |_event, window, cx| {
+                    let x = title_left(&menu_id, anchor_x);
+                    cb(&(menu_id.clone(), x), window, cx);
+                },
+            ),
         ));
     }
 
@@ -178,19 +219,24 @@ pub fn menu_bar(
         let cb = on_open_menu.clone();
         let hover_cb = on_open_menu.clone();
         let can_hover_switch = open_id_owned.is_some() && !is_open;
-        bar = bar.child(menu_label_button(
-            "top-menu-overflow",
-            overflow_label(i18n),
-            is_open,
-            can_hover_switch,
-            move |hovered, window, cx| {
-                if *hovered {
-                    hover_cb(&(MENU_PICKER_ID.to_string(), anchor_x), window, cx);
-                }
-            },
-            move |_event, window, cx| {
-                cb(&(MENU_PICKER_ID.to_string(), anchor_x), window, cx);
-            },
+        bar = bar.child(measured_title(
+            MENU_PICKER_ID.to_string(),
+            menu_label_button(
+                "top-menu-overflow",
+                overflow_label(i18n),
+                is_open,
+                can_hover_switch,
+                move |hovered, window, cx| {
+                    if *hovered {
+                        let x = title_left(MENU_PICKER_ID, anchor_x);
+                        hover_cb(&(MENU_PICKER_ID.to_string(), x), window, cx);
+                    }
+                },
+                move |_event, window, cx| {
+                    let x = title_left(MENU_PICKER_ID, anchor_x);
+                    cb(&(MENU_PICKER_ID.to_string(), x), window, cx);
+                },
+            ),
         ));
     }
 
