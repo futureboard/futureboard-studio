@@ -84,6 +84,7 @@ add-track.title = 新建轨道
 ## Panels & Timeline
 
 bottom-panel.mix-level = 混音：80%
+bottom-panel.mixer-pop-out = 在新窗口中打开混音器
 bottom-panel.plugin.compressor = 压缩器
 bottom-panel.plugin.delay = 延迟单位
 bottom-panel.plugin.equalizer = 均衡器
@@ -512,6 +513,7 @@ menu.window-lyric_editor_panel = 右侧停靠歌词编辑器
 menu.window-maximize = 最大化
 menu.window-minimize = 最小化
 menu.window-performance = 性能监视器
+menu.window-process_explorer = 进程资源管理器
 menu.window-virtual_speaker = 虚拟扬声器
 menu.window-visualizer = 可视化器
 menu.window-visualizer-spectrum = 频谱
