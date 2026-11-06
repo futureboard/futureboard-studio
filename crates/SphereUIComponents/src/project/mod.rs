@@ -1223,7 +1223,7 @@ fn timeline_insert_to_project(idx: usize, slot: &InsertSlotState) -> ProjectInse
     }
 }
 
-fn project_insert_to_timeline(pi: &ProjectInsert) -> InsertSlotState {
+pub(crate) fn project_insert_to_timeline(pi: &ProjectInsert) -> InsertSlotState {
     use crate::components::timeline::timeline_state::{
         InsertLoadStatus, InsertPluginFormat, PluginRuntimeBackend, PluginRuntimeState,
     };

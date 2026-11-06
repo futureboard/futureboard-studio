@@ -5272,9 +5272,13 @@ impl StudioLayout {
         use crate::components::timeline::timeline_state::TrackType;
         use SpherePluginHost::PluginKind;
 
-        let reg = self.read_dropped_plugin_preset(preset_path)?;
+        // A chain or track preset is its own load.
+        if self.apply_dropped_bundle_preset(track_id, preset_path, None, cx) {
+            return None;
+        }
+        let (reg, state) = self.read_dropped_plugin_preset(preset_path)?;
         if reg.kind == PluginKind::Instrument {
-            return self.create_instrument_track_from_preset(&reg, cx);
+            return self.create_instrument_track_from_preset(&reg, state, cx);
         }
         let track_id = match track_id {
             Some(track_id) => track_id.to_string(),
@@ -5292,7 +5296,14 @@ impl StudioLayout {
             .insert_slots(&track_id)
             .map(|slots| slots.len())
             .unwrap_or(0);
-        self.bind_preset_to_insert_slot(&track_id, slot_index, &reg, cx, "plugin_preset_drop")
+        self.bind_preset_to_insert_slot(
+            &track_id,
+            slot_index,
+            &reg,
+            state,
+            cx,
+            "plugin_preset_drop",
+        )
     }
 
     /// A fresh track for a plug-in dropped where no track was, selected, and
@@ -5343,7 +5354,12 @@ impl StudioLayout {
     ) -> Option<(String, usize, String)> {
         use SpherePluginHost::PluginKind;
 
-        let reg = self.read_dropped_plugin_preset(preset_path)?;
+        // A chain dropped on a strip replaces that channel's effects; a track
+        // preset makes its own track.
+        if self.apply_dropped_bundle_preset(Some(track_id), preset_path, None, cx) {
+            return None;
+        }
+        let (reg, state) = self.read_dropped_plugin_preset(preset_path)?;
         if reg.kind == PluginKind::Instrument {
             eprintln!(
                 "[PluginDrop] ignored instrument preset on effect slot preset={} plugin={}",
@@ -5352,23 +5368,62 @@ impl StudioLayout {
             );
             return None;
         }
-        self.bind_preset_to_insert_slot(track_id, slot_index, &reg, cx, "mixer_preset_drop")
+        self.bind_preset_to_insert_slot(track_id, slot_index, &reg, state, cx, "mixer_preset_drop")
     }
 
+    /// The plug-in a dropped one-plug-in `.pst` names, and for a user preset
+    /// (a saved sound rather than a scan-cache row) the state it carries.
+    ///
+    /// A user preset stores only the plug-in's id, so the plug-in itself is
+    /// looked up in this machine's catalog; one that is not installed here is
+    /// refused rather than inserted empty.
     fn read_dropped_plugin_preset(
         &self,
         preset_path: &std::path::Path,
-    ) -> Option<SpherePluginHost::RegistryPlugin> {
-        let reg = match SpherePluginHost::preset::read_preset_file(preset_path) {
-            Ok(reg) => reg,
-            Err(error) => {
-                eprintln!(
-                    "[PluginDrop] failed to read preset path={} error={error}",
-                    preset_path.display()
-                );
-                return None;
-            }
-        };
+    ) -> Option<(
+        SpherePluginHost::RegistryPlugin,
+        Option<std::sync::Arc<Vec<u8>>>,
+    )> {
+        use SpherePluginHost::preset::PstKind;
+        let (reg, state) =
+            if SpherePluginHost::preset::pst_kind(preset_path) == Some(PstKind::PluginState) {
+                let (plugin_id, state) =
+                    match SpherePluginHost::preset::read_state_preset(preset_path) {
+                        Ok(read) => read,
+                        Err(error) => {
+                            eprintln!(
+                                "[PluginDrop] failed to read preset path={} error={error}",
+                                preset_path.display()
+                            );
+                            return None;
+                        }
+                    };
+                let Some(reg) = self.plugin_catalog.available.as_ref().and_then(|plugins| {
+                    plugins
+                        .iter()
+                        .find(|p| p.id == plugin_id || p.class_id.as_deref() == Some(&plugin_id))
+                        .cloned()
+                }) else {
+                    eprintln!(
+                        "[PluginDrop] preset path={} is for plug-in {plugin_id}, which is not \
+                     installed",
+                        preset_path.display()
+                    );
+                    return None;
+                };
+                (reg, Some(std::sync::Arc::new(state)))
+            } else {
+                match SpherePluginHost::preset::read_preset_file(preset_path) {
+                    Ok(reg) => (reg, None),
+                    Err(error) => {
+                        eprintln!(
+                            "[PluginDrop] failed to read preset path={} error={error}",
+                            preset_path.display()
+                        );
+                        return None;
+                    }
+                }
+            };
         if !reg.supports_insert() {
             eprintln!(
                 "[PluginDrop] unsupported preset name={} format={:?} status={:?}",
@@ -5376,7 +5431,36 @@ impl StudioLayout {
             );
             return None;
         }
-        Some(reg)
+        Some((reg, state))
+    }
+
+    /// Give a just-bound insert the state a dropped preset carries, before
+    /// its instance loads: the slot's stored state is what the load sends, and
+    /// a built-in reads it from the main-process mirror.
+    fn seed_dropped_preset_state(
+        &mut self,
+        track_id: &str,
+        slot_id: &str,
+        state: Option<std::sync::Arc<Vec<u8>>>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = state else {
+            return;
+        };
+        let plugin_id = self.timeline.update(cx, |timeline, _cx| {
+            let slot = timeline
+                .state
+                .insert_slots_mut(track_id)?
+                .iter_mut()
+                .find(|slot| slot.id == slot_id)?;
+            slot.vst3_state = Some(state.clone());
+            slot.plugin_id.clone()
+        });
+        if let Some(plugin_id) = plugin_id {
+            crate::components::builtin_plugin_editor::builtin_state_seed(
+                &plugin_id, slot_id, &state,
+            );
+        }
     }
 
     fn bind_preset_to_insert_slot(
@@ -5384,6 +5468,7 @@ impl StudioLayout {
         track_id: &str,
         slot_index: usize,
         reg: &SpherePluginHost::RegistryPlugin,
+        state: Option<std::sync::Arc<Vec<u8>>>,
         cx: &mut Context<Self>,
         source: &'static str,
     ) -> Option<(String, usize, String)> {
@@ -5460,6 +5545,7 @@ impl StudioLayout {
             "[PluginDrop] track={track_id} slot={slot_id} index={slot_index} plugin={}",
             display_name
         );
+        self.seed_dropped_preset_state(track_id, &slot_id, state, cx);
         self.record_insert_chains(history_label, history_before, cx);
         self.after_preset_insert_bound(track_id, &slot_id, plugin_format, cx, source);
         cx.notify();
@@ -5469,6 +5555,7 @@ impl StudioLayout {
     fn create_instrument_track_from_preset(
         &mut self,
         reg: &SpherePluginHost::RegistryPlugin,
+        state: Option<std::sync::Arc<Vec<u8>>>,
         cx: &mut Context<Self>,
     ) -> Option<(String, usize, String)> {
         use crate::components::timeline::timeline_state::TrackType;
@@ -5518,6 +5605,7 @@ impl StudioLayout {
             timeline.state.select_track(&track_id);
             Some((track_id, 0usize, slot_id))
         })?;
+        self.seed_dropped_preset_state(&created.0, &created.2, state, cx);
         self.commit_track_edit("Add Instrument Track", edit, cx);
 
         eprintln!(

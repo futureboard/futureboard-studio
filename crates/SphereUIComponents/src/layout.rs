@@ -3035,6 +3035,9 @@ impl StudioLayout {
             "track:duplicate-no-fx" => self.duplicate_context_track(false, cx),
             "track:copy-fx-chain" => self.copy_context_fx_chain(cx),
             "track:paste-fx-chain" => self.paste_context_fx_chain(cx),
+            "track:save-chain-preset" => self.save_context_chain_preset(cx),
+            "track:save-track-preset" => self.save_context_track_preset(cx),
+            "track:load-preset" => self.open_context_preset(cx),
             "track:height-small" => self.set_context_track_height_preset(
                 crate::components::timeline::timeline_state::TrackHeightPreset::Small,
                 cx,

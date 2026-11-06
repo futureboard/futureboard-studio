@@ -306,6 +306,55 @@ impl TimelineState {
         Some(copies)
     }
 
+    /// Replace every slot on `track_id`, instrument included, with copies of
+    /// `slots` in order, and return the copies' ids. What a track preset does
+    /// to the track created for it. `None`, changing nothing, when the channel
+    /// carries no plug-ins or the slots do not fit.
+    ///
+    /// An instrument-hosting track given no instrument keeps the empty
+    /// instrument slot its chain floor expects, ahead of the effects.
+    pub fn replace_insert_chain(
+        &mut self,
+        track_id: &str,
+        slots: &[InsertSlotState],
+    ) -> Option<Vec<String>> {
+        let track = self.find_track(track_id)?;
+        if matches!(
+            track.track_type,
+            TrackType::Video | TrackType::Group | TrackType::Master
+        ) {
+            return None;
+        }
+        let first_is_instrument = slots
+            .first()
+            .is_some_and(|slot| slot.plugin_is_instrument == Some(true));
+        let placeholder = !first_is_instrument && track.needs_instrument_placeholder();
+        if slots.len() + usize::from(placeholder) > MAX_INSERT_SLOTS {
+            return None;
+        }
+        let existing: Vec<String> = self
+            .insert_slots(track_id)?
+            .iter()
+            .map(|slot| slot.id.clone())
+            .collect();
+        for insert_id in existing {
+            self.remove_insert(track_id, &insert_id);
+        }
+        if placeholder {
+            let placeholder_id = self.next_insert_slot_id_for(track_id);
+            self.insert_slots_mut(track_id)?
+                .push(InsertSlotState::empty(placeholder_id));
+        }
+        let mut copies = Vec::with_capacity(slots.len());
+        for slot in slots {
+            let copy_id = self.next_insert_slot_id_for(track_id);
+            let copy = slot.copy_as(copy_id.clone(), None);
+            self.insert_slots_mut(track_id)?.push(copy);
+            copies.push(copy_id);
+        }
+        Some(copies)
+    }
+
     /// `track_id`'s insert chain as it stands, for an undo step that puts it
     /// back. `None` for an unknown channel.
     pub fn capture_insert_chain(&self, track_id: &str) -> Option<InsertChainSnapshot> {
@@ -511,6 +560,53 @@ mod tests {
         let mut state = TimelineState::default();
         state.tracks.clear();
         state
+    }
+
+    /// A track preset sets the whole chain, instrument first, on the track
+    /// made for it: the old slots go, the copies keep their plug-ins, roles
+    /// and state, and each gets an id of its own.
+    #[test]
+    fn a_track_preset_replaces_the_whole_chain() {
+        let mut state = empty_state();
+        let source = track(&mut state, TrackType::Instrument, "Keys");
+        let synth = load(&mut state, &source, 0, "Synth", true);
+        let eq = load(&mut state, &source, 1, "EQ", false);
+        let mut template: Vec<InsertSlotState> = state.insert_slots(&source).unwrap().clone();
+        template[1].vst3_state = Some(Arc::new(vec![9, 9, 9]));
+
+        let target = track(&mut state, TrackType::Instrument, "New");
+        let _old = load(&mut state, &target, 0, "Old Synth", true);
+        let copies = state
+            .replace_insert_chain(&target, &template)
+            .expect("fits");
+        let slots = state.insert_slots(&target).unwrap();
+        assert_eq!(slots.len(), 2);
+        assert_eq!(
+            copies,
+            slots.iter().map(|s| s.id.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(slots[0].plugin_id.as_deref(), Some("Synth"));
+        assert_eq!(slots[0].plugin_is_instrument, Some(true));
+        assert_eq!(slots[1].plugin_id.as_deref(), Some("EQ"));
+        assert_eq!(slots[1].vst3_state.as_deref(), Some(&vec![9, 9, 9]));
+        assert!(!copies.contains(&synth) && !copies.contains(&eq));
+    }
+
+    /// Effects alone on an instrument track keep the instrument slot the
+    /// chain floor expects, empty, ahead of them.
+    #[test]
+    fn effects_alone_on_an_instrument_track_keep_its_instrument_slot() {
+        let mut state = empty_state();
+        let source = track(&mut state, TrackType::Audio, "Vox");
+        load(&mut state, &source, 0, "EQ", false);
+        let template: Vec<InsertSlotState> = state.insert_slots(&source).unwrap().clone();
+        let target = track(&mut state, TrackType::Instrument, "Keys");
+        state
+            .replace_insert_chain(&target, &template)
+            .expect("fits");
+        let slots = state.insert_slots(&target).unwrap();
+        assert!(slots[0].is_empty(), "the instrument slot stays");
+        assert_eq!(slots[1].plugin_id.as_deref(), Some("EQ"));
     }
 
     fn track_mut<'a>(state: &'a mut TimelineState, track_id: &str) -> &'a mut TrackState {

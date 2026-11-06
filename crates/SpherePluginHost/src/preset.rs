@@ -11,6 +11,23 @@ use crate::registry::{default_preset_root, RegistryPlugin};
 
 const PRESET_MAGIC: &[u8; 5] = b"FBPST";
 
+/// Header version of a file about one plug-in: a scan-cache row (no state) or
+/// a user preset (that plug-in's state).
+const VERSION_SINGLE: u16 = 1;
+/// Header version of a bundle: a chain of plug-ins, or a whole track. Older
+/// readers that only know version 1 see a file whose metadata names no
+/// plug-in and refuse it, rather than misreading it as one.
+const VERSION_BUNDLE: u16 = 2;
+
+/// The header's version field. Files written before the field was checked are
+/// all version 1.
+fn header_version(bytes: &[u8]) -> u16 {
+    if bytes.len() < 8 {
+        return VERSION_SINGLE;
+    }
+    u16::from_le_bytes([bytes[6], bytes[7]])
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PresetMetadata<'a> {
@@ -103,11 +120,13 @@ fn clear_pst_files_recursive(dir: &Path) -> Result<u32, String> {
     Ok(deleted)
 }
 
-/// Whether `path` is a user preset — an FBPST file carrying plug-in state —
-/// rather than a scan-cache row, which never carries any.
+/// Whether `path` is a user preset — an FBPST file carrying plug-in state, or
+/// a chain or track bundle — rather than a scan-cache row, which never carries
+/// any.
 ///
-/// Both are `.pst` in the same container, so the header's declared state
-/// length is what tells them apart. Only the 16 header bytes are read.
+/// All are `.pst` in the same container, so the header tells them apart: a
+/// bundle by its version, a one-plug-in preset by its declared state length.
+/// Only the 16 header bytes are read.
 pub fn is_state_preset_file(path: &Path) -> bool {
     use std::io::Read;
     let Ok(mut file) = fs::File::open(path) else {
@@ -117,7 +136,8 @@ pub fn is_state_preset_file(path: &Path) -> bool {
     if file.read_exact(&mut header).is_err() || &header[..5] != PRESET_MAGIC {
         return false;
     }
-    u32::from_le_bytes([header[12], header[13], header[14], header[15]]) > 0
+    header_version(&header) >= VERSION_BUNDLE
+        || u32::from_le_bytes([header[12], header[13], header[14], header[15]]) > 0
 }
 
 /// Validate that a plug-in binary exists before registration. Formats with no
@@ -202,6 +222,9 @@ pub fn read_preset_file(preset_path: &Path) -> Result<RegistryPlugin, String> {
     let bytes = fs::read(preset_path).map_err(|e| e.to_string())?;
     if bytes.len() < 24 || &bytes[..5] != PRESET_MAGIC {
         return Err("Not an FBPST preset".to_string());
+    }
+    if header_version(&bytes) >= VERSION_BUNDLE {
+        return Err("A chain or track preset, not a plug-in cache row".to_string());
     }
     // A user preset carries state; a cache row never does. Reading a user
     // preset as a row would list it as a phantom plug-in.
@@ -360,6 +383,9 @@ pub fn read_state_preset(path: &Path) -> Result<(String, Vec<u8>), String> {
     if bytes.len() < 24 || &bytes[..5] != PRESET_MAGIC {
         return Err("Not an FBPST preset".to_string());
     }
+    if header_version(&bytes) >= VERSION_BUNDLE {
+        return Err("A chain or track preset, not one plug-in's preset".to_string());
+    }
     let meta_len = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
     let state_len = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) as usize;
     let meta_start = 24usize;
@@ -410,17 +436,21 @@ fn build_state_preset_binary(preset: &StatePreset) -> Vec<u8> {
     };
     let meta = serde_json::to_vec(&metadata).unwrap_or_default();
     let mut out = Vec::with_capacity(24 + meta.len() + preset.state.len());
-    out.extend_from_slice(&preset_header(meta.len(), preset.state.len()));
+    out.extend_from_slice(&preset_header(
+        VERSION_SINGLE,
+        meta.len(),
+        preset.state.len(),
+    ));
     out.extend_from_slice(&meta);
     out.extend_from_slice(&preset.state);
     out
 }
 
 /// The 24-byte FBPST header shared by every `.pst` this app writes.
-fn preset_header(meta_len: usize, state_len: usize) -> [u8; 24] {
+fn preset_header(version: u16, meta_len: usize, state_len: usize) -> [u8; 24] {
     let mut header = [0u8; 24];
     header[..5].copy_from_slice(PRESET_MAGIC);
-    header[6..8].copy_from_slice(&1u16.to_le_bytes());
+    header[6..8].copy_from_slice(&version.to_le_bytes());
     header[8..12].copy_from_slice(&(meta_len as u32).to_le_bytes());
     header[12..16].copy_from_slice(&(state_len as u32).to_le_bytes());
     header
@@ -462,14 +492,418 @@ fn build_preset_binary(plugin: &RegistryPlugin) -> Vec<u8> {
 
     let meta = serde_json::to_vec(&metadata).unwrap_or_default();
     let mut out = Vec::with_capacity(24 + meta.len());
-    out.extend_from_slice(&preset_header(meta.len(), 0));
+    out.extend_from_slice(&preset_header(VERSION_SINGLE, meta.len(), 0));
     out.extend_from_slice(&meta);
     out
+}
+
+// ── Bundles: chains and tracks ──────────────────────────────────────────────
+
+/// What a bundle `.pst` holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BundleKind {
+    /// A track's effect chain, in order. Loads onto any track that can take
+    /// it; the track's instrument stays.
+    Chain,
+    /// A whole track: its kind, name, colour, level, pan and input monitor,
+    /// and every plug-in on it, instrument first. Loads as a new track.
+    Track,
+}
+
+/// One plug-in in a bundle, with its own opaque state.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PresetSlot {
+    /// The insert's plug-in id (class id where the format has one). State is
+    /// only ever restored into the plug-in that produced it.
+    pub plugin_id: String,
+    /// Plug-in name from the registry, for a file read on its own.
+    pub plugin_name: String,
+    pub vendor: String,
+    /// Format label: `VST3`, `VST2`, `CLAP`, `AU`, `LV2`, or empty for a
+    /// built-in.
+    pub format: String,
+    /// Module path the plug-in loaded from, where the format has one.
+    pub plugin_path: String,
+    pub version: Option<String>,
+    /// Whether the slot is an instrument. `None` when the host did not say.
+    pub is_instrument: Option<bool>,
+    /// The name the slot showed (the user may have renamed it).
+    pub display_name: String,
+    pub enabled: bool,
+    pub bypassed: bool,
+    /// 1-based instrument output channels mixed down; empty means 1/2.
+    pub output_channels: Vec<u8>,
+    pub multiout_collapsed: bool,
+    /// The plug-in's opaque state. Empty means its defaults.
+    pub state: Vec<u8>,
+}
+
+/// The track settings a track bundle carries. Strings rather than the UI's
+/// own types, so this crate stays free of them and the file stays readable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PresetTrack {
+    /// `audio`, `midi`, `instrument`, `bus` or `return`.
+    pub track_type: String,
+    pub name: String,
+    /// `#rrggbb`.
+    pub color: String,
+    /// Fader position, normalized as the track stores it.
+    pub volume: f32,
+    /// -1 (left) to 1 (right).
+    pub pan: f32,
+    /// `off`, `auto` or `always`.
+    pub input_monitor: String,
+}
+
+/// A chain or track preset: several plug-ins, and for a track its settings.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BundlePreset {
+    pub kind: BundleKind,
+    /// What the file is called in the browser.
+    pub name: String,
+    pub slots: Vec<PresetSlot>,
+    /// Present for [`BundleKind::Track`].
+    pub track: Option<PresetTrack>,
+}
+
+/// Bundle metadata: everything but the states, which follow it back to back in
+/// the payload, each found by its own offset and length.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BundleMetadata {
+    preset_format: String,
+    version: u32,
+    kind: BundleKind,
+    #[serde(default)]
+    created_at: i64,
+    /// The bundle's own name where single-plug-in files keep the plug-in's,
+    /// so a listing that reads `pluginMetadata.name` shows the right thing.
+    plugin_metadata: BundleNameOnly,
+    slots: Vec<BundleSlotMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    track: Option<PresetTrack>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BundleNameOnly {
+    #[serde(default)]
+    id: String,
+    name: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BundleSlotMetadata {
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    vendor: String,
+    #[serde(default)]
+    format: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    instrument: Option<bool>,
+    #[serde(default)]
+    display_name: String,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default)]
+    bypassed: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    output_channels: Vec<u8>,
+    #[serde(default)]
+    multiout_collapsed: bool,
+    state_offset: u64,
+    state_length: u64,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Writes a chain or track preset to `path`, creating parent directories.
+pub fn write_bundle_preset(path: &Path, preset: &BundlePreset) -> Result<(), String> {
+    if preset.slots.is_empty() && preset.kind == BundleKind::Chain {
+        return Err("a chain preset needs at least one plug-in".to_string());
+    }
+    if preset.kind == BundleKind::Track && preset.track.is_none() {
+        return Err("a track preset needs the track's settings".to_string());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let bytes = build_bundle_binary(preset)?;
+    let tmp = path.with_extension("pst.tmp");
+    {
+        let mut file = fs::File::create(&tmp).map_err(|e| e.to_string())?;
+        file.write_all(&bytes).map_err(|e| e.to_string())?;
+    }
+    fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn build_bundle_binary(preset: &BundlePreset) -> Result<Vec<u8>, String> {
+    let mut states = Vec::new();
+    let mut slots = Vec::with_capacity(preset.slots.len());
+    for slot in &preset.slots {
+        let offset = states.len() as u64;
+        states.extend_from_slice(&slot.state);
+        slots.push(BundleSlotMetadata {
+            id: slot.plugin_id.clone(),
+            name: slot.plugin_name.clone(),
+            vendor: slot.vendor.clone(),
+            format: slot.format.clone(),
+            path: slot.plugin_path.clone(),
+            version: slot.version.clone(),
+            instrument: slot.is_instrument,
+            display_name: slot.display_name.clone(),
+            enabled: slot.enabled,
+            bypassed: slot.bypassed,
+            output_channels: slot.output_channels.clone(),
+            multiout_collapsed: slot.multiout_collapsed,
+            state_offset: offset,
+            state_length: slot.state.len() as u64,
+        });
+    }
+    if states.len() > u32::MAX as usize {
+        return Err("the plug-in states are too large for one preset".to_string());
+    }
+    let metadata = BundleMetadata {
+        preset_format: "Futureboard preset".to_string(),
+        version: VERSION_BUNDLE as u32,
+        kind: preset.kind,
+        created_at: now_millis(),
+        plugin_metadata: BundleNameOnly {
+            id: String::new(),
+            name: preset.name.clone(),
+        },
+        slots,
+        track: preset.track.clone(),
+    };
+    let meta = serde_json::to_vec(&metadata).map_err(|e| e.to_string())?;
+    let mut out = Vec::with_capacity(24 + meta.len() + states.len());
+    out.extend_from_slice(&preset_header(VERSION_BUNDLE, meta.len(), states.len()));
+    out.extend_from_slice(&meta);
+    out.extend_from_slice(&states);
+    Ok(out)
+}
+
+/// Reads a chain or track preset back.
+pub fn read_bundle_preset(path: &Path) -> Result<BundlePreset, String> {
+    let bytes = fs::read(path).map_err(|e| e.to_string())?;
+    if bytes.len() < 24 || &bytes[..5] != PRESET_MAGIC {
+        return Err("Not an FBPST preset".to_string());
+    }
+    if header_version(&bytes) != VERSION_BUNDLE {
+        return Err("A one-plug-in preset, not a chain or track preset".to_string());
+    }
+    let meta_len = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
+    let state_len = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) as usize;
+    let meta_end = 24usize
+        .checked_add(meta_len)
+        .ok_or_else(|| "Preset metadata length overflow".to_string())?;
+    let state_end = meta_end
+        .checked_add(state_len)
+        .ok_or_else(|| "Preset state length overflow".to_string())?;
+    if bytes.len() < state_end {
+        return Err("Preset truncated".to_string());
+    }
+    let metadata: BundleMetadata =
+        serde_json::from_slice(&bytes[24..meta_end]).map_err(|e| e.to_string())?;
+    let states = &bytes[meta_end..state_end];
+    let mut slots = Vec::with_capacity(metadata.slots.len());
+    for slot in metadata.slots {
+        let start = usize::try_from(slot.state_offset).map_err(|_| "state offset".to_string())?;
+        let len = usize::try_from(slot.state_length).map_err(|_| "state length".to_string())?;
+        let end = start
+            .checked_add(len)
+            .filter(|end| *end <= states.len())
+            .ok_or_else(|| format!("the state of {} runs past the file", slot.name))?;
+        slots.push(PresetSlot {
+            plugin_id: slot.id,
+            plugin_name: slot.name,
+            vendor: slot.vendor,
+            format: slot.format,
+            plugin_path: slot.path,
+            version: slot.version,
+            is_instrument: slot.instrument,
+            display_name: slot.display_name,
+            enabled: slot.enabled,
+            bypassed: slot.bypassed,
+            output_channels: slot.output_channels,
+            multiout_collapsed: slot.multiout_collapsed,
+            state: states[start..end].to_vec(),
+        });
+    }
+    if metadata.kind == BundleKind::Track && metadata.track.is_none() {
+        return Err("A track preset without its track settings".to_string());
+    }
+    Ok(BundlePreset {
+        kind: metadata.kind,
+        name: metadata.plugin_metadata.name,
+        slots,
+        track: metadata.track,
+    })
+}
+
+/// What a `.pst` is, read from its header (and, for a bundle, its metadata).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PstKind {
+    /// A plug-in scan-cache row: a plug-in to insert with its defaults.
+    PluginRow,
+    /// One plug-in's saved sound.
+    PluginState,
+    /// A chain or track bundle.
+    Bundle(BundleKind),
+}
+
+/// Classifies a `.pst` without decoding its states. `None` for anything that
+/// is not an FBPST file.
+pub fn pst_kind(path: &Path) -> Option<PstKind> {
+    use std::io::Read;
+    let mut file = fs::File::open(path).ok()?;
+    let mut header = [0u8; 24];
+    file.read_exact(&mut header).ok()?;
+    if &header[..5] != PRESET_MAGIC {
+        return None;
+    }
+    if header_version(&header) >= VERSION_BUNDLE {
+        let meta_len = u32::from_le_bytes([header[8], header[9], header[10], header[11]]) as usize;
+        let mut meta = vec![0u8; meta_len.min(16 * 1024 * 1024)];
+        file.read_exact(&mut meta).ok()?;
+        #[derive(Deserialize)]
+        struct KindOnly {
+            kind: BundleKind,
+        }
+        let kind: KindOnly = serde_json::from_slice(&meta).ok()?;
+        return Some(PstKind::Bundle(kind.kind));
+    }
+    let state_len = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
+    Some(if state_len > 0 {
+        PstKind::PluginState
+    } else {
+        PstKind::PluginRow
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bundle(kind: BundleKind) -> BundlePreset {
+        BundlePreset {
+            kind,
+            name: "Vocal Chain".to_string(),
+            slots: vec![
+                PresetSlot {
+                    plugin_id: "builtin:equz8".to_string(),
+                    plugin_name: "EQ-Z8".to_string(),
+                    display_name: "EQ-Z8".to_string(),
+                    enabled: true,
+                    state: br#"{"bands":[1,2,3]}"#.to_vec(),
+                    ..Default::default()
+                },
+                PresetSlot {
+                    plugin_id: "vst3:abc".to_string(),
+                    plugin_name: "Comp".to_string(),
+                    format: "VST3".to_string(),
+                    plugin_path: "C:/VST3/Comp.vst3".to_string(),
+                    display_name: "Bus Comp".to_string(),
+                    enabled: true,
+                    bypassed: true,
+                    // A stateless plug-in keeps its defaults.
+                    state: Vec::new(),
+                    ..Default::default()
+                },
+                PresetSlot {
+                    plugin_id: "vst3:def".to_string(),
+                    plugin_name: "Limiter".to_string(),
+                    enabled: true,
+                    state: (0u8..=255).cycle().take(5000).collect(),
+                    ..Default::default()
+                },
+            ],
+            track: (kind == BundleKind::Track).then(|| PresetTrack {
+                track_type: "audio".to_string(),
+                name: "Lead Vocal".to_string(),
+                color: "#ff8800".to_string(),
+                volume: 0.7,
+                pan: -0.25,
+                input_monitor: "auto".to_string(),
+            }),
+        }
+    }
+
+    /// Every slot comes back in order with its own state byte for byte, and a
+    /// track keeps its settings.
+    #[test]
+    fn a_bundle_round_trips_every_slot_and_its_state() {
+        let dir = std::env::temp_dir().join("fb-preset-bundle");
+        let _ = fs::remove_dir_all(&dir);
+        for kind in [BundleKind::Chain, BundleKind::Track] {
+            let path = dir.join(format!("{kind:?}.pst"));
+            let written = bundle(kind);
+            write_bundle_preset(&path, &written).expect("write");
+            assert_eq!(read_bundle_preset(&path).expect("read"), written);
+            assert_eq!(pst_kind(&path), Some(PstKind::Bundle(kind)));
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A bundle shares the container but is never read as one plug-in: not as
+    /// a cache row (a phantom plug-in), not as a plug-in's preset (state handed
+    /// to the wrong plug-in), and Clear Database keeps it.
+    #[test]
+    fn a_bundle_is_not_mistaken_for_a_plug_in_or_cache() {
+        let dir = std::env::temp_dir().join("fb-preset-bundle-not-single");
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("Chain.pst");
+        let mut stateless = bundle(BundleKind::Chain);
+        for slot in &mut stateless.slots {
+            slot.state.clear();
+        }
+        write_bundle_preset(&path, &stateless).expect("write");
+        assert!(read_preset_file(&path).is_err(), "no phantom plug-in row");
+        assert!(read_state_preset(&path).is_err(), "not one plug-in's state");
+        assert!(is_state_preset_file(&path), "user work, even with no state");
+        assert_eq!(clear_pst_files_recursive(&dir).unwrap(), 0);
+        assert!(path.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The single-plug-in files classify as they always read.
+    #[test]
+    fn single_plug_in_files_classify_as_before() {
+        let dir = std::env::temp_dir().join("fb-preset-classify");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let user = dir.join("user.pst");
+        write_state_preset(
+            &user,
+            &StatePreset {
+                plugin_id: "x".to_string(),
+                plugin_name: "X".to_string(),
+                state: vec![1],
+            },
+        )
+        .unwrap();
+        let row = dir.join("row.pst");
+        let meta = br#"{"pluginMetadata":{"id":"x","name":"X"}}"#;
+        let mut bytes = preset_header(VERSION_SINGLE, meta.len(), 0).to_vec();
+        bytes.extend_from_slice(meta);
+        fs::write(&row, &bytes).unwrap();
+        assert_eq!(pst_kind(&user), Some(PstKind::PluginState));
+        assert_eq!(pst_kind(&row), Some(PstKind::PluginRow));
+        assert!(read_bundle_preset(&user).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     /// A user preset is an FBPST file like any other: same magic, same header,
     /// with the state in the payload the header reserves. Anything that reads
@@ -521,7 +955,7 @@ mod tests {
         let cache = dir.join("VST3").join("Effects").join("x.pst");
         fs::create_dir_all(cache.parent().unwrap()).unwrap();
         let meta = br#"{"pluginMetadata":{"id":"x","name":"X"}}"#;
-        let mut bytes = preset_header(meta.len(), 0).to_vec();
+        let mut bytes = preset_header(VERSION_SINGLE, meta.len(), 0).to_vec();
         bytes.extend_from_slice(meta);
         fs::write(&cache, &bytes).unwrap();
 
@@ -545,7 +979,7 @@ mod tests {
         fs::create_dir_all(&dir).expect("mkdir");
         let path = dir.join("cache.pst");
         let meta = br#"{"pluginMetadata":{"id":"x","name":"X"}}"#;
-        let mut bytes = preset_header(meta.len(), 0).to_vec();
+        let mut bytes = preset_header(VERSION_SINGLE, meta.len(), 0).to_vec();
         bytes.extend_from_slice(meta);
         fs::write(&path, &bytes).expect("write");
 
