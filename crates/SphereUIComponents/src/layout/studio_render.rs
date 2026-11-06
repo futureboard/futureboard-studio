@@ -674,17 +674,29 @@ impl Render for StudioLayout {
                 }),
             )
         });
-        // Add Track moved to an external window.
-        let virtual_keyboard_overlay = {
+        // Add Track moved to an external window. The Virtual Keyboard is a
+        // window of its own too (`virtual_keyboard_window`); what stays here
+        // is keeping its target and Studio's held notes in step.
+        {
             let visible = self.virtual_keyboard.read(cx).state.visible;
             if visible {
                 let window_active = window.is_window_active();
                 if self.virtual_keyboard_window_active && !window_active {
-                    // Deferred + panel-only: releasing through the sink here (we
-                    // are inside StudioLayout::render's lease) would re-enter
-                    // StudioLayout::update and panic. This is the multi-window
-                    // crash path (focus leaving for / closing the popout editor).
-                    self.defer_release_virtual_keyboard_notes(cx);
+                    // Studio lost focus, so it will not see the key-ups of the
+                    // notes typed here: release those. Only Studio's — a click
+                    // into the keyboard window is what took focus, and the note
+                    // it plays must keep sounding.
+                    //
+                    // Deferred + keyboard-only: releasing through the sink here
+                    // (inside StudioLayout::render's lease) would re-enter
+                    // StudioLayout::update and panic.
+                    let keyboard = self.virtual_keyboard.clone();
+                    let studio_window = window.window_handle().window_id();
+                    cx.defer(move |cx| {
+                        let _ = keyboard.update(cx, |keyboard, cx| {
+                            keyboard.release_window_notes(studio_window, cx)
+                        });
+                    });
                 }
                 self.virtual_keyboard_window_active = window_active;
                 let status = self.resolve_virtual_keyboard_target(cx);
@@ -701,17 +713,21 @@ impl Render for StudioLayout {
                 }
                 let label = status.label;
                 let hint = status.hint;
-                let _ = self.virtual_keyboard.update(cx, |panel, cx| {
-                    panel.set_target_status(label, hint);
-                    cx.notify();
-                });
-                Some(self.virtual_keyboard.clone().into_any_element())
+                let changed = {
+                    let state = &self.virtual_keyboard.read(cx).state;
+                    state.target_label != label || state.hint != hint
+                };
+                if changed {
+                    let _ = self.virtual_keyboard.update(cx, |panel, cx| {
+                        panel.set_target_status(label, hint);
+                        cx.notify();
+                    });
+                }
             } else {
                 self.virtual_keyboard_last_target = None;
                 self.virtual_keyboard_window_active = window.is_window_active();
-                None
             }
-        };
+        }
 
         // Phase 2b insert plugin picker overlay.
         let plugin_picker_overlay_el: Option<gpui::AnyElement> = if self.plugin_picker.is_open
@@ -1602,7 +1618,6 @@ impl Render for StudioLayout {
             .children(settings_overlay)
             .children(plugin_picker_overlay_el)
             .children(text_context_overlay)
-            .children(virtual_keyboard_overlay)
             .children({
                 if debug_active_panel_enabled() {
                     Some(

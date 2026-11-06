@@ -172,6 +172,7 @@ pub mod transport_perf_meter;
 pub mod update_dialog;
 pub mod video_player_window;
 pub mod virtual_keyboard;
+pub mod virtual_keyboard_window;
 pub mod virtual_speaker_window;
 #[cfg(feature = "gpu-renderer")]
 pub mod visualizer;

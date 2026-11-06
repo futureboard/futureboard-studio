@@ -2686,19 +2686,7 @@ impl StudioLayout {
             "view:zoom-out" => self.zoom_timeline_by(cx, 0.8),
             "view:reset-zoom" => self.reset_timeline_zoom(cx),
             "view:toggle-virtual-keyboard" | "midi:toggle-virtual-keyboard" => {
-                // Deferred + panel-only: toggling off releases active notes
-                // through the sink, which re-enters StudioLayout::update. We are
-                // inside a StudioLayout lease here (command dispatch), so flushing
-                // synchronously would double-lease and panic.
-                let panel = self.virtual_keyboard.clone();
-                let owner = cx.entity();
-                cx.defer(move |cx| {
-                    let _ = panel.update(cx, |keyboard, cx| keyboard.toggle(cx));
-                    let _ = owner.update(cx, |this, cx| {
-                        this.update_virtual_keyboard_target_status(cx);
-                        cx.notify();
-                    });
-                });
+                self.toggle_virtual_keyboard_window(cx);
             }
 
             // ── Project / track / edit commands available in native shell ─

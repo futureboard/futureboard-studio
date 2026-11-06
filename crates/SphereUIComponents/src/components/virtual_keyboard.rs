@@ -2,12 +2,8 @@ use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-use gpui::{
-    div, px, App, Context, InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
-    Styled, Window, WindowId,
-};
+use gpui::{App, Context, WindowId};
 
-use crate::theme::Colors;
 use sphere_midi_service::VirtualKeyboardEvent;
 
 pub type VirtualKeyboardEventSink =
@@ -613,7 +609,6 @@ pub struct VirtualKeyboardPanelState {
     pub visible: bool,
     pub hint: Option<String>,
     pub target_label: Option<String>,
-    pub keyboard_focus_claimed: bool,
 }
 
 impl Default for VirtualKeyboardPanelState {
@@ -623,7 +618,6 @@ impl Default for VirtualKeyboardPanelState {
             visible: false,
             hint: None,
             target_label: None,
-            keyboard_focus_claimed: false,
         }
     }
 }
@@ -637,18 +631,88 @@ impl VirtualKeyboardPanelState {
     }
 }
 
+/// The app-lifetime Virtual Keyboard: the musical-typing service and where its
+/// notes go. It draws nothing itself — the modeless window
+/// (`virtual_keyboard_window`) is its face — so it outlives that window, and
+/// typing keeps its octave, velocity and channel across opening and closing.
 pub struct VirtualKeyboardPanel {
     pub state: VirtualKeyboardPanelState,
     pub event_sink: Option<VirtualKeyboardEventSink>,
-    focus_handle: gpui::FocusHandle,
 }
 
 impl VirtualKeyboardPanel {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(_cx: &mut Context<Self>) -> Self {
         Self {
             state: VirtualKeyboardPanelState::default(),
             event_sink: None,
-            focus_handle: cx.focus_handle(),
+        }
+    }
+
+    /// Octave up or down a step. Held notes are released first, so none is
+    /// left sounding at the old pitch.
+    pub fn step_octave(&mut self, delta: i8, cx: &mut Context<Self>) {
+        let next = self.state.controller.octave.saturating_add(delta);
+        let output = self.state.controller.set_octave(next);
+        self.flush_output(output, cx);
+        cx.notify();
+    }
+
+    pub fn step_velocity(&mut self, delta: i8, cx: &mut Context<Self>) {
+        let velocity = self.state.controller.velocity;
+        let next = if delta < 0 {
+            velocity.saturating_sub(VELOCITY_STEP)
+        } else {
+            velocity.saturating_add(VELOCITY_STEP)
+        };
+        self.state.controller.set_velocity(next);
+        cx.notify();
+    }
+
+    pub fn step_channel(&mut self, delta: i8, cx: &mut Context<Self>) {
+        let next = (self.state.controller.channel as i8 + delta).clamp(0, 15) as u8;
+        let output = self.state.controller.set_channel(next);
+        self.flush_output(output, cx);
+        cx.notify();
+    }
+
+    pub fn toggle_sustain(&mut self, cx: &mut Context<Self>) {
+        let output = self.state.controller.toggle_sustain();
+        self.flush_output(output, cx);
+        cx.notify();
+    }
+
+    pub fn mouse_note_on(&mut self, note: u8, cx: &mut Context<Self>) {
+        let output = self.state.controller.mouse_note_on(note);
+        self.flush_output(output, cx);
+        cx.notify();
+    }
+
+    pub fn mouse_note_off(&mut self, note: u8, cx: &mut Context<Self>) {
+        let output = self.state.controller.mouse_note_off(note);
+        self.flush_output(output, cx);
+        cx.notify();
+    }
+
+    /// End every note held with the mouse (a release anywhere in the window).
+    pub fn release_mouse_notes(&mut self, cx: &mut Context<Self>) {
+        let mut output = VirtualKeyboardOutput::default();
+        output
+            .events
+            .extend(self.state.controller.release_mouse_notes());
+        if output.has_events() {
+            self.flush_output(output, cx);
+            cx.notify();
+        }
+    }
+
+    /// Release the notes typed in `window_id` only — that window lost focus
+    /// and will not see their key-ups. Notes held from another window, or
+    /// with the mouse, keep sounding.
+    pub fn release_window_notes(&mut self, window_id: WindowId, cx: &mut Context<Self>) {
+        let output = self.state.controller.release_notes_for_window(window_id);
+        if output.has_events() {
+            self.flush_output(output, cx);
+            cx.notify();
         }
     }
 
@@ -661,10 +725,8 @@ impl VirtualKeyboardPanel {
         self.state.visible = visible;
         if visible && !was_visible {
             vkbd_log("open");
-            self.state.keyboard_focus_claimed = false;
         } else if !visible && was_visible {
             vkbd_log("close");
-            self.state.keyboard_focus_claimed = false;
             let output = self.state.close();
             self.flush_output(output, cx);
         }
@@ -791,435 +853,6 @@ impl VirtualKeyboardPanel {
             }
         }
     }
-}
-
-impl Render for VirtualKeyboardPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if !self.state.visible {
-            return div().into_any_element();
-        }
-
-        if !self.state.keyboard_focus_claimed {
-            self.focus_handle.focus(_window, cx);
-            self.state.keyboard_focus_claimed = true;
-        }
-
-        let octave = self.state.controller.octave;
-        let velocity = self.state.controller.velocity;
-        let channel_label = self.state.controller.channel + 1;
-        let sustain = self.state.controller.sustain;
-        let active_notes = self.state.controller.active_note_values();
-        let target = cx.entity().clone();
-        let mouse_up_target = target.clone();
-
-        div()
-            .absolute()
-            .right(px(14.0))
-            .bottom(px(42.0))
-            .w(px(476.0))
-            .track_focus(&self.focus_handle)
-            .tab_index(0)
-            .rounded(px(crate::theme::radius::SURFACE))
-            .border(px(1.0))
-            .border_color(Colors::border_strong())
-            .bg(Colors::surface_panel())
-            .shadow_lg()
-            .text_color(Colors::text_secondary())
-            .capture_any_mouse_up(move |_event, _window, cx| {
-                let _ = mouse_up_target.update(cx, |this, cx| {
-                    let mut output = VirtualKeyboardOutput::default();
-                    output
-                        .events
-                        .extend(this.state.controller.release_mouse_notes());
-                    this.flush_output(output, cx);
-                    cx.notify();
-                });
-            })
-            .child(
-                div()
-                    .h(px(30.0))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(6.0))
-                    .px(px(8.0))
-                    .border_b(px(1.0))
-                    .border_color(Colors::border_subtle())
-                    .child(toolbar_label("Musical Typing"))
-                    .child(status_pill(
-                        self.state
-                            .target_label
-                            .clone()
-                            .unwrap_or_else(|| "No target".to_string()),
-                        self.state.hint.is_none(),
-                    ))
-                    .child(div().flex_1())
-                    .child(stepper("Oct", octave.to_string(), {
-                        let target = target.clone();
-                        move |delta, _w, cx| {
-                            let _ = target.update(cx, |this, cx| {
-                                let next = this.state.controller.octave + delta;
-                                let output = this.state.controller.set_octave(next);
-                                this.flush_output(output, cx);
-                                cx.notify();
-                            });
-                        }
-                    }))
-                    .child(stepper("Vel", velocity.to_string(), {
-                        let target = target.clone();
-                        move |delta, _w, cx| {
-                            let _ = target.update(cx, |this, cx| {
-                                let next = if delta < 0 {
-                                    this.state.controller.velocity.saturating_sub(8)
-                                } else {
-                                    this.state.controller.velocity.saturating_add(8)
-                                };
-                                this.state.controller.set_velocity(next);
-                                cx.notify();
-                            });
-                        }
-                    }))
-                    .child(stepper("Ch", channel_label.to_string(), {
-                        let target = target.clone();
-                        move |delta, _w, cx| {
-                            let _ = target.update(cx, |this, cx| {
-                                let next = this.state.controller.channel as i8 + delta;
-                                let output =
-                                    this.state.controller.set_channel(next.clamp(0, 15) as u8);
-                                this.flush_output(output, cx);
-                                cx.notify();
-                            });
-                        }
-                    }))
-                    .child(toggle_button("SUS", sustain, {
-                        let target = target.clone();
-                        move |_event, _w, cx| {
-                            let _ = target.update(cx, |this, cx| {
-                                let output = this.state.controller.toggle_sustain();
-                                this.flush_output(output, cx);
-                                cx.notify();
-                            });
-                        }
-                    }))
-                    .child(action_button("Panic", {
-                        let target = target.clone();
-                        move |_event, _w, cx| {
-                            let _ = target.update(cx, |this, cx| {
-                                let output = this.state.controller.panic();
-                                this.flush_output(output, cx);
-                                cx.notify();
-                            });
-                        }
-                    })),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.0))
-                    .p(px(8.0))
-                    .child(
-                        self.state
-                            .hint
-                            .as_ref()
-                            .map(|hint| {
-                                div()
-                                    .h(px(20.0))
-                                    .flex()
-                                    .items_center()
-                                    .px(px(7.0))
-                                    .rounded(px(crate::theme::radius::CONTROL))
-                                    .bg(Colors::surface_input())
-                                    .text_size(px(10.5))
-                                    .text_color(Colors::text_muted())
-                                    .child(hint.clone())
-                            })
-                            .unwrap_or_else(|| div().h(px(0.0))),
-                    )
-                    .child(piano_keyboard_view(octave, active_notes, target.clone()))
-                    .child(
-                        div()
-                            .h(px(20.0))
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .px(px(2.0))
-                            .text_size(px(10.0))
-                            .text_color(Colors::text_faint())
-                            .child("A S D F G H J K L ;  /  W E T Y U O P")
-                            .child("Z/X octave  C/V velocity  Q sustain"),
-                    ),
-            )
-            .into_any_element()
-    }
-}
-
-fn toolbar_label(label: &'static str) -> impl IntoElement {
-    div()
-        .text_size(px(11.0))
-        .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_color(Colors::text_primary())
-        .child(label)
-}
-
-fn status_pill(label: String, ok: bool) -> impl IntoElement {
-    div()
-        .max_w(px(118.0))
-        .h(px(20.0))
-        .px(px(7.0))
-        .flex()
-        .items_center()
-        .rounded(px(crate::theme::radius::CONTROL))
-        .border(px(1.0))
-        .border_color(if ok {
-            Colors::border_subtle()
-        } else {
-            Colors::status_warning()
-        })
-        .bg(Colors::surface_input())
-        .text_size(px(10.0))
-        .text_color(if ok {
-            Colors::text_muted()
-        } else {
-            Colors::status_warning()
-        })
-        .truncate()
-        .child(label)
-}
-
-fn stepper(
-    label: &'static str,
-    value: String,
-    on_step: impl Fn(i8, &mut Window, &mut App) + Clone + 'static,
-) -> impl IntoElement {
-    let minus = on_step.clone();
-    let plus = on_step;
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(3.0))
-        .child(mini_value(label, value))
-        .child(tiny_button("-", move |_e, w, cx| minus(-1, w, cx)))
-        .child(tiny_button("+", move |_e, w, cx| plus(1, w, cx)))
-}
-
-fn mini_value(label: &'static str, value: String) -> impl IntoElement {
-    div()
-        .h(px(20.0))
-        .min_w(px(42.0))
-        .px(px(5.0))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(crate::theme::radius::CONTROL))
-        .bg(Colors::surface_input())
-        .text_size(px(10.0))
-        .text_color(Colors::text_muted())
-        .child(format!("{label} {value}"))
-}
-
-fn tiny_button(
-    label: &'static str,
-    on_click: impl Fn(&gpui::MouseDownEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    div()
-        .w(px(18.0))
-        .h(px(20.0))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(crate::theme::radius::CONTROL))
-        .border(px(1.0))
-        .border_color(Colors::border_subtle())
-        .bg(Colors::surface_input())
-        .text_size(px(11.0))
-        .text_color(Colors::text_secondary())
-        .cursor(gpui::CursorStyle::PointingHand)
-        .hover(|s| s.bg(Colors::surface_control_hover()))
-        .on_mouse_down(MouseButton::Left, on_click)
-        .child(label)
-}
-
-fn toggle_button(
-    label: &'static str,
-    active: bool,
-    on_click: impl Fn(&gpui::MouseDownEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    div()
-        .h(px(20.0))
-        .px(px(7.0))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(crate::theme::radius::CONTROL))
-        .border(px(1.0))
-        .border_color(if active {
-            Colors::border_accent()
-        } else {
-            Colors::border_subtle()
-        })
-        .bg(if active {
-            Colors::accent_muted()
-        } else {
-            Colors::surface_input()
-        })
-        .text_size(px(10.0))
-        .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_color(if active {
-            Colors::accent_primary()
-        } else {
-            Colors::text_secondary()
-        })
-        .cursor(gpui::CursorStyle::PointingHand)
-        .hover(|s| s.bg(Colors::surface_control_hover()))
-        .on_mouse_down(MouseButton::Left, on_click)
-        .child(label)
-}
-
-fn action_button(
-    label: &'static str,
-    on_click: impl Fn(&gpui::MouseDownEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    div()
-        .h(px(20.0))
-        .px(px(8.0))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(crate::theme::radius::CONTROL))
-        .border(px(1.0))
-        .border_color(Colors::border_subtle())
-        .bg(Colors::surface_input())
-        .text_size(px(10.0))
-        .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_color(Colors::text_secondary())
-        .cursor(gpui::CursorStyle::PointingHand)
-        .hover(|s| s.bg(Colors::surface_control_hover()))
-        .on_mouse_down(MouseButton::Left, on_click)
-        .child(label)
-}
-
-fn piano_keyboard_view(
-    octave: i8,
-    active_notes: HashSet<u8>,
-    target: gpui::Entity<VirtualKeyboardPanel>,
-) -> impl IntoElement {
-    let white_width = 44.0;
-    let keyboard_width = white_width * WHITE_KEYS.len() as f32;
-    div()
-        .relative()
-        .w(px(keyboard_width))
-        .h(px(98.0))
-        .border(px(1.0))
-        .border_color(Colors::border_subtle())
-        .bg(Colors::surface_canvas())
-        .child(
-            div()
-                .absolute()
-                .left(px(0.0))
-                .top(px(0.0))
-                .flex()
-                .flex_row()
-                .children(WHITE_KEYS.iter().map(|entry| {
-                    let note = note_for_entry(*entry, octave);
-                    piano_key(
-                        entry.key,
-                        note,
-                        false,
-                        active_notes.contains(&note),
-                        target.clone(),
-                    )
-                })),
-        )
-        .children(BLACK_KEYS.iter().map(move |entry| {
-            let note = note_for_entry(*entry, octave);
-            let x = match entry.key {
-                "w" => 29.0,
-                "e" => 73.0,
-                "t" => 161.0,
-                "y" => 205.0,
-                "u" => 249.0,
-                "o" => 337.0,
-                "p" => 381.0,
-                _ => 0.0,
-            };
-            piano_key(
-                entry.key,
-                note,
-                true,
-                active_notes.contains(&note),
-                target.clone(),
-            )
-            .absolute()
-            .left(px(x))
-            .top(px(0.0))
-        }))
-}
-
-fn note_for_entry(entry: MusicalTypingKey, octave: i8) -> u8 {
-    let note =
-        BASE_WHITE_NOTE + ((octave as i16 - DEFAULT_OCTAVE as i16) * 12) + entry.semitone as i16;
-    note.clamp(0, 127) as u8
-}
-
-fn piano_key(
-    label: &'static str,
-    note: u8,
-    black: bool,
-    active: bool,
-    target: gpui::Entity<VirtualKeyboardPanel>,
-) -> gpui::Div {
-    let down_target = target.clone();
-    let up_target = target;
-    let width = if black { 28.0 } else { 44.0 };
-    let height = if black { 58.0 } else { 96.0 };
-    div()
-        .w(px(width))
-        .h(px(height))
-        .flex()
-        .items_end()
-        .justify_center()
-        .pb(px(if black { 5.0 } else { 7.0 }))
-        .border(px(1.0))
-        .border_color(if active {
-            Colors::border_accent()
-        } else {
-            Colors::border_subtle()
-        })
-        .bg(if active {
-            Colors::accent_muted()
-        } else if black {
-            Colors::surface_canvas()
-        } else {
-            Colors::surface_input()
-        })
-        .text_size(px(10.0))
-        .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_color(if active {
-            Colors::accent_primary()
-        } else if black {
-            Colors::text_secondary()
-        } else {
-            Colors::text_muted()
-        })
-        .cursor(gpui::CursorStyle::PointingHand)
-        .hover(|s| s.bg(Colors::surface_control_hover()))
-        .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
-            let _ = down_target.update(cx, |this, cx| {
-                let output = this.state.controller.mouse_note_on(note);
-                this.flush_output(output, cx);
-                cx.notify();
-            });
-        })
-        .on_mouse_up(MouseButton::Left, move |_event, _window, cx| {
-            let _ = up_target.update(cx, |this, cx| {
-                let output = this.state.controller.mouse_note_off(note);
-                this.flush_output(output, cx);
-                cx.notify();
-            });
-        })
-        .child(label.to_ascii_uppercase())
 }
 
 #[cfg(test)]

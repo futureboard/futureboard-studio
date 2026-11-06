@@ -207,6 +207,10 @@ pub(crate) struct ExternalWindows {
     pub settings: Option<gpui::WindowHandle<crate::components::settings_dialog::SettingsWindow>>,
     /// Detached mixer window (multi-monitor layouts).
     pub mixer: Option<gpui::WindowHandle<crate::components::MixerWindow>>,
+    /// The modeless Virtual Keyboard window.
+    pub virtual_keyboard: Option<
+        gpui::WindowHandle<crate::components::virtual_keyboard_window::VirtualKeyboardWindow>,
+    >,
     /// Bounds for an external-mixer open deferred to after the current update.
     pub pending_mixer_open: Option<Bounds<gpui::Pixels>>,
     /// Add Track dialog window.
@@ -3392,10 +3396,117 @@ impl StudioLayout {
                     "register virtual-keyboard window id={}",
                     window_id.as_u64()
                 ));
+                // The editor left the dock: the dock hides when a MIDI clip's
+                // editor was what it showed, rather than keep a second piano
+                // roll of the same clip open behind the window.
+                let was_docked =
+                    self.docked_midi_editor_visible() && self.selected_midi_clip_id(cx).is_some();
                 self.midi_editor.window = Some(handle);
+                if was_docked {
+                    self.close_bottom_panel(cx);
+                }
+                self.sync_midi_editor_pop_out(cx);
                 cx.notify();
             }
             Err(err) => eprintln!("[midi-editor] failed to open window: {err}"),
+        }
+    }
+
+    /// Open the Virtual Keyboard window, or close it when it is open.
+    ///
+    /// Musical typing is on exactly while the window is open: the service's
+    /// `visible` flag follows the window, so Studio's own key path captures
+    /// note keys only then.
+    pub(crate) fn toggle_virtual_keyboard_window(&mut self, cx: &mut Context<Self>) {
+        self.prune_virtual_keyboard_window(cx);
+        if let Some(handle) = self.external_windows.virtual_keyboard.take() {
+            let window_id = handle.window_id();
+            let _ = handle.update(cx, |_view, window, _cx| window.remove_window());
+            self.note_virtual_keyboard_window_closed(window_id, cx);
+            return;
+        }
+        self.open_virtual_keyboard_window(cx);
+    }
+
+    fn open_virtual_keyboard_window(&mut self, cx: &mut Context<Self>) {
+        let owner_bounds = self.studio_window_bounds(cx);
+        let owner = cx.entity().clone();
+        let on_close: Arc<dyn Fn(&mut Window, &mut gpui::App) + 'static> =
+            Arc::new(move |window, cx| {
+                let window_id = window.window_handle().window_id();
+                StudioLayout::defer_update(&owner, cx, move |layout, cx| {
+                    layout.external_windows.virtual_keyboard = None;
+                    layout.note_virtual_keyboard_window_closed(window_id, cx);
+                });
+            });
+        let key_owner = cx.entity().clone();
+        let dispatch_key: crate::components::virtual_keyboard_window::VirtualKeyboardKeyCb =
+            Arc::new(move |event, cx| {
+                let Some(command_id) = key_owner
+                    .read(cx)
+                    .shortcut_command_id(event, crate::keymap::KeymapScope::Global)
+                else {
+                    return false;
+                };
+                let _ = key_owner.update(cx, |layout, cx| {
+                    let owner_bounds = layout.studio_window_bounds(cx);
+                    layout.dispatch_command_id_from_bounds(&command_id, owner_bounds, cx);
+                    cx.notify();
+                });
+                true
+            });
+        match crate::components::virtual_keyboard_window::open_virtual_keyboard_window(
+            owner_bounds,
+            self.virtual_keyboard.clone(),
+            dispatch_key,
+            on_close,
+            cx,
+        ) {
+            Ok(handle) => {
+                let window_id = handle.window_id();
+                self.external_windows.virtual_keyboard = Some(handle);
+                // Deferred and keyboard-only: turning typing on may flush the
+                // service's sink, which re-enters this layout.
+                let keyboard = self.virtual_keyboard.clone();
+                let owner = cx.entity().clone();
+                cx.defer(move |cx| {
+                    let _ = keyboard.update(cx, |keyboard, cx| {
+                        keyboard.register_window(window_id);
+                        keyboard.set_visible(true, cx);
+                    });
+                    let _ = owner.update(cx, |layout, cx| {
+                        layout.update_virtual_keyboard_target_status(cx);
+                        cx.notify();
+                    });
+                });
+            }
+            Err(err) => eprintln!("[virtual-keyboard] failed to open window: {err}"),
+        }
+        cx.notify();
+    }
+
+    /// The window went away (its close button, the toggle, or the menu):
+    /// typing turns off and every note it held is released.
+    fn note_virtual_keyboard_window_closed(
+        &mut self,
+        window_id: gpui::WindowId,
+        cx: &mut Context<Self>,
+    ) {
+        self.unregister_virtual_keyboard_window(window_id, cx);
+        let keyboard = self.virtual_keyboard.clone();
+        cx.defer(move |cx| {
+            let _ = keyboard.update(cx, |keyboard, cx| keyboard.set_visible(false, cx));
+        });
+        cx.notify();
+    }
+
+    fn prune_virtual_keyboard_window(&mut self, cx: &mut Context<Self>) {
+        let Some(handle) = self.external_windows.virtual_keyboard.clone() else {
+            return;
+        };
+        if handle.update(cx, |_view, _window, _cx| ()).is_err() {
+            self.external_windows.virtual_keyboard = None;
+            self.note_virtual_keyboard_window_closed(handle.window_id(), cx);
         }
     }
 
