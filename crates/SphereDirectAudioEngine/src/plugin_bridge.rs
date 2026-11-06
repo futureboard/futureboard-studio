@@ -20,6 +20,34 @@ use std::sync::Arc;
 /// `sphere-plugin-host` asserts its own `MAX_BLOCK_FRAMES` matches this.
 pub const MAX_BRIDGE_BLOCK_FRAMES: usize = 2048;
 
+/// How long a sink may wait for the host's block while Audioguard renders
+/// ahead, nanoseconds; `0` outside a render-ahead.
+///
+/// The usual handoff grace is a fraction of a period, because it is spent on
+/// the device callback. A block rendered ahead has the ring's headroom
+/// instead, and the guard renders several blocks back to back while it fills,
+/// so the host needs up to a period to answer each one. Process-wide rather
+/// than per thread because the chain's parallel workers read it too; the
+/// render it belongs to holds the graph, so no other render overlaps it.
+static RENDER_AHEAD_GRACE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Set (or, with zero, clear) the render-ahead grace. Called by the guard
+/// thread around each block it renders.
+pub fn set_render_ahead_grace(grace: std::time::Duration) {
+    let nanos = grace.as_nanos().min(20_000_000) as u64;
+    RENDER_AHEAD_GRACE_NS.store(nanos, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The grace a sink may use for the block being rendered now, if it is being
+/// rendered ahead. One relaxed load.
+#[inline]
+pub fn render_ahead_grace() -> Option<std::time::Duration> {
+    match RENDER_AHEAD_GRACE_NS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        nanos => Some(std::time::Duration::from_nanos(nanos)),
+    }
+}
+
 /// One-block exchange with the external plugin host, called from the audio
 /// callback. The engine reads the host's previously produced block (one-block
 /// latency) and requests the next one — it never spins waiting for the host.

@@ -89,7 +89,7 @@ pub struct RuntimeTransportSnapshot {
 impl RuntimeTransportSnapshot {
     pub fn from_shared(shared: &SharedState, tempo_map: &TempoMap) -> Self {
         let sample_rate = shared.sample_rate.load(Ordering::Relaxed).max(1) as f64;
-        let position_samples = shared.position_samples.load(Ordering::Relaxed);
+        let position_samples = shared.playback_position();
         let position_seconds = position_samples as f64 / sample_rate;
         let loop_start_samples = shared.loop_start_samples.load(Ordering::Relaxed);
         let loop_end_samples = shared.loop_end_samples.load(Ordering::Relaxed);

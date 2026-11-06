@@ -74,14 +74,16 @@ pub enum EngineCommand {
     /// Clear Listen on every channel, returning the Control Room to its
     /// selected source (normally the master bus).
     ClearAllListen,
-    /// Set a track's gain (linear, 0..2).
-    SetTrackVolume { track_id: String, value: f32 },
+    /// Set a track's gain (linear, 0..2). The track is resolved to its index
+    /// on the control thread, so the callback neither searches by id nor frees
+    /// a `String`; an index the graph does not have is ignored.
+    SetTrackVolume { track_index: usize, value: f32 },
     /// Set a track's pan (-1..1).
-    SetTrackPan { track_id: String, value: f32 },
+    SetTrackPan { track_index: usize, value: f32 },
     /// Mute or unmute a track.
-    SetTrackMute { track_id: String, muted: bool },
+    SetTrackMute { track_index: usize, muted: bool },
     /// Solo or unsolo a track.
-    SetTrackSolo { track_id: String, solo: bool },
+    SetTrackSolo { track_index: usize, solo: bool },
     /// Update record-arm, monitoring, and input-channel routing without
     /// replacing the project graph. The control thread resolves the stable
     /// track id to an index before enqueueing so the callback payload is fixed

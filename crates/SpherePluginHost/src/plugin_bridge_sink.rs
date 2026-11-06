@@ -155,10 +155,14 @@ impl SharedRegionSink {
             .as_ref()
             .is_none_or(|alive| alive.load(Ordering::Relaxed));
         if host_alive && done == last && bridge.request_seq.load(Ordering::Acquire) != 0 {
-            let grace = output_handoff_grace(
-                bridge.block_frames.load(Ordering::Relaxed),
-                bridge.sample_rate.load(Ordering::Relaxed),
-            );
+            // A block Audioguard renders ahead has the ring's headroom, not
+            // the device callback's, so it may wait up to a period for it.
+            let grace = DirectAudio::plugin_bridge::render_ahead_grace().unwrap_or_else(|| {
+                output_handoff_grace(
+                    bridge.block_frames.load(Ordering::Relaxed),
+                    bridge.sample_rate.load(Ordering::Relaxed),
+                )
+            });
             if !grace.is_zero() {
                 let deadline = Instant::now() + grace;
                 while done == last && Instant::now() < deadline {

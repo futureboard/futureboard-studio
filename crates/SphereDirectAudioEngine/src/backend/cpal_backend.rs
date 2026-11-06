@@ -17,7 +17,7 @@ use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{BufferSize, FromSample, Sample, SampleFormat, SizedSample};
 use crossbeam_channel::{bounded, Receiver, Sender};
 
-use crate::backend::render::{drain_commands, fill_output_f32, LocalAudioState};
+use crate::backend::render::LocalAudioState;
 use crate::backend::DauxDeviceConfig;
 use crate::command::EngineCommand;
 use crate::dsp::dither::{DitheredOutput, OutputDither};
@@ -399,8 +399,17 @@ where
         BufferSize::Default => default_scratch_frames,
     };
     let scratch_frames = requested_frames.max(default_scratch_frames);
-    let mut local = LocalAudioState::with_monitor_capacity(sr, scratch_frames);
+    let local = LocalAudioState::with_monitor_capacity(sr, scratch_frames);
     let mut f32_scratch = vec![0.0f32; scratch_frames.saturating_mul(ch)];
+    // The callback must not grow the tracks' buffers on its first blocks.
+    runtime.reserve_track_blocks(requested_frames.min(scratch_frames));
+    // Audioguard owns the render state from here: the callback renders each
+    // block itself, or copies it from the blocks the guard rendered ahead.
+    let mut guarded = crate::audioguard::GuardedRenderer::new(
+        crate::audioguard::RenderCore::new(runtime, local, cmd_rx, output_sample_rate),
+        ch,
+        Arc::clone(&shared),
+    );
 
     // Separate handle for the error callback (the data callback moves `shared`).
     let err_shared = Arc::clone(&shared);
@@ -433,6 +442,7 @@ where
                 #[cfg(target_os = "windows")]
                 if mmcss_priority && !mmcss_set {
                     mmcss_set = set_mmcss_pro_audio();
+                    shared.mmcss_active.store(mmcss_set, Ordering::Relaxed);
                 }
                 #[cfg(not(target_os = "windows"))]
                 let _ = mmcss_priority; // suppress unused warning
@@ -442,15 +452,6 @@ where
                     rt_announced = true;
                     rt_announcer.announce_current_thread();
                 }
-
-                // ── Drain command queue ───────────────────────────────────────
-                drain_commands(
-                    &cmd_rx,
-                    &mut runtime,
-                    &shared,
-                    &mut local,
-                    output_sample_rate,
-                );
 
                 // ── Fill via shared f32 kernel ────────────────────────────────
                 let frames_needed = data.len() / ch.max(1);
@@ -468,7 +469,9 @@ where
                 // every frame) — no pre-zero needed here.
                 let scratch = &mut f32_scratch[..f32_len];
 
-                fill_output_f32(scratch, ch, &mut runtime, &shared, &mut local);
+                // Drains the command queue and renders (or plays the block
+                // Audioguard rendered ahead).
+                guarded.render(scratch);
 
                 // ── Convert f32 → T ───────────────────────────────────────────
                 // Not `from_sample`: that truncates toward zero, which is a bias
@@ -818,18 +821,25 @@ fn set_mmcss_pro_audio() -> bool {
         fn AvSetMmThreadCharacteristicsW(task_name: *const u16, task_index: *mut u32) -> isize;
     }
 
-    let task: Vec<u16> = "Pro Audio\0".encode_utf16().collect();
+    // "Pro Audio", NUL-terminated UTF-16. A constant, because this runs on the
+    // first audio callback: no allocation and no logging there. The outcome is
+    // published as `SharedState::mmcss_active`.
+    const TASK: [u16; 10] = [
+        b'P' as u16,
+        b'r' as u16,
+        b'o' as u16,
+        b' ' as u16,
+        b'A' as u16,
+        b'u' as u16,
+        b'd' as u16,
+        b'i' as u16,
+        b'o' as u16,
+        0,
+    ];
     let mut task_index = 0u32;
-    unsafe {
-        let handle = AvSetMmThreadCharacteristicsW(task.as_ptr(), &mut task_index);
-        let ok = handle != 0;
-        if ok {
-            eprintln!("[DAUx] MMCSS 'Pro Audio' priority set (index={task_index})");
-        } else {
-            eprintln!("[DAUx] MMCSS set failed (may require elevated privileges)");
-        }
-        ok
-    }
+    // SAFETY: `TASK` is a NUL-terminated UTF-16 string with static lifetime.
+    // The handle is kept for the thread's life (never reverted).
+    unsafe { AvSetMmThreadCharacteristicsW(TASK.as_ptr(), &mut task_index) != 0 }
 }
 
 #[cfg(test)]

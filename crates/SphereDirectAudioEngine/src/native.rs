@@ -341,7 +341,7 @@ pub struct EngineStats {
     pub device_lost: bool,
     /// Lifecycle state: "Closed" | "Ready" | "Running" | "DeviceLost".
     pub device_state: String,
-    /// Active Dropout Protection mode ("Off" | "Light" | "Medium" | "High").
+    /// Active Audioguard level ("Off" | "Normal" | "High").
     pub dropout_protection_mode: String,
     /// Blocks flagged as dropout-risk since the stream opened.
     pub dropout_count: u64,
@@ -583,7 +583,10 @@ impl AudioEngine {
             } else {
                 None
             },
-            mmcss_priority: false,
+            // Audioguard hardening: the ASIO and WASAPI Shared callback threads
+            // join MMCSS "Pro Audio" the way the exclusive backends and the
+            // worker pool already do.
+            mmcss_priority: true,
             safe_mode: false,
         })
     }
@@ -1486,6 +1489,16 @@ impl AudioEngine {
     /// Set the Dropout Protection mode (Settings → Playback).
     pub fn set_dropout_protection_mode(&self, mode: crate::engine::DropoutProtectionMode) {
         self.inner.set_dropout_protection_mode(mode);
+    }
+
+    /// Audioguard's state: level, render-ahead, ring misses, output guard.
+    pub fn audioguard_status(&self) -> crate::audioguard::AudioguardStatus {
+        self.inner.audioguard_status()
+    }
+
+    /// Inserts Audioguard bypassed since the last call, each reported once.
+    pub fn take_audioguard_tripped_inserts(&self) -> Vec<crate::audioguard::TrippedInsert> {
+        self.inner.take_audioguard_tripped_inserts()
     }
 
     /// Realtime dropout-protection diagnostics snapshot (atomic reads).

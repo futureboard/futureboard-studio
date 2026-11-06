@@ -276,61 +276,15 @@ impl AudioEngineState {
     }
 }
 
-/// Dropout Protection mode (Settings → Playback). Controls how much internal
-/// headroom the engine keeps against control/UI/plugin jitter, independent of
-/// the device buffer size. In this slice the mode sets the dropout-detection
-/// warn fraction (how early a block approaching its deadline is flagged) and is
-/// delivered to the engine so the deferred render-ahead safety buffer can read
-/// it. `Medium` is the recommended default.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DropoutProtectionMode {
-    /// Lowest latency, minimal safety margin — flag only true overruns.
-    Off = 0,
-    /// Small safety margin / conservative scheduling.
-    Light = 1,
-    /// Default recommended mode — better protection during UI activity.
-    Medium = 2,
-    /// Maximum stability — widest margin (may add internal latency later).
-    High = 3,
-}
-
-impl DropoutProtectionMode {
-    pub fn from_u8(v: u8) -> Self {
-        match v {
-            0 => Self::Off,
-            1 => Self::Light,
-            3 => Self::High,
-            _ => Self::Medium,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Off => "Off",
-            Self::Light => "Light",
-            Self::Medium => "Medium",
-            Self::High => "High",
-        }
-    }
-
-    /// Fraction `(num, den)` of the per-block deadline at or above which a block
-    /// is counted as a dropout-risk. Stricter modes tolerate less headroom
-    /// erosion before flagging, so the UI surfaces trouble earlier and the user
-    /// can react (or, in the deferred render-ahead slice, the buffer absorbs it).
-    #[inline]
-    pub fn dropout_threshold_ratio(self) -> (u64, u64) {
-        match self {
-            Self::Off => (100, 100),
-            Self::Light => (90, 100),
-            Self::Medium => (80, 100),
-            Self::High => (70, 100),
-        }
-    }
-}
+/// Solfege Audioguard level (Settings → Playback). Sets render-ahead, the
+/// output guard and how early a block approaching its deadline is flagged; see
+/// [`crate::audioguard`]. `Normal` is the default.
+pub use crate::audioguard::AudioguardLevel;
+/// The level's former name, kept for callers that still use it.
+pub type DropoutProtectionMode = AudioguardLevel;
 
 /// Why the most recent dropout-risk block was flagged. Stored as a `u8` in
-/// [`SharedState`] (audio → control); only `CallbackOverrun` is detected in this
-/// slice — the rest are reserved for the plugin-watchdog / disk-streaming slices.
+/// [`SharedState`] (audio → control).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DropoutReason {
     None = 0,
@@ -338,6 +292,9 @@ pub enum DropoutReason {
     GraphSwapLate = 2,
     DiskCacheMiss = 3,
     PluginOverrun = 4,
+    /// The device asked for a block the Audioguard ring did not have ready,
+    /// while the guard thread held the graph.
+    RenderAheadMiss = 5,
 }
 
 impl DropoutReason {
@@ -347,6 +304,7 @@ impl DropoutReason {
             2 => Self::GraphSwapLate,
             3 => Self::DiskCacheMiss,
             4 => Self::PluginOverrun,
+            5 => Self::RenderAheadMiss,
             _ => Self::None,
         }
     }
@@ -358,6 +316,7 @@ impl DropoutReason {
             Self::GraphSwapLate => "graph-swap-late",
             Self::DiskCacheMiss => "disk-cache-miss",
             Self::PluginOverrun => "plugin-overrun",
+            Self::RenderAheadMiss => "render-ahead-miss",
         }
     }
 }
@@ -384,6 +343,7 @@ pub(crate) fn record_output_callback_timing(
     elapsed_us: u32,
     block_frames: usize,
     sample_rate: u32,
+    count_dropouts: bool,
 ) {
     shared.last_callback_us.store(elapsed_us, Ordering::Relaxed);
     if elapsed_us > shared.max_callback_us.load(Ordering::Relaxed) {
@@ -402,7 +362,10 @@ pub(crate) fn record_output_callback_timing(
     if elapsed_us >= 2_000 {
         shared.slow_callback_count.fetch_add(1, Ordering::Relaxed);
     }
-    if deadline_us > 0 {
+    // A block rendered ahead by Audioguard has the ring's headroom, not one
+    // period: its time is published for the load meter, and only a block the
+    // device then misses counts as a dropout (`audioguard::GuardedRenderer`).
+    if deadline_us > 0 && count_dropouts {
         let mode =
             DropoutProtectionMode::from_u8(shared.dropout_protection_mode.load(Ordering::Relaxed));
         let (num, den) = mode.dropout_threshold_ratio();
@@ -662,6 +625,30 @@ pub struct SharedState {
     /// Per-block wall-clock budget published each callback, microseconds.
     pub callback_deadline_us: AtomicU32,
 
+    // ── Audioguard (audio ↔ control; see `crate::audioguard`) ─────────────
+    /// Frames rendered ahead into the Audioguard ring and not played yet.
+    /// While non-zero, `position_samples` is the render cursor, ahead of what
+    /// is heard, and [`SharedState::playback_position`] reads the cursor the
+    /// played blocks left instead.
+    pub guard_pending_frames: AtomicU64,
+    /// Transport cursor right after the last frame the device played from the
+    /// ring.
+    pub guard_played_cursor: AtomicU64,
+    /// The guard thread is rendering ahead.
+    pub guard_engaged: AtomicBool,
+    /// How far ahead it is aiming, frames.
+    pub guard_ahead_frames: AtomicU64,
+    /// Device blocks the ring could not supply in time.
+    pub guard_misses: AtomicU64,
+    /// Times the output guard muted the device output, and why it last did
+    /// (an [`crate::audioguard::OutputGuardReason`] as `u8`).
+    pub guard_output_mutes: AtomicU64,
+    pub guard_output_reason: AtomicU8,
+    /// Bumped by every played note, controller or pitch bend the callback
+    /// receives (MIDI keyboard, virtual keyboard, plug-in preview), so the
+    /// guard can step aside while someone is performing.
+    pub live_events: AtomicU64,
+
     // DAUx diagnostics (incremented by audio thread, read by control thread)
     pub glitch_count: AtomicU64,
     /// Device-level underruns reported by the backend (ALSA xruns and the
@@ -794,7 +781,15 @@ impl Default for SharedState {
             active_voices: AtomicU32::new(0),
             max_callback_us: AtomicU32::new(0),
             slow_callback_count: AtomicU64::new(0),
-            dropout_protection_mode: AtomicU8::new(DropoutProtectionMode::Medium as u8),
+            dropout_protection_mode: AtomicU8::new(AudioguardLevel::Normal as u8),
+            guard_pending_frames: AtomicU64::new(0),
+            guard_played_cursor: AtomicU64::new(0),
+            guard_engaged: AtomicBool::new(false),
+            guard_ahead_frames: AtomicU64::new(0),
+            guard_misses: AtomicU64::new(0),
+            guard_output_mutes: AtomicU64::new(0),
+            guard_output_reason: AtomicU8::new(0),
+            live_events: AtomicU64::new(0),
             dropout_count: AtomicU64::new(0),
             dropout_last_reason: AtomicU8::new(DropoutReason::None as u8),
             callback_deadline_us: AtomicU32::new(0),
@@ -824,6 +819,19 @@ impl SharedState {
         self.output_block_start.store(start, Ordering::Release);
     }
 
+    /// The transport cursor of what the device is playing: `position_samples`,
+    /// or — while Audioguard has blocks rendered ahead — the cursor the last
+    /// played block left, which is behind it by the ring. Control-side readers
+    /// (playhead, take start) use this; the render side keeps the raw cursor.
+    #[inline]
+    pub fn playback_position(&self) -> u64 {
+        if self.guard_pending_frames.load(Ordering::Acquire) > 0 {
+            self.guard_played_cursor.load(Ordering::Relaxed)
+        } else {
+            self.position_samples.load(Ordering::Relaxed)
+        }
+    }
+
     /// The transport sample the output is rendering right now.
     ///
     /// `position_samples` is advanced at the end of each output callback, so
@@ -837,7 +845,7 @@ impl SharedState {
     /// describe the current position: nothing rendered yet, a seek or loop
     /// wrap since, or a callback that is overdue.
     pub(crate) fn render_position_now(&self) -> u64 {
-        let position = self.position_samples.load(Ordering::Relaxed);
+        let position = self.playback_position();
         let start = self.output_block_start.load(Ordering::Acquire);
         let frames = self.output_block_frames.load(Ordering::Relaxed);
         let at = self.output_block_at_ns.load(Ordering::Relaxed);
@@ -1322,6 +1330,7 @@ impl EngineInner {
         self.shared
             .dropout_protection_mode
             .store(mode as u8, Ordering::Relaxed);
+        crate::audioguard::set_process_level(mode);
     }
 
     /// Snapshot the realtime dropout-protection counters for the control thread
@@ -1339,6 +1348,16 @@ impl EngineInner {
             callback_deadline_us: s.callback_deadline_us.load(Ordering::Relaxed),
             slow_callback_count: s.slow_callback_count.load(Ordering::Relaxed),
         }
+    }
+
+    /// Audioguard's state: level, render-ahead, ring misses, output guard.
+    pub fn audioguard_status(&self) -> crate::audioguard::AudioguardStatus {
+        crate::audioguard::AudioguardStatus::read(&self.shared)
+    }
+
+    /// Inserts Audioguard bypassed since the last call (each reported once).
+    pub fn take_audioguard_tripped_inserts(&self) -> Vec<crate::audioguard::TrippedInsert> {
+        crate::audioguard::take_tripped_inserts(&self.runtime.lock())
     }
 
     /// SoundFont voices sounding at the end of the last audio callback.
@@ -1369,7 +1388,7 @@ impl EngineInner {
     pub fn get_status(&self) -> JsSphereAudioStatus {
         let st = self.status.lock().clone();
         let sample_rate = self.shared.sample_rate.load(Ordering::Relaxed).max(1);
-        let position_samples = self.shared.position_samples.load(Ordering::Relaxed);
+        let position_samples = self.shared.playback_position();
         JsSphereAudioStatus {
             available: true,
             running: st.running,
@@ -3114,24 +3133,39 @@ impl EngineInner {
             return self.set_master_volume(value as f32);
         }
 
+        if !matches!(param_id, "volume" | "pan" | "muted" | "solo") {
+            return self.update_track_param_other(track_id, param_id, value);
+        }
+        // Resolved here, against the mirror of the graph the callback holds
+        // (kept in lockstep with every `LoadProject`), so the callback looks
+        // nothing up by id and frees no string. A track the graph does not
+        // have is a no-op, as the id lookup was.
+        let Some(track_index) = self
+            .runtime
+            .lock()
+            .tracks
+            .iter()
+            .position(|track| track.id == track_id)
+        else {
+            return Ok(());
+        };
         let live = match param_id {
             "volume" => self.send_command(EngineCommand::SetTrackVolume {
-                track_id: track_id.into(),
+                track_index,
                 value: value as f32,
             }),
             "pan" => self.send_command(EngineCommand::SetTrackPan {
-                track_id: track_id.into(),
+                track_index,
                 value: value as f32,
             }),
             "muted" => self.send_command(EngineCommand::SetTrackMute {
-                track_id: track_id.into(),
+                track_index,
                 muted: value != 0.0,
             }),
-            "solo" => self.send_command(EngineCommand::SetTrackSolo {
-                track_id: track_id.into(),
+            _ => self.send_command(EngineCommand::SetTrackSolo {
+                track_index,
                 solo: value != 0.0,
             }),
-            _ => return self.update_track_param_other(track_id, param_id, value),
         };
         if live.is_ok() {
             self.mirror_live_track_control(track_id, param_id, value);
@@ -3853,6 +3887,10 @@ impl EngineInner {
         // sent: the trailing `set_tempo_map` below then costs nothing instead of
         // rebuilding every MIDI event list on the audio thread after every sync.
         *self.last_sent_tempo_map.lock() = runtime.tempo_map.clone();
+        // Size the tracks' block buffers for the open device here, so the
+        // callback does not grow them on the first blocks after the swap.
+        let device_block = self.status.lock().buffer_size as usize;
+        runtime.reserve_track_blocks(device_block.max(1024));
         *self.runtime.lock() = runtime.clone();
         *current_project = Some(snapshot.clone());
         let load_result = self.send_command(EngineCommand::LoadProject(Box::new(runtime)));
@@ -6677,31 +6715,31 @@ where
                                 // so the bridge handshake is always alive.
                             }
                         }
-                        EngineCommand::SetTrackVolume { track_id, value } => {
-                            let applied = runtime.update_track_volume(&track_id, value);
+                        EngineCommand::SetTrackVolume { track_index, value } => {
+                            let applied = runtime.update_track_volume_at(track_index, value);
                             if callback_debug_enabled() {
                                 eprintln!(
-                                    "[SphereAudio callback] SetTrackVolume track={track_id} linear={value:.4} applied={applied}"
+                                    "[SphereAudio callback] SetTrackVolume track_index={track_index} linear={value:.4} applied={applied}"
                                 );
                             }
                         }
-                        EngineCommand::SetTrackPan { track_id, value } => {
-                            runtime.update_track_pan(&track_id, value);
+                        EngineCommand::SetTrackPan { track_index, value } => {
+                            runtime.update_track_pan_at(track_index, value);
                         }
-                        EngineCommand::SetTrackMute { track_id, muted } => {
+                        EngineCommand::SetTrackMute { track_index, muted } => {
                             if callback_debug_enabled() {
-                                eprintln!("[SphereAudio callback] SetTrackMute track={track_id} muted={muted}");
+                                eprintln!("[SphereAudio callback] SetTrackMute track_index={track_index} muted={muted}");
                             }
                             // No note-off: mute silences the output, and the
                             // render pass keeps the instrument running under
                             // it, so unmuting drops back in mid-note instead
                             // of waiting for the next note-on.
-                            runtime.update_track_mute(&track_id, muted);
+                            runtime.update_track_mute_at(track_index, muted);
                         }
-                        EngineCommand::SetTrackSolo { track_id, solo } => {
+                        EngineCommand::SetTrackSolo { track_index, solo } => {
                             // Same rule as mute: soloing another track must not
                             // cut this one's sounding notes.
-                            runtime.update_track_solo(&track_id, solo);
+                            runtime.update_track_solo_at(track_index, solo);
                         }
                         EngineCommand::SetTrackInputState {
                             track_index,
@@ -7145,6 +7183,7 @@ where
                     elapsed_us,
                     block_frames,
                     output_sample_rate,
+                    true,
                 );
             },
             move |err| {
@@ -7683,6 +7722,7 @@ mod bridge_insert_tests {
                 dsp: InsertDspState::default(),
                 vst3: None,
                 cpu_us: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                guard: Default::default(),
                 callback_process_log_done: false,
                 silent_process_blocks: 0,
                 bridge_missed_blocks: 0,
@@ -8189,6 +8229,7 @@ mod bridge_insert_tests {
             dsp: InsertDspState::default(),
             vst3: None,
             cpu_us: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            guard: Default::default(),
             callback_process_log_done: false,
             silent_process_blocks: 0,
             bridge_missed_blocks: 0,
@@ -9318,10 +9359,9 @@ mod dropout_tests {
             let (n, d) = m.dropout_threshold_ratio();
             n as f64 / d as f64
         };
-        assert!(frac(DropoutProtectionMode::High) < frac(DropoutProtectionMode::Medium));
-        assert!(frac(DropoutProtectionMode::Medium) < frac(DropoutProtectionMode::Light));
-        assert!(frac(DropoutProtectionMode::Light) < frac(DropoutProtectionMode::Off));
-        assert_eq!(frac(DropoutProtectionMode::Off), 1.0);
+        assert!(frac(AudioguardLevel::High) < frac(AudioguardLevel::Normal));
+        assert!(frac(AudioguardLevel::Normal) < frac(AudioguardLevel::Off));
+        assert_eq!(frac(AudioguardLevel::Off), 1.0);
     }
 
     #[test]
@@ -9329,8 +9369,8 @@ mod dropout_tests {
         let shared = SharedState::default();
         shared
             .dropout_protection_mode
-            .store(DropoutProtectionMode::Medium as u8, Ordering::Relaxed);
-        record_output_callback_timing(&shared, 1_000, FRAMES, SR);
+            .store(AudioguardLevel::Normal as u8, Ordering::Relaxed);
+        record_output_callback_timing(&shared, 1_000, FRAMES, SR, true);
         assert_eq!(shared.dropout_count.load(Ordering::Relaxed), 0);
         assert_eq!(
             shared.dropout_last_reason.load(Ordering::Relaxed),
@@ -9345,9 +9385,9 @@ mod dropout_tests {
         let shared = SharedState::default();
         shared
             .dropout_protection_mode
-            .store(DropoutProtectionMode::Medium as u8, Ordering::Relaxed);
+            .store(AudioguardLevel::Normal as u8, Ordering::Relaxed);
         // 9_000 µs > 80% of 10_666 µs (≈ 8_533) → dropout under Medium.
-        record_output_callback_timing(&shared, 9_000, FRAMES, SR);
+        record_output_callback_timing(&shared, 9_000, FRAMES, SR, true);
         assert_eq!(shared.dropout_count.load(Ordering::Relaxed), 1);
         assert_eq!(
             shared.dropout_last_reason.load(Ordering::Relaxed),
@@ -9362,10 +9402,14 @@ mod dropout_tests {
             .dropout_protection_mode
             .store(DropoutProtectionMode::Off as u8, Ordering::Relaxed);
         // Same 9_000 µs is < the full 10_666 µs deadline → no dropout under Off.
-        record_output_callback_timing(&shared, 9_000, FRAMES, SR);
+        record_output_callback_timing(&shared, 9_000, FRAMES, SR, true);
         assert_eq!(shared.dropout_count.load(Ordering::Relaxed), 0);
         // A genuine overrun past the deadline does flag, even under Off.
-        record_output_callback_timing(&shared, 12_000, FRAMES, SR);
+        record_output_callback_timing(&shared, 12_000, FRAMES, SR, true);
+        assert_eq!(shared.dropout_count.load(Ordering::Relaxed), 1);
+        // A block Audioguard rendered ahead is timed, never flagged: the ring,
+        // not one period, is its headroom.
+        record_output_callback_timing(&shared, 12_000, FRAMES, SR, false);
         assert_eq!(shared.dropout_count.load(Ordering::Relaxed), 1);
     }
 }

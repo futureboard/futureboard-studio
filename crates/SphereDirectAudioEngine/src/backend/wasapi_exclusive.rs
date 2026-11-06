@@ -39,7 +39,7 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects};
 
-use crate::backend::render::{drain_commands, fill_output_f32, LocalAudioState};
+use crate::backend::render::LocalAudioState;
 use crate::backend::DauxDeviceConfig;
 use crate::command::EngineCommand;
 use crate::dsp::dither::{DitheredOutput, OutputDither};
@@ -720,8 +720,16 @@ unsafe fn open_exclusive_stream(
     // ── Runtime ───────────────────────────────────────────────────────────────
     let mut runtime = initial_runtime;
     runtime.retarget_sample_rate(sample_rate);
-    let mut local = LocalAudioState::with_monitor_capacity(sample_rate as f64, actual_buf as usize);
+    runtime.reserve_track_blocks(actual_buf as usize);
+    let local = LocalAudioState::with_monitor_capacity(sample_rate as f64, actual_buf as usize);
     let mut scratch = vec![0.0f32; actual_buf as usize * device_ch];
+    // Audioguard owns the render state: each block is rendered here, or
+    // copied from the blocks the guard thread rendered ahead.
+    let mut guarded = crate::audioguard::GuardedRenderer::new(
+        crate::audioguard::RenderCore::new(runtime, local, cmd_rx.clone(), sample_rate),
+        device_ch,
+        Arc::clone(shared),
+    );
     // Word-length reduction for the integer device words. One xorshift for the
     // life of the stream, advanced per sample, never reseeded. Unused on the
     // float path, where samples reach the driver untouched.
@@ -751,8 +759,6 @@ unsafe fn open_exclusive_stream(
             break;
         }
 
-        drain_commands(cmd_rx, &mut runtime, shared, &mut local, sample_rate);
-
         let padding = client.GetCurrentPadding().unwrap_or(actual_buf);
         let frames = actual_buf.saturating_sub(padding);
         if frames == 0 {
@@ -776,7 +782,8 @@ unsafe fn open_exclusive_stream(
         let block = &mut scratch[..total];
         // `fill_output_f32` fully overwrites every sample of `block` on every
         // reachable path (see `backend/render.rs`) — no pre-zero needed.
-        fill_output_f32(block, device_ch, &mut runtime, shared, &mut local);
+        // Drains the command queue too.
+        guarded.render(block);
 
         // Straight into the driver's own buffer in its own word. Float is a
         // memcpy; the integer words quantize with dither at the resolution the

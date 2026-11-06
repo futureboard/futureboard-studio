@@ -182,7 +182,8 @@ fn ensure_workers(wanted: usize) -> usize {
 }
 
 fn worker_main(slot: usize) {
-    promote_worker_thread();
+    promote_audio_thread();
+    crate::audioguard::flush_denormals_on_this_thread();
     let mut seen = POOL.generation.load(Ordering::Acquire);
     loop {
         let mut spins = 0u32;
@@ -305,7 +306,7 @@ pub(crate) unsafe fn dispatch(count: usize, ctx: *const (), run: RunFn) -> bool 
 
 /// Give a worker the audio thread's scheduling class, so it is not the one
 /// thread in a block that the OS lets wait.
-fn promote_worker_thread() {
+pub(crate) fn promote_audio_thread() {
     #[cfg(target_os = "windows")]
     {
         #[link(name = "avrt")]

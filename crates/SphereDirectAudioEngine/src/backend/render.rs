@@ -207,6 +207,16 @@ pub struct LocalAudioState {
     pdc_bypass_applied: bool,
     /// Whether the graph compensated before the bypass, so it does again after.
     pdc_bypass_restore: bool,
+    /// Set by Audioguard while the guard thread renders this block ahead of
+    /// the device: the block's clock is published when it is played, not now,
+    /// it takes no live input, and its time is not a device deadline.
+    pub guard_rendering: bool,
+    /// Transport start of the block last rendered, and whether the transport
+    /// was playing it (what a block rendered ahead carries into the ring).
+    pub last_block_start: u64,
+    pub last_block_playing: bool,
+    /// Audioguard's device-output guard.
+    pub output_guard: crate::audioguard::OutputGuard,
 }
 
 impl LocalAudioState {
@@ -259,6 +269,10 @@ impl LocalAudioState {
             audition: AuditionPlayer::default(),
             pdc_bypass_applied: false,
             pdc_bypass_restore: false,
+            guard_rendering: false,
+            last_block_start: 0,
+            last_block_playing: false,
+            output_guard: crate::audioguard::OutputGuard::default(),
         }
     }
 
@@ -686,6 +700,18 @@ pub fn drain_commands(
     output_sample_rate: u32,
 ) -> bool {
     while let Ok(cmd) = cmd_rx.try_recv() {
+        // Someone is playing: Audioguard stops rendering ahead for a while so
+        // what they play is heard as they play it. One relaxed add.
+        if matches!(
+            cmd,
+            EngineCommand::MidiPreviewNoteOn { .. }
+                | EngineCommand::MidiPreviewControlChange { .. }
+                | EngineCommand::PluginPreviewNoteOn { .. }
+                | EngineCommand::PluginPreviewControlChange { .. }
+                | EngineCommand::PluginPreviewPitchBend { .. }
+        ) {
+            shared.live_events.fetch_add(1, Ordering::Relaxed);
+        }
         match cmd {
             EngineCommand::LoadProject(next_runtime) => {
                 if callback_debug_enabled() {
@@ -1053,32 +1079,30 @@ pub fn drain_commands(
                 // every block, so the bridge handshake is always alive.
                 runtime.set_bridge_editor_active(&track_id, active);
             }
-            EngineCommand::SetTrackVolume { track_id, value } => {
-                // Whether the id matched is the whole question when a fader
-                // moves and nothing gets quieter: `update_track_volume` is a
-                // silent no-op for an id the graph does not have, and that is
-                // indistinguishable from "applied" without this line.
-                let applied = runtime.update_track_volume(&track_id, value);
+            EngineCommand::SetTrackVolume { track_index, value } => {
+                // Whether the index matched is the whole question when a fader
+                // moves and nothing gets quieter.
+                let applied = runtime.update_track_volume_at(track_index, value);
                 if command_debug_enabled() {
                     eprintln!(
-                        "[DAUx] SetTrackVolume track={track_id} linear={value:.4} applied={applied}"
+                        "[DAUx] SetTrackVolume track_index={track_index} linear={value:.4} applied={applied}"
                     );
                 }
             }
-            EngineCommand::SetTrackPan { track_id, value } => {
-                runtime.update_track_pan(&track_id, value);
+            EngineCommand::SetTrackPan { track_index, value } => {
+                runtime.update_track_pan_at(track_index, value);
             }
-            EngineCommand::SetTrackMute { track_id, muted } => {
+            EngineCommand::SetTrackMute { track_index, muted } => {
                 if callback_debug_enabled() {
-                    eprintln!("[DAUx] SetTrackMute track={track_id} muted={muted}");
+                    eprintln!("[DAUx] SetTrackMute track_index={track_index} muted={muted}");
                 }
                 // No note-off (mirrors the cpal path): the render pass keeps a
                 // muted/unsoloed track's instrument running under the silence,
                 // so its notes play on and resume audibly on release.
-                runtime.update_track_mute(&track_id, muted);
+                runtime.update_track_mute_at(track_index, muted);
             }
-            EngineCommand::SetTrackSolo { track_id, solo } => {
-                runtime.update_track_solo(&track_id, solo);
+            EngineCommand::SetTrackSolo { track_index, solo } => {
+                runtime.update_track_solo_at(track_index, solo);
             }
             EngineCommand::SetTrackInputState {
                 track_index,
@@ -1258,6 +1282,7 @@ pub fn fill_output_f32(
         elapsed_us,
         block_frames,
         shared.sample_rate.load(Ordering::Relaxed),
+        !local.guard_rendering,
     );
     // Classify against *this block's* deadline, not a fixed microsecond count.
     // A flat 5 ms / 10 ms pair says the same thing about a 5.3 ms block (buffer
@@ -1270,7 +1295,7 @@ pub fn fill_output_f32(
     } else {
         5_000
     };
-    if elapsed_us >= warn_us {
+    if elapsed_us >= warn_us && !local.guard_rendering {
         let cb = shared.output_cb_count.load(Ordering::Relaxed);
         let last = SLOW_CALLBACK_LAST_LOG.load(Ordering::Relaxed);
         if cb.wrapping_sub(last) > 200 {
@@ -1456,17 +1481,21 @@ fn fill_output_f32_inner(
         log_stopped_graph_heartbeat(runtime, shared, local, frames_in_block, software_monitoring);
     }
 
-    let monitor_input_ready = if shared.live_input_active.load(Ordering::Relaxed) {
-        // Per-track input meters from the latest captured sample (Layer 6).
-        let input_l = f32_load(shared.live_input_l.load(Ordering::Relaxed));
-        let input_r = f32_load(shared.live_input_r.load(Ordering::Relaxed));
-        let source_pair = shared.monitor_source_pair();
-        runtime.accumulate_live_input_meters(input_l, input_r, source_pair);
-        read_monitor_input(frames_in_block as usize, shared, local)
-    } else {
-        clear_input_bus_meter(shared, local);
-        false
-    };
+    // A block Audioguard renders ahead takes no live input: it only renders
+    // ahead while nothing is monitored, and reading the input ring ahead of
+    // the device would only run it dry.
+    let monitor_input_ready =
+        if !local.guard_rendering && shared.live_input_active.load(Ordering::Relaxed) {
+            // Per-track input meters from the latest captured sample (Layer 6).
+            let input_l = f32_load(shared.live_input_l.load(Ordering::Relaxed));
+            let input_r = f32_load(shared.live_input_r.load(Ordering::Relaxed));
+            let source_pair = shared.monitor_source_pair();
+            runtime.accumulate_live_input_meters(input_l, input_r, source_pair);
+            read_monitor_input(frames_in_block as usize, shared, local)
+        } else {
+            clear_input_bus_meter(shared, local);
+            false
+        };
 
     // Audio Jam live-input tap. The pair `read_monitor_input` just staged is
     // the instrument plugged into the interface, before any track has touched
@@ -1702,6 +1731,19 @@ fn fill_output_f32_inner(
     // graph directly, no stage below can reach exported or recorded audio.
     apply_control_room(data, channels, runtime, shared, local);
 
+    // Audioguard output guard: invalid samples or a burst far past full scale
+    // never reach the speakers. After the Control Room, so it guards what the
+    // device actually plays; export renders the graph directly and is untouched.
+    if crate::audioguard::AudioguardLevel::from_u8(
+        shared.dropout_protection_mode.load(Ordering::Relaxed),
+    )
+    .protects()
+    {
+        local
+            .output_guard
+            .process(data, channels, runtime.sample_rate, shared);
+    }
+
     // Audio Jam Monitor tap. Deliberately *after* the Control Room, which is
     // the whole difference from the master tap above: master is the mix an
     // export gets, this is the signal that actually leaves for the monitoring
@@ -1764,8 +1806,14 @@ fn fill_output_f32_inner(
     shared.rms_r.store(f32_store(rms_r), Ordering::Relaxed);
 
     // Advance transport position.
+    local.last_block_start = base_sample;
+    local.last_block_playing = transport_playing && channels > 0;
     if transport_playing && channels > 0 {
-        shared.note_output_block(base_sample, frames);
+        // A block rendered ahead publishes its clock when the device plays it
+        // (`audioguard::GuardedRenderer`).
+        if !local.guard_rendering {
+            shared.note_output_block(base_sample, frames);
+        }
         let (next_position, _) = transport::advance_loop_position(base_sample, frames, loop_bounds);
         shared
             .position_samples

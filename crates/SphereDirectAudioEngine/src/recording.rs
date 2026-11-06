@@ -815,7 +815,7 @@ fn build_track_writers(
     std::fs::create_dir_all(&recordings_dir).map_err(|e| {
         SphereAudioError::NativeError(format!("Cannot create recordings folder: {e}"))
     })?;
-    let project_start_sample = shared.position_samples.load(Ordering::Relaxed);
+    let project_start_sample = shared.playback_position();
 
     let mut track_writers: Vec<TrackWriterState> = Vec::new();
     for (track_index, track) in config.tracks.iter().enumerate() {
@@ -1043,7 +1043,7 @@ fn start_recording_with_config(
     const PREVIEW_PEAKS_PER_SEC: u32 = 150;
     let samples_per_bin = (sample_rate / PREVIEW_PEAKS_PER_SEC).max(1) as usize;
     let preview_channels = monitor_channels.len().max(1) as u32;
-    let start_sample = shared.position_samples.load(Ordering::Relaxed);
+    let start_sample = shared.playback_position();
 
     shared.preview_ring.reset();
     shared.recording_preview_id.fetch_add(1, Ordering::Relaxed);
@@ -1187,7 +1187,7 @@ pub(crate) fn start_recording_live_tap(
     let mon_l = monitor_channels.first().copied().unwrap_or(0);
     let mon_r = monitor_channels.get(1).copied().unwrap_or(mon_l);
     let preview_channels = monitor_channels.len().max(1) as u32;
-    let start_sample = shared.position_samples.load(Ordering::Relaxed);
+    let start_sample = shared.playback_position();
 
     shared.preview_ring.reset();
     let preview_tracks = preview_tracks_for(&config.tracks, input_ch);
@@ -1307,7 +1307,7 @@ pub(crate) fn start_recording_asio_tap(
     const PREVIEW_PEAKS_PER_SEC: u32 = 150;
     let samples_per_bin = (sample_rate / PREVIEW_PEAKS_PER_SEC).max(1) as usize;
     let preview_channels = config.monitor_channels.len().clamp(1, 2) as u32;
-    let start_sample = shared.position_samples.load(Ordering::Relaxed);
+    let start_sample = shared.playback_position();
     shared.preview_ring.reset();
 
     // Which armed tracks the growing waveform can describe, and on which input

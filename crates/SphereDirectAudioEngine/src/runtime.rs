@@ -1657,6 +1657,8 @@ pub struct RuntimeInsert {
     /// UI. `Arc` because a graph rebuild moves the insert but the meter should
     /// not restart.
     pub cpu_us: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Audioguard's watch on this insert's output and deadlines.
+    pub guard: crate::audioguard::InsertGuard,
     pub callback_process_log_done: bool,
     pub silent_process_blocks: u32,
     /// Consecutive blocks the external plugin host failed to deliver on time
@@ -1785,7 +1787,7 @@ impl RuntimeInsert {
     /// by automation.
     #[inline]
     pub fn active(&self) -> bool {
-        self.enabled && !self.automation_bypassed
+        self.enabled && !self.automation_bypassed && !self.guard.bypassed
     }
 }
 
@@ -2903,6 +2905,26 @@ impl RuntimeProject {
         }
     }
 
+    /// Grow every track's block and receive buffers to hold `frames`, off the
+    /// audio thread. The render pass still grows them if a device hands it a
+    /// larger block than announced, but a graph prepared here never allocates
+    /// on its first blocks.
+    pub fn reserve_track_blocks(&mut self, frames: usize) {
+        let frames = frames.min(DEFAULT_AUDIO_BLOCK_CAPACITY);
+        for track in &mut self.tracks {
+            for buffer in [
+                &mut track.block_l,
+                &mut track.block_r,
+                &mut track.recv_l,
+                &mut track.recv_r,
+            ] {
+                if buffer.len() < frames {
+                    buffer.resize(frames, 0.0);
+                }
+            }
+        }
+    }
+
     /// Rebuild all sample-rate-derived runtime state for an already-cached graph.
     ///
     /// This is the safety net for device reopen/sample-rate changes: cached runtime
@@ -3547,6 +3569,7 @@ impl RuntimeProject {
                     ),
                     vst3,
                     cpu_us: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                    guard: Default::default(),
                     callback_process_log_done: false,
                     silent_process_blocks: 0,
                     bridge_missed_blocks: 0,
@@ -5065,6 +5088,40 @@ impl RuntimeProject {
         }
     }
 
+    /// Live fader by resolved index; `false` when the graph has no such track.
+    #[inline]
+    pub fn update_track_volume_at(&mut self, track_index: usize, volume: f32) -> bool {
+        match self.tracks.get_mut(track_index) {
+            Some(track) => {
+                track.volume = volume.clamp(0.0, 2.0);
+                true
+            }
+            None => false,
+        }
+    }
+
+    #[inline]
+    pub fn update_track_pan_at(&mut self, track_index: usize, pan: f32) {
+        if let Some(track) = self.tracks.get_mut(track_index) {
+            track.pan = pan.clamp(-1.0, 1.0);
+        }
+    }
+
+    #[inline]
+    pub fn update_track_mute_at(&mut self, track_index: usize, muted: bool) {
+        if let Some(track) = self.tracks.get_mut(track_index) {
+            track.muted = muted;
+        }
+    }
+
+    #[inline]
+    pub fn update_track_solo_at(&mut self, track_index: usize, solo: bool) {
+        if let Some(track) = self.tracks.get_mut(track_index) {
+            track.solo = solo;
+            self.has_solo = self.tracks.iter().any(|t| t.solo);
+        }
+    }
+
     #[inline]
     /// Place each channel as the snapshot says; a channel it does not list
     /// stays front and centre.
@@ -5285,6 +5342,11 @@ impl RuntimeProject {
         // "enabled" toggles bypass for all insert types.
         if param_id == "enabled" {
             insert.enabled = value >= 0.5;
+            // Switching it on is the user taking it back from Audioguard: it
+            // processes again, and is watched afresh.
+            if insert.enabled {
+                insert.guard.rearm();
+            }
             return;
         }
 
@@ -8575,6 +8637,7 @@ mod midi_tests {
                 dsp: InsertDspState::default(),
                 vst3: None,
                 cpu_us: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                guard: Default::default(),
                 callback_process_log_done: false,
                 silent_process_blocks: 0,
                 bridge_missed_blocks: 0,

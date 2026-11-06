@@ -2603,6 +2603,14 @@ pub fn apply_track_chain_block(
             );
         }
         publish_insert_cpu(insert, started.elapsed());
+        // Audioguard: an insert writing NaN / infinity is silenced at the
+        // insert, so the next one in the chain never sees it, and bypassed
+        // when it keeps doing it.
+        if insert.active() && crate::audioguard::process_level().protects() {
+            insert
+                .guard
+                .check_output(&mut track.block_l[..frames], &mut track.block_r[..frames]);
+        }
     }
     silence_nonfinite_block(&mut track.block_l[..frames], &mut track.block_r[..frames]);
 }
@@ -2877,6 +2885,7 @@ pub(crate) fn apply_external_bridge_insert_block(
     // stale output is never replayed. A few misses are normal on startup and
     // when resuming from pause, so only log once a stall is established.
     const BRIDGE_MISS_LOG_THRESHOLD: u32 = 8;
+    insert.guard.note_bridge_block(got == 0);
     if got == 0 {
         insert.bridge_missed_blocks = insert.bridge_missed_blocks.saturating_add(1);
         if plugin_restore_debug_enabled()

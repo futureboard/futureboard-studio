@@ -57,7 +57,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::System::IO::DeviceIoControl;
 
-use crate::backend::render::{drain_commands, fill_output_f32, LocalAudioState};
+use crate::backend::render::LocalAudioState;
 use crate::backend::DauxDeviceConfig;
 use crate::command::EngineCommand;
 use crate::engine::SharedState;
@@ -674,9 +674,17 @@ unsafe fn run_rt_stream(
     // Realtime runtime + scratch (period-sized; the fill loop chunks by period).
     let mut runtime = initial_runtime;
     runtime.retarget_sample_rate(sample_rate);
-    let mut local =
+    runtime.reserve_track_blocks(stream.period_frames as usize);
+    let local =
         LocalAudioState::with_monitor_capacity(sample_rate as f64, stream.period_frames as usize);
     let mut scratch = vec![0.0f32; stream.period_frames as usize * channels.max(1)];
+    // Audioguard owns the render state: each period is rendered here, or
+    // copied from the blocks the guard thread rendered ahead.
+    let mut guarded = crate::audioguard::GuardedRenderer::new(
+        crate::audioguard::RenderCore::new(runtime, local, cmd_rx, sample_rate),
+        channels.max(1),
+        Arc::clone(shared),
+    );
 
     // Pre-fill the whole buffer before RUN so the DMA engine starts on valid
     // audio rather than whatever the driver mapped.
@@ -686,9 +694,7 @@ unsafe fn run_rt_stream(
         write_total,
         buffer_frames,
         &mut scratch,
-        &mut runtime,
-        shared,
-        &mut local,
+        &mut guarded,
     );
     write_total = buffer_frames * block_align;
 
@@ -748,8 +754,6 @@ unsafe fn run_rt_stream(
             break;
         }
 
-        drain_commands(&cmd_rx, &mut runtime, shared, &mut local, sample_rate);
-
         // Reconstruct a monotonic play position from the wrapping offset.
         let play_off = match get_play_offset(stream.pin) {
             Ok(off) => off.min(buffer_bytes.saturating_sub(1)),
@@ -773,15 +777,7 @@ unsafe fn run_rt_stream(
             continue;
         }
 
-        render_into_ring(
-            stream,
-            write_total,
-            free_frames,
-            &mut scratch,
-            &mut runtime,
-            shared,
-            &mut local,
-        );
+        render_into_ring(stream, write_total, free_frames, &mut scratch, &mut guarded);
         write_total += free_frames * block_align;
     }
 }
@@ -796,9 +792,7 @@ unsafe fn render_into_ring(
     start_total: u64,
     frames: u64,
     scratch: &mut [f32],
-    runtime: &mut RuntimeProject,
-    shared: &Arc<SharedState>,
-    local: &mut LocalAudioState,
+    guarded: &mut crate::audioguard::GuardedRenderer,
 ) {
     let ch = stream.channels.max(1);
     let bps = stream.fmt.bytes() as u64;
@@ -812,7 +806,8 @@ unsafe fn render_into_ring(
         // `fill_output_f32` fully overwrites every sample of its output slice
         // on every reachable path (see `backend/render.rs`) — no pre-zero
         // needed.
-        fill_output_f32(&mut scratch[..n], ch, runtime, shared, local);
+        // Drains the command queue too.
+        guarded.render(&mut scratch[..n]);
 
         for (i, &s) in scratch[..n].iter().enumerate() {
             let byte_off = ((written_total + i as u64 * bps) % buffer_bytes) as usize;

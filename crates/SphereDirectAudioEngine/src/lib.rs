@@ -18,6 +18,7 @@ pub mod asio_registry;
 mod audio_file;
 mod audio_graph;
 mod audio_source;
+pub mod audioguard;
 pub mod backend;
 pub mod capture_tap;
 pub mod clap_processor;
@@ -78,7 +79,7 @@ pub use crate::audio_source::{
     open_clip_audio_source, read_frame_stereo, sample_source_stereo, ClipAudioSource,
     MappedWavSource,
 };
-pub use crate::engine::{DropoutDiagnostics, DropoutProtectionMode, DropoutReason};
+pub use crate::engine::{AudioguardLevel, DropoutDiagnostics, DropoutProtectionMode, DropoutReason};
 /// Instruction set of the render kernels: AVX2 by default, SSE as the fallback.
 pub use crate::dsp::simd::{
     active_level as active_simd_level, cpu_supports_avx2, set_simd_level, SimdLevel,
