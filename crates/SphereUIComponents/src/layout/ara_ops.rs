@@ -1119,6 +1119,12 @@ trait SessionPlugin {
     /// The instance the engine renders and editors attach to; a test double
     /// has none.
     fn instance(&self) -> Option<&DirectAudio::Vst3RuntimeProcessor>;
+    /// The sample rate every instance of the session was prepared at.
+    fn instance_rates(&self) -> Vec<u32> {
+        self.instance()
+            .map(|instance| vec![instance.sample_rate()])
+            .unwrap_or_default()
+    }
     /// What tells that instance apart from every other one alive
     /// ([`DirectAudio::Vst3RuntimeProcessor::handle_value`]): what an editor
     /// host holding a view on it is matched by. A test double may name one
@@ -1317,6 +1323,13 @@ impl SessionPlugin for LivePlugin {
 
     fn instance(&self) -> Option<&DirectAudio::Vst3RuntimeProcessor> {
         Some(&self.lead().processor)
+    }
+
+    fn instance_rates(&self) -> Vec<u32> {
+        self.members
+            .iter()
+            .map(|member| member.processor.sample_rate())
+            .collect()
     }
 
     fn view_is_attached(&self) -> bool {
@@ -2270,6 +2283,24 @@ impl AraState {
         self.retire_all(engine, now);
         self.load_archives(parked.saved, parked.fingerprints);
         true
+    }
+
+    /// Closes every session and parks its document, stored now, for the
+    /// sessions to reopen: what a change of the device's sample rate needs,
+    /// since an instance's rate is fixed when it is made. Parked documents,
+    /// kept-back restores and orphans come through as they were.
+    pub fn reopen_all(&mut self, engine: Option<&DirectAudio::AudioEngine>, now: Instant) {
+        let parked = self.park_for_rollback();
+        self.retire_all(engine, now);
+        self.load_archives(parked.saved, parked.fingerprints);
+    }
+
+    /// The rate of the first live instance not prepared at `rate`, if any.
+    pub fn instance_rate_other_than(&self, rate: u32) -> Option<u32> {
+        self.sessions
+            .values()
+            .flat_map(|session| session.plugin.instance_rates())
+            .find(|&instance| instance != rate)
     }
 
     /// What the user has to be told about saved documents since the last
@@ -4100,6 +4131,8 @@ mod tests {
         /// were.
         notes: HashMap<AraClipKey, Vec<AraNote>>,
         note_reads: usize,
+        /// The rate the double's instance was prepared at, if it has one.
+        rate: Option<u32>,
     }
 
     impl Script {
@@ -4135,6 +4168,7 @@ mod tests {
                 torn_down: false,
                 notes: HashMap::new(),
                 note_reads: 0,
+                rate: None,
             }
         }
     }
@@ -4238,6 +4272,9 @@ mod tests {
         }
         fn instance(&self) -> Option<&DirectAudio::Vst3RuntimeProcessor> {
             None
+        }
+        fn instance_rates(&self) -> Vec<u32> {
+            self.0.borrow().rate.into_iter().collect()
         }
         fn instance_handle(&self) -> Option<usize> {
             self.0.borrow().handle
@@ -4831,6 +4868,30 @@ mod tests {
             state.region_notes()[&AraClipKey::from("clip-1")][0].pitch,
             61.5
         );
+    }
+
+    /// An instance prepared before the device settled on its rate is found,
+    /// and reopening stores its document first and parks it for the session
+    /// that replaces it, so the user's edits come back at the new rate.
+    #[test]
+    fn a_session_at_the_old_rate_is_reopened_with_its_document() {
+        let mut state = AraState::default();
+        let key = evidence_key();
+        let script = open_fake(&mut state, &key);
+        script.borrow_mut().rate = Some(44_100);
+        sync(&mut state, &key, &track_graph(&[("clip-1", SOURCE)]), &[]).unwrap();
+        assert_eq!(state.instance_rate_other_than(48_000), Some(44_100));
+        assert_eq!(state.instance_rate_other_than(44_100), None);
+
+        script.borrow_mut().stored = Some(b"edited at 44.1".to_vec());
+        state.reopen_all(None, Instant::now());
+        assert!(state.sessions.is_empty());
+        assert_eq!(state.pending_keys(), vec![key.clone()]);
+        assert_eq!(
+            state.pending_archives[&key].data,
+            b"edited at 44.1".to_vec()
+        );
+        assert_eq!(state.instance_rate_other_than(48_000), None);
     }
 
     /// A clip the document stops rendering shows no notes any more.

@@ -3392,6 +3392,21 @@ impl EngineInner {
         Ok(())
     }
 
+    /// The rate the engine renders at now, and so the rate an ARA instance
+    /// created now is prepared at ([`Self::create_ara_processor`]). An
+    /// instance made before the device settled on its rate keeps the old one,
+    /// and plays its audio at the wrong pitch and speed; the host compares
+    /// against this to know to reload it.
+    pub fn render_sample_rate(&self) -> u32 {
+        self.shared.sample_rate.load(Ordering::Relaxed)
+    }
+
+    /// Whether an offline render holds the ARA renderers right now
+    /// ([`Self::lend_ara_renderers`]).
+    pub fn ara_renderers_lent(&self) -> bool {
+        self.ara_lent.load(Ordering::SeqCst)
+    }
+
     /// Clone the live runtime VST3 processor handle for an insert, if it has a
     /// ready native plugin instance. The returned handle is `Arc`-backed and
     /// cheap to clone; holding it keeps the C++ instance alive even across a

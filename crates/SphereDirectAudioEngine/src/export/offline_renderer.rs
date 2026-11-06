@@ -981,8 +981,9 @@ fn install_offline_ara_renderers(
             .find(|&rate| rate != sample_rate)
         {
             return Err(ExportError::Settings(format!(
-                "an ARA plug-in in this project runs at {rate} Hz, so it can only be rendered \
-                 at {rate} Hz"
+                "an ARA plug-in in this project runs at {rate} Hz, the audio device's rate, so \
+                 it can only be rendered at {rate} Hz. To export at {sample_rate} Hz, set the \
+                 audio device to {sample_rate} Hz first"
             )));
         }
         track.ara_renderers = lent.clone();

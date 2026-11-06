@@ -1390,6 +1390,17 @@ impl AudioEngine {
         self.inner.create_ara_processor(plugin_path, class_id)
     }
 
+    /// The rate a new ARA instance would be prepared at; see
+    /// `EngineInner::render_sample_rate`.
+    pub fn render_sample_rate(&self) -> u32 {
+        self.inner.render_sample_rate()
+    }
+
+    /// Whether an offline render holds the ARA renderers right now.
+    pub fn ara_renderers_lent(&self) -> bool {
+        self.inner.ara_renderers_lent()
+    }
+
     /// Install the ARA playback renderers for one track, replacing any previous
     /// set. An empty list removes them.
     pub fn set_ara_renderers(

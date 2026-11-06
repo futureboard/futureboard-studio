@@ -762,6 +762,9 @@ impl StudioLayout {
         if !self.ara.is_active() {
             return;
         }
+        if self.reopen_ara_at_engine_rate(cx) {
+            return;
+        }
         for request in self.ara.take_transport_requests() {
             // Paired with the trace on the ARA host side, this says whether a
             // request the plug-in made actually reached the transport.
@@ -1162,6 +1165,46 @@ impl StudioLayout {
             }
         })
         .detach();
+    }
+
+    /// Reloads every ARA plug-in whose instance was prepared at another rate
+    /// than the engine renders at now, keeping its document.
+    ///
+    /// An instance's rate is fixed when it is made. A project opened before
+    /// the audio device came up (or a device that reopened at another rate)
+    /// left Melodyne and the like rendering 44.1 kHz audio into a 48 kHz
+    /// stream: every edited note played at the wrong pitch and speed, and an
+    /// export at the project's rate was refused. Each document is stored,
+    /// the sessions closed, and opened again at the engine's rate with the
+    /// stored document, as a project reload would. Not while an export holds
+    /// the renderers: it is reading them. Answers whether it reloaded.
+    fn reopen_ara_at_engine_rate(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(engine) = self.audio_bridge.engine.clone() else {
+            return false;
+        };
+        let rate = engine.render_sample_rate();
+        if rate == 0 || engine.ara_renderers_lent() {
+            return false;
+        }
+        let Some(stale) = self.ara.instance_rate_other_than(rate) else {
+            return false;
+        };
+        eprintln!("[ARA] instances run at {stale} Hz, the engine at {rate} Hz: reloading them");
+        let keys: Vec<AraSessionKey> = self.ara.keys().cloned().collect();
+        self.close_ara_editors(&keys, cx);
+        self.ara
+            .reopen_all(Some(&engine), std::time::Instant::now());
+        self.finish_retired_ara_sessions(cx);
+        self.open_pending_ara_sessions(cx);
+        self.mark_engine_project_dirty();
+        self.show_ara_notice(
+            format!(
+                "ARA plug-ins were reloaded at {rate} Hz to match the audio device; their edits \
+                 were kept."
+            ),
+            cx,
+        );
+        true
     }
 
     /// Puts back the ARA documents of a project whose replacement failed,
