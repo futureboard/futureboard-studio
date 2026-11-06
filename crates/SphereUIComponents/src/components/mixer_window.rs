@@ -335,6 +335,11 @@ impl Render for MixerWindow {
             .capture_any_mouse_down(move |_event, window, cx| {
                 focus_on_pointer.focus(window, cx);
             })
+            // See the studio root: a release always brings a drag's hidden
+            // pointer back.
+            .capture_any_mouse_up(|_event, _window, _cx| {
+                crate::components::drag_pointer::show_after_drag();
+            })
             .capture_key_down(move |event, _window, cx| {
                 let window = _window;
                 if window

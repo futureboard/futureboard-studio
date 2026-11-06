@@ -32,6 +32,7 @@ pub mod edit;
 mod editor_panel;
 mod effect_editor_tab_view;
 pub mod extensions_window;
+pub mod drag_pointer;
 pub mod fader;
 pub mod file_browser;
 pub mod form;

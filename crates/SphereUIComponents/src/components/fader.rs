@@ -69,6 +69,21 @@ struct DragAnchor {
 /// Holding Shift moves the cap this much slower, for the last fraction of a dB.
 const FINE_DRAG_SCALE: f32 = 0.1;
 
+/// Pointer travel, in pixels, that sweeps a fader end to end, at the least.
+///
+/// A drag used to map the rail's drawn length onto the whole range, so a fader
+/// in a short strip — a docked mixer is some 45 px of rail — moved about 2 % of
+/// its range per pixel: an ordinary 3–5 px mouse step jumped several dB and the
+/// cap leapt instead of gliding. The rail still draws at whatever height the
+/// strip has; only the drag is held to this resolution, and a rail longer than
+/// it keeps following the pointer exactly.
+pub(crate) const MIN_FADER_DRAG_SPAN: f32 = 240.0;
+
+/// The travel a drag along a rail `rail` px long uses for the full range.
+pub(crate) fn fader_drag_span(rail: f32) -> f32 {
+    rail.max(MIN_FADER_DRAG_SPAN)
+}
+
 /// The value a relative drag reaches.
 ///
 /// The cap follows the pointer's *travel*, not its position: grabbing it a few
@@ -547,16 +562,24 @@ pub fn fader_with_drag_callbacks(
                 if let Some(start) = on_drag_start.as_ref() {
                     start(&value, window, cx);
                 }
+                crate::components::drag_pointer::hide_for_drag();
                 cx.new(|_| FaderDrag::new(drag.id.clone()))
             },
         )
+        // The pointer comes back on any release, commit or not.
+        .on_mouse_up(gpui::MouseButton::Left, |_event, _window, _cx| {
+            crate::components::drag_pointer::show_after_drag();
+        })
+        .on_mouse_up_out(gpui::MouseButton::Left, |_event, _window, _cx| {
+            crate::components::drag_pointer::show_after_drag();
+        })
         .on_drag_move::<FaderDrag>(move |event: &DragMoveEvent<FaderDrag>, window, cx| {
             let drag = event.drag(cx);
             if drag.id != id_string {
                 return;
             }
             let y: f32 = event.event.position.y.into();
-            let span = (f32::from(event.bounds.size.height) - FADER_THUMB_HEIGHT).max(1.0);
+            let span = fader_drag_span(f32::from(event.bounds.size.height) - FADER_THUMB_HEIGHT);
             // Up is louder: travel toward the maximum is the pointer moving up.
             let new_value = drag_to(drag, value, y, event.event.modifiers.shift, span, |dy| -dy);
             if fader_map_debug_enabled() {
@@ -617,16 +640,24 @@ pub fn horizontal_fader_with_drag_callbacks(
                 if let Some(start) = on_drag_start.as_ref() {
                     start(&value, window, cx);
                 }
+                crate::components::drag_pointer::hide_for_drag();
                 cx.new(|_| FaderDrag::new(drag.id.clone()))
             },
         )
+        // The pointer comes back on any release, commit or not.
+        .on_mouse_up(gpui::MouseButton::Left, |_event, _window, _cx| {
+            crate::components::drag_pointer::show_after_drag();
+        })
+        .on_mouse_up_out(gpui::MouseButton::Left, |_event, _window, _cx| {
+            crate::components::drag_pointer::show_after_drag();
+        })
         .on_drag_move::<FaderDrag>(move |event: &DragMoveEvent<FaderDrag>, window, cx| {
             let drag = event.drag(cx);
             if drag.id != id_string {
                 return;
             }
             let x: f32 = event.event.position.x.into();
-            let span = (f32::from(event.bounds.size.width) - HORIZONTAL_THUMB_W).max(1.0);
+            let span = fader_drag_span(f32::from(event.bounds.size.width) - HORIZONTAL_THUMB_W);
             let new_value = drag_to(drag, value, x, event.event.modifiers.shift, span, |dx| dx);
             if fader_map_debug_enabled() {
                 eprintln!(
@@ -678,6 +709,22 @@ mod tests {
         assert!((v - 0.87).abs() < 1.0e-5, "{v}");
         // Clamped at the ends.
         assert_eq!(drag_to(&drag, 0.62, -500.0, false, 200.0, |dy| -dy), 1.0);
+    }
+
+    /// A short rail drags at the same resolution as a full-height one; a tall
+    /// one still follows the pointer.
+    #[test]
+    fn a_short_fader_is_not_more_sensitive() {
+        assert_eq!(fader_drag_span(45.0), MIN_FADER_DRAG_SPAN);
+        assert_eq!(fader_drag_span(400.0), 400.0);
+        let drag = FaderDrag::new("f".into());
+        assert_eq!(
+            drag_to(&drag, 0.5, 100.0, false, fader_drag_span(45.0), |dy| -dy),
+            0.5
+        );
+        // 5 px on a 45 px rail used to be 11 % of the range.
+        let v = drag_to(&drag, 0.5, 95.0, false, fader_drag_span(45.0), |dy| -dy);
+        assert!((v - 0.5 - 5.0 / MIN_FADER_DRAG_SPAN).abs() < 1.0e-6, "{v}");
     }
 
     #[test]

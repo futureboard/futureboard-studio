@@ -1341,9 +1341,20 @@ impl StudioLayout {
             // repaint first. That repaint may include waveform work; when mixer
             // invalidation was deferred behind it, the strip highlight visibly
             // lagged even though the model had already changed.
-            timeline_select.update(cx, |t, _cx| {
+            let changed = timeline_select.update(cx, |t, _cx| {
+                let before = (t.state.selection.clone(), t.state.arrangement_range.clone());
                 t.state.press_track_selection(&id, additive, range);
+                before != (t.state.selection.clone(), t.state.arrangement_range.clone())
             });
+            // A press on the strip that is already the selection — the way
+            // every fader and send drag on it starts — selects nothing new.
+            // It used to repaint the whole studio anyway (layout, Inspector,
+            // arrangement) on the press, which held the UI thread for a
+            // quarter of a second just as the drag began: the cap sat still
+            // while the pointer moved, then leapt to catch up.
+            if !changed {
+                return;
+            }
             // Queue the lightweight mixer repaint first so selection feedback is
             // not blocked by Timeline/Inspector/tree work.
             crate::perf::record_notify("mixer_select");
@@ -2324,7 +2335,11 @@ impl StudioLayout {
                                 this.schedule_audio_project_sync(cx, false, "mixer_send_gain");
                             }
                             this.push_mixer_snapshot_to_window(cx);
-                            cx.notify();
+                            // Only the mixer draws a send's level. Repainting
+                            // the whole studio for every pointer sample of the
+                            // drag was what made the bar stutter behind the
+                            // hand.
+                            let _ = this.mixer_panel.update(cx, |_, cx| cx.notify());
                         }
                     });
                 },

@@ -1300,10 +1300,11 @@ const SEND_FLOOR_DB: f32 = -60.0;
 const SEND_CEIL_DB: f32 = 6.0;
 
 /// Pointer travel per dB of send level, at the least. The bar is a strip's
-/// width — some 70 px for 66 dB — and moving the level by the bar's own
+/// width — some 50–70 px for 66 dB — and moving the level by the bar's own
 /// width made every pixel about a dB, so a hand's ordinary 2–4 px per mouse
-/// event stepped the level in whole dB. Shift is ten times finer still.
-const SEND_DRAG_PX_PER_DB: f32 = 4.0;
+/// event stepped the level in whole dB. At 4 px a quick flick still crossed
+/// 20 dB; 6 px makes a step a fraction of a dB. Shift is ten times finer.
+const SEND_DRAG_PX_PER_DB: f32 = 6.0;
 
 /// A send level as a fraction of the bar.
 fn send_norm(gain_db: f32) -> f32 {
@@ -1311,28 +1312,23 @@ fn send_norm(gain_db: f32) -> f32 {
         .clamp(0.0, 1.0)
 }
 
-/// The travel, in pixels, that sweeps a send bar `width` wide end to end.
-fn send_drag_span(width: f32) -> f32 {
-    width.max((SEND_CEIL_DB - SEND_FLOOR_DB) * SEND_DRAG_PX_PER_DB)
+/// The travel, in pixels, that sweeps a send level end to end.
+fn send_drag_span() -> f32 {
+    (SEND_CEIL_DB - SEND_FLOOR_DB) * SEND_DRAG_PX_PER_DB
 }
 
-/// The level a send-bar drag reaches at window x `pointer`, the drag having
-/// started from level fraction `start`.
+/// The level a send-bar drag reaches at window y `pointer`, the drag having
+/// started from level fraction `start`. Up is more, like a fader: the bar is
+/// a strip's width, and a sideways drag ran out of room on a narrow strip
+/// long before the hand did.
 fn send_drag_db(
     drag: &crate::components::fader::FaderDrag,
     start: f32,
     pointer: f32,
     fine: bool,
-    width: f32,
 ) -> f32 {
-    let next = crate::components::fader::drag_to(
-        drag,
-        start,
-        pointer,
-        fine,
-        send_drag_span(width),
-        |dx| dx,
-    );
+    let next =
+        crate::components::fader::drag_to(drag, start, pointer, fine, send_drag_span(), |dy| -dy);
     SEND_FLOOR_DB + next * (SEND_CEIL_DB - SEND_FLOOR_DB)
 }
 
@@ -1406,7 +1402,7 @@ fn send_chip(
         .id(gpui::SharedString::from(gain_drag_id.clone()))
         .absolute()
         .inset_0()
-        .cursor(gpui::CursorStyle::ResizeLeftRight)
+        .cursor(gpui::CursorStyle::ResizeUpDown)
         .child(
             div()
                 .absolute()
@@ -1418,16 +1414,24 @@ fn send_chip(
         )
         .on_drag(
             FaderDrag::new(gain_drag_id.clone()),
-            |drag, _offset, _window, cx| cx.new(|_| FaderDrag::new(drag.id.clone())),
+            |drag, _offset, _window, cx| {
+                crate::components::drag_pointer::hide_for_drag();
+                cx.new(|_| FaderDrag::new(drag.id.clone()))
+            },
         )
+        .on_mouse_up(gpui::MouseButton::Left, |_event, _window, _cx| {
+            crate::components::drag_pointer::show_after_drag();
+        })
+        .on_mouse_up_out(gpui::MouseButton::Left, |_event, _window, _cx| {
+            crate::components::drag_pointer::show_after_drag();
+        })
         .on_drag_move::<FaderDrag>(move |event: &DragMoveEvent<FaderDrag>, window, cx| {
             let drag = event.drag(cx);
             if drag.id != gain_drag_id {
                 return;
             }
-            let x: f32 = event.event.position.x.into();
-            let width = f32::from(event.bounds.size.width);
-            let gain_db = send_drag_db(drag, norm, x, event.event.modifiers.shift, width);
+            let y: f32 = event.event.position.y.into();
+            let gain_db = send_drag_db(drag, norm, y, event.event.modifiers.shift);
             gain_change(
                 &(gain_pair.0.clone(), gain_pair.1.clone(), gain_db),
                 window,
@@ -4188,23 +4192,23 @@ mod send_drag_tests {
     use super::{send_drag_db, send_norm};
     use crate::components::fader::FaderDrag;
 
-    /// A drag on a strip-width bar from `start_db`, `travel` px to the right.
+    /// A drag on a send bar from `start_db`, `travel` px upward.
     fn dragged(start_db: f32, travel: f32, fine: bool) -> f32 {
         let drag = FaderDrag::new("send".into());
         let start = send_norm(start_db);
         // The first sample anchors the drag where the press landed.
-        let _ = send_drag_db(&drag, start, 500.0, fine, 70.0);
-        send_drag_db(&drag, start, 500.0 + travel, fine, 70.0)
+        let _ = send_drag_db(&drag, start, 500.0, fine);
+        send_drag_db(&drag, start, 500.0 - travel, fine)
     }
 
     #[test]
     fn a_few_pixels_move_a_send_by_a_fraction_of_a_db() {
         // A mouse event's usual 3 px: under a dB, not three whole dB.
         let moved = dragged(-10.0, 3.0, false) - -10.0;
-        assert!((moved - 0.75).abs() < 0.01, "3 px moved {moved} dB");
+        assert!((moved - 0.5).abs() < 0.01, "3 px moved {moved} dB");
         let fine = dragged(-10.0, 3.0, true) - -10.0;
         assert!(
-            (fine - 0.075).abs() < 0.01,
+            (fine - 0.05).abs() < 0.01,
             "3 px with Shift moved {fine} dB"
         );
     }

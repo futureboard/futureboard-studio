@@ -1031,6 +1031,12 @@ impl Render for StudioLayout {
             .capture_any_mouse_down(move |_event, window, cx| {
                 focus_holder_on_pointer.focus(window, cx);
             })
+            // A fader or send drag hides the pointer; whatever ends the drag,
+            // the release brings it back, even when the control that hid it
+            // has been rebuilt away meanwhile.
+            .capture_any_mouse_up(|_event, _window, _cx| {
+                crate::components::drag_pointer::show_after_drag();
+            })
             // Modifier changes travel the focus path, which the arrangement is
             // never on. Forward them so pressing or releasing Option over an
             // audio clip's cut zone shows or hides the razor line at once.
