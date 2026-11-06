@@ -1,10 +1,11 @@
 use crate::assets;
 use crate::components::timeline::timeline_state::{
     automation_value_to_y, automation_y_to_value, evaluate_automation, AutomationHover,
-    AutomationLaneState, AutomationMarquee, AutomationPoint, AutomationSampler, AutomationTarget,
-    TimelineGestureContext, TimelineState, HEADER_WIDTH,
+    AutomationLaneState, AutomationMarquee, AutomationMode, AutomationPoint, AutomationSampler,
+    AutomationTarget, TimelineGestureContext, TimelineState, HEADER_WIDTH, MASTER_TRACK_ID,
 };
 use crate::theme::{radius, space, typography, Colors};
+use gpui::prelude::FluentBuilder;
 use gpui::{
     canvas, div, fill, point, px, size, svg, AnyView, App, AppContext, Background, Bounds, Context,
     InteractiveElement, IntoElement, ParentElement, PathBuilder, PathStyle, Pixels, Point, Render,
@@ -34,12 +35,21 @@ fn lane_tooltip(text: &'static str) -> impl Fn(&mut Window, &mut App) -> AnyView
     move |_window, cx| cx.new(|_| LaneTooltipText(text)).into()
 }
 
-/// Left inset for automation sub-lane header content. Keeps lane titles visually
-/// nested under the parent track without shifting the timeline grid.
-const AUTOMATION_SUBLANE_HEADER_INDENT: f32 = 28.0;
+/// Width of the track's colour strip, carried down its automation rows from
+/// the track header so the block reads as part of the track.
+pub(crate) const AUTOMATION_TRACK_STRIP_W: f32 = 3.0;
 
-/// X-position of the vertical child-lane guide inside the header column.
-const AUTOMATION_SUBLANE_RAIL_X: f32 = 18.0;
+/// Where the automation section's content starts in the header column: the
+/// track header's own content inset, so the section's glyph sits in the same
+/// column as the track's handle.
+pub(crate) const AUTOMATION_CONTENT_X: f32 = AUTOMATION_TRACK_STRIP_W + space::BASE;
+
+/// X-position of the section's vertical guide: the centre of the 14 px glyph
+/// on its control row, so the guide hangs from it.
+pub(crate) const AUTOMATION_SUBLANE_RAIL_X: f32 = AUTOMATION_CONTENT_X + 7.0;
+
+/// Left inset for a lane's own content, one step right of the guide.
+const AUTOMATION_SUBLANE_HEADER_INDENT: f32 = AUTOMATION_SUBLANE_RAIL_X + space::LOOSE;
 
 /// Action fired from a sub-lane header control. One callback handles them all so
 /// new lane controls land without re-threading the whole call stack.
@@ -47,8 +57,11 @@ const AUTOMATION_SUBLANE_RAIL_X: f32 = 18.0;
 pub enum AutomationLaneAction {
     /// Focus the editor on this lane (header body click).
     Activate,
-    /// Toggle the lane's automation mode between Read and Off (enabled flag).
+    /// Step the lane's mode: Off, Read, Touch, Latch, Write.
     ToggleEnable,
+    /// Set the lane's mode directly from its segmented control: `None` is
+    /// Off.
+    SetMode(Option<crate::components::timeline::timeline_state::AutomationMode>),
     /// Remove every point but keep the lane.
     Clear,
     /// Remove the sub-lane (lane and its points).
@@ -98,7 +111,22 @@ fn target_category(target: &AutomationTarget) -> &'static str {
         | AutomationTarget::TrackPan
         | AutomationTarget::TrackMute => "Track",
         AutomationTarget::PluginParameter { .. } => "Plugin Parameter",
-        AutomationTarget::SendLevel { .. } => "Send",
+        AutomationTarget::SendLevel { .. } | AutomationTarget::SendEnabled { .. } => "Send",
+        AutomationTarget::InsertBypass { .. } => "Insert",
+    }
+}
+
+/// The kind of control a lane drives, as the glyph its mixer strip uses.
+fn target_icon(target: &AutomationTarget) -> &'static str {
+    match target {
+        AutomationTarget::TrackVolume => assets::ICON_SLIDERS_HORIZONTAL_PATH,
+        AutomationTarget::TrackPan => assets::ICON_ARROW_LEFT_RIGHT_PATH,
+        AutomationTarget::TrackMute => assets::ICON_VOLUME_X_PATH,
+        AutomationTarget::SendLevel { .. } | AutomationTarget::SendEnabled { .. } => {
+            assets::ICON_ROUTE_PATH
+        }
+        AutomationTarget::InsertBypass { .. } => assets::ICON_POWER_PATH,
+        AutomationTarget::PluginParameter { .. } => assets::ICON_PLUG_PATH,
     }
 }
 
@@ -185,6 +213,19 @@ pub fn automation_lane(
             gpui::MouseButton::Left,
             lane_action(AutomationLaneAction::Activate),
         )
+        // The track's colour strip, continued from its header. The master's
+        // block has no track to belong to.
+        .when(track_id != MASTER_TRACK_ID, |header| {
+            header.child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(px(AUTOMATION_TRACK_STRIP_W))
+                    .bg(Colors::with_alpha(track_color, 0.6)),
+            )
+        })
         // The section's nesting guide, continued from the control row; lit on
         // the lane being edited.
         .child(
@@ -201,10 +242,11 @@ pub fn automation_lane(
                 }),
         );
 
-    // ── Row 1: which parameter, and what it is worth now ─────────────────────
+    // ── Row 1: what the lane drives, and what it is worth now ────────────────
     //
-    // The name is a selector: it opens the track's parameter picker, the way a
-    // console automation strip chooses what it writes.
+    // The kind of control as an icon, then its name as a selector: it opens
+    // the track's parameter picker, the way a console automation strip
+    // chooses what it writes.
     let name_button = div()
         .id(("automation-lane-target", id_num))
         .flex()
@@ -217,18 +259,19 @@ pub fn automation_lane(
         .rounded(px(radius::CONTROL))
         .cursor(gpui::CursorStyle::PointingHand)
         .hover(move |s| s.bg(header_hover))
-        .tooltip(crate::components::fb_tooltip("Choose parameter"))
+        .tooltip(crate::components::fb_tooltip(format!(
+            "{category} \u{00b7} choose what this lane automates"
+        )))
         .on_mouse_down(
             gpui::MouseButton::Left,
             lane_action(AutomationLaneAction::PickTarget),
         )
         .child(
-            div()
+            svg()
+                .path(target_icon(&lane.target))
                 .flex_none()
-                .w(px(3.0))
-                .h(px(12.0))
-                .rounded(px(radius::PILL))
-                .bg(accent),
+                .size(px(14.0))
+                .text_color(if lane.enabled { accent } else { text_muted }),
         )
         .child(
             div()
@@ -247,14 +290,14 @@ pub fn automation_lane(
             svg()
                 .path(assets::ICON_CHEVRON_DOWN_PATH)
                 .flex_none()
-                .w(px(10.0))
-                .h(px(10.0))
+                .size(px(10.0))
                 .text_color(text_muted),
         );
 
     // The hovered point's value, else what the lane plays at the playhead —
-    // in the parameter's own unit. A hovered reading takes the curve's hue so
-    // it reads as "the point under the cursor", not the transport value.
+    // in the parameter's own unit, on a recessed field like every readout.
+    // A hovered reading takes the curve's hue so it reads as "the point under
+    // the cursor", not the transport value.
     let hovered_point_value = lane_hover
         .as_ref()
         .and_then(|h| h.point_id)
@@ -269,13 +312,21 @@ pub fn automation_lane(
     });
     let readout = div()
         .flex_none()
+        .flex()
+        .items_center()
+        .justify_end()
+        .min_w(px(52.0))
+        .h(px(18.0))
+        .px(px(space::SNUG))
+        .rounded(px(radius::CONTROL_SM))
+        .bg(Colors::surface_input())
         .text_size(px(typography::UI_XS))
         .font_weight(gpui::FontWeight::SEMIBOLD)
         .font_features(tabular_numerals())
         .text_color(if hovered_point_value.is_some() {
             Colors::automation_curve()
         } else if lane.enabled {
-            Colors::text_secondary()
+            Colors::text_primary()
         } else {
             text_muted
         })
@@ -291,62 +342,108 @@ pub fn automation_lane(
         .child(div().flex_1().min_w(px(0.0)).child(name_button))
         .child(readout);
 
-    // ── Row 2: mode and source, then the lane's own controls ─────────────────
+    // ── Row 2: the mode, as one flush segmented control, then the lane's own
+    // controls ────────────────────────────────────────────────────────────────
     //
-    // Two honest states: Read plays the lane back, Off bypasses it. Fill and
-    // border carry the state together (the latched language), never hue alone.
-    let (mode_label, mode_tip, mode_fill, mode_border, mode_text) = if lane.enabled {
-        let state_automation = Colors::state_automation();
-        let (fill, border) = Colors::latched(header_bg, state_automation);
-        (
-            "Read",
-            "Read — the lane drives the parameter. Click to bypass it.",
-            fill,
-            border,
-            state_automation,
-        )
-    } else {
-        (
-            "Off",
-            "Off — the lane is bypassed. Click to read it again.",
-            Colors::with_alpha(header_bg, 0.0),
-            border_subtle,
-            text_muted,
-        )
-    };
-    let mode_hover = Colors::composite(mode_fill, state_hover);
-    let mode_pill = div()
-        .id(("automation-lane-mode", id_num))
-        .flex_none()
+    // Off, Read, Touch, Latch, Write — each one click. Read takes the
+    // automation hue; the three that record take the record hue, so a lane
+    // that will write over the curve says so before the transport rolls. Fill
+    // and border carry the state together, never hue alone.
+    let current = lane.enabled.then_some(lane.mode);
+    let mut segments = div()
         .flex()
         .flex_row()
+        .flex_none()
         .items_center()
-        .gap(px(space::TIGHT))
         .h(px(18.0))
-        .px(px(space::SNUG))
-        .rounded(px(radius::CONTROL))
-        .bg(mode_fill)
+        .rounded(px(radius::CONTROL_SM))
         .border(px(1.0))
-        .border_color(mode_border)
-        .text_size(px(typography::UI_XS))
-        .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_color(mode_text)
-        .cursor(gpui::CursorStyle::PointingHand)
-        .hover(move |s| s.bg(mode_hover))
-        .tooltip(crate::components::fb_tooltip(mode_tip))
-        .on_mouse_down(
-            gpui::MouseButton::Left,
-            lane_action(AutomationLaneAction::ToggleEnable),
-        )
-        .child(
+        .border_color(border_subtle)
+        .bg(Colors::surface_input());
+    let choices: [(Option<AutomationMode>, &'static str, &'static str); 5] = [
+        (None, "Off", "Off \u{2014} the lane is bypassed"),
+        (
+            Some(AutomationMode::Read),
+            "R",
+            "Read \u{2014} the lane plays the parameter",
+        ),
+        (
+            Some(AutomationMode::Touch),
+            "T",
+            "Touch \u{2014} records while the control moves, then plays the lane again",
+        ),
+        (
+            Some(AutomationMode::Latch),
+            "L",
+            "Latch \u{2014} records from the first move until playback stops",
+        ),
+        (
+            Some(AutomationMode::Write),
+            "W",
+            "Write \u{2014} records the control for as long as playback runs",
+        ),
+    ];
+    for (index, (mode, label, tip)) in choices.into_iter().enumerate() {
+        let on = current == mode;
+        let hue = match mode {
+            None => text_muted,
+            Some(AutomationMode::Read) => Colors::state_automation(),
+            Some(_) => Colors::state_arm(),
+        };
+        let (fill, border) = if on && mode.is_some() {
+            Colors::latched(header_bg, hue)
+        } else if on {
+            (
+                Colors::composite(header_bg, Colors::state_selected()),
+                border_subtle,
+            )
+        } else {
+            (
+                Colors::with_alpha(header_bg, 0.0),
+                Colors::with_alpha(border_subtle, 0.0),
+            )
+        };
+        let hover = Colors::composite(fill, state_hover);
+        let recording = on && lane.recording;
+        segments = segments.child(
             div()
-                .w(px(5.0))
-                .h(px(5.0))
-                .rounded(px(radius::PILL))
-                .bg(mode_text),
-        )
-        .child(mode_label);
+                .id((
+                    "automation-lane-mode",
+                    id_num.wrapping_mul(8).wrapping_add(index),
+                ))
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap(px(space::HAIR))
+                .h_full()
+                .min_w(px(if mode.is_none() { 26.0 } else { 18.0 }))
+                .px(px(space::TIGHT))
+                .bg(fill)
+                .border(px(1.0))
+                .border_color(border)
+                .text_size(px(typography::UI_XS))
+                .font_weight(if on {
+                    gpui::FontWeight::BOLD
+                } else {
+                    gpui::FontWeight::MEDIUM
+                })
+                .text_color(if on { hue } else { text_muted })
+                .cursor(gpui::CursorStyle::PointingHand)
+                .hover(move |s| s.bg(hover))
+                .tooltip(crate::components::fb_tooltip(tip))
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    lane_action(AutomationLaneAction::SetMode(mode)),
+                )
+                // A lane being written right now shows a dot in its mode.
+                .when(recording, |segment| {
+                    segment.child(div().size(px(4.0)).rounded(px(radius::PILL)).bg(hue))
+                })
+                .child(label),
+        );
+    }
 
+    let point_count = lane.points.len();
     let mode_row = div()
         .flex()
         .flex_row()
@@ -362,14 +459,19 @@ pub fn automation_lane(
                 .gap(px(space::SNUG))
                 .min_w(px(0.0))
                 .pl(px(space::TIGHT))
-                .child(mode_pill)
+                .child(segments)
                 .child(
                     div()
                         .min_w(px(0.0))
                         .truncate()
                         .text_size(px(typography::UI_XS))
+                        .font_features(tabular_numerals())
                         .text_color(text_muted)
-                        .child(category),
+                        .child(match point_count {
+                            0 => "No points".to_string(),
+                            1 => "1 point".to_string(),
+                            n => format!("{n} points"),
+                        }),
                 ),
         )
         .child({
@@ -410,7 +512,7 @@ pub fn automation_lane(
             .flex()
             .flex_col()
             .justify_center()
-            .gap(px(space::TIGHT))
+            .gap(px(space::SNUG))
             .w_full()
             .h_full()
             .pl(px(AUTOMATION_SUBLANE_HEADER_INDENT))

@@ -417,6 +417,50 @@ impl TimelineState {
                 changed = true;
             }
         }
+        changed |= self.recompute_automated_sends(beat);
+        changed
+    }
+
+    /// What each send's lanes play at `beat`, for the send controls to show
+    /// (the engine plays the same lanes on its own). A lane shows only while
+    /// it reads — enabled, with points, and not being recorded, when the
+    /// control itself is what is heard. Returns whether any shown value moved.
+    fn recompute_automated_sends(&mut self, beat: f32) -> bool {
+        let mut changed = false;
+        for track in &mut self.tracks {
+            if track.sends.is_empty() {
+                continue;
+            }
+            let lane_value = |want: &dyn Fn(&AutomationTarget) -> bool| {
+                track
+                    .automation_lanes
+                    .iter()
+                    .find(|l| l.enabled && !l.recording && !l.points.is_empty() && want(&l.target))
+                    .map(|l| evaluate_automation(&l.points, beat as f64, l.target.default_value()))
+            };
+            let mut shown = Vec::with_capacity(track.sends.len());
+            for send in &track.sends {
+                let level = lane_value(
+                    &|t| matches!(t, AutomationTarget::SendLevel { send_id } if *send_id == send.id),
+                );
+                let on = lane_value(
+                    &|t| matches!(t, AutomationTarget::SendEnabled { send_id } if *send_id == send.id),
+                );
+                shown.push(match (on, level) {
+                    (None, None) => None,
+                    (on, level) => Some((
+                        on.map_or(send.enabled, |v| v >= 0.5),
+                        level.map_or(send.gain_db, volume::norm_to_db),
+                    )),
+                });
+            }
+            for (send, shown) in track.sends.iter_mut().zip(shown) {
+                if send.automated != shown {
+                    send.automated = shown;
+                    changed = true;
+                }
+            }
+        }
         changed
     }
 

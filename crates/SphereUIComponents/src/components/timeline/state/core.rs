@@ -34,6 +34,15 @@ pub struct MasterBusState {
     /// routing itself is the id in `master_output_connection_id`, so a rename
     /// changes this string and nothing else.
     pub output_label: String,
+    /// Master automation: Volume, insert bypass and master plug-in parameters.
+    /// Saved with the project (v61).
+    pub automation_lanes: Vec<AutomationLaneState>,
+    /// The lane the master's editor is on. Mirrors
+    /// `TrackState::selected_automation_target`.
+    pub selected_automation_target: Option<AutomationTarget>,
+    /// Whether the arrangement shows the master's automation block — the
+    /// master's counterpart of a track's Automation lane mode.
+    pub automation_expanded: bool,
 }
 
 /// Which signal the Control Room monitors. Mirrors the engine's
@@ -441,6 +450,9 @@ impl Default for TimelineState {
                 meter_peak_hold_r: 0.0,
                 meter_clip: false,
                 output_label: crate::output_routing::NO_OUTPUT_LABEL.to_string(),
+                automation_lanes: Vec::new(),
+                selected_automation_target: None,
+                automation_expanded: false,
             },
             monitor: MonitorBusState {
                 source: MonitorSourceKind::MasterBus,

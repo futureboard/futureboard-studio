@@ -30,12 +30,27 @@ pub struct SendSlotState {
     /// Realtime currently honours post-fader only (pre-fader is a refinement).
     pub pre_fader: bool,
     pub gain_db: f32,
+    /// What its automation lanes play at the playhead — `(on, gain dB)` — when
+    /// a lane in Read has something to say. UI-only, refreshed on the playback
+    /// tick by [`TimelineState::recompute_effective_volumes`]; `gain_db` and
+    /// `enabled` stay the send's own setting, which the engine falls back to.
+    pub automated: Option<(bool, f32)>,
 }
 
 impl SendSlotState {
     /// Linear send gain from `gain_db` (clamped to a sane range).
     pub fn gain_linear(&self) -> f32 {
         10f32.powf(self.gain_db.clamp(-60.0, 6.0) / 20.0)
+    }
+
+    /// The level the send shows: what automation plays, else its own.
+    pub fn display_gain_db(&self) -> f32 {
+        self.automated.map_or(self.gain_db, |(_, db)| db)
+    }
+
+    /// Whether the send shows as on: what automation plays, else its own.
+    pub fn display_enabled(&self) -> bool {
+        self.automated.map_or(self.enabled, |(on, _)| on)
     }
 }
 
@@ -648,6 +663,7 @@ impl TimelineState {
             enabled: true,
             pre_fader: false,
             gain_db: 0.0,
+            automated: None,
         });
         if routing_debug_enabled() {
             eprintln!(

@@ -40,13 +40,13 @@ impl TimelineState {
     /// with [`TrackAutomationView::change_to`], or use
     /// [`Self::edit_automation_view`].
     pub fn track_automation_view(&self, track_id: &str) -> TrackAutomationView {
-        let Some(track) = self.find_track(track_id) else {
+        let Some(lanes) = self.automation_lanes_of(track_id) else {
             return TrackAutomationView::default();
         };
         TrackAutomationView {
-            focus: (track.lane_mode == TrackLaneMode::Automation)
+            focus: (self.track_lane_mode(track_id) == TrackLaneMode::Automation)
                 .then(|| self.active_automation_target(track_id)),
-            lane_count: track.automation_lanes.len(),
+            lane_count: lanes.len(),
         }
     }
 

@@ -69,6 +69,8 @@ impl TimelineState {
                 target: AutomationTarget::TrackVolume,
                 enabled: true,
                 visible: false,
+                mode: AutomationMode::Read,
+                recording: false,
                 points: vec![
                     AutomationPoint::new(0.0, 0.8),
                     AutomationPoint::new(4.0, 0.5),
@@ -293,6 +295,9 @@ impl TimelineState {
                 meter_peak_hold_r: 0.0,
                 meter_clip: false,
                 output_label: crate::output_routing::NO_OUTPUT_LABEL.to_string(),
+                automation_lanes: Vec::new(),
+                selected_automation_target: None,
+                automation_expanded: false,
             },
             monitor: MonitorBusState {
                 source: MonitorSourceKind::MasterBus,

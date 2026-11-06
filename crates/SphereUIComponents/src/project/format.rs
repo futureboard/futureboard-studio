@@ -162,7 +162,12 @@ pub const PROJECT_MAGIC: &[u8; 8] = b"FBSTUD1\0";
 /// followed by that track's id. No earlier file holds it.
 /// v60 appends each track's freeze: a flag, then the bounce's path, start
 /// beat and duration. A pre-v60 track is not frozen.
-pub const PROJECT_VERSION: u32 = 60;
+/// v61 adds automation target tags 5 (a send's on/off, by send id) and 6 (an
+/// insert's bypass, by insert id), and appends each automation lane's mode
+/// (Read 0, Touch 1, Latch 2, Write 3) after its points. A pre-v61 lane reads.
+/// v62 appends the master bus's automation lanes after its inserts, then a
+/// flag for whether the arrangement shows them. A pre-v62 master has none.
+pub const PROJECT_VERSION: u32 = 62;
 
 /// Oldest on-disk format version whose migration to the current one is
 /// supported (see [`super::migrate`]): v30, which introduced arrangement
@@ -642,7 +647,7 @@ fn encode_insert(w: &mut FbWriter, ins: &ProjectInsert) {
     }
 }
 
-fn encode_automation_lane(w: &mut FbWriter, lane: &AutomationLane) {
+fn encode_automation_lane(w: &mut FbWriter, lane: &AutomationLane, version: u32) {
     w.write_str(&lane.id);
     w.write_str(&lane.parameter_name);
     w.write_bool(lane.visible);
@@ -659,6 +664,9 @@ fn encode_automation_lane(w: &mut FbWriter, lane: &AutomationLane) {
         w.write_f32(p.value);
         w.write_u8(p.curve); // v2
         w.write_f32(p.tension); // v21
+    }
+    if version >= 61 {
+        w.write_u8(lane.mode);
     }
 }
 
@@ -1107,7 +1115,7 @@ fn encode_track(w: &mut FbWriter, t: &ProjectTrack, version: u32) {
     // automation lanes
     w.write_u32(t.automation_lanes.len() as u32);
     for lane in &t.automation_lanes {
-        encode_automation_lane(w, lane);
+        encode_automation_lane(w, lane, version);
     }
     // clips
     w.write_u32(t.clips.len() as u32);
@@ -1587,6 +1595,13 @@ fn encode_body_versioned(project: &FutureboardProject, version: u32) -> Vec<u8> 
     w.write_u32(project.mixer.master_inserts.len() as u32);
     for ins in &project.mixer.master_inserts {
         encode_insert(&mut w, ins);
+    }
+    if version >= 62 {
+        w.write_u32(project.mixer.master_automation_lanes.len() as u32);
+        for lane in &project.mixer.master_automation_lanes {
+            encode_automation_lane(&mut w, lane, version);
+        }
+        w.write_u8(u8::from(project.mixer.master_automation_expanded));
     }
 
     // Tracks
@@ -2654,7 +2669,9 @@ fn decode_automation_lane(r: &mut FbReader, version: u32) -> Result<AutomationLa
             tension,
         });
     }
+    let mode = if version >= 61 { r.read_u8()? } else { 0 };
     Ok(AutomationLane {
+        mode,
         id,
         parameter_name,
         target,
@@ -3418,6 +3435,16 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
     } else {
         Vec::new()
     };
+    let (master_automation_lanes, master_automation_expanded) = if version >= 62 {
+        let lane_count = r.read_u32()? as usize;
+        let mut lanes = Vec::with_capacity(lane_count.min(4096));
+        for _ in 0..lane_count {
+            lanes.push(decode_automation_lane(&mut r, version)?);
+        }
+        (lanes, r.read_u8()? != 0)
+    } else {
+        (Vec::new(), false)
+    };
 
     let track_count = r.read_u32()? as usize;
     let mut tracks = Vec::with_capacity(track_count);
@@ -3839,6 +3866,8 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
         mixer: ProjectMixer {
             master_volume_norm,
             master_inserts,
+            master_automation_lanes,
+            master_automation_expanded,
             tree_expanded_node_ids,
             tree_pinned_channel_ids,
             tree_hidden_channel_ids,
@@ -4267,7 +4296,9 @@ mod tests {
 
     fn encode_legacy_song_text_project(version: u32, cues: &[LegacyProjectSongTextCue]) -> Vec<u8> {
         let project = FutureboardProject::new("Legacy Song Text");
-        let mut body = encode_body(&project);
+        // The v61 layout: v62 puts master lanes mid-body, which an older
+        // fixture made by trimming the tail must not carry.
+        let mut body = encode_body_versioned(&project, 61);
         // `encode_body` ends with the Song Text count, the v34 Audio
         // Connections count, the v35 output-routing block (two absent optional
         // strings plus the bootstrap latch), the v40 conductor-lane fold block
@@ -5799,7 +5830,9 @@ mod tests {
     fn a_v53_project_loads_the_default_view() {
         let mut project = FutureboardProject::new("v53");
         project.view = sample_view();
-        let mut body = encode_body(&project);
+        // The v61 layout: v62 puts master lanes mid-body, which an older
+        // fixture made by trimming the tail must not carry.
+        let mut body = encode_body_versioned(&project, 61);
         body.truncate(body.len() - view_section_len(&project.view));
         let bytes = project_bytes_with_version(body, 53);
         assert!(matches!(
@@ -6010,7 +6043,9 @@ mod tests {
     fn a_v53_ara_document_loads_without_a_record() {
         let mut project = FutureboardProject::new("v53 ara");
         project.ara_documents = vec![ara_document("track-1", None)];
-        let mut body = encode_body(&project);
+        // The v61 layout: v62 puts master lanes mid-body, which an older
+        // fixture made by trimming the tail must not carry.
+        let mut body = encode_body_versioned(&project, 61);
         body.truncate(body.len() - view_section_len(&project.view));
         let decoded =
             decode_project_with_options(&project_bytes_with_version(body, 53), true).unwrap();

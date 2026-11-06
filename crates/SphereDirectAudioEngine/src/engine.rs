@@ -7673,6 +7673,8 @@ mod bridge_insert_tests {
                 kind: "external-bridge-plugin".to_string(),
                 kind_tag: crate::runtime::RuntimeInsertKind::ExternalBridge,
                 enabled: true,
+                bypass_lane: None,
+                automation_bypassed: false,
                 params,
                 bridge_is_effect: true,
                 bridge_is_builtin: false,
@@ -8024,6 +8026,8 @@ mod bridge_insert_tests {
             level: 1.0,
             enabled: true,
             pre_fader: false,
+            level_lane: None,
+            enabled_lane: None,
         }];
         let mut ret = bridge_effect_track(1.0);
         ret.id = "ret".to_string();
@@ -8167,7 +8171,7 @@ mod bridge_insert_tests {
         assert!((track.block_r[0] - 1.0).abs() < 1e-6);
     }
 
-    fn bridge_effect_track_with_id(id: &str) -> RuntimeInsert {
+    pub(super) fn bridge_effect_track_with_id(id: &str) -> RuntimeInsert {
         let mut params = HashMap::new();
         params.insert("role".to_string(), serde_json::json!("effect"));
         RuntimeInsert {
@@ -8175,6 +8179,8 @@ mod bridge_insert_tests {
             kind: "external-bridge-plugin".to_string(),
             kind_tag: crate::runtime::RuntimeInsertKind::ExternalBridge,
             enabled: true,
+            bypass_lane: None,
+            automation_bypassed: false,
             params,
             bridge_is_effect: true,
             bridge_is_builtin: false,
@@ -8565,6 +8571,8 @@ mod routing_tests {
             level,
             enabled: true,
             pre_fader: false,
+            level_lane: None,
+            enabled_lane: None,
         }
     }
 
@@ -8585,6 +8593,72 @@ mod routing_tests {
                 tension: 0.0,
             }],
         }
+    }
+
+    /// Send level and on/off lanes override the send while they have
+    /// something to say, and an insert-bypass lane bypasses its insert while
+    /// playing — and only then.
+    #[test]
+    fn send_and_bypass_automation_override_the_controls() {
+        use crate::runtime::{volume_db_to_norm, volume_norm_to_linear};
+        let mut src = track("src", "audio", vec![send("ret", 1.0)]);
+        src.inserts = vec![super::bridge_insert_tests::bridge_effect_track_with_id("fx")];
+        let send_id = src.sends[0].id.clone();
+        src.automation_lanes = vec![
+            automation_lane(
+                RuntimeAutomationTarget::SendGain {
+                    send_id: send_id.clone(),
+                },
+                volume_db_to_norm(-6.0),
+                true,
+            ),
+            automation_lane(RuntimeAutomationTarget::SendEnabled { send_id }, 0.0, true),
+            automation_lane(
+                RuntimeAutomationTarget::InsertBypass {
+                    insert_id: "fx".to_string(),
+                },
+                1.0,
+                true,
+            ),
+        ];
+        crate::runtime::resolve_send_and_bypass_lanes(&mut src);
+
+        let (enabled, level) = src.send_state_at(0, 4.0);
+        assert!(!enabled, "the on/off lane switched the send off");
+        let expected = volume_norm_to_linear(volume_db_to_norm(-6.0));
+        assert!((level - expected).abs() < 1e-6, "{level} vs {expected}");
+
+        render::apply_insert_bypass_automation(&mut src, Some(4.0));
+        assert!(!src.inserts[0].active(), "bypassed by its lane while playing");
+        render::apply_insert_bypass_automation(&mut src, None);
+        assert!(src.inserts[0].active(), "its own switch stands while stopped");
+
+        // A disabled (Off) lane says nothing: the send's own values stand.
+        for lane in &mut src.automation_lanes {
+            lane.enabled = false;
+        }
+        assert_eq!(src.send_state_at(0, 4.0), (true, 1.0));
+    }
+
+    /// A Master Volume lane with points sets the master gain; with none, or
+    /// switched off, the master fader stands.
+    #[test]
+    fn master_volume_lane_overrides_the_master_fader() {
+        use crate::runtime::{volume_db_to_norm, volume_norm_to_linear};
+        let mut master = track("master", "master", vec![]);
+        master.automation_lanes = vec![automation_lane(
+            RuntimeAutomationTarget::TrackVolume,
+            volume_db_to_norm(-12.0),
+            true,
+        )];
+        let mut tracks = vec![track("a", "audio", vec![]), master];
+        let gain = render::master_automation_volume(&tracks, Some(1), 4.0).expect("lane value");
+        let expected = volume_norm_to_linear(volume_db_to_norm(-12.0));
+        assert!((gain - expected).abs() < 1e-6, "{gain} vs {expected}");
+        assert_eq!(render::master_automation_volume(&tracks, None, 4.0), None);
+
+        tracks[1].automation_lanes[0].enabled = false;
+        assert_eq!(render::master_automation_volume(&tracks, Some(1), 4.0), None);
     }
 
     #[test]
@@ -9017,7 +9091,7 @@ mod routing_tests {
         p.tracks[0].block_l[..frames].fill(1.0);
         p.tracks[0].block_r[..frames].fill(-2.0);
 
-        accumulate_sends(&mut p, 0, frames, false);
+        accumulate_sends(&mut p, 0, frames, false, 0.0);
 
         assert!(p.tracks[1].recv_l[..frames]
             .iter()
@@ -9046,7 +9120,7 @@ mod routing_tests {
         p.update_track_send_level(9, 0, 1.0);
         p.tracks[0].block_l[..frames].fill(1.0);
 
-        accumulate_sends(&mut p, 0, frames, false);
+        accumulate_sends(&mut p, 0, frames, false, 0.0);
 
         assert!(p.tracks[1].recv_l[..frames]
             .iter()
@@ -9072,11 +9146,11 @@ mod routing_tests {
         p.tracks[0].block_l[..frames].fill(1.0);
 
         // Post-fader phase: the pre-fader send must NOT route.
-        accumulate_sends(&mut p, 0, frames, false);
+        accumulate_sends(&mut p, 0, frames, false, 0.0);
         assert!(p.tracks[1].recv_l[..frames].iter().all(|&v| v == 0.0));
 
         // Pre-fader phase: now it routes.
-        accumulate_sends(&mut p, 0, frames, true);
+        accumulate_sends(&mut p, 0, frames, true, 0.0);
         assert!(p.tracks[1].recv_l[..frames]
             .iter()
             .all(|&v| (v - 1.0).abs() < 1e-6));
@@ -9095,7 +9169,7 @@ mod routing_tests {
         };
         p.resolve_indices();
         p.tracks[0].block_l[..frames].fill(1.0);
-        accumulate_sends(&mut p, 0, frames, false);
+        accumulate_sends(&mut p, 0, frames, false, 0.0);
         // Target is a normal audio track → not a valid send destination.
         assert!(p.tracks[1].recv_l[..frames].iter().all(|&v| v == 0.0));
     }
@@ -9116,7 +9190,7 @@ mod routing_tests {
         p.resolve_indices();
         p.tracks[1].block_l[..frames].fill(1.0);
 
-        accumulate_sends(&mut p, 1, frames, false);
+        accumulate_sends(&mut p, 1, frames, false, 0.0);
 
         assert!(p.tracks[0].recv_l[..frames]
             .iter()
@@ -9141,8 +9215,8 @@ mod routing_tests {
         p.tracks[0].block_l[..frames].fill(1.0);
         p.tracks[1].block_l[..frames].fill(1.0);
 
-        accumulate_sends(&mut p, 0, frames, false);
-        accumulate_sends(&mut p, 1, frames, false);
+        accumulate_sends(&mut p, 0, frames, false, 0.0);
+        accumulate_sends(&mut p, 1, frames, false, 0.0);
 
         // Both directions accumulate at the raw accumulate_sends layer (indices
         // resolve); the planner is what keeps cycles out of a built project.

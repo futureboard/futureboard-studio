@@ -289,7 +289,10 @@ pub struct AutomationPickerModel {
     pub last_touched: Option<LastTouchedPluginParam>,
     pub instrument: Option<AutomationPickerPluginGroup>,
     pub effects: Vec<AutomationPickerPluginGroup>,
-    pub track_targets: Vec<(AutomationTarget, bool)>,
+    /// Track-level targets — volume, pan, mute, each send's level and on/off,
+    /// each insert's bypass — with the label to show and whether a lane for it
+    /// already exists.
+    pub track_targets: Vec<(AutomationTarget, String, bool)>,
 }
 
 /// Interpolation shape between an automation point and the next one.
@@ -350,6 +353,14 @@ pub enum AutomationTarget {
     SendLevel {
         send_id: String,
     },
+    /// A send's on/off switch.
+    SendEnabled {
+        send_id: String,
+    },
+    /// An insert's bypass.
+    InsertBypass {
+        insert_id: String,
+    },
 }
 
 impl AutomationTarget {
@@ -360,7 +371,9 @@ impl AutomationTarget {
             AutomationTarget::TrackPan => "Pan".to_string(),
             AutomationTarget::TrackMute => "Mute".to_string(),
             AutomationTarget::PluginParameter { parameter_name, .. } => parameter_name.clone(),
-            AutomationTarget::SendLevel { send_id } => format!("Send {send_id}"),
+            AutomationTarget::SendLevel { .. } => "Send Level".to_string(),
+            AutomationTarget::SendEnabled { .. } => "Send On/Off".to_string(),
+            AutomationTarget::InsertBypass { .. } => "Bypass".to_string(),
         }
     }
 
@@ -372,7 +385,10 @@ impl AutomationTarget {
             AutomationTarget::TrackPan => 0.5,
             AutomationTarget::TrackMute => 0.0,
             AutomationTarget::PluginParameter { .. } => 0.5,
-            AutomationTarget::SendLevel { .. } => 0.0,
+            // The send's own unity, on the same fader law as the track's.
+            AutomationTarget::SendLevel { .. } => volume::db_to_norm(0.0),
+            AutomationTarget::SendEnabled { .. } => 1.0,
+            AutomationTarget::InsertBypass { .. } => 0.0,
         }
     }
 
@@ -388,9 +404,15 @@ impl AutomationTarget {
                 crate::components::knob::format_pan_label(norm * 2.0 - 1.0)
             }
             AutomationTarget::TrackMute => if norm >= 0.5 { "Muted" } else { "Open" }.to_string(),
-            AutomationTarget::PluginParameter { .. } | AutomationTarget::SendLevel { .. } => {
-                format!("{:.0}%", norm * 100.0)
+            // A send is a fader too: same law, same readout.
+            AutomationTarget::SendLevel { .. } => format!("{} dB", volume::format_db(norm)),
+            AutomationTarget::SendEnabled { .. } => {
+                if norm >= 0.5 { "On" } else { "Off" }.to_string()
             }
+            AutomationTarget::InsertBypass { .. } => {
+                if norm >= 0.5 { "Bypassed" } else { "Active" }.to_string()
+            }
+            AutomationTarget::PluginParameter { .. } => format!("{:.0}%", norm * 100.0),
         }
     }
 
@@ -402,6 +424,8 @@ impl AutomationTarget {
             AutomationTarget::TrackMute => 2,
             AutomationTarget::PluginParameter { .. } => 3,
             AutomationTarget::SendLevel { .. } => 4,
+            AutomationTarget::SendEnabled { .. } => 5,
+            AutomationTarget::InsertBypass { .. } => 6,
         }
     }
 
@@ -461,6 +485,76 @@ impl AutomationPoint {
     }
 }
 
+/// What an enabled lane does while the transport plays. A lane that is off
+/// (`enabled == false`) does none of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AutomationMode {
+    /// Plays the lane.
+    #[default]
+    Read,
+    /// Plays the lane, and records the control while it is being moved; let
+    /// go and the lane takes over again.
+    Touch,
+    /// Like Touch, but once moved the control's value keeps being recorded
+    /// until the transport stops.
+    Latch,
+    /// Records the control for as long as the transport plays.
+    Write,
+}
+
+impl AutomationMode {
+    pub const ALL: [Self; 4] = [Self::Read, Self::Touch, Self::Latch, Self::Write];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Read => "Read",
+            Self::Touch => "Touch",
+            Self::Latch => "Latch",
+            Self::Write => "Write",
+        }
+    }
+
+    /// Whether the mode records while playing.
+    pub fn records(self) -> bool {
+        !matches!(self, Self::Read)
+    }
+
+    pub fn to_tag(self) -> u8 {
+        match self {
+            Self::Read => 0,
+            Self::Touch => 1,
+            Self::Latch => 2,
+            Self::Write => 3,
+        }
+    }
+
+    pub fn from_tag(tag: u8) -> Self {
+        match tag {
+            1 => Self::Touch,
+            2 => Self::Latch,
+            3 => Self::Write,
+            _ => Self::Read,
+        }
+    }
+}
+
+/// One copied automation point, relative to the first point copied.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AutomationClipboardPoint {
+    pub offset: f32,
+    pub value: f32,
+    pub curve: AutomationCurve,
+    pub tension: f32,
+}
+
+/// Points copied from an automation lane, for Paste.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AutomationClipboard {
+    pub points: Vec<AutomationClipboardPoint>,
+    /// Beats from the first point to the last.
+    pub span: f32,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct AutomationLaneState {
     pub id: String,
@@ -473,6 +567,12 @@ pub struct AutomationLaneState {
     /// in-track automation overlay shown by [`TrackLaneMode::Automation`]).
     pub visible: bool,
     pub points: Vec<AutomationPoint>,
+    /// What the lane does while playing, when enabled.
+    pub mode: AutomationMode,
+    /// A pass is recording into this lane right now. UI-only, never saved:
+    /// the engine holds the lane back meanwhile so the moving control is what
+    /// is heard (see `engine_snapshot`).
+    pub recording: bool,
 }
 
 impl AutomationLaneState {
@@ -485,6 +585,8 @@ impl AutomationLaneState {
             enabled: true,
             visible: false,
             points: Vec::new(),
+            mode: AutomationMode::Read,
+            recording: false,
         }
     }
 
@@ -637,9 +739,79 @@ impl TimelineState {
     // and target/lane changes are committed edits the caller marks dirty once.
 
     pub fn track_lane_mode(&self, track_id: &str) -> TrackLaneMode {
+        if track_id == MASTER_TRACK_ID {
+            // The master has no clips: its "lane mode" is whether its
+            // automation block is shown.
+            return if self.master.automation_expanded {
+                TrackLaneMode::Automation
+            } else {
+                TrackLaneMode::Clips
+            };
+        }
         self.find_track(track_id)
             .map(|t| t.lane_mode)
             .unwrap_or(TrackLaneMode::Clips)
+    }
+
+    /// The automation lanes of `track_id`: a track's, or the master bus's for
+    /// [`MASTER_TRACK_ID`].
+    pub fn automation_lanes_of(&self, track_id: &str) -> Option<&[AutomationLaneState]> {
+        if track_id == MASTER_TRACK_ID {
+            return Some(&self.master.automation_lanes);
+        }
+        self.find_track(track_id)
+            .map(|track| track.automation_lanes.as_slice())
+    }
+
+    /// The lanes and the selected target of `track_id`, mutably — the one place
+    /// that knows the master bus keeps its own.
+    pub(super) fn automation_host_mut(
+        &mut self,
+        track_id: &str,
+    ) -> Option<(&mut Vec<AutomationLaneState>, &mut Option<AutomationTarget>)> {
+        if track_id == MASTER_TRACK_ID {
+            let master = &mut self.master;
+            return Some((
+                &mut master.automation_lanes,
+                &mut master.selected_automation_target,
+            ));
+        }
+        let track = self.tracks.iter_mut().find(|t| t.id == track_id)?;
+        Some((
+            &mut track.automation_lanes,
+            &mut track.selected_automation_target,
+        ))
+    }
+
+    fn selected_automation_target_of(&self, track_id: &str) -> Option<AutomationTarget> {
+        if track_id == MASTER_TRACK_ID {
+            return self.master.selected_automation_target.clone();
+        }
+        self.find_track(track_id)?
+            .selected_automation_target
+            .clone()
+    }
+
+    /// Every master control that can be automated: its volume, then each
+    /// loaded insert's bypass.
+    pub fn master_automation_targets(&self) -> Vec<AutomationTarget> {
+        let mut out = vec![AutomationTarget::TrackVolume];
+        for insert in self
+            .master
+            .inserts
+            .iter()
+            .filter(|insert| !insert.is_empty())
+        {
+            out.push(AutomationTarget::InsertBypass {
+                insert_id: insert.id.clone(),
+            });
+        }
+        out
+    }
+
+    /// Whether any master lane is shown in the arrangement.
+    pub fn master_automation_shown(&self) -> bool {
+        self.master.automation_expanded
     }
 
     /// Toggle a track between Clip and Automation mode. Never reaches the
@@ -648,6 +820,15 @@ impl TimelineState {
     /// makes sure a lane exists for the active target so the editor has
     /// something to draw.
     pub fn toggle_track_lane_mode(&mut self, track_id: &str) -> Option<TrackLaneMode> {
+        if track_id == MASTER_TRACK_ID {
+            self.master.automation_expanded = !self.master.automation_expanded;
+            let mode = self.track_lane_mode(track_id);
+            if mode == TrackLaneMode::Automation {
+                let target = self.active_automation_target(track_id);
+                let _ = self.ensure_automation_lane(track_id, target);
+            }
+            return Some(mode);
+        }
         let new_mode = {
             let track = self.tracks.iter_mut().find(|t| t.id == track_id)?;
             track.lane_mode = match track.lane_mode {
@@ -669,27 +850,132 @@ impl TimelineState {
     /// The target the lane editor is focused on for a track (selected target,
     /// else the first existing lane's target, else Track Volume).
     pub fn active_automation_target(&self, track_id: &str) -> AutomationTarget {
-        let Some(track) = self.find_track(track_id) else {
-            return AutomationTarget::TrackVolume;
-        };
-        if let Some(target) = track.selected_automation_target.clone() {
+        if let Some(target) = self.selected_automation_target_of(track_id) {
             return target;
         }
-        track
-            .automation_lanes
-            .first()
+        self.automation_lanes_of(track_id)
+            .and_then(|lanes| lanes.first())
             .map(|l| l.target.clone())
             .unwrap_or(AutomationTarget::TrackVolume)
     }
 
-    /// Targets offered by the picker for a track: Volume, Pan, Mute, then plugin
-    /// parameters (when metadata is available from the plugin host).
-    pub fn available_automation_targets(&self, track_id: &str) -> Vec<AutomationTarget> {
+    /// Every mixer control of `track` that can be automated, in channel-strip
+    /// order: volume, pan, mute, then each send's level and on/off, then each
+    /// loaded insert's bypass.
+    pub fn mixer_automation_targets(track: &TrackState) -> Vec<AutomationTarget> {
         let mut out = vec![
             AutomationTarget::TrackVolume,
             AutomationTarget::TrackPan,
             AutomationTarget::TrackMute,
         ];
+        for send in &track.sends {
+            out.push(AutomationTarget::SendLevel {
+                send_id: send.id.clone(),
+            });
+            out.push(AutomationTarget::SendEnabled {
+                send_id: send.id.clone(),
+            });
+        }
+        for insert in track.inserts.iter().filter(|insert| !insert.is_empty()) {
+            out.push(AutomationTarget::InsertBypass {
+                insert_id: insert.id.clone(),
+            });
+        }
+        out
+    }
+
+    /// What a lane for `target` is called on `track`: a send by where it
+    /// goes, a bypass by the plug-in it switches.
+    pub fn automation_target_label_for(track: &TrackState, target: &AutomationTarget) -> String {
+        let send_name = |send_id: &str| {
+            track
+                .sends
+                .iter()
+                .find(|send| send.id == send_id)
+                .map(|send| send.target_name.clone())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| "Send".to_string())
+        };
+        match target {
+            AutomationTarget::SendLevel { send_id } => {
+                format!("Send \u{2192} {}", send_name(send_id))
+            }
+            AutomationTarget::SendEnabled { send_id } => {
+                format!("Send \u{2192} {} On/Off", send_name(send_id))
+            }
+            AutomationTarget::InsertBypass { insert_id } => {
+                let plugin = track
+                    .inserts
+                    .iter()
+                    .find(|insert| insert.id == *insert_id)
+                    .map(|insert| insert.display_name.clone())
+                    .unwrap_or_else(|| "Insert".to_string());
+                format!("{plugin} Bypass")
+            }
+            other => other.display_name(),
+        }
+    }
+
+    /// [`Self::automation_target_label_for`] by track id.
+    pub fn automation_target_label(&self, track_id: &str, target: &AutomationTarget) -> String {
+        if track_id == MASTER_TRACK_ID {
+            return match target {
+                AutomationTarget::TrackVolume => "Master Volume".to_string(),
+                AutomationTarget::InsertBypass { insert_id } => {
+                    let plugin = self
+                        .master
+                        .inserts
+                        .iter()
+                        .find(|insert| insert.id == *insert_id)
+                        .map(|insert| insert.display_name.clone())
+                        .unwrap_or_else(|| "Insert".to_string());
+                    format!("{plugin} Bypass")
+                }
+                other => other.display_name(),
+            };
+        }
+        self.find_track(track_id)
+            .map(|track| Self::automation_target_label_for(track, target))
+            .unwrap_or_else(|| target.display_name())
+    }
+
+    /// Targets offered by the picker for a track: its mixer controls, then
+    /// plugin parameters (when metadata is available from the plugin host).
+    pub fn available_automation_targets(&self, track_id: &str) -> Vec<AutomationTarget> {
+        if track_id == MASTER_TRACK_ID {
+            let mut out = self.master_automation_targets();
+            for insert in self
+                .master
+                .inserts
+                .iter()
+                .filter(|insert| !insert.is_empty())
+            {
+                for param in &insert.parameters {
+                    if !Self::plugin_parameter_picker_visible(param) {
+                        continue;
+                    }
+                    out.push(AutomationTarget::PluginParameter {
+                        insert_id: insert.id.clone(),
+                        parameter_id: param.id.to_string(),
+                        parameter_name: plugin_automation_display_name(
+                            &insert.display_name,
+                            &param.name,
+                        ),
+                    });
+                }
+            }
+            return out;
+        }
+        let mut out = self
+            .find_track(track_id)
+            .map(Self::mixer_automation_targets)
+            .unwrap_or_else(|| {
+                vec![
+                    AutomationTarget::TrackVolume,
+                    AutomationTarget::TrackPan,
+                    AutomationTarget::TrackMute,
+                ]
+            });
         if let Some(track) = self.find_track(track_id) {
             for insert in &track.inserts {
                 if insert.is_empty() {
@@ -756,20 +1042,49 @@ impl TimelineState {
 
     /// Build grouped automation picker content for `track_id`.
     pub fn automation_picker_model(&self, track_id: &str) -> Option<AutomationPickerModel> {
+        if track_id == MASTER_TRACK_ID {
+            let existing: std::collections::HashSet<_> = self
+                .master
+                .automation_lanes
+                .iter()
+                .map(|lane| lane.target.clone())
+                .collect();
+            let track_targets = self
+                .master_automation_targets()
+                .into_iter()
+                .map(|target| {
+                    let label = self.automation_target_label(track_id, &target);
+                    let added = existing.contains(&target);
+                    (target, label, added)
+                })
+                .collect();
+            let effects = self
+                .master
+                .inserts
+                .iter()
+                .filter_map(|insert| self.plugin_group_for_insert(insert, &existing))
+                .collect();
+            return Some(AutomationPickerModel {
+                last_touched: self.last_touched_plugin_param_for_track(track_id).cloned(),
+                instrument: None,
+                effects,
+                track_targets,
+            });
+        }
         let track = self.find_track(track_id)?;
         let existing: std::collections::HashSet<_> = track
             .automation_lanes
             .iter()
             .map(|lane| lane.target.clone())
             .collect();
-        let track_targets = [
-            AutomationTarget::TrackVolume,
-            AutomationTarget::TrackPan,
-            AutomationTarget::TrackMute,
-        ]
-        .into_iter()
-        .map(|target| (target.clone(), existing.contains(&target)))
-        .collect();
+        let track_targets = Self::mixer_automation_targets(track)
+            .into_iter()
+            .map(|target| {
+                let label = Self::automation_target_label_for(track, &target);
+                let added = existing.contains(&target);
+                (target, label, added)
+            })
+            .collect();
         let instrument = track
             .instrument_insert()
             .and_then(|insert| self.plugin_group_for_insert(insert, &existing));
@@ -793,8 +1108,8 @@ impl TimelineState {
         track_id: &str,
         target: AutomationTarget,
     ) -> Option<String> {
-        if let Some(track) = self.tracks.iter_mut().find(|t| t.id == track_id) {
-            track.selected_automation_target = Some(target.clone());
+        if let Some((_, selected)) = self.automation_host_mut(track_id) {
+            *selected = Some(target.clone());
         }
         if automation_debug_enabled() {
             eprintln!(
@@ -818,29 +1133,35 @@ impl TimelineState {
         self.set_track_automation_target(track_id, next)
     }
 
-    fn lane_index_for_target(track: &TrackState, target: &AutomationTarget) -> Option<usize> {
-        track
-            .automation_lanes
-            .iter()
-            .position(|l| l.target == *target)
-    }
-
     /// Ensure a lane exists for `target` on `track_id`; returns its id.
     pub fn ensure_automation_lane(
         &mut self,
         track_id: &str,
         target: AutomationTarget,
     ) -> Option<String> {
-        let track = self.tracks.iter_mut().find(|t| t.id == track_id)?;
-        if let Some(idx) = Self::lane_index_for_target(track, &target) {
-            return Some(track.automation_lanes[idx].id.clone());
+        let name = self.automation_target_label(track_id, &target);
+        let (lanes, _) = self.automation_host_mut(track_id)?;
+        if let Some(lane) = lanes.iter_mut().find(|l| l.target == target) {
+            // Asking for a target shows its lane: a hidden one comes back
+            // rather than staying out of reach (a Bus or Return has no other
+            // way to get its row back).
+            lane.visible = true;
+            return Some(lane.id.clone());
         }
-        let lane_id = format!("autolane-{}-{}", track.id, track.automation_lanes.len() + 1);
+        // Unique even after removals: the count alone could repeat the id of
+        // a lane that is still there.
+        let mut n = lanes.len() + 1;
+        let mut lane_id = format!("autolane-{track_id}-{n}");
+        while lanes.iter().any(|l| l.id == lane_id) {
+            n += 1;
+            lane_id = format!("autolane-{track_id}-{n}");
+        }
         let mut lane = AutomationLaneState::new(lane_id.clone(), target);
+        lane.name = name;
         // New lanes are shown as sub-rows immediately so creating a target (via
         // the picker / toggle) reveals its lane under the parent track.
         lane.visible = true;
-        track.automation_lanes.push(lane);
+        lanes.push(lane);
         if automation_debug_enabled() {
             eprintln!(
                 "[automation] create_lane track={} lane={}",
@@ -852,27 +1173,27 @@ impl TimelineState {
 
     /// Id of the lane the editor is currently focused on for a track.
     pub fn active_automation_lane_id(&self, track_id: &str) -> Option<String> {
-        let track = self.find_track(track_id)?;
+        let lanes = self.automation_lanes_of(track_id)?;
         let target = self.active_automation_target(track_id);
-        track
-            .automation_lanes
+        lanes
             .iter()
             .find(|l| l.target == target)
             .map(|l| l.id.clone())
     }
 
-    fn lane_mut(&mut self, track_id: &str, lane_id: &str) -> Option<&mut AutomationLaneState> {
-        self.tracks
-            .iter_mut()
-            .find(|t| t.id == track_id)?
-            .automation_lanes
+    pub(super) fn lane_mut(
+        &mut self,
+        track_id: &str,
+        lane_id: &str,
+    ) -> Option<&mut AutomationLaneState> {
+        self.automation_host_mut(track_id)?
+            .0
             .iter_mut()
             .find(|l| l.id == lane_id)
     }
 
     pub fn automation_lane(&self, track_id: &str, lane_id: &str) -> Option<&AutomationLaneState> {
-        self.find_track(track_id)?
-            .automation_lanes
+        self.automation_lanes_of(track_id)?
             .iter()
             .find(|l| l.id == lane_id)
     }
@@ -976,6 +1297,105 @@ impl TimelineState {
                 p.curve = curve;
             }
         }
+    }
+
+    /// Set the curve of every selected point in one lane — the shape of the
+    /// segment leaving each. Returns how many changed. Committed edit.
+    pub fn set_selected_automation_curve(
+        &mut self,
+        track_id: &str,
+        lane_id: &str,
+        curve: AutomationCurve,
+    ) -> usize {
+        let mut changed = 0;
+        if let Some(lane) = self.lane_mut(track_id, lane_id) {
+            for point in lane.points.iter_mut().filter(|p| p.selected) {
+                if point.curve != curve {
+                    point.curve = curve;
+                    changed += 1;
+                }
+            }
+        }
+        if changed > 0 {
+            let playhead = self.transport.playhead_beats;
+            self.recompute_effective_volumes(playhead, "point_curve");
+        }
+        changed
+    }
+
+    /// The curve every selected point of one lane shares, or `None` when they
+    /// differ or nothing is selected — what a menu checks.
+    pub fn selected_automation_curve(
+        &self,
+        track_id: &str,
+        lane_id: &str,
+    ) -> Option<AutomationCurve> {
+        let lane = self.automation_lane(track_id, lane_id)?;
+        let mut curves = lane.points.iter().filter(|p| p.selected).map(|p| p.curve);
+        let first = curves.next()?;
+        curves.all(|curve| curve == first).then_some(first)
+    }
+
+    /// The selected points of one lane, relative to the first, for a paste
+    /// elsewhere. `None` when nothing is selected.
+    pub fn copy_selected_automation(
+        &self,
+        track_id: &str,
+        lane_id: &str,
+    ) -> Option<AutomationClipboard> {
+        let lane = self.automation_lane(track_id, lane_id)?;
+        let selected: Vec<&AutomationPoint> = lane.points.iter().filter(|p| p.selected).collect();
+        let start = selected
+            .iter()
+            .map(|p| p.beat)
+            .fold(f32::INFINITY, f32::min);
+        if !start.is_finite() {
+            return None;
+        }
+        let points: Vec<AutomationClipboardPoint> = selected
+            .iter()
+            .map(|p| AutomationClipboardPoint {
+                offset: p.beat - start,
+                value: p.value,
+                curve: p.curve,
+                tension: p.tension,
+            })
+            .collect();
+        let span = points.iter().map(|p| p.offset).fold(0.0, f32::max);
+        Some(AutomationClipboard { points, span })
+    }
+
+    /// Paste `clipboard` into one lane starting at `at_beat`: the points it
+    /// covers are replaced, the pasted ones come in selected. Returns how many
+    /// were pasted. Committed edit.
+    pub fn paste_automation(
+        &mut self,
+        track_id: &str,
+        lane_id: &str,
+        at_beat: f32,
+        clipboard: &AutomationClipboard,
+    ) -> usize {
+        let at_beat = at_beat.max(0.0);
+        let end = at_beat + clipboard.span;
+        let Some(lane) = self.lane_mut(track_id, lane_id) else {
+            return 0;
+        };
+        for point in lane.points.iter_mut() {
+            point.selected = false;
+        }
+        lane.points
+            .retain(|p| p.beat < at_beat - 1e-4 || p.beat > end + 1e-4);
+        for copied in &clipboard.points {
+            let mut point =
+                AutomationPoint::with_curve(at_beat + copied.offset, copied.value, copied.curve);
+            point.tension = copied.tension;
+            point.selected = true;
+            lane.points.push(point);
+        }
+        lane.sort_points();
+        let playhead = self.transport.playhead_beats;
+        self.recompute_effective_volumes(playhead, "point_paste");
+        clipboard.points.len()
     }
 
     /// Find the automation segment under `(beat, value)` and return its LEFT
@@ -1093,11 +1513,11 @@ impl TimelineState {
     /// Clear automation point selection on a track. UI-only. Returns true when
     /// anything was actually deselected.
     pub fn clear_automation_selection(&mut self, track_id: &str) -> bool {
-        let Some(track) = self.tracks.iter_mut().find(|t| t.id == track_id) else {
+        let Some((lanes, _)) = self.automation_host_mut(track_id) else {
             return false;
         };
         let mut changed = false;
-        for lane in track.automation_lanes.iter_mut() {
+        for lane in lanes.iter_mut() {
             for p in lane.points.iter_mut() {
                 if p.selected {
                     p.selected = false;
@@ -1250,9 +1670,9 @@ impl TimelineState {
     }
 
     pub fn selected_automation_point_count(&self, track_id: &str) -> usize {
-        self.find_track(track_id)
-            .map(|t| {
-                t.automation_lanes
+        self.automation_lanes_of(track_id)
+            .map(|lanes| {
+                lanes
                     .iter()
                     .flat_map(|l| l.points.iter())
                     .filter(|p| p.selected)
@@ -1275,10 +1695,7 @@ impl TimelineState {
         lane_id: &str,
         point_id: u64,
     ) -> bool {
-        let Some(track) = self.tracks.iter_mut().find(|t| t.id == track_id) else {
-            return false;
-        };
-        let Some(lane) = track.automation_lanes.iter_mut().find(|l| l.id == lane_id) else {
+        let Some(lane) = self.lane_mut(track_id, lane_id) else {
             return false;
         };
         let before = lane.points.len();
@@ -1291,11 +1708,11 @@ impl TimelineState {
     }
 
     pub fn delete_selected_automation_points(&mut self, track_id: &str) -> usize {
-        let Some(track) = self.tracks.iter_mut().find(|t| t.id == track_id) else {
+        let Some((lanes, _)) = self.automation_host_mut(track_id) else {
             return 0;
         };
         let mut removed = 0;
-        for lane in track.automation_lanes.iter_mut() {
+        for lane in lanes.iter_mut() {
             let before = lane.points.len();
             lane.points.retain(|p| !p.selected);
             removed += before - lane.points.len();
@@ -1319,10 +1736,8 @@ impl TimelineState {
         let target = self
             .automation_lane(track_id, lane_id)
             .map(|l| l.target.clone());
-        if let (Some(target), Some(track)) =
-            (target, self.tracks.iter_mut().find(|t| t.id == track_id))
-        {
-            track.selected_automation_target = Some(target);
+        if let (Some(target), Some((_, selected))) = (target, self.automation_host_mut(track_id)) {
+            *selected = Some(target);
         }
     }
 
@@ -1339,6 +1754,53 @@ impl TimelineState {
         let playhead = self.transport.playhead_beats;
         self.recompute_effective_volumes(playhead, "lane_enable_toggle");
         Some(enabled)
+    }
+
+    /// Step a lane through Off, Read, Touch, Latch and Write. Committed edit.
+    /// Returns the lane's `(enabled, mode)` after the step.
+    pub fn cycle_automation_lane_mode(
+        &mut self,
+        track_id: &str,
+        lane_id: &str,
+    ) -> Option<(bool, AutomationMode)> {
+        let lane = self.lane_mut(track_id, lane_id)?;
+        let (enabled, mode) = match (lane.enabled, lane.mode) {
+            (false, _) => (true, AutomationMode::Read),
+            (true, AutomationMode::Read) => (true, AutomationMode::Touch),
+            (true, AutomationMode::Touch) => (true, AutomationMode::Latch),
+            (true, AutomationMode::Latch) => (true, AutomationMode::Write),
+            (true, AutomationMode::Write) => (false, AutomationMode::Read),
+        };
+        lane.enabled = enabled;
+        lane.mode = mode;
+        let playhead = self.transport.playhead_beats;
+        self.recompute_effective_volumes(playhead, "lane_mode_cycle");
+        Some((enabled, mode))
+    }
+
+    /// Set a lane's mode: `None` turns it off. Returns whether it changed.
+    /// Committed edit.
+    pub fn set_automation_lane_mode(
+        &mut self,
+        track_id: &str,
+        lane_id: &str,
+        mode: Option<AutomationMode>,
+    ) -> bool {
+        let Some(lane) = self.lane_mut(track_id, lane_id) else {
+            return false;
+        };
+        let (enabled, mode) = match mode {
+            Some(mode) => (true, mode),
+            None => (false, lane.mode),
+        };
+        if lane.enabled == enabled && lane.mode == mode {
+            return false;
+        }
+        lane.enabled = enabled;
+        lane.mode = mode;
+        let playhead = self.transport.playhead_beats;
+        self.recompute_effective_volumes(playhead, "lane_mode_set");
+        true
     }
 
     /// Hide a lane's sub-row (does not delete it). UI-only.
@@ -1371,21 +1833,19 @@ impl TimelineState {
     /// Remove one automation lane from a track. Committed edit. Returns true
     /// when the lane existed and was removed.
     pub fn remove_automation_lane(&mut self, track_id: &str, lane_id: &str) -> bool {
-        let Some(track) = self.tracks.iter_mut().find(|t| t.id == track_id) else {
+        let Some((lanes, selected)) = self.automation_host_mut(track_id) else {
             return false;
         };
-        let before = track.automation_lanes.len();
-        track.automation_lanes.retain(|l| l.id != lane_id);
-        if track.automation_lanes.len() == before {
+        let before = lanes.len();
+        lanes.retain(|l| l.id != lane_id);
+        if lanes.len() == before {
             return false;
         }
-        if track
-            .selected_automation_target
+        if selected
             .as_ref()
-            .is_some_and(|t| !track.automation_lanes.iter().any(|l| l.target == *t))
+            .is_some_and(|t| !lanes.iter().any(|l| l.target == *t))
         {
-            track.selected_automation_target =
-                track.automation_lanes.first().map(|l| l.target.clone());
+            *selected = lanes.first().map(|l| l.target.clone());
         }
         let playhead = self.transport.playhead_beats;
         self.recompute_effective_volumes(playhead, "lane_remove");
@@ -1395,15 +1855,15 @@ impl TimelineState {
     /// Remove every automation lane on a track. Committed edit. Returns how
     /// many lanes were removed.
     pub fn clear_all_automation_lanes(&mut self, track_id: &str) -> usize {
-        let Some(track) = self.tracks.iter_mut().find(|t| t.id == track_id) else {
+        let Some((lanes, selected)) = self.automation_host_mut(track_id) else {
             return 0;
         };
-        let removed = track.automation_lanes.len();
+        let removed = lanes.len();
         if removed == 0 {
             return 0;
         }
-        track.automation_lanes.clear();
-        track.selected_automation_target = None;
+        lanes.clear();
+        *selected = None;
         let playhead = self.transport.playhead_beats;
         self.recompute_effective_volumes(playhead, "lanes_clear_all");
         removed
@@ -1415,10 +1875,8 @@ impl TimelineState {
     /// per-frame — so the clone cost is a gesture-rate concern, not a drag-rate
     /// one.
     pub fn capture_automation_lanes(&self, track_id: &str) -> Vec<AutomationLaneState> {
-        self.tracks
-            .iter()
-            .find(|t| t.id == track_id)
-            .map(|t| t.automation_lanes.clone())
+        self.automation_lanes_of(track_id)
+            .map(<[AutomationLaneState]>::to_vec)
             .unwrap_or_default()
     }
 
@@ -1426,20 +1884,18 @@ impl TimelineState {
     /// to [`Self::capture_automation_lanes`]; keeps the selected target valid
     /// and recomputes effective volumes so playback follows the restored curve.
     pub fn set_track_automation_lanes(&mut self, track_id: &str, lanes: Vec<AutomationLaneState>) {
-        let Some(track) = self.tracks.iter_mut().find(|t| t.id == track_id) else {
+        let Some((host_lanes, selected)) = self.automation_host_mut(track_id) else {
             return;
         };
-        track.automation_lanes = lanes;
+        *host_lanes = lanes;
         // A restored lane set may no longer contain the selected target (undoing
         // the creation of the lane that was selected), so re-point it rather
         // than leaving a selection that resolves to nothing.
-        let selected_still_present = track
-            .selected_automation_target
+        let selected_still_present = selected
             .as_ref()
-            .is_some_and(|t| track.automation_lanes.iter().any(|l| l.target == *t));
+            .is_some_and(|t| host_lanes.iter().any(|l| l.target == *t));
         if !selected_still_present {
-            track.selected_automation_target =
-                track.automation_lanes.first().map(|l| l.target.clone());
+            *selected = host_lanes.first().map(|l| l.target.clone());
         }
         let playhead = self.transport.playhead_beats;
         self.recompute_effective_volumes(playhead, "automation_lanes_restore");
@@ -1470,6 +1926,12 @@ pub fn automation_target_menu_command(track_id: &str, target: &AutomationTarget)
         AutomationTarget::SendLevel { send_id } => {
             format!("automation:add-target:{track_id}:send:{send_id}")
         }
+        AutomationTarget::SendEnabled { send_id } => {
+            format!("automation:add-target:{track_id}:send-on:{send_id}")
+        }
+        AutomationTarget::InsertBypass { insert_id } => {
+            format!("automation:add-target:{track_id}:bypass:{insert_id}")
+        }
     }
 }
 
@@ -1494,6 +1956,18 @@ pub fn parse_automation_target_menu_command(command: &str) -> Option<(String, Au
                 },
             ))
         }
+        _ if kind.starts_with("send-on:") => Some((
+            track_id.to_string(),
+            AutomationTarget::SendEnabled {
+                send_id: kind.strip_prefix("send-on:")?.to_string(),
+            },
+        )),
+        _ if kind.starts_with("bypass:") => Some((
+            track_id.to_string(),
+            AutomationTarget::InsertBypass {
+                insert_id: kind.strip_prefix("bypass:")?.to_string(),
+            },
+        )),
         _ if kind.starts_with("send:") => {
             let send_id = kind.strip_prefix("send:")?;
             Some((
@@ -1804,5 +2278,334 @@ mod paint_stroke_tests {
         let out = paint_automation_stroke(&[], &[(1.5, 0.7)], 0.01, 0.001);
         assert_eq!(out.len(), 1);
         assert_eq!((out[0].beat, out[0].value), (1.5, 0.7));
+    }
+}
+
+#[cfg(test)]
+mod mixer_target_tests {
+    use super::*;
+
+    fn bus_send_track() -> TimelineState {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let id = state.create_track(CreateTrackOptions {
+            track_type: TrackType::Audio,
+            name: "Vox".to_string(),
+            color: gpui::rgb(0x336699),
+            volume: 1.0,
+            pan: 0.0,
+            armed: false,
+            input_monitor: InputMonitorMode::Off,
+        });
+        let track = state.tracks.iter_mut().find(|t| t.id == id).unwrap();
+        track.sends.push(SendSlotState {
+            id: "send-1".to_string(),
+            target_track_id: "ret-1".to_string(),
+            target_name: "Reverb".to_string(),
+            enabled: true,
+            pre_fader: false,
+            gain_db: 0.0,
+            automated: None,
+        });
+        state
+    }
+
+    /// In Read, a send shows what its lane plays at the playhead; Off, or
+    /// while the lane is being recorded, it shows its own setting.
+    #[test]
+    fn a_reading_send_lane_moves_the_send_control() {
+        let mut state = bus_send_track();
+        let track_id = state.tracks[0].id.clone();
+        let lane = state
+            .ensure_automation_lane(
+                &track_id,
+                AutomationTarget::SendLevel {
+                    send_id: "send-1".to_string(),
+                },
+            )
+            .unwrap();
+        state.add_automation_point(&track_id, &lane, 0.0, volume::db_to_norm(-12.0));
+        // A point edit refreshes it at once, not only the next playback tick.
+        state.recompute_effective_volumes(2.0, "playback_tick");
+        let send = &state.tracks[0].sends[0];
+        assert!((send.display_gain_db() - (-12.0)).abs() < 0.05);
+        assert_eq!(send.gain_db, 0.0, "the send's own level is untouched");
+
+        state.lane_mut(&track_id, &lane).unwrap().recording = true;
+        state.recompute_effective_volumes(2.0, "playback_tick");
+        assert_eq!(state.tracks[0].sends[0].automated, None);
+
+        state.lane_mut(&track_id, &lane).unwrap().recording = false;
+        state.set_automation_lane_mode(&track_id, &lane, None);
+        state.recompute_effective_volumes(2.0, "playback_tick");
+        assert_eq!(state.tracks[0].sends[0].display_gain_db(), 0.0);
+    }
+
+    /// Every send offers its level and its on/off, named by where it goes.
+    #[test]
+    fn sends_are_automatable_and_named_by_their_return() {
+        let state = bus_send_track();
+        let track = &state.tracks[0];
+        let targets = TimelineState::mixer_automation_targets(track);
+        let level = AutomationTarget::SendLevel {
+            send_id: "send-1".to_string(),
+        };
+        let on = AutomationTarget::SendEnabled {
+            send_id: "send-1".to_string(),
+        };
+        assert!(targets.contains(&level) && targets.contains(&on));
+        assert_eq!(
+            TimelineState::automation_target_label_for(track, &level),
+            "Send \u{2192} Reverb"
+        );
+        assert!(
+            level.format_value(volume::db_to_norm(0.0)).ends_with(" dB"),
+            "a send reads in dB"
+        );
+        assert_eq!(on.format_value(1.0), "On");
+        assert_eq!(on.format_value(0.0), "Off");
+        assert_eq!(
+            AutomationTarget::InsertBypass {
+                insert_id: "x".to_string()
+            }
+            .format_value(1.0),
+            "Bypassed"
+        );
+    }
+
+    #[test]
+    fn new_targets_survive_their_menu_commands() {
+        for target in [
+            AutomationTarget::SendEnabled {
+                send_id: "send-1".to_string(),
+            },
+            AutomationTarget::InsertBypass {
+                insert_id: "insert-2".to_string(),
+            },
+            AutomationTarget::SendLevel {
+                send_id: "send-1".to_string(),
+            },
+        ] {
+            let command = automation_target_menu_command("track-1", &target);
+            assert_eq!(
+                parse_automation_target_menu_command(&command),
+                Some(("track-1".to_string(), target))
+            );
+        }
+    }
+
+    /// A Bus or Return shows in the arrangement only while it carries a shown
+    /// lane.
+    #[test]
+    fn a_bus_row_appears_with_its_automation() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let id = state.create_track(CreateTrackOptions {
+            track_type: TrackType::Bus,
+            name: "Drums Bus".to_string(),
+            color: gpui::rgb(0x336699),
+            volume: 1.0,
+            pan: 0.0,
+            armed: false,
+            input_monitor: InputMonitorMode::Off,
+        });
+        assert!(is_arrangement_hidden_track(state.find_track(&id).unwrap()));
+        state.ensure_automation_lane(&id, AutomationTarget::TrackVolume);
+        assert!(!is_arrangement_hidden_track(state.find_track(&id).unwrap()));
+    }
+}
+
+#[cfg(test)]
+mod point_tool_tests {
+    use super::*;
+
+    fn lane_with_points(beats: &[f32]) -> (TimelineState, String, String) {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let track = state.create_audio_track();
+        let lane = state
+            .ensure_automation_lane(&track, AutomationTarget::TrackVolume)
+            .unwrap();
+        for (i, beat) in beats.iter().enumerate() {
+            state.add_automation_point(&track, &lane, *beat, 0.1 * (i + 1) as f32);
+        }
+        (state, track, lane)
+    }
+
+    #[test]
+    fn the_curve_menu_sets_only_the_selected_points() {
+        let (mut state, track, lane) = lane_with_points(&[0.0, 4.0, 8.0]);
+        let ids: Vec<u64> = state
+            .automation_lane(&track, &lane)
+            .unwrap()
+            .points
+            .iter()
+            .map(|p| p.id)
+            .collect();
+        state.set_automation_selection(&track, &lane, &ids[..2]);
+        assert_eq!(
+            state.selected_automation_curve(&track, &lane),
+            Some(AutomationCurve::Linear)
+        );
+        assert_eq!(
+            state.set_selected_automation_curve(&track, &lane, AutomationCurve::Hold),
+            2
+        );
+        let curves: Vec<AutomationCurve> = state
+            .automation_lane(&track, &lane)
+            .unwrap()
+            .points
+            .iter()
+            .map(|p| p.curve)
+            .collect();
+        assert_eq!(
+            curves,
+            vec![
+                AutomationCurve::Hold,
+                AutomationCurve::Hold,
+                AutomationCurve::Linear
+            ]
+        );
+        assert_eq!(
+            state.selected_automation_curve(&track, &lane),
+            Some(AutomationCurve::Hold)
+        );
+    }
+
+    /// Paste lands the copied shape at the new beat, replacing what was there,
+    /// and leaves the pasted points selected.
+    #[test]
+    fn pasted_points_keep_their_shape_and_replace_what_they_cover() {
+        let (mut state, track, lane) = lane_with_points(&[0.0, 2.0, 10.0, 11.0]);
+        let ids: Vec<u64> = state
+            .automation_lane(&track, &lane)
+            .unwrap()
+            .points
+            .iter()
+            .map(|p| p.id)
+            .collect();
+        state.set_automation_selection(&track, &lane, &ids[..2]);
+        let copied = state
+            .copy_selected_automation(&track, &lane)
+            .expect("copied");
+        assert_eq!(copied.span, 2.0);
+        assert_eq!(state.paste_automation(&track, &lane, 9.5, &copied), 2);
+        let points = &state.automation_lane(&track, &lane).unwrap().points;
+        let beats: Vec<f32> = points.iter().map(|p| p.beat).collect();
+        assert_eq!(
+            beats,
+            vec![0.0, 2.0, 9.5, 11.5],
+            "10 and 11 were covered and replaced"
+        );
+        assert!(points[2].selected && points[3].selected && !points[0].selected);
+        assert!((points[3].value - 0.2).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod master_lane_tests {
+    use super::*;
+
+    fn state_with_one_track() -> TimelineState {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        state.create_audio_track();
+        state
+    }
+
+    /// The master keeps its own lanes: a lane made for it lands on the master
+    /// bus, named for the master, and no track gains one.
+    #[test]
+    fn master_lanes_live_on_the_master_bus() {
+        let mut state = state_with_one_track();
+        let lane = state
+            .ensure_automation_lane(MASTER_TRACK_ID, AutomationTarget::TrackVolume)
+            .expect("master lane");
+        assert_eq!(state.master.automation_lanes.len(), 1);
+        assert_eq!(state.master.automation_lanes[0].name, "Master Volume");
+        assert!(state.tracks[0].automation_lanes.is_empty());
+        assert!(state.automation_lane(MASTER_TRACK_ID, &lane).is_some());
+        // Point edits reach it through the same calls a track lane uses.
+        state.add_automation_point(MASTER_TRACK_ID, &lane, 4.0, 0.25);
+        assert_eq!(
+            state
+                .automation_lane(MASTER_TRACK_ID, &lane)
+                .unwrap()
+                .points
+                .len(),
+            1
+        );
+        // And undo's snapshot restores it.
+        let before = state.capture_automation_lanes(MASTER_TRACK_ID);
+        state.clear_all_automation_lanes(MASTER_TRACK_ID);
+        assert!(state.master.automation_lanes.is_empty());
+        state.set_track_automation_lanes(MASTER_TRACK_ID, before);
+        assert_eq!(state.master.automation_lanes.len(), 1);
+    }
+
+    /// Showing master automation opens a block after the last track with a
+    /// Volume lane, and the lane's geometry is inside that block.
+    #[test]
+    fn showing_master_automation_adds_a_block_after_the_tracks() {
+        let mut state = state_with_one_track();
+        let tracks_height = state.track_row_layout().total_height;
+        assert_eq!(state.track_row_layout().master_height, 0.0);
+
+        assert_eq!(
+            state.toggle_track_lane_mode(MASTER_TRACK_ID),
+            Some(TrackLaneMode::Automation)
+        );
+        let layout = state.track_row_layout();
+        assert_eq!(layout.master_y, tracks_height);
+        assert_eq!(
+            layout.master_height,
+            AUTOMATION_CONTROL_LANE_HEIGHT + AUTOMATION_SUBLANE_HEIGHT
+        );
+        assert_eq!(layout.total_height, tracks_height + layout.master_height);
+        let lane = &state.master.automation_lanes[0];
+        assert_eq!(lane.target, AutomationTarget::TrackVolume);
+        assert_eq!(
+            state.automation_sublane_geometry(MASTER_TRACK_ID, &lane.id),
+            Some((
+                tracks_height + AUTOMATION_CONTROL_LANE_HEIGHT,
+                AUTOMATION_SUBLANE_HEIGHT
+            ))
+        );
+        // The block does not belong to any track.
+        assert!(state
+            .track_row_layout()
+            .track_at_content_y(tracks_height + 1.0)
+            .is_none());
+
+        state.toggle_track_lane_mode(MASTER_TRACK_ID);
+        assert_eq!(state.track_row_layout().master_height, 0.0);
+        assert_eq!(
+            state.master.automation_lanes.len(),
+            1,
+            "hiding keeps the lanes"
+        );
+    }
+
+    /// The master offers its volume and each loaded insert's bypass, and is
+    /// never made the selected track.
+    #[test]
+    fn master_targets_and_selection() {
+        let mut state = state_with_one_track();
+        state.master.inserts.push(InsertSlotState {
+            display_name: "Limiter".to_string(),
+            ..InsertSlotState::empty("master-ins-1")
+        });
+        let bypass = AutomationTarget::InsertBypass {
+            insert_id: "master-ins-1".to_string(),
+        };
+        let targets = state.master_automation_targets();
+        assert!(targets.contains(&AutomationTarget::TrackVolume));
+        assert_eq!(
+            state.automation_target_label(MASTER_TRACK_ID, &bypass),
+            "Limiter Bypass"
+        );
+        let before = state.selection.selected_track_id.clone();
+        state.select_track(MASTER_TRACK_ID);
+        assert_eq!(state.selection.selected_track_id, before);
     }
 }

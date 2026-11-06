@@ -504,6 +504,8 @@ mod tests {
             level: 1.0,
             enabled: true,
             pre_fader: false,
+            level_lane: None,
+            enabled_lane: None,
         }
     }
 

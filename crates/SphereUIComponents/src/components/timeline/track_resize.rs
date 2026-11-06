@@ -106,8 +106,9 @@ pub fn visible_track_row_range(
         .map(|row| row.y)
         .unwrap_or(0.0);
     let bottom_spacer = if visible_end < track_count {
+        // Up to the master block, which the list draws after this spacer.
         let last = &row_layout.rows[visible_end - 1];
-        (row_layout.total_height - last.y - last.block_height()).max(0.0)
+        (row_layout.master_y - last.y - last.block_height()).max(0.0)
     } else {
         0.0
     };

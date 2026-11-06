@@ -38,6 +38,8 @@ pub fn render_project_sample(
     let mut out_r = 0.0f32;
     let master_index = runtime.tracks.iter().position(|t| t.track_type == "master");
     let beat = sample_to_beat(runtime, project_sample);
+    let master_volume =
+        master_automation_volume(&runtime.tracks, master_index, beat).unwrap_or(master_volume);
 
     for clip_index in 0..runtime.clips.len() {
         let (
@@ -196,8 +198,9 @@ pub fn render_project_sample(
         let send_count = runtime.tracks[track_index].sends.len();
         for s in 0..send_count {
             let (enabled, level, return_track_index) = {
-                let send = &runtime.tracks[track_index].sends[s];
-                (send.enabled, send.level, send.return_track_index)
+                let track = &runtime.tracks[track_index];
+                let (enabled, level) = track.send_state_at(s, beat);
+                (enabled, level, track.sends[s].return_track_index)
             };
             if !enabled || level <= 0.0 {
                 continue;
@@ -253,6 +256,18 @@ pub fn render_project_sample(
     // Master fader only. No limiter, no soft knee, no clip — the sum leaves
     // this function exactly as the graph built it, scaled.
     (out_l * master_volume, out_r * master_volume)
+}
+
+/// The master's linear gain at `beat` from its Volume lane, or `None` when it
+/// has none with points (the fader stands). Lane walk only, no allocation.
+#[inline]
+pub(crate) fn master_automation_volume(
+    tracks: &[RuntimeTrack],
+    master_index: Option<usize>,
+    beat: f64,
+) -> Option<f32> {
+    let master = tracks.get(master_index?)?;
+    master.automation_values_at_beat(beat).volume
 }
 
 /// Routing track kinds (Phase 3): receive sends rather than hosting clips.
@@ -822,7 +837,7 @@ fn finish_track_block(
     // their `recv_*`.
     scatter_vsti_output_children(runtime, track_index, frames, output, channels);
     // Pre-fader sends tap the post-insert signal currently in block_*.
-    accumulate_sends(runtime, track_index, frames, true);
+    accumulate_sends(runtime, track_index, frames, true, beat);
     // PFL and a TrackPreFader monitor source tap the same point the pre-fader
     // sends do: after this channel's inserts, before its fader.
     capture_monitor_taps(runtime, track_index, frames, TapStage::PreFader);
@@ -836,7 +851,7 @@ fn finish_track_block(
     // Post-fader sends tap *before* PDC so return FX latency can be compensated
     // on the dry/main path without also delaying the send feed (which would
     // push wet further behind dry).
-    accumulate_sends(runtime, track_index, frames, false);
+    accumulate_sends(runtime, track_index, frames, false, beat);
     let pdc_delay = runtime
         .latency_graph
         .track_pdc_delay
@@ -982,6 +997,7 @@ pub(crate) fn accumulate_sends(
     src_index: usize,
     frames: usize,
     pre_fader: bool,
+    beat: f64,
 ) {
     let send_count = runtime.tracks[src_index].sends.len();
     if send_count == 0 {
@@ -989,11 +1005,14 @@ pub(crate) fn accumulate_sends(
     }
     for s in 0..send_count {
         let (enabled, level, target_index) = {
-            let send = &runtime.tracks[src_index].sends[s];
+            let track = &runtime.tracks[src_index];
+            let send = &track.sends[s];
             if send.pre_fader != pre_fader {
                 continue;
             }
-            (send.enabled, send.level, send.return_track_index)
+            // The send's own on/off and level, or its automation's.
+            let (enabled, level) = track.send_state_at(s, beat);
+            (enabled, level, send.return_track_index)
         };
         if !enabled || level == 0.0 {
             continue;
@@ -1583,6 +1602,10 @@ fn render_project_block_interleaved_core(
     }
 
     let master_index = runtime.audio_graph.master_index;
+    // A Master Volume lane that has something to say overrides the master
+    // fader, the way a track's Volume lane overrides its own.
+    let master_volume = master_automation_volume(&runtime.tracks, master_index, block_beat)
+        .unwrap_or(master_volume);
 
     for clip_index in 0..runtime.clips.len() {
         if !transport_active {
@@ -2241,7 +2264,7 @@ fn apply_plugin_param_automation(track: &mut RuntimeTrack, beat: f64) {
         let Some(insert) = inserts.get_mut(binding.insert_ix) else {
             continue;
         };
-        if !insert.enabled {
+        if !insert.active() {
             continue;
         }
         match insert.kind_tag {
@@ -2256,6 +2279,25 @@ fn apply_plugin_param_automation(track: &mut RuntimeTrack, beat: f64) {
                 }
             }
         }
+    }
+}
+
+/// Set each insert's [`RuntimeInsert::automation_bypassed`] from its bypass
+/// lane at `beat`, or clear it when stopped (`None`). Index lookups only.
+#[inline]
+pub(crate) fn apply_insert_bypass_automation(track: &mut RuntimeTrack, beat: Option<f64>) {
+    let crate::runtime::RuntimeTrack {
+        automation_lanes,
+        inserts,
+        ..
+    } = track;
+    for insert in inserts.iter_mut() {
+        let Some(lane_ix) = insert.bypass_lane else {
+            continue;
+        };
+        insert.automation_bypassed = beat
+            .and_then(|beat| automation_lanes.get(lane_ix)?.evaluate_normalized(beat))
+            .is_some_and(|value| value >= 0.5);
     }
 }
 
@@ -2520,6 +2562,9 @@ pub fn apply_track_chain_block(
     if transport.playing {
         apply_plugin_param_automation(track, transport.ppq_position);
     }
+    // Insert bypass automation, the same way: read while playing, and the
+    // insert's own switch stands while stopped.
+    apply_insert_bypass_automation(track, transport.playing.then_some(transport.ppq_position));
 
     render_ara_block(track, frames, transport);
     render_soundfont_instrument_block(track, frames);
@@ -2683,7 +2728,7 @@ pub(crate) fn apply_external_bridge_insert_block(
     transport: RuntimeTransportContext,
 ) {
     let frames = block_l.len().min(block_r.len());
-    if frames == 0 || !insert.enabled {
+    if frames == 0 || !insert.active() {
         return;
     }
     let Some(sink) = bridge_sink else {
@@ -3280,7 +3325,7 @@ pub fn apply_preview_mode(l: f32, r: f32, mode: RuntimePreviewMode) -> (f32, f32
 #[inline]
 pub fn apply_insert(l: f32, r: f32, insert: &mut RuntimeInsert) -> (f32, f32) {
     if insert.kind_tag == crate::runtime::RuntimeInsertKind::NativePlugin {
-        if !insert.enabled {
+        if !insert.active() {
             if !insert.callback_process_log_done {
                 insert.callback_process_log_done = true;
                 // params lookup only inside the once-per-insert log branch.
@@ -3395,7 +3440,7 @@ pub fn apply_insert_block(
         (0.0, 0.0)
     };
 
-    if !insert.enabled {
+    if !insert.active() {
         if !insert.callback_process_log_done {
             insert.callback_process_log_done = true;
             let format = insert

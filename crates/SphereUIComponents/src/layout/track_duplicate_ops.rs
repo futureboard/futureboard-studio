@@ -160,7 +160,7 @@ impl StudioLayout {
                 ContextMenuEntry::disabled_item(label, command)
             }
         };
-        vec![
+        let mut entries = vec![
             entry("Duplicate Track".into(), "track:duplicate", clonable),
             entry(
                 "Duplicate Track without FX".into(),
@@ -169,6 +169,47 @@ impl StudioLayout {
             ),
             entry("Copy FX Chain".into(), "track:copy-fx-chain", has_effects),
             entry(paste_label, "track:paste-fx-chain", can_paste),
-        ]
+            // Presets: the chain or the whole track, kept as a `.pst` file.
+            entry(
+                "Save FX Chain as Preset…".into(),
+                "track:save-chain-preset",
+                has_effects,
+            ),
+            entry(
+                "Save Track as Preset…".into(),
+                "track:save-track-preset",
+                self.can_save_track_preset(track_id, cx),
+            ),
+            entry(
+                "Load Chain or Track Preset…".into(),
+                "track:load-preset",
+                true,
+            ),
+        ];
+        // Every mixer control the track can automate. On a Bus or Return this
+        // is the way in: their rows only appear in the arrangement once they
+        // carry a lane. Native menus group it as an "Automation" submenu.
+        if let Some(track) = state.find_track(track_id) {
+            use crate::components::timeline::timeline_state::{
+                automation_target_menu_command, TimelineState, TrackType,
+            };
+            if !matches!(track.track_type, TrackType::Video | TrackType::Group) {
+                entries.push(ContextMenuEntry::Separator);
+                entries.push(ContextMenuEntry::Header("Automation".into()));
+                for target in TimelineState::mixer_automation_targets(track) {
+                    let label = TimelineState::automation_target_label_for(track, &target);
+                    let shown = track
+                        .automation_lanes
+                        .iter()
+                        .any(|lane| lane.target == target && lane.visible);
+                    entries.push(entry(
+                        label,
+                        &automation_target_menu_command(track_id, &target),
+                        !shown,
+                    ));
+                }
+            }
+        }
+        entries
     }
 }

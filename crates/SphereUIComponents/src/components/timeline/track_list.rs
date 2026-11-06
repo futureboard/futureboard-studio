@@ -318,6 +318,55 @@ pub fn track_list(
         );
     }
 
+    // The master's automation, after every track: its control row, then each
+    // shown lane, laid out exactly where `TrackRowLayout` put them.
+    if row_layout.master_height > 0.0 {
+        let master_id = crate::components::timeline::timeline_state::MASTER_TRACK_ID;
+        let master_color = Colors::text_secondary();
+        let active_target = state.active_automation_target(master_id);
+        let mut block: Vec<gpui::AnyElement> = vec![automation_control_lane(
+            master_id,
+            master_color,
+            AUTOMATION_CONTROL_LANE_HEIGHT,
+            state,
+            on_automation_control.clone(),
+        )
+        .into_any_element()];
+        let mut lane_y = row_layout.master_y + AUTOMATION_CONTROL_LANE_HEIGHT;
+        for lane in state.master.automation_lanes.iter().filter(|l| l.visible) {
+            block.push(
+                automation_lane(
+                    master_id,
+                    lane,
+                    master_color,
+                    lane.target == active_target,
+                    lane_y,
+                    AUTOMATION_SUBLANE_HEIGHT,
+                    state,
+                    gesture,
+                    on_automation_down.clone(),
+                    on_automation_lane_action.clone(),
+                    on_automation_hover.clone(),
+                    on_automation_delete.clone(),
+                    automation_marquee,
+                    automation_hover,
+                )
+                .into_any_element(),
+            );
+            lane_y += AUTOMATION_SUBLANE_HEIGHT;
+        }
+        rows.push(
+            div()
+                .w_full()
+                .h(px(row_layout.master_height))
+                .flex_none()
+                .flex()
+                .flex_col()
+                .children(block)
+                .into_any_element(),
+        );
+    }
+
     div()
         .relative()
         .size_full()

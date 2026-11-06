@@ -112,6 +112,11 @@ impl TrackRowLayoutEntry {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrackRowLayout {
     pub rows: Vec<TrackRowLayoutEntry>,
+    /// Content-space y of the master's automation block, right after the last
+    /// track, and its height (`0.0` when it is not shown).
+    pub master_y: f32,
+    pub master_height: f32,
+    /// Every row plus the master block.
     pub total_height: f32,
     pub scroll_y: f32,
 }
@@ -148,9 +153,12 @@ impl TrackRowLayout {
             });
             y += height + automation_height + take_height;
         }
+        let master_height = state.master_automation_height();
         Self {
             rows,
-            total_height: y,
+            master_y: y,
+            master_height,
+            total_height: y + master_height,
             scroll_y,
         }
     }
@@ -292,6 +300,21 @@ impl TimelineState {
         track.lane_mode == TrackLaneMode::Automation
     }
 
+    /// Height of the master's automation block below the last track: its
+    /// control row and each shown lane, or `0.0` when it is hidden.
+    pub fn master_automation_height(&self) -> f32 {
+        if !self.master.automation_expanded {
+            return 0.0;
+        }
+        let lanes = self
+            .master
+            .automation_lanes
+            .iter()
+            .filter(|lane| lane.visible)
+            .count();
+        AUTOMATION_CONTROL_LANE_HEIGHT + lanes as f32 * AUTOMATION_SUBLANE_HEIGHT
+    }
+
     /// The automation lanes shown as sub-rows for a track: only when the
     /// automation section is expanded, and only lanes whose own show/hide flag
     /// is on. Order matches `track.automation_lanes`.
@@ -319,6 +342,9 @@ impl TimelineState {
     /// when automation is collapsed.
     pub fn automation_control_lane_y(&self, track_id: &str) -> Option<f32> {
         let layout = self.track_row_layout();
+        if track_id == MASTER_TRACK_ID {
+            return (layout.master_height > 0.0).then_some(layout.master_y);
+        }
         let row = layout.row_for_track(track_id)?;
         let track = self.find_track(track_id)?;
         if !self.track_automation_expanded(track) {
@@ -333,13 +359,26 @@ impl TimelineState {
     /// normalized value within the correct sub-lane).
     pub fn automation_sublane_geometry(&self, track_id: &str, lane_id: &str) -> Option<(f32, f32)> {
         let layout = self.track_row_layout();
-        let row = layout.row_for_track(track_id)?;
-        let track = self.find_track(track_id)?;
-        if !self.track_automation_expanded(track) {
-            return None;
-        }
-        let mut y = row.y + row.height + AUTOMATION_CONTROL_LANE_HEIGHT;
-        for lane in track.automation_lanes.iter().filter(|l| l.visible) {
+        let (mut y, lanes) = if track_id == MASTER_TRACK_ID {
+            if layout.master_height <= 0.0 {
+                return None;
+            }
+            (
+                layout.master_y + AUTOMATION_CONTROL_LANE_HEIGHT,
+                &self.master.automation_lanes,
+            )
+        } else {
+            let row = layout.row_for_track(track_id)?;
+            let track = self.find_track(track_id)?;
+            if !self.track_automation_expanded(track) {
+                return None;
+            }
+            (
+                row.y + row.height + AUTOMATION_CONTROL_LANE_HEIGHT,
+                &track.automation_lanes,
+            )
+        };
+        for lane in lanes.iter().filter(|l| l.visible) {
             if lane.id == lane_id {
                 return Some((y, AUTOMATION_SUBLANE_HEIGHT));
             }

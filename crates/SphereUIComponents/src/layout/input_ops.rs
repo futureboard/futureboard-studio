@@ -1466,20 +1466,29 @@ impl StudioLayout {
     ) -> Vec<ContextMenuEntry> {
         let i18n = I18n::new(&self.settings.read(cx).current.general.language);
         match target {
-            ContextTarget::TimelineEmpty => vec![
-                ContextMenuEntry::item(i18n.tr("context.timeline.add-audio"), "track:add-audio"),
-                ContextMenuEntry::item(i18n.tr("context.timeline.add-midi"), "track:add-midi"),
-                ContextMenuEntry::item(i18n.tr("menu.project-add_bus_track"), "track:add-bus"),
-                ContextMenuEntry::Separator,
-                menu_item_enabled(
-                    i18n.tr("context.paste"),
-                    "edit:paste",
-                    !self.clip_clipboard.is_empty(),
-                ),
-                ContextMenuEntry::Separator,
-                ContextMenuEntry::item(i18n.tr("context.zoom-in"), "view:zoom-in"),
-                ContextMenuEntry::item(i18n.tr("context.zoom-out"), "view:zoom-out"),
-            ],
+            ContextTarget::TimelineEmpty => {
+                let mut entries = vec![
+                    ContextMenuEntry::item(
+                        i18n.tr("context.timeline.add-audio"),
+                        "track:add-audio",
+                    ),
+                    ContextMenuEntry::item(i18n.tr("context.timeline.add-midi"), "track:add-midi"),
+                    ContextMenuEntry::item(i18n.tr("menu.project-add_bus_track"), "track:add-bus"),
+                    ContextMenuEntry::Separator,
+                    menu_item_enabled(
+                        i18n.tr("context.paste"),
+                        "edit:paste",
+                        !self.clip_clipboard.is_empty(),
+                    ),
+                ];
+                entries.extend(self.master_automation_menu_entries(cx));
+                entries.extend([
+                    ContextMenuEntry::Separator,
+                    ContextMenuEntry::item(i18n.tr("context.zoom-in"), "view:zoom-in"),
+                    ContextMenuEntry::item(i18n.tr("context.zoom-out"), "view:zoom-out"),
+                ]);
+                entries
+            }
             ContextTarget::TrackLane { .. } => {
                 let split_enabled = {
                     let state = &self.timeline.read(cx).state;
@@ -1781,14 +1790,60 @@ impl StudioLayout {
                     ),
                 ]
             }
-            ContextTarget::AutomationLane { .. } => vec![
-                ContextMenuEntry::item("Cycle Automation Target", "automation:cycle-target"),
-                ContextMenuEntry::item("Select All Points", "automation:select-all-points"),
-                ContextMenuEntry::item("Clear Selection", "automation:clear-selection"),
-                ContextMenuEntry::Separator,
-                ContextMenuEntry::item(i18n.tr("context.zoom-in"), "view:zoom-in"),
-                ContextMenuEntry::item(i18n.tr("context.zoom-out"), "view:zoom-out"),
-            ],
+            ContextTarget::AutomationLane {
+                track_id,
+                lane_id,
+                beat,
+            } => {
+                use crate::components::timeline::timeline_state::AutomationCurve;
+                let state = &self.timeline.read(cx).state;
+                let selected = state.selected_automation_point_ids(track_id, lane_id).len();
+                let curve = state.selected_automation_curve(track_id, lane_id);
+                let item = |label: &str, command: &str, enabled: bool| {
+                    if enabled {
+                        ContextMenuEntry::item(label, command)
+                    } else {
+                        ContextMenuEntry::disabled_item(label, command)
+                    }
+                };
+                let curve_item = |label: &str, command: &str, shape: AutomationCurve| {
+                    if selected == 0 {
+                        ContextMenuEntry::disabled_item(label, command)
+                    } else {
+                        ContextMenuEntry::checked_item(label, command, curve == Some(shape))
+                    }
+                };
+                vec![
+                    ContextMenuEntry::Header("Curve".to_string()),
+                    curve_item("Linear", "automation:curve:linear", AutomationCurve::Linear),
+                    curve_item(
+                        "Hold (step)",
+                        "automation:curve:hold",
+                        AutomationCurve::Hold,
+                    ),
+                    curve_item("Smooth", "automation:curve:smooth", AutomationCurve::Smooth),
+                    ContextMenuEntry::Separator,
+                    item("Copy Points", "automation:copy", selected > 0),
+                    item("Cut Points", "automation:cut", selected > 0),
+                    item(
+                        "Paste Points Here",
+                        &format!("automation:paste-at:{beat}"),
+                        self.can_paste_automation(),
+                    ),
+                    item(
+                        "Delete Points",
+                        "automation:delete-selected-points",
+                        selected > 0,
+                    ),
+                    ContextMenuEntry::Separator,
+                    ContextMenuEntry::item("Select All Points", "automation:select-all-points"),
+                    ContextMenuEntry::item("Clear Selection", "automation:clear-selection"),
+                    ContextMenuEntry::item("Cycle Automation Target", "automation:cycle-target"),
+                    ContextMenuEntry::Separator,
+                    ContextMenuEntry::item(i18n.tr("context.zoom-in"), "view:zoom-in"),
+                    ContextMenuEntry::item(i18n.tr("context.zoom-out"), "view:zoom-out"),
+                ]
+            }
             ContextTarget::Browser(path_opt) => {
                 let mut entries = Vec::new();
                 if let Some(path) = path_opt {
@@ -2084,7 +2139,7 @@ impl StudioLayout {
                     }
                     entries.push(ContextMenuEntry::Header(header.to_string()));
                     for target in targets {
-                        let label = target.display_name();
+                        let label = state.automation_target_label(track_id, target);
                         if existing.contains(target) {
                             entries.push(ContextMenuEntry::disabled_item(
                                 format!("{label} (already added)"),
@@ -2119,9 +2174,22 @@ impl StudioLayout {
                 let send_targets: Vec<AutomationTarget> = state
                     .available_automation_targets(track_id)
                     .into_iter()
-                    .filter(|t| matches!(t, AutomationTarget::SendLevel { .. }))
+                    .filter(|t| {
+                        matches!(
+                            t,
+                            AutomationTarget::SendLevel { .. }
+                                | AutomationTarget::SendEnabled { .. }
+                        )
+                    })
                     .collect();
                 push_group(&mut entries, "Sends", &send_targets);
+
+                let bypass_targets: Vec<AutomationTarget> = state
+                    .available_automation_targets(track_id)
+                    .into_iter()
+                    .filter(|t| matches!(t, AutomationTarget::InsertBypass { .. }))
+                    .collect();
+                push_group(&mut entries, "Inserts", &bypass_targets);
 
                 if entries.len() == 1 {
                     entries.push(ContextMenuEntry::disabled_item(

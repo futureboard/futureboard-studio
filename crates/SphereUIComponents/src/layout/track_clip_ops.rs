@@ -434,7 +434,10 @@ impl StudioLayout {
     /// lane is content that the engine snapshot carries, so it takes the full
     /// path. A move of the saved expansion or focused lane (v54) is view-only.
     /// Nothing is marked when nothing changed.
-    fn mark_automation_view_change(&mut self, change: timeline_state::AutomationViewChange) {
+    pub(super) fn mark_automation_view_change(
+        &mut self,
+        change: timeline_state::AutomationViewChange,
+    ) {
         use timeline_state::AutomationViewChange;
         match change {
             AutomationViewChange::Lanes => self.mark_dirty(),
@@ -496,10 +499,16 @@ impl StudioLayout {
         else {
             return target;
         };
-        let Some(track) = self.timeline.read(cx).state.find_track(track_id) else {
-            return target;
+        let state = &self.timeline.read(cx).state;
+        let inserts = if track_id == crate::components::timeline::timeline_state::MASTER_TRACK_ID {
+            &state.master.inserts
+        } else {
+            let Some(track) = state.find_track(track_id) else {
+                return target;
+            };
+            &track.inserts
         };
-        let Some(insert) = track.inserts.iter().find(|i| i.id == *insert_id) else {
+        let Some(insert) = inserts.iter().find(|i| i.id == *insert_id) else {
             return target;
         };
         let Some(param) = insert
@@ -604,20 +613,23 @@ impl StudioLayout {
             .timeline
             .read(cx)
             .state
-            .find_track(track_id)
-            .map(|t| t.automation_lanes.len())
-            .unwrap_or(0);
+            .automation_lanes_of(track_id)
+            .map_or(0, <[_]>::len);
         if lane_count == 0 {
             return;
         }
 
-        let track_name = self
-            .timeline
-            .read(cx)
-            .state
-            .find_track(track_id)
-            .map(|t| t.name.clone())
-            .unwrap_or_else(|| "Track".to_string());
+        let track_name = if track_id == crate::components::timeline::timeline_state::MASTER_TRACK_ID
+        {
+            "Master".to_string()
+        } else {
+            self.timeline
+                .read(cx)
+                .state
+                .find_track(track_id)
+                .map(|t| t.name.clone())
+                .unwrap_or_else(|| "Track".to_string())
+        };
         let track_id = track_id.to_string();
         let owner_bounds = window.bounds();
         let owner = cx.entity().clone();

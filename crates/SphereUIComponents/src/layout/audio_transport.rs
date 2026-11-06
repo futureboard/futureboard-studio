@@ -1086,6 +1086,8 @@ impl StudioLayout {
                 }
                 (playhead_moved, faders_moved && !arrangement_dirty)
             });
+            // Write / Touch / Latch: record what the controls do at this beat.
+            self.tick_automation_recording(interpolated.max(0.0), cx);
             // `refresh_inline_ui` notifies none of `Timeline`'s observers; of
             // those, the inspector shows the selected track's fader.
             if faders_moved {
@@ -1123,6 +1125,8 @@ impl StudioLayout {
                     cx.notify();
                 }
             });
+            // The run is over: what was recorded becomes one step per track.
+            self.finish_automation_recording(cx);
             // Transport just stopped: the line stays where it is but is drawn
             // dimmer, and only the overlay needs to hear about it.
             let docked = self.piano_roll.clone();

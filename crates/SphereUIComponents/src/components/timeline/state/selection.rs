@@ -404,6 +404,12 @@ impl TimelineState {
     }
 
     pub fn select_track(&mut self, track_id: &str) {
+        // The master's automation block is edited in place; the master bus is
+        // not a track, and selecting it would leave the Inspector and the
+        // track commands pointing at nothing.
+        if track_id == MASTER_TRACK_ID {
+            return;
+        }
         self.selection.select_track(track_id);
         self.arrangement_range = None;
     }

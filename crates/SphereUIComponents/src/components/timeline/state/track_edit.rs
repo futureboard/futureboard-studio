@@ -143,6 +143,16 @@ fn settled(track: &TrackState) -> TrackState {
         meter_peak_hold_l: 0.0,
         meter_peak_hold_r: 0.0,
         meter_clip: false,
+        // What automation shows at the playhead moves on its own too.
+        sends: track
+            .sends
+            .iter()
+            .map(|send| SendSlotState {
+                automated: None,
+                ..send.clone()
+            })
+            .collect(),
+        volume_effective: track.volume,
         ..track.clone()
     }
 }

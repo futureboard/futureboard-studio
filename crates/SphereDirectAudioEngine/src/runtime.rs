@@ -1191,6 +1191,14 @@ pub enum RuntimeAutomationTarget {
     SendGain {
         send_id: String,
     },
+    /// A send's on/off switch: 0.5 and above is on.
+    SendEnabled {
+        send_id: String,
+    },
+    /// An insert's bypass: 0.5 and above is bypassed.
+    InsertBypass {
+        insert_id: String,
+    },
     Unresolved,
 }
 
@@ -1209,6 +1217,12 @@ impl RuntimeAutomationTarget {
             4 if !lane.target.send_id.is_empty() => Self::SendGain {
                 send_id: lane.target.send_id.clone(),
             },
+            5 if !lane.target.send_id.is_empty() => Self::SendEnabled {
+                send_id: lane.target.send_id.clone(),
+            },
+            6 if !lane.target.insert_id.is_empty() => Self::InsertBypass {
+                insert_id: lane.target.insert_id.clone(),
+            },
             _ => Self::Unresolved,
         }
     }
@@ -1220,7 +1234,9 @@ impl RuntimeAutomationTarget {
             Self::TrackPan => 0.5,
             Self::TrackMute => 0.0,
             Self::PluginParameter { .. } => 0.5,
-            Self::SendGain { .. } => 0.0,
+            Self::SendGain { .. } => volume_db_to_norm(0.0),
+            Self::SendEnabled { .. } => 1.0,
+            Self::InsertBypass { .. } => 0.0,
             Self::Unresolved => 0.0,
         }
     }
@@ -1348,6 +1364,65 @@ impl RuntimeTrack {
             }
         }
         values
+    }
+}
+
+impl RuntimeTrack {
+    /// Send `s`'s on/off and level at `beat`: its own, unless an automation
+    /// lane that has something to say overrides it. Index lookups only — the
+    /// lanes were resolved off the audio thread.
+    #[inline]
+    pub fn send_state_at(&self, s: usize, beat: f64) -> (bool, f32) {
+        let Some(send) = self.sends.get(s) else {
+            return (false, 0.0);
+        };
+        let lane_value = |lane: Option<usize>| {
+            lane.and_then(|ix| self.automation_lanes.get(ix))
+                .and_then(|lane| lane.evaluate_normalized(beat))
+        };
+        let enabled = lane_value(send.enabled_lane)
+            .map(|v| v >= 0.5)
+            .unwrap_or(send.enabled);
+        let level = lane_value(send.level_lane)
+            .map(volume_norm_to_linear)
+            .unwrap_or(send.level);
+        (enabled, level)
+    }
+}
+
+/// Point each send and insert at the automation lane that targets it, so the
+/// render path reads an index instead of comparing ids. Off the audio thread.
+/// An empty or disabled lane still resolves: it says nothing per block
+/// ([`RuntimeAutomationLane::evaluate_normalized`]) and the control's own value
+/// stands.
+pub(crate) fn resolve_send_and_bypass_lanes(track: &mut RuntimeTrack) {
+    for send in &mut track.sends {
+        send.level_lane = None;
+        send.enabled_lane = None;
+    }
+    for insert in &mut track.inserts {
+        insert.bypass_lane = None;
+        insert.automation_bypassed = false;
+    }
+    for (lane_ix, lane) in track.automation_lanes.iter().enumerate() {
+        match &lane.target {
+            RuntimeAutomationTarget::SendGain { send_id } => {
+                if let Some(send) = track.sends.iter_mut().find(|s| &s.id == send_id) {
+                    send.level_lane = Some(lane_ix);
+                }
+            }
+            RuntimeAutomationTarget::SendEnabled { send_id } => {
+                if let Some(send) = track.sends.iter_mut().find(|s| &s.id == send_id) {
+                    send.enabled_lane = Some(lane_ix);
+                }
+            }
+            RuntimeAutomationTarget::InsertBypass { insert_id } => {
+                if let Some(insert) = track.inserts.iter_mut().find(|i| &i.id == insert_id) {
+                    insert.bypass_lane = Some(lane_ix);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1514,6 +1589,12 @@ pub struct RuntimeInsert {
     /// this tag, never on the string.
     pub kind_tag: RuntimeInsertKind,
     pub enabled: bool,
+    /// The owning track's Insert Bypass automation lane for this insert,
+    /// resolved to an index into its `automation_lanes` off the audio thread.
+    pub bypass_lane: Option<usize>,
+    /// Set per block from that lane while playing: the insert is bypassed by
+    /// automation, whatever `enabled` says. Read through [`Self::active`].
+    pub automation_bypassed: bool,
     pub params: HashMap<String, Value>,
     /// For [`RuntimeInsertKind::ExternalBridge`]: `params["role"] == "effect"`,
     /// resolved at build time so the block path never reads the params map.
@@ -1666,6 +1747,15 @@ fn vsti_output_children_from_params(
     children
 }
 
+impl RuntimeInsert {
+    /// Whether the insert processes this block: switched on, and not bypassed
+    /// by automation.
+    #[inline]
+    pub fn active(&self) -> bool {
+        self.enabled && !self.automation_bypassed
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeSend {
     pub id: String,
@@ -1678,6 +1768,11 @@ pub struct RuntimeSend {
     pub enabled: bool,
     /// Pre-fader tap (Phase 3). See [`EngineSendSnapshot::pre_fader`].
     pub pre_fader: bool,
+    /// The owning track's Send Level automation lane for this send, resolved
+    /// to an index into its `automation_lanes` off the audio thread.
+    pub level_lane: Option<usize>,
+    /// The owning track's Send On/Off automation lane for this send, likewise.
+    pub enabled_lane: Option<usize>,
 }
 
 /// Shape of one clip fade ramp.
@@ -2651,6 +2746,8 @@ impl RuntimeProject {
             // string param id or searches inserts by id per block.
             let bindings = build_plugin_param_bindings(&self.tracks[i]);
             self.tracks[i].plugin_param_automation = bindings;
+            // Send and insert-bypass lanes, likewise resolved to indices.
+            resolve_send_and_bypass_lanes(&mut self.tracks[i]);
         }
         // Reverse of the child routes resolved above: for each child "Out Ch"
         // strip, the instrument track that produces it. Soloing the main VSTi
@@ -3391,6 +3488,8 @@ impl RuntimeProject {
                     kind: insert.kind.clone(),
                     kind_tag: RuntimeInsertKind::from_kind(&insert.kind),
                     enabled: insert.enabled,
+                    bypass_lane: None,
+                    automation_bypassed: false,
                     bridge_is_effect: insert
                         .params
                         .get("role")
@@ -3505,6 +3604,8 @@ impl RuntimeProject {
                         level: send.level.clamp(0.0, 2.0),
                         enabled: send.enabled,
                         pre_fader: send.pre_fader,
+                        level_lane: None,
+                        enabled_lane: None,
                     })
                     .collect(),
                 automation_lanes: t
@@ -8236,6 +8337,42 @@ mod midi_tests {
             .expect("automation runtime")
     }
 
+    /// A send-level lane in a project snapshot reaches the built runtime bound
+    /// to its send, and reads there.
+    #[test]
+    fn a_snapshot_send_lane_binds_to_its_send_and_reads() {
+        let mut lane = empty_lane_snapshot("send-lane", 4);
+        lane.target.send_id = "send-1".to_string();
+        lane.points = vec![crate::types::EngineAutomationPointSnapshot {
+            beat: 0.0,
+            value: volume_db_to_norm(-12.0),
+            curve: 0,
+            tension: 0.0,
+        }];
+        let mut track = automation_track_snapshot(vec![lane]);
+        track.sends = vec![crate::types::EngineSendSnapshot {
+            id: "send-1".to_string(),
+            return_track_id: "ret-1".to_string(),
+            level: 1.0,
+            enabled: true,
+            pre_fader: false,
+        }];
+        let runtime = automation_runtime(track);
+        let src = runtime
+            .tracks
+            .iter()
+            .find(|t| t.id == "track-1")
+            .expect("track");
+        assert_eq!(
+            src.sends[0].level_lane,
+            Some(0),
+            "the lane is bound to its send"
+        );
+        let (_, level) = src.send_state_at(0, 2.0);
+        let expected = volume_norm_to_linear(volume_db_to_norm(-12.0));
+        assert!((level - expected).abs() < 1e-5, "{level} vs {expected}");
+    }
+
     #[test]
     fn automation_evaluator_applies_tension() {
         // A single curved segment 0→1 over beats [0, 4]. With ease-in tension the
@@ -8393,6 +8530,8 @@ mod midi_tests {
                 kind: "external-bridge-plugin".to_string(),
                 kind_tag: RuntimeInsertKind::ExternalBridge,
                 enabled: true,
+                bypass_lane: None,
+                automation_bypassed: false,
                 params: HashMap::new(),
                 bridge_is_effect: false,
                 bridge_is_builtin: false,

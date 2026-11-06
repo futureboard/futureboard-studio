@@ -543,6 +543,8 @@ pub struct AutomationLane {
     pub enabled: bool,
     pub points: Vec<AutomationPoint>,
     pub visible: bool,
+    /// v61+: Read 0, Touch 1, Latch 2, Write 3. Older files read as Read.
+    pub mode: u8,
 }
 
 // ── Tracks & clips ────────────────────────────────────────────────────────────
@@ -717,6 +719,10 @@ impl Default for ProjectSolfegeEngine {
 pub struct ProjectMixer {
     pub master_volume_norm: f32,
     pub master_inserts: Vec<ProjectInsert>,
+    /// v62: the master bus's automation lanes, and whether the arrangement
+    /// shows them.
+    pub master_automation_lanes: Vec<AutomationLane>,
+    pub master_automation_expanded: bool,
     /// v20: persisted mixer tree expanded node ids.
     pub tree_expanded_node_ids: Vec<String>,
     pub tree_pinned_channel_ids: Vec<String>,
@@ -730,6 +736,8 @@ impl Default for ProjectMixer {
                 0.0,
             ),
             master_inserts: Vec::new(),
+            master_automation_lanes: Vec::new(),
+            master_automation_expanded: false,
             tree_expanded_node_ids: Vec::new(),
             tree_pinned_channel_ids: Vec::new(),
             tree_hidden_channel_ids: Vec::new(),
@@ -1485,27 +1493,7 @@ impl From<&TimelineState> for FutureboardProject {
                         }
                     })
                     .collect();
-                let automation_lanes = t
-                    .automation_lanes
-                    .iter()
-                    .map(|al| AutomationLane {
-                        id: al.id.clone(),
-                        parameter_name: al.name.clone(),
-                        target: target_to_desc(&al.target),
-                        enabled: al.enabled,
-                        points: al
-                            .points
-                            .iter()
-                            .map(|p| AutomationPoint {
-                                beat: p.beat,
-                                value: p.value,
-                                curve: p.curve.to_tag(),
-                                tension: p.tension,
-                            })
-                            .collect(),
-                        visible: al.visible,
-                    })
-                    .collect();
+                let automation_lanes = t.automation_lanes.iter().map(lane_to_project).collect();
                 ProjectTrack {
                     id: t.id.clone(),
                     name: t.name.clone(),
@@ -1764,6 +1752,13 @@ impl From<&TimelineState> for FutureboardProject {
             .enumerate()
             .map(|(idx, slot)| timeline_insert_to_project(idx, slot))
             .collect();
+        project.mixer.master_automation_lanes = tl
+            .master
+            .automation_lanes
+            .iter()
+            .map(lane_to_project)
+            .collect();
+        project.mixer.master_automation_expanded = tl.master.automation_expanded;
         project.mixer.tree_expanded_node_ids = tl.mixer_tree.expanded_list();
         project.mixer.tree_pinned_channel_ids = tl.mixer_tree.pinned_list();
         project.mixer.tree_hidden_channel_ids = tl.mixer_tree.hidden_list();
@@ -1817,8 +1812,7 @@ pub fn apply_to_timeline(
         Vec::new();
     let mut unresolved_connections: Vec<(String, String)> = Vec::new();
     use crate::components::timeline::timeline_state::{
-        AccentSource as TlAccentSource, AccentState as TlAccentState, AutomationLaneState,
-        AutomationPoint as TlAutoPoint, ClipState, MidiChannel,
+        AccentSource as TlAccentSource, AccentState as TlAccentState, ClipState, MidiChannel,
         MidiControllerLane as TlControllerLane, MidiControllerPoint as TlControllerPoint,
         MidiNoteState, PitchCurve as TlPitchCurve, PitchPoint as TlPitchPoint,
         PitchSegmentShape as TlPitchSegmentShape, SendSlotState, TrackState,
@@ -2023,6 +2017,14 @@ pub fn apply_to_timeline(
         .iter()
         .map(project_insert_to_timeline)
         .collect();
+    tl.master.automation_lanes = project
+        .mixer
+        .master_automation_lanes
+        .iter()
+        .map(lane_from_project)
+        .collect();
+    tl.master.automation_expanded = project.mixer.master_automation_expanded;
+    tl.master.selected_automation_target = None;
     tl.mixer_tree =
         crate::components::timeline::timeline_state::MixerTreeViewState::from_project_lists(
             &project.mixer.tree_expanded_node_ids,
@@ -2238,32 +2240,7 @@ pub fn apply_to_timeline(
                     }
                 })
                 .collect();
-            let automation_lanes = pt
-                .automation_lanes
-                .iter()
-                .map(|al| AutomationLaneState {
-                    id: al.id.clone(),
-                    name: al.parameter_name.clone(),
-                    target: desc_to_target(&al.target, &al.parameter_name),
-                    enabled: al.enabled,
-                    visible: al.visible,
-                    points: al
-                        .points
-                        .iter()
-                        .map(|p| {
-                            let mut point = TlAutoPoint::with_curve(
-                                p.beat,
-                                p.value,
-                                crate::components::timeline::timeline_state::AutomationCurve::from_tag(
-                                    p.curve,
-                                ),
-                            );
-                            point.set_tension(p.tension);
-                            point
-                        })
-                        .collect(),
-                })
-                .collect();
+            let automation_lanes = pt.automation_lanes.iter().map(lane_from_project).collect();
             let inserts: Vec<InsertSlotState> = pt
                 .inserts
                 .iter()
@@ -2287,6 +2264,7 @@ pub fn apply_to_timeline(
                         enabled: s.enabled,
                         pre_fader: s.pre_fader,
                         gain_db: s.gain_db,
+                        automated: None,
                     }
                 })
                 .collect();
@@ -2905,6 +2883,59 @@ fn project_routing_to_timeline(
     state
 }
 
+/// A timeline automation lane as the project file stores it.
+fn lane_to_project(
+    al: &crate::components::timeline::timeline_state::AutomationLaneState,
+) -> AutomationLane {
+    AutomationLane {
+        id: al.id.clone(),
+        parameter_name: al.name.clone(),
+        target: target_to_desc(&al.target),
+        enabled: al.enabled,
+        mode: al.mode.to_tag(),
+        points: al
+            .points
+            .iter()
+            .map(|p| AutomationPoint {
+                beat: p.beat,
+                value: p.value,
+                curve: p.curve.to_tag(),
+                tension: p.tension,
+            })
+            .collect(),
+        visible: al.visible,
+    }
+}
+
+/// [`lane_to_project`] the other way round. Never restores a lane as
+/// recording: that belongs to a transport run, not to the file.
+fn lane_from_project(
+    al: &AutomationLane,
+) -> crate::components::timeline::timeline_state::AutomationLaneState {
+    use crate::components::timeline::timeline_state::{
+        AutomationCurve, AutomationLaneState, AutomationMode, AutomationPoint as TlAutoPoint,
+    };
+    AutomationLaneState {
+        id: al.id.clone(),
+        name: al.parameter_name.clone(),
+        target: desc_to_target(&al.target, &al.parameter_name),
+        enabled: al.enabled,
+        visible: al.visible,
+        mode: AutomationMode::from_tag(al.mode),
+        recording: false,
+        points: al
+            .points
+            .iter()
+            .map(|p| {
+                let mut point =
+                    TlAutoPoint::with_curve(p.beat, p.value, AutomationCurve::from_tag(p.curve));
+                point.set_tension(p.tension);
+                point
+            })
+            .collect(),
+    }
+}
+
 /// Flatten an [`AutomationTarget`] into its persisted descriptor.
 fn target_to_desc(
     target: &crate::components::timeline::timeline_state::AutomationTarget,
@@ -2924,7 +2955,8 @@ fn target_to_desc(
             desc.parameter_id = parameter_id.clone();
             desc.parameter_name = parameter_name.clone();
         }
-        T::SendLevel { send_id } => desc.send_id = send_id.clone(),
+        T::SendLevel { send_id } | T::SendEnabled { send_id } => desc.send_id = send_id.clone(),
+        T::InsertBypass { insert_id } => desc.insert_id = insert_id.clone(),
         _ => {}
     }
     desc
@@ -2952,6 +2984,13 @@ fn desc_to_target(
         },
         4 => T::SendLevel {
             send_id: desc.send_id.clone(),
+        },
+        // v61+
+        5 => T::SendEnabled {
+            send_id: desc.send_id.clone(),
+        },
+        6 => T::InsertBypass {
+            insert_id: desc.insert_id.clone(),
         },
         // tag 0: TrackVolume, or a legacy file — derive from the lane name.
         _ => {
@@ -3278,12 +3317,68 @@ mod v33_routing_adapter_tests {
         );
     }
 
+    /// v61's targets keep what they point at through the project file.
+    #[test]
+    fn send_on_off_and_bypass_targets_round_trip() {
+        use crate::components::timeline::timeline_state::AutomationTarget;
+        for target in [
+            AutomationTarget::SendEnabled {
+                send_id: "send-7".to_string(),
+            },
+            AutomationTarget::InsertBypass {
+                insert_id: "insert-3".to_string(),
+            },
+            AutomationTarget::SendLevel {
+                send_id: "send-7".to_string(),
+            },
+        ] {
+            let desc = super::target_to_desc(&target);
+            assert_eq!(super::desc_to_target(&desc, "ignored"), target);
+        }
+    }
+
+    /// v62: the master's lanes, their points and modes, and whether the
+    /// arrangement shows them come back from the file; a v61 file has none.
+    #[test]
+    fn v62_round_trips_master_automation() {
+        use crate::components::timeline::timeline_state::{
+            AutomationMode, AutomationTarget, TimelineState, MASTER_TRACK_ID,
+        };
+        let mut tl = TimelineState::default();
+        tl.toggle_track_lane_mode(MASTER_TRACK_ID);
+        let lane = tl
+            .ensure_automation_lane(MASTER_TRACK_ID, AutomationTarget::TrackVolume)
+            .unwrap();
+        tl.add_automation_point(MASTER_TRACK_ID, &lane, 8.0, 0.3);
+        tl.set_automation_lane_mode(MASTER_TRACK_ID, &lane, Some(AutomationMode::Latch));
+
+        let project = FutureboardProject::from(&tl);
+        let bytes = crate::project::format::encode_project(&project);
+        let reopened = crate::project::format::decode_project(&bytes).expect("decode");
+        let mut loaded = TimelineState::default();
+        let _ = apply_to_timeline(&reopened, &mut loaded);
+        assert!(loaded.master.automation_expanded);
+        assert_eq!(loaded.master.automation_lanes.len(), 1);
+        let restored = &loaded.master.automation_lanes[0];
+        assert_eq!(restored.target, AutomationTarget::TrackVolume);
+        assert_eq!(restored.mode, AutomationMode::Latch);
+        assert_eq!(restored.points.len(), 1);
+        assert!((restored.points[0].beat - 8.0).abs() < 1.0e-6);
+
+        // The same project in the v61 layout simply has no master lanes.
+        let old = crate::project::format::encode_project_as(&project, 61);
+        let reopened =
+            crate::project::format::decode_project_with_options(&old, true).expect("decode v61");
+        assert!(reopened.mixer.master_automation_lanes.is_empty());
+        assert!(!reopened.mixer.master_automation_expanded);
+    }
+
     #[test]
     fn the_encoder_writes_the_current_format_version() {
         let bytes = crate::project::format::encode_project(&FutureboardProject::new("current"));
         let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
         assert_eq!(version, crate::project::format::PROJECT_VERSION);
-        assert_eq!(crate::project::format::PROJECT_VERSION, 60);
+        assert_eq!(crate::project::format::PROJECT_VERSION, 62);
     }
 
     // ── v35 Master / Monitor output routing ─────────────────────────────────

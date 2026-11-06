@@ -156,7 +156,7 @@ impl StudioLayout {
                     state.song_text_event(event_id).is_some()
                 }
                 ContextTarget::AutomationLane { track_id, .. } => {
-                    state.find_track(track_id).is_some()
+                    state.automation_lanes_of(track_id).is_some()
                 }
                 ContextTarget::Browser(_) => true,
                 ContextTarget::ChordTrack { .. } | ContextTarget::ChordLane => true,
@@ -166,7 +166,7 @@ impl StudioLayout {
                 // The pinned Master/Monitor strips always exist.
                 ContextTarget::MasterOutputPicker | ContextTarget::MonitorOutputPicker => true,
                 ContextTarget::AutomationTargetPicker { track_id } => {
-                    state.find_track(track_id).is_some()
+                    state.automation_lanes_of(track_id).is_some()
                 }
                 ContextTarget::Tempo
                 | ContextTarget::TapTempo

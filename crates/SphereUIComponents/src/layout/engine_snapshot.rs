@@ -904,8 +904,16 @@ fn build_engine_sends(track: &TrackState) -> Vec<EngineSendSnapshot> {
 }
 
 fn build_engine_automation_lanes(track: &TrackState) -> Vec<EngineAutomationLaneSnapshot> {
-    track
-        .automation_lanes
+    build_engine_automation_lanes_from(&track.automation_lanes, track.volume_automation_read)
+}
+
+/// The engine's copy of a set of lanes. `volume_read` is the owner's Volume
+/// read switch (the master has none, so it always reads).
+fn build_engine_automation_lanes_from(
+    lanes: &[timeline_state::AutomationLaneState],
+    volume_read: bool,
+) -> Vec<EngineAutomationLaneSnapshot> {
+    lanes
         .iter()
         .map(|lane| {
             let mut target = EngineAutomationTargetSnapshot {
@@ -922,8 +930,12 @@ fn build_engine_automation_lanes(track: &TrackState) -> Vec<EngineAutomationLane
                     target.parameter_id = parameter_id.clone();
                     target.parameter_name = parameter_name.clone();
                 }
-                timeline_state::AutomationTarget::SendLevel { send_id } => {
+                timeline_state::AutomationTarget::SendLevel { send_id }
+                | timeline_state::AutomationTarget::SendEnabled { send_id } => {
                     target.send_id = send_id.clone();
+                }
+                timeline_state::AutomationTarget::InsertBypass { insert_id } => {
+                    target.insert_id = insert_id.clone();
                 }
                 _ => {}
             }
@@ -934,11 +946,12 @@ fn build_engine_automation_lanes(track: &TrackState) -> Vec<EngineAutomationLane
             // value copy — it never reads UI state — and base volume is always
             // sent as `EngineTrackSnapshot.volume`, so this never double-applies.
             let enabled = match lane.target {
-                timeline_state::AutomationTarget::TrackVolume => {
-                    lane.enabled && track.volume_automation_read
-                }
+                timeline_state::AutomationTarget::TrackVolume => lane.enabled && volume_read,
                 _ => lane.enabled,
-            };
+            }
+            // A lane being recorded is held back: what is heard is the
+            // control being moved, and what is written is what was heard.
+            && !lane.recording;
 
             EngineAutomationLaneSnapshot {
                 id: lane.id.clone(),
@@ -1114,7 +1127,7 @@ fn build_engine_project_snapshot_inner(
         output_track_id: None,
         inserts: master_inserts,
         sends: Vec::new(),
-        automation_lanes: Vec::new(),
+        automation_lanes: build_engine_automation_lanes_from(&state.master.automation_lanes, true),
         builtin_soundfont_player: false,
         soundfont_path: None,
         soundfont_preset_bank: None,

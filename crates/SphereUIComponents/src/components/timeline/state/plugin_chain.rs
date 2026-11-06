@@ -12,8 +12,14 @@ pub fn is_vsti_output_child_track_id(track_id: &str) -> bool {
 
 /// Tracks that exist for mixer/engine routing but must not appear as arrangement
 /// lanes (Bus/Return, plus VSTi multi-out child channels).
+///
+/// A Bus or Return carrying a shown automation lane is the exception: its row
+/// is where that lane is drawn and edited, so it appears while it has one.
 pub fn is_arrangement_hidden_track(track: &TrackState) -> bool {
-    track.track_type.is_mixer_only() || is_vsti_output_child_track_id(&track.id)
+    if is_vsti_output_child_track_id(&track.id) {
+        return true;
+    }
+    track.track_type.is_mixer_only() && !track.automation_lanes.iter().any(|lane| lane.visible)
 }
 
 /// Parent plugin instance (insert) id embedded in a child mixer-channel track id

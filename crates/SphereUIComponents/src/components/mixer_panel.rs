@@ -1369,12 +1369,15 @@ fn send_chip(
 
     let remove_pair = (track_id.to_string(), send.id.clone());
     let on_remove = callbacks.on_remove_send.clone();
-    let text = if send.enabled {
+    // What it plays now: automation in Read moves the bar like a hand would.
+    let enabled = send.display_enabled();
+    let gain_db = send.display_gain_db();
+    let text = if enabled {
         Colors::text_primary()
     } else {
         Colors::text_muted()
     };
-    let fill = if send.enabled {
+    let fill = if enabled {
         Colors::with_alpha(Colors::accent_primary(), 0.35)
     } else {
         Colors::with_alpha(Colors::text_disabled(), 0.35)
@@ -1388,8 +1391,8 @@ fn send_chip(
         source_index: send_index,
         refusal: DragRefusal::default(),
     };
-    let norm = send_norm(send.gain_db);
-    let level_text = send_level_text(send.gain_db);
+    let norm = send_norm(gain_db);
+    let level_text = send_level_text(gain_db);
     let tooltip = format!("{target_name} · {level_text} dB");
     let gain_drag_id = format!("mixer-send-gain-{}-{}", track_id, send.id);
     let gain_pair = (track_id.to_string(), send.id.clone());

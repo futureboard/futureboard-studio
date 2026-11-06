@@ -3083,6 +3083,16 @@ impl Timeline {
         else {
             return false;
         };
+        // A point that is part of a selection is right-clicked for the menu
+        // that edits the selection (curve, copy, cut, delete), not to be
+        // deleted on its own.
+        if self
+            .state
+            .selected_automation_point_ids(track_id, lane_id)
+            .contains(&point_id)
+        {
+            return false;
+        }
         // Captured before the removal: undo has to put the point back, and on
         // the last point of a lane it has to put the lane back too.
         let lanes_before = self.state.capture_automation_lanes(track_id);

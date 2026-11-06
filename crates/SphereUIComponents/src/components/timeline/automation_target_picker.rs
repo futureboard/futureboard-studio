@@ -128,8 +128,8 @@ pub fn automation_target_picker_overlay(
             .pt(px(6.0))
             .child("Track"),
     );
-    for (target, already_added) in &model.track_targets {
-        let label = target.display_name();
+    for (target, label, already_added) in &model.track_targets {
+        let label = label.clone();
         let cmd = automation_target_menu_command(track_id, target);
         let on_command = on_command.clone();
         body = body.child(picker_row(

@@ -1,6 +1,10 @@
 use crate::assets;
+use crate::components::timeline::automation_lane::{
+    AUTOMATION_CONTENT_X, AUTOMATION_SUBLANE_RAIL_X, AUTOMATION_TRACK_STRIP_W,
+};
 use crate::components::timeline::timeline_state::{
     LastTouchedPluginParam, TimelineState, AUTOMATION_CONTROL_LANE_HEIGHT, HEADER_WIDTH,
+    MASTER_TRACK_ID,
 };
 use crate::theme::{radius, space, typography, Colors};
 use gpui::prelude::FluentBuilder;
@@ -8,10 +12,6 @@ use gpui::{
     div, px, svg, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement,
     Styled,
 };
-
-/// Left inset for the automation control row header (slightly less than sub-lanes
-/// so the hierarchy reads: parent → control → lanes).
-const CONTROL_HEADER_INDENT: f32 = 24.0;
 
 /// Actions fired from the automation control lane. UI-only row — never serialized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,12 +53,8 @@ pub fn automation_control_lane(
     };
 
     let lane_count = state
-        .tracks
-        .iter()
-        .find(|track| track.id == track_id)
-        .map_or(0, |track| {
-            track.automation_lanes.iter().filter(|l| l.visible).count()
-        });
+        .automation_lanes_of(&track_id)
+        .map_or(0, |lanes| lanes.iter().filter(|l| l.visible).count());
     let header = control_header(
         &track_id,
         track_color,
@@ -77,11 +73,16 @@ pub fn automation_control_lane(
         .border_b(px(1.0))
         .border_color(Colors::with_alpha(Colors::automation_separator(), 0.7));
 
+    let is_master = track_id == MASTER_TRACK_ID;
     div()
         .flex()
         .flex_row()
         .w_full()
         .h(px(lane_height))
+        // The master block starts a section of its own below the tracks.
+        .when(is_master, |row| {
+            row.border_t(px(1.0)).border_color(Colors::border_strong())
+        })
         // No row-level fill: the header paints its own (opaque) label surface and
         // the right strip is translucent so the timeline grid shows through.
         .border_b(px(1.0))
@@ -102,12 +103,15 @@ enum ControlButtonStyle {
 #[allow(clippy::too_many_arguments)]
 fn control_header(
     track_id: &str,
-    _track_color: gpui::Rgba,
+    track_color: gpui::Rgba,
     lane_count: usize,
     last_touched: Option<&LastTouchedPluginParam>,
     id_num: usize,
     on_action: Option<AutomationControlCallback>,
 ) -> impl IntoElement {
+    // The master's block has no track row above it, so its control row is
+    // its header: it names the master, and hangs off nothing.
+    let is_master = track_id == MASTER_TRACK_ID;
     // Title: the section's glyph, its name and how many lanes it holds — the
     // count is what says there is more under a collapsed section.
     let title = div()
@@ -118,26 +122,46 @@ fn control_header(
         .min_w(px(0.0))
         .child(
             svg()
-                .path(assets::ICON_AUTOMATION_PATH)
+                .path(if is_master {
+                    assets::ICON_VOLUME_2_PATH
+                } else {
+                    assets::ICON_AUTOMATION_PATH
+                })
                 .flex_none()
-                .w(px(12.0))
-                .h(px(12.0))
+                .w(px(14.0))
+                .h(px(14.0))
                 .text_color(Colors::state_automation()),
         )
         .child(
             div()
                 .truncate()
-                .text_size(px(typography::UI_XS))
+                .text_size(px(typography::UI_SM))
                 .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(Colors::text_secondary())
-                .child("Automation"),
+                .text_color(Colors::text_primary())
+                .child(if is_master {
+                    "Master Automation"
+                } else {
+                    "Automation"
+                }),
         )
+        // The count as a badge in the section's hue, so a collapsed section
+        // still says how much is under it.
         .when(lane_count > 0, |row| {
+            let hue = Colors::state_automation();
             row.child(
                 div()
                     .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .min_w(px(16.0))
+                    .h(px(16.0))
+                    .px(px(space::TIGHT))
+                    .rounded(px(crate::theme::radius::PILL))
+                    .bg(Colors::with_alpha(hue, 0.16))
                     .text_size(px(typography::UI_XS))
-                    .text_color(Colors::text_muted())
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(hue)
                     .child(lane_count.to_string()),
             )
         });
@@ -181,7 +205,11 @@ fn control_header(
         .child(control_button(
             ("automation-ctrl-clear", id_num).into(),
             assets::ICON_TRASH_PATH,
-            "Remove all automation on this track…",
+            if is_master {
+                "Remove all master automation…"
+            } else {
+                "Remove all automation on this track…"
+            },
             ControlButtonStyle::Danger,
             track_id,
             AutomationControlAction::RequestClearAll,
@@ -196,13 +224,25 @@ fn control_header(
         .bg(Colors::automation_lane_header_bg())
         .border_r(px(1.0))
         .border_color(Colors::border_subtle())
-        // The nesting guide every automation row shares, so the section reads
-        // as one block hanging off its track.
+        // The track's colour strip, carried down from its header.
+        .when(!is_master, |header| {
+            header.child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(px(AUTOMATION_TRACK_STRIP_W))
+                    .bg(Colors::with_alpha(track_color, 0.6)),
+            )
+        })
+        // The guide every lane row continues, hanging from the section glyph
+        // so the lanes read as what it holds.
         .child(
             div()
                 .absolute()
-                .left(px(14.0))
-                .top(px(8.0))
+                .left(px(AUTOMATION_SUBLANE_RAIL_X))
+                .top(px(AUTOMATION_CONTROL_LANE_HEIGHT / 2.0 + 8.0))
                 .bottom_0()
                 .w(px(1.0))
                 .bg(Colors::automation_rail()),
@@ -216,7 +256,7 @@ fn control_header(
                 .gap(px(space::SNUG))
                 .w_full()
                 .h_full()
-                .pl(px(CONTROL_HEADER_INDENT))
+                .pl(px(AUTOMATION_CONTENT_X))
                 .pr(px(space::SNUG))
                 .child(title)
                 .child(buttons),

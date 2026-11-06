@@ -68,6 +68,8 @@ mod missing_media_ops;
 mod mixer_ops;
 mod stem_extract_ops;
 pub(crate) use mixer_ops::{clone_track_for_mixer, clone_track_for_mixer_summary};
+mod automation_edit_ops;
+mod chain_preset_ops;
 mod folder_ops;
 pub(crate) mod plugin_bridge_runtime;
 mod plugin_editor_chrome_ops;
@@ -581,6 +583,12 @@ pub struct StudioLayout {
     /// Inspector fold sections the user folded, by section key. View state
     /// only: it is not saved with the project and never marks it dirty.
     inspector_folded: std::collections::HashSet<String>,
+    /// Copied automation points, and whether Paste reads them or the clips.
+    automation_clipboard: automation_edit_ops::AutomationClipboardState,
+    /// Write / Touch / Latch recording for the current transport run.
+    automation_recorder: crate::components::timeline::timeline_state::AutomationRecorder,
+    /// The clock the recorder times a Touch release with.
+    automation_record_clock: std::time::Instant,
     /// UI-only selected plugin insert `(track_id, insert_id)` driving the
     /// Plugin Insert inspector target. Pure selection — never marks dirty.
     selected_insert: Option<(String, String)>,
@@ -1481,6 +1489,9 @@ impl StudioLayout {
                 .with_placeholder("Filter channels…"),
             inspector_name_edit: input_ops::InspectorNameEditState::new(cx),
             inspector_folded: std::collections::HashSet::new(),
+            automation_clipboard: Default::default(),
+            automation_recorder: Default::default(),
+            automation_record_clock: std::time::Instant::now(),
             selected_insert: None,
             plugin_picker: PluginPickerState::closed(),
             plugin_picker_search_input: TextInputState::new(
@@ -2252,6 +2263,15 @@ impl StudioLayout {
             command_id,
         ) {
             self.apply_output_routing_command(command, false, cx);
+            return;
+        }
+        // Paste copied automation points where the lane was right-clicked.
+        if let Some(beat) = command_id
+            .strip_prefix("automation:paste-at:")
+            .and_then(|beat| beat.parse::<f32>().ok())
+        {
+            let lane = self.take_menu_automation_lane(cx);
+            self.paste_automation_points(lane, Some(beat), cx);
             return;
         }
         if let Some((track_id, target)) =
@@ -3083,9 +3103,56 @@ impl StudioLayout {
             // shortcuts fall back to arrangement clip selection/clipboard.
             "edit:select-all" => self.select_all_timeline_items(cx),
             "automation:select-all-points" => self.select_all_automation_points(cx),
-            "edit:copy" => self.copy_selected_clips(cx),
-            "edit:cut" => self.cut_selected_clips(cx),
-            "edit:paste" => self.paste_clips_at_playhead(cx),
+            // Selected automation points take Copy / Cut; otherwise the clips
+            // do. Paste pastes whichever was copied last.
+            "edit:copy" | "automation:copy" => {
+                let lane = (command_id == "automation:copy")
+                    .then(|| self.take_menu_automation_lane(cx))
+                    .flatten();
+                if !self.copy_automation_points(lane, false, cx) {
+                    self.note_clips_copied();
+                    self.copy_selected_clips(cx);
+                }
+            }
+            "edit:cut" | "automation:cut" => {
+                let lane = (command_id == "automation:cut")
+                    .then(|| self.take_menu_automation_lane(cx))
+                    .flatten();
+                if !self.copy_automation_points(lane, true, cx) {
+                    self.note_clips_copied();
+                    self.cut_selected_clips(cx);
+                }
+            }
+            "edit:paste" => {
+                if !self.paste_automation_points(None, None, cx) {
+                    self.paste_clips_at_playhead(cx);
+                }
+            }
+            "master:automation-toggle" => self.toggle_master_automation(cx),
+            "automation:curve:linear" => {
+                let lane = self.take_menu_automation_lane(cx);
+                self.set_selected_automation_curve(
+                    lane,
+                    crate::components::timeline::timeline_state::AutomationCurve::Linear,
+                    cx,
+                );
+            }
+            "automation:curve:hold" => {
+                let lane = self.take_menu_automation_lane(cx);
+                self.set_selected_automation_curve(
+                    lane,
+                    crate::components::timeline::timeline_state::AutomationCurve::Hold,
+                    cx,
+                );
+            }
+            "automation:curve:smooth" => {
+                let lane = self.take_menu_automation_lane(cx);
+                self.set_selected_automation_curve(
+                    lane,
+                    crate::components::timeline::timeline_state::AutomationCurve::Smooth,
+                    cx,
+                );
+            }
             "edit:deselect-all" | "automation:clear-selection" => {
                 self.clear_automation_selection(cx)
             }

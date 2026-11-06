@@ -1309,8 +1309,18 @@ impl Render for Timeline {
                         let prev = this.state.capture_automation_lanes(&track_id);
                         if this
                             .state
-                            .toggle_automation_lane_enabled(&track_id, &lane_id)
+                            .cycle_automation_lane_mode(&track_id, &lane_id)
                             .is_some()
+                        {
+                            this.record_automation_lanes_edit(&track_id, prev, cx);
+                            cx.notify();
+                        }
+                    }
+                    AutomationLaneAction::SetMode(mode) => {
+                        let prev = this.state.capture_automation_lanes(&track_id);
+                        if this
+                            .state
+                            .set_automation_lane_mode(&track_id, &lane_id, mode)
                         {
                             this.record_automation_lanes_edit(&track_id, prev, cx);
                             cx.notify();

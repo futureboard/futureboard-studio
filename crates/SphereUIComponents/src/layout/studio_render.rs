@@ -149,11 +149,17 @@ impl Render for StudioLayout {
                                 track_id,
                                 lane_id,
                                 beat,
-                            } => ContextTarget::AutomationLane {
-                                track_id,
-                                lane_id,
-                                beat,
-                            },
+                            } => {
+                                // Its commands act on this lane, which on the
+                                // master is never the selected track's.
+                                this.automation_clipboard.menu_lane =
+                                    Some((track_id.clone(), lane_id.clone()));
+                                ContextTarget::AutomationLane {
+                                    track_id,
+                                    lane_id,
+                                    beat,
+                                }
+                            }
                             TimelineContextTarget::Ruler(beat) => {
                                 ContextTarget::TimelineRuler { beat }
                             }
