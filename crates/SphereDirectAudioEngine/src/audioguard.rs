@@ -494,15 +494,29 @@ impl InsertGuard {
         }
     }
 
-    /// Count one bridged block, `missed` when the host had nothing fresh. At
-    /// High, a plug-in that misses one block in four over a window is
-    /// bypassed: it was being heard dry or silent anyway, and every miss spent
-    /// part of the device period waiting for it.
+    /// Count one bridged block, `missed` when the host had nothing fresh.
+    ///
+    /// At High, a plug-in that misses one device-callback block in four over
+    /// a window is bypassed. A block rendered ahead does not count: the guard
+    /// asks again immediately, and the host still finishing the previous
+    /// block is the latency the ring exists to hide. Counting those misses
+    /// bypasses every bridged effect as soon as High is rendering ahead.
     #[inline]
     pub(crate) fn note_bridge_block(&mut self, missed: bool) {
-        if process_level() != AudioguardLevel::High {
+        self.note_bridge_block_at(
+            missed,
+            process_level(),
+            crate::plugin_bridge::render_ahead_grace().is_some(),
+        );
+    }
+
+    fn note_bridge_block_at(&mut self, missed: bool, level: AudioguardLevel, rendered_ahead: bool) {
+        if level != AudioguardLevel::High {
             self.window_blocks = 0;
             self.window_misses = 0;
+            return;
+        }
+        if rendered_ahead {
             return;
         }
         self.window_blocks += 1;
@@ -1174,6 +1188,46 @@ mod tests {
         let mut l = vec![0.2f32; 8];
         fresh.check_output(&mut l, &mut r);
         assert!(!fresh.bypassed);
+    }
+
+    /// High bypasses a bridged plug-in only for misses on the device
+    /// callback. Render-ahead misses are the host still finishing a block
+    /// the guard asked for immediately; counting them turned every effect
+    /// off as soon as High was rendering ahead.
+    #[test]
+    fn high_does_not_bypass_for_misses_while_rendering_ahead() {
+        let mut guard = InsertGuard::default();
+        for _ in 0..(MISS_WINDOW_BLOCKS * 2) {
+            guard.note_bridge_block_at(true, AudioguardLevel::High, true);
+        }
+        assert!(!guard.bypassed);
+        assert_eq!(guard.window_blocks, 0);
+        assert_eq!(guard.window_misses, 0);
+
+        let mut normal = InsertGuard::default();
+        for _ in 0..(MISS_WINDOW_BLOCKS * 2) {
+            normal.note_bridge_block_at(true, AudioguardLevel::Normal, false);
+        }
+        assert!(!normal.bypassed);
+
+        let mut late = InsertGuard::default();
+        let trip_at = MISS_WINDOW_BLOCKS / MISS_SHARE_TO_TRIP;
+        for block in 0..MISS_WINDOW_BLOCKS {
+            late.note_bridge_block_at(block < trip_at, AudioguardLevel::High, false);
+        }
+        assert!(
+            late.bypassed,
+            "a plug-in missing one device block in four is bypassed"
+        );
+
+        let mut jitter = InsertGuard::default();
+        for block in 0..MISS_WINDOW_BLOCKS {
+            jitter.note_bridge_block_at(block + 1 < trip_at, AudioguardLevel::High, false);
+        }
+        assert!(
+            !jitter.bypassed,
+            "fewer than one miss in four stays in the chain"
+        );
     }
 
     #[test]
