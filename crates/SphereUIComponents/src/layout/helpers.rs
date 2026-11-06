@@ -149,17 +149,36 @@ fn meter_visual_bucket(value: f32) -> u8 {
     (value.clamp(0.0, 1.0) * 255.0) as u8
 }
 
-/// Advance one smoothed meter value. The dirty verdict follows the same 8-bit
-/// visual precision used by meter render signatures, so every visible step is
-/// painted while sub-visible motion remains free of redundant notifications.
+/// How fast a meter falls once the signal drops, in dB per second — a peak
+/// meter's release, as a console's moderate fallback reads.
+const METER_RELEASE_DB_PER_SEC: f32 = 26.0;
+
+/// Advance one meter value: a peak meter's ballistics. It rises to a louder
+/// peak at once — the engine now hands over the highest peak since the last
+/// read, so there is nothing to smooth on the way up — and falls at a steady
+/// [`METER_RELEASE_DB_PER_SEC`], measured on the elapsed time so the display
+/// rate does not change it.
+///
+/// The fall used to take 18 % of the remaining level per 60 Hz frame. On the
+/// meter's dB scale that is about 100 dB a second: the bar dropped almost as
+/// fast as it rose and followed every flicker of the signal, which is the
+/// jitter the header and strip meters showed.
+///
+/// The dirty verdict follows the same 8-bit visual precision used by meter
+/// render signatures, so every visible step is painted while sub-visible
+/// motion remains free of redundant notifications.
 pub(super) fn smooth_meter_value(current: &mut f32, target: f32, dt_secs: f32) -> bool {
     let previous_bucket = meter_visual_bucket(*current);
     let target = target.clamp(0.0, 1.0);
-    let dt_frames = (dt_secs.clamp(1.0 / 240.0, 0.1) * 60.0).max(0.0);
-    let base_rate: f32 = if target > *current { 0.72 } else { 0.18 };
-    let rate = 1.0 - (1.0 - base_rate).powf(dt_frames);
-    let next = (*current + (target - *current) * rate).clamp(0.0, 1.0);
-    *current = if next < 0.002 { 0.0 } else { next };
+    let dt = dt_secs.clamp(1.0 / 240.0, 0.1);
+    let next = if target >= *current {
+        target
+    } else {
+        let fall = 10f32.powf(-METER_RELEASE_DB_PER_SEC * dt / 20.0);
+        (*current * fall).max(target)
+    };
+    // Below -60 dBFS the meter draws nothing.
+    *current = if next < 0.001 { 0.0 } else { next };
     previous_bucket != meter_visual_bucket(*current)
 }
 
@@ -335,9 +354,36 @@ mod transport_binding_tests {
         let mut level = 0.5;
         assert!(smooth_meter_value(&mut level, 0.0, 1.0 / 60.0));
 
-        level = 0.0041;
-        assert!(smooth_meter_value(&mut level, 0.0, 0.1));
+        // A quiet tail runs out to silence, and that last step is a repaint.
+        level = 0.0045;
+        let mut repainted = false;
+        for _ in 0..10 {
+            repainted |= smooth_meter_value(&mut level, 0.0, 0.1);
+        }
         assert_eq!(level, 0.0);
+        assert!(repainted);
+    }
+
+    /// A peak meter: up at once, down at a steady rate in dB, whatever the
+    /// display rate.
+    #[test]
+    fn meters_rise_at_once_and_fall_at_the_release_rate() {
+        let mut level = 0.1;
+        smooth_meter_value(&mut level, 0.9, 1.0 / 60.0);
+        assert_eq!(level, 0.9);
+
+        let fall_for = |steps: usize, dt: f32| {
+            let mut level = 1.0;
+            for _ in 0..steps {
+                smooth_meter_value(&mut level, 0.0, dt);
+            }
+            20.0 * level.log10()
+        };
+        // One second at 60 Hz and at 120 Hz: the same drop.
+        let at_60 = fall_for(60, 1.0 / 60.0);
+        let at_120 = fall_for(120, 1.0 / 120.0);
+        assert!((at_60 + METER_RELEASE_DB_PER_SEC).abs() < 0.05, "{at_60}");
+        assert!((at_120 - at_60).abs() < 0.05);
     }
 
     #[test]

@@ -1514,13 +1514,46 @@ pub struct RuntimePluginOutputMeterSnapshot {
     pub peak: f32,
 }
 
+/// A block peak as bits that order like the level: a non-negative finite
+/// `f32`'s bit pattern grows with its value, so `fetch_max` on the bits is a
+/// lock-free max of the levels. Anything else (a NaN from a misbehaving
+/// plug-in) counts as silence rather than pinning the meter.
+#[inline]
+fn peak_bits(peak: f32) -> u32 {
+    if peak.is_finite() && peak > 0.0 {
+        f32_store(peak)
+    } else {
+        0
+    }
+}
+
 impl RuntimeTrackMeter {
+    /// Publish one block. The peaks are the highest since the meter was last
+    /// taken, not this block's: the UI reads at display rate, a block is a few
+    /// milliseconds, and storing each block's own peak meant a read saw
+    /// whichever block happened to be last — every peak between two reads was
+    /// lost, and the bar jumped between whatever it caught. RMS stays the last
+    /// block's. Realtime-safe: two atomic max operations and two stores.
     #[inline]
     fn store(&self, peak_l: f32, peak_r: f32, rms_l: f32, rms_r: f32) {
-        self.peak_l.store(f32_store(peak_l), Ordering::Relaxed);
-        self.peak_r.store(f32_store(peak_r), Ordering::Relaxed);
+        self.peak_l.fetch_max(peak_bits(peak_l), Ordering::Relaxed);
+        self.peak_r.fetch_max(peak_bits(peak_r), Ordering::Relaxed);
         self.rms_l.store(f32_store(rms_l), Ordering::Relaxed);
         self.rms_r.store(f32_store(rms_r), Ordering::Relaxed);
+    }
+
+    /// Read the meter and start the next peak window: the peaks since the
+    /// last take, reset to silence. For the one display reader; diagnostics
+    /// use [`Self::load`], which leaves them.
+    #[inline]
+    pub(crate) fn take(&self, track_id: &str) -> RuntimeTrackMeterSnapshot {
+        RuntimeTrackMeterSnapshot {
+            track_id: track_id.to_string(),
+            peak_l: f32_load(self.peak_l.swap(0, Ordering::Relaxed)),
+            peak_r: f32_load(self.peak_r.swap(0, Ordering::Relaxed)),
+            rms_l: f32_load(self.rms_l.load(Ordering::Relaxed)),
+            rms_r: f32_load(self.rms_r.load(Ordering::Relaxed)),
+        }
     }
 
     #[inline]
@@ -4973,10 +5006,12 @@ impl RuntimeProject {
         }
     }
 
+    /// Every track's meter since the last call, which starts the next window
+    /// (see [`RuntimeTrackMeter::store`]). One display reader calls this.
     pub fn meter_snapshots(&self) -> Vec<RuntimeTrackMeterSnapshot> {
         self.tracks
             .iter()
-            .map(|track| track.meter.load(&track.id))
+            .map(|track| track.meter.take(&track.id))
             .collect()
     }
 
