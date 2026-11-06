@@ -19,6 +19,7 @@ use crate::components::timeline::timeline_state::{
     volume, GroupTree, TimelineState, TrackDragItem, TrackLaneMode, TrackState, TrackType,
     HEADER_WIDTH, TRACK_HEADER_CONTROLS_MIN_HEIGHT,
 };
+use crate::components::timeline::vu_meter::HEADER_METER_COLUMN_W;
 use crate::theme::{radius, size, space, typography, Colors};
 
 type TrackCallback = std::sync::Arc<dyn Fn(&String, &mut gpui::Window, &mut gpui::App) + 'static>;
@@ -1129,7 +1130,8 @@ pub fn track_header(
                             row.child(folder_menu_button(id_num, track_id, on_open))
                         }),
                 )
-                // Row 2: horizontal volume fader + pan pill + meter + dB pill.
+                // Row 2: horizontal volume fader + pan pill + dB pill. The
+                // meter has the header's right edge to itself.
                 // Only rendered when the row is tall enough to hold it; the
                 // compact header (short rows) shows just row 1.
                 .when(show_controls, |col| {
@@ -1273,10 +1275,6 @@ pub fn track_header(
                                         }
                                     })
                             })
-                            // Compact meter: a slot only. The studio root paints
-                            // the levels over it, so a level change repaints the
-                            // bar and not the arrangement around it.
-                            .child(track_meter_slot(meters, track.id.clone(), index))
                             // Bordered dB pill
                             .child(db_value_pill(
                                 volume::format_db(state.display_track_volume(track)),
@@ -1284,6 +1282,22 @@ pub fn track_header(
                             )),
                     )
                 }),
+        )
+        // The meter: a full-height stereo pair in its own column at the
+        // header's right edge, on the recessed plane, a hairline from the
+        // controls. A slot only — the studio root paints the levels over it,
+        // so a level change repaints the bars and not the arrangement.
+        .child(
+            div()
+                .flex()
+                .flex_none()
+                .justify_center()
+                .w(px(HEADER_METER_COLUMN_W))
+                .h_full()
+                .bg(Colors::surface_canvas())
+                .border_l(px(1.0))
+                .border_color(Colors::border_subtle())
+                .child(track_meter_slot(meters, track.id.clone(), index)),
         )
 }
 

@@ -339,28 +339,42 @@ pub const COMPACT_METER_GAP: f32 = 2.0;
 pub const COMPACT_METER_HEIGHT: f32 = 16.0;
 pub const COMPACT_METER_WIDTH: f32 = COMPACT_METER_BAR_W * 2.0 + COMPACT_METER_GAP;
 
-/// [`vu_meter_with_levels`] painted straight into `bounds` (its top-left is
-/// the meter's), for a layer that draws meters apart from the headers they sit
-/// in. Same rail, same segments, same rounding.
-pub fn paint_compact_meter(
+/// One bar of the track header's meter.
+pub const HEADER_METER_BAR_W: f32 = 3.0;
+/// Between its two bars.
+pub const HEADER_METER_GAP: f32 = 1.0;
+/// Width of the stereo pair the track header paints.
+pub const HEADER_METER_WIDTH: f32 = HEADER_METER_BAR_W * 2.0 + HEADER_METER_GAP;
+/// Inset of the pair inside its column, on every side.
+pub const HEADER_METER_INSET: f32 = crate::theme::space::TIGHT;
+/// The meter column at the track header's right edge: the pair and its inset.
+pub const HEADER_METER_COLUMN_W: f32 = HEADER_METER_WIDTH + 2.0 * HEADER_METER_INSET;
+
+/// The track header's meter painted straight into `bounds` (window space): a
+/// stereo pair as tall as the slot it was given, for the layer that draws the
+/// meters apart from the headers they sit in.
+///
+/// Square-cornered, so the topmost lit pixel is the level; segment boundaries
+/// on the same dB scale as the mixer's meter, whatever the row's height.
+pub fn paint_header_meter(
     bounds: gpui::Bounds<gpui::Pixels>,
     level_l: f32,
     level_r: f32,
     window: &mut gpui::Window,
 ) {
-    let total_height = COMPACT_METER_HEIGHT;
+    let total_height = f32::from(bounds.size.height).floor();
+    if total_height < 2.0 {
+        return;
+    }
     for (index, level) in [level_l, level_r].into_iter().enumerate() {
-        let left = bounds.origin.x + px(index as f32 * (COMPACT_METER_BAR_W + COMPACT_METER_GAP));
+        let left = bounds.origin.x + px(index as f32 * (HEADER_METER_BAR_W + HEADER_METER_GAP));
         let bar = |bottom: f32, height: f32| {
             gpui::Bounds::new(
                 gpui::point(left, bounds.origin.y + px(total_height - bottom - height)),
-                gpui::size(px(COMPACT_METER_BAR_W), px(height)),
+                gpui::size(px(HEADER_METER_BAR_W), px(height)),
             )
         };
-        window.paint_quad(
-            gpui::fill(bar(0.0, total_height), Colors::meter_rail())
-                .corner_radii(px(crate::theme::radius::CONTROL)),
-        );
+        window.paint_quad(gpui::fill(bar(0.0, total_height), Colors::meter_rail()));
         let (green_h, yellow_h, red_h) = bar_segment_heights(level, total_height);
         for (bottom, height, color) in [
             (0.0, green_h, Colors::meter_low()),

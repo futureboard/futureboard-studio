@@ -32,7 +32,7 @@ use gpui::{
 
 use crate::components::timeline::playhead::PlayheadFrameCell;
 use crate::components::timeline::vu_meter::{
-    paint_compact_meter, COMPACT_METER_HEIGHT, COMPACT_METER_WIDTH,
+    paint_header_meter, HEADER_METER_INSET, HEADER_METER_WIDTH,
 };
 use crate::components::timeline::Timeline;
 use crate::theme::Colors;
@@ -137,8 +137,9 @@ pub(crate) fn occluder_probe(
     })
 }
 
-/// Where a header's compact meter goes: its size, nothing painted. Its bounds
-/// are recorded for [`ArrangementMeterOverlay`].
+/// Where a header's meter goes: the stereo pair's width and the full height
+/// of the column it sits in, less the inset; nothing painted. Its bounds are
+/// recorded for [`ArrangementMeterOverlay`].
 pub(crate) fn track_meter_slot(
     layout: &SharedArrangementOverlay,
     track_id: String,
@@ -147,8 +148,9 @@ pub(crate) fn track_meter_slot(
     let layout = layout.clone();
     div()
         .flex_none()
-        .w(px(COMPACT_METER_WIDTH))
-        .h(px(COMPACT_METER_HEIGHT))
+        .w(px(HEADER_METER_WIDTH))
+        .h_full()
+        .py(px(HEADER_METER_INSET))
         .child(
             canvas(
                 move |bounds, _window, _cx| {
@@ -219,7 +221,7 @@ impl Render for ArrangementMeterOverlay {
                     .collect();
                 window.with_content_mask(Some(ContentMask { bounds: clip }), |window| {
                     for (bounds, level_l, level_r) in meters {
-                        paint_compact_meter(bounds, level_l, level_r, window);
+                        paint_header_meter(bounds, level_l, level_r, window);
                     }
                 });
             },
