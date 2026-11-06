@@ -472,7 +472,17 @@ impl InsertSlotState {
 pub const MASTER_TRACK_ID: &str = "master";
 
 /// Most slots one channel's insert chain holds, the instrument slot included.
-pub const MAX_INSERT_SLOTS: usize = 8;
+///
+/// No limit: a chain takes as many plug-ins as the machine can run. The
+/// engine and the plug-in host never had a cap of their own (each insert is
+/// processed in turn, and its cost shows in the Process Explorer); eight was a
+/// UI rule only. Kept as a named bound so every "is there room" check still
+/// reads as one, and a cap could come back in one place.
+pub const MAX_INSERT_SLOTS: usize = usize::MAX;
+
+/// A chain deep enough that a test stands for "many more than the old eight".
+#[cfg(test)]
+pub(crate) const LONG_CHAIN_FOR_TESTS: usize = 64;
 
 /// A planned move of one effect from one channel's chain to another's — what
 /// [`TimelineState::apply_insert_move`] does and everything
@@ -2430,7 +2440,7 @@ mod insert_move_tests {
         let full = track(&mut state, TrackType::Audio, "Full");
         let synth = load(&mut state, &inst, 0, "synth", true);
         let fx = load(&mut state, &inst, 1, "fx", false);
-        for index in 0..MAX_INSERT_SLOTS {
+        for index in 0..LONG_CHAIN_FOR_TESTS {
             load(&mut state, &full, index, "filler", false);
         }
         // A VSTi used as an effect on an audio track is still an instrument
@@ -2449,8 +2459,8 @@ mod insert_move_tests {
             "no effect chain"
         );
         assert!(
-            state.plan_insert_move(&inst, &fx, &full, 0).is_none(),
-            "no room"
+            state.plan_insert_move(&inst, &fx, &full, 0).is_some(),
+            "a long chain still has room: there is no slot limit"
         );
         assert!(
             state.plan_insert_move(&inst, &fx, &bare_midi, 0).is_none(),
@@ -2873,13 +2883,14 @@ mod insert_move_tests {
             None,
             "an instrument is never copied"
         );
-        for index in 1..MAX_INSERT_SLOTS {
+        for index in 1..LONG_CHAIN_FOR_TESTS {
             load(&mut state, &audio, index, "filler", false);
         }
-        assert_eq!(
-            state.duplicate_insert(&audio, &fx, &audio, 1, None),
-            None,
-            "a full chain has no room, its own copy included"
+        assert!(
+            state
+                .duplicate_insert(&audio, &fx, &audio, 1, None)
+                .is_some(),
+            "a long chain still takes a copy: there is no slot limit"
         );
     }
 

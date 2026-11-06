@@ -1162,7 +1162,8 @@ fn inserts_section(
 }
 
 /// The end of a rack's chain: the drop strip after the last slot, and
-/// "+ Insert" (one trailing empty slot until `MAX_INSERT_SLOTS` is reached).
+/// "+ Insert" (one trailing empty slot; a chain has no slot limit, so it is
+/// always offered — the rack scrolls).
 /// With no slots, "+ Insert" keeps the top of the rack and the strip goes
 /// under it, so an empty rack looks as it always did.
 fn chain_end(

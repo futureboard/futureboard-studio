@@ -783,8 +783,8 @@ mod tests {
         assert_eq!(state.replace_fx_chain(&bare_midi, &chain), None);
 
         let inst = track(&mut state, TrackType::Instrument, "Inst");
-        assert!(state.can_take_fx_chain(&inst, MAX_INSERT_SLOTS - 1));
-        assert!(!state.can_take_fx_chain(&inst, MAX_INSERT_SLOTS));
+        // No slot limit: a chain far past the old eight still fits.
+        assert!(state.can_take_fx_chain(&inst, LONG_CHAIN_FOR_TESTS));
         let copies = state.replace_fx_chain(&inst, &chain).expect("pasted");
         assert!(
             state.insert_slot_at(&inst, 0).unwrap().is_empty(),
