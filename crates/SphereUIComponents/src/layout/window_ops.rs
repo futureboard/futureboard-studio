@@ -2135,7 +2135,7 @@ impl StudioLayout {
 
     /// What the audio engine currently reports about itself.
     ///
-    /// Two calls into the engine: `stats()` for the device and the callback
+    /// Three calls into the engine: `stats()` for the device and the callback
     /// budget, `latency_info()` for the delay-compensation graph. Both are
     /// control-thread reads of already-published state — no engine command, no
     /// lock held across the UI — so the monitor can ask twice a second.
@@ -2170,7 +2170,7 @@ impl StudioLayout {
             glitch_count: stats.glitch_count,
             dropout_count: stats.dropout_count,
             dropout_last_reason: stats.dropout_last_reason.clone(),
-            dropout_protection_mode: stats.dropout_protection_mode.clone(),
+            audioguard: audioguard_reading(&engine.audioguard_status()),
             active_voices: stats.active_voices,
             last_error: stats.last_error.clone(),
         }
@@ -3737,4 +3737,23 @@ mod tests {
             NO_AUDIO_INPUT_LABEL
         );
     }
+}
+
+/// Audioguard's line in the Performance window.
+fn audioguard_reading(status: &DirectAudio::audioguard::AudioguardStatus) -> String {
+    use DirectAudio::AudioguardLevel;
+    let mut parts = vec![status.level.as_str().to_string()];
+    if status.level != AudioguardLevel::Off {
+        parts.push(if status.rendering_ahead {
+            format!("rendering {:.0} ms ahead", status.ahead_ms)
+        } else {
+            "rendering in the callback".to_string()
+        });
+        parts.push(format!("{} ring misses", status.ring_misses));
+        parts.push(format!("{} output mutes", status.output_mutes));
+    }
+    if status.mmcss_active {
+        parts.push("MMCSS Pro Audio".to_string());
+    }
+    parts.join(" · ")
 }

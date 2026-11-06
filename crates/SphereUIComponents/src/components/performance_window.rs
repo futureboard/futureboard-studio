@@ -73,7 +73,9 @@ pub struct AudioEngineReading {
     pub glitch_count: u64,
     pub dropout_count: u64,
     pub dropout_last_reason: String,
-    pub dropout_protection_mode: String,
+    /// Solfege Audioguard in one line: level, render-ahead, ring misses and
+    /// output mutes.
+    pub audioguard: String,
     pub active_voices: u32,
     pub last_error: Option<String>,
 }
@@ -290,10 +292,13 @@ fn audio_engine_section(
         rows.push(reading_row(
             "Dropouts",
             &format!(
-                "{} glitches · {} at-risk blocks · protection {}",
-                engine.glitch_count, engine.dropout_count, engine.dropout_protection_mode
+                "{} glitches · {} at-risk blocks",
+                engine.glitch_count, engine.dropout_count
             ),
         ));
+        if !engine.audioguard.is_empty() {
+            rows.push(reading_row("Audioguard", &engine.audioguard));
+        }
         if !engine.dropout_last_reason.is_empty() {
             rows.push(reading_row("Last reason", &engine.dropout_last_reason));
         }

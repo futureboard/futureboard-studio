@@ -585,7 +585,7 @@ fn recording(cx: &PageCtx) -> Vec<PrefGroup> {
 // ── Playback (transport, metronome, engine) ─────────────────────────────────
 
 fn playback(cx: &PageCtx) -> Vec<PrefGroup> {
-    use crate::settings::{DropoutProtectionMode as Dp, SpacebarAction};
+    use crate::settings::{AudioguardLevel as Ag, SpacebarAction};
     let s = cx.schema;
     let up = cx.up();
     let met = &s.recording.metronome;
@@ -710,20 +710,27 @@ fn playback(cx: &PageCtx) -> Vec<PrefGroup> {
                 ),
             ))
             .row(PrefRow::described(
-                "Dropout Protection",
-                "Headroom against UI and plug-in jitter. Medium is recommended; Off is lowest latency.",
-                &["dropout", "protection", "glitch", "xrun", "buffer"],
-                choice(
+                cx.tr("settings.field.audioguard"),
+                cx.tr("settings.hint.audioguard"),
+                &[
+                    "audioguard",
                     "dropout",
+                    "protection",
+                    "glitch",
+                    "xrun",
+                    "buffer",
+                    "guard",
+                ],
+                choice(
+                    "audioguard",
                     vec![
-                        (Dp::Off, "Off".to_string()),
-                        (Dp::Light, "Light".to_string()),
-                        (Dp::Medium, "Medium".to_string()),
-                        (Dp::High, "High".to_string()),
+                        (Ag::Off, cx.tr("settings.audioguard.off")),
+                        (Ag::Normal, cx.tr("settings.audioguard.normal")),
+                        (Ag::High, cx.tr("settings.audioguard.high")),
                     ],
-                    s.playback.dropout_protection,
+                    s.playback.audioguard,
                     &up,
-                    |s, v| s.playback.dropout_protection = v,
+                    |s, v| s.playback.audioguard = v,
                 ),
             )),
     ]

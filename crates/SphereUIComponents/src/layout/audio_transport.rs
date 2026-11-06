@@ -1164,6 +1164,9 @@ impl StudioLayout {
         let status_due = state_changed
             || self.engine_sync.last_status_poll_at.elapsed() >= Duration::from_millis(250);
         if status_due {
+            // Here, at the top of the poll rather than inside the status
+            // refresh, because it can edit the project (an Audioguard bypass).
+            self.poll_audioguard(cx);
             self.notify_status_bar_if_changed(cx);
         }
 

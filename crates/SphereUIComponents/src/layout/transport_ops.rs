@@ -920,6 +920,12 @@ impl StudioLayout {
             (None, Some(error), _) => format!("Audio: {error}"),
             // Why the edit command just used did nothing (e.g. X with no clips
             // to crossfade): the answer to the last thing the user did.
+            // What Audioguard just did to the sound: a muted burst, a bypassed
+            // plug-in, a reconnecting device.
+            (None, None, _) if self.active_audioguard_notice().is_some() => self
+                .active_audioguard_notice()
+                .unwrap_or_default()
+                .to_string(),
             (None, None, _) if self.active_edit_notice().is_some() => {
                 self.active_edit_notice().unwrap_or_default().to_string()
             }

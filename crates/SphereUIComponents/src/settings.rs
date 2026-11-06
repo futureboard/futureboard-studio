@@ -1012,42 +1012,61 @@ impl AudioInstructionSet {
     }
 }
 
-/// Dropout Protection mode (Settings → Playback). Keeps internal headroom
-/// against control/UI/plugin jitter, independent of the device buffer size.
-/// Maps 1:1 to `DirectAudio::DropoutProtectionMode`.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum DropoutProtectionMode {
-    /// Lowest latency, minimal safety margin.
+/// Solfege Audioguard level (Settings → Playback). Maps 1:1 to
+/// `DirectAudio::AudioguardLevel`.
+///
+/// Reads the former Dropout Protection values too: `Light` and `Medium` were
+/// its middle settings and are `Normal` now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AudioguardLevel {
+    /// Every block rendered as it is played; no output guard.
     Off,
-    /// Small safety margin / conservative scheduling.
-    Light,
-    /// Default recommended mode — better protection during UI activity.
-    Medium,
-    /// Maximum stability (may add internal latency).
+    /// Render-ahead while nothing is live, the output guard, and a plug-in
+    /// that keeps producing invalid audio is bypassed.
+    #[default]
+    Normal,
+    /// A deeper render-ahead, and a bridged plug-in that keeps missing its
+    /// deadline is bypassed too.
     High,
 }
 
-impl Default for DropoutProtectionMode {
-    fn default() -> Self {
-        DropoutProtectionMode::Medium
+/// Written with the former Dropout Protection names (`Normal` as `Medium`),
+/// so an older Studio reading these settings still understands them.
+impl Serialize for AudioguardLevel {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(match self {
+            Self::Off => "Off",
+            Self::Normal => "Medium",
+            Self::High => "High",
+        })
     }
 }
 
-impl DropoutProtectionMode {
+impl<'de> Deserialize<'de> for AudioguardLevel {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        Ok(match name.as_str() {
+            "Off" => Self::Off,
+            "High" => Self::High,
+            // "Normal", and the former "Light" / "Medium".
+            _ => Self::Normal,
+        })
+    }
+}
+
+impl AudioguardLevel {
     pub fn label(self) -> &'static str {
         match self {
-            DropoutProtectionMode::Off => "Off",
-            DropoutProtectionMode::Light => "Light",
-            DropoutProtectionMode::Medium => "Medium (Recommended)",
-            DropoutProtectionMode::High => "High",
+            AudioguardLevel::Off => "Off",
+            AudioguardLevel::Normal => "Normal (Recommended)",
+            AudioguardLevel::High => "High",
         }
     }
 
-    pub const ALL: [DropoutProtectionMode; 4] = [
-        DropoutProtectionMode::Off,
-        DropoutProtectionMode::Light,
-        DropoutProtectionMode::Medium,
-        DropoutProtectionMode::High,
+    pub const ALL: [AudioguardLevel; 3] = [
+        AudioguardLevel::Off,
+        AudioguardLevel::Normal,
+        AudioguardLevel::High,
     ];
 }
 
@@ -1080,9 +1099,10 @@ pub struct PlaybackSettings {
     /// Align parallel track paths at the master bus (Phase W PDC).
     #[serde(default = "default_true")]
     pub latency_compensation: bool,
-    /// Realtime dropout protection mode.
-    #[serde(default)]
-    pub dropout_protection: DropoutProtectionMode,
+    /// Solfege Audioguard level. Saved under its former name, Dropout
+    /// Protection, so settings files keep working in both directions.
+    #[serde(default, rename = "dropout_protection")]
+    pub audioguard: AudioguardLevel,
     /// Spacebar play/pause vs play/stop.
     #[serde(default)]
     pub spacebar_action: SpacebarAction,
@@ -1123,7 +1143,7 @@ impl Default for PlaybackSettings {
     fn default() -> Self {
         Self {
             latency_compensation: default_true(),
-            dropout_protection: DropoutProtectionMode::default(),
+            audioguard: AudioguardLevel::default(),
             spacebar_action: SpacebarAction::default(),
             return_playhead_on_stop: false,
             follow_playhead: default_true(),
@@ -1788,5 +1808,47 @@ mod tool_bar_style_tests {
         assert!(text.contains(r#""tool_bar":"classic""#), "{text}");
         let parsed: ArrangementAppearanceSettings = serde_json::from_str(&text).expect("parse");
         assert_eq!(parsed.tool_bar, ToolBarStyle::Classic);
+    }
+}
+
+#[cfg(test)]
+mod audioguard_setting_tests {
+    use super::*;
+
+    fn level_from(value: &str) -> AudioguardLevel {
+        serde_json::from_str(&format!(r#""{value}""#)).expect("a level parses")
+    }
+
+    /// The four former Dropout Protection modes still load, as the three levels.
+    #[test]
+    fn former_dropout_protection_values_load_as_audioguard_levels() {
+        assert_eq!(level_from("Off"), AudioguardLevel::Off);
+        assert_eq!(level_from("Light"), AudioguardLevel::Normal);
+        assert_eq!(level_from("Medium"), AudioguardLevel::Normal);
+        assert_eq!(level_from("Normal"), AudioguardLevel::Normal);
+        assert_eq!(level_from("High"), AudioguardLevel::High);
+        assert_eq!(AudioguardLevel::default(), AudioguardLevel::Normal);
+    }
+
+    /// Written under the old field name and values, so an older Studio reading
+    /// the same settings file still understands it, and it round-trips here.
+    #[test]
+    fn the_level_is_written_the_way_an_older_studio_reads_it() {
+        for level in AudioguardLevel::ALL {
+            let mut playback = PlaybackSettings::default();
+            playback.audioguard = level;
+            let text = serde_json::to_string(&playback).expect("serialize");
+            let old_name = match level {
+                AudioguardLevel::Off => "Off",
+                AudioguardLevel::Normal => "Medium",
+                AudioguardLevel::High => "High",
+            };
+            assert!(
+                text.contains(&format!(r#""dropout_protection":"{old_name}""#)),
+                "{text}"
+            );
+            let parsed: PlaybackSettings = serde_json::from_str(&text).expect("parse");
+            assert_eq!(parsed.audioguard, level);
+        }
     }
 }

@@ -68,6 +68,7 @@ mod missing_media_ops;
 mod mixer_ops;
 mod stem_extract_ops;
 pub(crate) use mixer_ops::{clone_track_for_mixer, clone_track_for_mixer_summary};
+mod audioguard_ops;
 mod automation_edit_ops;
 mod chain_preset_ops;
 mod folder_ops;
@@ -330,16 +331,13 @@ fn native_audio_backend_from_driver_type(driver_type: &str) -> DirectAudio::Audi
     backend.sanitize_for_current_build()
 }
 
-/// Map the persisted Dropout Protection setting to the engine's mode enum.
-fn engine_dropout_mode(
-    mode: crate::settings::DropoutProtectionMode,
-) -> DirectAudio::DropoutProtectionMode {
-    use crate::settings::DropoutProtectionMode as Ui;
-    match mode {
-        Ui::Off => DirectAudio::DropoutProtectionMode::Off,
-        Ui::Light => DirectAudio::DropoutProtectionMode::Light,
-        Ui::Medium => DirectAudio::DropoutProtectionMode::Medium,
-        Ui::High => DirectAudio::DropoutProtectionMode::High,
+/// Map the persisted Audioguard setting to the engine's level.
+fn engine_audioguard_level(level: crate::settings::AudioguardLevel) -> DirectAudio::AudioguardLevel {
+    use crate::settings::AudioguardLevel as Ui;
+    match level {
+        Ui::Off => DirectAudio::AudioguardLevel::Off,
+        Ui::Normal => DirectAudio::AudioguardLevel::Normal,
+        Ui::High => DirectAudio::AudioguardLevel::High,
     }
 }
 
@@ -416,7 +414,7 @@ pub(crate) fn build_and_warm_audio_engine(
 
     engine.set_pdc_enabled(schema.playback.latency_compensation);
     engine.set_record_pdc_bypass_enabled(schema.recording.audio.bypass_pdc_while_recording);
-    engine.set_dropout_protection_mode(engine_dropout_mode(schema.playback.dropout_protection));
+    engine.set_dropout_protection_mode(engine_audioguard_level(schema.playback.audioguard));
     apply_audio_processing_settings(&schema.performance.audio_processing);
 
     // Open on the device the user actually chose.
@@ -797,6 +795,8 @@ pub struct StudioLayout {
     /// The open project's entry in Background Tasks, from its first install
     /// step to the last (set_session_install_progress).
     session_install_job: Option<crate::components::background_tasks::BackgroundJob>,
+    /// Solfege Audioguard's notices, plug-in bypasses and device reconnects.
+    audioguard: audioguard_ops::AudioguardUiState,
     session_install_progress: crate::components::progress_dialog::ProgressBarValue,
     /// Non-fatal plugin restore warnings collected during session install.
     session_install_warnings: Vec<String>,
@@ -1605,6 +1605,7 @@ impl StudioLayout {
             session_install_status: crate::app_state::SessionInstallStatus::Ready,
             session_install_detail: String::new(),
             session_install_job: None,
+            audioguard: Default::default(),
             session_install_progress:
                 crate::components::progress_dialog::ProgressBarValue::Indeterminate,
             session_install_warnings: Vec::new(),
@@ -3484,13 +3485,11 @@ impl StudioLayout {
 
         apply_audio_processing_settings(&schema.performance.audio_processing);
         if let Some(ref engine) = self.audio_bridge.engine {
-            // Dropout Protection is a lightweight atomic — push it every sync; no
-            // engine graph rebuild (it never changes the audio graph). Done before
-            // the PDC block so the (immutable) engine borrow ends before the
+            // Audioguard is a lightweight atomic — push it every sync; no engine
+            // graph rebuild (it never changes the audio graph). Done before the
+            // PDC block so the (immutable) engine borrow ends before the
             // `schedule_audio_project_sync` mutable-self call below.
-            engine.set_dropout_protection_mode(engine_dropout_mode(
-                schema.playback.dropout_protection,
-            ));
+            engine.set_dropout_protection_mode(engine_audioguard_level(schema.playback.audioguard));
 
             engine.set_record_pdc_bypass_enabled(schema.recording.audio.bypass_pdc_while_recording);
             let desired_pdc = schema.playback.latency_compensation;

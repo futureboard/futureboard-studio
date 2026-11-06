@@ -844,6 +844,11 @@ settings.field.plugin-path-latency = ຄວາມໜ່ວງສູງສຸດ�
 settings.field.master-plugin-latency = ປລັກອິນມາສເຕີ
 settings.field.pdc-status = ການຊົດເຊີຍຄວາມໜ່ວງ
 settings.field.latency-compensation = ການຊົດເຊີຍຄວາມໜ່ວງປລັກອິນ (PDC)
+settings.field.audioguard = Solfege Audioguard
+settings.hint.audioguard = ປ້ອງກັນສຽງຂາດ: ເຣັນເດີລ່ວງໜ້າເມື່ອບໍ່ມີຫຍັງຫຼິ້ນສົດ, ປິດສຽງເມື່ອເອົາພຸດຜິດປົກກະຕິ ຫຼື ດັງເກີນຄວບຄຸມ, ແລະ ຂ້າມປລັກອິນທີ່ຜິດພາດຊ້ຳໆ. ປິດ = ເຣັນເດີທຸກບລັອກຂະນະຫຼິ້ນ.
+settings.audioguard.off = ປິດ
+settings.audioguard.normal = ປົກກະຕິ (ແນະນຳ)
+settings.audioguard.high = ສູງ
 settings.section.latency-report = ລາຍງານຄວາມໜ່ວງ
 settings.section.playback-latency = ການຫຼິ້ນ > ຄວາມໜ່ວງ
 settings.ltc.enable = ເປີດໃຊ້ຕົວອ່ານ LTC (linear timecode) ທີ່ຂາເຂົ້າ
