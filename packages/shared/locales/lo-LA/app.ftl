@@ -84,6 +84,7 @@ add-track.title = ແທຣັກໃໝ່
 ## Panels & Timeline
 
 bottom-panel.mix-level = ລະດັບການປະສົມ\: 80%
+bottom-panel.mixer-pop-out = ເປີດມິກເຊີໃນໜ້າຕ່າງແຍກ
 bottom-panel.plugin.compressor = ຄອມເພຣສເຊີ
 bottom-panel.plugin.delay = ເຄື່ອງເຮັດສຽງດີເລ
 bottom-panel.plugin.equalizer = ອີຄວໍໄລເຊີ
@@ -512,6 +513,7 @@ menu.window-lyric_editor_panel = Lyric Editor in Right Dock
 menu.window-maximize = ຂະຫຍາຍໃຫຍ່ສຸດ
 menu.window-minimize = ຫຍໍ້ລົງ
 menu.window-performance = Performance Monitor
+menu.window-process_explorer = Process Explorer
 menu.window-virtual_speaker = Virtual Speaker
 menu.window-visualizer = Visualizer
 menu.window-visualizer-spectrum = Spectrum
