@@ -278,6 +278,13 @@ pub struct Timeline {
     erase_clip_drag: Option<HashSet<String>>,
     /// Live preview of clip ids marked for erase (mirrors `erase_clip_drag`).
     erase_preview_ids: HashSet<String>,
+    /// The notes each ARA clip sounds after its plug-in's edits, by clip id,
+    /// drawn over the clip (see [`Self::set_ara_notes`]). Read from the
+    /// plug-in, never saved, and outside the undo state.
+    ara_notes: std::collections::HashMap<
+        String,
+        std::sync::Arc<[crate::components::timeline::audio_clip::AraClipNote]>,
+    >,
     /// In-flight automation point move. Mutated live; committed once on release.
     automation_drag: Option<crate::components::timeline::timeline_state::AutomationPointDrag>,
     /// In-flight automation curve-tension drag (Alt+drag on a segment). Mutated

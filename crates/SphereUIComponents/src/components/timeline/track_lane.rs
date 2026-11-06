@@ -75,6 +75,10 @@ pub fn track_lane(
     on_audio_clip_process_preview: AudioClipProcessPreviewCb,
     on_audio_clip_process_commit: AudioClipProcessCommitCb,
     on_crossfade: Option<CrossfadeGestureCb>,
+    ara_notes: &std::collections::HashMap<
+        String,
+        std::sync::Arc<[crate::components::timeline::audio_clip::AraClipNote]>,
+    >,
 ) -> impl IntoElement {
     let _s = crate::perf::PerfScope::enter("TrackLane");
     let track_id = track.id.clone();
@@ -182,6 +186,7 @@ pub fn track_lane(
                     state.effective_clip_fades(clip, &crossfades),
                     time,
                     ara,
+                    ara.then(|| ara_notes.get(&clip.id).cloned()).flatten(),
                     on_process_preview,
                     on_process_commit,
                 )

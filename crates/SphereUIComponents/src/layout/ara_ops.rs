@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 
 use sphere_ara_host::{
     ara_persistent_id, AraAudioAccess, AraClipKey, AraGraph, AraGraphChange, AraHostError,
-    AraModelObserver, AraModelUpdate, AraMusicalTimeline, AraRendererId, AraRestoreMap,
+    AraModelObserver, AraModelUpdate, AraMusicalTimeline, AraNote, AraRendererId, AraRestoreMap,
     AraRestoreOutcome, AraRestoreReport, AraRestoreRequest, AraRestoreScope, AraResult, AraRoles,
     AraSampleReader, AraSession, AraSessionConfig, AraSourceKey, AraStoredArchive, AraTrackKey,
     AraTransportControl, AraTransportRequest,
@@ -291,6 +291,10 @@ struct ModelSignals {
     /// user's edits in the editor arrive as these even from a plug-in that
     /// never reports `DocumentDataChanged`, which only ARA 2.3 has.
     content_edits: AtomicU64,
+    /// Every report that can change the notes a clip shows: an analysis
+    /// ending, a source's, a modification's or a region's content changing.
+    /// Read by [`AraState::refresh_region_notes`].
+    note_changes: AtomicU64,
     /// Analyses reported started and not yet over, per source.
     ///
     /// Per source, so that one start nothing ever completes cannot pin the
@@ -339,6 +343,16 @@ impl ModelSignals {
     }
 
     fn record(&self, update: &AraModelUpdate) {
+        let notes_may_change = match update {
+            AraModelUpdate::AnalysisProgress { state, .. } => *state == ANALYSIS_COMPLETED,
+            AraModelUpdate::DocumentDataChanged => false,
+            AraModelUpdate::SourceContentChanged { .. }
+            | AraModelUpdate::ModificationContentChanged { .. }
+            | AraModelUpdate::RegionContentChanged { .. } => true,
+        };
+        if notes_may_change {
+            self.note_changes.fetch_add(1, Ordering::Relaxed);
+        }
         match update {
             AraModelUpdate::DocumentDataChanged => {
                 self.document_changes.fetch_add(1, Ordering::Relaxed);
@@ -1071,6 +1085,11 @@ trait SessionPlugin {
     fn is_poisoned(&self) -> bool;
     fn notify_model_updates(&mut self) -> AraResult<()>;
     fn analysis_incomplete(&mut self, source: &AraSourceKey) -> AraResult<Option<bool>>;
+    /// The notes the plug-in reports for `clip`'s region after its edits
+    /// (see `AraSession::region_notes`); a test double has none.
+    fn region_notes(&mut self, _clip: &AraClipKey) -> AraResult<Option<Vec<AraNote>>> {
+        Ok(None)
+    }
     fn set_musical_timeline(&mut self, timeline: &AraMusicalTimeline) -> AraResult<()>;
     fn graph_change(&self, graph: &AraGraph) -> AraGraphChange;
     fn apply_graph(&mut self, graph: &AraGraph) -> AraResult<()>;
@@ -1215,6 +1234,10 @@ impl SessionPlugin for LivePlugin {
 
     fn analysis_incomplete(&mut self, source: &AraSourceKey) -> AraResult<Option<bool>> {
         self.session.analysis_incomplete(source)
+    }
+
+    fn region_notes(&mut self, clip: &AraClipKey) -> AraResult<Option<Vec<AraNote>>> {
+        self.session.region_notes(clip)
     }
 
     fn set_musical_timeline(&mut self, timeline: &AraMusicalTimeline) -> AraResult<()> {
@@ -1502,6 +1525,11 @@ struct AraTrackSession {
     installed_latency: Option<u32>,
     /// Undo and redo of the edits made in the plug-in's own editor.
     history: AraHistory,
+    /// The note-change count, clips and time the clips' notes were last read
+    /// at; `None` forces the next read (see [`AraState::refresh_region_notes`]).
+    notes_seen: Option<u64>,
+    notes_clips: Vec<AraClipKey>,
+    notes_read_at: Option<Instant>,
     /// What the editor was last told is active: the clips and tracks the
     /// user has selected in Studio. Every track stays in the editor; this is
     /// only which of them it works on.
@@ -1530,6 +1558,9 @@ impl AraTrackSession {
             settled: false,
             installed_latency: None,
             history: AraHistory::default(),
+            notes_seen: None,
+            notes_clips: Vec::new(),
+            notes_read_at: None,
             selection: None,
         }
     }
@@ -1632,6 +1663,10 @@ static NEXT_ARA_STATE: AtomicU64 = AtomicU64::new(1);
 /// Every live ARA session, plus the queues its plug-ins post into.
 pub struct AraState {
     sessions: HashMap<AraSessionKey, AraTrackSession>,
+    /// The notes each ARA clip sounds after the plug-in's edits, as last
+    /// read (see [`Self::refresh_region_notes`]). What the arrangement draws
+    /// on the clip.
+    region_notes: HashMap<AraClipKey, Arc<[AraNote]>>,
     /// Sessions of a project that was replaced or closed, waiting for their
     /// editor views to let go before their documents are destroyed.
     retired: Vec<RetiredSession>,
@@ -1684,6 +1719,7 @@ impl Default for AraState {
     fn default() -> Self {
         Self {
             sessions: HashMap::new(),
+            region_notes: HashMap::new(),
             retired: Vec::new(),
             transport_inbox: Arc::default(),
             pending_archives: HashMap::new(),
@@ -1715,7 +1751,72 @@ impl std::fmt::Debug for AraState {
     }
 }
 
+/// Shortest wait between two reads of one document's notes: Melodyne reports a
+/// content change for every step of a drag.
+const NOTES_READ_INTERVAL: Duration = Duration::from_millis(120);
+
 impl AraState {
+    /// The notes each ARA clip sounds after the plug-in's edits.
+    pub fn region_notes(&self) -> &HashMap<AraClipKey, Arc<[AraNote]>> {
+        &self.region_notes
+    }
+
+    /// Re-reads the notes of every document whose plug-in reported a content
+    /// change, or whose clips changed or were rebuilt, since the last read,
+    /// at most every [`NOTES_READ_INTERVAL`]. Returns whether any clip's notes
+    /// changed. Control thread, outside an edit cycle; a document mid-apply
+    /// waits for the next poll.
+    pub fn refresh_region_notes(&mut self, now: Instant) -> bool {
+        let Self {
+            sessions,
+            region_notes,
+            ..
+        } = self;
+        let mut changed = false;
+        for session in sessions.values_mut() {
+            if !session.settled || session.plugin.is_poisoned() {
+                continue;
+            }
+            let count = session.signals.note_changes.load(Ordering::Relaxed);
+            let mut clips = session.clips.clone();
+            clips.sort();
+            if session.notes_seen == Some(count) && session.notes_clips == clips {
+                continue;
+            }
+            if session
+                .notes_read_at
+                .is_some_and(|at| now.duration_since(at) < NOTES_READ_INTERVAL)
+            {
+                continue;
+            }
+            for clip in &clips {
+                match session.plugin.region_notes(clip) {
+                    Ok(Some(notes)) => {
+                        let notes: Arc<[AraNote]> = notes.into();
+                        if region_notes.get(clip).is_none_or(|held| **held != *notes) {
+                            region_notes.insert(clip.clone(), notes);
+                            changed = true;
+                        }
+                    }
+                    Ok(None) => changed |= region_notes.remove(clip).is_some(),
+                    // Kept as they were; the next change reads again.
+                    Err(error) => trace(&format!("notes of {} unreadable: {error}", clip.as_str())),
+                }
+            }
+            session.notes_seen = Some(count);
+            session.notes_clips = clips;
+            session.notes_read_at = Some(now);
+        }
+        // A clip no document renders any more shows no notes.
+        let live: HashSet<&AraClipKey> = sessions
+            .values()
+            .flat_map(|session| session.clips.iter())
+            .collect();
+        let before = region_notes.len();
+        region_notes.retain(|clip, _| live.contains(clip));
+        changed | (region_notes.len() != before)
+    }
+
     /// Whether any clip is currently bound.
     pub fn is_active(&self) -> bool {
         !self.sessions.is_empty()
@@ -2707,6 +2808,9 @@ impl AraState {
         // while regions render: its edit cycles exist so the plug-in can
         // synchronise its render threads, and only renderer assignments need
         // the plug-in out of its render state. See [`sync_path`] for when.
+        // A sync can move, trim or rebuild a clip's region, and the notes
+        // the arrangement shows are in song time: read them again after it.
+        session.notes_seen = None;
         let path = sync_path(restore_due, session.settled, || {
             session.plugin.graph_change(graph)
         });
@@ -3957,6 +4061,10 @@ mod tests {
         /// onto other clips.
         placed: Vec<Vec<(String, AraClipKey)>>,
         torn_down: bool,
+        /// The notes each clip's region reports, and how many reads there
+        /// were.
+        notes: HashMap<AraClipKey, Vec<AraNote>>,
+        note_reads: usize,
     }
 
     impl Script {
@@ -3990,6 +4098,8 @@ mod tests {
                 builds: Vec::new(),
                 placed: Vec::new(),
                 torn_down: false,
+                notes: HashMap::new(),
+                note_reads: 0,
             }
         }
     }
@@ -4005,6 +4115,11 @@ mod tests {
         }
         fn analysis_incomplete(&mut self, _source: &AraSourceKey) -> AraResult<Option<bool>> {
             Ok(None)
+        }
+        fn region_notes(&mut self, clip: &AraClipKey) -> AraResult<Option<Vec<AraNote>>> {
+            let mut script = self.0.borrow_mut();
+            script.note_reads += 1;
+            Ok(script.notes.get(clip).cloned())
         }
         fn set_musical_timeline(&mut self, _timeline: &AraMusicalTimeline) -> AraResult<()> {
             if self.0.borrow().prepare_fails {
@@ -4625,6 +4740,81 @@ mod tests {
 
     fn on_track<'a>(clips: &[&'a str]) -> HashSet<&'a str> {
         clips.iter().copied().collect()
+    }
+
+    fn note(start: f64, pitch: f32) -> AraNote {
+        AraNote {
+            start_seconds: start,
+            duration_seconds: 0.5,
+            pitch,
+            volume: 1.0,
+        }
+    }
+
+    /// The notes an ARA clip shows are read from the plug-in once the
+    /// document settles, then again only when it reports a content change:
+    /// an idle poll reads nothing.
+    #[test]
+    fn region_notes_are_read_once_and_again_after_a_content_change() {
+        let mut state = AraState::default();
+        let key = evidence_key();
+        let script = open_fake(&mut state, &key);
+        script
+            .borrow_mut()
+            .notes
+            .insert(AraClipKey::from("clip-1"), vec![note(0.0, 60.0)]);
+        sync(&mut state, &key, &track_graph(&[("clip-1", SOURCE)]), &[]).unwrap();
+
+        let start = Instant::now();
+        assert!(state.refresh_region_notes(start));
+        assert_eq!(
+            state
+                .region_notes()
+                .get(&AraClipKey::from("clip-1"))
+                .map(|n| n.len()),
+            Some(1)
+        );
+        let reads = script.borrow().note_reads;
+        assert!(!state.refresh_region_notes(start + NOTES_READ_INTERVAL * 2));
+        assert_eq!(
+            script.borrow().note_reads,
+            reads,
+            "nothing changed, nothing read"
+        );
+
+        // An edit in the plug-in: the pitch moved.
+        script
+            .borrow_mut()
+            .notes
+            .insert(AraClipKey::from("clip-1"), vec![note(0.0, 61.5)]);
+        let signals = Arc::clone(&state.sessions[&key].signals);
+        signals.record(&AraModelUpdate::ModificationContentChanged {
+            clip: Some(AraClipKey::from("clip-1")),
+        });
+        assert!(state.refresh_region_notes(start + NOTES_READ_INTERVAL * 4));
+        assert_eq!(
+            state.region_notes()[&AraClipKey::from("clip-1")][0].pitch,
+            61.5
+        );
+    }
+
+    /// A clip the document stops rendering shows no notes any more.
+    #[test]
+    fn a_clip_that_leaves_the_document_loses_its_notes() {
+        let mut state = AraState::default();
+        let key = evidence_key();
+        let script = open_fake(&mut state, &key);
+        script
+            .borrow_mut()
+            .notes
+            .insert(AraClipKey::from("clip-1"), vec![note(0.0, 60.0)]);
+        sync(&mut state, &key, &track_graph(&[("clip-1", SOURCE)]), &[]).unwrap();
+        let start = Instant::now();
+        assert!(state.refresh_region_notes(start));
+
+        sync(&mut state, &key, &track_graph(&[]), &[]).unwrap();
+        assert!(state.refresh_region_notes(start + NOTES_READ_INTERVAL * 2));
+        assert!(state.region_notes().is_empty());
     }
 
     /// The user's report: a split clip's halves opened empty in Melodyne.

@@ -5,7 +5,7 @@
 //! step — the clip's binding, the ARA document, the engine's renderer list, and
 //! the project snapshot — so no caller has to know the order.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use gpui::Context;
@@ -804,8 +804,14 @@ impl StudioLayout {
         // as the answer to a later host edit.
         self.ara.notify_model_updates();
         self.sync_ara_editor_selection(cx);
-        let polled = self.ara.poll_documents(std::time::Instant::now());
+        let now = std::time::Instant::now();
+        let polled = self.ara.poll_documents(now);
         self.sync_ara_analysis_job();
+        // The notes each ARA clip plays after the plug-in's edits, on the
+        // arrangement: re-read only when the plug-in reported a change.
+        if self.ara.refresh_region_notes(now) {
+            self.push_ara_notes_to_timeline(cx);
+        }
         if polled {
             // The plug-in changed its own persistent state, so the project has
             // unsaved work even though nothing in the timeline moved. It is
@@ -816,6 +822,33 @@ impl StudioLayout {
             self.mark_dirty_view_only();
             cx.notify();
         }
+    }
+
+    /// Hand the ARA clips' notes to the arrangement, which draws them over
+    /// the clips.
+    fn push_ara_notes_to_timeline(&mut self, cx: &mut Context<Self>) {
+        use crate::components::timeline::audio_clip::AraClipNote;
+        let notes: HashMap<String, std::sync::Arc<[AraClipNote]>> = self
+            .ara
+            .region_notes()
+            .iter()
+            .map(|(clip, notes)| {
+                let converted: std::sync::Arc<[AraClipNote]> = notes
+                    .iter()
+                    .map(|note| AraClipNote {
+                        start_seconds: note.start_seconds,
+                        duration_seconds: note.duration_seconds,
+                        pitch: note.pitch,
+                    })
+                    .collect();
+                (clip.as_str().to_string(), converted)
+            })
+            .collect();
+        self.timeline.update(cx, |timeline, cx| {
+            if timeline.set_ara_notes(notes) {
+                cx.notify();
+            }
+        });
     }
 
     /// Lists an ARA plug-in's analysis in Background Tasks while it runs: a

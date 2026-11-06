@@ -616,6 +616,29 @@ pub enum AraModelUpdate {
     DocumentDataChanged,
 }
 
+/// One note an ARA plug-in reports for a clip's playback region: the notes
+/// as they sound after the plug-in's edits (Melodyne's blobs), in song time.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AraNote {
+    /// Where the note starts in the song, in seconds.
+    pub start_seconds: f64,
+    /// How long it sounds, in seconds.
+    pub duration_seconds: f64,
+    /// Its pitch as a fractional MIDI note number (60 = middle C), from the
+    /// plug-in's frequency when it reports one: a note tuned off the grid
+    /// sits between two keys.
+    pub pitch: f32,
+    /// Perceptual volume, 0 and up, as the plug-in reports it.
+    pub volume: f32,
+}
+
+impl AraNote {
+    /// The fractional MIDI note number of `frequency` Hz (A4 = 440 Hz = 69).
+    pub fn pitch_of_frequency(frequency: f32) -> f32 {
+        69.0 + 12.0 * (frequency / 440.0).log2()
+    }
+}
+
 /// Receives model updates.
 ///
 /// ARA lets a plug-in report these only from inside
@@ -665,6 +688,15 @@ mod tests {
             transform: AraPlaybackTransform::NONE,
             color: None,
         }
+    }
+
+    #[test]
+    fn a_notes_frequency_becomes_a_fractional_midi_pitch() {
+        assert!((AraNote::pitch_of_frequency(440.0) - 69.0).abs() < 1e-4);
+        assert!((AraNote::pitch_of_frequency(261.6256) - 60.0).abs() < 1e-3);
+        // A quarter tone sharp of A4 sits halfway to B-flat.
+        let quarter_sharp = 440.0 * 2f32.powf(0.5 / 12.0);
+        assert!((AraNote::pitch_of_frequency(quarter_sharp) - 69.5).abs() < 1e-3);
     }
 
     #[test]

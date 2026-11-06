@@ -566,6 +566,12 @@ pub fn scenes() -> Vec<Scene> {
             open: arrangement_meters_scene,
         },
         Scene {
+            name: "ara-notes",
+            width: 1_100.0,
+            height: 520.0,
+            open: ara_notes_scene,
+        },
+        Scene {
             name: "system-overloaded",
             width: crate::components::message_box_dialog::MESSAGE_BOX_WIDTH,
             height: 380.0,
@@ -1511,6 +1517,7 @@ impl gpui::Render for AudioClipsPreview {
                         state.effective_clip_fades(clip, &crossfades),
                         &state.clip_time_axis(clip),
                         false,
+                        None,
                         Arc::new(|_, _, _| {}),
                         Arc::new(|_, _, _| {}),
                     )
@@ -1937,6 +1944,53 @@ fn system_overloaded_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWi
         cx,
     )
     .map_err(gpui::private::anyhow::Error::msg)?;
+    Ok(handle.into())
+}
+
+/// The demo arrangement with its first track on an ARA plug-in, and the notes
+/// the plug-in reports for the vocal over the clip: a phrase with one note
+/// pulled sharp and one drifting flat, as Melodyne would hand them back.
+fn ara_notes_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    use crate::components::timeline::audio_clip::AraClipNote;
+    use crate::components::timeline::timeline_state::AraTrackBinding;
+    let handle = cx.open_window(options, |_, cx| {
+        let timeline = cx.new(|_| {
+            let mut timeline = crate::components::timeline::Timeline::with_demo_content();
+            let seconds_per_beat = 60.0 / timeline.state.bpm.max(1.0) as f64;
+            let track = &mut timeline.state.tracks[0];
+            track.ara = Some(AraTrackBinding {
+                plugin_id: "vst3:melodyne".to_string(),
+                plugin_path: "C:/Melodyne.vst3".to_string(),
+                class_id: "ABCD".to_string(),
+            });
+            let clip = track.clips[0].clone();
+            let start = clip.start_beat as f64 * seconds_per_beat;
+            let phrase: [(f64, f64, f32); 11] = [
+                (0.10, 0.45, 64.0),
+                (0.60, 0.40, 67.0),
+                (1.05, 0.85, 69.4),
+                (2.00, 0.35, 67.0),
+                (2.40, 0.40, 64.0),
+                (2.85, 0.90, 62.0),
+                (4.40, 0.45, 64.0),
+                (4.90, 0.40, 66.8),
+                (5.35, 0.95, 69.0),
+                (6.40, 0.35, 71.0),
+                (6.80, 0.60, 68.7),
+            ];
+            let notes: std::sync::Arc<[AraClipNote]> = phrase
+                .iter()
+                .map(|&(at, length, pitch)| AraClipNote {
+                    start_seconds: start + at,
+                    duration_seconds: length,
+                    pitch,
+                })
+                .collect();
+            timeline.set_ara_notes([(clip.id, notes)].into_iter().collect());
+            timeline
+        });
+        cx.new(|_| ArrangementMetersPreview { timeline })
+    })?;
     Ok(handle.into())
 }
 

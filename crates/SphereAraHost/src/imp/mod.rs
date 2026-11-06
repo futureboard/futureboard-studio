@@ -34,8 +34,8 @@ use crate::error::{AraHostError, AraResult};
 use crate::info::{AraFactoryInfo, AraRendererId, AraRoles};
 use crate::model::{
     AraAudioSourceDesc, AraClipKey, AraColor, AraGraph, AraGraphChange, AraMusicalTimeline,
-    AraPlaybackRegionDesc, AraPlaybackTransform, AraRegionSequenceDesc, AraSourceKey, AraTrackKey,
-    HeldGraph, ara_persistent_id,
+    AraNote, AraPlaybackRegionDesc, AraPlaybackTransform, AraRegionSequenceDesc, AraSourceKey,
+    AraTrackKey, HeldGraph, ara_persistent_id,
 };
 
 use services::{
@@ -1331,6 +1331,48 @@ impl Session {
         document
             .audio_source_content_analysis_incomplete::<Notes>(handle)
             .ok()
+    }
+
+    /// See [`crate::AraSession::region_notes`].
+    pub(crate) fn region_notes(&mut self, clip: &AraClipKey) -> AraResult<Option<Vec<AraNote>>> {
+        let Some(region) = self.clips.get(clip).map(|entry| entry.region) else {
+            return Ok(None);
+        };
+        if !self.notes_analysable {
+            return Ok(None);
+        }
+        let document = self.document_mut()?;
+        match document.playback_region_content_available::<Notes>(region) {
+            Ok(true) => {}
+            Ok(false) | Err(AraError::Unsupported(_)) => return Ok(None),
+            Err(error) => return Err(map_error(error)),
+        }
+        let Some(mut reader) = document
+            .playback_region_content_reader::<Notes>(region, None)
+            .map_err(map_error)?
+        else {
+            return Ok(None);
+        };
+        let mut notes = Vec::with_capacity(reader.len());
+        for index in 0..reader.len() {
+            let event = reader.event(index).map_err(map_error)?;
+            let pitch = match (event.frequency(), event.pitch()) {
+                (Some(frequency), _) if frequency > 0.0 => AraNote::pitch_of_frequency(frequency),
+                (_, Some(pitch)) => pitch as f32,
+                _ => continue,
+            };
+            if !pitch.is_finite() || event.note_duration() <= 0.0 {
+                continue;
+            }
+            notes.push(AraNote {
+                start_seconds: event.start_position(),
+                duration_seconds: event.note_duration(),
+                pitch,
+                volume: event.volume(),
+            });
+        }
+        notes.sort_by(|a, b| a.start_seconds.total_cmp(&b.start_seconds));
+        Ok(Some(notes))
     }
 
     /// Whether note analysis of `key` is still incomplete, as the plug-in

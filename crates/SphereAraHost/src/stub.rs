@@ -144,6 +144,13 @@ impl Session {
         ))
     }
 
+    pub(crate) fn region_notes(
+        &mut self,
+        _clip: &crate::model::AraClipKey,
+    ) -> AraResult<Option<Vec<crate::model::AraNote>>> {
+        Ok(None)
+    }
+
     pub(crate) fn analysis_incomplete(&mut self, _key: &AraSourceKey) -> AraResult<Option<bool>> {
         unsupported()
     }

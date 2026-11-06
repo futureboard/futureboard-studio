@@ -279,6 +279,9 @@ pub fn track_list(
                                     on_audio_clip_process_preview.clone(),
                                     on_audio_clip_process_commit.clone(),
                                     on_crossfade.clone(),
+                                    // Uncached lanes (no `Timeline` view) have
+                                    // no ARA notes to show.
+                                    &Default::default(),
                                 )
                                 .into_any_element(),
                             }),

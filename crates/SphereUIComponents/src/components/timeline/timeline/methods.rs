@@ -282,6 +282,7 @@ impl Timeline {
             range_select_drag: None,
             erase_clip_drag: None,
             erase_preview_ids: HashSet::new(),
+            ara_notes: Default::default(),
             automation_drag: None,
             automation_curve_drag: None,
             automation_marquee: None,
@@ -387,6 +388,7 @@ impl Timeline {
             range_select_drag: None,
             erase_clip_drag: None,
             erase_preview_ids: HashSet::new(),
+            ara_notes: Default::default(),
             automation_drag: None,
             automation_curve_drag: None,
             automation_marquee: None,
@@ -1754,11 +1756,28 @@ impl Timeline {
     /// can rebuild it on its own. The row layout is recomputed instead of
     /// borrowed from the frame: it is O(track_count) and only runs when the
     /// grid is actually dirty, which is far less often than every frame.
+    /// Replace the ARA clips' notes; `true` when they changed, so the caller
+    /// notifies (every lane repaints from them).
+    pub fn set_ara_notes(
+        &mut self,
+        notes: std::collections::HashMap<
+            String,
+            std::sync::Arc<[crate::components::timeline::audio_clip::AraClipNote]>,
+        >,
+    ) -> bool {
+        if self.ara_notes == notes {
+            return false;
+        }
+        self.ara_notes = notes;
+        true
+    }
+
     /// Build one track's clip lane from this frame's published context.
     ///
     /// Called by the cached [`crate::components::timeline::track_lane_view::TrackLaneView`],
     /// which renders during the prepaint of the tree `render` just returned —
     /// so `frame_lane_ctx` is always this frame's.
+
     pub(crate) fn render_track_lane(&self, track_id: &str) -> gpui::AnyElement {
         use gpui::{IntoElement, ParentElement, Styled};
         let Some(ctx) = self.frame_lane_ctx.as_ref() else {
@@ -1797,6 +1816,7 @@ impl Timeline {
                 ctx.on_audio_clip_process_preview.clone(),
                 ctx.on_audio_clip_process_commit.clone(),
                 ctx.on_crossfade.clone(),
+                &self.ara_notes,
             ))
             .into_any_element()
     }

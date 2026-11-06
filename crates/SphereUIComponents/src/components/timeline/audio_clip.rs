@@ -1056,6 +1056,106 @@ fn stretch_badge(clip: &ClipState, state: &TimelineState) -> Option<StretchBadge
     Some(StretchBadge { label, locked })
 }
 
+/// One note an ARA plug-in reports for a clip, as it sounds after the
+/// plug-in's edits (Melodyne's edited pitch), in song time.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AraClipNote {
+    pub start_seconds: f64,
+    pub duration_seconds: f64,
+    /// Fractional MIDI note number: a note tuned off the grid sits between
+    /// two keys, as the plug-in plays it.
+    pub pitch: f32,
+}
+
+/// Semitones the notes of a clip are spread over at the least, so one held
+/// note does not fill the clip from top to bottom.
+const ARA_NOTE_MIN_SPAN: f32 = 12.0;
+
+/// The notes of an ARA clip over its waveform, the way the plug-in plays them:
+/// one bar per note on a pitch axis fitted to the clip's own range, so the
+/// edits made in the plug-in (pitch, timing, length) read on the arrangement.
+/// Culled to the clip's visible part; paint-time only.
+fn ara_notes_canvas(
+    notes: std::sync::Arc<[AraClipNote]>,
+    state: &TimelineState,
+    clip_left: f32,
+    track_color: gpui::Rgba,
+    bottom_reserve: f32,
+) -> impl IntoElement {
+    let base_bpm = state.bpm.max(1.0) as f64;
+    // Beats once, here; the paint closure only scales.
+    let spans: Vec<(f32, f32, f32)> = notes
+        .iter()
+        .map(|note| {
+            let start = state
+                .tempo_map
+                .beat_at_seconds(note.start_seconds.max(0.0), base_bpm);
+            let end = state.tempo_map.beat_at_seconds(
+                (note.start_seconds + note.duration_seconds).max(0.0),
+                base_bpm,
+            );
+            (
+                state.beats_to_x(start as f32) - clip_left,
+                state.beats_to_x(end as f32) - clip_left,
+                note.pitch,
+            )
+        })
+        .collect();
+    let (lo, hi) = spans
+        .iter()
+        .fold((f32::MAX, f32::MIN), |(lo, hi), (_, _, pitch)| {
+            (lo.min(*pitch), hi.max(*pitch))
+        });
+    let middle = (lo + hi) * 0.5;
+    let span = (hi - lo + 2.0).max(ARA_NOTE_MIN_SPAN);
+    let (lo, hi) = (middle - span * 0.5, middle + span * 0.5);
+    let fill = Colors::with_alpha(Colors::text_primary(), 0.86);
+    let edge = Colors::timeline_audio_clip_border(track_color, true);
+    gpui::canvas(
+        |_bounds, _window, _cx| {},
+        move |bounds: gpui::Bounds<gpui::Pixels>, (), window, _cx| {
+            let w: f32 = bounds.size.width.into();
+            let h: f32 = bounds.size.height.into();
+            if spans.is_empty() || h < 8.0 || w <= 0.0 {
+                return;
+            }
+            let origin_x: f32 = bounds.origin.x.into();
+            let origin_y: f32 = bounds.origin.y.into();
+            let inset = 2.0;
+            // Above the clip's label row, which floats over the bottom.
+            let usable = h - 2.0 * inset - bottom_reserve;
+            if usable < 6.0 {
+                return;
+            }
+            let bar_h = (usable / span).clamp(2.0, 6.0);
+            for &(x0, x1, pitch) in &spans {
+                if x1 < 0.0 || x0 > w {
+                    continue;
+                }
+                let x0 = x0.max(0.0);
+                let x1 = x1.min(w);
+                let bar_w = (x1 - x0).max(1.5);
+                let t = ((hi - pitch) / (hi - lo)).clamp(0.0, 1.0);
+                let y = inset + t * (usable - bar_h);
+                let bar = gpui::Bounds::new(
+                    gpui::point(px(origin_x + x0), px(origin_y + y)),
+                    gpui::size(px(bar_w), px(bar_h)),
+                );
+                window.paint_quad(gpui::quad(
+                    bar,
+                    px((bar_h * 0.5).min(2.0)),
+                    fill,
+                    px(if bar_h >= 4.0 { 0.5 } else { 0.0 }),
+                    edge,
+                    gpui::BorderStyle::Solid,
+                ));
+            }
+        },
+    )
+    .absolute()
+    .inset_0()
+}
+
 pub fn audio_clip(
     clip: &ClipState,
     track_id: &str,
@@ -1077,6 +1177,7 @@ pub fn audio_clip(
     fades: EffectiveFades,
     time: &ClipTimeAxis<'_>,
     ara: bool,
+    ara_notes: Option<std::sync::Arc<[AraClipNote]>>,
     on_process_preview: AudioClipProcessPreviewCb,
     on_process_commit: AudioClipProcessCommitCb,
 ) -> impl IntoElement {
@@ -1275,14 +1376,27 @@ pub fn audio_clip(
         .flex()
         .flex_col()
         .justify_between()
-        // Waveform preview area
-        .child(div().flex_1().min_h_0().child(waveform_canvas(
-            clip,
-            track_color,
-            state,
-            left,
-            width,
-        )))
+        // Waveform preview area, and over it on an ARA clip the notes the
+        // plug-in plays: its edited pitch.
+        .child(
+            div()
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .child(waveform_canvas(clip, track_color, state, left, width))
+                .children(
+                    ara_notes
+                        .filter(|notes| ara && !notes.is_empty())
+                        .map(|notes| {
+                            let reserve = if show_labels {
+                                LABEL_ROW_H + crate::theme::space::HAIR
+                            } else {
+                                0.0
+                            };
+                            ara_notes_canvas(notes, state, left, track_color, reserve)
+                        }),
+                ),
+        )
         // Smart Tool: an Option-click on the Pointer's clip body cuts (see
         // `smart_cut_zone`). Before the strip, so the strip's own controls
         // (inline gain) stay on top of it.

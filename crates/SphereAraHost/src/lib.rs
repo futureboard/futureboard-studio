@@ -51,9 +51,9 @@ pub use info::{AraFactoryInfo, AraRendererId, AraRoles};
 pub use model::{
     ARA_ENCODED_ID_PREFIX, AraAudioAccess, AraAudioSourceDesc, AraBarSignature, AraClipKey,
     AraColor, AraGraph, AraGraphChange, AraKeySignature, AraModelObserver, AraModelUpdate,
-    AraMusicalTimeline, AraPlaybackRegionDesc, AraPlaybackTransform, AraRegionSequenceDesc,
-    AraSampleReader, AraSourceKey, AraTempoEntry, AraTrackKey, AraTransportControl,
-    AraTransportRequest, ara_persistent_id,
+    AraMusicalTimeline, AraNote, AraPlaybackRegionDesc, AraPlaybackTransform,
+    AraRegionSequenceDesc, AraSampleReader, AraSourceKey, AraTempoEntry, AraTrackKey,
+    AraTransportControl, AraTransportRequest, ara_persistent_id,
 };
 
 use std::sync::Arc;
@@ -384,6 +384,16 @@ impl AraSession {
     /// such a report.
     pub fn analysis_incomplete(&mut self, source: &AraSourceKey) -> AraResult<Option<bool>> {
         self.inner.analysis_incomplete(source)
+    }
+
+    /// The notes the plug-in reports for `clip`'s playback region, as they
+    /// sound after its edits, in song time and in order.
+    ///
+    /// `Ok(None)` when the clip is not rendered by this document, or the
+    /// plug-in has no note content for it (yet). Unpitched notes are left
+    /// out. Outside an edit cycle only; the model thread.
+    pub fn region_notes(&mut self, clip: &AraClipKey) -> AraResult<Option<Vec<AraNote>>> {
+        self.inner.region_notes(clip)
     }
 
     /// Whether the session was quarantined by an ARA assertion or an impossible
