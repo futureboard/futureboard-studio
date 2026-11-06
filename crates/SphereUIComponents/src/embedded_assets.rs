@@ -221,6 +221,7 @@ impl AssetSource for EmbeddedAssets {
             assets::ICON_VOLUME_2_PATH,
             assets::ICON_CIRCLE_DOT_PATH,
             assets::ICON_MAGNET_PATH,
+            assets::ICON_DRUM_PATH,
             assets::ICON_GRIP_VERTICAL_PATH,
             assets::ICON_FILE_PATH,
             assets::ICON_CHEVRON_RIGHT_PATH,

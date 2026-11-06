@@ -22,6 +22,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::prelude::FluentBuilder;
+use gpui::SharedString;
 use gpui::{
     canvas, deferred, div, fill, point, px, size, svg, Animation, AnimationExt, AppContext, Bounds,
     Context, Entity, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
@@ -45,16 +46,23 @@ pub mod advanced_tools;
 mod articulation_lane;
 mod cc_lane;
 mod cc_lane_render;
+mod drum_map;
 mod grid_render;
 mod native_menus;
 pub mod playhead;
 mod render;
 pub mod scope;
+pub use drum_map::DrumLanes;
 mod tools_panel;
 
 /// Default note-row height (px per semitone). Reset-zoom restores this value so
 /// note height matches the editor's default density after Zoom Y changes.
 const DEFAULT_ROW_H: f32 = 14.0;
+/// Row height drum mode opens at: a lane carries a name and a hit, and is
+/// read across a bar, so it gets more room than a semitone.
+const DRUM_ROW_H: f32 = 22.0;
+/// Width of the drum lane list: room for "Closed Hi-Hat" and its note.
+const DRUM_LANE_W: f32 = 132.0;
 /// Legacy alias used by unit tests and denser-zoom comparisons that still mean
 /// "the default row height".
 const ROW_H: f32 = DEFAULT_ROW_H;
@@ -1199,6 +1207,17 @@ pub struct PianoRoll {
     /// Vertical zoom: pixels per semitone / note-row height (Zoom Y).
     /// Independent of [`Self::ppb`]. Reset restores [`DEFAULT_ROW_H`].
     row_h: f32,
+    /// Drum editor mode: the pitch axis is a list of drum lanes rather than
+    /// 128 keys, notes are hits, and the Draw tool toggles a hit per step.
+    drum_mode: bool,
+    /// Which lanes drum mode lists.
+    drum_lanes: DrumLanes,
+    /// The lanes, top to bottom, refreshed each render from the edited clip
+    /// (see [`Self::refresh_drum_rows`]). Every drum-mode row mapping reads it.
+    drum_rows: Vec<u8>,
+    /// Lane names from the track's own instrument (the Drum Sampler's pads),
+    /// over the General MIDI names.
+    drum_names: std::collections::HashMap<u8, SharedString>,
     snap_on: bool,
     grid_res: GridRes,
     /// Quantize strength resolution, independent of the visual grid.
@@ -1510,6 +1529,10 @@ impl PianoRoll {
             tool: PianoTool::Draw,
             ppb: 80.0,
             row_h: DEFAULT_ROW_H,
+            drum_mode: false,
+            drum_lanes: DrumLanes::Kit,
+            drum_rows: Vec::new(),
+            drum_names: std::collections::HashMap::new(),
             snap_on: true,
             grid_res: GridRes::Sixteenth,
             quantize_res: GridRes::Sixteenth,
@@ -2272,10 +2295,172 @@ impl PianoRoll {
         self.project_beat_to_x(beat + self.edit_origin())
     }
     fn y_to_pitch(&self, local_y: f32) -> u8 {
+        if self.drum_mode {
+            if let Some(pitch) =
+                drum_map::drum_row_at(&self.drum_rows, local_y, self.scroll_y, self.note_row_h())
+            {
+                return pitch;
+            }
+        }
         local_y_to_pitch(local_y, self.scroll_y, self.row_h)
     }
     fn pitch_to_y(&self, pitch: u8) -> f32 {
+        if self.drum_mode {
+            // A note with no lane is drawn nowhere; `drum_rows` gives every
+            // played note one, so this only hides what was never played.
+            return match drum_map::drum_row_index(&self.drum_rows, pitch) {
+                Some(row) => row as f32 * self.note_row_h() - self.scroll_y,
+                None => -1.0e6,
+            };
+        }
         (PITCH_CNT - 1 - pitch as i32) as f32 * self.row_h - self.scroll_y
+    }
+
+    /// How many rows the pitch axis has: 128 keys, or the drum lanes.
+    fn pitch_row_count(&self) -> usize {
+        if self.drum_mode && !self.drum_rows.is_empty() {
+            self.drum_rows.len()
+        } else {
+            PITCH_CNT as usize
+        }
+    }
+
+    /// The row index (from the top) of `pitch`, fractional pitches included
+    /// in piano mode.
+    fn pitch_row_of(&self, pitch: f32) -> f32 {
+        if self.drum_mode {
+            let nearest = pitch.round().clamp(0.0, 127.0) as u8;
+            if let Some(row) = drum_map::drum_row_index(&self.drum_rows, nearest) {
+                return row as f32;
+            }
+        }
+        (PITCH_CNT - 1) as f32 - pitch
+    }
+
+    /// `pitch` moved by a drag of `dpitch` (rows up, positive). The piano
+    /// moves semitones under the scale lock; drum mode moves whole lanes.
+    fn moved_pitch(&self, pitch: u8, dpitch: i32) -> u8 {
+        if self.drum_mode {
+            return drum_map::drum_move(&self.drum_rows, pitch, -dpitch);
+        }
+        let raw_pitch = (pitch as i32 + dpitch).clamp(0, 127) as u8;
+        self.pitch_ctx.constrain_pitch(raw_pitch)
+    }
+
+    /// What a row is called in the lane list and the hover status: the
+    /// track's instrument's name for it, the General MIDI name, or the note.
+    fn drum_lane_name(&self, pitch: u8) -> SharedString {
+        if let Some(name) = self.drum_names.get(&pitch) {
+            return name.clone();
+        }
+        drum_map::gm_drum_name(pitch)
+            .map(SharedString::from)
+            .unwrap_or_else(|| SharedString::from(note_name(pitch as i32)))
+    }
+
+    /// Width of the key column: the keyboard, or the drum lane list, which is
+    /// wider so a sound's name fits beside its note.
+    pub(super) fn key_column_w(&self) -> f32 {
+        if self.drum_mode {
+            key_lane_width().max(DRUM_LANE_W)
+        } else {
+            key_lane_width()
+        }
+    }
+
+    pub fn drum_mode(&self) -> bool {
+        self.drum_mode
+    }
+
+    /// Switch between the piano roll and the drum editor. The view keeps the
+    /// same notes; the row under the middle of the view is kept in view.
+    pub fn set_drum_mode(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.drum_mode == on {
+            return;
+        }
+        self.drum_mode = on;
+        self.refresh_drum_rows(cx);
+        // Lanes are worth a taller row than semitones, and start at the top.
+        if on {
+            self.row_h = self.row_h.max(DRUM_ROW_H);
+            self.scroll_y = 0.0;
+        } else {
+            self.scroll_to_pitch(60);
+        }
+        cx.notify();
+    }
+
+    pub fn set_drum_lanes(&mut self, lanes: DrumLanes, cx: &mut Context<Self>) {
+        if self.drum_lanes == lanes {
+            return;
+        }
+        self.drum_lanes = lanes;
+        self.refresh_drum_rows(cx);
+        self.scroll_y = self.scroll_y.clamp(0.0, self.max_scroll_y());
+        cx.notify();
+    }
+
+    /// Rebuild the lanes from the edited clip: every note it plays has one.
+    /// Names come from the track's Drum Sampler pads where it has one. Cheap
+    /// enough per render: one pass over the clip's notes, only in drum mode.
+    pub(super) fn refresh_drum_rows(&mut self, cx: &Context<Self>) {
+        if !self.drum_mode {
+            return;
+        }
+        let used: Vec<u8> = self
+            .editing_clip_id(cx)
+            .and_then(|clip_id| {
+                self.timeline
+                    .read(cx)
+                    .state
+                    .midi_clip_notes(&clip_id)
+                    .map(|notes| notes.iter().map(|note| note.pitch).collect())
+            })
+            .unwrap_or_default();
+        self.drum_rows = drum_map::drum_rows(self.drum_lanes, &used);
+        self.drum_names = self.drum_sampler_names(cx);
+    }
+
+    /// Pad names of the built-in Drum Sampler on the edited track, by note:
+    /// each pad's sample, which is what the user loaded onto that note.
+    fn drum_sampler_names(
+        &self,
+        cx: &Context<Self>,
+    ) -> std::collections::HashMap<u8, SharedString> {
+        let mut names = std::collections::HashMap::new();
+        #[cfg(feature = "builtin-plugin-editor")]
+        {
+            let state = &self.timeline.read(cx).state;
+            let Some(track) = self
+                .editing_clip_id(cx)
+                .and_then(|clip_id| state.find_clip(&clip_id).map(|(track, _)| track))
+            else {
+                return names;
+            };
+            for insert in track.inserts.iter().filter(|insert| !insert.is_empty()) {
+                let Some(params) =
+                    crate::components::builtin_plugin_editor::builtin_drum_sampler_params(
+                        &insert.id,
+                    )
+                else {
+                    continue;
+                };
+                for pad in params.pads.iter() {
+                    if let Some(sample) = pad.sample_name.as_ref().filter(|name| !name.is_empty()) {
+                        let label = std::path::Path::new(sample)
+                            .file_stem()
+                            .map(|stem| stem.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| sample.clone());
+                        names
+                            .entry(pad.note)
+                            .or_insert_with(|| SharedString::from(label));
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "builtin-plugin-editor"))]
+        let _ = cx;
+        names
     }
 
     /// Current Zoom Y (px per semitone). Prefer this over the `DEFAULT_ROW_H`
@@ -2286,7 +2471,7 @@ impl PianoRoll {
     }
 
     fn total_pitch_h(&self) -> f32 {
-        PITCH_CNT as f32 * self.note_row_h()
+        self.pitch_row_count() as f32 * self.note_row_h()
     }
 
     fn point_to_beat_pitch(&self, local_x: f32, local_y: f32) -> (f32, u8) {
@@ -2591,6 +2776,10 @@ impl PianoRoll {
     /// above, its lower half to the one below.
     fn key_pitch_at_local(&self, local_x: f32, local_y: f32, lane_w: f32) -> u8 {
         let pitch = self.y_to_pitch(local_y);
+        if self.drum_mode {
+            // A lane is the whole row: there are no black keys to split.
+            return pitch;
+        }
         keyboard_key_at(
             pitch,
             local_y - self.pitch_to_y(pitch),
@@ -2655,7 +2844,7 @@ impl PianoRoll {
             scroll_x: self.scroll_x.max(0.0),
             row_h: self.note_row_h(),
             scroll_y: self.scroll_y.max(0.0),
-            key_lane_width: key_lane_width(),
+            key_lane_width: self.key_column_w(),
             snap_step_beats: viewport_snap_step(self.snap_on, self.grid_res, self.ppb),
             sub_step_beats: self.step_beats().max(MIN_NOTE_BEATS),
             grid_width,
@@ -2690,6 +2879,17 @@ impl PianoRoll {
     /// drifting the view sideways in pitch.
     pub fn zoom_viewport_vertically(&mut self, factor: f32, view_h: f32, anchor_y: f32) {
         let anchor_y = anchor_y.clamp(0.0, view_h.max(1.0));
+        if self.drum_mode {
+            // Lanes are rows, not pitches: keep the same row fraction under
+            // the cursor.
+            let anchor_row = (anchor_y + self.scroll_y) / self.note_row_h().max(0.0001);
+            let new_row_h =
+                (self.note_row_h() * factor).clamp(PIANO_ROLL_MIN_ROW_H, PIANO_ROLL_MAX_ROW_H);
+            self.row_h = new_row_h;
+            self.scroll_y =
+                (anchor_row * new_row_h - anchor_y).clamp(0.0, self.max_scroll_y_for(view_h));
+            return;
+        }
         let anchor_pitch = local_y_to_pitch_f32(anchor_y, self.scroll_y, self.note_row_h());
         let new_row_h =
             (self.note_row_h() * factor).clamp(PIANO_ROLL_MIN_ROW_H, PIANO_ROLL_MAX_ROW_H);
@@ -2711,12 +2911,15 @@ impl PianoRoll {
         if view_h <= 1.0 {
             return;
         }
-        let span = (max_pitch - min_pitch).max(1.0);
+        // Measured in rows: one per semitone, or one per drum lane.
+        let span = (self.pitch_row_of(min_pitch) - self.pitch_row_of(max_pitch))
+            .abs()
+            .max(1.0);
         let fit_h = (view_h - PIANO_ROLL_FIT_PAD_PX * 2.0).max(24.0);
         let new_row_h = (fit_h / span).clamp(PIANO_ROLL_MIN_ROW_H, PIANO_ROLL_MAX_ROW_H);
         self.row_h = new_row_h;
-        let anchor_pitch = (min_pitch + max_pitch) * 0.5;
-        let target_top = (PITCH_CNT - 1) as f32 * new_row_h - anchor_pitch * new_row_h;
+        let anchor_row = (self.pitch_row_of(min_pitch) + self.pitch_row_of(max_pitch)) * 0.5;
+        let target_top = anchor_row * new_row_h;
         self.scroll_y =
             (target_top + new_row_h * 0.5 - view_h * 0.5).clamp(0.0, self.max_scroll_y_for(view_h));
     }
@@ -2772,7 +2975,7 @@ impl PianoRoll {
     fn scroll_to_pitch(&mut self, pitch: u8) {
         let (_, view_h) = self.grid_view_size();
         let row_h = self.note_row_h();
-        let target = ((PITCH_CNT - 1) as f32 - pitch as f32) * row_h - view_h * 0.5 + row_h * 0.5;
+        let target = self.pitch_row_of(pitch as f32) * row_h - view_h * 0.5 + row_h * 0.5;
         self.scroll_y = target.clamp(0.0, self.max_scroll_y());
     }
 
@@ -2804,12 +3007,25 @@ impl PianoRoll {
         } else {
             let lo = target_notes.iter().map(|n| n.pitch).min().unwrap_or(60);
             let hi = target_notes.iter().map(|n| n.pitch).max().unwrap_or(60);
-            (lo.saturating_sub(6), hi.saturating_add(6))
+            if self.drum_mode {
+                // Every played note is a lane; a padded pitch may not be.
+                (lo, hi)
+            } else {
+                (lo.saturating_sub(6), hi.saturating_add(6))
+            }
         };
 
-        let mid = (min_p as f32 + max_p as f32) * 0.5;
         let row_h = self.note_row_h();
-        let target_scroll = ((PITCH_CNT - 1) as f32 - mid) * row_h - view_h * 0.5 + row_h * 0.5;
+        // The middle row between the extremes: in drum mode the lanes are
+        // not one semitone apart, so it is found by row, not by pitch.
+        let mid_row = (self.pitch_row_of(min_p as f32) + self.pitch_row_of(max_p as f32)) * 0.5;
+        let target_scroll = if self.drum_mode {
+            // A kit reads from its first played lane down — the kick and
+            // snare at the top, not centred out of view.
+            (self.pitch_row_of(min_p as f32) - 1.0).max(0.0) * row_h
+        } else {
+            mid_row * row_h - view_h * 0.5 + row_h * 0.5
+        };
         self.scroll_y = target_scroll.clamp(0.0, self.max_scroll_y());
 
         let (_, clip_len) = self.clip_meta(cx, clip_id);
@@ -3226,9 +3442,20 @@ impl PianoRoll {
 
         match self.tool {
             PianoTool::Draw => {
-                let pitch = self.pitch_ctx.constrain_pitch(self.y_to_pitch(ly));
+                let pitch = if self.drum_mode {
+                    // Lanes are notes of the kit; the scale lock has no say.
+                    self.y_to_pitch(ly)
+                } else {
+                    self.pitch_ctx.constrain_pitch(self.y_to_pitch(ly))
+                };
                 let unsnap = event.modifiers.shift;
-                let start = self.snap_beats_live(self.x_to_clip_beat(lx), unsnap);
+                let start = if self.drum_mode {
+                    // A hit lands at the start of the step it was clicked in,
+                    // the way a step sequencer fills a cell.
+                    self.drum_step_start(self.x_to_clip_beat(lx), unsnap)
+                } else {
+                    self.snap_beats_live(self.x_to_clip_beat(lx), unsnap)
+                };
                 if midi_debug_enabled() {
                     if let Some((track_id, channel)) = self.preview_target(cx) {
                         eprintln!(
@@ -3343,6 +3570,17 @@ impl PianoRoll {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus, cx);
+        // In drum mode the Draw tool toggles: a click on a hit removes it, as
+        // a click on an empty step adds one. Shift and Ctrl still select.
+        if self.drum_mode
+            && self.tool == PianoTool::Draw
+            && !event.modifiers.shift
+            && !event.modifiers.control
+            && !event.modifiers.platform
+        {
+            self.erase_note(id, cx);
+            return;
+        }
         // Tool-specific note actions take precedence over select/move.
         match self.tool {
             PianoTool::Erase => {
@@ -4217,6 +4455,10 @@ impl PianoRoll {
             if let PianoDrag::DrawNote { unsnap, .. } = &mut self.drag {
                 *unsnap = event.modifiers.shift;
             }
+            // A drum hit is one step long wherever the pointer goes.
+            if self.drum_mode {
+                return;
+            }
             if let Some((lx, _)) = self.grid_local(event.position) {
                 let live_unsnap = matches!(self.drag, PianoDrag::DrawNote { unsnap: true, .. });
                 let beat = self.snap_beats_live(self.x_to_clip_beat(lx), live_unsnap);
@@ -4242,8 +4484,7 @@ impl PianoRoll {
             let cur_y: f32 = event.position.y.into();
             let ppb = self.ppb.max(0.0001);
             let row_h = self.note_row_h();
-            let pitch_ctx = self.pitch_ctx;
-            let mut audition_pitch: Option<u8> = None;
+            let mut audition_pitch: Option<(u8, i32)> = None;
             if let PianoDrag::Move {
                 start_x,
                 start_y,
@@ -4259,11 +4500,12 @@ impl PianoRoll {
                 *dx_beats = (cur_x - *start_x) / ppb;
                 *dpitch = -(((cur_y - *start_y) / row_h).round() as i32);
                 *unsnap = event.modifiers.shift;
-                let raw_pitch = (*grab_pitch as i32 + *dpitch).clamp(0, 127) as u8;
-                audition_pitch = Some(pitch_ctx.constrain_pitch(raw_pitch));
+                audition_pitch = Some((*grab_pitch, *dpitch));
             }
             // Switch the live audition note when the dragged pitch changes; a
             // horizontal-only (timing) move never retriggers.
+            let audition_pitch =
+                audition_pitch.map(|(grab, dpitch)| self.moved_pitch(grab, dpitch));
             if let Some(pitch) = audition_pitch {
                 let changed = self
                     .active_preview_note
@@ -4525,9 +4767,8 @@ impl PianoRoll {
                     .iter()
                     .map(|(id, start, pitch)| {
                         let new_start = (*start + effective_delta).max(0.0);
-                        let raw_pitch = (*pitch as i32 + dpitch).clamp(0, 127) as u8;
-                        let new_pitch = pitch_ctx.constrain_pitch(raw_pitch);
-                        (*id, new_start, new_pitch)
+                        let _ = pitch_ctx;
+                        (*id, new_start, self.moved_pitch(*pitch, dpitch))
                     })
                     .collect();
                 // Skip a commit (and the dirty flag) if snapping landed every
@@ -4679,11 +4920,19 @@ impl PianoRoll {
         match key {
             "up" if !ctrl && !self.selection.is_empty() => {
                 cx.stop_propagation();
-                self.transpose_selection(if shift { 12 } else { 1 }, cx);
+                if self.drum_mode {
+                    self.move_selection_lanes(-1, cx);
+                } else {
+                    self.transpose_selection(if shift { 12 } else { 1 }, cx);
+                }
             }
             "down" if !ctrl && !self.selection.is_empty() => {
                 cx.stop_propagation();
-                self.transpose_selection(if shift { -12 } else { -1 }, cx);
+                if self.drum_mode {
+                    self.move_selection_lanes(1, cx);
+                } else {
+                    self.transpose_selection(if shift { -12 } else { -1 }, cx);
+                }
             }
             // Articulation lane focus: Delete removes the selected direction
             // event; notes keep their own Delete handling below.
@@ -4797,6 +5046,9 @@ impl PianoRoll {
     /// Pitches the Draw tool will create for `root`. Chord mode stacks diatonic
     /// thirds from the active scale; Lock still applies to a single-note draw.
     fn chord_draw_pitches(&self, root: u8) -> Vec<u8> {
+        if self.drum_mode {
+            return vec![root];
+        }
         match self.chord_kind {
             ChordInsertKind::Off => vec![self.pitch_ctx.constrain_pitch(root)],
             kind => self.pitch_ctx.scale.chord_pitches(root, kind.voices()),
@@ -5128,6 +5380,63 @@ impl PianoRoll {
         );
         self.selection = new_ids.into_iter().collect();
         cx.notify();
+    }
+
+    /// The start of the grid step `beat` falls in, for a drum hit: the cell it
+    /// was clicked in, not the nearest line. Off the grid (Shift, snap off, or
+    /// a free grid) the hit lands where it was clicked.
+    fn drum_step_start(&self, beat: f32, unsnap: bool) -> f32 {
+        let step = self.step_beats();
+        if unsnap || !self.snap_on || self.grid_res.is_free() || step <= 0.0 {
+            return beat.max(0.0);
+        }
+        ((beat / step).floor() * step).max(0.0)
+    }
+
+    /// Move the selected hits `rows_down` lanes (negative is up), as one
+    /// undoable edit — the drum editor's Up/Down.
+    fn move_selection_lanes(&mut self, rows_down: i32, cx: &mut Context<Self>) {
+        let Some(clip_id) = self.editing_clip_id(cx) else {
+            return;
+        };
+        let moves: Vec<(u64, i32)> = {
+            let Some(notes) = self.timeline.read(cx).state.midi_clip_notes(&clip_id) else {
+                return;
+            };
+            notes
+                .iter()
+                .filter(|note| self.selection.contains(&note.id))
+                .map(|note| {
+                    let target = drum_map::drum_move(&self.drum_rows, note.pitch, rows_down);
+                    (note.id, target as i32 - note.pitch as i32)
+                })
+                .filter(|(_, delta)| *delta != 0)
+                .collect()
+        };
+        if moves.is_empty() {
+            return;
+        }
+        // Lanes are not evenly spaced in pitch, so each hit moves by its own
+        // semitone delta, in one edit.
+        let deltas: std::collections::HashMap<u64, i32> = moves.into_iter().collect();
+        self.transpose_notes_by(&clip_id, &deltas, cx);
+    }
+
+    /// Transpose each of `deltas`' notes by its own semitone delta, as one
+    /// undoable edit.
+    fn transpose_notes_by(
+        &mut self,
+        _clip_id: &str,
+        deltas: &std::collections::HashMap<u64, i32>,
+        cx: &mut Context<Self>,
+    ) {
+        let ids: Vec<u64> = deltas.keys().copied().collect();
+        let deltas = deltas.clone();
+        self.commit_note_transform(cx, &ids, move |state, cid| {
+            for (id, delta) in &deltas {
+                state.transpose_midi_notes(cid, &[*id], *delta);
+            }
+        });
     }
 
     /// Transpose the selected notes by `delta` semitones (clamped to 0..=127),
@@ -5728,11 +6037,16 @@ impl PianoRoll {
         let (_, view_h) = self.grid_view_size();
         let anchor_y = view_h * 0.5;
         let old_row = self.note_row_h();
-        let anchor_pitch_f = (PITCH_CNT as f32 - 1.0) - ((anchor_y + self.scroll_y) / old_row);
-        self.row_h = DEFAULT_ROW_H;
+        // The row fraction under the middle stays put; drum lanes reset to
+        // their own default height.
+        let anchor_row = (anchor_y + self.scroll_y) / old_row.max(0.0001);
+        self.row_h = if self.drum_mode {
+            DRUM_ROW_H
+        } else {
+            DEFAULT_ROW_H
+        };
         let new_row = self.note_row_h();
-        self.scroll_y = (((PITCH_CNT as f32 - 1.0) - anchor_pitch_f) * new_row - anchor_y)
-            .clamp(0.0, self.max_scroll_y());
+        self.scroll_y = (anchor_row * new_row - anchor_y).clamp(0.0, self.max_scroll_y());
         cx.notify();
     }
 

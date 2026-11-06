@@ -4,6 +4,7 @@
 
 use super::*;
 use gpui::{PathBuilder, PathStyle, StrokeOptions};
+use std::collections::HashMap;
 
 impl PianoRoll {
     pub(super) fn display_note(&self, n: &MidiNoteState) -> DisplayNote {
@@ -24,8 +25,7 @@ impl PianoRoll {
                     // peer so an off-grid multi-selection keeps internal spacing.
                     let snapped_anchor = self.snap_beats_live(*anchor_start + *dx_beats, *unsnap);
                     start = (n.start + snapped_anchor - *anchor_start).max(0.0);
-                    let raw_pitch = (n.pitch as i32 + dpitch).clamp(0, 127) as u8;
-                    pitch = self.pitch_ctx.constrain_pitch(raw_pitch);
+                    pitch = self.moved_pitch(n.pitch, *dpitch);
                 }
             }
             PianoDrag::Resize {
@@ -51,11 +51,26 @@ impl PianoRoll {
     }
 
     pub(super) fn note_to_rect(&self, note: &DisplayNote) -> (f32, f32, f32, f32) {
+        if self.drum_mode {
+            // A hit is a diamond at its start: drums have no length to read.
+            let (cx, cy, size) = self.drum_hit_geometry(note);
+            let half = size * 0.5;
+            return (cx - half, cy - half, cx + half, cy + half);
+        }
         let x = self.clip_beat_to_x(note.start);
         let w = (note.duration * self.ppb).max(NOTE_MIN_W);
         let y = self.pitch_to_y(note.pitch) + 1.0;
         let h = self.note_row_h() - 2.0;
         (x, y, x + w, y + h)
+    }
+
+    /// Centre x, centre y and size of a drum hit's diamond, grid-local.
+    pub(super) fn drum_hit_geometry(&self, note: &DisplayNote) -> (f32, f32, f32) {
+        let row_h = self.note_row_h();
+        let size = (row_h - 4.0).clamp(6.0, 18.0);
+        let x = self.clip_beat_to_x(note.start);
+        let y = self.pitch_to_y(note.pitch) + row_h * 0.5;
+        (x, y, size)
     }
 
     pub(super) fn marquee_hits(
@@ -501,6 +516,7 @@ impl Render for PianoRoll {
             }));
         }
 
+        self.refresh_drum_rows(cx);
         let clip_id = self.editing_clip_id(cx);
         if clip_id != self.last_editing_clip && !matches!(self.drag, PianoDrag::None) {
             self.cancel_active_gesture(cx);
@@ -1114,6 +1130,49 @@ impl PianoRoll {
                 cx,
             ));
 
+        // ── Editor mode: the keyboard or the drum lanes ──
+        let drum_mode = self.drum_mode;
+        let mut editor_mode = tool_strip()
+            .child(tool_segment(
+                "pr-mode-piano",
+                assets::ICON_KEYBOARD_PATH,
+                "Piano editor".into(),
+                !drum_mode,
+                cx.listener(|this, _, _w, cx| {
+                    this.cancel_active_gesture(cx);
+                    this.set_drum_mode(false, cx);
+                }),
+            ))
+            .child(tool_segment(
+                "pr-mode-drum",
+                assets::ICON_DRUM_PATH,
+                "Drum editor: lanes by sound, one hit per step".into(),
+                drum_mode,
+                cx.listener(|this, _, _w, cx| {
+                    this.cancel_active_gesture(cx);
+                    this.set_drum_mode(true, cx);
+                }),
+            ));
+        if drum_mode {
+            // Which lanes: the whole kit, or only what the clip plays.
+            let lanes = self.drum_lanes;
+            editor_mode = editor_mode
+                .child(tool_segment(
+                    "pr-drum-kit",
+                    assets::ICON_LIST_MUSIC_PATH,
+                    "Show the whole General MIDI kit".into(),
+                    lanes == DrumLanes::Kit,
+                    cx.listener(|this, _, _w, cx| this.set_drum_lanes(DrumLanes::Kit, cx)),
+                ))
+                .child(tool_segment(
+                    "pr-drum-used",
+                    assets::ICON_MUSIC_PATH,
+                    "Show only the sounds this clip plays".into(),
+                    lanes == DrumLanes::Used,
+                    cx.listener(|this, _, _w, cx| this.set_drum_lanes(DrumLanes::Used, cx)),
+                ));
+        }
+
         // ── Grid ──
         let grid_rows = GridRes::ALL
             .iter()
@@ -1463,6 +1522,8 @@ impl PianoRoll {
             .bg(Colors::surface_panel())
             .child(tools)
             .child(bar_divider())
+            .child(editor_mode)
+            .child(bar_divider())
             .child(bar_icon_button(
                 "pr-snap",
                 assets::ICON_MAGNET_PATH,
@@ -1475,10 +1536,14 @@ impl PianoRoll {
             ))
             .child(grid_menu)
             .child(bar_divider())
-            .child(scale_menu)
-            .child(lock)
-            .child(chord_menu)
-            .child(bar_divider())
+            // Scale lock and chord insert act on pitch; drum lanes are sounds,
+            // and drum mode ignores both, so they are not offered there.
+            .when(!drum_mode, |row| {
+                row.child(scale_menu)
+                    .child(lock)
+                    .child(chord_menu)
+                    .child(bar_divider())
+            })
             .child(channel_menu)
             .child(bar_divider())
             .child(quantize)
@@ -1933,7 +1998,7 @@ impl PianoRoll {
             // Left: piano keys.
             .child(
                 div()
-                    .w(px(key_lane_width()))
+                    .w(px(self.key_column_w()))
                     .flex_shrink_0()
                     .h_full()
                     .flex()
@@ -2059,11 +2124,126 @@ impl PianoRoll {
     /// key's row, black keys cover [`BLACK_KEY_SHARE`] of the lane in their
     /// own row. Every key edge is a grid row edge, so a key and its row can
     /// never disagree. One canvas for the keys; only the names are elements.
+    /// The drum lanes inside a view `view_h` tall, by index from the top.
+    pub(super) fn visible_drum_rows(&self, view_h: f32) -> std::ops::Range<usize> {
+        let row_h = self.note_row_h().max(0.0001);
+        let count = self.drum_rows.len();
+        let first = ((self.scroll_y / row_h).floor().max(0.0) as usize).min(count);
+        let last = (((self.scroll_y + view_h) / row_h).ceil().max(0.0) as usize + 1).min(count);
+        first..last.max(first)
+    }
+
+    /// The drum editor's lane list in place of the keyboard: each lane's
+    /// name, and its note quieter beside it. A press auditions the lane.
+    fn build_drum_lane(&self) -> Vec<gpui::AnyElement> {
+        use crate::theme::{space, typography};
+        let row_h = self.note_row_h();
+        let (_, view_h) = self.grid_view_size();
+        let pressed = self.key_lane_pressed_pitch;
+        let band = Colors::with_alpha(Colors::surface_base(), 0.35);
+        let press = Colors::with_alpha(Colors::accent_primary(), 0.32);
+        let seam = Colors::with_alpha(Colors::text_primary(), 0.06);
+
+        let mut fills: Vec<(f32, Option<gpui::Rgba>)> = Vec::new();
+        let mut labels: Vec<gpui::AnyElement> = Vec::new();
+        for index in self.visible_drum_rows(view_h) {
+            let pitch = self.drum_rows[index];
+            let y = index as f32 * row_h - self.scroll_y;
+            let is_pressed = pressed == Some(pitch);
+            let fill = if is_pressed {
+                Some(press)
+            } else if index % 2 == 1 {
+                Some(band)
+            } else {
+                None
+            };
+            fills.push((y, fill));
+            if row_h < 10.0 {
+                continue;
+            }
+            labels.push(
+                div()
+                    .absolute()
+                    .left(px(space::SNUG))
+                    .right(px(space::SNUG))
+                    .top(px(y))
+                    .h(px(row_h))
+                    .flex()
+                    .items_center()
+                    .gap(px(space::TIGHT))
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_size(px(typography::DENSE_LABEL))
+                            .text_color(if is_pressed {
+                                Colors::text_primary()
+                            } else {
+                                Colors::text_secondary()
+                            })
+                            .child(self.drum_lane_name(pitch)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(typography::DENSE_CAPTION))
+                            .text_color(Colors::text_faint())
+                            .child(note_name(pitch as i32)),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        let rows = canvas(
+            |_bounds, _window, _cx| (),
+            move |bounds: gpui::Bounds<gpui::Pixels>, (), window, _cx| {
+                let ox: f32 = bounds.origin.x.into();
+                let oy: f32 = bounds.origin.y.into();
+                let w: f32 = bounds.size.width.into();
+                window.paint_layer(bounds, |window| {
+                    for (top, fill) in &fills {
+                        if let Some(fill) = fill {
+                            window.paint_quad(gpui::fill(
+                                gpui::Bounds {
+                                    origin: gpui::point(px(ox), px(oy + top)),
+                                    size: gpui::size(px(w), px(row_h)),
+                                },
+                                *fill,
+                            ));
+                        }
+                        window.paint_quad(gpui::fill(
+                            gpui::Bounds {
+                                origin: gpui::point(px(ox), px(oy + top + row_h - 1.0)),
+                                size: gpui::size(px(w), px(1.0)),
+                            },
+                            seam,
+                        ));
+                    }
+                });
+            },
+        )
+        .absolute()
+        .inset_0()
+        .into_any_element();
+
+        let mut out = Vec::with_capacity(labels.len() + 1);
+        out.push(rows);
+        out.extend(labels);
+        out
+    }
+
     pub(super) fn build_key_lane(
         &self,
         first_pitch: i32,
         last_pitch: i32,
     ) -> Vec<gpui::AnyElement> {
+        if self.drum_mode {
+            return self.build_drum_lane();
+        }
         use crate::theme::typography;
         let row_h = self.note_row_h();
         let half = row_h * 0.5;
@@ -2966,7 +3146,26 @@ impl PianoRoll {
         let c_row = Colors::with_alpha(Colors::text_primary(), 0.03);
         let mut rows = Vec::new();
         let mut row_lines = Vec::new();
-        for p in first_pitch..=last_pitch {
+        if self.drum_mode {
+            // Lanes alternate so a hit reads along its row across the bar; a
+            // hairline under each. No key colours or scale: lanes are sounds.
+            let band = Colors::with_alpha(Colors::surface_base(), 0.35);
+            let line = Colors::with_alpha(Colors::text_primary(), 0.06);
+            let (_, view_h) = self.grid_view_size();
+            for index in self.visible_drum_rows(view_h) {
+                let y = index as f32 * row_h - self.scroll_y;
+                if index % 2 == 1 {
+                    rows.push((y, y + row_h, band));
+                }
+                row_lines.push((y + row_h, line));
+            }
+        }
+        let pitch_range = if self.drum_mode {
+            1..=0
+        } else {
+            first_pitch..=last_pitch
+        };
+        for p in pitch_range {
             let pitch = p as u8;
             let y = self.pitch_to_y(pitch);
             let in_scale = !scale_active || scale.contains_pitch(pitch);
@@ -3288,6 +3487,139 @@ impl PianoRoll {
         )
     }
 
+    /// One drum hit: a diamond centred on its start in its lane, filled by
+    /// velocity like a note, with the same selection, erase and mute states.
+    /// No length, label or resize edge — a hit is a moment.
+    fn drum_hit_element(
+        cx: &mut Context<Self>,
+        hit: DrumHit,
+        track_color: gpui::Rgba,
+    ) -> gpui::AnyElement {
+        let DrumHit {
+            id,
+            pitch,
+            start,
+            x,
+            y,
+            row_h,
+            velocity,
+            selected,
+            erase_target,
+            muted,
+            name,
+        } = hit;
+        let mut fill = track_color;
+        fill.a = if erase_target {
+            0.45
+        } else if muted {
+            0.14
+        } else if selected {
+            1.0
+        } else {
+            0.42 + 0.5 * (velocity as f32 / 127.0)
+        };
+        let border = if erase_target {
+            Colors::status_error()
+        } else if selected {
+            Colors::accent_primary()
+        } else if muted {
+            Colors::with_alpha(Colors::text_muted(), 0.6)
+        } else {
+            Colors::composite(
+                track_color,
+                Colors::with_alpha(Colors::surface_canvas(), 0.45),
+            )
+        };
+        let border_w = if selected { 1.5 } else { 1.0 };
+        let size = (row_h - 4.0).clamp(6.0, 18.0);
+        let left = x - size * 0.5;
+        let top = y + (row_h - size) * 0.5;
+        div()
+            .id(("pr-note", id as usize))
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .w(px(size))
+            .h(px(size))
+            .cursor(gpui::CursorStyle::PointingHand)
+            .child(
+                canvas(
+                    |_bounds, _window, _cx| (),
+                    move |bounds: gpui::Bounds<gpui::Pixels>, (), window, _cx| {
+                        let ox: f32 = bounds.origin.x.into();
+                        let oy: f32 = bounds.origin.y.into();
+                        let s: f32 = bounds.size.width.into();
+                        let half = s * 0.5;
+                        let diamond = |inset: f32| {
+                            [
+                                point(px(ox + half), px(oy + inset)),
+                                point(px(ox + s - inset), px(oy + half)),
+                                point(px(ox + half), px(oy + s - inset)),
+                                point(px(ox + inset), px(oy + half)),
+                            ]
+                        };
+                        // The edge first, the fill inset by its width over it.
+                        let mut edge = PathBuilder::fill();
+                        let outer = diamond(0.0);
+                        edge.move_to(outer[0]);
+                        for corner in &outer[1..] {
+                            edge.line_to(*corner);
+                        }
+                        edge.close();
+                        if let Ok(path) = edge.build() {
+                            window.paint_path(path, border);
+                        }
+                        let mut body = PathBuilder::fill();
+                        let inner = diamond(border_w * std::f32::consts::SQRT_2);
+                        body.move_to(inner[0]);
+                        for corner in &inner[1..] {
+                            body.line_to(*corner);
+                        }
+                        body.close();
+                        if let Ok(path) = body.build() {
+                            // Over the canvas, so a quiet hit still reads hollow
+                            // rather than taking the edge's colour through it.
+                            window.paint_path(
+                                path,
+                                Colors::composite(Colors::surface_canvas(), fill),
+                            );
+                        }
+                    },
+                )
+                .absolute()
+                .inset_0(),
+            )
+            .on_hover(cx.listener(move |this, hovered: &bool, _w, cx| {
+                this.hover_note_status = hovered.then(|| {
+                    format!(
+                        "{} ({}) · at {:.2} · vel {}{}",
+                        name,
+                        note_name(pitch as i32),
+                        start,
+                        velocity,
+                        if muted { " · muted" } else { "" }
+                    )
+                });
+                cx.notify();
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.note_mouse_down(id, ev, window, cx);
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    let (lx, ly) = this.grid_local(ev.position).unwrap_or((0.0, 0.0));
+                    this.note_right_down(id, lx, ly, window, cx);
+                }),
+            )
+            .into_any_element()
+    }
+
     pub(super) fn build_note_elements(
         &mut self,
         cx: &mut Context<Self>,
@@ -3366,6 +3698,16 @@ impl PianoRoll {
                 .collect()
         };
 
+        let drum = self.drum_mode;
+        let drum_names: HashMap<u8, SharedString> = if drum {
+            self.drum_rows
+                .iter()
+                .map(|pitch| (*pitch, self.drum_lane_name(*pitch)))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
         geos.into_iter()
             .map(
                 |(
@@ -3383,6 +3725,26 @@ impl PianoRoll {
                     articulation,
                     inline_pitch,
                 )| {
+                    if drum {
+                        let name = drum_names.get(&pitch).cloned().unwrap_or_default();
+                        return Self::drum_hit_element(
+                            cx,
+                            DrumHit {
+                                id,
+                                pitch,
+                                start,
+                                x,
+                                y,
+                                row_h,
+                                velocity,
+                                selected,
+                                erase_target,
+                                muted,
+                                name,
+                            },
+                            track_color,
+                        );
+                    }
                     // Velocity is the fill's strength: a quiet note reads
                     // quiet before its bar in the lane is found. Selection is
                     // said twice — full strength and the accent edge — and
@@ -3677,4 +4039,19 @@ impl PianoRoll {
             })
             .collect()
     }
+}
+
+/// What [PianoRoll::drum_hit_element] draws one hit from.
+struct DrumHit {
+    id: u64,
+    pitch: u8,
+    start: f32,
+    x: f32,
+    y: f32,
+    row_h: f32,
+    velocity: u8,
+    selected: bool,
+    erase_target: bool,
+    muted: bool,
+    name: SharedString,
 }

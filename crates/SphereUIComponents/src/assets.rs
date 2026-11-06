@@ -170,6 +170,8 @@ pub const ICON_HARD_DRIVE_PATH: &str = "icons/hard-drive.svg";
 pub const ICON_MUSIC_PATH: &str = "icons/music.svg";
 pub const ICON_KEYBOARD_PATH: &str = "icons/keyboard-music.svg";
 pub const ICON_LAYERS_PATH: &str = "icons/layers.svg";
+/// The MIDI editor's drum mode switch. Futureboard's own glyph.
+pub const ICON_DRUM_PATH: &str = "icons/drum.svg";
 pub const ICON_PALETTE_PATH: &str = "icons/palette.svg";
 pub const ICON_MOVE_HORIZONTAL_PATH: &str = "icons/move-horizontal.svg";
 pub const ICON_TYPE_PATH: &str = "icons/type.svg";
@@ -216,7 +218,7 @@ pub const ICON_REPAIR_DRUM_SILENCER_PATH: &str = "icons/audio_repair/drum_silenc
 /// routing — replacing the general-purpose Lucide / Tabler glyphs that stood
 /// in for them. Keyed by the same virtual paths, so every call site picks
 /// them up unchanged. See `packages/shared/icons/futureboard/README.md`.
-pub const FUTUREBOARD_ICONS: [(&str, &str); 32] = [
+pub const FUTUREBOARD_ICONS: [(&str, &str); 33] = [
     (
         ICON_PLAY_PATH,
         include_str!("../../../packages/shared/icons/futureboard/play.svg"),
@@ -344,6 +346,10 @@ pub const FUTUREBOARD_ICONS: [(&str, &str); 32] = [
     (
         ICON_LAYERS_PATH,
         include_str!("../../../packages/shared/icons/futureboard/stack.svg"),
+    ),
+    (
+        ICON_DRUM_PATH,
+        include_str!("../../../packages/shared/icons/futureboard/drum.svg"),
     ),
 ];
 
