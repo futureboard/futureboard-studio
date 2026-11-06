@@ -51,6 +51,18 @@ impl StudioLayout {
     ) {
         self.session_install_detail = detail.into();
         self.session_install_progress = progress;
+        // The same steps in Background Tasks, where they stay readable once
+        // the loading dialog has gone.
+        let job = self.session_install_job.get_or_insert_with(|| {
+            crate::components::background_tasks::BackgroundJob::start(
+                crate::components::BackgroundTaskKind::ProjectLoad,
+                "Open project",
+            )
+        });
+        job.set_detail(self.session_install_detail.clone());
+        if let ProgressBarValue::Value(value) = progress {
+            job.set_progress((value.clamp(0.0, 1.0) * 1000.0) as u32, 1000);
+        }
         cx.notify();
     }
 
@@ -445,6 +457,20 @@ impl StudioLayout {
         };
         self.session_install_detail.clear();
         self.session_install_progress = ProgressBarValue::value(1.0);
+        if let Some(job) = self.session_install_job.take() {
+            let mut outcome = format!(
+                "{} plug-in{} restored",
+                report.restored,
+                if report.restored == 1 { "" } else { "s" }
+            );
+            if report.failed > 0 {
+                outcome.push_str(&format!(", {} failed", report.failed));
+            }
+            if report.skipped > 0 {
+                outcome.push_str(&format!(", {} skipped", report.skipped));
+            }
+            job.complete(Some(outcome));
+        }
 
         session_log!(
             "install complete plugins restored={} failed={} warnings={}",

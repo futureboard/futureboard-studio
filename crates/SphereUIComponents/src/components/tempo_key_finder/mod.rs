@@ -294,11 +294,22 @@ impl TempoKeyFinderWindow {
             Scope::ClipRange => Some((self.target.source_start, self.target.source_end)),
             Scope::WholeFile => None,
         };
+        let job = crate::components::background_tasks::BackgroundJob::start(
+            crate::components::BackgroundTaskKind::Analysis,
+            "Find tempo and key",
+        );
+        if let Some(name) = std::path::Path::new(&path).file_name() {
+            job.set_detail(name.to_string_lossy());
+        }
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move { run_analysis(&path, range) })
                 .await;
+            match &result {
+                Ok(_) => job.complete(None),
+                Err(error) => job.fail(error.to_string()),
+            }
             let _ = this.update(cx, |this, cx| {
                 // A newer request superseded this one; its result is stale.
                 if this.generation != generation {

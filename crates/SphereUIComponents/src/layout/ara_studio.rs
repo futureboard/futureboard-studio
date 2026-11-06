@@ -803,7 +803,10 @@ impl StudioLayout {
         // after sees them, and judges them as this periodic poll's rather than
         // as the answer to a later host edit.
         self.ara.notify_model_updates();
-        if self.ara.poll_documents(std::time::Instant::now()) {
+        self.sync_ara_editor_selection(cx);
+        let polled = self.ara.poll_documents(std::time::Instant::now());
+        self.sync_ara_analysis_job();
+        if polled {
             // The plug-in changed its own persistent state, so the project has
             // unsaved work even though nothing in the timeline moved. It is
             // saved with the project, not played by the engine: the same
@@ -813,6 +816,93 @@ impl StudioLayout {
             self.mark_dirty_view_only();
             cx.notify();
         }
+    }
+
+    /// Lists an ARA plug-in's analysis in Background Tasks while it runs: a
+    /// Melodyne reading a take can take a while, and nothing else in Studio
+    /// says it is working. One entry for however many sources are running.
+    fn sync_ara_analysis_job(&mut self) {
+        use crate::components::background_tasks::BackgroundJob;
+        let running = self.ara.analysing_source_count();
+        if running == 0 {
+            if let Some(job) = self.ara_analysis_job.take() {
+                job.complete(None);
+            }
+            self.ara_analysis_shown = 0;
+            return;
+        }
+        let shown = self.ara_analysis_shown;
+        let job = self.ara_analysis_job.get_or_insert_with(|| {
+            BackgroundJob::start(
+                crate::components::BackgroundTaskKind::Analysis,
+                "ARA analysis",
+            )
+        });
+        if shown != running {
+            job.set_detail(format!(
+                "{running} audio source{} being analysed",
+                if running == 1 { "" } else { "s" }
+            ));
+        }
+        self.ara_analysis_shown = running;
+    }
+
+    /// Makes the ARA editor work on what is selected in Studio.
+    ///
+    /// The editor shows every track of the document; which of them is active
+    /// follows the arrangement: a selected audio clip selects its region (and
+    /// its track), and a selected track with no clip selected makes that
+    /// track active, with its clips. Run every frame, it sends only a change,
+    /// so the plug-in follows clicks as they happen rather than at the next
+    /// rebuild.
+    fn sync_ara_editor_selection(&mut self, cx: &mut Context<Self>) {
+        use crate::components::timeline::timeline_state::ClipType;
+        use sphere_ara_host::AraTrackKey;
+        let Some(key) = self.selected_ara_session_key(cx) else {
+            return;
+        };
+        let (clips, tracks) = {
+            let state = &self.timeline.read(cx).state;
+            let members = Self::ara_members_in(state, &key.plugin_id);
+            let mut clips: Vec<AraClipKey> = Vec::new();
+            let mut tracks: Vec<AraTrackKey> = Vec::new();
+            for clip_id in &state.selection.selected_clip_ids {
+                let Some((track, clip)) = state.find_clip(clip_id) else {
+                    continue;
+                };
+                if !members.contains(&track.id) || !matches!(clip.clip_type, ClipType::Audio { .. })
+                {
+                    continue;
+                }
+                clips.push(AraClipKey::from(clip_id.as_str()));
+                let track = AraTrackKey(track.id.clone());
+                if !tracks.contains(&track) {
+                    tracks.push(track);
+                }
+            }
+            if tracks.is_empty() {
+                if let Some(track) = state
+                    .selection
+                    .selected_track_id
+                    .as_deref()
+                    .filter(|id| members.iter().any(|member| member == id))
+                    .and_then(|id| state.tracks.iter().find(|track| track.id == id))
+                {
+                    clips = track
+                        .clips
+                        .iter()
+                        .filter(|clip| matches!(clip.clip_type, ClipType::Audio { .. }))
+                        .map(|clip| AraClipKey::from(clip.id.as_str()))
+                        .collect();
+                    tracks.push(AraTrackKey(track.id.clone()));
+                }
+            }
+            (clips, tracks)
+        };
+        if tracks.is_empty() {
+            return;
+        }
+        self.ara.select_in_editor(&key, clips, tracks);
     }
 
     /// Publishes the project's musical context — tempo, meter and key — to

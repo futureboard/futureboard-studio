@@ -427,6 +427,11 @@ impl AudioToolWindow {
         self.session.analyzing = true;
         self.status = "Analyzing…".to_string();
         let host = cx.entity().downgrade();
+        let job = crate::components::background_tasks::BackgroundJob::start(
+            crate::components::BackgroundTaskKind::Analysis,
+            format!("{}: read audio", kind.label()),
+        );
+        job.set_detail(self.session.target.clip_name.clone());
         cx.spawn(async move |_, cx| {
             let result = cx
                 .background_executor()
@@ -442,6 +447,10 @@ impl AudioToolWindow {
                     Ok::<_, String>((samples, mono, channels, buffer.sample_rate))
                 })
                 .await;
+            match &result {
+                Ok(_) => job.complete(None),
+                Err(error) => job.fail(error.clone()),
+            }
             let _ = host.update(cx, |this, cx| {
                 this.session.analyzing = false;
                 match result {
@@ -1040,6 +1049,10 @@ impl AudioToolWindow {
         self.status = "Rendering…".to_string();
         let host = cx.entity().downgrade();
         let on_command = self.callbacks.on_command.clone();
+        let job = crate::components::background_tasks::BackgroundJob::start(
+            crate::components::BackgroundTaskKind::AudioProcess,
+            format!("{}: apply", tool_kind.label()),
+        );
         cx.spawn(async move |_, cx| {
             let result = cx
                 .background_executor()
@@ -1109,6 +1122,15 @@ impl AudioToolWindow {
                     })
                 })
                 .await;
+            match &result {
+                Ok(source) => job.complete(
+                    source
+                        .path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned()),
+                ),
+                Err(error) => job.fail(error.clone()),
+            }
             let _ = host.update(cx, |this, cx| {
                 this.rendering = false;
                 match result {

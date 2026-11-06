@@ -1873,6 +1873,10 @@ impl PluginManagerWindow {
             },
         };
 
+        let job = crate::components::background_tasks::BackgroundJob::start(
+            crate::components::BackgroundTaskKind::PluginLoad,
+            "Scan plug-ins",
+        );
         cx.spawn(async move |this, cx| {
             let (tx, rx) = std::sync::mpsc::channel::<ScanProgress>();
             let scan_options = options;
@@ -1881,9 +1885,25 @@ impl PluginManagerWindow {
                     let _ = tx.send(progress);
                 })
             });
+            let report = |job: &crate::components::background_tasks::BackgroundJob,
+                          progress: &ScanProgress| match progress {
+                ScanProgress::ScanningBundle {
+                    current,
+                    total,
+                    path,
+                } => {
+                    if let Some(name) = path.file_name() {
+                        job.set_detail(name.to_string_lossy());
+                    }
+                    job.set_progress(*current as u32, (*total).max(1) as u32);
+                }
+                ScanProgress::Registering { name, .. } => job.set_detail(name.clone()),
+                _ => {}
+            };
 
             loop {
                 while let Ok(progress) = rx.try_recv() {
+                    report(&job, &progress);
                     let _ = this.update(cx, |win, cx| {
                         let i18n = I18n::from_app(cx);
                         win.state.apply_scan_progress(&progress, i18n);
@@ -1908,6 +1928,15 @@ impl PluginManagerWindow {
 
             match handle.join() {
                 Ok(result) => {
+                    let mut outcome = format!(
+                        "{} plug-in{}",
+                        result.plugins.len(),
+                        if result.plugins.len() == 1 { "" } else { "s" }
+                    );
+                    if !result.failed.is_empty() {
+                        outcome.push_str(&format!(", {} failed", result.failed.len()));
+                    }
+                    job.complete(Some(outcome));
                     let _ = this.update(cx, |win, cx| {
                         let i18n = I18n::from_app(cx);
                         win.state.apply_scan_result(result, i18n);
@@ -1915,6 +1944,7 @@ impl PluginManagerWindow {
                     });
                 }
                 Err(_) => {
+                    job.fail("The scanner stopped unexpectedly");
                     let _ = this.update(cx, |win, cx| {
                         win.state.scanning = false;
                         win.state.status_text = I18n::from_app(cx).tr("plugin-manager.error.panic");

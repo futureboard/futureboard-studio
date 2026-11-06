@@ -369,6 +369,10 @@ impl VoxtunePanel {
         cx.notify();
 
         let panel = cx.entity().downgrade();
+        let bg_job = crate::components::background_tasks::BackgroundJob::start(
+            crate::components::BackgroundTaskKind::AudioProcess,
+            "Voxtune: render the tuned take",
+        );
         cx.spawn(async move |_, cx| {
             let job_target = target.clone();
             let result = cx
@@ -408,6 +412,15 @@ impl VoxtunePanel {
                     })
                 })
                 .await;
+            match &result {
+                Ok(source) => bg_job.complete(
+                    source
+                        .path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned()),
+                ),
+                Err(error) => bg_job.fail(error.clone()),
+            }
             let _ = panel.update(cx, |this, cx| {
                 this.applying = false;
                 match result {

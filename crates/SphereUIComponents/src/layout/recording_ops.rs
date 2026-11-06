@@ -849,6 +849,13 @@ impl StudioLayout {
                 }
                 step("engine detach take");
                 self.recording.awaiting_finalize = true;
+                // The writer closing the take's files is a job of its own:
+                // short for a take, long for an hour of many inputs.
+                self.recording_finalize_job =
+                    Some(crate::components::background_tasks::BackgroundJob::start(
+                        crate::components::BackgroundTaskKind::Recording,
+                        "Write recorded take",
+                    ));
             }
         } else if midi_results.is_empty() {
             self.recording.ui_state = RecordingUiState::Failed {
@@ -895,12 +902,23 @@ impl StudioLayout {
         let Some(engine) = self.audio_bridge.engine.clone() else {
             self.recording.awaiting_finalize = false;
             self.recording.start_after_finalize = false;
+            self.recording_finalize_job = None;
             return;
         };
         let Some(outcome) = engine.poll_stop_recording() else {
             return;
         };
         self.recording.awaiting_finalize = false;
+        if let Some(job) = self.recording_finalize_job.take() {
+            match &outcome {
+                Ok(results) => job.complete(Some(format!(
+                    "{} file{}",
+                    results.len(),
+                    if results.len() == 1 { "" } else { "s" }
+                ))),
+                Err(error) => job.fail(error.to_string()),
+            }
+        }
 
         match outcome {
             Ok(results) => {

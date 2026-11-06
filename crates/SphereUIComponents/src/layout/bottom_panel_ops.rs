@@ -360,6 +360,7 @@ impl StudioLayout {
     pub(crate) fn notify_status_bar_if_changed(&mut self, cx: &mut Context<Self>) {
         const STATUS_COALESCE: Duration = Duration::from_millis(250);
         crate::perf::count("bottom_panel_timer_tick_count", 1);
+        self.sync_background_tasks(cx);
 
         let show_perf = self
             .settings
@@ -422,6 +423,38 @@ impl StudioLayout {
     ) {
         self.background_tasks.cancel(task_id);
         self.notify_status_bar(cx);
+    }
+
+    pub(crate) fn dismiss_status_bar_background_task(
+        &mut self,
+        task_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.background_tasks.dismiss(task_id);
+        self.notify_status_bar(cx);
+    }
+
+    pub(crate) fn clear_finished_background_tasks(&mut self, cx: &mut Context<Self>) {
+        self.background_tasks.clear_finished();
+        self.notify_status_bar(cx);
+    }
+
+    /// Bring the Background Tasks list up to date: what jobs posted from
+    /// other threads, and — while the popup shows a running job — its
+    /// elapsed time, once a second. Repaints the status bar only on a change.
+    fn sync_background_tasks(&mut self, cx: &mut Context<Self>) {
+        self.background_tasks.drain_job_inbox();
+        let clock = if self.background_tasks.panel_open && self.background_tasks.running_count() > 0
+        {
+            crate::components::background_tasks::now_ms() / 1000
+        } else {
+            0
+        };
+        let key = (self.background_tasks.revision, clock);
+        if key != self.engine_sync.last_background_tasks_key {
+            self.engine_sync.last_background_tasks_key = key;
+            self.notify_status_bar(cx);
+        }
     }
 
     pub(crate) fn toggle_status_bar_perf_popover(&mut self, cx: &mut Context<Self>) {

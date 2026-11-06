@@ -123,6 +123,9 @@ pub(crate) struct EngineSyncState {
     pub last_status_sig: u64,
     /// Left+audio footer signature for perf-only coalescing.
     pub last_status_left_audio_sig: u64,
+    /// Background Tasks list revision and the second it was drawn at, so the
+    /// status bar repaints for the list only when it moved.
+    pub last_background_tasks_key: (u64, u64),
     /// Last time footer text was pushed to the status entity.
     pub last_status_poll_at: Instant,
     /// Last time `engine.set_bpm` was sent during a live BPM drag (~30 Hz cap).
@@ -153,6 +156,7 @@ impl Default for EngineSyncState {
             last_meter_notify_sig: u64::MAX,
             last_status_sig: u64::MAX,
             last_status_left_audio_sig: u64::MAX,
+            last_background_tasks_key: (u64::MAX, 0),
             last_status_poll_at: Instant::now() - Duration::from_secs(1),
             bpm_committed_at: None,
             bridge_reconciled_at: Instant::now() - Duration::from_secs(1),

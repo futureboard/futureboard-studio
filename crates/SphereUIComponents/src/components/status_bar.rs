@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
+use crate::components::background_tasks::BackgroundTaskActions;
 use crate::components::title_bar::{status_item, STATUSBAR_HEIGHT};
 use crate::components::{
-    background_task_button, background_task_panel, BackgroundTaskCancelCb, BackgroundTaskStore,
-    BackgroundTaskToggleCb,
+    background_task_button, background_task_panel, BackgroundTaskStore, BackgroundTaskToggleCb,
 };
 use crate::theme::Colors;
 use gpui::prelude::FluentBuilder;
@@ -58,7 +58,7 @@ pub fn status_bar_with_background_tasks(
     content: StatusBarContent,
     tasks: &BackgroundTaskStore,
     on_toggle_tasks: BackgroundTaskToggleCb,
-    on_cancel_task: BackgroundTaskCancelCb,
+    task_actions: BackgroundTaskActions,
     perf_popover_open: bool,
     on_toggle_perf_popover: Option<PerfMetricsToggleCb>,
     on_open_listening: Option<ListeningOpenCb>,
@@ -67,7 +67,7 @@ pub fn status_bar_with_background_tasks(
         content,
         Some(tasks),
         Some(on_toggle_tasks),
-        Some(on_cancel_task),
+        Some(task_actions),
         on_toggle_perf_popover,
         perf_popover_open,
         on_open_listening,
@@ -78,7 +78,7 @@ fn status_bar_inner(
     content: StatusBarContent,
     tasks: Option<&BackgroundTaskStore>,
     on_toggle_tasks: Option<BackgroundTaskToggleCb>,
-    on_cancel_task: Option<BackgroundTaskCancelCb>,
+    task_actions: Option<BackgroundTaskActions>,
     on_toggle_perf_popover: Option<PerfMetricsToggleCb>,
     perf_popover_open: bool,
     on_open_listening: Option<ListeningOpenCb>,
@@ -93,9 +93,9 @@ fn status_bar_inner(
         }
         _ => None,
     };
-    let task_panel = match (tasks, on_toggle_tasks, on_cancel_task) {
-        (Some(tasks), Some(on_close), Some(on_cancel)) if tasks.panel_open => {
-            Some(background_task_panel(tasks, on_close, on_cancel).into_any_element())
+    let task_panel = match (tasks, task_actions) {
+        (Some(tasks), Some(actions)) if tasks.panel_open => {
+            Some(background_task_panel(tasks, actions).into_any_element())
         }
         _ => None,
     };

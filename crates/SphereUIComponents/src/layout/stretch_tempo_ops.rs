@@ -353,11 +353,22 @@ impl StudioLayout {
         cx.notify();
 
         let clip_id = clip_id.to_string();
+        let job = crate::components::background_tasks::BackgroundJob::start(
+            crate::components::BackgroundTaskKind::AudioProcess,
+            "Find tempo",
+        );
+        if let Some(name) = Path::new(&path).file_name() {
+            job.set_detail(name.to_string_lossy());
+        }
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move { analyze_clip_tempo(&path, &stretch, project_bpm) })
                 .await;
+            match &result {
+                Ok(success) => job.complete(Some(format!("{:.2} BPM", success.detection.bpm))),
+                Err(error) => job.fail(error.to_string()),
+            }
 
             let _ = this.update(cx, move |this, cx| {
                 if this.timeline.read(cx).state.find_clip(&clip_id).is_none() {

@@ -314,14 +314,32 @@ impl StudioLayout {
         let progress = open_progress_dialog_window(owner_bounds, dialog, None, cx).ok();
 
         let owner = cx.entity().clone();
+        let job = crate::components::background_tasks::BackgroundJob::start(
+            crate::components::BackgroundTaskKind::SampleRateConversion,
+            format!("Re-open project at {new_rate} Hz"),
+        );
+        job.set_detail("Restarting the audio engine and plug-ins");
         cx.spawn(async move |_this, cx| {
             // Let the loading dialog paint before the (brief, blocking) reopen.
             cx.background_executor()
                 .timer(Duration::from_millis(80))
                 .await;
-            let _ = owner.update(cx, |this, cx| {
+            let active = owner.update(cx, |this, cx| {
                 this.reopen_audio_with_sample_rate(new_rate, cx);
+                this.audio_bridge
+                    .stats
+                    .as_ref()
+                    .map(|stats| stats.sample_rate)
             });
+            match active {
+                Some(rate) if rate == new_rate => {
+                    job.complete(Some(format!("Running at {rate} Hz")))
+                }
+                Some(rate) => job.fail(format!(
+                    "The device runs at {rate} Hz, not the {new_rate} Hz asked for"
+                )),
+                None => job.fail("The audio engine did not come back"),
+            }
             if let Some(handle) = progress {
                 let _ = handle.update(cx, |_view, window, _cx| window.remove_window());
             }

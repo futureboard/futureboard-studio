@@ -605,12 +605,32 @@ pub async fn run_import_pipeline(
     cx: &mut AsyncApp,
 ) {
     let mut key = asset_key;
+    // Every import is listed in Background Tasks, from the copy to the last
+    // peak: a long file can take a while, and the clip alone does not say why.
+    let file_label = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| key.clone());
+    let job = crate::components::background_tasks::BackgroundJob::start(
+        if matches!(clips, ImportClips::Saved) {
+            crate::components::BackgroundTaskKind::Waveform
+        } else {
+            crate::components::BackgroundTaskKind::Import
+        },
+        if matches!(clips, ImportClips::Saved) {
+            format!("Build waveform: {file_label}")
+        } else {
+            format!("Import {file_label}")
+        },
+    );
+    job.set_detail("Copying into the project");
     // Phase D: copy the dropped file into the project folder before importing,
     // and decode the copy. Only clips this import created take the copy's id.
     let (path, copied_key) =
         maybe_copy_into_project(&key, path, project_root.clone(), &clips, &timeline, cx).await;
     key = copied_key;
     if !waveform_cache::try_begin_import(&key) {
+        job.complete(Some("Already in the project".to_string()));
         // Already imported, or an import is still in flight for this source path.
         //
         // Repeated drag of the same file lands here: a fresh clip referencing
@@ -631,6 +651,7 @@ pub async fn run_import_pipeline(
     let layout_weak = layout.clone();
 
     // ── Probe metadata ───────────────────────────────────────────────
+    job.set_detail("Reading the file");
     waveform_cache::set_import_state(&key, AudioImportState::Probing);
     throttled_timeline_notify(&timeline_probe, cx, true);
 
@@ -694,6 +715,7 @@ pub async fn run_import_pipeline(
                 key, error
             );
             waveform_cache::install_failed(&key, error.to_string());
+            job.fail(format!("Could not read the file: {error}"));
             let path_key = key.clone();
             let _ = timeline_probe.update(cx, move |timeline, cx| {
                 timeline.state.set_audio_import_for_asset(
@@ -711,6 +733,7 @@ pub async fn run_import_pipeline(
 
     // ── Peak generation (streaming for WAV, off UI thread) ─────────────
     eprintln!("[audio-import] peak cache started path={key}");
+    job.set_detail("Building the waveform");
     waveform_cache::set_import_state(&key, AudioImportState::GeneratingPeaks { progress: 0.0 });
     throttled_timeline_notify(&timeline_peaks, cx, true);
 
@@ -731,6 +754,7 @@ pub async fn run_import_pipeline(
 
     match result {
         Ok(preview) => {
+            job.complete(None);
             install_preview_chunks_progressive(&path_key, preview, &timeline_peaks, cx);
             let _ = timeline_peaks.update(cx, move |timeline, cx| {
                 timeline
@@ -742,6 +766,7 @@ pub async fn run_import_pipeline(
         }
         Err(message) => {
             eprintln!("[audio-import] peak cache failed path={path_key} error={message}");
+            job.fail(message.clone());
             waveform_cache::install_failed(&path_key, message.clone());
             let _ = timeline_peaks.update(cx, move |timeline, cx| {
                 timeline.state.set_audio_import_for_asset(

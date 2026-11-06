@@ -937,6 +937,12 @@ impl StudioLayout {
         if self.midi_editor.window.is_some() {
             self.close_midi_editor_window(cx);
         }
+        // A project still opening is stopped with the session.
+        self.session_install_job = None;
+        // The session's windows go with it; the keyboard plays into this one.
+        if self.external_windows.virtual_keyboard.is_some() {
+            self.toggle_virtual_keyboard_window(cx);
+        }
     }
 
     /// Capture plugin/host state needed to shut down the session off the UI thread.

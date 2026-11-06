@@ -2174,6 +2174,18 @@ impl AraState {
     /// Also settles analyses a plug-in reported started and, by its own
     /// account, has finished (see [`finished_analyses`]), so that one it never
     /// completes cannot keep the document from ever settling.
+    /// How many audio sources a plug-in is analysing right now, across every
+    /// document: what Background Tasks lists while it runs.
+    pub fn analysing_source_count(&self) -> usize {
+        self.sessions
+            .values()
+            .map(|session| {
+                let running = session.signals.running();
+                running.sources.len() + running.unknown as usize
+            })
+            .sum()
+    }
+
     pub fn poll_documents(&mut self, now: Instant) -> bool {
         let mut changed = false;
         for (key, session) in self.sessions.iter_mut() {

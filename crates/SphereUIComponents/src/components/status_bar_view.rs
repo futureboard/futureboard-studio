@@ -64,6 +64,24 @@ impl Render for StatusBarView {
                 layout.cancel_status_bar_background_task(&task_id, cx);
             });
         });
+        let owner_dismiss = self.owner.clone();
+        let on_dismiss_task: BackgroundTaskCancelCb = Arc::new(move |task_id, _w, cx| {
+            let _ = owner_dismiss.update(cx, |layout, cx| {
+                layout.dismiss_status_bar_background_task(&task_id, cx);
+            });
+        });
+        let owner_clear = self.owner.clone();
+        let on_clear_finished: BackgroundTaskToggleCb = Arc::new(move |_, _w, cx| {
+            let _ = owner_clear.update(cx, |layout, cx| {
+                layout.clear_finished_background_tasks(cx);
+            });
+        });
+        let task_actions = crate::components::background_tasks::BackgroundTaskActions {
+            on_close: on_toggle_tasks.clone(),
+            on_cancel: on_cancel_task,
+            on_dismiss: on_dismiss_task,
+            on_clear_finished,
+        };
         let on_toggle_perf: Option<PerfMetricsToggleCb> = if show_perf {
             let owner = self.owner.clone();
             Some(Arc::new(move |_, _w, cx| {
@@ -87,7 +105,7 @@ impl Render for StatusBarView {
             self.cached.clone(),
             tasks,
             on_toggle_tasks,
-            on_cancel_task,
+            task_actions,
             perf_popover_open,
             on_toggle_perf,
             Some(on_open_listening),

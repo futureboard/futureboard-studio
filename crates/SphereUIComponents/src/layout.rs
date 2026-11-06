@@ -629,6 +629,16 @@ pub struct StudioLayout {
     ara_editor: Entity<components::AraEditorHost>,
     /// Set while that view lives in its own window instead of the dock.
     ara_editor_popped_out: bool,
+    /// The clip the bottom dock last followed a click onto (see
+    /// ollow_clip_selection_in_dock), so a re-notify of the same selection
+    /// never takes the dock off a tab the user chose since.
+    dock_followed_clip: Option<String>,
+    /// The running ARA analysis in Background Tasks (sync_ara_analysis_job),
+    /// and the source count it last showed.
+    ara_analysis_job: Option<crate::components::background_tasks::BackgroundJob>,
+    ara_analysis_shown: usize,
+    /// The take being written to disk after Stop, in Background Tasks.
+    recording_finalize_job: Option<crate::components::background_tasks::BackgroundJob>,
     /// An ARA editor window has been asked for and has not appeared yet.
     ///
     /// Opening one is deferred — the docked view has to let go of the plug-in's
@@ -784,6 +794,9 @@ pub struct StudioLayout {
     session_install_status: crate::app_state::SessionInstallStatus,
     /// In-window loading gate detail while [`session_install_status`] is Loading.
     session_install_detail: String,
+    /// The open project's entry in Background Tasks, from its first install
+    /// step to the last (set_session_install_progress).
+    session_install_job: Option<crate::components::background_tasks::BackgroundJob>,
     session_install_progress: crate::components::progress_dialog::ProgressBarValue,
     /// Non-fatal plugin restore warnings collected during session install.
     session_install_warnings: Vec<String>,
@@ -1534,6 +1547,10 @@ impl StudioLayout {
             ara: ara_ops::AraState::default(),
             ara_editor,
             ara_editor_popped_out: false,
+            dock_followed_clip: None,
+            ara_analysis_job: None,
+            ara_analysis_shown: 0,
+            recording_finalize_job: None,
             ara_editor_open_pending: false,
             panels: StudioPanelVisibility::default(),
             settings,
@@ -1588,6 +1605,7 @@ impl StudioLayout {
             last_window_title: None,
             session_install_status: crate::app_state::SessionInstallStatus::Ready,
             session_install_detail: String::new(),
+            session_install_job: None,
             session_install_progress:
                 crate::components::progress_dialog::ProgressBarValue::Indeterminate,
             session_install_warnings: Vec::new(),

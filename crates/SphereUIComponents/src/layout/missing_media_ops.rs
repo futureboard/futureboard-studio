@@ -604,10 +604,16 @@ impl StudioLayout {
                 layout.say_in_missing_media(format!("Searching {}…", root.display()), cx);
             });
             let search_root = root.clone();
+            let job = crate::components::background_tasks::BackgroundJob::start(
+                crate::components::BackgroundTaskKind::MediaSearch,
+                "Search for missing files",
+            );
+            job.set_detail(root.display().to_string());
             let found = cx
                 .background_executor()
                 .spawn(async move { find_by_name(&search_root, &names) })
                 .await;
+            job.complete(Some(format!("Found {} of {}", found.len(), wanted.len())));
             let _ = this.update(cx, |layout, cx| {
                 let mut relinked = 0;
                 for (row, name) in &wanted {

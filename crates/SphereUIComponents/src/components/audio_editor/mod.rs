@@ -1291,6 +1291,10 @@ impl AudioEditorHost {
 
         let host = cx.entity().downgrade();
         let old_path = path.clone();
+        let job = crate::components::background_tasks::BackgroundJob::start(
+            crate::components::BackgroundTaskKind::AudioProcess,
+            format!("Audio Editor: {label}"),
+        );
         cx.spawn(async move |_, cx| {
             let result = cx
                 .background_executor()
@@ -1348,6 +1352,10 @@ impl AudioEditorHost {
                     ))
                 })
                 .await;
+            match &result {
+                Ok(_) => job.complete(None),
+                Err(error) => job.fail(error.clone()),
+            }
             let _ = host.update(cx, |this, cx| {
                 this.finish_edit(clip_id, old_path, label, after, result, cx);
             });

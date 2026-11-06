@@ -21,6 +21,7 @@ use DirectAudio::{
 
 use super::engine_snapshot::build_engine_project_snapshot_for_export;
 use super::StudioLayout;
+use crate::components::background_tasks::{BackgroundJob, BackgroundTaskKind};
 use crate::components::progress_dialog::{
     open_progress_dialog_window, ProgressBarValue, ProgressDialogOptions, ProgressDialogWindow,
 };
@@ -458,6 +459,7 @@ impl StudioLayout {
         let cancel = ExportCancelToken::new();
         let shared = Arc::new(Mutex::new(BounceShared::default()));
         let names: Vec<&str> = targets.iter().map(|t| t.track_name.as_str()).collect();
+        let job_detail = names.join(", ");
         let options = ProgressDialogOptions::default()
             .title(kind.title())
             .heading(format!("{}…", kind.title()))
@@ -508,8 +510,15 @@ impl StudioLayout {
             return;
         }
 
+        // Listed in Background Tasks too: the dialog can be closed or hidden
+        // behind another window, the list is where the render still shows.
+        let job = BackgroundJob::start_cancellable(BackgroundTaskKind::Render, kind.title());
+        job.set_detail(job_detail);
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(POLL_INTERVAL).await;
+            if job.is_cancelled() {
+                cancel.cancel();
+            }
             let (progress, done) = match shared.lock() {
                 Ok(mut guard) => (guard.progress, guard.done.take()),
                 Err(_) => (
@@ -522,7 +531,18 @@ impl StudioLayout {
                     dialog.set_progress(ProgressBarValue::value(progress), cx);
                 });
             }
+            job.set_progress((progress.clamp(0.0, 1.0) * 1000.0) as u32, 1000);
             if let Some(result) = done {
+                match &result {
+                    Ok(results) => job.complete(Some(format!(
+                        "{} track{}",
+                        results.len(),
+                        if results.len() == 1 { "" } else { "s" }
+                    ))),
+                    // Cancelled: the guard records it as stopped when dropped.
+                    Err(_) if cancel.is_cancelled() => drop(job),
+                    Err(message) => job.fail(message.clone()),
+                }
                 let _ = this.update(cx, |layout, cx| {
                     layout.bounce_running = false;
                     close_dialog(dialog.as_ref(), cx);

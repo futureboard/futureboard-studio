@@ -325,12 +325,23 @@ impl StemExtractorWindow {
             ));
 
         let worker_shared = shared.clone();
+        let bg_job = crate::components::background_tasks::BackgroundJob::start_cancellable(
+            crate::components::BackgroundTaskKind::MediaCopy,
+            format!("Download {} model", model.label()),
+        );
         std::thread::Builder::new()
             .name("fb-stem-model-dl".to_string())
             .spawn(move || {
                 let progress_shared = worker_shared.clone();
+                let job = &bg_job;
+                let job_cancel = cancel.clone();
                 let mut on_progress =
                     move |progress: SphereAudioProcessor::StemModelDownloadProgress| {
+                        if job.is_cancelled() {
+                            job_cancel.cancel();
+                        }
+                        job.set_detail(progress.detail.clone());
+                        job.set_progress((progress.percent * 10.0) as u32, 1000);
                         if let Ok(mut guard) = progress_shared.lock() {
                             guard.progress = Some(progress);
                         }
@@ -342,6 +353,11 @@ impl StemExtractorWindow {
                     &mut on_progress,
                 )
                 .map_err(|e| e.user_message());
+                match &result {
+                    Ok(()) => bg_job.complete(None),
+                    Err(_) if cancel.is_cancelled() => drop(bg_job),
+                    Err(message) => bg_job.fail(message.clone()),
+                }
                 if let Ok(mut guard) = worker_shared.lock() {
                     guard.done = Some(result);
                 }
@@ -460,11 +476,22 @@ impl StemExtractorWindow {
             stems: Vec::new(),
         };
         let worker_shared = shared.clone();
+        let bg_job = crate::components::background_tasks::BackgroundJob::start_cancellable(
+            crate::components::BackgroundTaskKind::AudioProcess,
+            format!("Extract stems: {}", clip.clip_name),
+        );
         std::thread::Builder::new()
             .name("fb-stem-extract".to_string())
             .spawn(move || {
                 let progress_shared = worker_shared.clone();
+                let job = &bg_job;
+                let job_cancel = cancel.clone();
                 let mut on_progress = move |progress: SphereAudioProcessor::StemExtractProgress| {
+                    if job.is_cancelled() {
+                        job_cancel.cancel();
+                    }
+                    job.set_detail(progress.detail.clone());
+                    job.set_progress((progress.percent * 10.0) as u32, 1000);
                     if let Ok(mut guard) = progress_shared.lock() {
                         guard.progress = Some(progress);
                     }
@@ -538,6 +565,19 @@ impl StemExtractorWindow {
                         },
                     })
                 })();
+                match &result {
+                    Ok(summary) => bg_job.complete(Some(format!(
+                        "{} stem{}",
+                        summary.apply.stems.len(),
+                        if summary.apply.stems.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    ))),
+                    Err(_) if cancel.is_cancelled() => drop(bg_job),
+                    Err(message) => bg_job.fail(message.clone()),
+                }
 
                 if let Ok(mut guard) = worker_shared.lock() {
                     guard.done = Some(result);
