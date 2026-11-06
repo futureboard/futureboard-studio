@@ -71,7 +71,7 @@ pub mod typography {
     /// Section headers, dialog titles, emphasized labels.
     pub const UI_MD: f32 = 13.0;
     /// Semibold section / panel titles.
-    pub const UI_TITLE: f32 = 13.0;
+    pub const UI_TITLE: f32 = 14.0;
     /// The name of the object a panel inspects (the Inspector's track or clip
     /// name) — the one line in a panel that reads before everything else.
     pub const UI_LG: f32 = 16.0;
@@ -119,21 +119,22 @@ pub mod radius {
     /// Controls in the 16–20 px band (mixer M/S/R/I, insert chips, dense
     /// toolbar buttons). [`CONTROL`] on a 16 px control would eat nearly 40% of
     /// its height and read as a lozenge.
-    pub const CONTROL_SM: f32 = 4.0;
+    pub const CONTROL_SM: f32 = 5.0;
     /// The workhorse: interactive controls 24–32 px tall. Buttons, inputs,
     /// select triggers, transport, dock tabs, clips.
     ///
-    /// The scale follows the ratio real systems use — radius ≈ 0.2–0.25 × the
-    /// control's height — rather than one flat value across the whole band,
-    /// which is why there are two control tiers instead of one.
-    pub const CONTROL: f32 = 6.0;
+    /// The scale follows a ratio of radius ≈ 0.25–0.33 × the control's height —
+    /// soft enough to read as one family of objects lifted off the planes, not
+    /// so round that a 24 px button turns into a pill — rather than one flat
+    /// value across the whole band, which is why there are two control tiers.
+    pub const CONTROL: f32 = 8.0;
     /// Containing surfaces that sit visibly above another plane: menus,
     /// popovers, tooltips, cards, inspector sections, mixer strip frames.
-    pub const SURFACE: f32 = 10.0;
+    pub const SURFACE: f32 = 12.0;
     /// Window-level surfaces only — modals and client-decorated utility windows,
     /// matched to the host window radius so a modal never reads sharper than the
     /// frame behind it.
-    pub const DIALOG: f32 = 14.0;
+    pub const DIALOG: f32 = 16.0;
     /// Fully round. NON-INTERACTIVE identity objects ≤ 20 px (status chips,
     /// badges, avatars, scrollbar thumbs, knob bodies, rail caps) and toggle
     /// switch tracks. Never on transport, mute/solo/arm, clips, notes or rows.
@@ -315,30 +316,53 @@ pub mod elevation {
     ///
     /// One value replacing the six different (offset, blur) pairs in the crate.
     pub const OVERLAY: ShadowSpec = ShadowSpec {
-        offset_y: 4.0,
-        blur: 12.0,
-        spread: 0.0,
-        alpha: 0.45,
+        offset_y: 8.0,
+        blur: 24.0,
+        spread: -2.0,
+        alpha: 0.40,
     };
 
     /// Clip drag ghosts, track drag previews, slot and browser drags.
     pub const DRAG: ShadowSpec = ShadowSpec {
-        offset_y: 8.0,
-        blur: 20.0,
-        spread: 0.0,
-        alpha: 0.50,
+        offset_y: 12.0,
+        blur: 32.0,
+        spread: -4.0,
+        alpha: 0.48,
     };
+
+    /// How much of a spec's alpha a light theme uses: on a near-white plane a
+    /// black shadow has all the range a dark plane lacks, and at full strength
+    /// it reads as a smudge.
+    const LIGHT_THEME_SHADOW: f32 = 0.45;
 
     /// Build the GPUI shadow list for a level, so no component writes a
     /// `BoxShadow` literal again.
+    ///
+    /// Two layers: the spec's soft key shadow, which carries the lift, and a
+    /// tight contact shadow under the edge, which keeps the surface seated
+    /// on the plane below instead of floating in a haze.
     pub fn shadow(spec: ShadowSpec) -> Vec<BoxShadow> {
-        vec![BoxShadow {
-            color: gpui::hsla(0.0, 0.0, 0.0, spec.alpha),
-            offset: point(px(0.0), px(spec.offset_y)),
-            blur_radius: px(spec.blur),
-            spread_radius: px(spec.spread),
-            inset: false,
-        }]
+        let scale = if super::is_dark() {
+            1.0
+        } else {
+            LIGHT_THEME_SHADOW
+        };
+        vec![
+            BoxShadow {
+                color: gpui::hsla(0.0, 0.0, 0.0, spec.alpha * scale),
+                offset: point(px(0.0), px(spec.offset_y)),
+                blur_radius: px(spec.blur),
+                spread_radius: px(spec.spread),
+                inset: false,
+            },
+            BoxShadow {
+                color: gpui::hsla(0.0, 0.0, 0.0, spec.alpha * 0.5 * scale),
+                offset: point(px(0.0), px(1.0)),
+                blur_radius: px(3.0),
+                spread_radius: px(0.0),
+                inset: false,
+            },
+        ]
     }
 
     /// Keyboard focus ring.
@@ -361,8 +385,8 @@ pub mod elevation {
 pub mod menu {
     pub const PANEL_MIN_WIDTH: f32 = 210.0;
     pub const PANEL_MAX_WIDTH: f32 = 340.0;
-    pub const PANEL_PAD: f32 = 3.0;
-    pub const ROW_HEIGHT: f32 = 20.0;
+    pub const PANEL_PAD: f32 = 4.0;
+    pub const ROW_HEIGHT: f32 = 22.0;
     pub const ROW_PAD_X: f32 = 8.0;
     pub const CHECK_SLOT_W: f32 = 18.0;
     pub const ICON_SIZE: f32 = 11.0;
@@ -370,7 +394,7 @@ pub mod menu {
     pub const LABEL_TEXT_SIZE: f32 = crate::theme::typography::UI_XS;
     pub const META_TEXT_SIZE: f32 = crate::theme::typography::UI_XS;
     pub const HEADER_TEXT_SIZE: f32 = crate::theme::typography::UI_XS;
-    pub const HEADER_HEIGHT: f32 = 21.0;
+    pub const HEADER_HEIGHT: f32 = 23.0;
     pub const SEPARATOR_MARGIN_Y: f32 = 2.0;
     pub const ITEM_GAP: f32 = 1.0;
 
@@ -616,21 +640,14 @@ pub fn initialize_theme_system() -> ThemeLoadReport {
 }
 
 fn install_builtin_theme_templates(themes_dir: &Path) {
-    let default_path = themes_dir.join("Default").join("theme.json");
-    if !default_path.exists() {
-        if let Some(parent) = default_path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let _ = fs::write(&default_path, DEFAULT_THEME_JSON);
-    }
-
-    let light_path = themes_dir.join("Light").join("theme.json");
-    if !light_path.exists() {
-        if let Some(parent) = light_path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let _ = fs::write(&light_path, LIGHT_THEME_JSON);
-    }
+    install_builtin_theme(
+        &themes_dir.join("Default").join("theme.json"),
+        DEFAULT_THEME_JSON,
+    );
+    install_builtin_theme(
+        &themes_dir.join("Light").join("theme.json"),
+        LIGHT_THEME_JSON,
+    );
 
     // The authoring template sits directly in the themes root (not inside its
     // own folder) so `discover_theme_files` below picks it up like any other
@@ -641,6 +658,63 @@ fn install_builtin_theme_templates(themes_dir: &Path) {
     if !template_path.exists() {
         let _ = fs::write(&template_path, TEMPLATE_THEME_JSON);
     }
+}
+
+/// Write a built-in theme where it is missing, and replace an installed copy
+/// that is the same theme at an older version.
+///
+/// The installed copy is what loads, so without the second half a Studio
+/// update never reaches anyone whose copy was written by an older build: the
+/// new palette sits in the bundle and the old one keeps painting the app. A
+/// replaced copy is kept beside it as `theme.json.v<old>.bak` (not `.json`,
+/// so it is never discovered as a second theme), in case it had been edited.
+fn install_builtin_theme(path: &Path, bundled: &str) {
+    let installed = match fs::read_to_string(path) {
+        Ok(installed) => installed,
+        Err(_) => {
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = fs::write(path, bundled);
+            return;
+        }
+    };
+    let Some(old_version) = stale_builtin_version(&installed, bundled) else {
+        return;
+    };
+    let backup = path.with_file_name(format!("theme.json.v{old_version}.bak"));
+    if fs::write(&backup, &installed).is_ok() {
+        let _ = fs::write(path, bundled);
+        eprintln!(
+            "[theme] updated {} from v{old_version}; the old copy is {}",
+            path.display(),
+            backup.display()
+        );
+    }
+}
+
+/// The installed copy's version when it is the bundled theme (same id) at an
+/// older version; `None` for anything else, including a copy that does not
+/// parse — that one is the user's to fix, not ours to overwrite.
+fn stale_builtin_version(installed: &str, bundled: &str) -> Option<String> {
+    let identity = |json: &str| -> Option<(String, String)> {
+        let value: serde_json::Value = serde_json::from_str(json).ok()?;
+        Some((
+            value.get("id")?.as_str()?.to_string(),
+            value.get("version")?.as_str()?.to_string(),
+        ))
+    };
+    let (installed_id, installed_version) = identity(installed)?;
+    let (bundled_id, bundled_version) = identity(bundled)?;
+    let parse = |version: &str| -> Option<Vec<u64>> {
+        version
+            .trim()
+            .split('.')
+            .map(|part| part.parse::<u64>().ok())
+            .collect()
+    };
+    let older = parse(&installed_version)? < parse(&bundled_version)?;
+    (installed_id == bundled_id && older).then_some(installed_version)
 }
 
 /// Finds every theme manifest under the themes root, recursively.
@@ -1367,6 +1441,36 @@ mod theme_discovery_tests {
         let loaded = load_theme_file(&custom_path, &default).expect("valid theme json");
         assert_eq!(loaded.id, "user.mycustom");
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An installed built-in theme from an older build is replaced by the
+    /// bundled one, and the old copy kept; anything else is left alone.
+    #[test]
+    fn a_stale_builtin_theme_copy_is_refreshed_and_backed_up() {
+        let bundled = r#"{"id":"futureboard.light","version":"2.1.0","tokens":{}}"#;
+        let old = r#"{"id":"futureboard.light","version":"1.0.0","tokens":{}}"#;
+        assert_eq!(
+            stale_builtin_version(old, bundled).as_deref(),
+            Some("1.0.0")
+        );
+        let same = r#"{"id":"futureboard.light","version":"2.1.0","tokens":{"x":1}}"#;
+        assert_eq!(stale_builtin_version(same, bundled), None);
+        let newer = r#"{"id":"futureboard.light","version":"2.10.0","tokens":{}}"#;
+        assert_eq!(stale_builtin_version(newer, bundled), None);
+        let other = r#"{"id":"user.mine","version":"0.1.0","tokens":{}}"#;
+        assert_eq!(stale_builtin_version(other, bundled), None);
+        assert_eq!(stale_builtin_version("{ not json", bundled), None);
+
+        let dir = scratch_dir();
+        let path = dir.join("Light").join("theme.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, old).unwrap();
+        install_builtin_theme(&path, bundled);
+        assert_eq!(fs::read_to_string(&path).unwrap(), bundled);
+        let backup = dir.join("Light").join("theme.json.v1.0.0.bak");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), old);
+        assert!(!discover_theme_files(&dir).contains(&backup));
         let _ = fs::remove_dir_all(&dir);
     }
 

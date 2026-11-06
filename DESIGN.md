@@ -9,11 +9,12 @@ and this document is wrong and should be fixed.
 
 Futureboard is a signal-first creative instrument. Its signature is:
 
-- a graphite ramp of clearly separated working planes, lit from value rather
-  than from effects;
+- a deep, cool graphite ramp of clearly separated working planes, lit from
+  value rather than from effects, with soft lift on the layers that float;
 - one restrained cyan signal that marks focus, selection, live routing, and the
   primary action — and nothing else;
-- rounded, deliberately sized controls whose radius follows their height;
+- softly rounded, deliberately sized controls whose radius follows their
+  height;
 - quiet chrome around expressive musical content;
 - typography and numbers calibrated for fast scanning;
 - motion that confirms cause and effect, never decorates idle space;
@@ -38,7 +39,7 @@ Never write a raw literal for any of these. Every one lives in `theme.rs`.
 | Layer | Module | What it holds |
 | --- | --- | --- |
 | Color | `Colors::*` (161 semantic tokens) | Themed via `packages/shared/themes/*.json` |
-| Radius | `theme::radius` | `NONE 0 · MICRO 3 · CONTROL_SM 4 · CONTROL 6 · SURFACE 10 · DIALOG 14 · PILL` |
+| Radius | `theme::radius` | `NONE 0 · MICRO 3 · CONTROL_SM 5 · CONTROL 8 · SURFACE 12 · DIALOG 16 · PILL` |
 | Spacing | `theme::space` | `NONE 0 · HAIR 2 · TIGHT 4 · SNUG 6 · BASE 8 · LOOSE 12 · SECTION 16 · BLOCK 24 · PAGE 32` |
 | Size | `theme::size` | Control-height ladder + `hit_target()` |
 | State | `theme::state` | State-layer alphas |
@@ -55,13 +56,13 @@ JSON files are produced from them. If you add a token, add it in both, and give
 
 Pick a token by **what the thing is**, never by how big it looks.
 
-Radius tracks control height at roughly 0.2–0.25×, which is why there are two
+Radius tracks control height at roughly 0.25–0.33×, which is why there are two
 control tiers rather than one flat value:
 
-- 16–20 px controls → `CONTROL_SM` (4)
-- 24–32 px controls → `CONTROL` (6)
-- containing surfaces → `SURFACE` (10)
-- windows and modals → `DIALOG` (14)
+- 16–20 px controls → `CONTROL_SM` (5)
+- 24–32 px controls → `CONTROL` (8)
+- containing surfaces → `SURFACE` (12)
+- windows and modals → `DIALOG` (16)
 
 **Nesting.** An element inside a rounded container uses
 `radius::inner(outer, padding)`. The scale is built so `inner(SURFACE, TIGHT)`
@@ -107,9 +108,19 @@ canvas / input (recessed)
 ```
 
 Depth is carried by **value first, hairline second, shadow only for genuinely
-floating layers**. On a dark panel a black shadow has almost no dynamic range
-left, which is why shadow is reserved for menus, popovers and drag ghosts.
-Borders are white-alpha so one token composites correctly on every plane.
+floating layers**. The dark ramp runs from a near-black canvas (`#0D0E11`) to
+raised surfaces (`#34353E`) with a faint cool cast, so neighbouring planes sit
+far enough apart to separate without a line. `elevation::shadow` gives a
+floating layer two shadows — a soft key shadow for the lift and a tight
+contact shadow that keeps its edge seated — and uses less than half the alpha
+on a light theme, where black has the range a dark plane lacks. Shadow stays
+reserved for menus, popovers, dialogs and drag ghosts. Borders are white-alpha
+so one token composites correctly on every plane.
+
+A built-in theme's installed copy (`Extensions/Themes/Default|Light/theme.json`)
+is what loads, so bump the bundled file's `version` whenever its values
+change: Studio replaces an installed copy of the same id at an older version
+and keeps the old one beside it as `theme.json.v<old>.bak`.
 
 Use cyan for active meaning only: focus and keyboard target, selection, live
 connection or routed signal, and the one primary action. Do not wash panels in

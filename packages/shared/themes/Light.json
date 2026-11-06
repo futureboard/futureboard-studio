@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "futureboard.light",
   "name": "Futureboard Light",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "author": "Futureboard Studio",
   "appearance": "light",
   "targets": [
@@ -71,7 +71,7 @@
       "thumb": "#3A3F49",
       "tick": "#00000018",
       "scaleText": "#5C616B",
-      "groove": "#E7EAEF",
+      "groove": "#E2E5EA",
       "thumbBorder": "#00000038"
     },
     "knob": {
@@ -88,7 +88,7 @@
       "clip": "#FF2D20"
     },
     "mixer": {
-      "background": "#E7EAEF",
+      "background": "#E2E5EA",
       "masterStripBackground": "#EDEFF3"
     },
     "panel": {
@@ -112,7 +112,7 @@
       "dragged": "#00000024",
       "armed": "#0E9AA72E",
       "recessed": "#00000014",
-      "scrim": "#11162059",
+      "scrim": "#11162066",
       "focusRing": "#0E9AA7E0",
       "mute": "#3A6FD8",
       "solo": "#B07A10",
@@ -126,23 +126,23 @@
       "success": "#1F9D5C"
     },
     "statusbar": {
-      "background": "#E9ECF0",
+      "background": "#E6E9EE",
       "text": "#5C616B",
       "textMuted": "#838892",
       "accent": "#0E9AA7",
       "warning": "#A9761A"
     },
     "surface": {
-      "base": "#EFF1F4",
-      "panel": "#F7F8FA",
-      "panelAlt": "#E9ECF0",
+      "base": "#EDEFF3",
+      "panel": "#F8F9FB",
+      "panelAlt": "#E6E9EE",
       "panelRaised": "#FFFFFF",
-      "canvas": "#E7EAEF",
+      "canvas": "#E2E5EA",
       "raised": "#FFFFFF",
       "input": "#FFFFFF",
-      "window": "#F3F5F7",
-      "titlebar": "#E9ECF0",
-      "sidebar": "#EDEFF3",
+      "window": "#F1F3F6",
+      "titlebar": "#E6E9EE",
+      "sidebar": "#EBEDF1",
       "card": "#FFFFFF",
       "cardHover": "#F1F3F6",
       "cardSelected": "#D9DDE4",
@@ -151,24 +151,24 @@
       "hover": "#E4E7EC",
       "active": "#D9DDE4",
       "controlHover": "#EDEFF3",
-      "overlay": "#11162059",
+      "overlay": "#11162066",
       "selected": "#D9DDE4",
       "selectedSoft": "#E4E7EC",
       "pressed": "#D2D6DD",
-      "muted": "#E9ECF0",
-      "bottomPanel": "#F7F8FA",
-      "bottomPanelHeader": "#E9ECF0",
-      "mixerStrip": "#F7F8FA",
+      "muted": "#E6E9EE",
+      "bottomPanel": "#F8F9FB",
+      "bottomPanelHeader": "#E6E9EE",
+      "mixerStrip": "#F8F9FB",
       "mixerStripAlt": "#F1F3F6",
       "mixerStripSelected": "#D9DDE4",
-      "masterStripHeader": "#E9ECF0"
+      "masterStripHeader": "#E6E9EE"
     },
     "tab": {
       "text": "#3A3F49",
       "text_muted": "#5C616B",
       "text_active": "#12141A",
       "indicator_active": "#0E9AA7",
-      "backgroundActive": "#0E9AA71A",
+      "backgroundActive": "#0E9AA724",
       "backgroundHover": "#E4E7EC"
     },
     "text": {
@@ -193,9 +193,9 @@
       "regionBackgroundAlt": "#00000004",
       "laneBackground": "#00000006",
       "laneAltBackground": "#00000010",
-      "selectedLaneBackground": "#0E9AA714",
+      "selectedLaneBackground": "#0E9AA71A",
       "emptyBodyBackground": "#0000000A",
-      "rulerBackground": "#E9ECF0",
+      "rulerBackground": "#E6E9EE",
       "rulerTick": "#00000029",
       "rulerText": "#3A3F49",
       "selection": "#0E9AA72E"
