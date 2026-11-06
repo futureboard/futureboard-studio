@@ -1,5 +1,5 @@
 //! Note transforms behind the MIDI editor's tools panel: quantize, length,
-//! transpose, chord voicing and strum.
+//! time stretch, transpose, chord voicing and strum.
 //!
 //! Every function here is a pure, in-place rewrite of the start, duration or
 //! pitch of the notes whose ids are in `ids`. None of them adds or removes a
@@ -353,6 +353,137 @@ pub fn retrograde_notes(notes: &mut [MidiNoteState], ids: &HashSet<u64>) -> usiz
         if changed_f32(start, note.start) {
             note.start = start;
             changed += 1;
+        }
+    }
+    changed
+}
+
+/// The beats the notes cover together: the earliest start to the latest end.
+pub fn note_span(notes: &[MidiNoteState], ids: &HashSet<u64>) -> Option<(f32, f32)> {
+    notes
+        .iter()
+        .filter(|n| ids.contains(&n.id))
+        .fold(None, |span, note| {
+            let end = note.start + note.duration;
+            Some(match span {
+                None => (note.start, end),
+                Some((s, e)) => (f32::min(s, note.start), f32::max(e, end)),
+            })
+        })
+}
+
+/// Which edge of the notes' span stays where it is while they stretch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StretchAnchor {
+    /// The first note keeps its start; the passage grows or shrinks to the right.
+    Start,
+    /// The last note keeps its end; the passage grows or shrinks to the left.
+    End,
+}
+
+/// The tightest and loosest a stretch goes in one step: 1/64 to 64 times.
+pub const MIN_STRETCH_FACTOR: f32 = 1.0 / 64.0;
+pub const MAX_STRETCH_FACTOR: f32 = 64.0;
+
+/// A time stretch of a passage: every position is scaled about one edge of
+/// the passage's span, every length by the same factor. Shared by the
+/// editor's live drag and the committed edit so both put a note in the same
+/// place.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StretchSpec {
+    /// The passage's span before the stretch, clip-local beats.
+    pub first: f32,
+    pub last: f32,
+    /// New length over old; above 1 slows the passage down.
+    pub factor: f32,
+    pub anchor: StretchAnchor,
+}
+
+impl StretchSpec {
+    fn pivot(&self) -> f32 {
+        match self.anchor {
+            StretchAnchor::Start => self.first,
+            StretchAnchor::End => self.last,
+        }
+    }
+
+    fn factor(&self) -> f32 {
+        if self.factor.is_finite() {
+            self.factor.clamp(MIN_STRETCH_FACTOR, MAX_STRETCH_FACTOR)
+        } else {
+            1.0
+        }
+    }
+
+    /// Where a note at `start` lasting `duration` lands.
+    pub fn map(&self, start: f32, duration: f32) -> (f32, f32) {
+        let factor = self.factor();
+        let pivot = self.pivot();
+        (
+            (pivot + (start - pivot) * factor).max(0.0),
+            (duration * factor).max(MIN_NOTE_BEATS),
+        )
+    }
+
+    /// The span after the stretch.
+    pub fn stretched_span(&self) -> (f32, f32) {
+        let factor = self.factor();
+        let pivot = self.pivot();
+        (
+            (pivot + (self.first - pivot) * factor).max(0.0),
+            pivot + (self.last - pivot) * factor,
+        )
+    }
+}
+
+/// Time-stretch the notes by `factor` about one edge of their span. Starts
+/// and lengths scale together, and so does every note's own expression
+/// (pitch curve and expression lanes are timed from the note's start), so a
+/// bend lands at the same point of a longer note.
+pub fn stretch_notes(
+    notes: &mut [MidiNoteState],
+    ids: &HashSet<u64>,
+    factor: f32,
+    anchor: StretchAnchor,
+) -> usize {
+    if !factor.is_finite() || factor <= 0.0 || (factor - 1.0).abs() < 1.0e-6 {
+        return 0;
+    }
+    let Some((first, last)) = note_span(notes, ids) else {
+        return 0;
+    };
+    let spec = StretchSpec {
+        first,
+        last,
+        factor,
+        anchor,
+    };
+    let factor = spec.factor();
+    let mut changed = 0;
+    for note in selected(notes, ids) {
+        let (start, duration) = spec.map(note.start, note.duration);
+        if changed_f32(start, note.start) || changed_f32(duration, note.duration) {
+            changed += 1;
+        }
+        note.start = start;
+        note.duration = duration;
+        if let Some(curve) = note.pitch_curve.as_mut() {
+            for point in &mut curve.points {
+                point.beat *= factor;
+            }
+        }
+        let expression = &mut note.expression;
+        for curve in [
+            &mut expression.pitch,
+            &mut expression.pressure,
+            &mut expression.timbre,
+        ]
+        .into_iter()
+        .chain(expression.custom.iter_mut().map(|lane| &mut lane.curve))
+        {
+            for point in &mut curve.points {
+                point.position *= factor;
+            }
         }
     }
     changed
@@ -885,6 +1016,71 @@ mod tests {
             strength: 1.0,
             swing: 0.0,
         }
+    }
+
+    /// Doubling from the start keeps the first note where it is and spreads
+    /// the rest out, lengths doubled; halving from the end keeps the last end.
+    #[test]
+    fn stretch_scales_positions_and_lengths_about_one_edge() {
+        let mut notes = vec![note(60, 1.0, 0.5), note(62, 2.0, 1.0), note(64, 8.0, 1.0)];
+        let ids: HashSet<u64> = [notes[0].id, notes[1].id].into_iter().collect();
+        assert_eq!(note_span(&notes, &ids), Some((1.0, 3.0)));
+        assert_eq!(
+            stretch_notes(&mut notes, &ids, 2.0, StretchAnchor::Start),
+            2
+        );
+        assert!((notes[0].start - 1.0).abs() < 1e-5 && (notes[0].duration - 1.0).abs() < 1e-5);
+        assert!((notes[1].start - 3.0).abs() < 1e-5 && (notes[1].duration - 2.0).abs() < 1e-5);
+        // A note outside the selection is untouched.
+        assert!((notes[2].start - 8.0).abs() < 1e-5);
+
+        let mut notes = vec![note(60, 0.0, 1.0), note(62, 3.0, 1.0)];
+        let ids = all(&notes);
+        stretch_notes(&mut notes, &ids, 0.5, StretchAnchor::End);
+        assert!((notes[0].start - 2.0).abs() < 1e-5 && (notes[0].duration - 0.5).abs() < 1e-5);
+        assert!((notes[1].start - 3.5).abs() < 1e-5);
+        assert!((notes[1].start + notes[1].duration - 4.0).abs() < 1e-5);
+        assert_eq!(
+            stretch_notes(&mut notes, &ids, 1.0, StretchAnchor::Start),
+            0
+        );
+    }
+
+    /// A note's own curves are timed from its start, so they stretch with it.
+    #[test]
+    fn stretch_carries_the_notes_expression() {
+        use super::super::{PitchCurve, PitchPoint, PitchSegmentShape};
+        let mut first = note(60, 0.0, 1.0);
+        first.pitch_curve = Some(PitchCurve::from_points(vec![PitchPoint::new(
+            0.5,
+            100.0,
+            PitchSegmentShape::default(),
+        )]));
+        first
+            .expression
+            .pressure
+            .points
+            .push(sphere_midi_service::ExpressionPoint::new(0.25, 0.8));
+        let mut notes = vec![first, note(62, 1.0, 1.0)];
+        let ids = all(&notes);
+        stretch_notes(&mut notes, &ids, 3.0, StretchAnchor::Start);
+        let curve = notes[0].pitch_curve.as_ref().unwrap();
+        assert!((curve.points[0].beat - 1.5).abs() < 1e-5);
+        assert!((notes[0].expression.pressure.points[0].position - 0.75).abs() < 1e-5);
+        assert!((notes[1].start - 3.0).abs() < 1e-5);
+    }
+
+    /// Stretching to the left never pushes a note before the clip's start.
+    #[test]
+    fn stretch_from_the_end_stops_at_the_clip_start() {
+        let spec = StretchSpec {
+            first: 1.0,
+            last: 3.0,
+            factor: 4.0,
+            anchor: StretchAnchor::End,
+        };
+        assert_eq!(spec.map(1.0, 1.0).0, 0.0);
+        assert_eq!(spec.stretched_span().0, 0.0);
     }
 
     #[test]

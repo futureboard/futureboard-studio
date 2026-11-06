@@ -474,6 +474,18 @@ pub fn scenes() -> Vec<Scene> {
             open: midi_tools_scene,
         },
         Scene {
+            name: "midi-stretch",
+            width: 1_200.0,
+            height: 760.0,
+            open: midi_stretch_scene,
+        },
+        Scene {
+            name: "midi-stretch-idle",
+            width: 1_200.0,
+            height: 760.0,
+            open: midi_stretch_idle_scene,
+        },
+        Scene {
             name: "midi-drums",
             width: 1_200.0,
             height: 760.0,
@@ -1544,6 +1556,32 @@ impl gpui::Render for AudioClipsPreview {
 /// the Timing page.
 fn midi_tools_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
     open_midi_tools(options, cx, 0, false)
+}
+
+/// Time stretch caught mid-drag: the first eight notes selected and pulled
+/// to one and a half times their length from the ruler's right handle.
+fn midi_stretch_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_midi_stretch(options, cx, 1.5)
+}
+
+/// The same selection before the drag: the span and its two handles.
+fn midi_stretch_idle_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_midi_stretch(options, cx, 1.0)
+}
+
+fn open_midi_stretch(options: WindowOptions, cx: &mut App, factor: f32) -> Result<AnyWindowHandle> {
+    use crate::components::piano_roll::PianoRoll;
+    let handle = cx.open_window(options, |_, cx| {
+        let timeline = preview_midi_timeline(cx);
+        cx.new(|cx| {
+            let mut roll = PianoRoll::new(timeline, cx);
+            roll.set_tools_panel_open(true, cx);
+            roll.preview_tools(0, false);
+            roll.preview_stretch(8, factor, cx);
+            roll
+        })
+    })?;
+    Ok(handle.into())
 }
 
 /// The Pitch page, with the Chord Track shown under the ruler.

@@ -36,7 +36,8 @@ use crate::components::timeline::timeline::Timeline;
 use crate::components::timeline::timeline_state::{
     midi_debug_enabled, ArticulationId, ChordInsertKind, MidiArticulationEvent, MidiChannel,
     MidiChannelMask, MidiControllerKind, MidiControllerPoint, MidiNoteState, PitchCurve,
-    PitchTransformContext, ScaleKind, ScaleRoot, TimelineState, MIN_NOTE_BEATS,
+    PitchTransformContext, ScaleKind, ScaleRoot, StretchAnchor, StretchSpec, TimelineState,
+    MIN_NOTE_BEATS,
 };
 use crate::theme::Colors;
 use sphere_midi_service::{NoteExpression, NoteExpressionLane};
@@ -53,6 +54,7 @@ pub mod playhead;
 mod render;
 pub mod scope;
 pub use drum_map::DrumLanes;
+mod stretch;
 mod tools_panel;
 
 /// Default note-row height (px per semitone). Reset-zoom restores this value so
@@ -1029,6 +1031,17 @@ enum PianoDrag {
         /// `PianoDrag::Move::unsnap`).
         unsnap: bool,
     },
+    /// Time-stretch the selection from a handle at one end of its span on the
+    /// ruler, or Alt on a selected note's end. `spec` holds the span at
+    /// mouse-down and the live factor; the notes are drawn through it and
+    /// written once, on release, as one undo step.
+    Stretch {
+        ids: HashSet<u64>,
+        start_x: f32,
+        spec: StretchSpec,
+        /// Live Shift-held state (see `PianoDrag::Move::unsnap`).
+        unsnap: bool,
+    },
     /// Drag a velocity bar. Values are always derived from `prev`, never from
     /// the prior mouse-move frame. Alt switches to absolute assignment and Shift
     /// scales the relative pointer delta for fine adjustment.
@@ -1697,6 +1710,10 @@ impl PianoRoll {
                 prev.is_empty()
             }
             PianoDrag::Resize { id, .. } => !valid_note_ids.contains(id),
+            PianoDrag::Stretch { ids, .. } => {
+                ids.retain(|id| valid_note_ids.contains(id));
+                ids.is_empty()
+            }
             PianoDrag::Velocity { prev, .. } => {
                 prev.retain(|(id, _)| valid_note_ids.contains(id));
                 prev.is_empty()
@@ -1791,6 +1808,7 @@ impl PianoRoll {
                 dx_beats, dpitch, ..
             } => format!("Move Δ{:.2} beat Δ{} st", dx_beats, dpitch),
             PianoDrag::Resize { new_dur, .. } => format!("Length {:.2}", new_dur),
+            PianoDrag::Stretch { ids, spec, .. } => stretch::stretch_status(spec, ids.len()),
             PianoDrag::CcPaint { erase, .. } => {
                 self.drag_value_status.clone().unwrap_or_else(|| {
                     if *erase {
@@ -3667,6 +3685,12 @@ impl PianoRoll {
     ) {
         window.focus(&self.focus, cx);
         let multi = self.selection.len() > 1 && self.selection.contains(&id);
+        // Alt on the end of a note in a selection stretches the selection
+        // instead of lengthening every note by the same amount.
+        if multi && event.modifiers.alt {
+            self.begin_stretch_drag(StretchAnchor::Start, event, window, cx);
+            return;
+        }
         if !multi {
             self.selection = HashSet::from([id]);
         }
@@ -4547,6 +4571,18 @@ impl PianoRoll {
                 *new_dur = d;
                 cx.notify();
             }
+            PianoDrag::Stretch {
+                start_x,
+                spec,
+                unsnap,
+                ..
+            } => {
+                *unsnap = event.modifiers.shift;
+                let cur_x: f32 = event.position.x.into();
+                let step = (snap_enabled && !*unsnap).then_some(snap_step);
+                spec.factor = stretch::drag_factor(spec, cur_x - *start_x, ppb, step);
+                cx.notify();
+            }
             PianoDrag::Velocity {
                 clip_id,
                 prev,
@@ -4842,6 +4878,9 @@ impl PianoRoll {
                         state.resize_midi_note(cid, note_id, next);
                     }
                 });
+            }
+            PianoDrag::Stretch { ids, spec, .. } => {
+                self.commit_stretch(ids, spec, cx);
             }
             PianoDrag::Velocity {
                 clip_id: velocity_clip_id,

@@ -204,10 +204,23 @@ impl PianoRoll {
     ) where
         F: FnOnce(&mut [MidiNoteState], &HashSet<u64>) -> usize,
     {
+        let ids = self.tool_target_ids(cx);
+        self.run_note_tool_on(label, ids, cx, transform);
+    }
+
+    /// [`Self::run_note_tool`] over the notes `ids` names.
+    pub(super) fn run_note_tool_on<F>(
+        &mut self,
+        label: &'static str,
+        ids: Vec<u64>,
+        cx: &mut Context<Self>,
+        transform: F,
+    ) where
+        F: FnOnce(&mut [MidiNoteState], &HashSet<u64>) -> usize,
+    {
         let Some(clip_id) = self.editing_clip_id(cx) else {
             return;
         };
-        let ids = self.tool_target_ids(cx);
         if ids.is_empty() {
             return;
         }
@@ -641,6 +654,30 @@ impl PianoRoll {
                 }),
             )
             .into_any_element()]),
+            insp_section("TIME STRETCH").into_any_element(),
+            tool_row(
+                [
+                    ("pr-tools-stretch-half", "×½", 0.5),
+                    ("pr-tools-stretch-two-thirds", "×⅔", 2.0 / 3.0),
+                    ("pr-tools-stretch-three-halves", "×1½", 1.5),
+                    ("pr-tools-stretch-double", "×2", 2.0),
+                ]
+                .into_iter()
+                .map(|(id, label, factor)| {
+                    tool_button(
+                        id,
+                        label,
+                        Emphasis::Normal,
+                        enabled,
+                        cx.listener(move |this, _, _w, cx| this.tool_stretch(factor, cx)),
+                    )
+                    .into_any_element()
+                })
+                .collect(),
+            ),
+            tool_caption(
+                "Starts and lengths scale from the first note. Or drag a handle beside the selected notes.",
+            ),
         ]
     }
 

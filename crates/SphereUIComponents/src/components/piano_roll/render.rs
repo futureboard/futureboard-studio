@@ -39,6 +39,11 @@ impl PianoRoll {
                     duration = (*prev_duration + *delta_dur).max(MIN_NOTE_BEATS);
                 }
             }
+            PianoDrag::Stretch { ids, spec, .. } => {
+                if ids.contains(&n.id) {
+                    (start, duration) = spec.map(n.start, n.duration);
+                }
+            }
             _ => {}
         }
         DisplayNote {
@@ -1753,9 +1758,11 @@ impl PianoRoll {
         let mut ruler = self.build_ruler_clip_band(track_color, view_w);
         ruler.extend(self.build_ruler(project_start, project_end));
         ruler.extend(self.build_loop_ruler_markers(loop_region));
+        ruler.extend(self.build_stretch_band(cx, clip_id));
         // Under the editable notes and over the grid: context, not content.
         let context_notes = self.build_context_notes(cx, view_w, view_h);
         let notes_geo = self.build_note_elements(cx, clip_id, track_color);
+        let stretch_handles = self.build_stretch_handles(cx, clip_id);
         let quantize_preview = self.build_quantize_preview(cx, clip_id);
         let marquee_overlay = self.build_marquee_overlay();
         let draw_preview = self.build_draw_note_preview(track_color);
@@ -2101,6 +2108,7 @@ impl PianoRoll {
                             .children(playhead_overlay)
                             .children(grid_empty_hint)
                             .children(notes_geo)
+                            .children(stretch_handles)
                             .children(quantize_preview)
                             .when_some(marquee_overlay, |el, overlay| el.child(overlay))
                             .children(draw_preview)
