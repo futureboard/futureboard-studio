@@ -1094,13 +1094,10 @@ impl VoxtuneEditor {
             .children(overlays)
             .when(play_x >= 0.0 && play_x <= w, |d| {
                 d.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .bottom_0()
-                        .left(px(play_x.floor()))
-                        .w(px(1.0))
-                        .bg(Colors::timeline_playhead()),
+                    crate::components::timeline::playhead::playhead_line_element(
+                        play_x.floor(),
+                        1.0,
+                    ),
                 )
             })
             .children(action_bar)
@@ -1240,7 +1237,6 @@ impl VoxtuneEditor {
         let window = (v0 / duration, v1 / duration);
         let well = Colors::timeline_background();
         let edge = Colors::with_alpha(Colors::text_primary(), 0.55);
-        let playhead = Colors::timeline_playhead();
         let capture = self.overview_bounds.clone();
         let strip = gpui::canvas(
             move |b, _, _| capture.set(Some(b)),
@@ -1276,7 +1272,15 @@ impl VoxtuneEditor {
                     gpui::BorderStyle::Solid,
                 ));
                 if (0.0..=1.0).contains(&play) {
-                    window_.paint_quad(q(play * w, 0.0, 1.0, h, playhead));
+                    let left: f32 = b.origin.x.into();
+                    let top: f32 = b.origin.y.into();
+                    crate::components::timeline::playhead::paint_playhead_line(
+                        window_,
+                        left + play * w,
+                        top,
+                        top + h,
+                        1.0,
+                    );
                 }
             },
         )
@@ -2491,15 +2495,28 @@ impl VoxtuneEditor {
             .child(painter)
             .children(labels)
             .when(play_x >= 0.0 && play_x <= w, |d| {
+                // The ruler's tab, in the playhead's colours: the line's
+                // colour inside its stroke.
+                let (line, stroke) = crate::components::timeline::playhead::playhead_colors(1.0);
                 d.child(
                     div()
                         .absolute()
-                        .left(px(play_x - 4.0))
+                        .left(px(play_x - 5.0))
                         .bottom_0()
-                        .w(px(9.0))
-                        .h(px(6.0))
+                        .w(px(11.0))
+                        .h(px(7.0))
                         .rounded_t(px(radius::MICRO))
-                        .bg(Colors::timeline_playhead()),
+                        .bg(stroke)
+                        .child(
+                            div()
+                                .absolute()
+                                .left(px(1.0))
+                                .top(px(1.0))
+                                .w(px(9.0))
+                                .h(px(6.0))
+                                .rounded_t(px(radius::MICRO))
+                                .bg(line),
+                        ),
                 )
             })
             .on_mouse_down(

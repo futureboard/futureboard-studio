@@ -193,13 +193,7 @@ pub struct EditorPlayhead {
 impl Render for EditorPlayhead {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         match self.x.get() {
-            Some(x) => div()
-                .absolute()
-                .top_0()
-                .bottom_0()
-                .left(px(x - 0.5))
-                .w(px(1.0))
-                .bg(Colors::timeline_playhead()),
+            Some(x) => crate::components::timeline::playhead::playhead_line_element(x - 0.5, 1.0),
             None => div(),
         }
     }

@@ -185,6 +185,8 @@
       "gridMinor": "#0000000D",
       "gridBar": "#00000038",
       "playhead": "#E0453D",
+      "playheadLine": "#111316",
+      "playheadStroke": "#FFFFFFE0",
       "background": "#F3F5F7",
       "contentBackground": "#F3F5F7",
       "regionBackground": "#00000008",

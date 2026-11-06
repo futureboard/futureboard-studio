@@ -809,6 +809,17 @@ const DEFAULT_TRACK_COLOR_VALUES: [u32; 12] = [
 ];
 
 impl Colors {
+    /// [`Self::resolve`] with a fallback that depends on whether the active
+    /// theme is dark, for tokens a theme written before them does not carry.
+    fn resolve_for_appearance(key: &str, dark: &str, light: &str) -> Rgba {
+        let theme = active_theme_store()
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        theme.colors.get(key).copied().unwrap_or_else(|| {
+            parse_theme_color(if theme.dark { dark } else { light }).unwrap_or_default()
+        })
+    }
+
     fn resolve(key: &str, fallback: &str) -> Rgba {
         let theme = active_theme_store()
             .read()
@@ -911,6 +922,20 @@ impl Colors {
     theme_color!(timeline_grid_minor, "timeline.gridMinor", "#FFFFFF0D");
     theme_color!(timeline_grid_bar, "timeline.gridBar", "#FFFFFF3D");
     theme_color!(timeline_playhead, "timeline.playhead", "#FF6A5A");
+
+    /// The playhead line: white on a dark theme, near-black on a light one, so
+    /// it reads as the one neutral line over every clip colour. A theme sets
+    /// its own with `timeline.playheadLine`.
+    pub fn playhead_line() -> Rgba {
+        Self::resolve_for_appearance("timeline.playheadLine", "#FFFFFF", "#111316")
+    }
+
+    /// The stroke on both sides of the playhead line and around its head:
+    /// dark on a dark theme, light on a light one, so the line stays visible
+    /// over a clip of its own colour. `timeline.playheadStroke` in a theme.
+    pub fn playhead_stroke() -> Rgba {
+        Self::resolve_for_appearance("timeline.playheadStroke", "#000000B3", "#FFFFFFE0")
+    }
     // The MIDI editor's keyboard: white keys that read as white keys.
     theme_color!(piano_white_key, "piano.whiteKey", "#E4E6EA");
     theme_color!(piano_black_key, "piano.blackKey", "#15171C");

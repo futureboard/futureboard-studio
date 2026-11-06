@@ -26,8 +26,8 @@ use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use gpui::{
-    canvas, div, fill, point, px, size, Bounds, ContentMask, Context, IntoElement, ParentElement,
-    Pixels, Render, Styled, WeakEntity, Window,
+    canvas, div, point, px, size, Bounds, ContentMask, Context, IntoElement, ParentElement, Pixels,
+    Render, Styled, WeakEntity, Window,
 };
 
 use crate::components::timeline::playhead::PlayheadFrameCell;
@@ -35,7 +35,6 @@ use crate::components::timeline::vu_meter::{
     paint_header_meter, HEADER_METER_INSET, HEADER_METER_WIDTH,
 };
 use crate::components::timeline::Timeline;
-use crate::theme::Colors;
 
 /// What the arrangement's last layout recorded for the layers.
 #[derive(Default)]
@@ -286,7 +285,7 @@ impl Render for PlayheadOverlay {
         let (ruler_height, header_width) = (self.ruler_height, self.header_width);
         canvas(
             |_bounds, _window, _cx| (),
-            move |_bounds, (), window, cx| {
+            move |_bounds, (), window, _cx| {
                 let layout = layout.borrow();
                 let Some(timeline) = layout.timeline_bounds else {
                     return;
@@ -302,7 +301,6 @@ impl Render for PlayheadOverlay {
                 if lane_w <= 0.0 || x < -2.0 || x > lane_w + 2.0 {
                     return;
                 }
-                let color = Colors::timeline_playhead();
                 let line_x = lane_left + x;
 
                 let head = Bounds::new(
@@ -311,17 +309,11 @@ impl Render for PlayheadOverlay {
                 );
                 window.with_content_mask(Some(ContentMask { bounds: head }), |window| {
                     // Kept inside the ruler strip, as the head always was.
-                    let head_bounds = Bounds::new(
-                        point(px(line_x - 5.5), px(top + 2.0)),
-                        size(px(12.0), px(12.0)),
-                    );
-                    let _ = window.paint_svg(
-                        head_bounds,
-                        crate::assets::ICON_PLAYHEAD_HANDLE_PATH.into(),
-                        None,
-                        gpui::TransformationMatrix::unit(),
-                        color.into(),
-                        cx,
+                    crate::components::timeline::playhead::paint_playhead_head(
+                        window,
+                        line_x,
+                        top + 2.0,
+                        1.0,
                     );
                 });
 
@@ -347,13 +339,9 @@ impl Render for PlayheadOverlay {
                 window.with_content_mask(Some(ContentMask { bounds: body }), |window| {
                     window.paint_layer(body, |window| {
                         for (from, to) in visible_spans(line_x, body_top, bottom, &occluders) {
-                            window.paint_quad(fill(
-                                Bounds::new(
-                                    point(px(line_x), px(from)),
-                                    size(px(1.0), px(to - from)),
-                                ),
-                                color,
-                            ));
+                            crate::components::timeline::playhead::paint_playhead_line(
+                                window, line_x, from, to, 1.0,
+                            );
                         }
                     });
                 });

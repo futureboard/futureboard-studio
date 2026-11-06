@@ -17,11 +17,8 @@
 //! makes it move at all, and doing it here is what keeps it cheap.
 
 use gpui::{
-    canvas, div, fill, px, size, Bounds, Context, IntoElement, ParentElement, Pixels, Render,
-    Styled, Window,
+    canvas, div, Bounds, Context, IntoElement, ParentElement, Pixels, Render, Styled, Window,
 };
-
-use crate::theme::Colors;
 
 /// Where the piano roll's playhead is this frame, shared between the roll that
 /// computes it and the overlay that draws it.
@@ -61,10 +58,8 @@ impl Render for PianoRollPlayheadOverlay {
         crate::perf::count("piano_roll_playhead_paint_count", 1);
 
         let frame = self.frame.get();
-        let color = Colors::with_alpha(
-            Colors::status_warning(),
-            if frame.playing { 0.9 } else { 0.45 },
-        );
+        // The studio's playhead, dimmed while the transport is parked.
+        let alpha = if frame.playing { 1.0 } else { 0.5 };
         let x = frame.x;
         let visible = frame.visible;
 
@@ -85,11 +80,15 @@ impl Render for PianoRollPlayheadOverlay {
                     return;
                 }
                 window.paint_layer(bounds, |window| {
-                    let line_bounds = Bounds::new(
-                        bounds.origin + gpui::point(px(x), px(0.0)),
-                        size(px(1.0), px(h)),
+                    let left: f32 = bounds.origin.x.into();
+                    let top: f32 = bounds.origin.y.into();
+                    crate::components::timeline::playhead::paint_playhead_line(
+                        window,
+                        left + x,
+                        top,
+                        top + h,
+                        alpha,
                     );
-                    window.paint_quad(fill(line_bounds, color));
                 });
             },
         )

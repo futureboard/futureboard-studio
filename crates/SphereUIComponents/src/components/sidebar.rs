@@ -1299,7 +1299,6 @@ fn mini_waveform_canvas(
     );
     let limit_marker = Colors::border_strong();
     let played_shade = Colors::timeline_selection();
-    let playhead_color = Colors::timeline_playhead();
 
     let element = canvas(
         |_bounds, _window, _cx| {},
@@ -1372,13 +1371,15 @@ fn mini_waveform_canvas(
                         played_shade,
                     ));
                 }
-                window.paint_quad(fill(
-                    Bounds::new(
-                        bounds.origin + point(px(x.min(w - 1.0)), px(0.0)),
-                        gpui::size(px(1.0), px(h)),
-                    ),
-                    playhead_color,
-                ));
+                let left: f32 = bounds.origin.x.into();
+                let top: f32 = bounds.origin.y.into();
+                crate::components::timeline::playhead::paint_playhead_line(
+                    window,
+                    left + x.min(w - 1.0),
+                    top,
+                    top + h,
+                    1.0,
+                );
             }
         },
     )
