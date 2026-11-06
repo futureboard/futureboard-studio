@@ -474,6 +474,18 @@ pub fn scenes() -> Vec<Scene> {
             open: midi_tools_scene,
         },
         Scene {
+            name: "midi-drums",
+            width: 1_200.0,
+            height: 760.0,
+            open: midi_drums_scene,
+        },
+        Scene {
+            name: "midi-drums-used",
+            width: 1_200.0,
+            height: 760.0,
+            open: midi_drums_used_scene,
+        },
+        Scene {
             name: "midi-tools-pitch",
             width: 1_200.0,
             height: 760.0,
@@ -548,6 +560,24 @@ pub fn scenes() -> Vec<Scene> {
             open: inspector_folded_scene,
         },
         Scene {
+            name: "arrangement-meters",
+            width: 1_100.0,
+            height: 520.0,
+            open: arrangement_meters_scene,
+        },
+        Scene {
+            name: "automation",
+            width: 1_100.0,
+            height: 560.0,
+            open: automation_scene,
+        },
+        Scene {
+            name: "master-automation",
+            width: 1_100.0,
+            height: 560.0,
+            open: master_automation_scene,
+        },
+        Scene {
             name: "tool-bars",
             width: 900.0,
             height: 220.0,
@@ -576,6 +606,30 @@ pub fn scenes() -> Vec<Scene> {
             width: 1_040.0,
             height: 460.0,
             open: audio_connections_scene,
+        },
+        Scene {
+            name: "welcome",
+            width: 1_180.0,
+            height: 760.0,
+            open: welcome_scene,
+        },
+        Scene {
+            name: "process-explorer",
+            width: 920.0,
+            height: 560.0,
+            open: process_explorer_scene,
+        },
+        Scene {
+            name: "background-tasks",
+            width: 520.0,
+            height: 520.0,
+            open: background_tasks_scene,
+        },
+        Scene {
+            name: "virtual-keyboard",
+            width: 760.0,
+            height: 236.0,
+            open: virtual_keyboard_scene,
         },
         Scene {
             name: "audio-connections-empty",
@@ -1622,6 +1676,62 @@ fn preview_midi_timeline(
     }
 }
 
+/// The MIDI editor in drum mode, on a two-bar beat; `used` lists only the
+/// sounds the clip plays instead of the whole kit.
+fn open_midi_drums(options: WindowOptions, cx: &mut App, used: bool) -> Result<AnyWindowHandle> {
+    use crate::components::piano_roll::{DrumLanes, PianoRoll};
+    use crate::components::timeline::timeline::Timeline;
+    let handle = cx.open_window(options, move |_, cx| {
+        let timeline = cx.new(|_| {
+            let mut timeline = Timeline::new();
+            let state = &mut timeline.state;
+            let track = state.create_midi_track();
+            if let Some(clip) = state.create_midi_clip(&track, 0.0, 8.0) {
+                for bar in 0..2 {
+                    let at = bar as f32 * 4.0;
+                    for kick in [0.0, 1.5, 2.0] {
+                        state.add_midi_note(&clip, 36, at + kick, 0.25, 118);
+                    }
+                    for snare in [1.0, 3.0] {
+                        state.add_midi_note(&clip, 38, at + snare, 0.25, 104);
+                    }
+                    for step in 0..8 {
+                        let accent = if step % 2 == 0 { 96 } else { 64 };
+                        if bar == 1 && step == 7 {
+                            state.add_midi_note(&clip, 46, at + 3.5, 0.25, 92);
+                        } else {
+                            state.add_midi_note(&clip, 42, at + step as f32 * 0.5, 0.25, accent);
+                        }
+                    }
+                }
+                state.add_midi_note(&clip, 49, 0.0, 0.25, 110);
+                state.add_midi_note(&clip, 50, 7.25, 0.25, 90);
+                state.add_midi_note(&clip, 47, 7.5, 0.25, 96);
+                state.add_midi_note(&clip, 45, 7.75, 0.25, 100);
+                state.select_clip(&clip);
+            }
+            timeline
+        });
+        cx.new(|cx| {
+            let mut roll = PianoRoll::new(timeline, cx);
+            roll.set_drum_mode(true, cx);
+            if used {
+                roll.set_drum_lanes(DrumLanes::Used, cx);
+            }
+            roll
+        })
+    })?;
+    Ok(handle.into())
+}
+
+fn midi_drums_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_midi_drums(options, cx, false)
+}
+
+fn midi_drums_used_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_midi_drums(options, cx, true)
+}
+
 fn chords_roots() -> [u8; 4] {
     [0, 9, 5, 7]
 }
@@ -1746,6 +1856,146 @@ fn inspector_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHand
 fn inspector_folded_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
     let handle = cx.open_window(options, |_, cx| {
         cx.new(|cx| InspectorPreview::new(&["routing", "program", "mpe", "instrument"], cx))
+    })?;
+    Ok(handle.into())
+}
+
+/// The demo arrangement with its overlay layers, as the studio root stacks
+/// them, and levels on the tracks so the header meters show: quiet, healthy,
+/// hot and clipping.
+struct ArrangementMetersPreview {
+    timeline: gpui::Entity<crate::components::timeline::Timeline>,
+}
+
+impl gpui::Render for ArrangementMetersPreview {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+        use gpui::{div, ParentElement, Styled};
+        let overlays: Vec<gpui::AnyView> = self.timeline.update(cx, |timeline, cx| {
+            timeline.ensure_overlay_layers(cx);
+            timeline.overlay_layers().collect()
+        });
+        div()
+            .size_full()
+            .relative()
+            .flex()
+            .flex_col()
+            .child(
+                gpui::AnyView::from(self.timeline.clone())
+                    .cached(crate::components::timeline::Timeline::cached_style()),
+            )
+            .children(overlays)
+    }
+}
+
+fn arrangement_meters_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    let handle = cx.open_window(options, |_, cx| {
+        let timeline = cx.new(|_| {
+            let mut timeline = crate::components::timeline::Timeline::with_demo_content();
+            let levels = [
+                (0.05, 0.04),
+                (0.35, 0.3),
+                (0.62, 0.7),
+                (0.92, 1.0),
+                (0.2, 0.18),
+            ];
+            for (track, (l, r)) in timeline.state.tracks.iter_mut().zip(levels.iter().cycle()) {
+                track.meter_level_l = *l;
+                track.meter_level_r = *r;
+            }
+            timeline
+        });
+        cx.new(|_| ArrangementMetersPreview { timeline })
+    })?;
+    Ok(handle.into())
+}
+
+/// The demo arrangement with automation lanes shown on its first track:
+/// Volume reading a curve, Pan in Touch, Mute in Write while it records.
+fn automation_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    use crate::components::timeline::timeline_state::{AutomationMode, AutomationTarget};
+    let handle = cx.open_window(options, |_, cx| {
+        let timeline = cx.new(|_| {
+            let mut timeline = crate::components::timeline::Timeline::with_demo_content();
+            let state = &mut timeline.state;
+            let track_id = state.tracks[0].id.clone();
+            let volume = state
+                .ensure_automation_lane(&track_id, AutomationTarget::TrackVolume)
+                .unwrap();
+            for (beat, value) in [(0.0, 0.55), (4.0, 0.8), (8.0, 0.4), (12.0, 0.7)] {
+                state.add_automation_point(&track_id, &volume, beat, value);
+            }
+            let pan = state
+                .ensure_automation_lane(&track_id, AutomationTarget::TrackPan)
+                .unwrap();
+            for (beat, value) in [(0.0, 0.5), (6.0, 0.2), (10.0, 0.8)] {
+                state.add_automation_point(&track_id, &pan, beat, value);
+            }
+            let mute = state
+                .ensure_automation_lane(&track_id, AutomationTarget::TrackMute)
+                .unwrap();
+            let track = state.tracks.iter_mut().find(|t| t.id == track_id).unwrap();
+            track.lane_mode =
+                crate::components::timeline::timeline_state::TrackLaneMode::Automation;
+            for lane in &mut track.automation_lanes {
+                lane.visible = true;
+                if lane.id == pan {
+                    lane.mode = AutomationMode::Touch;
+                }
+                if lane.id == mute {
+                    lane.mode = AutomationMode::Write;
+                    lane.recording = true;
+                }
+            }
+            timeline
+        });
+        cx.new(|_| ArrangementMetersPreview { timeline })
+    })?;
+    Ok(handle.into())
+}
+
+/// The master's automation block after the last track: Volume in Read with a
+/// fade, and a second lane in Latch.
+fn master_automation_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    use crate::components::timeline::timeline_state::{
+        AutomationMode, AutomationTarget, MASTER_TRACK_ID,
+    };
+    let handle = cx.open_window(options, |_, cx| {
+        let timeline = cx.new(|_| {
+            let mut timeline = crate::components::timeline::Timeline::with_demo_content();
+            let state = &mut timeline.state;
+            state.toggle_track_lane_mode(MASTER_TRACK_ID);
+            let volume = state
+                .ensure_automation_lane(MASTER_TRACK_ID, AutomationTarget::TrackVolume)
+                .unwrap();
+            for (beat, value) in [(0.0, 0.72), (8.0, 0.72), (12.0, 0.5), (16.0, 0.0)] {
+                state.add_automation_point(MASTER_TRACK_ID, &volume, beat, value);
+            }
+            state.master.inserts.push(
+                crate::components::timeline::timeline_state::InsertSlotState {
+                    display_name: "Limiter".to_string(),
+                    ..crate::components::timeline::timeline_state::InsertSlotState::empty(
+                        "master-limiter",
+                    )
+                },
+            );
+            let bypass = state
+                .ensure_automation_lane(
+                    MASTER_TRACK_ID,
+                    AutomationTarget::InsertBypass {
+                        insert_id: "master-limiter".to_string(),
+                    },
+                )
+                .unwrap();
+            for (beat, value) in [(0.0, 0.0), (4.0, 1.0), (6.0, 0.0)] {
+                state.add_automation_point(MASTER_TRACK_ID, &bypass, beat, value);
+            }
+            state.set_automation_lane_mode(MASTER_TRACK_ID, &bypass, Some(AutomationMode::Latch));
+            // Scrolled so the last tracks and the master block are in view.
+            let layout = state.track_row_layout();
+            state.viewport.scroll_y = (layout.master_y - 220.0).max(0.0);
+            timeline
+        });
+        cx.new(|_| ArrangementMetersPreview { timeline })
     })?;
     Ok(handle.into())
 }
@@ -3118,4 +3368,302 @@ mod tests {
         let (frames, _) = zapp_telemetry(&zapp::default_params());
         assert!(frames.iter().any(|frame| frame.out_peak > 0.0));
     }
+}
+
+/// The Process Explorer with a session's worth of plug-ins.
+/// The Background Tasks popup over the status bar's corner, with a job in
+/// each state.
+fn background_tasks_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    use crate::components::background_tasks::{
+        now_ms, BackgroundTaskActions, BackgroundTaskKind, BackgroundTaskProgress,
+        BackgroundTaskStatus, BackgroundTaskStore, BackgroundTaskUpdate,
+    };
+    use crate::theme::Colors;
+    use gpui::{div, IntoElement, ParentElement, Render, Styled};
+    struct BackgroundTasksPreview {
+        store: BackgroundTaskStore,
+    }
+    impl Render for BackgroundTasksPreview {
+        fn render(&mut self, _w: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let noop: crate::components::BackgroundTaskToggleCb = Arc::new(|_, _, _| {});
+            let noop_id: crate::components::BackgroundTaskCancelCb = Arc::new(|_, _, _| {});
+            div()
+                .relative()
+                .size_full()
+                .font(crate::theme::ui_font())
+                .bg(Colors::surface_window())
+                .child(crate::components::background_task_panel(
+                    &self.store,
+                    BackgroundTaskActions {
+                        on_close: noop.clone(),
+                        on_cancel: noop_id.clone(),
+                        on_dismiss: noop_id,
+                        on_clear_finished: noop,
+                    },
+                ))
+        }
+    }
+    let mut store = BackgroundTaskStore::default();
+    let mut add = |id: &str,
+                   kind,
+                   title: &str,
+                   detail: Option<&str>,
+                   status,
+                   progress: Option<(u32, u32)>,
+                   error: Option<&str>,
+                   cancellable: bool,
+                   ran_for_ms: u64| {
+        store.add_or_update(
+            id,
+            BackgroundTaskUpdate {
+                kind,
+                title: title.to_string(),
+                detail: detail.map(str::to_string),
+                status: BackgroundTaskStatus::Running,
+                progress: progress
+                    .map(|(current, total)| BackgroundTaskProgress { current, total }),
+                error: None,
+                cancellable,
+                parent_id: None,
+            },
+        );
+        if status != BackgroundTaskStatus::Running {
+            store.add_or_update(
+                id,
+                BackgroundTaskUpdate {
+                    kind,
+                    title: title.to_string(),
+                    detail: detail.map(str::to_string),
+                    status,
+                    progress: None,
+                    error: error.map(str::to_string),
+                    cancellable: false,
+                    parent_id: None,
+                },
+            );
+        }
+        if let Some(task) = store.tasks.get_mut(id) {
+            let now = now_ms();
+            task.started_at = Some(now.saturating_sub(ran_for_ms + 9_000));
+            if task.finished_at.is_some() {
+                task.finished_at = Some(now.saturating_sub(9_000));
+            } else {
+                task.started_at = Some(now.saturating_sub(ran_for_ms));
+            }
+        }
+    };
+    add(
+        "render",
+        BackgroundTaskKind::Render,
+        "Export Mixdown",
+        Some("Lead Vox, Bass, Drums"),
+        BackgroundTaskStatus::Running,
+        Some((620, 1000)),
+        None,
+        true,
+        74_000,
+    );
+    add(
+        "ara",
+        BackgroundTaskKind::Analysis,
+        "ARA analysis",
+        Some("2 audio sources being analysed"),
+        BackgroundTaskStatus::Running,
+        None,
+        None,
+        false,
+        12_000,
+    );
+    add(
+        "import",
+        BackgroundTaskKind::Import,
+        "Import Gtr DI take 3.wav",
+        None,
+        BackgroundTaskStatus::Failed,
+        None,
+        Some("Could not read the file: unsupported sample format"),
+        false,
+        1_500,
+    );
+    add(
+        "scan",
+        BackgroundTaskKind::PluginLoad,
+        "Scan plug-ins",
+        Some("214 plug-ins, 2 failed"),
+        BackgroundTaskStatus::Complete,
+        None,
+        None,
+        false,
+        41_000,
+    );
+    add(
+        "stems",
+        BackgroundTaskKind::AudioProcess,
+        "Extract stems: Full Mix",
+        None,
+        BackgroundTaskStatus::Cancelled,
+        None,
+        None,
+        false,
+        6_000,
+    );
+    store.panel_open = true;
+    let handle = cx.open_window(options, |_, cx| {
+        cx.new(|_| BackgroundTasksPreview { store })
+    })?;
+    Ok(handle.into())
+}
+
+/// The modeless Virtual Keyboard window, with a chord held.
+fn virtual_keyboard_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    use crate::components::virtual_keyboard_window::VirtualKeyboardWindow;
+    use crate::components::VirtualKeyboardPanel;
+    let keyboard = cx.new(VirtualKeyboardPanel::new);
+    keyboard.update(cx, |keyboard, cx| {
+        keyboard.set_target_status(Some("Keys — Vital".to_string()), None);
+        for note in [60, 64, 67] {
+            keyboard.mouse_note_on(note, cx);
+        }
+    });
+    let handle = cx.open_window(options, move |_, cx| {
+        cx.new(|cx| {
+            VirtualKeyboardWindow::new(keyboard, Arc::new(|_, _| false), Arc::new(|_, _| {}), cx)
+        })
+    })?;
+    Ok(handle.into())
+}
+
+fn process_explorer_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    use crate::components::process_explorer_window::{
+        PluginKind, PluginProcessRow, ProcessExplorerReading, ProcessExplorerWindow,
+    };
+    let row =
+        |name: &str, vendor: Option<&str>, track: &str, color: u32, kind, pid, dsp, latency| {
+            PluginProcessRow {
+                insert_id: name.to_string(),
+                plugin_name: name.to_string(),
+                vendor: vendor.map(str::to_string),
+                track_name: track.to_string(),
+                track_color: gpui::rgb(color),
+                kind,
+                host_pid: pid,
+                dsp_load: dsp,
+                latency_samples: latency,
+                bypassed: false,
+                problem: None,
+            }
+        };
+    let mut rows = vec![
+        row(
+            "Melodyne",
+            Some("Celemony"),
+            "Lead Vox",
+            0x4f8fdc,
+            PluginKind::Vst3,
+            Some(14212),
+            Some(0.142),
+            0,
+        ),
+        row(
+            "Pro-Q 3",
+            Some("FabFilter"),
+            "Lead Vox",
+            0x4f8fdc,
+            PluginKind::Vst3,
+            Some(14212),
+            Some(0.031),
+            0,
+        ),
+        row(
+            "AirBoost",
+            None,
+            "Lead Vox",
+            0x4f8fdc,
+            PluginKind::BuiltIn,
+            None,
+            Some(0.004),
+            0,
+        ),
+        row(
+            "Vital",
+            Some("Matt Tytel"),
+            "Pad",
+            0x8f6fdc,
+            PluginKind::Vst3,
+            Some(15880),
+            Some(0.268),
+            0,
+        ),
+        row(
+            "Surge XT",
+            Some("Surge Synth Team"),
+            "Bass",
+            0x4fbf7f,
+            PluginKind::Clap,
+            Some(16004),
+            Some(0.087),
+            0,
+        ),
+        row(
+            "EchoSpace",
+            None,
+            "FX Return",
+            0x6f8f9f,
+            PluginKind::BuiltIn,
+            None,
+            Some(0.012),
+            0,
+        ),
+        row(
+            "BurnLimit",
+            None,
+            "Master",
+            0x9aa0a6,
+            PluginKind::BuiltIn,
+            None,
+            Some(0.009),
+            512,
+        ),
+        row(
+            "TDR Nova",
+            Some("Tokyo Dawn Records"),
+            "Drums",
+            0xd08f4f,
+            PluginKind::Vst2,
+            Some(16112),
+            None,
+            64,
+        ),
+    ];
+    rows[7].problem = Some("Loading".to_string());
+    rows[5].bypassed = true;
+    // A session's worth, so the list has to scroll.
+    for copy in 0..3 {
+        let mut more = rows[..8].to_vec();
+        for row in &mut more {
+            row.insert_id = format!("{}-{copy}", row.insert_id);
+        }
+        rows.extend(more);
+    }
+    let reading = ProcessExplorerReading {
+        rows,
+        sample_rate: 48_000,
+    };
+    let handle = cx.open_window(options, |_, cx| {
+        cx.new(|cx| ProcessExplorerWindow::preview(reading, cx))
+    })?;
+    Ok(handle.into())
+}
+
+/// The start screen, with this machine's own recent list and settings.
+fn welcome_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    use crate::welcome::{WelcomeCallbacks, WelcomeWindow};
+    let callbacks = WelcomeCallbacks {
+        on_action: std::sync::Arc::new(|_, _, _| {}),
+        footer_action: None,
+    };
+    let handle = cx.open_window(options, |_, cx| {
+        cx.new(|cx| WelcomeWindow::new(callbacks, cx.focus_handle()))
+    })?;
+    Ok(handle.into())
 }
