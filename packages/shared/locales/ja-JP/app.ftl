@@ -84,6 +84,7 @@ add-track.title = New Track
 ## Panels & Timeline
 
 bottom-panel.mix-level = Mix\: 80%
+bottom-panel.mixer-pop-out = ミキサーを別ウィンドウで開く
 bottom-panel.plugin.compressor = Compressor
 bottom-panel.plugin.delay = Delay Unit
 bottom-panel.plugin.equalizer = Equalizer
@@ -512,6 +513,7 @@ menu.window-lyric_editor_panel = 右ドックに歌詞エディター
 menu.window-maximize = 最大化
 menu.window-minimize = 最小化
 menu.window-performance = パフォーマンスモニター
+menu.window-process_explorer = プロセスエクスプローラー
 menu.window-virtual_speaker = バーチャルスピーカー
 menu.window-visualizer = ビジュアライザー
 menu.window-visualizer-spectrum = スペクトラム
