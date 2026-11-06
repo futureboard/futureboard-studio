@@ -1564,10 +1564,7 @@ impl Timeline {
         self.on_media_changed = callback;
     }
 
-    pub fn set_clip_gain_live_callback(
-        &mut self,
-        callback: Option<super::TimelineClipGainLiveCb>,
-    ) {
+    pub fn set_clip_gain_live_callback(&mut self, callback: Option<super::TimelineClipGainLiveCb>) {
         self.on_clip_gain_live = callback;
     }
 

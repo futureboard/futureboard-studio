@@ -1047,9 +1047,8 @@ impl StudioLayout {
         let app_chrome = cx.new(|cx| {
             shell_regions::AppChromeView::new(studio_entity.clone(), &timeline, &settings, cx)
         });
-        let classic_tool_strip = cx.new(|cx| {
-            components::timeline::tool_strip::ClassicToolStrip::new(&timeline, cx)
-        });
+        let classic_tool_strip =
+            cx.new(|cx| components::timeline::tool_strip::ClassicToolStrip::new(&timeline, cx));
         let chord_display_panel = cx.new(|cx| {
             components::SongTextPanelView::new(
                 timeline.clone(),

@@ -2007,8 +2007,7 @@ impl StudioLayout {
             eprintln!("[jam] this project has no tracks to share");
             return;
         }
-        let result =
-            crate::jam::run_action(|controller| controller.publish_multitrack(&tracks));
+        let result = crate::jam::run_action(|controller| controller.publish_multitrack(&tracks));
         if let Err(error) = result {
             eprintln!("[jam] multitrack share failed: {}", error.user_message());
         }
