@@ -226,6 +226,15 @@ pub struct AraGraph {
     pub sequences: Vec<AraRegionSequenceDesc>,
     /// Every ARA-managed clip.
     pub regions: Vec<AraPlaybackRegionDesc>,
+    /// Clips made from another one, `(copy, origin)`: a split's halves, a
+    /// duplicate, a pasted or Alt-dragged copy.
+    ///
+    /// A copy the document does not render yet, of a clip it does, gets its
+    /// modification cloned from the origin's (`cloneAudioModification`): it
+    /// starts with the origin's edits, and the origin keeps its own. A pair
+    /// whose copy is already rendered, or whose origin is not, is ignored, so
+    /// the list may name every copy the host remembers.
+    pub clones: Vec<(AraClipKey, AraClipKey)>,
 }
 
 impl AraGraph {
@@ -665,6 +674,7 @@ mod tests {
             sources: vec![source("asset-1")],
             sequences: vec![sequence("track-1")],
             regions: vec![region("clip-1", "asset-1", "track-1")],
+            ..AraGraph::default()
         };
         assert!(graph.validate().is_ok());
     }
@@ -845,6 +855,7 @@ mod tests {
                 region("clip-1", "asset-1", "track-1"),
                 region("clip-2", "asset-2", "track-1"),
             ],
+            ..AraGraph::default()
         }
     }
 

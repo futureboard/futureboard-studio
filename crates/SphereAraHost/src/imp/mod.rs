@@ -474,6 +474,14 @@ fn doomed_clips<'a>(
     doomed
 }
 
+/// The modification of a clip that is going while copies of it are built in
+/// the same edit cycle: kept until they are cloned from it.
+struct KeptModification {
+    handle: AudioModificationHandle,
+    address: usize,
+    source: AraSourceKey,
+}
+
 /// A restore settled before the plug-in is touched.
 struct PreparedRestore {
     plan: RestorePlan,
@@ -954,6 +962,17 @@ impl Session {
             }
         }
 
+        // Origins of copies built in this cycle. A split's original is going
+        // and being copied at once: its region goes now, but its modification
+        // stays until the halves are cloned from it below.
+        let clone_origins: HashSet<&AraClipKey> = graph
+            .clones
+            .iter()
+            .filter(|(copy, origin)| !clips.contains_key(copy) && clips.contains_key(origin))
+            .map(|(_, origin)| origin)
+            .collect();
+        let mut kept_modifications: HashMap<AraClipKey, KeptModification> = HashMap::new();
+
         // Teardown is leaf-first: regions, then modifications, then the sources
         // and sequences they referenced. A clip that moved to another source or
         // track goes here too and is created again below.
@@ -961,9 +980,20 @@ impl Session {
             if let Some(entry) = clips.remove(key) {
                 edit.destroy_playback_region(entry.region)
                     .map_err(map_error)?;
+                index.remove_region(entry.region_address);
+                if clone_origins.contains(key) && wanted_sources.contains(&entry.desc.source) {
+                    kept_modifications.insert(
+                        key.clone(),
+                        KeptModification {
+                            handle: entry.modification,
+                            address: entry.modification_address,
+                            source: entry.desc.source.clone(),
+                        },
+                    );
+                    continue;
+                }
                 edit.destroy_audio_modification(entry.modification)
                     .map_err(map_error)?;
-                index.remove_region(entry.region_address);
                 index.remove_modification(entry.modification_address);
             }
         }
@@ -1147,9 +1177,53 @@ impl Session {
                         &ara_persistent_id(desc.key.as_str()),
                     )
                     .map_err(map_error)?;
-                    let modification = edit
-                        .create_audio_modification(source, modification_properties)
-                        .map_err(map_error)?;
+                    // A copy starts from its origin's edits, on the same audio;
+                    // anything else, or a plug-in that refuses the clone, gets a
+                    // modification of its own.
+                    let origin = graph
+                        .clones
+                        .iter()
+                        .find(|(copy, _)| *copy == desc.key)
+                        .map(|(_, origin)| origin);
+                    let original = origin.and_then(|origin| {
+                        clips
+                            .get(origin)
+                            .filter(|entry| entry.desc.source == desc.source)
+                            .map(|entry| entry.modification)
+                            .or_else(|| {
+                                kept_modifications
+                                    .get(origin)
+                                    .filter(|kept| kept.source == desc.source)
+                                    .map(|kept| kept.handle)
+                            })
+                    });
+                    let cloned = original.and_then(|original| {
+                        match edit
+                            .clone_audio_modification(original, modification_properties.clone())
+                        {
+                            Ok(modification) => {
+                                trace(&format!(
+                                    "'{}' cloned the modification of '{}'",
+                                    desc.key.as_str(),
+                                    origin.map_or("", |origin| origin.as_str())
+                                ));
+                                Some(modification)
+                            }
+                            Err(error) => {
+                                trace(&format!(
+                                    "'{}' could not clone its origin's modification: {error}",
+                                    desc.key.as_str()
+                                ));
+                                None
+                            }
+                        }
+                    });
+                    let modification = match cloned {
+                        Some(modification) => modification,
+                        None => edit
+                            .create_audio_modification(source, modification_properties)
+                            .map_err(map_error)?,
+                    };
                     let modification_address = edit
                         .audio_modification_ref(modification)
                         .map_err(map_error)?
@@ -1175,6 +1249,13 @@ impl Session {
                     );
                 }
             }
+        }
+
+        // The copies are built: the modifications kept for them go now.
+        for kept in kept_modifications.into_values() {
+            edit.destroy_audio_modification(kept.handle)
+                .map_err(map_error)?;
+            index.remove_modification(kept.address);
         }
 
         // The graph is whole: its archived state goes in now, before the

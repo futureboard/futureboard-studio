@@ -511,6 +511,7 @@ mod tests {
                 .iter()
                 .map(|(clip, source)| region(clip, source))
                 .collect(),
+            clones: Vec::new(),
         }
     }
 

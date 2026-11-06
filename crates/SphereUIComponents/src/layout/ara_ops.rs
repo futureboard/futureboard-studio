@@ -1943,6 +1943,11 @@ impl AraState {
                 .iter()
                 .filter(|(copy, origin)| {
                     session.clips.contains(origin)
+                        // A copy in this document clones its origin's
+                        // modification as it is built (`AraGraph::clones`).
+                        // Restoring the stored source onto it instead reset
+                        // the origin's own edits on that source.
+                        && !on_track.contains(copy.as_str())
                         && !held_anywhere.contains(copy)
                         && !self.inherited.iter().any(|held| held.clip == *copy)
                         && !self.departed.iter().any(|held| held.clip == *copy)
@@ -4161,6 +4166,7 @@ mod tests {
                 .iter()
                 .map(|(clip, source)| region_desc(clip, source))
                 .collect(),
+            clones: Vec::new(),
         }
     }
 
@@ -4622,11 +4628,12 @@ mod tests {
     }
 
     /// The user's report: a split clip's halves opened empty in Melodyne.
-    /// Both halves get new ids, so each takes over the original's
-    /// modification, restored onto it from the document stored as the
-    /// original left, one restore per half.
+    /// Both halves are in the original's document, so each clones the
+    /// original's modification as it is built (`AraGraph::clones`): no
+    /// stored document is restored onto them, which is what used to reset
+    /// edits on the same audio.
     #[test]
-    fn a_split_clip_gives_its_edits_to_both_halves() {
+    fn a_split_clip_in_its_document_clones_rather_than_restores() {
         let mut state = AraState::default();
         let key = evidence_key();
         let script = open_fake(&mut state, &key);
@@ -4639,6 +4646,8 @@ mod tests {
             &on_track(&["clip-2", "clip-3"]),
             &copies(&[("clip-2", "clip-1"), ("clip-3", "clip-1")]),
         );
+        assert!(state.inherited.is_empty(), "the halves clone instead");
+        let placed_before = script.borrow().placed.len();
         sync(
             &mut state,
             &key,
@@ -4646,32 +4655,25 @@ mod tests {
             &[],
         )
         .unwrap();
-
         let script = script.borrow();
-        let build = script.builds.last().expect("the split rebuilt the graph");
-        let source = ara_persistent_id(SOURCE).into_owned();
-        assert_eq!(build.len(), 2, "one restore per half");
-        for asked in build {
-            assert_eq!(asked.data, b"edited".to_vec());
-            assert!(asked.mapped);
-            assert_eq!(asked.part, Some((vec![source.clone()], false)));
-        }
-        let original = ara_persistent_id("clip-1").into_owned();
-        let placed = &script.placed[script.placed.len() - 2..];
         assert_eq!(
-            placed,
-            &[
-                vec![(original.clone(), AraClipKey::from("clip-2"))],
-                vec![(original, AraClipKey::from("clip-3"))],
-            ]
+            script.placed.len(),
+            placed_before,
+            "nothing restored onto the halves"
         );
+        assert!(script
+            .builds
+            .last()
+            .is_none_or(|build| build.iter().all(|asked| asked.data != b"edited".to_vec())));
     }
 
-    /// A duplicate, a pasted or an Alt-dragged copy: the original stays, and
-    /// the copy starts from its edits rather than from nothing. Once it has
-    /// them it is the session's own clip, and later syncs leave it alone.
+    /// The user's report: an Alt-dragged copy worked, and the clip it was
+    /// copied from lost its Melodyne edits. Restoring the stored source onto
+    /// the copy reset the original's modification on that source. A copy in
+    /// the same document now clones the original's modification, and the
+    /// original is not touched.
     #[test]
-    fn a_copy_starts_from_its_originals_edits_once() {
+    fn a_copy_in_its_originals_document_leaves_the_original_alone() {
         let mut state = AraState::default();
         let key = evidence_key();
         let script = open_fake(&mut state, &key);
@@ -4681,23 +4683,35 @@ mod tests {
         let graph = track_graph(&[("clip-1", SOURCE), ("clip-2", SOURCE)]);
 
         state.capture_departures(&key, &on_track(&["clip-1", "clip-2"]), &lineage);
+        assert!(state.inherited.is_empty());
+        let placed_before = script.borrow().placed.len();
         sync(&mut state, &key, &graph, &[]).unwrap();
         assert_eq!(
-            script.borrow().placed.last(),
-            Some(&vec![(
-                ara_persistent_id("clip-1").into_owned(),
-                AraClipKey::from("clip-2")
-            )])
+            script.borrow().placed.len(),
+            placed_before,
+            "no stored document is restored for the copy"
         );
+    }
 
-        let builds = script.borrow().builds.len();
-        state.capture_departures(&key, &on_track(&["clip-1", "clip-2"]), &lineage);
-        sync(&mut state, &key, &graph, &[]).unwrap();
-        let script = script.borrow();
-        assert!(
-            script.builds.len() == builds || script.builds.last().is_some_and(Vec::is_empty),
-            "nothing is restored onto the copy a second time"
+    /// A copy that lands outside its original's document (on a track the
+    /// document does not render) still takes the original's state from the
+    /// stored document, as before: there is no live modification to clone
+    /// there.
+    #[test]
+    fn a_copy_outside_its_originals_document_still_inherits() {
+        let mut state = AraState::default();
+        let key = evidence_key();
+        let _script = open_fake(&mut state, &key);
+        sync(&mut state, &key, &track_graph(&[("clip-1", SOURCE)]), &[]).unwrap();
+        _script.borrow_mut().stored_identity = host_record(&[("clip-1", SOURCE)]);
+
+        state.capture_departures(
+            &key,
+            &on_track(&["clip-1"]),
+            &copies(&[("clip-2", "clip-1")]),
         );
+        assert_eq!(state.inherited.len(), 1);
+        assert_eq!(state.inherited[0].clip, AraClipKey::from("clip-2"));
     }
 
     /// A copy of a clip the plug-in never saw (no modification in its

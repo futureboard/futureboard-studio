@@ -253,6 +253,7 @@ pub fn document_view(
     let mut regions: Vec<AraPlaybackRegionDesc> = Vec::new();
     let mut sequences: Vec<AraRegionSequenceDesc> = Vec::new();
     let mut offline: Vec<(AraClipKey, AraSourceKey)> = Vec::new();
+    let mut clones: Vec<(AraClipKey, AraClipKey)> = Vec::new();
     let base_bpm = state.bpm.max(1.0) as f64;
 
     let mut lead_name: Option<String> = None;
@@ -319,6 +320,10 @@ pub fn document_view(
             );
             let duration_in_playback = (end_in_playback - start_in_playback).max(f64::EPSILON);
 
+            // A copy starts from its origin's edits (see `AraGraph::clones`).
+            if let Some(origin) = state.clip_lineage.origin_of(&clip.id) {
+                clones.push((AraClipKey(clip.id.clone()), AraClipKey(origin)));
+            }
             regions.push(AraPlaybackRegionDesc {
                 key: AraClipKey(clip.id.clone()),
                 source: source_key,
@@ -355,7 +360,7 @@ pub fn document_view(
             sources: sources.into_values().collect(),
             sequences,
             regions,
-            ..AraGraph::default()
+            clones,
         },
         media_paths,
         offline,
@@ -444,6 +449,31 @@ mod tests {
             .expect("the second track's clip");
         assert_eq!(harmony.track, AraTrackKey(second));
         assert_eq!(view.graph.name.as_deref(), Some("Futureboard"));
+    }
+
+    /// An Alt-dragged copy is described as a copy of its original, so the
+    /// host clones the original's modification for it and leaves the
+    /// original's edits as they are.
+    #[test]
+    fn a_copied_clip_is_listed_as_a_clone_of_its_original() {
+        let mut state = timeline_with_ara_track();
+        let original = state.tracks[0].clips[0].clone();
+        let copy = state.clone_clip_for_insert(
+            &original,
+            "clip-2".to_string(),
+            "Take 1 Copy".into(),
+            16.0,
+        );
+        state.tracks[0].clips.push(copy);
+
+        let mut shape = |_: &str| Some((48_000.0, 192_000, 2));
+        let view = project_view(&state, &key(&state), &mut shape);
+
+        assert_eq!(view.graph.regions.len(), 2);
+        assert_eq!(
+            view.graph.clones,
+            vec![(AraClipKey::from("clip-2"), AraClipKey::from("clip-1"))]
+        );
     }
 
     #[test]
