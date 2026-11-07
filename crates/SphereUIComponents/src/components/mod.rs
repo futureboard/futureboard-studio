@@ -97,7 +97,7 @@ pub mod gate_model;
 pub mod gate_panel;
 pub mod gpu_editor_diagnostics;
 #[cfg(feature = "builtin-plugin-editor")]
-pub mod imager_panel;
+pub mod imager_plate;
 pub mod inspector_kit;
 #[cfg(feature = "builtin-plugin-editor")]
 pub mod mix_station_model;

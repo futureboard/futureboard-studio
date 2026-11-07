@@ -99,6 +99,40 @@ impl Split {
     }
 }
 
+/// Two bands out of one signal: one 4th-order Linkwitz–Riley split. The low
+/// and high outputs sum to a 2nd-order all-pass at `hz`, so a caller that
+/// drops part of one band can run its other signals through the same split
+/// and sum both outputs to keep every path on the same phase.
+///
+/// `hz` must already be held inside what a biquad can be tuned to at the
+/// sample rate.
+#[derive(Debug, Clone)]
+pub struct TwoBandSplitter {
+    split: Split,
+}
+
+impl TwoBandSplitter {
+    pub fn new(hz: f32, sample_rate: f32) -> Self {
+        Self {
+            split: Split::new(hz, sample_rate),
+        }
+    }
+
+    pub fn retune(&mut self, hz: f32, sample_rate: f32) {
+        self.split.retune(hz, sample_rate);
+    }
+
+    /// `(low, high)`.
+    #[inline]
+    pub fn run(&mut self, x: f32) -> (f32, f32) {
+        self.split.run(x)
+    }
+
+    pub fn reset(&mut self) {
+        self.split.reset();
+    }
+}
+
 /// Four bands out of one signal.
 ///
 /// The middle crossover splits first; each half is split again at its own

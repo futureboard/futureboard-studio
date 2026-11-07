@@ -138,6 +138,12 @@ pub(crate) struct PluginEditorWindows {
         String,
         gpui::WindowHandle<crate::components::zapp_plate::ZappWindow>,
     >,
+    /// Open native Imager editors, keyed by insert id, like `quick_sampler`.
+    #[cfg(feature = "builtin-plugin-editor")]
+    pub imager: std::collections::HashMap<
+        String,
+        gpui::WindowHandle<crate::components::imager_plate::ImagerWindow>,
+    >,
     /// Open native AirBoost editors, keyed by insert id, like `quick_sampler`.
     #[cfg(feature = "builtin-plugin-editor")]
     pub airboost: std::collections::HashMap<
@@ -185,7 +191,7 @@ pub(crate) struct PluginEditorWindows {
         String,
         gpui::WindowHandle<crate::components::gate_panel::WayGateEditorWindow>,
     >,
-    /// Open native Compressor and Imager editors (one window type for both),
+    /// Open native Compressor editors,
     /// keyed by insert id, like `quick_sampler`.
     #[cfg(feature = "builtin-plugin-editor")]
     pub bands: std::collections::HashMap<
@@ -3400,8 +3406,8 @@ impl StudioLayout {
                 cx,
             ),
             Some(imager::ui::UI_ORIGIN) => self.open_native_editor(
-                |windows| &mut windows.bands,
-                crate::components::band_panel::open_imager_editor,
+                |windows| &mut windows.imager,
+                crate::components::imager_plate::open_imager_editor,
                 (target, identity, host_ops),
                 window,
                 cx,
@@ -3580,6 +3586,10 @@ impl StudioLayout {
             }
             let saturators: Vec<_> = self.plugin_editors.zapp.values().copied().collect();
             for handle in saturators {
+                let _ = handle.update(cx, |editor, _window, cx| editor.sync_from_mirror(cx));
+            }
+            let imagers: Vec<_> = self.plugin_editors.imager.values().copied().collect();
+            for handle in imagers {
                 let _ = handle.update(cx, |editor, _window, cx| editor.sync_from_mirror(cx));
             }
             let air_eqs: Vec<_> = self.plugin_editors.airboost.values().copied().collect();

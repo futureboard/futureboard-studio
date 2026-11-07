@@ -15,6 +15,12 @@
 //! decorrelated so it does not comb against what is there, instead of
 //! letting it vanish.
 //!
+//! A band can be bypassed — left as it came in — and a global width offset
+//! moves every other band's width together. *Mono Bass* folds the summed
+//! side below its own crossover to mono: mid and side both run through one
+//! more Linkwitz–Riley split there, the side keeps only its high band and the
+//! mid takes both back, so the two stay on the same all-pass.
+//!
 //! Splitting mid as well as side is what makes the plugin transparent at rest:
 //! the two see the identical phase response, so with every width at 100 % the
 //! output is the input through one shared all-pass — no comb, no level change,
@@ -27,6 +33,7 @@
 //! arithmetic on them.
 
 use builtin_dsp_core::crossover::FourBandSplitter as BandSplitter;
+use builtin_dsp_core::crossover::TwoBandSplitter;
 use builtin_dsp_core::delay::{Allpass, DelayRing};
 use builtin_dsp_core::{
     ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, clamp, db_to_linear,
@@ -36,6 +43,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod ipc;
 pub mod presets;
+pub mod telemetry;
 pub mod ui;
 
 /// Editor-facing parameter id table, re-exported at the crate root so the host
@@ -118,6 +126,16 @@ pub const SOLO_NONE: i32 = -1;
 pub const MIN_OUTPUT_DB: f32 = -24.0;
 pub const MAX_OUTPUT_DB: f32 = 12.0;
 
+/// The global width offset, in the same percent of side as a band's width:
+/// added to every band, so −100 folds everything to mono and +100 doubles
+/// what each band has.
+pub const MAX_GLOBAL_WIDTH: f32 = 100.0;
+
+/// Mono Bass: the side below this crossover is folded away.
+pub const MIN_MONO_BASS_HZ: f32 = 20.0;
+pub const MAX_MONO_BASS_HZ: f32 = 500.0;
+pub const DEFAULT_MONO_BASS_HZ: f32 = 80.0;
+
 /// Output samples the vectorscope keeps, as left/right pairs.
 pub const SCOPE_POINTS: usize = 128;
 /// Output samples between two scope points. 128 × 12 = 1536 samples, so a
@@ -167,10 +185,27 @@ pub struct Params {
     /// band's settings, and the plugin works on the signal whole.
     #[serde(default = "multiband_default")]
     pub multiband: bool,
+    /// Per band, left as it came in: its width, stereoize and the global
+    /// offset all stand aside. A blob saved before band bypass existed loads
+    /// with none bypassed.
+    #[serde(default)]
+    pub band_bypass: [bool; BAND_COUNT],
+    /// Offset on every band's width, −[`MAX_GLOBAL_WIDTH`] … +100.
+    #[serde(default)]
+    pub global_width: f32,
+    /// Fold the side below [`Params::mono_bass_hz`] to mono.
+    #[serde(default)]
+    pub mono_bass: bool,
+    #[serde(default = "mono_bass_hz_default")]
+    pub mono_bass_hz: f32,
 }
 
 const fn multiband_default() -> bool {
     true
+}
+
+const fn mono_bass_hz_default() -> f32 {
+    DEFAULT_MONO_BASS_HZ
 }
 
 pub fn default_params() -> Params {
@@ -184,6 +219,10 @@ pub fn default_params() -> Params {
         stereoize_mode: StereoizeMode::One,
         recover_sides: false,
         multiband: true,
+        band_bypass: [false; BAND_COUNT],
+        global_width: 0.0,
+        mono_bass: false,
+        mono_bass_hz: DEFAULT_MONO_BASS_HZ,
     }
 }
 
@@ -216,6 +255,16 @@ pub fn descriptor() -> PluginDescriptor {
             min: 0.0,
             max: MAX_STEREOIZE,
             unit: "%",
+        }
+    }
+    const fn toggle(id: &'static str, name: &'static str) -> ParamDescriptor {
+        ParamDescriptor {
+            id,
+            name,
+            default_value: 0.0,
+            min: 0.0,
+            max: 1.0,
+            unit: "bool",
         }
     }
     // A const so the table is a 'static promotion — the helper calls
@@ -280,6 +329,27 @@ pub fn descriptor() -> PluginDescriptor {
             max: 1.0,
             unit: "bool",
         },
+        toggle("bypass1", "Bypass 1"),
+        toggle("bypass2", "Bypass 2"),
+        toggle("bypass3", "Bypass 3"),
+        toggle("bypass4", "Bypass 4"),
+        ParamDescriptor {
+            id: "globalWidth",
+            name: "Global Width",
+            default_value: 0.0,
+            min: -MAX_GLOBAL_WIDTH,
+            max: MAX_GLOBAL_WIDTH,
+            unit: "%",
+        },
+        toggle("monoBass", "Mono Bass"),
+        ParamDescriptor {
+            id: "monoBassHz",
+            name: "Mono Bass Below",
+            default_value: DEFAULT_MONO_BASS_HZ,
+            min: MIN_MONO_BASS_HZ,
+            max: MAX_MONO_BASS_HZ,
+            unit: "Hz",
+        },
     ];
     PluginDescriptor {
         id: PLUGIN_ID,
@@ -300,6 +370,12 @@ pub fn effective_crossovers(params: &Params, sample_rate: f32) -> [f32; CROSSOVE
         .map(|f| clamp(f, MIN_CROSSOVER_HZ, ceiling));
     hz.sort_by(f32::total_cmp);
     hz
+}
+
+/// The Mono Bass crossover the filters actually run at.
+pub fn mono_bass_hz(params: &Params, sample_rate: f32) -> f32 {
+    let ceiling = max_filter_frequency(sample_rate).min(MAX_MONO_BASS_HZ);
+    clamp(params.mono_bass_hz, MIN_MONO_BASS_HZ, ceiling)
 }
 
 /// Running left/right statistics for one correlation meter.
@@ -515,6 +591,11 @@ pub struct Dsp {
     /// switch (0 or 1).
     stereoize_gain: [f32; BAND_COUNT],
     recover_gain: f32,
+    /// Mono Bass: the split mid and side both pass through, and the fade in
+    /// and out of it. Off and settled, neither runs.
+    bass_mid: TwoBandSplitter,
+    bass_side: TwoBandSplitter,
+    mono: Fade,
 
     /// Side gain per band, gliding toward `params.width`.
     width_gain: [f32; BAND_COUNT],
@@ -549,6 +630,9 @@ impl Dsp {
             spread: std::array::from_fn(|band| BandSpread::new(band, sr)),
             stereoize_gain: [0.0; BAND_COUNT],
             recover_gain: 0.0,
+            bass_mid: TwoBandSplitter::new(mono_bass_hz(&params, sr), sr),
+            bass_side: TwoBandSplitter::new(mono_bass_hz(&params, sr), sr),
+            mono: Fade::new(params.mono_bass, sr),
             width_gain: params.width.map(|w| w / 100.0),
             output_gain: 1.0,
             output_target: 1.0,
@@ -609,6 +693,7 @@ impl Dsp {
                 self.retune()
             }
             ipc::OUTPUT_INDEX => self.output_target = db_to_linear(self.params.output_db),
+            ipc::MONO_BASS_HZ_INDEX => self.retune_bass(),
             // Widths are read by the smoother and solo/power straight off
             // `params` in `process_stereo`.
             _ => {}
@@ -673,14 +758,28 @@ impl Dsp {
         if self.params.multiband { band } else { 0 }
     }
 
+    /// The side gain `band` plays at: its width plus the global offset, or
+    /// unchanged while it is bypassed.
     #[inline]
     fn band_width(&self, band: usize) -> f32 {
-        self.params.width[self.source_band(band)] * 0.01
+        let source = self.source_band(band);
+        if self.params.band_bypass[source] {
+            return 1.0;
+        }
+        clamp(
+            self.params.width[source] + self.params.global_width,
+            0.0,
+            MAX_WIDTH,
+        ) * 0.01
     }
 
     #[inline]
     fn band_stereoize(&self, band: usize) -> f32 {
-        self.params.stereoize[self.source_band(band)] / MAX_STEREOIZE
+        let source = self.source_band(band);
+        if self.params.band_bypass[source] {
+            return 0.0;
+        }
+        self.params.stereoize[source] / MAX_STEREOIZE
     }
 
     /// Points Power and the band gains at what `params` asks for. Waking from
@@ -693,15 +792,26 @@ impl Dsp {
             for spread in &mut self.spread {
                 spread.clear();
             }
+            self.bass_mid.reset();
+            self.bass_side.reset();
             self.power.set(true);
             self.band_targets();
             for gain in &mut self.band_gain {
                 gain.settle();
             }
+            self.mono.set(self.params.mono_bass);
+            self.mono.settle();
             return;
         }
         self.power.set(self.params.power);
         self.band_targets();
+        if self.params.mono_bass && self.mono.is_off() {
+            // Woken from settled off: the split starts from silence rather
+            // than from whatever it last held.
+            self.bass_mid.reset();
+            self.bass_side.reset();
+        }
+        self.mono.set(self.params.mono_bass);
     }
 
     fn band_targets(&mut self) {
@@ -720,7 +830,9 @@ impl Dsp {
     fn settle_switches(&mut self) {
         self.power.set(self.params.power);
         self.band_targets();
+        self.mono.set(self.params.mono_bass);
         self.power.settle();
+        self.mono.settle();
         for gain in &mut self.band_gain {
             gain.settle();
         }
@@ -730,6 +842,13 @@ impl Dsp {
         let hz = effective_crossovers(&self.params, self.sample_rate);
         self.mid.retune(hz, self.sample_rate);
         self.side.retune(hz, self.sample_rate);
+        self.retune_bass();
+    }
+
+    fn retune_bass(&mut self) {
+        let hz = mono_bass_hz(&self.params, self.sample_rate);
+        self.bass_mid.retune(hz, self.sample_rate);
+        self.bass_side.retune(hz, self.sample_rate);
     }
 
     fn update_time_constants(&mut self) {
@@ -761,6 +880,8 @@ impl StereoEffect for Dsp {
     fn reset(&mut self) {
         self.mid.reset();
         self.side.reset();
+        self.bass_mid.reset();
+        self.bass_side.reset();
         for spread in &mut self.spread {
             spread.clear();
         }
@@ -787,6 +908,7 @@ impl StereoEffect for Dsp {
         self.update_time_constants();
         let step = Fade::step_for(sr);
         self.power.step = step;
+        self.mono.step = step;
         for gain in &mut self.band_gain {
             gain.step = step;
         }
@@ -794,6 +916,9 @@ impl StereoEffect for Dsp {
         let hz = effective_crossovers(&self.params, sr);
         self.mid = BandSplitter::new(hz, sr);
         self.side = BandSplitter::new(hz, sr);
+        let bass = mono_bass_hz(&self.params, sr);
+        self.bass_mid = TwoBandSplitter::new(bass, sr);
+        self.bass_side = TwoBandSplitter::new(bass, sr);
         // Off the audio path: a rate change rebuilds the decorrelators at
         // lengths for the new rate.
         self.spread = std::array::from_fn(|band| BandSpread::new(band, sr));
@@ -863,11 +988,30 @@ impl Dsp {
             mid_out += band_mid * heard;
             side_out += band_side * heard;
         }
+        let (mid_out, side_out) = self.fold_bass(mid_out, side_out);
 
         self.output_gain += (self.output_target - self.output_gain) * glide;
         let out_l = (mid_out + side_out) * self.output_gain;
         let out_r = (mid_out - side_out) * self.output_gain;
         (out_l, out_r)
+    }
+
+    /// Mono Bass on the summed mid and side: the side loses its low band,
+    /// the mid takes its own two back — the same all-pass on both. Faded
+    /// in and out; off and settled, the signal passes untouched.
+    #[inline]
+    fn fold_bass(&mut self, mid: f32, side: f32) -> (f32, f32) {
+        if self.mono.is_off() {
+            return (mid, side);
+        }
+        let on = self.mono.next();
+        let (mid_low, mid_high) = self.bass_mid.run(mid);
+        let (_, side_high) = self.bass_side.run(side);
+        let folded_mid = mid_low + mid_high;
+        (
+            mid + (folded_mid - mid) * on,
+            side + (side_high - side) * on,
+        )
     }
 }
 
@@ -1334,5 +1478,94 @@ mod tests {
             }
         }
         assert!((peak - 0.5).abs() < 0.01, "{peak}");
+    }
+
+    fn with(edit: impl FnOnce(&mut Params)) -> Dsp {
+        let mut params = default_params();
+        edit(&mut params);
+        let mut dsp = Dsp::new(RATE);
+        dsp.set_params(params);
+        dsp
+    }
+
+    /// Side alone (left = −right): what is left of it at `hz`, as a share of
+    /// what went in.
+    fn side_kept(dsp: &mut Dsp, hz: f32) -> f32 {
+        let (l, r) = sine_gain(dsp, hz, 0.5, -0.5);
+        0.5 * (l + r) / 0.5
+    }
+
+    /// Mono Bass takes the side out below its crossover and leaves it above.
+    #[test]
+    fn mono_bass_folds_only_the_lows() {
+        let mut dsp = with(|p| {
+            p.mono_bass = true;
+            p.mono_bass_hz = 120.0;
+        });
+        let low = side_kept(&mut dsp, 30.0);
+        let high = side_kept(&mut dsp, 2_000.0);
+        assert!(low < 0.05, "30 Hz side kept {low}");
+        assert!((high - 1.0).abs() < 0.03, "2 kHz side kept {high}");
+    }
+
+    /// The mid passes Mono Bass at its level everywhere: only side is lost.
+    #[test]
+    fn mono_bass_leaves_the_mid_alone() {
+        let mut dsp = with(|p| p.mono_bass = true);
+        for hz in [30.0, 80.0, 300.0, 4_000.0] {
+            let (l, r) = sine_gain(&mut dsp, hz, 0.5, 0.5);
+            assert!(
+                (l - 0.5).abs() < 0.01 && (r - 0.5).abs() < 0.01,
+                "{hz} Hz: {l}, {r}"
+            );
+        }
+    }
+
+    /// A bypassed band plays as it came in, whatever its width and the
+    /// global offset say; the others still take both.
+    #[test]
+    fn a_bypassed_band_ignores_its_width_and_the_global_offset() {
+        let mut dsp = with(|p| {
+            p.width = [0.0, 0.0, 0.0, 0.0];
+            p.global_width = -50.0;
+            p.band_bypass = [false, false, true, false];
+        });
+        let bypassed = side_kept(&mut dsp, 2_500.0);
+        let narrowed = side_kept(&mut dsp, 400.0);
+        assert!(
+            (bypassed - 1.0).abs() < 0.05,
+            "bypassed band kept {bypassed}"
+        );
+        assert!(narrowed < 0.05, "narrowed band kept {narrowed}");
+    }
+
+    /// The global offset adds to every band's width, held to the range.
+    #[test]
+    fn the_global_width_offsets_every_band() {
+        let mut dsp = with(|p| {
+            p.width = [100.0, 150.0, 100.0, 100.0];
+            p.global_width = -50.0;
+        });
+        let low = side_kept(&mut dsp, 40.0);
+        let low_mid = side_kept(&mut dsp, 400.0);
+        assert!((low - 0.5).abs() < 0.05, "low kept {low}");
+        assert!((low_mid - 1.0).abs() < 0.05, "low mid kept {low_mid}");
+        let mut dsp = with(|p| p.global_width = -100.0);
+        assert!(side_kept(&mut dsp, 2_500.0) < 0.02);
+    }
+
+    /// Mono Bass crossfades in and out rather than switching a filter in.
+    #[test]
+    fn switching_mono_bass_does_not_step() {
+        let fresh = || with(|p| p.width = [80.0, 120.0, 100.0, 100.0]);
+        let frames = 96_000;
+        let still = worst_kink(&mut fresh(), frames, |_, _| {});
+        let mono = worst_kink(&mut fresh(), frames, |dsp, n| {
+            if n % 12_000 == 0 {
+                let on = (n / 12_000) % 2 == 0;
+                assert!(dsp.apply_wire_param(ipc::MONO_BASS_INDEX, if on { 1.0 } else { 0.0 }));
+            }
+        });
+        assert!(mono < still * 2.0, "mono bass: {mono} against {still}");
     }
 }

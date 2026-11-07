@@ -144,8 +144,8 @@ fn open_builtin(
     cx: &mut Context<LiveStageApp>,
 ) {
     use sphere_ui_components::components::{
-        band_panel, dyn_panel, eq_window, fx_window, gate_panel, mix_station_panel,
-        rodhareist_window, white_sharp_window,
+        band_panel, burn_limit_plate, dyn_panel, equz8_plate, equzx_plate, fx_window, gate_panel,
+        imager_plate, mix_station_panel, rodhareist_window, white_sharp_window,
     };
 
     let key = PluginInstanceKey {
@@ -206,19 +206,19 @@ fn open_builtin(
     let args = (owner_bounds, key, identity, host_ops, on_close);
     let (b, k, i, h, c) = args;
     let opened = match stem {
-        "equz8" => open(eq_window::open_equz8_editor, b, k, i, h, c, cx),
-        "equzx" => open(eq_window::open_equzx_editor, b, k, i, h, c, cx),
+        "equz8" => open(equz8_plate::open_equz8_editor, b, k, i, h, c, cx),
+        "equzx" => open(equzx_plate::open_equzx_editor, b, k, i, h, c, cx),
         "verbspace" => open(fx_window::open_verbspace_editor, b, k, i, h, c, cx),
         "echospace" => open(fx_window::open_echospace_editor, b, k, i, h, c, cx),
         "fa2a" => open(dyn_panel::open_fa2a_editor, b, k, i, h, c, cx),
         "fa76" => open(dyn_panel::open_fa76_editor, b, k, i, h, c, cx),
         "zcomp" => open(dyn_panel::open_zcomp_editor, b, k, i, h, c, cx),
-        "burnlimit" => open(dyn_panel::open_burnlimit_editor, b, k, i, h, c, cx),
+        "burnlimit" => open(burn_limit_plate::open_burnlimit_editor, b, k, i, h, c, cx),
         "clipper67" => open(dyn_panel::open_clipper67_editor, b, k, i, h, c, cx),
         "transient" => open(dyn_panel::open_transient_editor, b, k, i, h, c, cx),
         "waygate" => open(gate_panel::open_waygate_editor, b, k, i, h, c, cx),
         "compresser" => open(band_panel::open_compresser_editor, b, k, i, h, c, cx),
-        "imager" => open(band_panel::open_imager_editor, b, k, i, h, c, cx),
+        "imager" => open(imager_plate::open_imager_editor, b, k, i, h, c, cx),
         "mixstation" => open(mix_station_panel::open_mixstation_editor, b, k, i, h, c, cx),
         "whitesharp" => open(
             white_sharp_window::open_whitesharp_editor,

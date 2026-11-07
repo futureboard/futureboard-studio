@@ -1,18 +1,13 @@
-//! The native editors of the band built-ins — the Compressor and Imager — as
-//! one [`KitModel`] family.
+//! The Compressor's native editor, as a [`KitModel`].
 //!
-//! Both split the spectrum at three crossovers dragged on a frequency
-//! display, with a card per band below:
+//! It runs single-band — a transfer curve whose threshold is dragged
+//! sideways — or four-band: the spectrum split at three crossovers dragged on
+//! a frequency display, each band's live reduction hanging from the top of
+//! it, and a card per band below. (The Imager, which shared this family,
+//! has its own editor now: `imager_plate`.)
 //!
-//! * the Compressor runs single-band (a transfer curve whose threshold is
-//!   dragged sideways) or four-band (each band's live reduction hangs from
-//!   the top of the display);
-//! * the Imager widens or narrows each band — dragged up and down on the
-//!   display — beside a vectorscope and correlation meters.
-//!
-//! The panel paints only what follows the params; spectra, reductions,
-//! scopes and meters are painted by the window's overlay into the bounds
-//! recorded here.
+//! The panel paints only what follows the params; spectra, reductions and
+//! meters are painted by the window's overlay into the bounds recorded here.
 
 use std::sync::Arc;
 
@@ -23,8 +18,8 @@ use gpui::{
 };
 
 use crate::components::band_model::{
-    band_id, crossover_bounds, knob, preset_applied, presets, short_hz, width_id, width_readout,
-    BandKind, BandParams, BANDS, BAND_NAMES, CROSSOVER_IDS,
+    band_id, crossover_bounds, knob, preset_applied, presets, short_hz, BandKind, BandParams,
+    BANDS, BAND_NAMES, CROSSOVER_IDS,
 };
 use crate::components::builtin_plugin_editor_window::{BuiltinEditorHostOps, PluginInstanceKey};
 use crate::components::context_menu::ContextMenuEntry;
@@ -38,7 +33,7 @@ use crate::components::plugin_kit::{
 };
 use crate::components::plugin_live::{
     dashed, frame_of, label, paint_level_bar, paint_operating_point, paint_reduction_bar,
-    paint_spectrum, transfer_plot, Align, Live, ScopeMode,
+    paint_spectrum, transfer_plot, Align, Live,
 };
 use crate::components::quick_sampler_panel::rect;
 use crate::theme::{radius, space, state, typography, Colors};
@@ -67,35 +62,16 @@ const FREQ_TICKS: [(f32, &str); 10] = [
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BandDrag {
     Crossover(usize),
-    /// A band's width dragged on the display, from where the press began
-    /// and every band's width then (Link Bands moves them all).
-    Width {
-        band: usize,
-        origin_y: f32,
-        start: [f32; BANDS],
-    },
-    /// A band's width fader, the same way.
-    Fader {
-        band: usize,
-        origin_y: f32,
-        start: [f32; BANDS],
-    },
     Threshold,
 }
 
 #[derive(Default)]
 pub struct BandUi {
     pub drag: Option<BandDrag>,
-    /// The Imager's Link Bands: a width gesture moves every band by the
-    /// same amount. An editor setting, not a param.
-    pub link_bands: bool,
-    /// What the Imager's vectorscope draws.
-    pub scope: ScopeMode,
 }
 
 pub struct BandLiveView {
     params: BandParams,
-    scope: ScopeMode,
 }
 
 impl KitModel for BandKind {
@@ -106,7 +82,6 @@ impl KitModel for BandKind {
     fn title(self) -> &'static str {
         match self {
             BandKind::Comp => "Compressor",
-            BandKind::Imager => "Imager",
         }
     }
 
@@ -114,8 +89,6 @@ impl KitModel for BandKind {
         match params {
             BandParams::Comp(p) if p.mode == compresser::Mode::Multi => "Four-band compression",
             BandParams::Comp(_) => "Single-band compression",
-            BandParams::Imager(p) if p.multiband => "Four-band stereo imaging",
-            BandParams::Imager(_) => "Stereo imaging",
         }
         .to_string()
     }
@@ -123,7 +96,6 @@ impl KitModel for BandKind {
     fn key(self) -> &'static str {
         match self {
             BandKind::Comp => "compresser",
-            BandKind::Imager => "imager",
         }
     }
 
@@ -135,7 +107,6 @@ impl KitModel for BandKind {
         use crate::components::builtin_plugin_editor as mirror;
         Some(match self {
             BandKind::Comp => BandParams::Comp(mirror::builtin_compresser_params(insert_id)?),
-            BandKind::Imager => BandParams::Imager(mirror::builtin_imager_params(insert_id)?),
         })
     }
 
@@ -170,7 +141,6 @@ impl KitModel for BandKind {
     fn live_view(editor: &KitEditor<Self>) -> BandLiveView {
         BandLiveView {
             params: editor.params.clone(),
-            scope: editor.ui.scope,
         }
     }
 
@@ -181,30 +151,18 @@ impl KitModel for BandKind {
         window: &mut Window,
         cx: &mut App,
     ) {
-        match &view.params {
-            BandParams::Imager(_) => crate::components::imager_panel::paint_imager_live(
-                &view.params,
-                view.scope,
-                live,
-                bounds,
-                window,
-                cx,
-            ),
-            BandParams::Comp(_) => paint_band_live(&view.params, live, bounds, window, cx),
-        }
+        paint_band_live(&view.params, live, bounds, window, cx);
     }
 
     fn window_size(self) -> (f32, f32) {
         match self {
             BandKind::Comp => (1_080.0, 720.0),
-            BandKind::Imager => (1_140.0, 760.0),
         }
     }
 
     fn min_size(self) -> (f32, f32) {
         match self {
             BandKind::Comp => (920.0, 620.0),
-            BandKind::Imager => (1_000.0, 680.0),
         }
     }
 
@@ -256,7 +214,7 @@ pub(crate) fn x_of(hz: f32, plot: (f32, f32, f32, f32)) -> f32 {
 
 fn press_bands(
     e: &mut KitEditor<BandKind>,
-    (x, y): (f32, f32),
+    (x, _): (f32, f32),
     event: &MouseDownEvent,
     cx: &mut Cx<BandKind>,
 ) {
@@ -272,95 +230,15 @@ fn press_bands(
         .filter(|(_, distance)| *distance <= CROSSOVER_HIT)
         .min_by(|a, b| a.1.total_cmp(&b.1))
         .map(|(i, _)| i);
-    let edges = e.params.edges();
-    let band = if split {
-        (0..BANDS).find(|b| x >= x_of(edges[*b], plot) && x < x_of(edges[b + 1], plot))
-    } else {
-        // One band works the whole signal.
-        Some(0)
-    };
     if event.click_count >= 2 {
-        // A double-click puts back what it lands on.
+        // A double-click puts back the crossover it lands on.
         if let Some(i) = nearest {
             let default = BandParams::defaults(e.model).crossovers()[i];
             e.set_value(CROSSOVER_IDS[i], default, cx);
-        } else if let (BandKind::Imager, Some(band)) = (e.model, band) {
-            reset_width(e, band, cx);
         }
         return;
     }
-    e.ui.drag = match (nearest, e.model, band) {
-        (Some(i), _, _) => Some(BandDrag::Crossover(i)),
-        (None, BandKind::Imager, Some(band)) => Some(BandDrag::Width {
-            band,
-            origin_y: y,
-            start: widths(e),
-        }),
-        _ => None,
-    };
-    cx.notify();
-}
-
-/// Every band's width now.
-pub(crate) fn widths(e: &KitEditor<BandKind>) -> [f32; BANDS] {
-    std::array::from_fn(|band| e.value(width_id(band)))
-}
-
-/// The bands a width gesture on `band` moves: all of them with Link Bands
-/// on and the split in play, else that one.
-fn moved_bands(e: &KitEditor<BandKind>, band: usize) -> Vec<usize> {
-    if e.ui.link_bands && e.params.multiband() {
-        (0..BANDS).collect()
-    } else {
-        vec![band]
-    }
-}
-
-/// Moves the gesture's bands `delta` percent from where they started.
-fn drag_widths(
-    e: &mut KitEditor<BandKind>,
-    band: usize,
-    start: [f32; BANDS],
-    delta: f32,
-    cx: &mut Cx<BandKind>,
-) {
-    let next = moved_bands(e, band)
-        .into_iter()
-        .fold(e.params.clone(), |next, b| {
-            let width = (start[b] + delta).clamp(0.0, imager::MAX_WIDTH).round();
-            next.with(width_id(b), width)
-        });
-    e.set_params(next, cx);
-}
-
-/// Puts the gesture's bands back to unchanged.
-pub(crate) fn reset_width(e: &mut KitEditor<BandKind>, band: usize, cx: &mut Cx<BandKind>) {
-    let next = moved_bands(e, band)
-        .into_iter()
-        .fold(e.params.clone(), |next, b| {
-            next.with(width_id(b), imager::DEFAULT_WIDTH)
-        });
-    e.set_params(next, cx);
-}
-
-/// A press on a band's width fader: a double-click resets it, a press
-/// starts dragging it.
-pub(crate) fn press_fader(
-    e: &mut KitEditor<BandKind>,
-    band: usize,
-    y: f32,
-    event: &MouseDownEvent,
-    cx: &mut Cx<BandKind>,
-) {
-    if event.click_count >= 2 {
-        reset_width(e, band, cx);
-        return;
-    }
-    e.ui.drag = Some(BandDrag::Fader {
-        band,
-        origin_y: y,
-        start: widths(e),
-    });
+    e.ui.drag = nearest.map(BandDrag::Crossover);
     cx.notify();
 }
 
@@ -398,7 +276,7 @@ fn drag_to(e: &mut KitEditor<BandKind>, event: &MouseMoveEvent, cx: &mut Cx<Band
         cx.notify();
         return;
     }
-    let (x, y) = (f32::from(event.position.x), f32::from(event.position.y));
+    let x = f32::from(event.position.x);
     match drag {
         BandDrag::Threshold => set_threshold_at(e, x, cx),
         BandDrag::Crossover(i) => {
@@ -412,45 +290,12 @@ fn drag_to(e: &mut KitEditor<BandKind>, event: &MouseMoveEvent, cx: &mut Cx<Band
                 .round();
             e.set_value(CROSSOVER_IDS[i], hz, cx);
         }
-        BandDrag::Width {
-            band,
-            origin_y,
-            start,
-        } => {
-            let Some(bounds) = e.live_bounds.get(LiveSlot::Bands) else {
-                return;
-            };
-            let half = (band_plot(bounds).3 * 0.5 - 8.0).max(1.0);
-            let scale = if event.modifiers.shift { FINE } else { 1.0 };
-            drag_widths(e, band, start, (origin_y - y) / half * 100.0 * scale, cx);
-        }
-        BandDrag::Fader {
-            band,
-            origin_y,
-            start,
-        } => {
-            let Some(bounds) = e.live_bounds.get(LiveSlot::Fader(band)) else {
-                return;
-            };
-            let travel = f32::from(bounds.size.height).max(1.0);
-            let scale = if event.modifiers.shift { FINE } else { 1.0 };
-            drag_widths(
-                e,
-                band,
-                start,
-                (origin_y - y) / travel * imager::MAX_WIDTH * scale,
-                cx,
-            );
-        }
     }
 }
 
 // ── The panel ───────────────────────────────────────────────────────────────
 
 fn band_panel(e: &KitEditor<BandKind>, cx: &mut Cx<BandKind>) -> AnyElement {
-    if e.model == BandKind::Imager {
-        return crate::components::imager_panel::imager_panel(e, cx);
-    }
     let mode_row = match &e.params {
         BandParams::Comp(p) => Some(
             div()
@@ -474,7 +319,6 @@ fn band_panel(e: &KitEditor<BandKind>, cx: &mut Cx<BandKind>) -> AnyElement {
                     "Drag across the curve to set the threshold"
                 })),
         ),
-        BandParams::Imager(_) => None,
     };
     div()
         .flex()
@@ -549,19 +393,11 @@ pub(crate) fn main_display(e: &KitEditor<BandKind>, cx: &mut Cx<BandKind>) -> An
         .flex_1()
         .into_any_element();
     }
-    let legend = match &params {
-        BandParams::Comp(_) => "Reduction per band".to_string(),
-        BandParams::Imager(p) if p.multiband => {
-            "Drag a band up to widen it, a crossover to move it".to_string()
-        }
-        BandParams::Imager(_) => "Drag up to widen the whole signal".to_string(),
-    };
+    let legend = "Reduction per band".to_string();
     let dragging = e.ui.drag;
     let static_bands = canvas(
         |_, _, _| (),
-        move |bounds, _, window, cx| {
-            paint_band_display(window, cx, bounds, &params, dragging, bypassed)
-        },
+        move |bounds, _, window, cx| paint_band_display(window, cx, bounds, &params, dragging),
     )
     .absolute()
     .size_full();
@@ -613,8 +449,6 @@ fn aside(e: &KitEditor<BandKind>, cx: &mut Cx<BandKind>) -> AnyElement {
                 ],
             ))
             .into_any_element(),
-        // The Imager draws its own scope column (`imager_panel`).
-        BandParams::Imager(_) => column.into_any_element(),
     }
 }
 
@@ -780,8 +614,6 @@ fn bottom(e: &KitEditor<BandKind>, cx: &mut Cx<BandKind>) -> AnyElement {
                     .collect();
             row.children(cards).into_any_element()
         }
-        // The Imager draws its own strips (`imager_panel`).
-        BandParams::Imager(_) => row.into_any_element(),
     }
 }
 
@@ -891,19 +723,17 @@ fn paint_comp_transfer(
     );
 }
 
-/// The band display's frame: the frequency grid and labels, the crossover
-/// handles and — for the Imager — each band's width as a box around the
-/// centre line.
+/// The band display's frame: the frequency grid and labels and the crossover
+/// handles.
 fn paint_band_display(
     window: &mut Window,
     cx: &mut App,
     bounds: Bounds<Pixels>,
     params: &BandParams,
     dragging: Option<BandDrag>,
-    bypassed: bool,
 ) {
     let plot = band_plot(bounds);
-    let (x0, y0, w, h) = plot;
+    let (_, y0, _, h) = plot;
     let ink = Colors::text_primary();
     for (hz, text) in FREQ_TICKS {
         let x = x_of(hz, plot);
@@ -927,94 +757,6 @@ fn paint_band_display(
             y0 + h + 3.0,
             align,
         );
-    }
-    let edges = params.edges();
-    let solo = params.solo();
-    if let BandParams::Imager(p) = params {
-        let centre = y0 + h * 0.5;
-        let half = (h * 0.5 - 8.0).max(1.0);
-        dashed(
-            window,
-            (x0, centre),
-            (x0 + w, centre),
-            1.0,
-            Colors::with_alpha(ink, 0.12),
-        );
-        for unity in [centre - half * 0.5, centre + half * 0.5] {
-            dashed(
-                window,
-                (x0, unity),
-                (x0 + w, unity),
-                1.0,
-                Colors::with_alpha(ink, 0.08),
-            );
-        }
-        let shown = if p.multiband { BANDS } else { 1 };
-        for band in 0..shown {
-            let (left, right) = if p.multiband {
-                (
-                    x_of(edges[band], plot) + 2.0,
-                    x_of(edges[band + 1], plot) - 2.0,
-                )
-            } else {
-                (x0 + 2.0, x0 + w - 2.0)
-            };
-            if right <= left {
-                continue;
-            }
-            let reach = (p.width[band] / imager::MAX_WIDTH * half).max(0.75);
-            let muted = solo.is_some_and(|s| s != band);
-            let active = matches!(
-                dragging,
-                Some(BandDrag::Width { band: b, .. } | BandDrag::Fader { band: b, .. }) if b == band
-            );
-            let tone = if muted {
-                Colors::text_disabled()
-            } else {
-                Colors::accent_primary()
-            };
-            let (fill_alpha, edge_alpha) = if active { (0.26, 0.9) } else { (0.16, 0.55) };
-            let dim = if bypassed { 0.35 } else { 1.0 };
-            let body = rect(left, centre - reach, right - left, 2.0 * reach);
-            window.paint_quad(
-                fill(body, Colors::with_alpha(tone, fill_alpha * dim))
-                    .corner_radii(px(3.0))
-                    .border_widths(px(1.0))
-                    .border_color(Colors::with_alpha(tone, edge_alpha * dim)),
-            );
-            if right - left > 54.0 {
-                label(
-                    window,
-                    cx,
-                    &if p.multiband {
-                        format!("{} {}", BAND_NAMES[band], width_readout(p.width[band]))
-                    } else {
-                        format!("Width {}", width_readout(p.width[band]))
-                    },
-                    typography::DENSE_CAPTION,
-                    Colors::text_secondary(),
-                    (left + right) * 0.5,
-                    y0 + 4.0,
-                    Align::Center,
-                );
-                if p.stereoize[band] >= 0.5 {
-                    label(
-                        window,
-                        cx,
-                        &format!(
-                            "Stereoize {} {:.0}%",
-                            p.stereoize_mode.label(),
-                            p.stereoize[band]
-                        ),
-                        typography::DENSE_CAPTION,
-                        Colors::accent_primary_hover(),
-                        (left + right) * 0.5,
-                        y0 + 17.0,
-                        Align::Center,
-                    );
-                }
-            }
-        }
     }
     // With the split off there are no band edges to show.
     let crossovers = if params.multiband() {
@@ -1061,14 +803,13 @@ fn paint_band_live(
     cx: &mut App,
 ) {
     let bypassed = !params.power();
+    let BandParams::Comp(p) = params;
     if let Some(b) = bounds.get(LiveSlot::Bands) {
         let plot = band_plot(b);
         paint_spectrum(window, live, plot);
-        if let BandParams::Comp(p) = params {
-            paint_band_reduction(window, cx, plot, params, p, live.band_reduction(), bypassed);
-        }
+        paint_band_reduction(window, cx, plot, params, p, live.band_reduction(), bypassed);
     }
-    if let (Some(b), BandParams::Comp(p)) = (bounds.get(LiveSlot::Transfer), params) {
+    if let Some(b) = bounds.get(LiveSlot::Transfer) {
         if !bypassed {
             let (threshold, ratio, knee) = (p.threshold_db, p.ratio, p.knee_db);
             paint_operating_point(window, b, live, TRANSFER_RANGE, 0.0, |input| {
@@ -1079,11 +820,7 @@ fn paint_band_live(
     let frame = live.frame;
     if let Some(b) = bounds.get(LiveSlot::Meters) {
         let (x0, y0, w, h) = frame_of(b);
-        let rows: &[usize] = if matches!(params, BandParams::Comp(_)) {
-            &[0, 1, 2]
-        } else {
-            &[1, 2]
-        };
+        let rows: &[usize] = &[0, 1, 2];
         let row_h = h / rows.len() as f32;
         for (i, row) in rows.iter().enumerate() {
             let r = rect(x0, y0 + i as f32 * row_h, w, (row_h - 8.0).max(16.0));
@@ -1114,16 +851,14 @@ fn paint_band_live(
             }
         }
     }
-    if let BandParams::Comp(p) = params {
-        let reduction = live.band_reduction();
-        for band in 0..BANDS {
-            if let Some(b) = bounds.get(LiveSlot::Reduction(band)) {
-                let off = bypassed || p.bands[band].bypass;
-                let value = frame
-                    .and(reduction)
-                    .map(|r| if off { 0.0 } else { r[band] });
-                paint_reduction_bar(window, cx, b, "Reduction", value);
-            }
+    let reduction = live.band_reduction();
+    for band in 0..BANDS {
+        if let Some(b) = bounds.get(LiveSlot::Reduction(band)) {
+            let off = bypassed || p.bands[band].bypass;
+            let value = frame
+                .and(reduction)
+                .map(|r| if off { 0.0 } else { r[band] });
+            paint_reduction_bar(window, cx, b, "Reduction", value);
         }
     }
 }
@@ -1203,26 +938,6 @@ pub fn open_compresser_editor(
 ) -> Result<gpui::WindowHandle<BandEditorWindow>, String> {
     open_kit_editor(
         BandKind::Comp,
-        owner_bounds,
-        key,
-        identity,
-        host_ops,
-        on_close,
-        cx,
-    )
-}
-
-/// Opens with a track's Imager insert.
-pub fn open_imager_editor(
-    owner_bounds: Option<Bounds<Pixels>>,
-    key: PluginInstanceKey,
-    identity: ShellIdentity,
-    host_ops: BuiltinEditorHostOps,
-    on_close: Arc<dyn Fn(&mut Window, &mut App)>,
-    cx: &mut App,
-) -> Result<gpui::WindowHandle<BandEditorWindow>, String> {
-    open_kit_editor(
-        BandKind::Imager,
         owner_bounds,
         key,
         identity,

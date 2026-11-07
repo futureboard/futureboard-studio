@@ -79,7 +79,12 @@ pub fn color_a(hex: u32, alpha: f32) -> Rgba {
 
 const OUTFIT_FAMILY: &str = "Outfit";
 const PLEX_MONO_FAMILY: &str = "IBM Plex Mono";
-static FACES: [&[u8]; 8] = [
+/// The Imager's face, Mona Sans, at its normal width (300–600), and the two
+/// wider cuts the design sets its name and its big readouts in.
+const MONA_SANS_FAMILY: &str = "Mona Sans";
+const MONA_SANS_EXPANDED_FAMILY: &str = "Mona Sans Expanded";
+const MONA_SANS_SEMI_EXPANDED_FAMILY: &str = "Mona Sans SemiExpanded";
+static FACES: [&[u8]; 14] = [
     include_bytes!("../../assets/fonts/outfit/Outfit-Light.ttf"),
     include_bytes!("../../assets/fonts/outfit/Outfit-Regular.ttf"),
     include_bytes!("../../assets/fonts/outfit/Outfit-Medium.ttf"),
@@ -88,11 +93,17 @@ static FACES: [&[u8]; 8] = [
     include_bytes!("../../assets/fonts/ibm-plex-mono/IBMPlexMono-Regular.ttf"),
     include_bytes!("../../assets/fonts/ibm-plex-mono/IBMPlexMono-Medium.ttf"),
     include_bytes!("../../assets/fonts/ibm-plex-mono/IBMPlexMono-SemiBold.ttf"),
+    include_bytes!("../../assets/fonts/mona-sans/MonaSans-Light.ttf"),
+    include_bytes!("../../assets/fonts/mona-sans/MonaSans-Regular.ttf"),
+    include_bytes!("../../assets/fonts/mona-sans/MonaSans-Medium.ttf"),
+    include_bytes!("../../assets/fonts/mona-sans/MonaSans-SemiBold.ttf"),
+    include_bytes!("../../assets/fonts/mona-sans/MonaSansExpanded-Regular.ttf"),
+    include_bytes!("../../assets/fonts/mona-sans/MonaSansSemiExpanded-Light.ttf"),
 ];
 static REGISTERED: AtomicBool = AtomicBool::new(false);
 
-/// Adds the embedded Outfit (300–700) and IBM Plex Mono (400–600) faces to
-/// the text system, once per process.
+/// Adds the embedded Outfit (300–700), IBM Plex Mono (400–600) and Mona Sans
+/// faces to the text system, once per process.
 pub fn ensure_fonts(cx: &App) {
     if REGISTERED.swap(true, Ordering::AcqRel) {
         return;
@@ -125,6 +136,21 @@ pub fn outfit(weight: FontWeight) -> Font {
 /// The designs' number face.
 pub fn mono(weight: FontWeight) -> Font {
     embedded(PLEX_MONO_FAMILY, weight)
+}
+
+/// The Imager's face, Mona Sans, 300–600.
+pub fn mona_sans(weight: FontWeight) -> Font {
+    embedded(MONA_SANS_FAMILY, weight)
+}
+
+/// Mona Sans at 125 % width, regular: the Imager's name.
+pub fn mona_sans_expanded() -> Font {
+    embedded(MONA_SANS_EXPANDED_FAMILY, FontWeight::NORMAL)
+}
+
+/// Mona Sans at 112.5 % width, light: the Imager's big readouts.
+pub fn mona_sans_semi_expanded_light() -> Font {
+    embedded(MONA_SANS_SEMI_EXPANDED_FAMILY, FontWeight::LIGHT)
 }
 
 /// A div font size at the design size `size`, scaled by `s`, undoing
@@ -1110,30 +1136,54 @@ pub fn switch(
 
 /// The plate's scale for a window `viewport`: the design fitted under the
 /// shell's chrome.
-pub fn plate_scale((width, height): (f32, f32)) -> f32 {
+pub fn plate_scale(viewport: (f32, f32)) -> f32 {
+    plate_scale_for(viewport, (PLATE_W, PLATE_H))
+}
+
+/// [`plate_scale`] for a design laid out at `design` rather than the
+/// standard plate.
+pub fn plate_scale_for((width, height): (f32, f32), (design_w, design_h): (f32, f32)) -> f32 {
     let height = (height - SHELL_CHROME_H).max(1.0);
-    (width / PLATE_W).min(height / PLATE_H).clamp(0.4, 3.0)
+    (width / design_w).min(height / design_h).clamp(0.4, 3.0)
 }
 
 /// The plate at scale `s`, centred on its ground.
 pub fn plate_frame(s: f32, children: Vec<AnyElement>) -> AnyElement {
+    plate_frame_sized(
+        s,
+        (PLATE_W, PLATE_H),
+        GROUND,
+        outfit(FontWeight::NORMAL),
+        children,
+    )
+}
+
+/// A design laid out at `design` on its own `ground`, in `font`, at scale
+/// `s` and centred.
+pub fn plate_frame_sized(
+    s: f32,
+    (design_w, design_h): (f32, f32),
+    ground: u32,
+    font: Font,
+    children: Vec<AnyElement>,
+) -> AnyElement {
     div()
         .size_full()
         .flex()
         .items_center()
         .justify_center()
         .overflow_hidden()
-        .bg(color(GROUND))
-        .font(outfit(FontWeight::NORMAL))
+        .bg(color(ground))
+        .font(font)
         .text_color(color(WHITE))
         .child(
             div()
                 .relative()
                 .flex_shrink_0()
-                .w(px(PLATE_W * s))
-                .h(px(PLATE_H * s))
+                .w(px(design_w * s))
+                .h(px(design_h * s))
                 .overflow_hidden()
-                .bg(color(GROUND))
+                .bg(color(ground))
                 .children(children),
         )
         .into_any_element()
@@ -1421,8 +1471,27 @@ fn preset_picker<M: KitModel>(
         ))
         .on_click(e.click_cb(cx, |this, cx| this.toggle_preset_menu(cx)));
 
-    let mut picker = div().relative().flex_shrink_0().child(chip);
-    if open {
+    div()
+        .relative()
+        .flex_shrink_0()
+        .child(chip)
+        .children(preset_menu(e, cx, s, accent))
+        .into_any_element()
+}
+
+/// The preset list while it is open, to sit in a `relative` parent under
+/// the chip that opened it; `None` while closed.
+pub fn preset_menu<M: KitModel>(
+    e: &KitEditor<M>,
+    cx: &mut Cx<M>,
+    s: f32,
+    accent: Rgba,
+) -> Option<AnyElement> {
+    let key = e.model.key();
+    if !e.preset_open {
+        return None;
+    }
+    {
         let bank = e.model.presets();
         let current = e.preset;
         let entity = cx.entity().clone();
@@ -1489,21 +1558,25 @@ fn preset_picker<M: KitModel>(
             .on_mouse_down_out(move |_, _, app| {
                 let _ = close.update(app, |this, cx| this.close_preset_menu(cx));
             });
-        picker = picker.child(
-            div().absolute().left_0().bottom_0().child(
-                deferred(
-                    anchored()
-                        .anchor(Anchor::TopLeft)
-                        .offset(point(px(0.0), px(4.0 * s)))
-                        .snap_to_window_with_margin(px(8.0))
-                        .child(menu),
+        Some(
+            div()
+                .absolute()
+                .left_0()
+                .bottom_0()
+                .child(
+                    deferred(
+                        anchored()
+                            .anchor(Anchor::TopLeft)
+                            .offset(point(px(0.0), px(4.0 * s)))
+                            .snap_to_window_with_margin(px(8.0))
+                            .child(menu),
+                    )
+                    // Over the live displays and a floating band panel.
+                    .with_priority(2),
                 )
-                // Over the live displays and a floating band panel.
-                .with_priority(2),
-            ),
-        );
+                .into_any_element(),
+        )
     }
-    picker.into_any_element()
 }
 
 /// A point on a plate display, relative to its recorded bounds and scaled.

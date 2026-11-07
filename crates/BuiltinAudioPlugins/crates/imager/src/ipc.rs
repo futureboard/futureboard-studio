@@ -8,8 +8,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    BAND_COUNT, MAX_CROSSOVER_HZ, MAX_OUTPUT_DB, MAX_STEREOIZE, MAX_WIDTH, MIN_CROSSOVER_HZ,
-    MIN_OUTPUT_DB, Params, SOLO_NONE, StereoizeMode, clamp, default_params,
+    BAND_COUNT, DEFAULT_MONO_BASS_HZ, MAX_CROSSOVER_HZ, MAX_GLOBAL_WIDTH, MAX_MONO_BASS_HZ,
+    MAX_OUTPUT_DB, MAX_STEREOIZE, MAX_WIDTH, MIN_CROSSOVER_HZ, MIN_MONO_BASS_HZ, MIN_OUTPUT_DB,
+    Params, SOLO_NONE, StereoizeMode, clamp, default_params,
 };
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -32,8 +33,15 @@ pub const STEREOIZE_4_INDEX: u32 = 13;
 pub const STEREOIZE_MODE_INDEX: u32 = 14;
 pub const RECOVER_SIDES_INDEX: u32 = 15;
 pub const MULTIBAND_INDEX: u32 = 16;
+pub const BYPASS_1_INDEX: u32 = 17;
+pub const BYPASS_2_INDEX: u32 = 18;
+pub const BYPASS_3_INDEX: u32 = 19;
+pub const BYPASS_4_INDEX: u32 = 20;
+pub const GLOBAL_WIDTH_INDEX: u32 = 21;
+pub const MONO_BASS_INDEX: u32 = 22;
+pub const MONO_BASS_HZ_INDEX: u32 = 23;
 
-pub const PARAM_COUNT: usize = 17;
+pub const PARAM_COUNT: usize = 24;
 
 /// Wire index *is* the position in this table; the editor and the host both
 /// resolve through it, so the order is part of the persisted contract. Append
@@ -56,6 +64,13 @@ pub const UI_PARAM_IDS: [&str; PARAM_COUNT] = [
     "stereoizeMode",
     "recoverSides",
     "multiband",
+    "bypass1",
+    "bypass2",
+    "bypass3",
+    "bypass4",
+    "globalWidth",
+    "monoBass",
+    "monoBassHz",
 ];
 
 /// Inclusive `(min, max)` for every continuous parameter, indexed by wire
@@ -80,6 +95,13 @@ const RANGES: [(f32, f32); PARAM_COUNT] = [
     (0.0, 1.0),                                  // stereoizeMode
     (0.0, 0.0),                                  // recoverSides
     (0.0, 0.0),                                  // multiband
+    (0.0, 0.0),                                  // bypass1
+    (0.0, 0.0),                                  // bypass2
+    (0.0, 0.0),                                  // bypass3
+    (0.0, 0.0),                                  // bypass4
+    (-MAX_GLOBAL_WIDTH, MAX_GLOBAL_WIDTH),       // globalWidth
+    (0.0, 0.0),                                  // monoBass
+    (MIN_MONO_BASS_HZ, MAX_MONO_BASS_HZ),        // monoBassHz
 ];
 
 #[inline]
@@ -167,6 +189,16 @@ pub fn sanitize_params(params: &mut Params) {
     } else {
         0.0
     };
+    params.global_width = if params.global_width.is_finite() {
+        clamp_wire(GLOBAL_WIDTH_INDEX, params.global_width)
+    } else {
+        0.0
+    };
+    params.mono_bass_hz = if params.mono_bass_hz.is_finite() {
+        clamp_wire(MONO_BASS_HZ_INDEX, params.mono_bass_hz)
+    } else {
+        DEFAULT_MONO_BASS_HZ
+    };
 }
 
 /// Apply one compact UI/control update. Allocation-free and total: invalid
@@ -192,6 +224,12 @@ pub fn apply_wire_param(params: &mut Params, index: u32, value: f32) -> bool {
         STEREOIZE_MODE_INDEX => params.stereoize_mode = StereoizeMode::from_wire(value),
         RECOVER_SIDES_INDEX => params.recover_sides = value >= 0.5,
         MULTIBAND_INDEX => params.multiband = value >= 0.5,
+        BYPASS_1_INDEX..=BYPASS_4_INDEX => {
+            params.band_bypass[(index - BYPASS_1_INDEX) as usize] = value >= 0.5
+        }
+        GLOBAL_WIDTH_INDEX => params.global_width = clamp_wire(index, value),
+        MONO_BASS_INDEX => params.mono_bass = value >= 0.5,
+        MONO_BASS_HZ_INDEX => params.mono_bass_hz = clamp_wire(index, value),
         _ => return false,
     }
     true
@@ -226,6 +264,13 @@ pub fn ui_values(params: &Params) -> Vec<(&'static str, f32)> {
         ("stereoizeMode", params.stereoize_mode.to_wire()),
         ("recoverSides", f32::from(params.recover_sides)),
         ("multiband", f32::from(params.multiband)),
+        ("bypass1", f32::from(params.band_bypass[0])),
+        ("bypass2", f32::from(params.band_bypass[1])),
+        ("bypass3", f32::from(params.band_bypass[2])),
+        ("bypass4", f32::from(params.band_bypass[3])),
+        ("globalWidth", params.global_width),
+        ("monoBass", f32::from(params.mono_bass)),
+        ("monoBassHz", params.mono_bass_hz),
     ]
 }
 
@@ -279,6 +324,10 @@ mod tests {
         saved.stereoize_mode = StereoizeMode::Two;
         saved.recover_sides = true;
         saved.multiband = false;
+        saved.band_bypass = [false, true, false, true];
+        saved.global_width = -35.0;
+        saved.mono_bass = true;
+        saved.mono_bass_hz = 140.0;
 
         let mut rebuilt = default_params();
         for (id, value) in ui_values(&saved) {
@@ -296,6 +345,22 @@ mod tests {
         assert_eq!(rebuilt.stereoize_mode, StereoizeMode::Two);
         assert!(rebuilt.recover_sides);
         assert!(!rebuilt.multiband);
+        assert_eq!(rebuilt.band_bypass, [false, true, false, true]);
+        assert_eq!(rebuilt.global_width, -35.0);
+        assert!(rebuilt.mono_bass);
+        assert_eq!(rebuilt.mono_bass_hz, 140.0);
+    }
+
+    /// A blob from before band bypass, the global width and Mono Bass loads
+    /// with all three out of the way.
+    #[test]
+    fn an_older_blob_loads_with_the_new_controls_at_rest() {
+        let json = r#"{"version":1,"params":{"power":true,"crossoverHz":[120.0,1000.0,6000.0],"width":[100.0,100.0,100.0,100.0],"soloBand":-1,"outputDb":0.0}}"#;
+        let state = ImagerState::from_json(json).unwrap();
+        assert_eq!(state.params.band_bypass, [false; BAND_COUNT]);
+        assert_eq!(state.params.global_width, 0.0);
+        assert!(!state.params.mono_bass);
+        assert_eq!(state.params.mono_bass_hz, DEFAULT_MONO_BASS_HZ);
     }
 
     #[test]

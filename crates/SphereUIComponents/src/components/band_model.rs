@@ -1,5 +1,6 @@
-//! What the native band editors edit: the Compressor and Imager — their
-//! params behind one type, wire table, presets and knobs.
+//! What the Compressor's native editor edits: its params behind one type,
+//! wire table, presets and knobs. (The Imager shared this once; its editor
+//! is imager_plate now.)
 //!
 //! No GPUI here. Every value goes back to the plug-in as wire edits the DSP
 //! crates' own `ipc` tables compute and clamp.
@@ -9,7 +10,7 @@ use std::sync::{Arc, OnceLock};
 use crate::components::fx_model::{spec, KnobSpec, Taper, Unit};
 use crate::components::plugin_kit::{bank, KitPreset};
 
-/// Both plug-ins split the spectrum the same way.
+/// The Compressor splits the spectrum into four bands.
 pub const BANDS: usize = 4;
 pub const CROSSOVERS: usize = BANDS - 1;
 pub const BAND_NAMES: [&str; BANDS] = ["Low", "Low Mid", "High Mid", "High"];
@@ -17,18 +18,16 @@ pub const BAND_NAMES: [&str; BANDS] = ["Low", "Low Mid", "High Mid", "High"];
 pub const MIN_CROSSOVER_RATIO: f32 = 1.25;
 pub const CROSSOVER_IDS: [&str; CROSSOVERS] = ["crossover1Hz", "crossover2Hz", "crossover3Hz"];
 
-const _: () = assert!(compresser::BAND_COUNT == BANDS && imager::BAND_COUNT == BANDS);
+const _: () = assert!(compresser::BAND_COUNT == BANDS);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BandKind {
     Comp,
-    Imager,
 }
 
 #[derive(Clone, Debug)]
 pub enum BandParams {
     Comp(compresser::Params),
-    Imager(imager::Params),
 }
 
 fn indexed(
@@ -45,21 +44,18 @@ impl BandParams {
     pub fn defaults(kind: BandKind) -> Self {
         match kind {
             BandKind::Comp => Self::Comp(compresser::default_params()),
-            BandKind::Imager => Self::Imager(imager::default_params()),
         }
     }
 
     pub fn kind(&self) -> BandKind {
         match self {
             Self::Comp(_) => BandKind::Comp,
-            Self::Imager(_) => BandKind::Imager,
         }
     }
 
     fn ui_values(&self) -> Vec<(&'static str, f32)> {
         match self {
             Self::Comp(p) => compresser::ipc::ui_values(p),
-            Self::Imager(p) => imager::ipc::ui_values(p),
         }
     }
 
@@ -67,7 +63,6 @@ impl BandParams {
         let values = self.ui_values();
         match self {
             Self::Comp(_) => indexed(values, compresser::ui_param_index),
-            Self::Imager(_) => indexed(values, imager::ui_param_index),
         }
     }
 
@@ -76,9 +71,6 @@ impl BandParams {
         match &mut next {
             Self::Comp(p) => {
                 compresser::ipc::apply_ui_param(p, id, value);
-            }
-            Self::Imager(p) => {
-                imager::ipc::apply_ui_param(p, id, value);
             }
         }
         next
@@ -105,7 +97,6 @@ impl BandParams {
     pub fn crossovers(&self) -> [f32; CROSSOVERS] {
         match self {
             Self::Comp(p) => p.crossover_hz,
-            Self::Imager(p) => p.crossover_hz,
         }
     }
 
@@ -117,12 +108,10 @@ impl BandParams {
         [20.0, sorted[0], sorted[1], sorted[2], 20_000.0]
     }
 
-    /// Whether the band split is in play: in Multi mode for the Compressor,
-    /// with Multiband on for the Imager.
+    /// Whether the band split is in play: the Compressor in Multi mode.
     pub fn multiband(&self) -> bool {
         match self {
             Self::Comp(p) => p.mode == compresser::Mode::Multi,
-            Self::Imager(p) => p.multiband,
         }
     }
 }
@@ -150,42 +139,15 @@ pub fn band_id(band: usize, field: &str) -> &'static str {
     ids.iter().copied().find(|id| *id == wanted).unwrap_or("")
 }
 
-pub fn width_id(band: usize) -> &'static str {
-    ["width1", "width2", "width3", "width4"][band.min(BANDS - 1)]
-}
-
-pub fn stereoize_id(band: usize) -> &'static str {
-    ["stereoize1", "stereoize2", "stereoize3", "stereoize4"][band.min(BANDS - 1)]
-}
-
-/// A width as Ozone-style imagers read it: −100 folds to mono, 0 leaves the
-/// band as it came, +100 doubles its side.
-pub fn width_readout(width: f32) -> String {
-    let relative = (width - imager::DEFAULT_WIDTH).round();
-    if relative.abs() < 0.5 {
-        "0".to_string()
-    } else {
-        format!("{relative:+.0}")
-    }
-}
-
 // ── Presets ─────────────────────────────────────────────────────────────────
 
 pub fn presets(kind: BandKind) -> Arc<Vec<KitPreset<BandParams>>> {
     static COMP: OnceLock<Arc<Vec<KitPreset<BandParams>>>> = OnceLock::new();
-    static IMAGER: OnceLock<Arc<Vec<KitPreset<BandParams>>>> = OnceLock::new();
     match kind {
         BandKind::Comp => COMP
             .get_or_init(|| {
                 bank(compresser::factory_presets(), |p| {
                     (p.name, BandParams::Comp(p.params))
-                })
-            })
-            .clone(),
-        BandKind::Imager => IMAGER
-            .get_or_init(|| {
-                bank(imager::factory_presets(), |p| {
-                    (p.name, BandParams::Imager(p.params))
                 })
             })
             .clone(),
@@ -208,7 +170,6 @@ pub fn preset_applied(current: &BandParams, preset: &BandParams) -> BandParams {
 pub fn knob(kind: BandKind, id: &str) -> Option<KnobSpec> {
     let descriptor = match kind {
         BandKind::Comp => compresser::descriptor(),
-        BandKind::Imager => imager::descriptor(),
     };
     let range = descriptor.params.iter().find(|p| p.id == id)?;
     // A band's knobs read like the single band's.
@@ -229,20 +190,12 @@ pub fn knob(kind: BandKind, id: &str) -> Option<KnobSpec> {
         ),
         (BandKind::Comp, "kneeDb") => ("Knee", Taper::Linear, Unit::Db),
         (BandKind::Comp, "mix") => ("Mix", Taper::Linear, Unit::Percent),
-        (BandKind::Imager, _) if id.starts_with("width") => ("Width", Taper::Linear, Unit::Percent),
-        (BandKind::Imager, _) if id.starts_with("stereoize") && id != "stereoizeMode" => {
-            ("Stereoize", Taper::Linear, Unit::Percent)
-        }
         (_, "outputDb") => ("Output", Taper::Linear, Unit::Db),
         _ => return None,
     };
     let mut knob = spec(range.id, label, range.min, range.max, taper, unit);
     match field {
         "makeupDb" | "MakeupDb" | "outputDb" => knob.bipolar = true,
-        _ if id.starts_with("width") => {
-            knob.bipolar = true;
-            knob.centre = imager::DEFAULT_WIDTH;
-        }
         _ => {}
     }
     Some(knob)
@@ -250,19 +203,6 @@ pub fn knob(kind: BandKind, id: &str) -> Option<KnobSpec> {
 
 pub fn default_value(kind: BandKind, id: &str) -> f32 {
     BandParams::defaults(kind).value(id)
-}
-
-/// A width in words.
-pub fn describe_width(width: f32) -> &'static str {
-    if width < 0.5 {
-        "Mono"
-    } else if width < 95.0 {
-        "Narrower"
-    } else if width <= 105.0 {
-        "Unchanged"
-    } else {
-        "Wider"
-    }
 }
 
 /// A frequency for a label: `120`, `1.2k`, `12k`.
@@ -283,7 +223,6 @@ mod tests {
     fn id_at(kind: BandKind, index: u32) -> &'static str {
         match kind {
             BandKind::Comp => compresser::ui_param_id(index),
-            BandKind::Imager => imager::ui_param_id(index),
         }
         .unwrap()
     }
@@ -300,7 +239,7 @@ mod tests {
 
     #[test]
     fn every_preset_lands_exactly_from_every_other() {
-        for kind in [BandKind::Comp, BandKind::Imager] {
+        for kind in [BandKind::Comp] {
             let bank = presets(kind);
             for from in bank.iter() {
                 for to in bank.iter() {
@@ -325,10 +264,10 @@ mod tests {
 
     #[test]
     fn a_preset_keeps_power_and_the_solo() {
-        let current = BandParams::defaults(BandKind::Imager)
+        let current = BandParams::defaults(BandKind::Comp)
             .with("power", 0.0)
             .with("soloBand", 2.0);
-        for preset in presets(BandKind::Imager).iter() {
+        for preset in presets(BandKind::Comp).iter() {
             let applied = preset_applied(&current, &preset.params);
             assert!(!applied.power());
             assert_eq!(applied.solo(), Some(2));
@@ -353,12 +292,7 @@ mod tests {
             ["ThresholdDb", "Ratio", "AttackMs", "ReleaseMs", "MakeupDb"].map(|f| band_id(b, f))
         }))
         .collect();
-        let imager: Vec<&str> = (0..BANDS)
-            .map(width_id)
-            .chain((0..BANDS).map(stereoize_id))
-            .chain(["outputDb"])
-            .collect();
-        for (kind, ids) in [(BandKind::Comp, comp), (BandKind::Imager, imager)] {
+        for (kind, ids) in [(BandKind::Comp, comp)] {
             for id in ids {
                 let knob = knob(kind, id).unwrap_or_else(|| panic!("{kind:?}: no knob for {id}"));
                 let default = default_value(kind, id);
@@ -369,14 +303,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn widths_read_from_mono_to_double() {
-        assert_eq!(width_readout(0.0), "-100");
-        assert_eq!(width_readout(100.0), "0");
-        assert_eq!(width_readout(130.0), "+30");
-        assert_eq!(width_readout(200.0), "+100");
     }
 
     #[test]
