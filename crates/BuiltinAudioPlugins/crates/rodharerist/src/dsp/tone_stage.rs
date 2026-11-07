@@ -61,9 +61,11 @@ impl ToneStage {
     }
 
     /// Audio thread: call once per audio block (never per sample) so the NAM
-    /// engine can adopt a pending capture swap at a safe boundary.
-    pub(super) fn begin_block(&mut self) {
-        self.nam.begin_block();
+    /// engine can adopt a pending capture swap at a safe boundary. `frames`
+    /// is the host buffer about to be processed; `0` leaves the inference
+    /// chunk where it is.
+    pub(super) fn begin_block(&mut self, frames: usize) {
+        self.nam.begin_block(frames);
     }
 
     pub(super) fn set_engine(&mut self, engine: ToneEngineKind) {
