@@ -23,8 +23,8 @@
 use std::time::{Duration, Instant};
 
 use gpui::{
-    div, px, AnyElement, App, Context, FontWeight, InteractiveElement, IntoElement, ParentElement,
-    Rgba, StatefulInteractiveElement, Styled, Window,
+    div, px, AnyElement, App, AppContext, Context, FontWeight, InteractiveElement, IntoElement,
+    ParentElement, Render, Rgba, StatefulInteractiveElement, Styled, Window,
 };
 use rodharerist::{CabModel, Line2Mode, Params, RowSend, StageChannel, StageKind, ToneEngineKind};
 
@@ -40,13 +40,18 @@ type Cx<'a> = Context<'a, RodhareistEditorWindow>;
 
 /// Rodhareist's accent.
 const ACCENT: u32 = 0xf25c54;
-/// Chain geometry, at the design size: where the path starts, its width,
-/// the wire's centre line, one block and the pitch between blocks.
+/// Chain geometry, at the design size. The well is 327 tall, so a block is
+/// smaller than the original 99 px plate: two lanes fit at 72 px, four still
+/// clear the header and the caption. The send control sits at the end of
+/// the lane, past the blocks and short of the output meter.
 const CHAIN_LEFT: f32 = 108.0;
-const CHAIN_W: f32 = 795.0;
-const CHAIN_MID: f32 = 162.5;
-const BLOCK: f32 = 99.0;
-const PITCH: f32 = 116.0;
+const BLOCK_RUN: f32 = 620.0;
+const SEND_LEFT: f32 = 740.0;
+const LANE_TOP: f32 = 46.0;
+const LANE_BOTTOM: f32 = 302.0;
+const CAPTION_TOP: f32 = 308.0;
+/// The block size the type and icon were drawn for.
+const BLOCK_REF: f32 = 72.0;
 /// Positions the chain shows before it scrolls.
 const CHAIN_VISIBLE: usize = 7;
 /// Taps further apart than this start a new tempo.
@@ -346,6 +351,54 @@ fn model_desc(label: &str) -> &'static str {
         "Modern EQ" => "Extended shelves and narrow, precise bells.",
         "Cry Wah" => "Classic sweep: park it or rock it.",
         "Touch Wah" => "Envelope filter that follows your pick.",
+        "Glass Boost" => "Treble boost. The low strings stay clean.",
+        "Velvet OD" => "Soft, low-gain overdrive with a warm mid.",
+        "Octave Fuzz" => "Strong even harmonics. An octave sits on the note.",
+        "Bass Grind" => "The low band reaches the clipper. Dark on top.",
+        "Honk Box" => "A narrow mid peak into a medium clip.",
+        "Smooth Lead" => "Compressed sustain with the top rolled off.",
+        "Sputter Fuzz" => "Opens on the attack and chokes as the note decays.",
+        "Clean Push" => "Almost clean level, with a hint of soft clip.",
+        "Park Head" => "Rounder, lower-gain British head. More bass, more sag.",
+        "Silver Twin" => "Brighter and stiffer than Twin Clean.",
+        "Thick Stack" => "Huge low-mids, soft clip, a lot of sag.",
+        "Mini Chime" => "Small combo. Early breakup, fizzy top.",
+        "Hot Mod" => "A hot-rodded plexi. Tight mids, more feedback.",
+        "Vintage Modern" => "High gain that sags. Looser than Recto Modern.",
+        "Studio Bass" => "Mid-forward bass. Less sub than Bass 800.",
+        "Express Lead" => "Little feedback. The power section lets go.",
+        "Closed 1x12" => "Small sealed single. The top rolls off early.",
+        "Ported 2x12" => "A tuned port under a closed pair.",
+        "Open 4x10" => "Four tens, open back, strong rear cancellation.",
+        "Ceramic 2x12" => "Tight pair with less bell than the alnico.",
+        "Deep 4x12" => "Lower and looser than the oversized 4x12.",
+        "Combo 1x15" => "Open fifteen. Dark and loose.",
+        "Alnico 1x10" => "Small bright single. Boxy.",
+        "Dark 1x15" => "Sealed fifteen with very little top.",
+        "Dimension Double" => "Short, quiet doubling. Less swirl than the chorus.",
+        "Tri Chorus" => "A longer, slower chorus with a wider offset.",
+        "Thru Zero" => "The sweep passes close to the dry signal.",
+        "Slow Jet" => "A slow flanger with more regeneration.",
+        "Harmonic Trem" => "Lows and highs pulse against each other.",
+        "Bias Trem" => "A slow, soft wobble. Less chop than the opto.",
+        "Slap Echo" => "Bright repeats that stay put.",
+        "Oil Can" => "Dark, saturated, the pitch wanders.",
+        "Dark Echo" => "Repeats lose their top and their low end.",
+        "Ambient Echo" => "Long, quiet repeats alternating across the image.",
+        "Wow Echo" => "Tape movement turned up until the pitch drifts.",
+        "Triplet Tap" => "Quarter note left against a triplet right.",
+        "Spring Tank" => "Short and sparse, with a lot of early ring.",
+        "Drum Chamber" => "Medium room, darker than the hall.",
+        "Ambience" => "A very short early field. Almost no tail.",
+        "Dark Hall" => "Hall length with the top rolled off.",
+        "Air EQ" => "A very high shelf and wide bells.",
+        "Bass Shelf" => "The low shelf sits lower. Bells stay broad.",
+        "Presence EQ" => "The high shelf comes in around the presence band.",
+        "Notch EQ" => "Narrow bells for small cuts.",
+        "Bass Wah" => "The sweep sits an octave lower.",
+        "Vocal Wah" => "A narrow, more resonant vowel.",
+        "Parked Filter" => "A short travel around one mid.",
+        "Talk Filter" => "A wide envelope sweep with more dry body under it.",
         _ => "",
     }
 }
@@ -405,16 +458,93 @@ fn focus_slot(order: &[Option<StageKind>], focus: ChainFocus) -> usize {
     }
 }
 
-/// A chain of `shown` positions across the path: the design's 99 px blocks
-/// 116 px apart up to seven, narrower blocks 12 px apart beyond, so the
-/// whole chain always fits. Returns the block size and the pitch.
-fn chain_geometry(shown: usize) -> (f32, f32) {
-    if shown <= CHAIN_VISIBLE {
-        (BLOCK, PITCH)
-    } else {
-        let gap = 12.0;
-        let block = (CHAIN_W - gap * (shown - 1) as f32) / shown as f32;
-        (block, block + gap)
+/// One lane of blocks: size and pitch at the design size, and how tall
+/// the lane is.
+struct LaneGeom {
+    size: f32,
+    pitch: f32,
+    lane_h: f32,
+}
+
+/// How many lanes to draw. The main path is always there. One more lane
+/// is offered past the last row in use, and the well stops at four.
+fn lane_count(p: &Params) -> usize {
+    let mut highest = 0u8;
+    for stage in p.stage_order.iter().flatten() {
+        highest = highest.max(p.stage_row[*stage as usize].min(3));
+    }
+    for (index, send) in p.row_send.iter().enumerate() {
+        if *send != RowSend::Off {
+            highest = highest.max(index as u8 + 1);
+        }
+    }
+    (highest as usize + 2).clamp(2, 4)
+}
+
+fn lane_geom(lanes: usize, shown: usize) -> LaneGeom {
+    let lanes = lanes.clamp(1, 4);
+    let shown = shown.max(1);
+    let lane_h = (LANE_BOTTOM - LANE_TOP) / lanes as f32;
+    let gap = 6.0;
+    let fit = (BLOCK_RUN - gap * (shown - 1) as f32) / shown as f32;
+    let size = fit.min(lane_h - 8.0).min(BLOCK_REF);
+    LaneGeom {
+        size,
+        pitch: size + gap,
+        lane_h,
+    }
+}
+
+fn slot_origin(geom: &LaneGeom, slot: usize, row: usize) -> (f32, f32) {
+    let left = CHAIN_LEFT + slot as f32 * geom.pitch;
+    let top = LANE_TOP + row as f32 * geom.lane_h + (geom.lane_h - geom.size) * 0.5;
+    (left, top)
+}
+
+/// What a chain drag carries. Editor-local: the audio thread never sees it.
+#[derive(Clone, Copy)]
+struct ChainDrag {
+    slot: usize,
+    kind: StageKind,
+}
+
+struct ChainGhost {
+    name: &'static str,
+}
+
+impl Render for ChainGhost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(8.0))
+            .py(px(4.0))
+            .rounded(px(2.0))
+            .bg(color(0xd9d9d9))
+            .text_color(color(0x111111))
+            .text_size(px(12.0))
+            .child(self.name)
+    }
+}
+
+/// Drop writes `stage_order` and, when the lane changed, `stage_row`.
+fn drop_chain(
+    cx: &Cx,
+    slot: usize,
+    row: u8,
+) -> impl Fn(&ChainDrag, &mut Window, &mut App) + 'static {
+    let entity = cx.entity().clone();
+    move |drag, _window, app| {
+        let kind = drag.kind;
+        let _ = entity.update(app, |this, cx| {
+            let mut next = this.params_snapshot();
+            let from = next
+                .stage_order
+                .iter()
+                .position(|entry| *entry == Some(kind))
+                .unwrap_or(drag.slot);
+            rodharerist::reorder_chain(&mut next.stage_order, &mut next.stage_row, from, slot, row);
+            this.chain_focus = Some(ChainFocus::Block(kind));
+            this.set_params(next, cx);
+        });
     }
 }
 
@@ -775,19 +905,17 @@ fn chain_block(
     w: &RodhareistEditorWindow,
     p: &Params,
     slot: usize,
+    row: u8,
     selected: bool,
-    (size, pitch): (f32, f32),
+    geom: &LaneGeom,
     cx: &mut Cx,
     s: f32,
 ) -> AnyElement {
+    let size = geom.size;
     // Narrower blocks keep their type legible and shrink the rest.
-    let k = size / BLOCK;
-    let type_k = k.max(0.82);
+    let k = (size / BLOCK_REF).clamp(0.55, 1.0);
+    let type_k = k.max(0.72);
     let entry = p.stage_order[slot];
-    let row_mark = entry.and_then(|kind| {
-        let row = p.stage_row[kind as usize];
-        (row > 0).then(|| format!("{}", row + 1))
-    });
     let names = w.ui.show_names;
     // A block on one side only says which.
     let side = entry
@@ -844,11 +972,6 @@ fn chain_block(
                         .text_color(fg)
                         .font_weight(FontWeight::SEMIBOLD),
                 )
-                .children(row_mark.map(|mark| {
-                    words(mark, 9.0 * type_k, WHITE, s)
-                        .text_color(fg)
-                        .font_weight(FontWeight::SEMIBOLD)
-                }))
                 .child(
                     div()
                         .flex()
@@ -869,14 +992,16 @@ fn chain_block(
                         .child(div().size(px(8.0 * k * s)).rounded_full().bg(led)),
                 ),
         )
-        .child(div().flex().justify_center().child(icon(
-            icon_path,
-            (24.0, 24.0),
-            (26.0 * k, 26.0 * k),
-            1.6,
-            fg,
-            s,
-        )))
+        .children((size >= 48.0).then(|| {
+            div().flex().justify_center().child(icon(
+                icon_path,
+                (24.0, 24.0),
+                (22.0 * k, 22.0 * k),
+                1.6,
+                fg,
+                s,
+            ))
+        }))
         .child(
             div()
                 .h(px(14.0 * s))
@@ -890,7 +1015,15 @@ fn chain_block(
     if dashed {
         block = block.border_dashed();
     }
+    if let Some(kind) = entry {
+        block = block.on_drag(ChainDrag { slot, kind }, |drag, _, _, cx| {
+            cx.new(|_| ChainGhost {
+                name: blocks::block_name(drag.kind),
+            })
+        });
+    }
     let block = block
+        .on_drop(drop_chain(cx, slot, row))
         .tooltip(fb_tooltip(match entry {
             Some(kind) => format!(
                 "Slot {} \u{00B7} {} \u{2014} double-click to bypass",
@@ -917,18 +1050,17 @@ fn chain_block(
                 });
             }
         });
-    let left = CHAIN_LEFT + slot as f32 * pitch;
-    // Centred on the wire, so narrower blocks stay threaded on it.
-    let top = CHAIN_MID - size / 2.0;
+    let (left, top) = slot_origin(geom, slot, row as usize);
+    let ring = if size < 64.0 { 3.0 } else { 4.0 };
     if selected {
         // The design's ring: a dark gap, then the accent.
         div()
             .absolute()
-            .left(px((left - 5.0) * s))
-            .top(px((top - 5.0) * s))
-            .size(px((size + 10.0) * s))
-            .p(px(3.0 * s))
-            .rounded(px(5.0 * s))
+            .left(px((left - ring) * s))
+            .top(px((top - ring) * s))
+            .size(px((size + ring * 2.0) * s))
+            .p(px((ring - 2.0).max(1.0) * s))
+            .rounded(px(4.0 * s))
             .border(px(2.0 * s))
             .border_color(accent())
             .bg(color(plate::WELL))
@@ -1019,95 +1151,93 @@ fn send_button(
         .into_any_element()
 }
 
-/// Four send rows under the chain. Row 1 is line 2. Rows 2–4 are the
-/// bottom sends. A row set to Off does not run its blocks.
-fn send_rows(p: &Params, cx: &mut Cx, s: f32) -> AnyElement {
-    let mut rows: Vec<AnyElement> = Vec::with_capacity(4);
-    let line2 = [
-        (Line2Mode::Wet, "WET"),
-        (Line2Mode::Dry, "DRY"),
-        (Line2Mode::WetDryWet, "W/D/W"),
-    ];
-    let line2_buttons = line2.into_iter().enumerate().map(|(index, (mode, label))| {
-        send_button(
-            cx,
-            index,
-            label,
-            p.line2_mode == mode,
-            s,
-            move |this, cx| {
-                this.set_wire_value("line2_mode", index as f32, cx);
-            },
-        )
-    });
-    let line2_level = p.line2_mix;
-    rows.push(
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(4.0 * s))
-            .child(numbers("1", 11.0, SOFT, s).w(px(12.0 * s)))
-            .children(line2_buttons)
-            .child(send_button(
+/// The lane's split, at its end: line 2 on the main path, a bottom send
+/// on the others. Same buttons as before, sitting on the lane instead of
+/// in a strip under the chain.
+fn lane_send(p: &Params, row: usize, geom: &LaneGeom, cx: &Cx, s: f32) -> AnyElement {
+    let top = LANE_TOP + row as f32 * geom.lane_h + (geom.lane_h - 16.0) * 0.5;
+    let mut buttons: Vec<AnyElement> = Vec::new();
+    if row == 0 {
+        let line2 = [
+            (Line2Mode::Wet, "WET"),
+            (Line2Mode::Dry, "DRY"),
+            (Line2Mode::WetDryWet, "W/D/W"),
+        ];
+        for (index, (mode, label)) in line2.into_iter().enumerate() {
+            buttons.push(send_button(
                 cx,
-                10,
-                "SEND",
-                p.line2_mode == Line2Mode::WetDryWet,
+                index,
+                label,
+                p.line2_mode == mode,
                 s,
-                move |this, cx| this.set_wire_value("line2_mix", step_send(line2_level), cx),
-            ))
-            .child(numbers(format!("{line2_level:.0}"), 11.0, SOFT, s))
-            .into_any_element(),
-    );
-    let bottom = [
-        (RowSend::Off, "OFF"),
-        (RowSend::Serial, "SER"),
-        (RowSend::Parallel, "PAR"),
-        (RowSend::WetDryWet, "W/D/W"),
-    ];
-    for (row, (send_id, level_id)) in [
-        ("row_send_1", "row_level_1"),
-        ("row_send_2", "row_level_2"),
-        ("row_send_3", "row_level_3"),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let current = p.row_send[row];
-        let level = p.row_level[row];
-        let modes = bottom;
-        let buttons = modes.into_iter().enumerate().map(|(index, (mode, label))| {
-            let id = 20 + row * 8 + index;
-            send_button(cx, id, label, current == mode, s, move |this, cx| {
+                move |this, cx| this.set_wire_value("line2_mode", index as f32, cx),
+            ));
+        }
+        let level = p.line2_mix;
+        buttons.push(send_button(
+            cx,
+            8,
+            "LVL",
+            p.line2_mode == Line2Mode::WetDryWet,
+            s,
+            move |this, cx| this.set_wire_value("line2_mix", step_send(level), cx),
+        ));
+        buttons.push(numbers(format!("{level:.0}"), 11.0, SOFT, s).into_any_element());
+    } else {
+        let bottom = [
+            (RowSend::Off, "OFF"),
+            (RowSend::Serial, "SER"),
+            (RowSend::Parallel, "PAR"),
+            (RowSend::WetDryWet, "W/D/W"),
+        ];
+        let send_id = ["row_send_1", "row_send_2", "row_send_3"][row - 1];
+        let level_id = ["row_level_1", "row_level_2", "row_level_3"][row - 1];
+        let current = p.row_send[row - 1];
+        let level = p.row_level[row - 1];
+        for (index, (mode, label)) in bottom.into_iter().enumerate() {
+            let id = 20 + (row - 1) * 8 + index;
+            buttons.push(send_button(cx, id, label, current == mode, s, move |this, cx| {
                 this.set_wire_value(send_id, index as f32, cx);
-            })
-        });
-        rows.push(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(4.0 * s))
-                .child(numbers(format!("{}", row + 2), 11.0, SOFT, s).w(px(12.0 * s)))
-                .children(buttons)
-                .child(send_button(
-                    cx,
-                    80 + row,
-                    "SEND",
-                    current != RowSend::Off,
-                    s,
-                    move |this, cx| this.set_wire_value(level_id, step_send(level), cx),
-                ))
-                .child(numbers(format!("{level:.0}"), 11.0, SOFT, s))
-                .into_any_element(),
-        );
+            }));
+        }
+        buttons.push(send_button(
+            cx,
+            80 + row,
+            "LVL",
+            current != RowSend::Off,
+            s,
+            move |this, cx| this.set_wire_value(level_id, step_send(level), cx),
+        ));
+        buttons.push(numbers(format!("{level:.0}"), 11.0, SOFT, s).into_any_element());
     }
     div()
+        .absolute()
+        .left(px(SEND_LEFT * s))
+        .top(px(top * s))
         .flex()
-        .flex_col()
-        .gap(px(2.0 * s))
-        .children(rows)
+        .flex_row()
+        .items_center()
+        .gap(px(3.0 * s))
+        .child(numbers(format!("{}", row + 1), 11.0, SOFT, s).w(px(12.0 * s)))
+        .children(buttons)
+        .into_any_element()
+}
+
+/// An empty column on a lane that is not showing the slot's block. A drop
+/// here moves the block onto this lane without packing the path.
+fn drop_cell(slot: usize, row: u8, geom: &LaneGeom, cx: &Cx, s: f32) -> AnyElement {
+    let (left, top) = slot_origin(geom, slot, row as usize);
+    div()
+        .id(("rodhareist-drop", row as usize * 16 + slot))
+        .absolute()
+        .left(px(left * s))
+        .top(px(top * s))
+        .size(px(geom.size * s))
+        .rounded(px(2.0 * s))
+        .border(px(1.0))
+        .border_color(color_a(0, 0.0))
+        .hover(|style| style.border_color(color(0x5a5a5a)))
+        .on_drop(drop_chain(cx, slot, row))
         .into_any_element()
 }
 
@@ -1119,18 +1249,46 @@ fn display(
     s: f32,
 ) -> AnyElement {
     let shown = shown_slots(&p.stage_order);
+    let lanes = lane_count(p);
     let selected_slot = focus_slot(&p.stage_order, focus);
-    let geometry = chain_geometry(shown);
-    let wire = div()
-        .absolute()
-        .left(px(CHAIN_LEFT * s))
-        .top(px((CHAIN_MID - 1.5) * s))
-        .w(px(CHAIN_W * s))
-        .h(px(3.0 * s))
-        .bg(color(0xb5b5b5));
-    let chain: Vec<AnyElement> = (0..shown)
-        .map(|slot| chain_block(w, p, slot, slot == selected_slot, geometry, cx, s))
-        .collect();
+    let geom = lane_geom(lanes, shown);
+    let mut wires = Vec::with_capacity(lanes);
+    let mut sends = Vec::with_capacity(lanes);
+    let mut cells: Vec<AnyElement> = Vec::new();
+    for row in 0..lanes {
+        let mid = LANE_TOP + row as f32 * geom.lane_h + geom.lane_h * 0.5;
+        wires.push(
+            div()
+                .absolute()
+                .left(px(CHAIN_LEFT * s))
+                .top(px((mid - 1.0) * s))
+                .w(px(BLOCK_RUN * s))
+                .h(px(2.0 * s))
+                .bg(color(0xb5b5b5))
+                .into_any_element(),
+        );
+        sends.push(lane_send(p, row, &geom, cx, s));
+        for slot in 0..shown {
+            let here = match p.stage_order[slot] {
+                Some(kind) => p.stage_row[kind as usize] as usize == row,
+                None => row == 0,
+            };
+            if here {
+                cells.push(chain_block(
+                    w,
+                    p,
+                    slot,
+                    row as u8,
+                    slot == selected_slot,
+                    &geom,
+                    cx,
+                    s,
+                ));
+            } else {
+                cells.push(drop_cell(slot, row as u8, &geom, cx, s));
+            }
+        }
+    }
     let input = level_knob("input_trim", "IN", p.input_trim_db, 31.0, cx, s);
     let output = level_knob("output_trim", "OUT", p.output_trim_db, 964.0, cx, s);
     div()
@@ -1146,20 +1304,16 @@ fn display(
         .children(meters(w, s))
         .child(input)
         .child(output)
-        .child(wire)
-        .children(chain)
+        .children(wires)
+        .children(cells)
+        .children(sends)
         .child(
             div()
                 .absolute()
                 .left(px(CHAIN_LEFT * s))
-                .top(px(218.0 * s))
-                .w(px(CHAIN_W * s))
-                .flex()
-                .flex_col()
-                .items_start()
-                .gap(px(3.0 * s))
-                .child(words(caption_line(p, focus), 13.0, WHITE, s))
-                .child(send_rows(p, cx, s)),
+                .top(px(CAPTION_TOP * s))
+                .w(px(BLOCK_RUN * s))
+                .child(words(caption_line(p, focus), 13.0, WHITE, s)),
         )
         .into_any_element()
 }
@@ -2839,5 +2993,20 @@ mod tests {
         let p = rodharerist::default_params();
         assert_eq!(shown_slots(&[None; rodharerist::PATH_SLOTS]), CHAIN_VISIBLE);
         assert!(shown_slots(&p.stage_order) >= p.stage_order.iter().flatten().count());
+    }
+
+    #[test]
+    fn an_unused_rig_offers_two_lanes_and_four_still_fit() {
+        let p = rodharerist::default_params();
+        assert_eq!(lane_count(&p), 2);
+        let two = lane_geom(2, 7);
+        assert!(two.size >= 48.0);
+        assert!(LANE_TOP + 2.0 * two.lane_h <= LANE_BOTTOM + 0.01);
+        let mut parked = p.clone();
+        parked.stage_row[StageKind::Delay as usize] = 3;
+        assert_eq!(lane_count(&parked), 4);
+        let four = lane_geom(4, 7);
+        assert!(four.size + 6.0 <= four.lane_h);
+        assert!(LANE_TOP + 4.0 * four.lane_h <= LANE_BOTTOM + 0.01);
     }
 }

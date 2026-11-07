@@ -89,6 +89,14 @@ const DRIVE_MODELS = [
   'Tight Rift',
   'Amber Crunch',
   'Copper Fuzz',
+  'Glass Boost',
+  'Velvet OD',
+  'Octave Fuzz',
+  'Bass Grind',
+  'Honk Box',
+  'Smooth Lead',
+  'Sputter Fuzz',
+  'Clean Push',
 ]
 const AMP_MODELS = [
   'Mandarin 80',
@@ -115,6 +123,14 @@ const AMP_MODELS = [
   'Liverpool',
   'Bass 800',
   'Stealth Lead',
+  'Park Head',
+  'Silver Twin',
+  'Thick Stack',
+  'Mini Chime',
+  'Hot Mod',
+  'Vintage Modern',
+  'Studio Bass',
+  'Express Lead',
 ]
 const CAB_MODELS = [
   '1960v Vintage 4x12',
@@ -137,6 +153,14 @@ const CAB_MODELS = [
   'Cream 4x12',
   'Bass 8x10',
   'Silver Bell 1x12',
+  'Closed 1x12',
+  'Ported 2x12',
+  'Open 4x10',
+  'Ceramic 2x12',
+  'Deep 4x12',
+  'Combo 1x15',
+  'Alnico 1x10',
+  'Dark 1x15',
 ]
 /** `CabModel::Ir`: convolution with a loaded file, not a modeled voicing. */
 const CAB_IR = 11
@@ -153,13 +177,49 @@ const MOD_MODELS = [
   'Isan Jet',
   'Soft Phase',
   'Wide Vibe',
+  'Dimension Double',
+  'Tri Chorus',
+  'Thru Zero',
+  'Slow Jet',
+  'Harmonic Trem',
+  'Bias Trem',
 ]
-const WAH_MODELS = ['Cry Wah', 'Touch Wah']
+const WAH_MODELS = ['Cry Wah', 'Touch Wah', 'Bass Wah', 'Vocal Wah', 'Parked Filter', 'Talk Filter']
 const WAH_TOUCH = 1
-const DELAY_MODELS = ['Tape Echo', 'Digital Delay', 'Analog Delay', 'Ping-Pong', 'Dual Delay']
-const REVERB_MODELS = ['Studio Plate', 'Tracking Room', 'Concert Hall', 'Shimmer']
+const DELAY_MODELS = [
+  'Tape Echo',
+  'Digital Delay',
+  'Analog Delay',
+  'Ping-Pong',
+  'Dual Delay',
+  'Stereo Delay',
+  'Slap Echo',
+  'Oil Can',
+  'Dark Echo',
+  'Ambient Echo',
+  'Wow Echo',
+  'Triplet Tap',
+]
+const REVERB_MODELS = [
+  'Studio Plate',
+  'Tracking Room',
+  'Concert Hall',
+  'Shimmer',
+  'Spring Tank',
+  'Drum Chamber',
+  'Ambience',
+  'Dark Hall',
+]
 const REVERB_SHIMMER = 3
-const EQ_MODELS = ['Studio EQ', 'Vintage EQ', 'Modern EQ']
+const EQ_MODELS = [
+  'Studio EQ',
+  'Vintage EQ',
+  'Modern EQ',
+  'Air EQ',
+  'Bass Shelf',
+  'Presence EQ',
+  'Notch EQ',
+]
 
 /** `ToneEngineKind` wire values. */
 const ENGINE_CLASSIC = 0

@@ -57,16 +57,42 @@ impl ModStage {
             // two phaser voices is the exception: `Phaser::configure` swaps
             // the cascade itself and clears only what the new one cannot use.
             match model {
-                ModModel::Chorus => self.chorus.reset(),
-                ModModel::Flanger => self.flanger.reset(),
-                ModModel::Tremolo => self.tremolo.reset(),
+                ModModel::Chorus | ModModel::Dimension | ModModel::TriChorus => self.chorus.reset(),
+                ModModel::Flanger | ModModel::ThruZero | ModModel::SlowJet => self.flanger.reset(),
+                ModModel::Tremolo | ModModel::HarmonicTrem | ModModel::BiasTrem => {
+                    self.tremolo.reset()
+                }
                 _ => {}
             }
         }
         match self.model {
             ModModel::Chorus => self.chorus.configure(rate, depth, mix),
+            ModModel::Dimension => {
+                self.chorus
+                    .configure_voice(rate, depth, mix, super::chorus::ChorusVoice::dimension())
+            }
+            ModModel::TriChorus => self
+                .chorus
+                .configure_voice(rate, depth, mix, super::chorus::ChorusVoice::tri()),
             ModModel::Flanger => self.flanger.configure(rate, depth, mix),
+            ModModel::ThruZero => self.flanger.configure_voice(
+                rate,
+                depth,
+                mix,
+                super::flanger::FlangerVoice::thru_zero(),
+            ),
+            ModModel::SlowJet => {
+                self.flanger
+                    .configure_voice(rate, depth, mix, super::flanger::FlangerVoice::slow())
+            }
             ModModel::Tremolo => self.tremolo.configure(rate, depth, mix),
+            ModModel::HarmonicTrem => {
+                self.tremolo
+                    .configure_kind(rate, depth, mix, super::tremolo::TremKind::Harmonic)
+            }
+            ModModel::BiasTrem => self
+                .tremolo
+                .configure_kind(rate, depth, mix, super::tremolo::TremKind::Bias),
             other => {
                 // Every remaining model is a voiced phaser.
                 if let Some(voice) = other.phaser_voice() {
@@ -79,9 +105,15 @@ impl ModStage {
     #[inline]
     pub(super) fn process(&mut self, left: f32, right: f32) -> (f32, f32) {
         match self.model {
-            ModModel::Chorus => self.chorus.process(left, right),
-            ModModel::Flanger => self.flanger.process(left, right),
-            ModModel::Tremolo => self.tremolo.process(left, right),
+            ModModel::Chorus | ModModel::Dimension | ModModel::TriChorus => {
+                self.chorus.process(left, right)
+            }
+            ModModel::Flanger | ModModel::ThruZero | ModModel::SlowJet => {
+                self.flanger.process(left, right)
+            }
+            ModModel::Tremolo | ModModel::HarmonicTrem | ModModel::BiasTrem => {
+                self.tremolo.process(left, right)
+            }
             _ => self.phaser.process(left, right),
         }
     }

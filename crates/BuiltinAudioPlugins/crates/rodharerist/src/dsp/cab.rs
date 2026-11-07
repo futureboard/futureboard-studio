@@ -519,7 +519,211 @@ impl CabProfile {
                 compression: 0.03,
                 output_gain: 0.9,
             },
+            // Small sealed single. The rolloff starts early and the box mode sits high.
+            CabModel::Closed1x12 => Self {
+                topology: CabTopology::VintageClosed,
+                hpf_hz: 128.0,
+                resonance_hz: 210.0,
+                resonance_damping: 0.32,
+                resonance_gain: 0.55,
+                second_mode_hz: 480.0,
+                second_mode_gain: 0.22,
+                body_hz: 1_100.0,
+                body_gain: 0.20,
+                breakup_hz: 2_400.0,
+                breakup_damping: 0.42,
+                breakup_gain: 0.12,
+                notch_hz: 3_100.0,
+                notch_gain: 0.22,
+                cutoff_hz: 3_400.0,
+                slope: 4,
+                rear_delay_ms: 0.0,
+                rear_gain: 0.0,
+                compression: 0.16,
+                output_gain: 0.86,
+            },
+            // A port under a pair: a low bump, then a tighter top than an open 2x12.
+            CabModel::Ported2x12 => Self {
+                topology: CabTopology::VintagePair,
+                hpf_hz: 58.0,
+                resonance_hz: 70.0,
+                resonance_damping: 0.28,
+                resonance_gain: 0.62,
+                second_mode_hz: 190.0,
+                second_mode_gain: 0.10,
+                body_hz: 540.0,
+                body_gain: 0.06,
+                breakup_hz: 2_900.0,
+                breakup_damping: 0.40,
+                breakup_gain: 0.16,
+                notch_hz: 1_600.0,
+                notch_gain: 0.12,
+                cutoff_hz: 4_400.0,
+                slope: 3,
+                rear_delay_ms: 2.4,
+                rear_gain: 0.16,
+                compression: 0.10,
+                output_gain: 0.90,
+            },
+            // Four tens, open. The rear wave is stronger and later than a combo.
+            CabModel::Open4x10 => Self {
+                topology: CabTopology::OpenBack,
+                hpf_hz: 98.0,
+                resonance_hz: 160.0,
+                resonance_damping: 0.55,
+                resonance_gain: 0.18,
+                second_mode_hz: 420.0,
+                second_mode_gain: -0.18,
+                body_hz: 880.0,
+                body_gain: 0.04,
+                breakup_hz: 3_800.0,
+                breakup_damping: 0.36,
+                breakup_gain: 0.20,
+                notch_hz: 2_400.0,
+                notch_gain: 0.08,
+                cutoff_hz: 6_400.0,
+                slope: 2,
+                rear_delay_ms: 2.1,
+                rear_gain: -0.42,
+                compression: 0.04,
+                output_gain: 0.93,
+            },
+            CabModel::Ceramic2x12 => Self {
+                topology: CabTopology::ModernClosed,
+                hpf_hz: 84.0,
+                resonance_hz: 118.0,
+                resonance_damping: 0.72,
+                resonance_gain: 0.22,
+                second_mode_hz: 260.0,
+                second_mode_gain: 0.06,
+                body_hz: 700.0,
+                body_gain: -0.04,
+                breakup_hz: 2_800.0,
+                breakup_damping: 0.58,
+                breakup_gain: 0.10,
+                notch_hz: 3_600.0,
+                notch_gain: 0.20,
+                cutoff_hz: 4_200.0,
+                slope: 4,
+                rear_delay_ms: 0.0,
+                rear_gain: 0.0,
+                compression: 0.12,
+                output_gain: 0.88,
+            },
+            CabModel::Deep4x12 => Self {
+                topology: CabTopology::Oversized,
+                hpf_hz: 42.0,
+                resonance_hz: 64.0,
+                resonance_damping: 0.40,
+                resonance_gain: 0.58,
+                second_mode_hz: 120.0,
+                second_mode_gain: 0.30,
+                body_hz: 360.0,
+                body_gain: -0.14,
+                breakup_hz: 2_600.0,
+                breakup_damping: 0.50,
+                breakup_gain: 0.14,
+                notch_hz: 1_700.0,
+                notch_gain: 0.22,
+                cutoff_hz: 4_600.0,
+                slope: 4,
+                rear_delay_ms: 0.0,
+                rear_gain: 0.0,
+                compression: 0.22,
+                output_gain: 0.84,
+            },
+            CabModel::Combo1x15 => Self {
+                topology: CabTopology::OpenCombo,
+                hpf_hz: 48.0,
+                resonance_hz: 78.0,
+                resonance_damping: 0.46,
+                resonance_gain: 0.40,
+                second_mode_hz: 190.0,
+                second_mode_gain: -0.08,
+                body_hz: 420.0,
+                body_gain: 0.18,
+                breakup_hz: 1_800.0,
+                breakup_damping: 0.55,
+                breakup_gain: 0.08,
+                notch_hz: 2_600.0,
+                notch_gain: 0.16,
+                cutoff_hz: 3_200.0,
+                slope: 3,
+                rear_delay_ms: 2.6,
+                rear_gain: -0.34,
+                compression: 0.09,
+                output_gain: 0.92,
+            },
+            CabModel::Alnico1x10 => Self {
+                topology: CabTopology::SmallCombo,
+                hpf_hz: 140.0,
+                resonance_hz: 240.0,
+                resonance_damping: 0.34,
+                resonance_gain: 0.48,
+                second_mode_hz: 620.0,
+                second_mode_gain: 0.26,
+                body_hz: 1_400.0,
+                body_gain: 0.22,
+                breakup_hz: 4_200.0,
+                breakup_damping: 0.30,
+                breakup_gain: 0.28,
+                notch_hz: 2_200.0,
+                notch_gain: 0.10,
+                cutoff_hz: 5_200.0,
+                slope: 3,
+                rear_delay_ms: 0.55,
+                rear_gain: -0.14,
+                compression: 0.08,
+                output_gain: 0.90,
+            },
+            CabModel::Dark15 => Self {
+                topology: CabTopology::Bass,
+                hpf_hz: 40.0,
+                resonance_hz: 72.0,
+                resonance_damping: 0.50,
+                resonance_gain: 0.36,
+                second_mode_hz: 150.0,
+                second_mode_gain: 0.18,
+                body_hz: 280.0,
+                body_gain: 0.16,
+                breakup_hz: 1_200.0,
+                breakup_damping: 0.70,
+                breakup_gain: 0.04,
+                notch_hz: 2_800.0,
+                notch_gain: 0.24,
+                cutoff_hz: 2_400.0,
+                slope: 4,
+                rear_delay_ms: 0.0,
+                rear_gain: 0.0,
+                compression: 0.14,
+                output_gain: 0.95,
+            },
         }
+    }
+}
+
+/// Rear-wave contribution.
+///
+/// A negative `rear_gain` is an open back: lows cancel, highs stay as a
+/// dull remainder. A positive gain is a reflection, mixed full-band.
+fn rear_term(
+    channel: &mut CabChannel,
+    delay: &DelayLine,
+    sample_rate: f32,
+    profile: CabProfile,
+) -> f32 {
+    if profile.rear_delay_ms <= 0.0 || profile.rear_gain.abs() < 1.0e-4 {
+        return 0.0;
+    }
+    let rear = delay.read(sample_rate * profile.rear_delay_ms * 0.001);
+    if profile.rear_gain < 0.0 {
+        let a = alpha(340.0, sample_rate);
+        channel.rear_low = finite(channel.rear_low + a * (rear - channel.rear_low));
+        let low = channel.rear_low;
+        let high = rear - low;
+        low * profile.rear_gain * 1.9 + high * profile.rear_gain * 0.25
+    } else {
+        rear * profile.rear_gain
     }
 }
 
@@ -555,6 +759,12 @@ struct CabChannel {
     condenser_low: f32,
     room_low: f32,
     envelope: f32,
+    /// Extra closed-back pole, below the speaker stack.
+    closed_lp: f32,
+    /// Low band of the rear wave, for open-back cancellation.
+    rear_low: f32,
+    /// High band used to pull the plastic 5 kHz edge down.
+    presence: f32,
 }
 
 impl Default for CabChannel {
@@ -574,6 +784,9 @@ impl Default for CabChannel {
             condenser_low: 0.0,
             room_low: 0.0,
             envelope: 0.0,
+            closed_lp: 0.0,
+            rear_low: 0.0,
+            presence: 0.0,
         }
     }
 }
@@ -867,20 +1080,20 @@ impl CabLane {
                     - notch * profile.notch_gain
             }
             CabTopology::OpenCombo | CabTopology::OpenBack => {
-                let rear = delay.read(sample_rate * profile.rear_delay_ms * 0.001);
+                let rear = rear_term(channel, delay, sample_rate, profile);
                 channel.hp_y
                     + mode1 * profile.resonance_gain
                     + body * profile.body_gain
-                    + rear * profile.rear_gain
+                    + rear
                     + breakup * profile.breakup_gain * (0.35 + center * 0.70)
             }
             CabTopology::SmallCombo => {
-                let rear = delay.read(sample_rate * profile.rear_delay_ms * 0.001);
+                let rear = rear_term(channel, delay, sample_rate, profile);
                 channel.hp_y
                     + mode1 * profile.resonance_gain
                     + mode2 * profile.second_mode_gain
                     + body * profile.body_gain
-                    + rear * profile.rear_gain
+                    + rear
                     - notch * profile.notch_gain
             }
             CabTopology::ModernClosed => {
@@ -892,11 +1105,11 @@ impl CabLane {
                     - notch * profile.notch_gain * (0.7 + controls.position * 0.5)
             }
             CabTopology::VintagePair => {
-                let pair = delay.read(sample_rate * profile.rear_delay_ms * 0.001);
+                let pair = rear_term(channel, delay, sample_rate, profile);
                 channel.hp_y
                     + mode1 * profile.resonance_gain
                     + mode2 * profile.second_mode_gain
-                    + pair * profile.rear_gain
+                    + pair
                     + body * profile.body_gain
                     + breakup * profile.breakup_gain * (0.55 + center * 0.65)
                     - notch * profile.notch_gain
@@ -928,6 +1141,27 @@ impl CabLane {
             *stage = finite(*stage + controls.speaker_lpf_alpha * (acoustic - *stage));
             acoustic = *stage;
         }
+
+        // A closed back rolls off sooner than the open cabinets. One more
+        // pole, under the speaker stack, keeps the sealed boxes from sharing
+        // the open boxes' top.
+        if matches!(
+            profile.topology,
+            CabTopology::VintageClosed
+                | CabTopology::ModernClosed
+                | CabTopology::Oversized
+                | CabTopology::Bass
+        ) {
+            let closed = alpha((profile.cutoff_hz * 0.55).max(900.0), sample_rate);
+            channel.closed_lp = finite(channel.closed_lp + closed * (acoustic - channel.closed_lp));
+            acoustic = channel.closed_lp;
+        }
+
+        // A stack of one-poles leaves a hard edge around 5 kHz. Pull a
+        // little of that band down so the cone does not sound like plastic.
+        let presence = alpha(5_200.0, sample_rate);
+        channel.presence = finite(channel.presence + presence * (acoustic - channel.presence));
+        acoustic -= (acoustic - channel.presence) * 0.18;
 
         // Position changes proximity and cone breakup as well as high
         // radiation. Distance reduces proximity and introduces a softened,

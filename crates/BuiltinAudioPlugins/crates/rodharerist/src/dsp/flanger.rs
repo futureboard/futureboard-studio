@@ -12,9 +12,52 @@ const MAX_DELAY_MS: f32 = 12.0;
 /// Glide time for depth/mix edits (see `smooth.rs`).
 const SMOOTH_SECONDS: f32 = 0.010;
 
-/// Fixed regeneration. High enough for the metallic comb resonance a flanger
-/// is for, low enough that the loop can never run away (|fb| < 1).
+/// Fixed regeneration of the original jet. High enough for the metallic
+/// comb, low enough that the loop can never run away (|fb| < 1).
 const FEEDBACK: f32 = 0.45;
+
+#[derive(Clone, Copy)]
+pub(super) struct FlangerVoice {
+    pub base_s: f32,
+    pub depth_s: f32,
+    pub rate_lo: f32,
+    pub rate_span: f32,
+    pub feedback: f32,
+}
+
+impl FlangerVoice {
+    pub(super) fn classic() -> Self {
+        Self {
+            base_s: 0.0015,
+            depth_s: 0.0012,
+            rate_lo: 0.05,
+            rate_span: 3.95,
+            feedback: FEEDBACK,
+        }
+    }
+
+    /// The sweep reaches nearly to the dry signal, and the feedback is negative.
+    pub(super) fn thru_zero() -> Self {
+        Self {
+            base_s: 0.0022,
+            depth_s: 0.0020,
+            rate_lo: 0.08,
+            rate_span: 2.4,
+            feedback: -0.62,
+        }
+    }
+
+    /// Slower, longer, more regeneration.
+    pub(super) fn slow() -> Self {
+        Self {
+            base_s: 0.0045,
+            depth_s: 0.0030,
+            rate_lo: 0.02,
+            rate_span: 0.7,
+            feedback: 0.72,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct Flanger {
@@ -26,6 +69,7 @@ pub(super) struct Flanger {
     base_samples: f32,
     depth_samples: Smoothed,
     mix: Smoothed,
+    feedback: f32,
 }
 
 impl Flanger {
@@ -43,6 +87,7 @@ impl Flanger {
             base_samples: 0.0015 * sr,
             depth_samples: Smoothed::new(sr, SMOOTH_SECONDS, 0.0),
             mix: Smoothed::new(sr, SMOOTH_SECONDS, 0.5),
+            feedback: FEEDBACK,
         }
     }
 
@@ -69,15 +114,24 @@ impl Flanger {
 
     /// `rate` and `depth` are 0..10; `mix` is 0..100 %.
     pub(super) fn configure(&mut self, rate: f32, depth: f32, mix: f32) {
+        self.configure_voice(rate, depth, mix, FlangerVoice::classic());
+    }
+
+    pub(super) fn configure_voice(
+        &mut self,
+        rate: f32,
+        depth: f32,
+        mix: f32,
+        voice: FlangerVoice,
+    ) {
         let sr = self.sample_rate;
-        // 0.05 Hz → 4 Hz — flangers live slower than choruses.
-        let rate_hz = 0.05 + (rate / 10.0).clamp(0.0, 1.0) * 3.95;
+        let rate_hz = voice.rate_lo + (rate / 10.0).clamp(0.0, 1.0) * voice.rate_span;
         self.lfo_l.set_rate(rate_hz, sr);
         self.lfo_r.set_rate(rate_hz, sr);
-        // Base 1.5 ms, up to ±1.2 ms of modulation (sweeps through the comb).
-        self.base_samples = 0.0015 * sr;
+        self.base_samples = voice.base_s * sr;
         self.depth_samples
-            .set_target((depth / 10.0).clamp(0.0, 1.0) * 0.0012 * sr);
+            .set_target((depth / 10.0).clamp(0.0, 1.0) * voice.depth_s * sr);
+        self.feedback = voice.feedback;
         self.mix.set_target((mix / 100.0).clamp(0.0, 1.0));
     }
 
@@ -92,8 +146,9 @@ impl Flanger {
         let wet_r = self.line_r.read_interp(self.base_samples + mod_r);
 
         // Regeneration goes back into the line with the dry input.
-        self.line_l.write_sample(left + wet_l * FEEDBACK);
-        self.line_r.write_sample(right + wet_r * FEEDBACK);
+        let feedback = self.feedback;
+        self.line_l.write_sample(left + wet_l * feedback);
+        self.line_r.write_sample(right + wet_r * feedback);
 
         (mix(left, wet_l, mix_amount), mix(right, wet_r, mix_amount))
     }
