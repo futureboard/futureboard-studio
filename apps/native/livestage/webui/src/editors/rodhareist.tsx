@@ -102,6 +102,19 @@ const AMP_MODELS = [
   'Overdrive Special',
   'Invader 5150',
   'Tweed Deluxe',
+  'Princeton',
+  'Custom 100',
+  'Mark Lead',
+  'Normal 15',
+  'Jazz 120',
+  'Deluxe 5',
+  'JTM 45',
+  'Brown Panel',
+  'Fireball',
+  'SLO Lead',
+  'Liverpool',
+  'Bass 800',
+  'Stealth Lead',
 ]
 const CAB_MODELS = [
   '1960v Vintage 4x12',
@@ -118,6 +131,12 @@ const CAB_MODELS = [
   'Impulse Response',
   'Modern 2x12',
   'American 1x12 Combo',
+  'Alnico 2x12',
+  'Greenback 4x12',
+  'Jensen 1x12',
+  'Cream 4x12',
+  'Bass 8x10',
+  'Silver Bell 1x12',
 ]
 /** `CabModel::Ir`: convolution with a loaded file, not a modeled voicing. */
 const CAB_IR = 11

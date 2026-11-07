@@ -563,6 +563,19 @@ pub(crate) fn amp_model_label(m: AmpModel) -> &'static str {
         Boutique => "Overdrive Special",
         Invader => "Invader 5150",
         TweedCombo => "Tweed Deluxe",
+        Princeton => "Princeton",
+        Hundred => "Custom 100",
+        Mark => "Mark Lead",
+        Normal15 => "Normal 15",
+        Jazz120 => "Jazz 120",
+        Deluxe5 => "Deluxe 5",
+        Jtm45 => "JTM 45",
+        Brown => "Brown Panel",
+        Fireball => "Fireball",
+        Slo => "SLO Lead",
+        Liverpool => "Liverpool",
+        Bass800 => "Bass 800",
+        Stealth => "Stealth Lead",
     }
 }
 
@@ -582,6 +595,12 @@ pub(crate) fn cab_model_label(model: CabModel) -> &'static str {
         CabModel::Ir => "Impulse Response",
         CabModel::Modern2x12 => "Modern 2x12",
         CabModel::American1x12 => "American 1x12 Combo",
+        CabModel::Alnico2x12 => "Alnico 2x12",
+        CabModel::Green4x12 => "Greenback 4x12",
+        CabModel::Jensen1x12 => "Jensen 1x12",
+        CabModel::Cream4x12 => "Cream 4x12",
+        CabModel::Bass810 => "Bass 8x10",
+        CabModel::Silver1x12 => "Silver Bell 1x12",
     }
 }
 
