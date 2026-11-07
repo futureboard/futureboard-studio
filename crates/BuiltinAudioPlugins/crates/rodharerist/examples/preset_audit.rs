@@ -36,8 +36,8 @@
 use std::f32::consts::TAU;
 
 use builtin_dsp_core::StereoEffect;
-use rodharerist::{AmpModel, CabModel, Dsp, MicModel, PATH_SLOTS, StageKind, default_params};
-use rustfft::{FftPlanner, num_complex::Complex};
+use rodharerist::{default_params, AmpModel, CabModel, Dsp, MicModel, StageKind, PATH_SLOTS};
+use rustfft::{num_complex::Complex, FftPlanner};
 
 const SR: f32 = 48_000.0;
 /// Long enough for a reverb tail and a few delay repeats to establish.
@@ -175,7 +175,7 @@ fn band_energy(spectrum: &[f32], lo: f32, hi: f32) -> f32 {
 /// Amp models in `AmpModel::ALL` order, with the cab each one is normally
 /// paired with in the bank — the map has to include the cab, because a preset
 /// is never auditioned without one.
-const AMP_MAP: [(AmpModel, CabModel); 11] = [
+const AMP_MAP: [(AmpModel, CabModel); 24] = [
     (AmpModel::Mandarin, CabModel::Vintage2x12),
     (AmpModel::Plexi, CabModel::Brit4x12),
     (AmpModel::Twin, CabModel::American2x12),
@@ -187,6 +187,19 @@ const AMP_MAP: [(AmpModel, CabModel); 11] = [
     (AmpModel::Boutique, CabModel::Vintage2x12),
     (AmpModel::Invader, CabModel::Uber4x12),
     (AmpModel::TweedCombo, CabModel::Tweed1x12),
+    (AmpModel::Princeton, CabModel::American1x12),
+    (AmpModel::Hundred, CabModel::Brit4x12),
+    (AmpModel::Mark, CabModel::Modern4x12),
+    (AmpModel::Normal15, CabModel::OpenBack),
+    (AmpModel::Jazz120, CabModel::Alnico2x12),
+    (AmpModel::Deluxe5, CabModel::Jensen1x12),
+    (AmpModel::Jtm45, CabModel::Green4x12),
+    (AmpModel::Brown, CabModel::Brit4x12),
+    (AmpModel::Fireball, CabModel::Uber4x12),
+    (AmpModel::Slo, CabModel::Slo4x12),
+    (AmpModel::Liverpool, CabModel::Silver1x12),
+    (AmpModel::Bass800, CabModel::Bass810),
+    (AmpModel::Stealth, CabModel::Cream4x12),
 ];
 
 /// Where each amp model actually sits on its Gain and Master travel, measured

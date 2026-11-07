@@ -49,8 +49,8 @@ mod wah;
 mod wav;
 
 use builtin_dsp_core::{
-    ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, clamp, db_to_linear,
-    time_constant,
+    clamp, db_to_linear, time_constant, ParamDescriptor, PluginCategory, PluginDescriptor,
+    StereoEffect,
 };
 
 use cab::Cabinet;
@@ -60,13 +60,13 @@ use drive::Drive;
 use eq::EqStage;
 use gate::NoiseGate;
 pub use ir::{
-    IrInfo, IrLoadError, IrLoader, MAX_IR_SECONDS, PARTITION as IR_PARTITION_SAMPLES,
-    PreparedIrRuntime, prepare_ir_runtime,
+    prepare_ir_runtime, IrInfo, IrLoadError, IrLoader, PreparedIrRuntime, MAX_IR_SECONDS,
+    PARTITION as IR_PARTITION_SAMPLES,
 };
 use mod_stage::ModStage;
 pub use nam::{
-    NAM_BLOCK as NAM_BLOCK_SAMPLES, NamCaptureInfo, NamLoadError, NamLoader, PreparedNamRuntime,
-    prepare_nam_runtime,
+    prepare_nam_runtime, NamCaptureInfo, NamLoadError, NamLoader, PreparedNamRuntime,
+    NAM_BLOCK as NAM_BLOCK_SAMPLES,
 };
 use reverb::PlateReverb;
 pub use tone_stage::ToneEngineKind;
@@ -224,6 +224,28 @@ impl StageKind {
             Self::Amp | Self::Cab => return None,
         })
     }
+
+    /// Wire id for the send row this block sits on. Row 1 is the main
+    /// chain. Rows 2–4 are the bottom sends. Append-only, in `ALL` order.
+    pub fn row_id(self) -> &'static str {
+        match self {
+            Self::Gate => "gate_row",
+            Self::Drive => "drive_row",
+            Self::Amp => "amp_row",
+            Self::Mod => "mod_row",
+            Self::Delay => "delay_row",
+            Self::Reverb => "reverb_row",
+            Self::Cab => "cab_row",
+            Self::Comp => "comp_row",
+            Self::Eq => "eq_row",
+            Self::Wah => "wah_row",
+            Self::Drive2 => "drive2_row",
+            Self::Mod2 => "mod2_row",
+            Self::Delay2 => "delay2_row",
+            Self::Eq2 => "eq2_row",
+            Self::Comp2 => "comp2_row",
+        }
+    }
 }
 
 /// Which side of the stereo path a block processes. A block on one side
@@ -350,6 +372,46 @@ pub enum AmpModel {
     Invader,
     /// "Tweed Deluxe" — small, early-breakup single-speaker combo.
     TweedCombo,
+    /// "Princeton" — small blackface combo: more headroom than a Deluxe,
+    /// less than a Twin. The circuit this follows is the Princeton Reverb
+    /// normal channel.
+    Princeton,
+    /// "Custom 100" — high-headroom, high-feedback British clean that stays
+    /// tight until it is loud. The circuit this follows is the Hiwatt DR103.
+    Hundred,
+    /// "Mark Lead" — mid-forward high gain, tighter and less scooped than
+    /// Recto. The circuit this follows is the Mesa Mark IIC+.
+    Mark,
+    /// "Normal 15" — earlier British chime than Top Boost, two stages.
+    /// The circuit this follows is the Vox AC15 normal channel.
+    Normal15,
+    /// "Jazz 120" — solid-state clean, almost no sag. The circuit this
+    /// follows is the Roland JC-120.
+    Jazz120,
+    /// "Deluxe 5" — loose, early breakup. The circuit this follows is the
+    /// Fender 5E3 Deluxe.
+    Deluxe5,
+    /// "JTM 45" — rounder, lower-gain plexi. The circuit this follows is
+    /// the Marshall JTM45.
+    Jtm45,
+    /// "Brown Panel" — hot plexi: more gain, less feedback, more sag.
+    Brown,
+    /// "Fireball" — tight modern high gain, very little sag. The circuit
+    /// this follows is the ENGL Fireball.
+    Fireball,
+    /// "SLO Lead" — singing mids, less scooped than the modern stack.
+    /// The circuit this follows is the Soldano SLO-100.
+    Slo,
+    /// "Liverpool" — EL84 chime with more clean than Normal 15. The
+    /// circuit this follows is a Matchless DC30.
+    Liverpool,
+    /// "Bass 800" — deep, tight bass head. The circuit this follows is
+    /// the Ampeg SVT.
+    Bass800,
+    /// "Stealth Lead" — the later 5150 head: high gain with a stiffer
+    /// power section and more mids than Invader. The circuit this follows
+    /// is the EVH 5150 III red channel.
+    Stealth,
 }
 
 impl AmpModel {
@@ -366,6 +428,19 @@ impl AmpModel {
         Self::Boutique,
         Self::Invader,
         Self::TweedCombo,
+        Self::Princeton,
+        Self::Hundred,
+        Self::Mark,
+        Self::Normal15,
+        Self::Jazz120,
+        Self::Deluxe5,
+        Self::Jtm45,
+        Self::Brown,
+        Self::Fireball,
+        Self::Slo,
+        Self::Liverpool,
+        Self::Bass800,
+        Self::Stealth,
     ];
 
     pub fn from_model_id(id: &str) -> Option<Self> {
@@ -381,6 +456,19 @@ impl AmpModel {
             "boutique" => Some(Self::Boutique),
             "invader" => Some(Self::Invader),
             "tweed_combo" => Some(Self::TweedCombo),
+            "princeton" => Some(Self::Princeton),
+            "hundred" => Some(Self::Hundred),
+            "mark" => Some(Self::Mark),
+            "normal15" => Some(Self::Normal15),
+            "jazz120" => Some(Self::Jazz120),
+            "deluxe5" => Some(Self::Deluxe5),
+            "jtm45" => Some(Self::Jtm45),
+            "brown" => Some(Self::Brown),
+            "fireball" => Some(Self::Fireball),
+            "slo" => Some(Self::Slo),
+            "liverpool" => Some(Self::Liverpool),
+            "bass800" => Some(Self::Bass800),
+            "stealth" => Some(Self::Stealth),
             _ => None,
         }
     }
@@ -429,6 +517,23 @@ pub enum CabModel {
     /// "American 1x12 Combo" — small, bright, open single speaker; brighter
     /// and less boxy than the Tweed 1x12.
     American1x12,
+    /// "Alnico 2x12" — open pair with a strong speaker bell. More air than
+    /// the American 2x12.
+    Alnico2x12,
+    /// "Greenback 4x12" — closed 4x12 with a mid honk and an early rolloff.
+    /// More mid than the British Stack.
+    Green4x12,
+    /// "Jensen 1x12" — paper-cone single, darker and boxier than the
+    /// American 1x12.
+    Jensen1x12,
+    /// "Cream 4x12" — tight closed 4x12 with more top than a greenback
+    /// and less scoop than the Modern 4x12.
+    Cream4x12,
+    /// "Bass 8x10" — deeper and tighter than the Bass Cabinet.
+    Bass810,
+    /// "Silver Bell 1x12" — bright open single with a high bell and a
+    /// strong rear reflection.
+    Silver1x12,
 }
 
 impl CabModel {
@@ -448,6 +553,12 @@ impl CabModel {
         // Append-only past this point (wire ABI).
         Self::Modern2x12,
         Self::American1x12,
+        Self::Alnico2x12,
+        Self::Green4x12,
+        Self::Jensen1x12,
+        Self::Cream4x12,
+        Self::Bass810,
+        Self::Silver1x12,
     ];
 
     /// The modeled voicings only — [`Self::ALL`] minus [`Self::Ir`], which is
@@ -467,6 +578,12 @@ impl CabModel {
         Self::Slo4x12,
         Self::Modern2x12,
         Self::American1x12,
+        Self::Alnico2x12,
+        Self::Green4x12,
+        Self::Jensen1x12,
+        Self::Cream4x12,
+        Self::Bass810,
+        Self::Silver1x12,
     ];
 
     pub fn from_model_id(id: &str) -> Option<Self> {
@@ -485,6 +602,12 @@ impl CabModel {
             "ir" => Some(Self::Ir),
             "modern_212" => Some(Self::Modern2x12),
             "american_1x12" => Some(Self::American1x12),
+            "alnico_2x12" => Some(Self::Alnico2x12),
+            "green_412" => Some(Self::Green4x12),
+            "jensen_1x12" => Some(Self::Jensen1x12),
+            "cream_412" => Some(Self::Cream4x12),
+            "bass_810" => Some(Self::Bass810),
+            "silver_1x12" => Some(Self::Silver1x12),
             _ => None,
         }
     }
@@ -766,6 +889,155 @@ impl DelayModel {
     }
 }
 
+/// How the chain meets the output.
+///
+/// Wet is the chain itself. Dry is the signal just before the first
+/// time-based block (modulation, delay, reverb). Wet/dry/wet keeps that
+/// dry signal in the center and places the effect's added stereo on the
+/// sides. The discriminant is the wire value: append only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum Line2Mode {
+    #[default]
+    Wet = 0,
+    Dry = 1,
+    WetDryWet = 2,
+}
+
+impl Line2Mode {
+    pub fn from_index(i: u32) -> Self {
+        match i {
+            1 => Self::Dry,
+            2 => Self::WetDryWet,
+            _ => Self::Wet,
+        }
+    }
+
+    pub fn index(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Gains `(dry, wet, center)` for one output sample.
+///
+/// Wet/dry/wet is `center + (wet - dry) * send`: a mono dry amp stays in
+/// the middle and the effect's added stereo sits on the sides. `send` is
+/// 0..1. At 0 the result is the dry center; at 1 it is the chain output
+/// when the dry tap is mono and the effect is mixed into the chain.
+/// How a bottom send row (rows 2–4) returns onto the main chain.
+///
+/// Off does not run the row. Serial replaces the main path with the row
+/// by the send amount. Parallel adds only what the row added. Wet/dry/wet
+/// is that row's own dry-center / wet-sides image, blended by the send.
+/// The discriminant is the wire value: append only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum RowSend {
+    #[default]
+    Off = 0,
+    Serial = 1,
+    Parallel = 2,
+    WetDryWet = 3,
+}
+
+impl RowSend {
+    pub fn from_index(i: u32) -> Self {
+        match i {
+            1 => Self::Serial,
+            2 => Self::Parallel,
+            3 => Self::WetDryWet,
+            _ => Self::Off,
+        }
+    }
+
+    pub fn index(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Bottom send rows. Row 1 is the main chain and its line-2 blend.
+pub const BOTTOM_ROWS: usize = 3;
+
+pub fn line2_targets(mode: Line2Mode, send: f32) -> (f32, f32, f32) {
+    let send = send.clamp(0.0, 1.0);
+    match mode {
+        Line2Mode::Wet => (0.0, 1.0, 0.0),
+        Line2Mode::Dry => (1.0, 0.0, 0.0),
+        Line2Mode::WetDryWet => (-send, send, 1.0),
+    }
+}
+
+fn line2_coeff(sample_rate: f32) -> f32 {
+    1.0 - (-1.0 / (sample_rate.max(1.0) * 0.005)).exp()
+}
+
+fn default_row_level() -> [f32; BOTTOM_ROWS] {
+    [100.0; BOTTOM_ROWS]
+}
+
+/// Mix one bottom row back onto the main path. `g` is the smoothed send.
+fn mix_bottom_row(
+    main_l: f32,
+    main_r: f32,
+    in_l: f32,
+    in_r: f32,
+    row_l: f32,
+    row_r: f32,
+    dry_l: f32,
+    dry_r: f32,
+    send: RowSend,
+    g: f32,
+) -> (f32, f32) {
+    let g = g.clamp(0.0, 1.0);
+    match send {
+        RowSend::Off => (main_l, main_r),
+        RowSend::Serial => (
+            main_l * (1.0 - g) + row_l * g,
+            main_r * (1.0 - g) + row_r * g,
+        ),
+        RowSend::Parallel => (main_l + (row_l - in_l) * g, main_r + (row_r - in_r) * g),
+        RowSend::WetDryWet => {
+            // Full wet/dry/wet of the row, then blended onto main. Using
+            // the send as the wet/dry/wet amount would replace main with
+            // the mono center at send 0.
+            let (gd, gw, gc) = line2_targets(Line2Mode::WetDryWet, 1.0);
+            let center = 0.5 * (dry_l + dry_r);
+            let wdw_l = dry_l * gd + row_l * gw + center * gc;
+            let wdw_r = dry_r * gd + row_r * gw + center * gc;
+            (
+                main_l * (1.0 - g) + wdw_l * g,
+                main_r * (1.0 - g) + wdw_r * g,
+            )
+        }
+    }
+}
+
+fn row_of(stage_row: &[u8; PATH_SLOTS], stage: StageKind) -> usize {
+    (stage_row[stage as usize] as usize).min(BOTTOM_ROWS)
+}
+
+fn following_row(
+    order: &[Option<StageKind>; PATH_SLOTS],
+    stage_row: &[u8; PATH_SLOTS],
+    index: usize,
+) -> Option<usize> {
+    for later in order.iter().skip(index + 1).flatten() {
+        return Some(row_of(stage_row, *later));
+    }
+    None
+}
+
+/// A time-based block: the dry tap for line 2 is the signal just before
+/// the first one of these that is actually on.
+fn time_effect_on(p: &Params, stage: StageKind) -> bool {
+    match stage {
+        StageKind::Mod => p.mod_on,
+        StageKind::Delay => p.delay_on,
+        StageKind::Reverb => p.reverb_on,
+        StageKind::Mod2 => p.stage_b.mod_on,
+        StageKind::Delay2 => p.stage_b.delay_on,
+        _ => false,
+    }
+}
+
 /// Full parameter set. Knob ranges match `editorui/src/data.ts` one-to-one so the
 /// React UI and the bridge speak the same units.
 ///
@@ -934,6 +1206,26 @@ pub struct Params {
     /// legal set which no path references, so an old project loads unchanged.
     #[serde(default)]
     pub stage_b: StageBParams,
+
+    /// Output blend. Wet (the default) is the chain, so an old project
+    /// that has no key here sounds the same as it did.
+    #[serde(default)]
+    pub line2_mode: Line2Mode,
+    /// Wet/dry/wet send, 0..100. Ignored while the mode is Wet or Dry.
+    #[serde(default = "default_line2_mix")]
+    pub line2_mix: f32,
+
+    /// Send mode for rows 2–4. Off (the default) does not run that row,
+    /// so an old project stays on the main chain.
+    #[serde(default)]
+    pub row_send: [RowSend; BOTTOM_ROWS],
+    /// Send amount for rows 2–4, 0..100.
+    #[serde(default = "default_row_level")]
+    pub row_level: [f32; BOTTOM_ROWS],
+    /// Which send row each block sits on. 0 is the main chain. Indexed by
+    /// the `StageKind` discriminant.
+    #[serde(default)]
+    pub stage_row: [u8; PATH_SLOTS],
 
     /// The editor's tuner is listening to the input. A view of the rig, not
     /// part of the tone: never saved, so a project or preset always opens
@@ -1190,6 +1482,9 @@ fn default_delay_fb_r() -> f32 {
 fn default_reverb_shimmer() -> f32 {
     62.0
 }
+fn default_line2_mix() -> f32 {
+    70.0
+}
 fn default_nam_slim_size() -> f32 {
     100.0
 }
@@ -1293,6 +1588,11 @@ pub fn default_params() -> Params {
         nam_loudness_norm: true,
         nam_slim_size: default_nam_slim_size(),
         stage_b: StageBParams::default(),
+        line2_mode: Line2Mode::Wet,
+        line2_mix: default_line2_mix(),
+        row_send: [RowSend::Off; BOTTOM_ROWS],
+        row_level: default_row_level(),
+        stage_row: [0; PATH_SLOTS],
         tuner_on: false,
         nam_file: None,
         ir_file: None,
@@ -1644,6 +1944,70 @@ pub fn descriptor() -> PluginDescriptor {
                 max: 15.0,
                 unit: "dB",
             },
+            ParamDescriptor {
+                id: "line2_mode",
+                name: "Line 2",
+                default_value: 0.0,
+                min: 0.0,
+                max: 2.0,
+                unit: "mode",
+            },
+            ParamDescriptor {
+                id: "line2_mix",
+                name: "Line 2 Send",
+                default_value: 70.0,
+                min: 0.0,
+                max: 100.0,
+                unit: "%",
+            },
+            ParamDescriptor {
+                id: "row_send_1",
+                name: "Row 2 Send",
+                default_value: 0.0,
+                min: 0.0,
+                max: 3.0,
+                unit: "mode",
+            },
+            ParamDescriptor {
+                id: "row_send_2",
+                name: "Row 3 Send",
+                default_value: 0.0,
+                min: 0.0,
+                max: 3.0,
+                unit: "mode",
+            },
+            ParamDescriptor {
+                id: "row_send_3",
+                name: "Row 4 Send",
+                default_value: 0.0,
+                min: 0.0,
+                max: 3.0,
+                unit: "mode",
+            },
+            ParamDescriptor {
+                id: "row_level_1",
+                name: "Row 2 Level",
+                default_value: 100.0,
+                min: 0.0,
+                max: 100.0,
+                unit: "%",
+            },
+            ParamDescriptor {
+                id: "row_level_2",
+                name: "Row 3 Level",
+                default_value: 100.0,
+                min: 0.0,
+                max: 100.0,
+                unit: "%",
+            },
+            ParamDescriptor {
+                id: "row_level_3",
+                name: "Row 4 Level",
+                default_value: 100.0,
+                min: 0.0,
+                max: 100.0,
+                unit: "%",
+            },
         ],
     }
 }
@@ -1683,6 +2047,15 @@ pub struct Dsp {
     eq_b: EqStage,
     mod_b: ModStage,
     delay_b: DelayStage,
+    /// Smoothed line-2 gains `(dry, wet, center)`. Start on Wet so the first
+    /// sample is the chain, with nothing to slew.
+    line2_g_dry: f32,
+    line2_g_wet: f32,
+    line2_g_center: f32,
+    line2_coeff: f32,
+    /// Smoothed send for rows 2–4. Starts at 0 so an Off row adds nothing
+    /// until its send comes up.
+    row_gain: [f32; BOTTOM_ROWS],
     /// Linear gains derived from `input_trim_db` / `output_trim_db`, recomputed
     /// on the control thread so the audio path only multiplies.
     in_gain: smooth::Smoothed,
@@ -1851,6 +2224,11 @@ impl Dsp {
             eq_b: EqStage::new(sr),
             mod_b: ModStage::new(sr),
             delay_b: DelayStage::new(sr),
+            line2_g_dry: 0.0,
+            line2_g_wet: 1.0,
+            line2_g_center: 0.0,
+            line2_coeff: line2_coeff(sr),
+            row_gain: [0.0; BOTTOM_ROWS],
             in_gain: smooth::Smoothed::new(sr, TRIM_SMOOTH_SECONDS, 1.0),
             out_gain: smooth::Smoothed::new(sr, TRIM_SMOOTH_SECONDS, 1.0),
             meters: Meters::new(sr),
@@ -1998,6 +2376,23 @@ impl Dsp {
             nam_loudness_norm: params.nam_loudness_norm,
             nam_slim_size: clamp(params.nam_slim_size, 0.0, 100.0),
             stage_b: params.stage_b.clamped(),
+            line2_mode: params.line2_mode,
+            line2_mix: clamp(params.line2_mix, 0.0, 100.0),
+            row_send: params.row_send,
+            row_level: {
+                let mut level = params.row_level;
+                for value in &mut level {
+                    *value = clamp(*value, 0.0, 100.0);
+                }
+                level
+            },
+            stage_row: {
+                let mut row = params.stage_row;
+                for value in &mut row {
+                    *value = (*value).min(BOTTOM_ROWS as u8);
+                }
+                row
+            },
             tuner_on: params.tuner_on,
             // File names are Studio's business, not the DSP's: dropping them
             // here keeps every later clone of these params (the per-edit
@@ -2628,6 +3023,29 @@ pub fn apply_to_params(p: &mut Params, id: &str, value: f32) -> bool {
         "delay2_channel" => set_channel(p, StageKind::Delay2, value),
         "eq2_channel" => set_channel(p, StageKind::Eq2, value),
         "comp2_channel" => set_channel(p, StageKind::Comp2, value),
+        "line2_mode" => p.line2_mode = Line2Mode::from_index(value.round() as u32),
+        "line2_mix" => p.line2_mix = value,
+        "row_send_1" => p.row_send[0] = RowSend::from_index(value.round() as u32),
+        "row_send_2" => p.row_send[1] = RowSend::from_index(value.round() as u32),
+        "row_send_3" => p.row_send[2] = RowSend::from_index(value.round() as u32),
+        "row_level_1" => p.row_level[0] = value,
+        "row_level_2" => p.row_level[1] = value,
+        "row_level_3" => p.row_level[2] = value,
+        "gate_row" => set_row(p, StageKind::Gate, value),
+        "drive_row" => set_row(p, StageKind::Drive, value),
+        "amp_row" => set_row(p, StageKind::Amp, value),
+        "mod_row" => set_row(p, StageKind::Mod, value),
+        "delay_row" => set_row(p, StageKind::Delay, value),
+        "reverb_row" => set_row(p, StageKind::Reverb, value),
+        "cab_row" => set_row(p, StageKind::Cab, value),
+        "comp_row" => set_row(p, StageKind::Comp, value),
+        "eq_row" => set_row(p, StageKind::Eq, value),
+        "wah_row" => set_row(p, StageKind::Wah, value),
+        "drive2_row" => set_row(p, StageKind::Drive2, value),
+        "mod2_row" => set_row(p, StageKind::Mod2, value),
+        "delay2_row" => set_row(p, StageKind::Delay2, value),
+        "eq2_row" => set_row(p, StageKind::Eq2, value),
+        "comp2_row" => set_row(p, StageKind::Comp2, value),
 
         _ => return false,
     }
@@ -2638,6 +3056,10 @@ fn set_channel(p: &mut Params, kind: StageKind, value: f32) {
     p.stage_channel[kind as usize] = StageChannel::from_index(value.round().max(0.0) as u32);
 }
 
+fn set_row(p: &mut Params, kind: StageKind, value: f32) {
+    p.stage_row[kind as usize] = value.round().clamp(0.0, BOTTOM_ROWS as f32) as u8;
+}
+
 /// Enumerate a `Params` as `(ui id, raw value)` pairs covering every wire id
 /// except `clear_clip` (an action, not state). Replaying the returned list
 /// through [`apply_to_params`] / `Dsp::apply_ui_param` in order reproduces the
@@ -2645,7 +3067,11 @@ fn set_channel(p: &mut Params, kind: StageKind, value: f32) {
 /// applying `amp_model` resets `tone_engine` to Classic.
 pub fn ui_values(p: &Params) -> Vec<(&'static str, f32)> {
     fn b(v: bool) -> f32 {
-        if v { 1.0 } else { 0.0 }
+        if v {
+            1.0
+        } else {
+            0.0
+        }
     }
     fn model_index<T: PartialEq + Copy>(all: &[T], value: T) -> f32 {
         all.iter().position(|m| *m == value).unwrap_or(0) as f32
@@ -2784,6 +3210,17 @@ pub fn ui_values(p: &Params) -> Vec<(&'static str, f32)> {
             out.push((id, p.stage_channel[*kind as usize].index() as f32));
         }
     }
+    out.push(("line2_mode", p.line2_mode.index() as f32));
+    out.push(("line2_mix", p.line2_mix));
+    const SEND_IDS: [&str; BOTTOM_ROWS] = ["row_send_1", "row_send_2", "row_send_3"];
+    const LEVEL_IDS: [&str; BOTTOM_ROWS] = ["row_level_1", "row_level_2", "row_level_3"];
+    for index in 0..BOTTOM_ROWS {
+        out.push((SEND_IDS[index], p.row_send[index].index() as f32));
+        out.push((LEVEL_IDS[index], p.row_level[index]));
+    }
+    for kind in StageKind::ALL {
+        out.push((kind.row_id(), p.stage_row[*kind as usize] as f32));
+    }
     out
 }
 
@@ -2858,6 +3295,7 @@ impl StereoEffect for Dsp {
         self.mod_b.set_sample_rate(sr);
         self.delay_b.set_sample_rate(sr);
         self.cab_ir_step = 1.0 / (sr * CAB_ENGINE_FADE_SECONDS).max(1.0);
+        self.line2_coeff = line2_coeff(sr);
         self.meters.rms_coeff = time_constant(sr, 0.300);
         if self.tuner.sample_rate() != sr {
             // Control thread: the tuner's buffers are sized for its rate.
@@ -2891,6 +3329,85 @@ impl StereoEffect for Dsp {
 }
 
 impl Dsp {
+    /// Return a bottom row onto main when its span has ended.
+    #[inline]
+    fn return_row(
+        &mut self,
+        main_l: &mut f32,
+        main_r: &mut f32,
+        open: &mut [bool; BOTTOM_ROWS],
+        mixed: &mut [bool; BOTTOM_ROWS],
+        row_in_l: &[f32; BOTTOM_ROWS],
+        row_in_r: &[f32; BOTTOM_ROWS],
+        row_l: &mut [f32; BOTTOM_ROWS],
+        row_r: &mut [f32; BOTTOM_ROWS],
+        row_dry_l: &mut [f32; BOTTOM_ROWS],
+        row_dry_r: &mut [f32; BOTTOM_ROWS],
+        row_tapped: &[bool; BOTTOM_ROWS],
+        row_send: &[RowSend; BOTTOM_ROWS],
+        row_level: &[f32; BOTTOM_ROWS],
+        row: usize,
+        next: Option<usize>,
+    ) {
+        if next == Some(row) {
+            return;
+        }
+        let b = row - 1;
+        if !row_tapped[b] {
+            row_dry_l[b] = row_l[b];
+            row_dry_r[b] = row_r[b];
+        }
+        self.apply_row_return(
+            main_l,
+            main_r,
+            row_in_l[b],
+            row_in_r[b],
+            row_l[b],
+            row_r[b],
+            row_dry_l[b],
+            row_dry_r[b],
+            row_send[b],
+            row_level[b],
+            b,
+        );
+        open[b] = false;
+        mixed[b] = true;
+    }
+
+    #[inline]
+    fn apply_row_return(
+        &mut self,
+        main_l: &mut f32,
+        main_r: &mut f32,
+        in_l: f32,
+        in_r: f32,
+        row_l: f32,
+        row_r: f32,
+        dry_l: f32,
+        dry_r: f32,
+        send: RowSend,
+        level: f32,
+        index: usize,
+    ) {
+        let target = (level * 0.01).clamp(0.0, 1.0);
+        let k = self.line2_coeff;
+        self.row_gain[index] += (target - self.row_gain[index]) * k;
+        let (l, r) = mix_bottom_row(
+            *main_l,
+            *main_r,
+            in_l,
+            in_r,
+            row_l,
+            row_r,
+            dry_l,
+            dry_r,
+            send,
+            self.row_gain[index],
+        );
+        *main_l = l;
+        *main_r = r;
+    }
+
     /// One frame through the rig, power aside.
     #[inline]
     fn run(&mut self, left: f32, right: f32) -> (f32, f32) {
@@ -2914,26 +3431,166 @@ impl Dsp {
             self.meters.rms_coeff,
         );
 
-        for slot in self.params.stage_order {
-            let Some(stage) = slot else { continue };
+        let mut dry_l = l;
+        let mut dry_r = r;
+        let mut tapped = false;
+        let order = self.params.stage_order;
+        let stage_row = self.params.stage_row;
+        let row_send = self.params.row_send;
+        let row_level = self.params.row_level;
+        let stage_channel = self.params.stage_channel;
+        // One accumulator per bottom row. A row opens on its first block,
+        // tapped from main at that moment, and returns when the next
+        // occupied block is on a different row.
+        let mut open = [false; BOTTOM_ROWS];
+        let mut mixed = [false; BOTTOM_ROWS];
+        let mut row_in_l = [0.0f32; BOTTOM_ROWS];
+        let mut row_in_r = [0.0f32; BOTTOM_ROWS];
+        let mut row_l = [0.0f32; BOTTOM_ROWS];
+        let mut row_r = [0.0f32; BOTTOM_ROWS];
+        let mut row_dry_l = [0.0f32; BOTTOM_ROWS];
+        let mut row_dry_r = [0.0f32; BOTTOM_ROWS];
+        let mut row_tapped = [false; BOTTOM_ROWS];
+        for index in 0..PATH_SLOTS {
+            let Some(stage) = order[index] else { continue };
+            let row = row_of(&stage_row, stage);
+            // An Off row does not run. That is what keeps a parked block
+            // from spending the callback.
+            if row > 0 && row_send[row - 1] == RowSend::Off {
+                continue;
+            }
+            if row > 0 && !open[row - 1] {
+                let b = row - 1;
+                open[b] = true;
+                row_in_l[b] = l;
+                row_in_r[b] = r;
+                row_l[b] = l;
+                row_r[b] = r;
+                row_dry_l[b] = l;
+                row_dry_r[b] = r;
+                row_tapped[b] = false;
+            }
+            let (src_l, src_r) = if row == 0 {
+                (l, r)
+            } else {
+                (row_l[row - 1], row_r[row - 1])
+            };
+            // Line 2's dry tap is the chain just before the first time-based
+            // block that is actually on. A bottom row keeps its own tap.
+            // One pass: the delay and reverb are not clocked a second time.
+            if time_effect_on(&self.params, stage) {
+                if row == 0 && !tapped {
+                    dry_l = l;
+                    dry_r = r;
+                    tapped = true;
+                } else if row > 0 && !row_tapped[row - 1] {
+                    let b = row - 1;
+                    row_dry_l[b] = row_l[b];
+                    row_dry_r[b] = row_r[b];
+                    row_tapped[b] = true;
+                }
+            }
             // A block on one side hears that side alone (as a mono pair, so
             // a stereo block still sees a signal on both its inputs) and
             // only that side takes its output; the other side passes by.
-            let channel = self.params.stage_channel[stage as usize];
+            let channel = stage_channel[stage as usize];
             let (in_l, in_r) = match channel {
-                StageChannel::Both => (l, r),
-                StageChannel::Left => (l, l),
-                StageChannel::Right => (r, r),
+                StageChannel::Both => (src_l, src_r),
+                StageChannel::Left => (src_l, src_l),
+                StageChannel::Right => (src_r, src_r),
             };
             let Some((out_l, out_r)) = self.run_stage(stage, in_l, in_r) else {
+                if row > 0 {
+                    self.return_row(
+                        &mut l,
+                        &mut r,
+                        &mut open,
+                        &mut mixed,
+                        &row_in_l,
+                        &row_in_r,
+                        &mut row_l,
+                        &mut row_r,
+                        &mut row_dry_l,
+                        &mut row_dry_r,
+                        &row_tapped,
+                        &row_send,
+                        &row_level,
+                        row,
+                        following_row(&order, &stage_row, index),
+                    );
+                }
                 continue;
             };
-            (l, r) = match channel {
-                StageChannel::Both => (out_l, out_r),
-                StageChannel::Left => (out_l, r),
-                StageChannel::Right => (l, out_r),
-            };
+            if row == 0 {
+                (l, r) = match channel {
+                    StageChannel::Both => (out_l, out_r),
+                    StageChannel::Left => (out_l, r),
+                    StageChannel::Right => (l, out_r),
+                };
+            } else {
+                let b = row - 1;
+                (row_l[b], row_r[b]) = match channel {
+                    StageChannel::Both => (out_l, out_r),
+                    StageChannel::Left => (out_l, row_r[b]),
+                    StageChannel::Right => (row_l[b], out_r),
+                };
+                self.return_row(
+                    &mut l,
+                    &mut r,
+                    &mut open,
+                    &mut mixed,
+                    &row_in_l,
+                    &row_in_r,
+                    &mut row_l,
+                    &mut row_r,
+                    &mut row_dry_l,
+                    &mut row_dry_r,
+                    &row_tapped,
+                    &row_send,
+                    &row_level,
+                    row,
+                    following_row(&order, &stage_row, index),
+                );
+            }
         }
+        for b in 0..BOTTOM_ROWS {
+            if open[b] {
+                if !row_tapped[b] {
+                    row_dry_l[b] = row_l[b];
+                    row_dry_r[b] = row_r[b];
+                }
+                self.apply_row_return(
+                    &mut l,
+                    &mut r,
+                    row_in_l[b],
+                    row_in_r[b],
+                    row_l[b],
+                    row_r[b],
+                    row_dry_l[b],
+                    row_dry_r[b],
+                    row_send[b],
+                    row_level[b],
+                    b,
+                );
+            } else if !mixed[b] {
+                let k = self.line2_coeff;
+                self.row_gain[b] += (0.0 - self.row_gain[b]) * k;
+            }
+        }
+        if !tapped {
+            dry_l = l;
+            dry_r = r;
+        }
+
+        let send = (self.params.line2_mix * 0.01).clamp(0.0, 1.0);
+        let (target_dry, target_wet, target_center) = line2_targets(self.params.line2_mode, send);
+        let k = self.line2_coeff;
+        self.line2_g_dry += (target_dry - self.line2_g_dry) * k;
+        self.line2_g_wet += (target_wet - self.line2_g_wet) * k;
+        self.line2_g_center += (target_center - self.line2_g_center) * k;
+        let center = 0.5 * (dry_l + dry_r);
+        l = dry_l * self.line2_g_dry + l * self.line2_g_wet + center * self.line2_g_center;
+        r = dry_r * self.line2_g_dry + r * self.line2_g_wet + center * self.line2_g_center;
 
         // Guard against denormals / NaNs escaping into the engine.
         if !l.is_finite() {
@@ -3843,7 +4500,7 @@ mod tests {
         assert!(dsp.apply_ui_param("path_slot_0", 2.0)); // Amp first
         assert!(dsp.apply_ui_param("path_slot_1", 0.0)); // Gate
         assert!(dsp.apply_ui_param("path_slot_2", -1.0)); // clear
-        // Remaining slots still have defaults until overwritten — sanitize packs.
+                                                          // Remaining slots still have defaults until overwritten — sanitize packs.
         let mut order = [None; PATH_SLOTS];
         order[0] = Some(StageKind::Amp);
         order[1] = Some(StageKind::Cab);
@@ -5049,5 +5706,172 @@ mod telemetry_tests {
         for preset in crate::factory_presets() {
             assert!(!preset.params.tuner_on, "{}", preset.name);
         }
+    }
+
+    #[test]
+    fn wet_dry_wet_keeps_the_dry_amp_and_puts_the_effect_on_the_sides() {
+        let dry = (0.4, 0.4);
+        let wet = (0.6, 0.3);
+        let center = 0.5 * (dry.0 + dry.1);
+        let (gd, gw, gc) = line2_targets(Line2Mode::WetDryWet, 0.5);
+        let l = dry.0 * gd + wet.0 * gw + center * gc;
+        let r = dry.1 * gd + wet.1 * gw + center * gc;
+        assert!((l - 0.5).abs() < 1.0e-5, "{l}");
+        assert!((r - 0.35).abs() < 1.0e-5, "{r}");
+
+        let (gd, gw, gc) = line2_targets(Line2Mode::WetDryWet, 0.0);
+        let l = dry.0 * gd + wet.0 * gw + center * gc;
+        assert!((l - center).abs() < 1.0e-5);
+        assert_eq!(line2_targets(Line2Mode::Wet, 0.3), (0.0, 1.0, 0.0));
+        assert_eq!(line2_targets(Line2Mode::Dry, 1.0), (1.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn dry_line_is_the_signal_before_the_delay() {
+        fn rig(mode: Line2Mode) -> Dsp {
+            let mut dsp = Dsp::new(48_000.0);
+            let mut p = default_params();
+            p.stage_order = [None; PATH_SLOTS];
+            p.stage_order[0] = Some(StageKind::Delay);
+            p.gate_on = false;
+            p.comp_on = false;
+            p.drive_on = false;
+            p.amp_on = false;
+            p.cab_on = false;
+            p.eq_on = false;
+            p.mod_on = false;
+            p.reverb_on = false;
+            p.wah_on = false;
+            p.delay_on = true;
+            p.delay_mix = 100.0;
+            p.delay_time_ms = 200.0;
+            p.delay_fb = 0.0;
+            p.input_trim_db = 0.0;
+            p.output_trim_db = 0.0;
+            p.line2_mode = mode;
+            p.line2_mix = 100.0;
+            dsp.update_params(p);
+            for _ in 0..2_000 {
+                let _ = dsp.process_stereo(0.0, 0.0);
+            }
+            dsp
+        }
+        let (wet_l, _) = rig(Line2Mode::Wet).process_stereo(1.0, 1.0);
+        let (dry_l, _) = rig(Line2Mode::Dry).process_stereo(1.0, 1.0);
+        assert!(
+            wet_l.abs() < 0.05,
+            "full-wet delay should still be empty, got {wet_l}"
+        );
+        assert!(
+            dry_l > 0.5,
+            "dry line should be the pre-delay signal, got {dry_l}"
+        );
+    }
+
+    #[test]
+    fn an_old_save_without_line2_stays_wet() {
+        let json = crate::RodhareistState::new(default_params())
+            .to_json()
+            .expect("serializes");
+        let stripped = json
+            .replace(",\"line2_mode\":\"Wet\"", "")
+            .replace(",\"line2_mix\":70.0", "");
+        assert_ne!(stripped, json);
+        let restored = crate::RodhareistState::from_json(&stripped).expect("parses");
+        assert_eq!(restored.params.line2_mode, Line2Mode::Wet);
+        assert_eq!(restored.params.line2_mix, 70.0);
+    }
+
+    #[test]
+    fn an_old_save_keeps_blocks_on_the_main_row() {
+        let json = crate::RodhareistState::new(default_params())
+            .to_json()
+            .expect("serializes");
+        let mut value: serde_json::Value = serde_json::from_str(&json).expect("json");
+        fn strip(value: &mut serde_json::Value) {
+            let Some(obj) = value.as_object_mut() else {
+                return;
+            };
+            obj.remove("row_send");
+            obj.remove("row_level");
+            obj.remove("stage_row");
+            for child in obj.values_mut() {
+                strip(child);
+            }
+        }
+        strip(&mut value);
+        let restored = crate::RodhareistState::from_json(&value.to_string()).expect("parses");
+        assert_eq!(restored.params.row_send, [RowSend::Off; BOTTOM_ROWS]);
+        assert_eq!(restored.params.row_level, [100.0; BOTTOM_ROWS]);
+        assert_eq!(restored.params.stage_row, [0; PATH_SLOTS]);
+    }
+
+    fn drive_tail(mut params: Params) -> f32 {
+        params.stage_order = [None; PATH_SLOTS];
+        params.stage_order[0] = Some(StageKind::Drive);
+        params.amp_on = false;
+        params.cab_on = false;
+        params.gate_on = false;
+        params.comp_on = false;
+        params.mod_on = false;
+        params.delay_on = false;
+        params.reverb_on = false;
+        params.eq_on = false;
+        params.wah_on = false;
+        params.input_trim_db = 0.0;
+        params.output_trim_db = 0.0;
+        params.line2_mode = Line2Mode::Wet;
+        params.drive_gain = 8.0;
+        let mut dsp = Dsp::new(48_000.0);
+        dsp.set_params(params);
+        let mut energy = 0.0;
+        for n in 0..8_000 {
+            let x = (n as f32 * 0.07).sin() * 0.25;
+            let y = dsp.process_stereo(x, x).0;
+            if n >= 7_936 {
+                energy += y.abs();
+            }
+        }
+        energy
+    }
+
+    #[test]
+    fn an_off_row_does_not_run_its_block() {
+        let mut dry = default_params();
+        dry.drive_on = false;
+        let mut parked = default_params();
+        parked.drive_on = true;
+        parked.stage_row[StageKind::Drive as usize] = 1;
+        parked.row_send[0] = RowSend::Off;
+        let mut heard = default_params();
+        heard.drive_on = true;
+        let bypassed = drive_tail(dry);
+        let silent = drive_tail(parked);
+        let driven = drive_tail(heard);
+        assert!(
+            (silent - bypassed).abs() < 1.0e-3,
+            "off row {silent} vs dry {bypassed}"
+        );
+        assert!(
+            (driven - bypassed).abs() > 0.05,
+            "drive should change the tone"
+        );
+    }
+
+    #[test]
+    fn a_serial_row_at_full_send_matches_the_main_chain() {
+        let mut main_params = default_params();
+        main_params.drive_on = true;
+        let main = drive_tail(main_params);
+        let mut moved = default_params();
+        moved.drive_on = true;
+        moved.stage_row[StageKind::Drive as usize] = 1;
+        moved.row_send[0] = RowSend::Serial;
+        moved.row_level[0] = 100.0;
+        let serial = drive_tail(moved);
+        assert!(
+            (main - serial).abs() < 1.0e-3,
+            "main {main} vs serial row {serial}"
+        );
     }
 }

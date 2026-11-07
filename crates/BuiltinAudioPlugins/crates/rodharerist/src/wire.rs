@@ -148,6 +148,32 @@ pub const UI_PARAM_IDS: &[&str] = &[
     "delay2_channel", // 125
     "eq2_channel",    // 126
     "comp2_channel",  // 127
+    // Output blend. Appended: an index in this table is an ABI.
+    "line2_mode", // 128
+    "line2_mix",  // 129
+    // Bottom send rows. Appended: an index in this table is an ABI.
+    // Row 1 is line 2. These are rows 2–4, then each block's row.
+    "row_send_1",  // 130
+    "row_send_2",  // 131
+    "row_send_3",  // 132
+    "row_level_1", // 133
+    "row_level_2", // 134
+    "row_level_3", // 135
+    "gate_row",    // 136
+    "drive_row",   // 137
+    "amp_row",     // 138
+    "mod_row",     // 139
+    "delay_row",   // 140
+    "reverb_row",  // 141
+    "cab_row",     // 142
+    "comp_row",    // 143
+    "eq_row",      // 144
+    "wah_row",     // 145
+    "drive2_row",  // 146
+    "mod2_row",    // 147
+    "delay2_row",  // 148
+    "eq2_row",     // 149
+    "comp2_row",   // 150
 ];
 
 /// String id → wire index. Linear scan over a small table — control/UI
@@ -166,8 +192,8 @@ pub fn ui_param_id(index: u32) -> Option<&'static str> {
 mod tests {
     use super::*;
     use crate::dsp::{
-        AmpModel, CabModel, DelayModel, DriveModel, Dsp, EqModel, ModModel, ReverbModel, StageKind,
-        ToneEngineKind, WahModel, apply_to_params, default_params, ui_values,
+        apply_to_params, default_params, ui_values, AmpModel, CabModel, DelayModel, DriveModel,
+        Dsp, EqModel, ModModel, ReverbModel, StageKind, ToneEngineKind, WahModel,
     };
 
     #[test]
@@ -199,7 +225,7 @@ mod tests {
     /// accidental reorder/insert must fail here, loudly.
     #[test]
     fn wire_indices_are_pinned() {
-        assert_eq!(UI_PARAM_IDS.len(), 128);
+        assert_eq!(UI_PARAM_IDS.len(), 151);
         assert_eq!(ui_param_index("power"), Some(0));
         assert_eq!(ui_param_index("gate_on"), Some(3));
         assert_eq!(ui_param_index("drive_model"), Some(10));
@@ -253,6 +279,12 @@ mod tests {
         assert_eq!(ui_param_index("gate_channel"), Some(115));
         assert_eq!(ui_param_index("delay_channel"), Some(118));
         assert_eq!(ui_param_index("comp2_channel"), Some(127));
+        assert_eq!(ui_param_index("line2_mode"), Some(128));
+        assert_eq!(ui_param_index("line2_mix"), Some(129));
+        assert_eq!(ui_param_index("row_send_1"), Some(130));
+        assert_eq!(ui_param_index("row_level_3"), Some(135));
+        assert_eq!(ui_param_index("gate_row"), Some(136));
+        assert_eq!(ui_param_index("comp2_row"), Some(150));
     }
 
     /// Every block that can run on one side has its channel on the wire,
@@ -267,6 +299,10 @@ mod tests {
                 }
                 None => assert!(!kind.splits(), "{kind:?} splits but has no id"),
             }
+            assert!(
+                ui_param_index(kind.row_id()).is_some(),
+                "{kind:?} row is not on the wire"
+            );
         }
     }
 
@@ -326,6 +362,8 @@ mod tests {
         src.stage_b.delay_fb_r = 70.0;
         src.stage_channel[StageKind::Delay as usize] = crate::StageChannel::Left;
         src.stage_channel[StageKind::Wah as usize] = crate::StageChannel::Right;
+        src.line2_mode = crate::dsp::Line2Mode::WetDryWet;
+        src.line2_mix = 42.0;
 
         let mut restored = default_params();
         for (id, value) in ui_values(&src) {
@@ -359,6 +397,10 @@ mod tests {
             "boutique",
             "invader",
             "tweed_combo",
+            "princeton",
+            "hundred",
+            "mark",
+            "normal15",
         ];
         for (i, id) in amp.iter().enumerate() {
             assert_eq!(

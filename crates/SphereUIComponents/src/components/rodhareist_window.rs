@@ -146,6 +146,57 @@ pub(crate) struct LoadStatus {
 }
 
 /// A stored file's name as the editor shows it: without its extension.
+/// `User/futureboard.rodharerist` under the app preset root. The plug-in
+/// id is already a safe directory name, the same folder the editor chrome
+/// uses for this plug-in's `.pst` files.
+fn user_preset_dir() -> PathBuf {
+    SpherePluginHost::registry::default_preset_root()
+        .join("User")
+        .join(rodharerist::PLUGIN_ID)
+}
+
+fn list_user_presets() -> Vec<(String, PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(user_preset_dir()) else {
+        return Vec::new();
+    };
+    let mut presets = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
+            continue;
+        };
+        if !ext.eq_ignore_ascii_case("pst") {
+            continue;
+        }
+        let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        presets.push((name.to_string(), path));
+    }
+    presets.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    presets
+}
+
+fn preset_file_stem(name: &str) -> String {
+    let stem: String = name
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    let stem = stem.trim().trim_matches('.').to_string();
+    if stem.is_empty() {
+        "My Rig".to_string()
+    } else {
+        stem
+    }
+}
+
 fn display_name(file_name: &str) -> String {
     std::path::Path::new(file_name)
         .file_stem()
@@ -178,6 +229,12 @@ fn store_user_file(
     Ok((name, bytes))
 }
 
+/// A user preset the editor loaded, and the params that load applied.
+struct LoadedUserPreset {
+    name: String,
+    params: Params,
+}
+
 pub struct RodhareistEditorWindow {
     key: PluginInstanceKey,
     identity: ShellIdentity,
@@ -193,6 +250,13 @@ pub struct RodhareistEditorWindow {
     /// The factory preset last loaded, or matched on open. Shown as
     /// "edited" once the params move away from it.
     preset: Option<usize>,
+    /// `.pst` files in this plug-in's user preset folder.
+    user_presets: Vec<(String, PathBuf)>,
+    /// The user preset last loaded, and the params it applied, so the
+    /// header can say when the rig has moved off that file.
+    user_preset: Option<LoadedUserPreset>,
+    /// The last save or load failure, shown on the Home preset list.
+    preset_note: Option<String>,
     /// The chain slot the block editor shows. Editor-local view state —
     /// never saved, never sent to the plug-in.
     pub(crate) chain_focus: Option<ChainFocus>,
@@ -226,6 +290,9 @@ impl RodhareistEditorWindow {
             meter: ShellMeter::default(),
             io: IoMeter::default(),
             preset: None,
+            user_presets: Vec::new(),
+            user_preset: None,
+            preset_note: None,
             chain_focus: None,
             ui: RodUi::default(),
             pads: None,
@@ -234,6 +301,7 @@ impl RodhareistEditorWindow {
         plate::ensure_fonts(cx);
         window.sync_from_mirror(cx);
         window.preset = matching_preset(&window.params);
+        window.refresh_user_presets();
         window.start_meter(cx);
         window
     }
@@ -266,6 +334,8 @@ impl RodhareistEditorWindow {
             self.nam_status = LoadStatus::default();
             self.chain_focus = None;
             self.preset = None;
+            self.user_preset = None;
+            self.preset_note = None;
             self.pads = None;
             self.ui = RodUi::default();
         }
@@ -275,6 +345,7 @@ impl RodhareistEditorWindow {
         if self.preset.is_none() {
             self.preset = matching_preset(&self.params);
         }
+        self.refresh_user_presets();
     }
 
     /// Sends what changed between the window's params and `next` as wire
@@ -453,6 +524,8 @@ impl RodhareistEditorWindow {
                 };
                 let next = preset_applied(&this.params, &preset.params);
                 this.preset = Some(index);
+                this.user_preset = None;
+                this.preset_note = None;
                 this.chain_focus = None;
                 this.set_params(next, cx);
             });
@@ -475,6 +548,121 @@ impl RodhareistEditorWindow {
                 }
             });
         }
+    }
+
+    /// `.pst` files saved for Rodhareist, name then path.
+    pub(crate) fn user_presets(&self) -> &[(String, PathBuf)] {
+        &self.user_presets
+    }
+
+    pub(crate) fn preset_note(&self) -> Option<&str> {
+        self.preset_note.as_deref()
+    }
+
+    /// The loaded user preset and whether the rig has moved off it.
+    pub(crate) fn user_preset_status(&self) -> Option<(&str, bool)> {
+        let loaded = self.user_preset.as_ref()?;
+        Some((&loaded.name, loaded.params != self.params))
+    }
+
+    pub(crate) fn refresh_user_presets(&mut self) {
+        self.user_presets = list_user_presets();
+    }
+
+    /// Click handler that stores the current rig as a `.pst`.
+    pub(crate) fn save_user_preset_cb(
+        &self,
+        cx: &Context<Self>,
+    ) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static {
+        let entity = cx.entity().clone();
+        move |_event, _window, app: &mut App| {
+            let _ = entity.update(app, |this, cx| {
+                match this.save_user_preset() {
+                    Ok(()) => this.preset_note = None,
+                    Err(error) => this.preset_note = Some(error),
+                }
+                cx.notify();
+            });
+        }
+    }
+
+    /// Click handler that loads user preset `index`.
+    pub(crate) fn load_user_preset_cb(
+        &self,
+        cx: &Context<Self>,
+        index: usize,
+    ) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static {
+        let entity = cx.entity().clone();
+        move |_event, _window, app: &mut App| {
+            let _ = entity.update(app, |this, cx| {
+                let Some((name, path)) = this.user_presets.get(index).cloned() else {
+                    return;
+                };
+                match this.read_user_preset(&path) {
+                    Ok(saved) => {
+                        let next = preset_applied(&this.params, &saved);
+                        this.preset = None;
+                        this.user_preset = Some(LoadedUserPreset {
+                            name,
+                            params: next.clone(),
+                        });
+                        this.preset_note = None;
+                        this.chain_focus = None;
+                        this.set_params(next, cx);
+                    }
+                    Err(error) => {
+                        this.preset_note = Some(error);
+                        cx.notify();
+                    }
+                }
+            });
+        }
+    }
+
+    fn save_user_preset(&mut self) -> Result<(), String> {
+        let name = self.user_preset_save_name();
+        let stem = preset_file_stem(&name);
+        let path = user_preset_dir().join(format!("{stem}.pst"));
+        let json = rodharerist::RodhareistState::new(self.params.clone())
+            .to_json()
+            .map_err(|e| e.to_string())?;
+        SpherePluginHost::preset::write_state_preset(
+            &path,
+            &SpherePluginHost::preset::StatePreset {
+                plugin_id: rodharerist::PLUGIN_ID.to_string(),
+                plugin_name: "Rodhareist".to_string(),
+                state: json.into_bytes(),
+            },
+        )?;
+        self.preset = None;
+        self.user_preset = Some(LoadedUserPreset {
+            name: stem,
+            params: self.params.clone(),
+        });
+        self.refresh_user_presets();
+        Ok(())
+    }
+
+    fn read_user_preset(&self, path: &std::path::Path) -> Result<Params, String> {
+        let (plugin_id, bytes) = SpherePluginHost::preset::read_state_preset(path)?;
+        if plugin_id != rodharerist::PLUGIN_ID {
+            return Err(format!("This preset belongs to {plugin_id}"));
+        }
+        let json = String::from_utf8(bytes).map_err(|_| "preset state is not text".to_string())?;
+        let state = rodharerist::RodhareistState::from_json(&json).map_err(|e| e.to_string())?;
+        Ok(state.params)
+    }
+
+    fn user_preset_save_name(&self) -> String {
+        if let Some(loaded) = &self.user_preset {
+            return loaded.name.clone();
+        }
+        if let Some(index) = self.preset {
+            if let Some(preset) = rodharerist::factory_presets().get(index) {
+                return preset.name.to_string();
+            }
+        }
+        "My Rig".to_string()
     }
 
     /// The loaded factory preset and whether the params have moved off it.

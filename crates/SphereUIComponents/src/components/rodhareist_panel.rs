@@ -26,7 +26,7 @@ use gpui::{
     div, px, AnyElement, App, Context, FontWeight, InteractiveElement, IntoElement, ParentElement,
     Rgba, StatefulInteractiveElement, Styled, Window,
 };
-use rodharerist::{CabModel, Params, StageChannel, StageKind, ToneEngineKind};
+use rodharerist::{CabModel, Line2Mode, Params, RowSend, StageChannel, StageKind, ToneEngineKind};
 
 use crate::components::controls::fb_tooltip;
 use crate::components::plate::{
@@ -286,6 +286,19 @@ fn model_desc(label: &str) -> &'static str {
         "Overdrive Special" => "Smooth, singing boutique sustain.",
         "Invader 5150" => "Tight, scooped modern full stack.",
         "Tweed Deluxe" => "Small combo with early breakup.",
+        "Princeton" => "Small blackface combo, earlier breakup than a Twin.",
+        "Custom 100" => "High-headroom British clean that stays tight.",
+        "Mark Lead" => "Mid-forward high gain, tighter than Recto.",
+        "Normal 15" => "Earlier British chime, less gain than Top Boost.",
+        "Jazz 120" => "Solid-state clean. Stays clean when a Twin would break up.",
+        "Deluxe 5" => "Loose small combo. Breaks up early and sags.",
+        "JTM 45" => "Rounder, lower-gain plexi.",
+        "Brown Panel" => "Hot plexi: more gain, less feedback, more sag.",
+        "Fireball" => "Tight modern high gain with almost no sag.",
+        "SLO Lead" => "Singing mids. Less scooped than the modern stack.",
+        "Liverpool" => "EL84 chime with more clean than Normal 15.",
+        "Bass 800" => "Deep, tight bass head.",
+        "Stealth Lead" => "Later 5150 lead. More mids and a stiffer power section than Invader.",
         "NAM Capture" => "Runs a Neural Amp Modeler capture you load.",
         "1960v Vintage 4x12" => "Vintage British closed 4x12.",
         "American 2x12" => "Brighter, tighter open-back combo.",
@@ -301,6 +314,12 @@ fn model_desc(label: &str) -> &'static str {
         "Impulse Response" => "Convolves with a cabinet IR you load.",
         "Modern 2x12" => "Tight closed-back pair, extended top.",
         "American 1x12 Combo" => "Small, bright, open single speaker.",
+        "Alnico 2x12" => "Open pair with a strong speaker bell.",
+        "Greenback 4x12" => "Closed 4x12, mid honk, early rolloff.",
+        "Jensen 1x12" => "Paper-cone single, darker than the American 1x12.",
+        "Cream 4x12" => "Tight closed 4x12 with more top than a greenback.",
+        "Bass 8x10" => "Deeper and tighter than the Bass Cabinet.",
+        "Silver Bell 1x12" => "Bright open single with a high bell.",
         "70s Analog Chorus" => "Lush doubling with gentle movement.",
         "Vibe Phase 90" => "Four-stage swirl, from subtle to jet.",
         "Jet Flanger" => "Metallic sweep with resonant peaks.",
@@ -611,6 +630,9 @@ fn header(w: &RodhareistEditorWindow, p: &Params, cx: &mut Cx, s: f32) -> AnyEle
                 .on_click(act(cx, move |this, cx| {
                     this.ui.page = item;
                     this.ui.search_focus = false;
+                    if item == Page::Home {
+                        this.refresh_user_presets();
+                    }
                     cx.notify();
                 }))
         }));
@@ -762,6 +784,10 @@ fn chain_block(
     let k = size / BLOCK;
     let type_k = k.max(0.82);
     let entry = p.stage_order[slot];
+    let row_mark = entry.and_then(|kind| {
+        let row = p.stage_row[kind as usize];
+        (row > 0).then(|| format!("{}", row + 1))
+    });
     let names = w.ui.show_names;
     // A block on one side only says which.
     let side = entry
@@ -818,6 +844,11 @@ fn chain_block(
                         .text_color(fg)
                         .font_weight(FontWeight::SEMIBOLD),
                 )
+                .children(row_mark.map(|mark| {
+                    words(mark, 9.0 * type_k, WHITE, s)
+                        .text_color(fg)
+                        .font_weight(FontWeight::SEMIBOLD)
+                }))
                 .child(
                     div()
                         .flex()
@@ -923,12 +954,25 @@ fn caption_line(p: &Params, focus: ChainFocus) -> String {
                 Some(StageChannel::Right) => " \u{00B7} right only",
                 _ => "",
             };
+            let row = p.stage_row[kind as usize];
+            let row_note = if row == 0 {
+                String::new()
+            } else {
+                let send = match p.row_send[row as usize - 1] {
+                    RowSend::Off => "off",
+                    RowSend::Serial => "serial",
+                    RowSend::Parallel => "parallel",
+                    RowSend::WetDryWet => "w/d/w",
+                };
+                format!(" \u{00B7} row {} {send}", row + 1)
+            };
             format!(
-                "Slot {} \u{00B7} {} \u{00B7} {}{}{}",
+                "Slot {} \u{00B7} {} \u{00B7} {}{}{}{}",
                 slot + 1,
                 family.label(),
                 blocks::model_name(p, kind).unwrap_or("No amp"),
                 side,
+                row_note,
                 if blocks::is_on(p, kind) {
                     ""
                 } else {
@@ -938,6 +982,133 @@ fn caption_line(p: &Params, focus: ChainFocus) -> String {
         }
         ChainFocus::Empty(_) => format!("Slot {} \u{00B7} empty", slot + 1),
     }
+}
+
+fn step_send(current: f32) -> f32 {
+    const STEPS: [f32; 5] = [0.0, 25.0, 50.0, 75.0, 100.0];
+    STEPS
+        .iter()
+        .copied()
+        .find(|step| *step > current + 0.5)
+        .unwrap_or(0.0)
+}
+
+fn send_button(
+    cx: &Cx,
+    id: usize,
+    label: &'static str,
+    on: bool,
+    s: f32,
+    write: impl Fn(&mut RodhareistEditorWindow, &mut Cx) + 'static,
+) -> AnyElement {
+    let (bg, border, _) = choice_colors(on, false);
+    div()
+        .id(("rodhareist-send", id))
+        .flex()
+        .items_center()
+        .justify_center()
+        .h(px(16.0 * s))
+        .px(px(6.0 * s))
+        .rounded(px(2.0 * s))
+        .border(px(1.0))
+        .border_color(border)
+        .bg(bg)
+        .cursor(gpui::CursorStyle::PointingHand)
+        .child(words(label, 10.0, if on { WHITE } else { PALE }, s))
+        .on_click(act(cx, write))
+        .into_any_element()
+}
+
+/// Four send rows under the chain. Row 1 is line 2. Rows 2–4 are the
+/// bottom sends. A row set to Off does not run its blocks.
+fn send_rows(p: &Params, cx: &mut Cx, s: f32) -> AnyElement {
+    let mut rows: Vec<AnyElement> = Vec::with_capacity(4);
+    let line2 = [
+        (Line2Mode::Wet, "WET"),
+        (Line2Mode::Dry, "DRY"),
+        (Line2Mode::WetDryWet, "W/D/W"),
+    ];
+    let line2_buttons = line2.into_iter().enumerate().map(|(index, (mode, label))| {
+        send_button(
+            cx,
+            index,
+            label,
+            p.line2_mode == mode,
+            s,
+            move |this, cx| {
+                this.set_wire_value("line2_mode", index as f32, cx);
+            },
+        )
+    });
+    let line2_level = p.line2_mix;
+    rows.push(
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.0 * s))
+            .child(numbers("1", 11.0, SOFT, s).w(px(12.0 * s)))
+            .children(line2_buttons)
+            .child(send_button(
+                cx,
+                10,
+                "SEND",
+                p.line2_mode == Line2Mode::WetDryWet,
+                s,
+                move |this, cx| this.set_wire_value("line2_mix", step_send(line2_level), cx),
+            ))
+            .child(numbers(format!("{line2_level:.0}"), 11.0, SOFT, s))
+            .into_any_element(),
+    );
+    let bottom = [
+        (RowSend::Off, "OFF"),
+        (RowSend::Serial, "SER"),
+        (RowSend::Parallel, "PAR"),
+        (RowSend::WetDryWet, "W/D/W"),
+    ];
+    for (row, (send_id, level_id)) in [
+        ("row_send_1", "row_level_1"),
+        ("row_send_2", "row_level_2"),
+        ("row_send_3", "row_level_3"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let current = p.row_send[row];
+        let level = p.row_level[row];
+        let modes = bottom;
+        let buttons = modes.into_iter().enumerate().map(|(index, (mode, label))| {
+            let id = 20 + row * 8 + index;
+            send_button(cx, id, label, current == mode, s, move |this, cx| {
+                this.set_wire_value(send_id, index as f32, cx);
+            })
+        });
+        rows.push(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(4.0 * s))
+                .child(numbers(format!("{}", row + 2), 11.0, SOFT, s).w(px(12.0 * s)))
+                .children(buttons)
+                .child(send_button(
+                    cx,
+                    80 + row,
+                    "SEND",
+                    current != RowSend::Off,
+                    s,
+                    move |this, cx| this.set_wire_value(level_id, step_send(level), cx),
+                ))
+                .child(numbers(format!("{level:.0}"), 11.0, SOFT, s))
+                .into_any_element(),
+        );
+    }
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(2.0 * s))
+        .children(rows)
+        .into_any_element()
 }
 
 fn display(
@@ -981,19 +1152,14 @@ fn display(
             div()
                 .absolute()
                 .left(px(CHAIN_LEFT * s))
-                .top(px(232.0 * s))
+                .top(px(218.0 * s))
                 .w(px(CHAIN_W * s))
                 .flex()
                 .flex_col()
-                .items_center()
-                .gap(px(4.0 * s))
+                .items_start()
+                .gap(px(3.0 * s))
                 .child(words(caption_line(p, focus), 13.0, WHITE, s))
-                .child(words(
-                    "Click a block to select it \u{00B7} double-click to bypass",
-                    11.5,
-                    FAINT,
-                    s,
-                )),
+                .child(send_rows(p, cx, s)),
         )
         .into_any_element()
 }
@@ -1030,10 +1196,57 @@ fn home(w: &RodhareistEditorWindow, p: &Params, cx: &mut Cx, s: f32) -> Vec<AnyE
                 .into_any_element()
         })
         .collect();
+    let loaded_user = w.user_preset_status().map(|(name, _)| name.to_string());
+    let user_rows: Vec<AnyElement> = w
+        .user_presets()
+        .iter()
+        .enumerate()
+        .map(|(index, (name, _))| {
+            let on = loaded_user.as_deref() == Some(name.as_str());
+            let (bg, border, _) = choice_colors(on, true);
+            div()
+                .id(("rodhareist-user-preset", index))
+                .flex()
+                .flex_row()
+                .items_center()
+                .flex_shrink_0()
+                .gap(px(10.0 * s))
+                .h(px(40.0 * s))
+                .px(px(10.0 * s))
+                .rounded(px(3.0 * s))
+                .border(px(1.0))
+                .border_color(border)
+                .bg(bg)
+                .cursor(gpui::CursorStyle::PointingHand)
+                .hover(|style| style.bg(color(0x2e2e2e)))
+                .child(numbers("PST", 12.0, if on { ACCENT } else { SOFT }, s).w(px(30.0 * s)))
+                .child(words(name.clone(), 13.0, WHITE, s))
+                .on_click(w.load_user_preset_cb(cx, index))
+                .into_any_element()
+        })
+        .collect();
+    let note = w.preset_note().unwrap_or("").to_string();
+    let has_note = !note.is_empty();
     let list = section(s, 6.0, 262.0)
         .p(px(14.0 * s))
         .gap(px(6.0 * s))
         .child(heading("Presets", s).mb(px(4.0 * s)))
+        .child(
+            div()
+                .id("rodhareist-save-preset")
+                .flex()
+                .items_center()
+                .justify_center()
+                .h(px(32.0 * s))
+                .rounded(px(3.0 * s))
+                .border(px(1.0))
+                .border_color(color(0x454545))
+                .bg(color(0x2a2a2a))
+                .cursor(gpui::CursorStyle::PointingHand)
+                .hover(|style| style.bg(color(0x2e2e2e)))
+                .child(words("Save .pst", 13.0, WHITE, s))
+                .on_click(w.save_user_preset_cb(cx)),
+        )
         .child(
             div()
                 .id("rodhareist-presets")
@@ -1043,14 +1256,39 @@ fn home(w: &RodhareistEditorWindow, p: &Params, cx: &mut Cx, s: f32) -> Vec<AnyE
                 .flex_col()
                 .gap(px(6.0 * s))
                 .overflow_y_scroll()
-                .children(rows),
+                .children(rows)
+                .child(heading("Your presets", s).mt(px(8.0 * s)).mb(px(2.0 * s)))
+                .children(if user_rows.is_empty() {
+                    vec![words("No saved presets", 12.0, SOFT, s).into_any_element()]
+                } else {
+                    user_rows
+                }),
         );
+    let list = if has_note {
+        list.child(words(note, 12.0, ACCENT, s))
+    } else {
+        list
+    };
 
-    let (code, name, edited) =
+    let (kicker, title) = if let Some((user_name, edited)) = w.user_preset_status() {
+        (
+            format!("USER{}", if edited { " · EDITED" } else { "" }),
+            user_name.to_string(),
+        )
+    } else {
         match current.and_then(|(i, edited)| presets.get(i).map(|pr| (pr, edited))) {
-            Some((preset, edited)) => (preset.id, preset.name, edited),
-            None => ("", "Custom", false),
-        };
+            Some((preset, edited)) => (
+                format!(
+                    "{} · BANK {}{}",
+                    preset.id,
+                    preset.id.get(..2).unwrap_or(""),
+                    if edited { " · EDITED" } else { "" }
+                ),
+                preset.name.to_string(),
+            ),
+            None => ("NO PRESET LOADED".to_string(), "Custom".to_string()),
+        }
+    };
     let occupied: Vec<usize> = p
         .stage_order
         .iter()
@@ -1078,20 +1316,9 @@ fn home(w: &RodhareistEditorWindow, p: &Params, cx: &mut Cx, s: f32) -> Vec<AnyE
                 .flex()
                 .flex_col()
                 .gap(px(4.0 * s))
-                .child(numbers(
-                    match code.get(0..2) {
-                        Some(bank) => format!(
-                            "{code} \u{00B7} BANK {bank}{}",
-                            if edited { " \u{00B7} EDITED" } else { "" }
-                        ),
-                        None => "NO PRESET LOADED".to_string(),
-                    },
-                    12.0,
-                    ACCENT,
-                    s,
-                ))
+                .child(numbers(kicker, 12.0, ACCENT, s))
                 .child(
-                    words(name, 38.0, WHITE, s)
+                    words(title, 38.0, WHITE, s)
                         .font_weight(FontWeight::SEMIBOLD)
                         .line_height(px(40.0 * s)),
                 ),
@@ -1117,6 +1344,7 @@ fn home(w: &RodhareistEditorWindow, p: &Params, cx: &mut Cx, s: f32) -> Vec<AnyE
                 .h(px(96.0 * s))
                 .child(tuner_box(w, p, s))
                 .child(tempo_box(p, cx, s))
+                .child(line2_box(p, cx, s))
                 .child(master_box(p, cx, s)),
         );
     vec![list.into_any_element(), performance.into_any_element()]
@@ -1333,6 +1561,73 @@ fn tempo_box(p: &Params, cx: &mut Cx, s: f32) -> AnyElement {
                 .tooltip(fb_tooltip("Tap a quarter note: sets Delay A's time"))
                 .on_click(act(cx, |this, cx| this.tap_tempo(cx))),
         )
+        .into_any_element()
+}
+
+fn line2_box(p: &Params, cx: &mut Cx, s: f32) -> AnyElement {
+    let modes = [
+        (Line2Mode::Wet, "WET"),
+        (Line2Mode::Dry, "DRY"),
+        (Line2Mode::WetDryWet, "W/D/W"),
+    ];
+    let buttons =
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(4.0 * s))
+            .children(modes.into_iter().enumerate().map(|(index, (mode, label))| {
+                let on = p.line2_mode == mode;
+                let (bg, border, _) = choice_colors(on, false);
+                div()
+                    .id(("rodhareist-line2", index))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(64.0 * s))
+                    .h(px(22.0 * s))
+                    .rounded(px(3.0 * s))
+                    .border(px(1.0))
+                    .border_color(border)
+                    .bg(bg)
+                    .cursor(gpui::CursorStyle::PointingHand)
+                    .child(words(label, 11.0, if on { WHITE } else { PALE }, s))
+                    .on_click(act(cx, move |this, cx| {
+                        this.set_wire_value("line2_mode", index as f32, cx);
+                    }))
+                    .into_any_element()
+            }));
+    let dial = Dial::new("line2_mix", "SEND", 0.0, 100.0, 70.0, DialUnit::Percent);
+    let look =
+        KnobLook::small(40.0).styled(4.0, 14.0, plate::FACE, plate::FACE_EDGE, 1.5, 5.0, 2.2);
+    let cell = KnobCell::new(72.0, 10.0, 11.0).gap(1.0).label(0.08, SOFT);
+    tile(s)
+        .w(px(168.0 * s))
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .gap(px(8.0 * s))
+        .p(px(6.0 * s))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.0 * s))
+                .child(numbers("LINE 2", 11.0, SOFT, s))
+                .child(buttons),
+        )
+        .child(knob(
+            cx,
+            "rodhareist-line2-mix",
+            dial,
+            p.line2_mix,
+            look,
+            cell,
+            accent(),
+            p.line2_mode == Line2Mode::WetDryWet,
+            s,
+            |this: &mut RodhareistEditorWindow, v, cx| this.set_wire_value("line2_mix", v, cx),
+        ))
         .into_any_element()
 }
 
@@ -1803,9 +2098,31 @@ fn block_card(
         })
         .collect();
 
-    // The side of the path the block runs on, the cabinet's microphone and
-    // IR, and the amp's NAM capture.
+    // Which send row the block sits on, the side of the path it runs on,
+    // the cabinet's microphone and IR, and the amp's NAM capture.
     let mut extras: Vec<AnyElement> = Vec::new();
+    let row_now = (p.stage_row[kind as usize] as usize).min(3);
+    extras.push(
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0 * s))
+            .child(caption("Row", 10.5, 0.1, SOFT, s).mr(px(4.0 * s)))
+            .children((0..4).map(|row| {
+                plate::pill(
+                    ("rodhareist-block-row", row),
+                    ["1", "2", "3", "4"][row],
+                    row_now == row,
+                    accent(),
+                    plate::PillLook::words(28.0, 12.0, 12.5),
+                    true,
+                    s,
+                    w.set_cb(cx, kind.row_id(), row as f32),
+                )
+            }))
+            .into_any_element(),
+    );
     if let (Some(current), Some(id)) = (blocks::channel(p, kind), kind.channel_id()) {
         extras.push(
             div()
