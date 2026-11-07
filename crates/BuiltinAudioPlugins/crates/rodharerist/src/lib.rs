@@ -14,7 +14,8 @@ mod wire;
 
 pub use dsp::{
     apply_to_params, default_params, descriptor, prepare_ir_runtime, prepare_nam_runtime,
-    telemetry, ui_values, AmpModel, CabModel, DelayModel, DriveModel, Dsp, EqModel, IrInfo,
+    reorder_chain, telemetry, ui_values, AmpModel, CabModel, DelayModel, DriveModel, Dsp, EqModel,
+    IrInfo,
     IrLoadError, IrLoader, Line2Mode, MicModel, ModModel, NamCaptureInfo, NamLoadError, NamLoader,
     Params, PreparedIrRuntime, PreparedNamRuntime, ReverbModel, RowSend, StageBParams,
     StageChannel, StageKind, ToneEngineKind, WahModel, IR_PARTITION_SAMPLES, MAX_IR_SECONDS,

@@ -13,6 +13,69 @@ use crate::dsp::WahModel;
 const SWEEP_LO_HZ: f32 = 350.0;
 const SWEEP_HI_HZ: f32 = 2_200.0;
 
+struct WahVoice {
+    lo: f32,
+    hi: f32,
+    q0: f32,
+    q_span: f32,
+    dry: f32,
+    envelope: bool,
+}
+
+fn wah_voice(model: WahModel) -> WahVoice {
+    match model {
+        // Cry and Touch keep the original sweep, Q and dry blend.
+        WahModel::CryWah => WahVoice {
+            lo: SWEEP_LO_HZ,
+            hi: SWEEP_HI_HZ,
+            q0: 2.0,
+            q_span: 10.0,
+            dry: 0.15,
+            envelope: false,
+        },
+        WahModel::TouchWah => WahVoice {
+            lo: SWEEP_LO_HZ,
+            hi: SWEEP_HI_HZ,
+            q0: 2.0,
+            q_span: 10.0,
+            dry: 0.15,
+            envelope: true,
+        },
+        WahModel::BassWah => WahVoice {
+            lo: 80.0,
+            hi: 800.0,
+            q0: 1.4,
+            q_span: 5.0,
+            dry: 0.40,
+            envelope: false,
+        },
+        WahModel::VocalWah => WahVoice {
+            lo: 520.0,
+            hi: 1_600.0,
+            q0: 4.5,
+            q_span: 14.0,
+            dry: 0.04,
+            envelope: false,
+        },
+        WahModel::ParkedFilter => WahVoice {
+            lo: 740.0,
+            hi: 1_050.0,
+            q0: 3.0,
+            q_span: 6.0,
+            dry: 0.50,
+            envelope: false,
+        },
+        WahModel::TalkFilter => WahVoice {
+            lo: 180.0,
+            hi: 2_800.0,
+            q0: 1.2,
+            q_span: 4.0,
+            dry: 0.28,
+            envelope: true,
+        },
+    }
+}
+
 /// Pedal glide: how fast the swept corner may move (seconds).
 const PEDAL_SMOOTH_SECONDS: f32 = 0.030;
 
@@ -58,6 +121,10 @@ pub(super) struct Wah {
     q_inv: Smoothed,
     /// Envelope sensitivity 0..1 (touch model only).
     sensitivity: f32,
+    sweep_lo: f32,
+    sweep_hi: f32,
+    dry: f32,
+    envelope: bool,
     env: f32,
     env_attack: f32,
     env_release: f32,
@@ -74,6 +141,10 @@ impl Wah {
             position: Smoothed::new(sr, PEDAL_SMOOTH_SECONDS, 0.45),
             q_inv: Smoothed::new(sr, SMOOTH_SECONDS, 1.0 / 6.0),
             sensitivity: 0.5,
+            sweep_lo: SWEEP_LO_HZ,
+            sweep_hi: SWEEP_HI_HZ,
+            dry: 0.15,
+            envelope: false,
             env: 0.0,
             env_attack: env_coeff(sr, ENV_ATTACK_SECONDS),
             env_release: env_coeff(sr, ENV_RELEASE_SECONDS),
@@ -108,9 +179,13 @@ impl Wah {
             self.svf_r.reset();
             self.env = 0.0;
         }
+        let voice = wah_voice(model);
+        self.sweep_lo = voice.lo;
+        self.sweep_hi = voice.hi;
+        self.dry = voice.dry;
+        self.envelope = voice.envelope;
         self.position.set_target((pos / 10.0).clamp(0.0, 1.0));
-        // Q from 2 (broad) to 12 (screaming vowel).
-        let q = 2.0 + (res / 10.0).clamp(0.0, 1.0) * 10.0;
+        let q = voice.q0 + (res / 10.0).clamp(0.0, 1.0) * voice.q_span;
         self.q_inv.set_target(1.0 / q);
         self.sensitivity = (sens / 10.0).clamp(0.0, 1.0);
     }
@@ -121,31 +196,33 @@ impl Wah {
         let q_inv = self.q_inv.tick();
 
         // Where in the sweep 0..1 the filter sits this sample.
-        let sweep = match self.model {
-            WahModel::CryWah => pedal,
-            WahModel::TouchWah => {
-                // Envelope follower on the stereo peak; sensitivity scales
-                // how far a given level pushes the sweep above the heel
-                // position set by the pedal knob.
-                let level = left.abs().max(right.abs());
-                let coeff = if level > self.env {
-                    self.env_attack
-                } else {
-                    self.env_release
-                };
-                self.env = level + coeff * (self.env - level);
-                (pedal + self.env * (2.0 + 6.0 * self.sensitivity)).min(1.0)
-            }
+        let sweep = if self.envelope {
+            // Envelope follower on the stereo peak; sensitivity scales
+            // how far a given level pushes the sweep above the heel
+            // position set by the pedal knob.
+            let level = left.abs().max(right.abs());
+            let coeff = if level > self.env {
+                self.env_attack
+            } else {
+                self.env_release
+            };
+            self.env = level + coeff * (self.env - level);
+            (pedal + self.env * (2.0 + 6.0 * self.sensitivity)).min(1.0)
+        } else {
+            pedal
         };
 
-        let freq = SWEEP_LO_HZ * (SWEEP_HI_HZ / SWEEP_LO_HZ).powf(sweep);
+        let freq = self.sweep_lo * (self.sweep_hi / self.sweep_lo).powf(sweep);
         // Chamberlin coefficient; clamped for stability at high rates/corners.
         let f = (2.0 * (std::f32::consts::PI * freq / self.sample_rate).sin()).clamp(0.0, 0.9);
 
         // A touch of dry keeps low-string body under the vocal peak.
         let wet_l = self.svf_l.band_pass(left, f, q_inv);
         let wet_r = self.svf_r.band_pass(right, f, q_inv);
-        (wet_l * 0.9 + left * 0.15, wet_r * 0.9 + right * 0.15)
+        (
+            wet_l * 0.9 + left * self.dry,
+            wet_r * 0.9 + right * self.dry,
+        )
     }
 }
 

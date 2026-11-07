@@ -304,6 +304,27 @@ pub enum DriveModel {
     /// "Copper Fuzz" — silicon fuzz, tighter and more aggressive than the
     /// germanium Face Fuzz.
     CopperFuzz,
+    /// "Glass Boost" — treble booster. The circuit this follows is a
+    /// Rangemaster: a high corner, little clip, a bright push.
+    GlassBoost,
+    /// "Velvet OD" — soft low-gain overdrive. The circuit this follows is a
+    /// Bluesbreaker: a wide soft knee and a warm mid.
+    VelvetOd,
+    /// "Octave Fuzz" — strong even-order asymmetry, an octave-up edge.
+    /// The circuit this follows is an Octavia.
+    OctaveFuzz,
+    /// "Bass Grind" — the low band reaches the clipper. A bass overdrive,
+    /// dark on top.
+    BassGrind,
+    /// "Honk Box" — a narrow mid peak into a medium clip.
+    HonkBox,
+    /// "Smooth Lead" — compressed, rolled-off sustain.
+    SmoothLead,
+    /// "Sputter Fuzz" — mismatched junctions that choke between notes.
+    /// The circuit this follows is a gated fuzz, not the Face.
+    SputterFuzz,
+    /// "Clean Push" — almost linear level, a hint of soft clip.
+    CleanPush,
 }
 
 impl DriveModel {
@@ -321,6 +342,14 @@ impl DriveModel {
         // Append-only past this point (wire ABI).
         Self::AmberCrunch,
         Self::CopperFuzz,
+        Self::GlassBoost,
+        Self::VelvetOd,
+        Self::OctaveFuzz,
+        Self::BassGrind,
+        Self::HonkBox,
+        Self::SmoothLead,
+        Self::SputterFuzz,
+        Self::CleanPush,
     ];
 
     /// Map the editor model id.
@@ -338,6 +367,14 @@ impl DriveModel {
             "tight_rift" => Some(Self::TightRift),
             "amber_crunch" => Some(Self::AmberCrunch),
             "copper_fuzz" => Some(Self::CopperFuzz),
+            "glass_boost" => Some(Self::GlassBoost),
+            "velvet_od" => Some(Self::VelvetOd),
+            "octave_fuzz" => Some(Self::OctaveFuzz),
+            "bass_grind" => Some(Self::BassGrind),
+            "honk_box" => Some(Self::HonkBox),
+            "smooth_lead" => Some(Self::SmoothLead),
+            "sputter_fuzz" => Some(Self::SputterFuzz),
+            "clean_push" => Some(Self::CleanPush),
             _ => None,
         }
     }
@@ -412,6 +449,30 @@ pub enum AmpModel {
     /// power section and more mids than Invader. The circuit this follows
     /// is the EVH 5150 III red channel.
     Stealth,
+    /// "Park Head" — rounder, lower-gain British head. The circuit this
+    /// follows is a Park 75.
+    ParkHead,
+    /// "Silver Twin" — brighter and stiffer than Twin Clean. The circuit
+    /// this follows is a silverface Twin Reverb.
+    SilverTwin,
+    /// "Thick Stack" — huge low-mids, soft clip, a lot of sag. The circuit
+    /// this follows is an OR120.
+    ThickStack,
+    /// "Mini Chime" — small EL84 combo, early and fizzy. The circuit this
+    /// follows is an AC10.
+    MiniChime,
+    /// "Hot Mod" — a modded plexi: tight mids, more feedback. The circuit
+    /// this follows is a BE-100 style hot-rod.
+    HotMod,
+    /// "Vintage Modern" — high gain that sags, looser than Recto Modern.
+    /// The circuit this follows is a vintage-mode dual rectifier.
+    VintageModern,
+    /// "Studio Bass" — mid-forward bass, less sub than Bass 800. The
+    /// circuit this follows is a B-15.
+    StudioBass,
+    /// "Express Lead" — low feedback, a fast exploding power section.
+    /// The circuit this follows is a Trainwreck Express.
+    ExpressLead,
 }
 
 impl AmpModel {
@@ -441,6 +502,14 @@ impl AmpModel {
         Self::Liverpool,
         Self::Bass800,
         Self::Stealth,
+        Self::ParkHead,
+        Self::SilverTwin,
+        Self::ThickStack,
+        Self::MiniChime,
+        Self::HotMod,
+        Self::VintageModern,
+        Self::StudioBass,
+        Self::ExpressLead,
     ];
 
     pub fn from_model_id(id: &str) -> Option<Self> {
@@ -469,6 +538,14 @@ impl AmpModel {
             "liverpool" => Some(Self::Liverpool),
             "bass800" => Some(Self::Bass800),
             "stealth" => Some(Self::Stealth),
+            "park_head" => Some(Self::ParkHead),
+            "silver_twin" => Some(Self::SilverTwin),
+            "thick_stack" => Some(Self::ThickStack),
+            "mini_chime" => Some(Self::MiniChime),
+            "hot_mod" => Some(Self::HotMod),
+            "vintage_modern" => Some(Self::VintageModern),
+            "studio_bass" => Some(Self::StudioBass),
+            "express_lead" => Some(Self::ExpressLead),
             _ => None,
         }
     }
@@ -534,6 +611,22 @@ pub enum CabModel {
     /// "Silver Bell 1x12" — bright open single with a high bell and a
     /// strong rear reflection.
     Silver1x12,
+    /// "Closed 1x12" — small sealed single, early rolloff.
+    Closed1x12,
+    /// "Ported 2x12" — a tuned port under a closed pair.
+    Ported2x12,
+    /// "Open 4x10" — four tens, open back, strong rear cancellation.
+    Open4x10,
+    /// "Ceramic 2x12" — tight pair, less bell than the alnico.
+    Ceramic2x12,
+    /// "Deep 4x12" — lower and looser than the oversized closed 4x12.
+    Deep4x12,
+    /// "Combo 1x15" — open fifteen, dark and loose.
+    Combo1x15,
+    /// "Alnico 1x10" — small bright single, boxy.
+    Alnico1x10,
+    /// "Dark 1x15" — sealed fifteen, little top.
+    Dark15,
 }
 
 impl CabModel {
@@ -559,6 +652,14 @@ impl CabModel {
         Self::Cream4x12,
         Self::Bass810,
         Self::Silver1x12,
+        Self::Closed1x12,
+        Self::Ported2x12,
+        Self::Open4x10,
+        Self::Ceramic2x12,
+        Self::Deep4x12,
+        Self::Combo1x15,
+        Self::Alnico1x10,
+        Self::Dark15,
     ];
 
     /// The modeled voicings only — [`Self::ALL`] minus [`Self::Ir`], which is
@@ -584,6 +685,14 @@ impl CabModel {
         Self::Cream4x12,
         Self::Bass810,
         Self::Silver1x12,
+        Self::Closed1x12,
+        Self::Ported2x12,
+        Self::Open4x10,
+        Self::Ceramic2x12,
+        Self::Deep4x12,
+        Self::Combo1x15,
+        Self::Alnico1x10,
+        Self::Dark15,
     ];
 
     pub fn from_model_id(id: &str) -> Option<Self> {
@@ -608,6 +717,14 @@ impl CabModel {
             "cream_412" => Some(Self::Cream4x12),
             "bass_810" => Some(Self::Bass810),
             "silver_1x12" => Some(Self::Silver1x12),
+            "closed_1x12" => Some(Self::Closed1x12),
+            "ported_2x12" => Some(Self::Ported2x12),
+            "open_4x10" => Some(Self::Open4x10),
+            "ceramic_2x12" => Some(Self::Ceramic2x12),
+            "deep_4x12" => Some(Self::Deep4x12),
+            "combo_1x15" => Some(Self::Combo1x15),
+            "alnico_1x10" => Some(Self::Alnico1x10),
+            "dark_15" => Some(Self::Dark15),
             _ => None,
         }
     }
@@ -675,6 +792,18 @@ pub enum ModModel {
     SoftPhase,
     /// "Wide Vibe" — linked stereo spread for a genuinely wide swirl.
     WideVibe,
+    /// "Dimension Double" — a short, quiet doubling chorus.
+    Dimension,
+    /// "Tri Chorus" — a longer, slower chorus with a wider offset.
+    TriChorus,
+    /// "Thru Zero" — a flanger whose sweep passes near the dry signal.
+    ThruZero,
+    /// "Slow Jet" — a slow flanger with more regeneration.
+    SlowJet,
+    /// "Harmonic Trem" — lows and highs pulse against each other.
+    HarmonicTrem,
+    /// "Bias Trem" — a slow, soft bias wobble. Less chop than the opto.
+    BiasTrem,
 }
 
 impl ModModel {
@@ -693,6 +822,12 @@ impl ModModel {
         Self::IsanJet,
         Self::SoftPhase,
         Self::WideVibe,
+        Self::Dimension,
+        Self::TriChorus,
+        Self::ThruZero,
+        Self::SlowJet,
+        Self::HarmonicTrem,
+        Self::BiasTrem,
     ];
 
     pub fn from_model_id(id: &str) -> Option<Self> {
@@ -708,6 +843,12 @@ impl ModModel {
             "isan_jet" => Some(Self::IsanJet),
             "soft_phase" => Some(Self::SoftPhase),
             "wide_vibe" => Some(Self::WideVibe),
+            "dimension" => Some(Self::Dimension),
+            "tri_chorus" => Some(Self::TriChorus),
+            "thru_zero" => Some(Self::ThruZero),
+            "slow_jet" => Some(Self::SlowJet),
+            "harmonic_trem" => Some(Self::HarmonicTrem),
+            "bias_trem" => Some(Self::BiasTrem),
             _ => None,
         }
     }
@@ -724,7 +865,15 @@ impl ModModel {
             Self::IsanJet => Some(V::IsanJet),
             Self::SoftPhase => Some(V::SoftPhase),
             Self::WideVibe => Some(V::WideVibe),
-            Self::Chorus | Self::Flanger | Self::Tremolo => None,
+            Self::Chorus
+            | Self::Flanger
+            | Self::Tremolo
+            | Self::Dimension
+            | Self::TriChorus
+            | Self::ThruZero
+            | Self::SlowJet
+            | Self::HarmonicTrem
+            | Self::BiasTrem => None,
         }
     }
 
@@ -743,15 +892,34 @@ pub enum WahModel {
     CryWah,
     /// "Touch Wah" — envelope-follower auto wah.
     TouchWah,
+    /// "Bass Wah" — the sweep sits an octave lower.
+    BassWah,
+    /// "Vocal Wah" — a narrow, more resonant vowel.
+    VocalWah,
+    /// "Parked Filter" — a short travel around one mid.
+    ParkedFilter,
+    /// "Talk Filter" — a wide envelope sweep, more dry body under it.
+    TalkFilter,
 }
 
 impl WahModel {
-    pub const ALL: &'static [Self] = &[Self::CryWah, Self::TouchWah];
+    pub const ALL: &'static [Self] = &[
+        Self::CryWah,
+        Self::TouchWah,
+        Self::BassWah,
+        Self::VocalWah,
+        Self::ParkedFilter,
+        Self::TalkFilter,
+    ];
 
     pub fn from_model_id(id: &str) -> Option<Self> {
         match id {
             "cry_wah" => Some(Self::CryWah),
             "touch_wah" => Some(Self::TouchWah),
+            "bass_wah" => Some(Self::BassWah),
+            "vocal_wah" => Some(Self::VocalWah),
+            "parked_filter" => Some(Self::ParkedFilter),
+            "talk_filter" => Some(Self::TalkFilter),
             _ => None,
         }
     }
@@ -778,10 +946,26 @@ pub enum EqModel {
     /// "Modern EQ" — surgical/digital character: extended shelf range,
     /// narrow precise bells.
     Modern,
+    /// "Air EQ" — a very high shelf and wide bells.
+    Air,
+    /// "Bass Shelf" — the low shelf sits lower, bells stay broad.
+    BassShelf,
+    /// "Presence EQ" — the high shelf comes in early, around the presence band.
+    Presence,
+    /// "Notch EQ" — narrow bells for small cuts.
+    Notch,
 }
 
 impl EqModel {
-    pub const ALL: &'static [Self] = &[Self::Studio, Self::Vintage, Self::Modern];
+    pub const ALL: &'static [Self] = &[
+        Self::Studio,
+        Self::Vintage,
+        Self::Modern,
+        Self::Air,
+        Self::BassShelf,
+        Self::Presence,
+        Self::Notch,
+    ];
 
     pub fn from_model_id(id: &str) -> Option<Self> {
         match id {
@@ -792,6 +976,10 @@ impl EqModel {
             "parametric" => Some(Self::Studio),
             "vintage_eq" => Some(Self::Vintage),
             "modern_eq" => Some(Self::Modern),
+            "air_eq" => Some(Self::Air),
+            "bass_shelf" => Some(Self::BassShelf),
+            "presence_eq" => Some(Self::Presence),
+            "notch_eq" => Some(Self::Notch),
             _ => None,
         }
     }
@@ -817,10 +1005,27 @@ pub enum ReverbModel {
     Hall,
     /// "Shimmer" — hall bed with an octave-up voice regenerating in the tail.
     Shimmer,
+    /// "Spring Tank" — short, sparse, a lot of early ring.
+    Spring,
+    /// "Drum Chamber" — medium, darker than the hall.
+    Chamber,
+    /// "Ambience" — a very short early field, almost no tail.
+    Ambience,
+    /// "Dark Hall" — hall length with the top rolled off.
+    DarkHall,
 }
 
 impl ReverbModel {
-    pub const ALL: &'static [Self] = &[Self::Plate, Self::Room, Self::Hall, Self::Shimmer];
+    pub const ALL: &'static [Self] = &[
+        Self::Plate,
+        Self::Room,
+        Self::Hall,
+        Self::Shimmer,
+        Self::Spring,
+        Self::Chamber,
+        Self::Ambience,
+        Self::DarkHall,
+    ];
 
     pub fn from_model_id(id: &str) -> Option<Self> {
         match id {
@@ -828,6 +1033,10 @@ impl ReverbModel {
             "room" => Some(Self::Room),
             "hall" => Some(Self::Hall),
             "shimmer" => Some(Self::Shimmer),
+            "spring" => Some(Self::Spring),
+            "chamber" => Some(Self::Chamber),
+            "ambience" => Some(Self::Ambience),
+            "dark_hall" => Some(Self::DarkHall),
             _ => None,
         }
     }
@@ -860,6 +1069,18 @@ pub enum DelayModel {
     /// "Stereo Delay" — clean repeats, each side on its own Time and
     /// Feedback (`delay_time_r` / `delay_fb_r` set the right one).
     Stereo,
+    /// "Slap Echo" — bright, barely moving, a short-character repeat.
+    SlapEcho,
+    /// "Oil Can" — dark, wobbly, heavily saturated.
+    OilCan,
+    /// "Dark Echo" — repeats that lose their top and their low end.
+    DarkEcho,
+    /// "Ambient Echo" — long, quiet, alternating across the image.
+    AmbientEcho,
+    /// "Wow Echo" — tape movement turned up until the pitch wanders.
+    WowEcho,
+    /// "Triplet Tap" — quarter note left against a triplet right.
+    TripletTap,
 }
 
 impl DelayModel {
@@ -870,6 +1091,12 @@ impl DelayModel {
         Self::PingPong,
         Self::Dual,
         Self::Stereo,
+        Self::SlapEcho,
+        Self::OilCan,
+        Self::DarkEcho,
+        Self::AmbientEcho,
+        Self::WowEcho,
+        Self::TripletTap,
     ];
 
     pub fn from_model_id(id: &str) -> Option<Self> {
@@ -880,6 +1107,12 @@ impl DelayModel {
             "ping_pong" => Some(Self::PingPong),
             "dual" => Some(Self::Dual),
             "stereo" => Some(Self::Stereo),
+            "slap_echo" => Some(Self::SlapEcho),
+            "oil_can" => Some(Self::OilCan),
+            "dark_echo" => Some(Self::DarkEcho),
+            "ambient_echo" => Some(Self::AmbientEcho),
+            "wow_echo" => Some(Self::WowEcho),
+            "triplet_tap" => Some(Self::TripletTap),
             _ => None,
         }
     }
@@ -3247,6 +3480,40 @@ fn sanitize_stage_order(order: [Option<StageKind>; PATH_SLOTS]) -> [Option<Stage
     out
 }
 
+/// Move the block in `from` onto `to`.
+///
+/// A filled destination swaps, so a hole stays a hole — this does not pack
+/// the path and cannot resurrect a stage `sanitize_stage_order` dropped.
+/// `to_row` is the lane the dragged block lands on (0 = the main chain).
+/// The block it displaces keeps the row the dragged one left.
+pub fn reorder_chain(
+    order: &mut [Option<StageKind>; PATH_SLOTS],
+    stage_row: &mut [u8; PATH_SLOTS],
+    from: usize,
+    to: usize,
+    to_row: u8,
+) {
+    if from >= PATH_SLOTS || to >= PATH_SLOTS {
+        return;
+    }
+    let Some(kind) = order[from] else {
+        return;
+    };
+    let to_row = to_row.min(BOTTOM_ROWS as u8);
+    if from == to {
+        stage_row[kind as usize] = to_row;
+        return;
+    }
+    let from_row = stage_row[kind as usize];
+    let displaced = order[to];
+    order[from] = displaced;
+    order[to] = Some(kind);
+    stage_row[kind as usize] = to_row;
+    if let Some(other) = displaced {
+        stage_row[other as usize] = from_row;
+    }
+}
+
 impl StereoEffect for Dsp {
     fn reset(&mut self) {
         self.gate.reset();
@@ -5487,6 +5754,12 @@ mod tests {
             ModModel::IsanJet => "isan_jet",
             ModModel::SoftPhase => "soft_phase",
             ModModel::WideVibe => "wide_vibe",
+            ModModel::Dimension => "dimension",
+            ModModel::TriChorus => "tri_chorus",
+            ModModel::ThruZero => "thru_zero",
+            ModModel::SlowJet => "slow_jet",
+            ModModel::HarmonicTrem => "harmonic_trem",
+            ModModel::BiasTrem => "bias_trem",
         }
     }
 
@@ -5873,5 +6146,114 @@ mod telemetry_tests {
             (main - serial).abs() < 1.0e-3,
             "main {main} vs serial row {serial}"
         );
+    }
+
+    #[test]
+    fn a_drag_reorder_keeps_a_unique_path_and_its_holes() {
+        let mut order = [None; PATH_SLOTS];
+        order[0] = Some(StageKind::Gate);
+        order[2] = Some(StageKind::Drive);
+        order[4] = Some(StageKind::Amp);
+        let mut rows = [0u8; PATH_SLOTS];
+        reorder_chain(&mut order, &mut rows, 2, 6, 2);
+        assert_eq!(order[2], None, "the empty destination must stay a hole");
+        assert_eq!(order[6], Some(StageKind::Drive));
+        assert_eq!(rows[StageKind::Drive as usize], 2);
+        assert_eq!(order[0], Some(StageKind::Gate));
+        assert_eq!(order[4], Some(StageKind::Amp));
+        reorder_chain(&mut order, &mut rows, 0, 4, 1);
+        assert_eq!(order[0], Some(StageKind::Amp));
+        assert_eq!(order[4], Some(StageKind::Gate));
+        assert_eq!(rows[StageKind::Gate as usize], 1);
+        assert_eq!(rows[StageKind::Amp as usize], 0);
+        let mut seen = [false; StageKind::COUNT];
+        for stage in order.into_iter().flatten() {
+            assert!(!seen[stage as usize], "{stage:?} appears twice");
+            seen[stage as usize] = true;
+        }
+        assert_eq!(order.iter().flatten().count(), 3);
+    }
+
+    #[test]
+    fn a_block_dropped_on_an_off_row_does_not_run() {
+        let mut parked = default_params();
+        parked.drive_on = true;
+        let from = parked
+            .stage_order
+            .iter()
+            .position(|slot| *slot == Some(StageKind::Drive))
+            .expect("drive is on the default path");
+        reorder_chain(&mut parked.stage_order, &mut parked.stage_row, from, from, 1);
+        parked.row_send[0] = RowSend::Off;
+        let mut dry = default_params();
+        dry.drive_on = false;
+        let silent = drive_tail(parked);
+        let bypassed = drive_tail(dry);
+        assert!(
+            (silent - bypassed).abs() < 1.0e-3,
+            "off row {silent} vs dry {bypassed}"
+        );
+    }
+
+    #[test]
+    fn wet_dry_wet_row_at_send_zero_keeps_main() {
+        let main = (0.8_f32, -0.3_f32);
+        let (l, r) = mix_bottom_row(
+            main.0,
+            main.1,
+            0.2,
+            0.2,
+            0.9,
+            -0.4,
+            0.4,
+            0.4,
+            RowSend::WetDryWet,
+            0.0,
+        );
+        assert!((l - main.0).abs() < 1.0e-6 && (r - main.1).abs() < 1.0e-6);
+        // `line2_targets(WetDryWet, 0)` is the mono center. The row mix
+        // must not substitute that for main when the send is closed.
+        let (gd, gw, gc) = line2_targets(Line2Mode::WetDryWet, 0.0);
+        let center = 0.4;
+        let mono = 0.2 * gd + 0.9 * gw + center * gc;
+        assert!((l - mono).abs() > 0.2, "send 0 collapsed main to {mono}");
+    }
+
+    #[test]
+    fn new_models_round_trip_and_old_indices_stay_put() {
+        assert_eq!(DriveModel::ALL[11], DriveModel::CopperFuzz);
+        assert_eq!(DriveModel::from_index(11), DriveModel::CopperFuzz);
+        assert_eq!(DriveModel::from_model_id("glass_boost"), Some(DriveModel::GlassBoost));
+        assert_eq!(DriveModel::ALL[12], DriveModel::GlassBoost);
+        assert_eq!(AmpModel::ALL[23], AmpModel::Stealth);
+        assert_eq!(AmpModel::from_index(23), AmpModel::Stealth);
+        assert_eq!(AmpModel::from_model_id("park_head"), Some(AmpModel::ParkHead));
+        assert_eq!(AmpModel::ALL[24], AmpModel::ParkHead);
+        assert_eq!(CabModel::ALL[11], CabModel::Ir);
+        assert_eq!(CabModel::ALL[19], CabModel::Silver1x12);
+        assert_eq!(CabModel::from_index(19), CabModel::Silver1x12);
+        assert_eq!(CabModel::from_model_id("closed_1x12"), Some(CabModel::Closed1x12));
+        assert_eq!(CabModel::ALL[20], CabModel::Closed1x12);
+        assert_eq!(ModModel::ALL[10], ModModel::WideVibe);
+        assert_eq!(ModModel::from_model_id("dimension"), Some(ModModel::Dimension));
+        assert_eq!(ModModel::ALL[11], ModModel::Dimension);
+        assert_eq!(DelayModel::ALL[5], DelayModel::Stereo);
+        assert_eq!(DelayModel::from_model_id("slap_echo"), Some(DelayModel::SlapEcho));
+        assert_eq!(DelayModel::ALL[6], DelayModel::SlapEcho);
+        assert_eq!(ReverbModel::ALL[3], ReverbModel::Shimmer);
+        assert_eq!(ReverbModel::from_model_id("spring"), Some(ReverbModel::Spring));
+        assert_eq!(ReverbModel::ALL[4], ReverbModel::Spring);
+        assert_eq!(WahModel::ALL[1], WahModel::TouchWah);
+        assert_eq!(WahModel::from_model_id("bass_wah"), Some(WahModel::BassWah));
+        assert_eq!(WahModel::ALL[2], WahModel::BassWah);
+        assert_eq!(EqModel::ALL[2], EqModel::Modern);
+        assert_eq!(EqModel::from_model_id("air_eq"), Some(EqModel::Air));
+        assert_eq!(EqModel::ALL[3], EqModel::Air);
+        for (i, model) in AmpModel::ALL.iter().enumerate() {
+            assert_eq!(AmpModel::from_index(i as u32), *model);
+        }
+        for (i, model) in CabModel::ALL.iter().enumerate() {
+            assert_eq!(CabModel::from_index(i as u32), *model);
+        }
     }
 }

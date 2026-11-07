@@ -401,6 +401,23 @@ mod tests {
             "hundred",
             "mark",
             "normal15",
+            "jazz120",
+            "deluxe5",
+            "jtm45",
+            "brown",
+            "fireball",
+            "slo",
+            "liverpool",
+            "bass800",
+            "stealth",
+            "park_head",
+            "silver_twin",
+            "thick_stack",
+            "mini_chime",
+            "hot_mod",
+            "vintage_modern",
+            "studio_bass",
+            "express_lead",
         ];
         for (i, id) in amp.iter().enumerate() {
             assert_eq!(
@@ -422,6 +439,14 @@ mod tests {
             "tight_rift",
             "amber_crunch",
             "copper_fuzz",
+            "glass_boost",
+            "velvet_od",
+            "octave_fuzz",
+            "bass_grind",
+            "honk_box",
+            "smooth_lead",
+            "sputter_fuzz",
+            "clean_push",
         ];
         for (i, id) in drive.iter().enumerate() {
             assert_eq!(
@@ -446,6 +471,20 @@ mod tests {
             "ir",
             "modern_212",
             "american_1x12",
+            "alnico_2x12",
+            "green_412",
+            "jensen_1x12",
+            "cream_412",
+            "bass_810",
+            "silver_1x12",
+            "closed_1x12",
+            "ported_2x12",
+            "open_4x10",
+            "ceramic_2x12",
+            "deep_4x12",
+            "combo_1x15",
+            "alnico_1x10",
+            "dark_15",
         ];
         for (i, id) in cab.iter().enumerate() {
             assert_eq!(
@@ -454,7 +493,16 @@ mod tests {
                 "cab `{id}`"
             );
         }
-        let reverb = ["plate", "room", "hall", "shimmer"];
+        let reverb = [
+            "plate",
+            "room",
+            "hall",
+            "shimmer",
+            "spring",
+            "chamber",
+            "ambience",
+            "dark_hall",
+        ];
         for (i, id) in reverb.iter().enumerate() {
             assert_eq!(
                 ReverbModel::from_model_id(id),
@@ -476,6 +524,12 @@ mod tests {
             "isan_jet",
             "soft_phase",
             "wide_vibe",
+            "dimension",
+            "tri_chorus",
+            "thru_zero",
+            "slow_jet",
+            "harmonic_trem",
+            "bias_trem",
         ];
         for (i, id) in mod_models.iter().enumerate() {
             assert_eq!(
@@ -484,7 +538,20 @@ mod tests {
                 "mod `{id}`"
             );
         }
-        let delay = ["tape", "digital", "analog", "ping_pong", "dual", "stereo"];
+        let delay = [
+            "tape",
+            "digital",
+            "analog",
+            "ping_pong",
+            "dual",
+            "stereo",
+            "slap_echo",
+            "oil_can",
+            "dark_echo",
+            "ambient_echo",
+            "wow_echo",
+            "triplet_tap",
+        ];
         for (i, id) in delay.iter().enumerate() {
             assert_eq!(
                 DelayModel::from_model_id(id),
@@ -492,7 +559,14 @@ mod tests {
                 "delay `{id}`"
             );
         }
-        let wah = ["cry_wah", "touch_wah"];
+        let wah = [
+            "cry_wah",
+            "touch_wah",
+            "bass_wah",
+            "vocal_wah",
+            "parked_filter",
+            "talk_filter",
+        ];
         for (i, id) in wah.iter().enumerate() {
             assert_eq!(
                 WahModel::from_model_id(id),
@@ -500,7 +574,15 @@ mod tests {
                 "wah `{id}`"
             );
         }
-        let eq = ["parametric", "vintage_eq", "modern_eq"];
+        let eq = [
+            "parametric",
+            "vintage_eq",
+            "modern_eq",
+            "air_eq",
+            "bass_shelf",
+            "presence_eq",
+            "notch_eq",
+        ];
         for (i, id) in eq.iter().enumerate() {
             assert_eq!(
                 EqModel::from_model_id(id),

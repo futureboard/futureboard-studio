@@ -35,7 +35,7 @@ enum Routing {
     /// repeats alternate across the image.
     PingPong,
     /// Independent lines like `Stereo`, but the right tap runs at
-    /// [`DUAL_RIGHT_RATIO`] of the Time knob.
+    /// [`Voicing::right_ratio`] of the Time knob.
     Dual,
     /// Independent lines like `Stereo`, the right one on its own Time and
     /// Feedback knobs.
@@ -64,6 +64,8 @@ struct Voicing {
     /// voicings that a Time drag reads as a tape-style pitch glide; short on
     /// the digital ones, where a glide would be wrong.
     time_slew_s: f32,
+    /// Right-tap fraction of the Time knob. Only [`Routing::Dual`] reads it.
+    right_ratio: f32,
     routing: Routing,
 }
 
@@ -77,6 +79,7 @@ impl Voicing {
                 flutter_s: 0.000_3,
                 drive: 1.0,
                 time_slew_s: 0.100,
+                right_ratio: 1.0,
                 routing: Routing::Stereo,
             },
             // Clean and full-bandwidth: repeats that stay where you put them.
@@ -86,6 +89,7 @@ impl Voicing {
                 flutter_s: 0.0,
                 drive: 0.25,
                 time_slew_s: 0.020,
+                right_ratio: 1.0,
                 routing: Routing::Stereo,
             },
             // Bucket-brigade: dark, thinning, compressed repeats.
@@ -95,6 +99,7 @@ impl Voicing {
                 flutter_s: 0.000_08,
                 drive: 1.4,
                 time_slew_s: 0.090,
+                right_ratio: 1.0,
                 routing: Routing::Stereo,
             },
             // Repeats alternating left/right across the image.
@@ -104,6 +109,7 @@ impl Voicing {
                 flutter_s: 0.000_05,
                 drive: 0.8,
                 time_slew_s: 0.025,
+                right_ratio: 1.0,
                 routing: Routing::PingPong,
             },
             // Two rhythmic taps: quarter left, dotted eighth right.
@@ -113,6 +119,7 @@ impl Voicing {
                 flutter_s: 0.000_12,
                 drive: 0.9,
                 time_slew_s: 0.030,
+                right_ratio: DUAL_RIGHT_RATIO,
                 routing: Routing::Dual,
             },
             // Clean repeats, each side on its own time and feedback.
@@ -122,7 +129,65 @@ impl Voicing {
                 flutter_s: 0.0,
                 drive: 0.35,
                 time_slew_s: 0.020,
+                right_ratio: 1.0,
                 routing: Routing::Split,
+            },
+            // Bright and still. The Time knob is what makes it a slap.
+            DelayModel::SlapEcho => Self {
+                tone_hz: 9_000.0,
+                body_hz: 0.0,
+                flutter_s: 0.000_02,
+                drive: 0.55,
+                time_slew_s: 0.015,
+                right_ratio: 1.0,
+                routing: Routing::Stereo,
+            },
+            // Oil-can: dark, saturated, the head wanders.
+            DelayModel::OilCan => Self {
+                tone_hz: 1_400.0,
+                body_hz: 240.0,
+                flutter_s: 0.000_9,
+                drive: 1.8,
+                time_slew_s: 0.150,
+                right_ratio: 1.0,
+                routing: Routing::Stereo,
+            },
+            DelayModel::DarkEcho => Self {
+                tone_hz: 900.0,
+                body_hz: 320.0,
+                flutter_s: 0.000_15,
+                drive: 1.25,
+                time_slew_s: 0.080,
+                right_ratio: 1.0,
+                routing: Routing::Stereo,
+            },
+            DelayModel::AmbientEcho => Self {
+                tone_hz: 2_800.0,
+                body_hz: 180.0,
+                flutter_s: 0.000_18,
+                drive: 0.45,
+                time_slew_s: 0.040,
+                right_ratio: 1.0,
+                routing: Routing::PingPong,
+            },
+            DelayModel::WowEcho => Self {
+                tone_hz: 3_200.0,
+                body_hz: 80.0,
+                flutter_s: 0.001_4,
+                drive: 1.15,
+                time_slew_s: 0.180,
+                right_ratio: 1.0,
+                routing: Routing::Stereo,
+            },
+            // Quarter against a triplet eighth (2/3).
+            DelayModel::TripletTap => Self {
+                tone_hz: 4_200.0,
+                body_hz: 0.0,
+                flutter_s: 0.000_06,
+                drive: 0.7,
+                time_slew_s: 0.028,
+                right_ratio: 2.0 / 3.0,
+                routing: Routing::Dual,
             },
         }
     }
@@ -299,7 +364,7 @@ impl DelayStage {
         let mix_amount = self.mix.tick();
         let flut = self.flutter.tick() * self.flutter_depth;
         let (right_samples, right_feedback) = match self.voicing.routing {
-            Routing::Dual => (delay_samples * DUAL_RIGHT_RATIO, feedback),
+            Routing::Dual => (delay_samples * self.voicing.right_ratio, feedback),
             Routing::Split => (delay_samples_r, feedback_r),
             Routing::Stereo | Routing::PingPong => (delay_samples, feedback),
         };

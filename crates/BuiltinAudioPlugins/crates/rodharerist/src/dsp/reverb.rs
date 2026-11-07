@@ -69,9 +69,11 @@ impl Voicing {
                 size: 0.72,
                 fb_offset: 0.70,
                 fb_scale: 0.28,
-                damp: 0.28,
+                // Denser and a little darker than the first cut, which rang
+                // like a bare metal sheet.
+                damp: 0.42,
                 crossfeed: 0.30,
-                diffusion: 0.68,
+                diffusion: 0.76,
                 early_gain: 0.08,
             },
             // Short, damped, early — a tight tracking room.
@@ -106,6 +108,47 @@ impl Voicing {
                 crossfeed: 0.34,
                 diffusion: 0.62,
                 early_gain: 0.14,
+            },
+            // Sparse and bright: a spring, not a plate.
+            ReverbModel::Spring => Self {
+                predelay_s: 0.004,
+                size: 0.38,
+                fb_offset: 0.58,
+                fb_scale: 0.22,
+                damp: 0.16,
+                crossfeed: 0.05,
+                diffusion: 0.18,
+                early_gain: 0.62,
+            },
+            ReverbModel::Chamber => Self {
+                predelay_s: 0.016,
+                size: 0.66,
+                fb_offset: 0.66,
+                fb_scale: 0.22,
+                damp: 0.64,
+                crossfeed: 0.22,
+                diffusion: 0.48,
+                early_gain: 0.26,
+            },
+            ReverbModel::Ambience => Self {
+                predelay_s: 0.002,
+                size: 0.30,
+                fb_offset: 0.42,
+                fb_scale: 0.12,
+                damp: 0.72,
+                crossfeed: 0.04,
+                diffusion: 0.28,
+                early_gain: 0.70,
+            },
+            ReverbModel::DarkHall => Self {
+                predelay_s: 0.034,
+                size: 0.86,
+                fb_offset: 0.72,
+                fb_scale: 0.22,
+                damp: 0.78,
+                crossfeed: 0.50,
+                diffusion: 0.46,
+                early_gain: 0.10,
             },
         }
     }

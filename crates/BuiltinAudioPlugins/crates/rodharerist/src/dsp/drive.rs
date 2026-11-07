@@ -135,6 +135,38 @@ impl DiodeVoicing {
             DriveModel::CopperFuzz => {
                 Self::new(0.65, 1.35, 0.130, 0.120, 2.5e-7, 4.5e-7, 6_500.0, 105.0)
             }
+            // Rangemaster: the corner is high, so only the top reaches the
+            // diodes and the low strings stay clean.
+            DriveModel::GlassBoost => {
+                Self::new(1.0, 0.99, 0.090, 0.088, 8.0e-9, 1.0e-8, 14_000.0, 1_400.0)
+            }
+            // Bluesbreaker: a wide soft knee, little asymmetry, a low corner.
+            DriveModel::VelvetOd => {
+                Self::new(0.90, 1.10, 0.140, 0.135, 9.0e-7, 1.1e-6, 8_000.0, 220.0)
+            }
+            // Octavia: one junction much lower than the other, so the even
+            // harmonics read as an octave.
+            DriveModel::OctaveFuzz => {
+                Self::new(0.42, 1.55, 0.080, 0.200, 1.8e-7, 8.0e-7, 4_200.0, 90.0)
+            }
+            // Bass overdrive: the corner sits under the fundamental.
+            DriveModel::BassGrind => {
+                Self::new(0.85, 1.15, 0.070, 0.065, 6.0e-7, 8.0e-7, 3_200.0, 40.0)
+            }
+            DriveModel::HonkBox => {
+                Self::new(1.0, 0.96, 0.060, 0.058, 2.0e-7, 2.4e-7, 6_000.0, 480.0)
+            }
+            DriveModel::SmoothLead => {
+                Self::new(0.80, 1.20, 0.180, 0.170, 1.4e-6, 1.8e-6, 3_600.0, 520.0)
+            }
+            // Gated fuzz: the two time constants disagree, so the clipper
+            // opens on the attack and chokes as the note decays.
+            DriveModel::SputterFuzz => {
+                Self::new(0.38, 1.70, 0.280, 0.060, 4.0e-6, 1.2e-7, 2_800.0, 80.0)
+            }
+            DriveModel::CleanPush => {
+                Self::new(1.0, 1.0, 0.420, 0.420, 2.0e-6, 2.0e-6, 16_000.0, 30.0)
+            }
             // Dedicated-topology models never reach this table.
             _ => Self::new(1.0, 1.0, 0.075, 0.075, 2.0e-8, 2.0e-8, 12_000.0, 400.0),
         }
@@ -312,6 +344,14 @@ impl Drive {
             DriveModel::Centurion => (0.42 + g * 16.0, 0.20 + lvl * 0.74, 0.88),
             DriveModel::AmberCrunch => (0.42 + g * 20.0, 0.19 + lvl * 0.72, 0.90),
             DriveModel::CopperFuzz => (0.35 + g * 58.0, 0.12 + lvl * 0.58, 1.0),
+            DriveModel::GlassBoost => (0.70 + g * 6.0, 0.28 + lvl * 0.70, 0.80),
+            DriveModel::VelvetOd => (0.50 + g * 9.0, 0.22 + lvl * 0.64, 0.86),
+            DriveModel::OctaveFuzz => (0.30 + g * 36.0, 0.11 + lvl * 0.50, 1.0),
+            DriveModel::BassGrind => (0.40 + g * 16.0, 0.16 + lvl * 0.60, 0.94),
+            DriveModel::HonkBox => (0.40 + g * 22.0, 0.15 + lvl * 0.68, 1.0),
+            DriveModel::SmoothLead => (0.45 + g * 26.0, 0.14 + lvl * 0.58, 0.96),
+            DriveModel::SputterFuzz => (0.30 + g * 46.0, 0.09 + lvl * 0.48, 1.0),
+            DriveModel::CleanPush => (0.85 + g * 3.5, 0.35 + lvl * 0.70, 0.62),
             // Dedicated-topology models returned above.
             _ => (1.0, 1.0, 1.0),
         };
@@ -329,8 +369,10 @@ impl Drive {
         // own top end, so the low-pass no longer has to hide fizz by being dark.
         match model {
             DriveModel::Screamer => {
+                // A little more mid than the first cut, so the screamer
+                // does not sit as a flat boost into the amp.
                 self.mid_boost
-                    .set(make_eq_coefficients("bell", 720.0, 6.0, 0.7, sr));
+                    .set(make_eq_coefficients("bell", 720.0, 7.5, 0.7, sr));
                 let cutoff = 3_200.0 + t * 6_800.0;
                 self.tone_lpf.set(make_eq_coefficients(
                     "lowpass",
@@ -341,7 +383,9 @@ impl Drive {
                 ));
             }
             DriveModel::Minotaur => {
-                self.mid_boost.set(None);
+                // A small low-mid bell. Without it the boost was flat.
+                self.mid_boost
+                    .set(make_eq_coefficients("bell", 420.0, 2.5, 0.6, sr));
                 let cutoff = (5_000.0 + t * 9_000.0).min(sr * 0.45);
                 self.tone_lpf
                     .set(make_eq_coefficients("lowpass", cutoff, 0.0, 0.707, sr));
@@ -405,6 +449,62 @@ impl Drive {
                 self.mid_boost
                     .set(make_eq_coefficients("bell", 500.0, 3.5, 0.65, sr));
                 let cutoff = (1_500.0 + t * 5_200.0).min(sr * 0.45);
+                self.tone_lpf
+                    .set(make_eq_coefficients("lowpass", cutoff, 0.0, 0.707, sr));
+            }
+            DriveModel::GlassBoost => {
+                self.mid_boost
+                    .set(make_eq_coefficients("bell", 2_800.0, 5.0, 0.8, sr));
+                let cutoff = (6_000.0 + t * 8_000.0).min(sr * 0.45);
+                self.tone_lpf
+                    .set(make_eq_coefficients("lowpass", cutoff, 0.0, 0.707, sr));
+            }
+            DriveModel::VelvetOd => {
+                self.mid_boost
+                    .set(make_eq_coefficients("bell", 480.0, 3.0, 0.6, sr));
+                let cutoff = (2_400.0 + t * 4_800.0).min(sr * 0.45);
+                self.tone_lpf
+                    .set(make_eq_coefficients("lowpass", cutoff, 0.0, 0.707, sr));
+            }
+            DriveModel::OctaveFuzz => {
+                self.mid_boost
+                    .set(make_eq_coefficients("bell", 700.0, 6.0, 0.9, sr));
+                let cutoff = (1_600.0 + t * 2_800.0).min(sr * 0.45);
+                self.tone_lpf
+                    .set(make_eq_coefficients("lowpass", cutoff, 0.0, 0.707, sr));
+            }
+            DriveModel::BassGrind => {
+                self.mid_boost
+                    .set(make_eq_coefficients("bell", 160.0, 5.0, 0.7, sr));
+                let cutoff = (800.0 + t * 2_200.0).min(sr * 0.45);
+                self.tone_lpf
+                    .set(make_eq_coefficients("lowpass", cutoff, 0.0, 0.707, sr));
+            }
+            DriveModel::HonkBox => {
+                self.mid_boost
+                    .set(make_eq_coefficients("bell", 1_050.0, 8.0, 1.3, sr));
+                let cutoff = (2_000.0 + t * 3_800.0).min(sr * 0.45);
+                self.tone_lpf
+                    .set(make_eq_coefficients("lowpass", cutoff, 0.0, 0.707, sr));
+            }
+            DriveModel::SmoothLead => {
+                self.mid_boost
+                    .set(make_eq_coefficients("bell", 620.0, 3.0, 0.55, sr));
+                let cutoff = (1_200.0 + t * 2_600.0).min(sr * 0.45);
+                self.tone_lpf
+                    .set(make_eq_coefficients("lowpass", cutoff, 0.0, 0.707, sr));
+            }
+            DriveModel::SputterFuzz => {
+                self.mid_boost
+                    .set(make_eq_coefficients("bell", 320.0, 5.0, 0.5, sr));
+                let cutoff = (900.0 + t * 2_000.0).min(sr * 0.45);
+                self.tone_lpf
+                    .set(make_eq_coefficients("lowpass", cutoff, 0.0, 0.707, sr));
+            }
+            DriveModel::CleanPush => {
+                self.mid_boost
+                    .set(make_eq_coefficients("bell", 2_000.0, 1.2, 0.5, sr));
+                let cutoff = (8_000.0 + t * 6_000.0).min(sr * 0.45);
                 self.tone_lpf
                     .set(make_eq_coefficients("lowpass", cutoff, 0.0, 0.707, sr));
             }

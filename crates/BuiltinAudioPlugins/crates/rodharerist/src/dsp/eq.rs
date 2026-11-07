@@ -47,6 +47,26 @@ impl EqProfile {
                 high_shelf_hz: 8_000.0,
                 bell_q: 1.4,
             },
+            EqModel::Air => Self {
+                low_shelf_hz: 70.0,
+                high_shelf_hz: 12_000.0,
+                bell_q: 0.5,
+            },
+            EqModel::BassShelf => Self {
+                low_shelf_hz: 45.0,
+                high_shelf_hz: 5_000.0,
+                bell_q: 0.75,
+            },
+            EqModel::Presence => Self {
+                low_shelf_hz: 200.0,
+                high_shelf_hz: 2_400.0,
+                bell_q: 1.1,
+            },
+            EqModel::Notch => Self {
+                low_shelf_hz: 140.0,
+                high_shelf_hz: 7_000.0,
+                bell_q: 2.8,
+            },
         }
     }
 }
@@ -139,7 +159,7 @@ mod tests {
 
     #[test]
     fn flat_eq_is_bit_transparent() {
-        for model in [EqModel::Studio, EqModel::Vintage, EqModel::Modern] {
+        for &model in EqModel::ALL {
             let mut eq = EqStage::new(48_000.0);
             eq.configure(model, 0.0, 400.0, 0.0, 2_000.0, 0.0, 0.0);
             for n in 0..1_000 {
@@ -176,7 +196,7 @@ mod tests {
                 .map(|n| eq.process((n as f32 * 0.05).sin() * 0.5, 0.0).0)
                 .collect::<Vec<_>>()
         };
-        let models = [EqModel::Studio, EqModel::Vintage, EqModel::Modern];
+        let models = EqModel::ALL;
         let rendered: Vec<_> = models.iter().map(|m| render(*m)).collect();
         for i in 0..rendered.len() {
             for j in (i + 1)..rendered.len() {

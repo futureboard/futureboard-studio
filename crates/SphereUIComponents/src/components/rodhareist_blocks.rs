@@ -546,6 +546,14 @@ pub(crate) fn drive_model_label(m: DriveModel) -> &'static str {
         TightRift => "Tight Rift",
         AmberCrunch => "Amber Crunch",
         CopperFuzz => "Copper Fuzz",
+        GlassBoost => "Glass Boost",
+        VelvetOd => "Velvet OD",
+        OctaveFuzz => "Octave Fuzz",
+        BassGrind => "Bass Grind",
+        HonkBox => "Honk Box",
+        SmoothLead => "Smooth Lead",
+        SputterFuzz => "Sputter Fuzz",
+        CleanPush => "Clean Push",
     }
 }
 
@@ -576,6 +584,14 @@ pub(crate) fn amp_model_label(m: AmpModel) -> &'static str {
         Liverpool => "Liverpool",
         Bass800 => "Bass 800",
         Stealth => "Stealth Lead",
+        ParkHead => "Park Head",
+        SilverTwin => "Silver Twin",
+        ThickStack => "Thick Stack",
+        MiniChime => "Mini Chime",
+        HotMod => "Hot Mod",
+        VintageModern => "Vintage Modern",
+        StudioBass => "Studio Bass",
+        ExpressLead => "Express Lead",
     }
 }
 
@@ -601,6 +617,14 @@ pub(crate) fn cab_model_label(model: CabModel) -> &'static str {
         CabModel::Cream4x12 => "Cream 4x12",
         CabModel::Bass810 => "Bass 8x10",
         CabModel::Silver1x12 => "Silver Bell 1x12",
+        CabModel::Closed1x12 => "Closed 1x12",
+        CabModel::Ported2x12 => "Ported 2x12",
+        CabModel::Open4x10 => "Open 4x10",
+        CabModel::Ceramic2x12 => "Ceramic 2x12",
+        CabModel::Deep4x12 => "Deep 4x12",
+        CabModel::Combo1x15 => "Combo 1x15",
+        CabModel::Alnico1x10 => "Alnico 1x10",
+        CabModel::Dark15 => "Dark 1x15",
     }
 }
 
@@ -625,6 +649,12 @@ pub(crate) fn mod_model_label(model: ModModel) -> &'static str {
         ModModel::IsanJet => "Isan Jet",
         ModModel::SoftPhase => "Soft Phase",
         ModModel::WideVibe => "Wide Vibe",
+        ModModel::Dimension => "Dimension Double",
+        ModModel::TriChorus => "Tri Chorus",
+        ModModel::ThruZero => "Thru Zero",
+        ModModel::SlowJet => "Slow Jet",
+        ModModel::HarmonicTrem => "Harmonic Trem",
+        ModModel::BiasTrem => "Bias Trem",
     }
 }
 
@@ -632,6 +662,10 @@ pub(crate) fn wah_model_label(model: WahModel) -> &'static str {
     match model {
         WahModel::CryWah => "Cry Wah",
         WahModel::TouchWah => "Touch Wah",
+        WahModel::BassWah => "Bass Wah",
+        WahModel::VocalWah => "Vocal Wah",
+        WahModel::ParkedFilter => "Parked Filter",
+        WahModel::TalkFilter => "Talk Filter",
     }
 }
 
@@ -643,6 +677,12 @@ pub(crate) fn delay_model_label(model: DelayModel) -> &'static str {
         DelayModel::PingPong => "Ping-Pong",
         DelayModel::Dual => "Dual Delay",
         DelayModel::Stereo => "Stereo Delay",
+        DelayModel::SlapEcho => "Slap Echo",
+        DelayModel::OilCan => "Oil Can",
+        DelayModel::DarkEcho => "Dark Echo",
+        DelayModel::AmbientEcho => "Ambient Echo",
+        DelayModel::WowEcho => "Wow Echo",
+        DelayModel::TripletTap => "Triplet Tap",
     }
 }
 
@@ -652,6 +692,10 @@ pub(crate) fn reverb_model_label(model: ReverbModel) -> &'static str {
         ReverbModel::Room => "Tracking Room",
         ReverbModel::Hall => "Concert Hall",
         ReverbModel::Shimmer => "Shimmer",
+        ReverbModel::Spring => "Spring Tank",
+        ReverbModel::Chamber => "Drum Chamber",
+        ReverbModel::Ambience => "Ambience",
+        ReverbModel::DarkHall => "Dark Hall",
     }
 }
 
@@ -660,6 +704,10 @@ pub(crate) fn eq_model_label(model: EqModel) -> &'static str {
         EqModel::Studio => "Studio EQ",
         EqModel::Vintage => "Vintage EQ",
         EqModel::Modern => "Modern EQ",
+        EqModel::Air => "Air EQ",
+        EqModel::BassShelf => "Bass Shelf",
+        EqModel::Presence => "Presence EQ",
+        EqModel::Notch => "Notch EQ",
     }
 }
 
