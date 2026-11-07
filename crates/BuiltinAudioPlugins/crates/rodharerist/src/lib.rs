@@ -13,17 +13,16 @@ pub mod ui;
 mod wire;
 
 pub use dsp::{
-    apply_to_params, default_params, descriptor, prepare_ir_runtime, prepare_nam_runtime,
-    reorder_chain, telemetry, ui_values, AmpModel, CabModel, DelayModel, DriveModel, Dsp, EqModel,
-    IrInfo,
-    IrLoadError, IrLoader, Line2Mode, MicModel, ModModel, NamCaptureInfo, NamLoadError, NamLoader,
-    Params, PreparedIrRuntime, PreparedNamRuntime, ReverbModel, RowSend, StageBParams,
-    StageChannel, StageKind, ToneEngineKind, WahModel, IR_PARTITION_SAMPLES, MAX_IR_SECONDS,
-    NAM_BLOCK_SAMPLES, PATH_SLOTS, PLUGIN_ID,
+    AmpModel, CabModel, DelayModel, DriveModel, Dsp, EqModel, IR_PARTITION_SAMPLES, IrInfo,
+    IrLoadError, IrLoader, Line2Mode, MAX_IR_SECONDS, MicModel, ModModel, NAM_BLOCK_SAMPLES,
+    NamCaptureInfo, NamLoadError, NamLoader, PATH_SLOTS, PLUGIN_ID, Params, PreparedIrRuntime,
+    PreparedNamRuntime, ReverbModel, RowSend, StageBParams, StageChannel, StageKind,
+    ToneEngineKind, WahModel, apply_to_params, default_params, descriptor, prepare_ir_runtime,
+    prepare_nam_runtime, reorder_chain, telemetry, ui_values,
 };
-pub use presets::{factory_presets, FactoryPreset};
+pub use presets::{FactoryPreset, factory_presets};
 pub use state::{RodhareistState, SCHEMA_VERSION};
-pub use wire::{ui_param_id, ui_param_index, UI_PARAM_IDS};
+pub use wire::{UI_PARAM_IDS, ui_param_id, ui_param_index};
 
 #[cfg(test)]
 mod tests {
@@ -92,5 +91,66 @@ mod tests {
         dsp.reset();
         let (l, r) = dsp.process_stereo(0.0, 0.0);
         assert!(l.abs() < 1.0e-3 && r.abs() < 1.0e-3);
+    }
+}
+
+/// Counts heap hits on the thread that armed it. `const` thread-locals so the
+/// counter itself does not allocate on first touch.
+#[cfg(test)]
+pub(crate) mod alloc_probe {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    struct Counting;
+
+    thread_local! {
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+        static COUNT: Cell<u64> = const { Cell::new(0) };
+    }
+
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            if ARMED.with(Cell::get) {
+                COUNT.with(|c| c.set(c.get() + 1));
+            }
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            if ARMED.with(Cell::get) {
+                COUNT.with(|c| c.set(c.get() + 1));
+            }
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            if ARMED.with(Cell::get) {
+                COUNT.with(|c| c.set(c.get() + 1));
+            }
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static GLOBAL: Counting = Counting;
+
+    pub(crate) fn reset() {
+        COUNT.with(|c| c.set(0));
+    }
+
+    pub(crate) fn arm() {
+        ARMED.with(|c| c.set(true));
+    }
+
+    pub(crate) fn disarm() {
+        ARMED.with(|c| c.set(false));
+    }
+
+    pub(crate) fn count() -> u64 {
+        COUNT.with(Cell::get)
     }
 }

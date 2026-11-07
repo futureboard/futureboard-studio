@@ -31,25 +31,25 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    div, px, size, App, AppContext, Context, FocusHandle, InteractiveElement, IntoElement,
-    KeyDownEvent, ParentElement, Render, Styled, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowHandle, WindowKind,
+    App, AppContext, Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
+    ParentElement, Render, Styled, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle,
+    WindowKind, div, px, size,
 };
 use rodharerist::Params;
 
 use crate::components::builtin_plugin_editor::{
-    file_load, FileLoad, RodhareistFile, RODHAREIST_FILES_FOLDER,
+    FileLoad, RODHAREIST_FILES_FOLDER, RodhareistFile, file_load,
 };
 use crate::components::builtin_plugin_editor_window::{
     BuiltinEditorHostOps, BuiltinIrLoadRequest, BuiltinNamLoadRequest, PluginInstanceKey,
 };
 use crate::components::native_plugin_shell::{
+    NativeBuiltinEditor, SHELL_METER_INTERVAL, ShellIdentity, ShellMeter,
     claim_editor_transport_key, native_plugin_shell, swallow_editor_transport_key_up,
-    NativeBuiltinEditor, ShellIdentity, ShellMeter, SHELL_METER_INTERVAL,
 };
 use crate::components::plate;
 use crate::components::rodhareist_panel::{
-    rodhareist_panel, tapped_interval, ChainFocus, Page, RodUi,
+    ChainFocus, Page, RodUi, rodhareist_panel, tapped_interval,
 };
 
 /// The editor at its design size, and the smallest it may get.
@@ -302,6 +302,7 @@ impl RodhareistEditorWindow {
         window.sync_from_mirror(cx);
         window.preset = matching_preset(&window.params);
         window.refresh_user_presets();
+        window.ui.preset_name = window.user_preset_save_name();
         window.start_meter(cx);
         window
     }
@@ -346,6 +347,7 @@ impl RodhareistEditorWindow {
             self.preset = matching_preset(&self.params);
         }
         self.refresh_user_presets();
+        self.ui.preset_name = self.user_preset_save_name();
     }
 
     /// Sends what changed between the window's params and `next` as wire
@@ -469,6 +471,10 @@ impl RodhareistEditorWindow {
 
     /// Typing into the Explore page's search field.
     fn on_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        if self.ui.preset_name_focus && self.ui.page == Page::Home {
+            self.on_preset_name_key(event, cx);
+            return;
+        }
         if !self.ui.search_focus || self.ui.page != Page::Explore {
             return;
         }
@@ -492,6 +498,38 @@ impl RodhareistEditorWindow {
                     Some(text) if !text.chars().any(char::is_control) => {
                         if self.ui.query.chars().count() < 40 {
                             self.ui.query.push_str(text);
+                        }
+                    }
+                    _ => return,
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Home's preset name field. Enter writes the `.pst`; Escape leaves the text.
+    fn on_preset_name_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let keystroke = &event.keystroke;
+        match keystroke.key.as_str() {
+            "escape" => self.ui.preset_name_focus = false,
+            "backspace" => {
+                self.ui.preset_name.pop();
+            }
+            "enter" => {
+                self.ui.preset_name_focus = false;
+                match self.save_user_preset() {
+                    Ok(()) => self.preset_note = None,
+                    Err(error) => self.preset_note = Some(error),
+                }
+            }
+            _ => {
+                if keystroke.modifiers.control || keystroke.modifiers.platform {
+                    return;
+                }
+                match keystroke.key_char.as_deref() {
+                    Some(text) if !text.chars().any(char::is_control) => {
+                        if self.ui.preset_name.chars().count() < 48 {
+                            self.ui.preset_name.push_str(text);
                         }
                     }
                     _ => return,
@@ -526,6 +564,8 @@ impl RodhareistEditorWindow {
                 this.preset = Some(index);
                 this.user_preset = None;
                 this.preset_note = None;
+                this.ui.preset_name = preset.name.to_string();
+                this.ui.preset_name_focus = false;
                 this.chain_focus = None;
                 this.set_params(next, cx);
             });
@@ -577,6 +617,7 @@ impl RodhareistEditorWindow {
         let entity = cx.entity().clone();
         move |_event, _window, app: &mut App| {
             let _ = entity.update(app, |this, cx| {
+                this.ui.preset_name_focus = false;
                 match this.save_user_preset() {
                     Ok(()) => this.preset_note = None,
                     Err(error) => this.preset_note = Some(error),
@@ -603,9 +644,11 @@ impl RodhareistEditorWindow {
                         let next = preset_applied(&this.params, &saved);
                         this.preset = None;
                         this.user_preset = Some(LoadedUserPreset {
-                            name,
+                            name: name.clone(),
                             params: next.clone(),
                         });
+                        this.ui.preset_name = name;
+                        this.ui.preset_name_focus = false;
                         this.preset_note = None;
                         this.chain_focus = None;
                         this.set_params(next, cx);
@@ -620,9 +663,21 @@ impl RodhareistEditorWindow {
     }
 
     fn save_user_preset(&mut self) -> Result<(), String> {
-        let name = self.user_preset_save_name();
+        let typed = self.ui.preset_name.trim();
+        let name = if typed.is_empty() {
+            self.user_preset_save_name()
+        } else {
+            typed.to_string()
+        };
         let stem = preset_file_stem(&name);
-        let path = user_preset_dir().join(format!("{stem}.pst"));
+        let dir = user_preset_dir();
+        let path = dir.join(format!("{stem}.pst"));
+        let previous = self.user_preset.as_ref().map(|loaded| loaded.name.clone());
+        let replacing_loaded = previous.as_deref() == Some(stem.as_str());
+        let same_as_suggestion = preset_file_stem(&self.user_preset_save_name()) == stem;
+        if path.exists() && !replacing_loaded && !same_as_suggestion {
+            return Err(format!("A preset named {stem} is already saved"));
+        }
         let json = rodharerist::RodhareistState::new(self.params.clone())
             .to_json()
             .map_err(|e| e.to_string())?;
@@ -636,9 +691,21 @@ impl RodhareistEditorWindow {
         )?;
         self.preset = None;
         self.user_preset = Some(LoadedUserPreset {
-            name: stem,
+            name: stem.clone(),
             params: self.params.clone(),
         });
+        self.ui.preset_name = stem.clone();
+        if let Some(old) = previous {
+            if old != stem {
+                let old_path = dir.join(format!("{old}.pst"));
+                if old_path != path && old_path.exists() {
+                    if let Err(error) = std::fs::remove_file(&old_path) {
+                        self.refresh_user_presets();
+                        return Err(format!("Saved {stem}. The previous preset stayed: {error}"));
+                    }
+                }
+            }
+        }
         self.refresh_user_presets();
         Ok(())
     }
@@ -651,6 +718,12 @@ impl RodhareistEditorWindow {
         let json = String::from_utf8(bytes).map_err(|_| "preset state is not text".to_string())?;
         let state = rodharerist::RodhareistState::from_json(&json).map_err(|e| e.to_string())?;
         Ok(state.params)
+    }
+
+    /// The name the field starts from: the loaded user preset, else the
+    /// factory name, else "My Rig".
+    pub(crate) fn suggested_preset_name(&self) -> String {
+        self.user_preset_save_name()
     }
 
     fn user_preset_save_name(&self) -> String {
@@ -786,12 +859,26 @@ impl RodhareistEditorWindow {
         })
     }
 
+    /// The IR the host accepted for the file this insert names. A filename
+    /// in the project, with no host answer, is not a loaded IR.
     pub(crate) fn ir_loaded_info(&self) -> Option<(String, f32)> {
-        let name = self.loaded_name(RodhareistFile::Impulse)?;
-        let seconds = self
-            .current_load(RodhareistFile::Impulse)
-            .map_or(0.0, |load| load.frames as f32 / self.sample_rate_hint());
+        let name = self.file_name(RodhareistFile::Impulse)?;
+        let load = self.current_load(RodhareistFile::Impulse)?;
+        if load.error.is_some() {
+            return None;
+        }
+        let seconds = if load.frames == 0 {
+            0.0
+        } else {
+            load.frames as f32 / self.sample_rate_hint()
+        };
         Some((display_name(&name), seconds))
+    }
+
+    /// The impulse file named on the insert, whether or not the host loaded it.
+    pub(crate) fn ir_project_name(&self) -> Option<String> {
+        self.file_name(RodhareistFile::Impulse)
+            .map(|name| display_name(&name))
     }
     pub(crate) fn ir_loading(&self) -> bool {
         self.ir_status.loading
@@ -875,7 +962,12 @@ impl RodhareistEditorWindow {
                     .await;
                 let _ = this.update(cx, |this, cx| {
                     match stored {
-                        Ok((name, bytes)) => this.send_file(file, name, bytes),
+                        Ok((name, bytes)) => {
+                            if file == RodhareistFile::Impulse {
+                                this.engage_ir_cab(cx);
+                            }
+                            this.send_file(file, name, bytes);
+                        }
                         Err(error) => {
                             let status = this.status_mut(file);
                             status.loading = false;
@@ -893,6 +985,18 @@ impl RodhareistEditorWindow {
                 Some("Native file dialogs are unavailable in this build.".into());
             cx.notify();
         }
+    }
+
+    /// The cabinet convolution is `CabModel::Ir`. Choosing a `.wav` selects
+    /// that model so the file is the cabinet, not only a stored name.
+    fn engage_ir_cab(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = rodharerist::CabModel::ALL
+            .iter()
+            .position(|model| *model == rodharerist::CabModel::Ir)
+        else {
+            return;
+        };
+        self.set_wire("cab_model", index as f32, cx);
     }
 
     /// Sends a stored file's bytes to the host under `name`.
@@ -1035,7 +1139,8 @@ impl Render for RodhareistEditorWindow {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 // Explore search owns Space while its caret is up. Everywhere
                 // else in this window Space is play/pause.
-                let typing = this.ui.search_focus && this.ui.page == Page::Explore;
+                let typing = (this.ui.search_focus && this.ui.page == Page::Explore)
+                    || (this.ui.preset_name_focus && this.ui.page == Page::Home);
                 if !typing && claim_editor_transport_key(event, window, cx) {
                     return;
                 }

@@ -49,8 +49,8 @@ mod wah;
 mod wav;
 
 use builtin_dsp_core::{
-    clamp, db_to_linear, time_constant, ParamDescriptor, PluginCategory, PluginDescriptor,
-    StereoEffect,
+    ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, clamp, db_to_linear,
+    time_constant,
 };
 
 use cab::Cabinet;
@@ -60,13 +60,13 @@ use drive::Drive;
 use eq::EqStage;
 use gate::NoiseGate;
 pub use ir::{
-    prepare_ir_runtime, IrInfo, IrLoadError, IrLoader, PreparedIrRuntime, MAX_IR_SECONDS,
-    PARTITION as IR_PARTITION_SAMPLES,
+    IrInfo, IrLoadError, IrLoader, MAX_IR_SECONDS, PARTITION as IR_PARTITION_SAMPLES,
+    PreparedIrRuntime, prepare_ir_runtime,
 };
 use mod_stage::ModStage;
 pub use nam::{
-    prepare_nam_runtime, NamCaptureInfo, NamLoadError, NamLoader, PreparedNamRuntime,
-    NAM_BLOCK as NAM_BLOCK_SAMPLES,
+    NAM_BLOCK as NAM_BLOCK_SAMPLES, NamCaptureInfo, NamLoadError, NamLoader, PreparedNamRuntime,
+    prepare_nam_runtime,
 };
 use reverb::PlateReverb;
 pub use tone_stage::ToneEngineKind;
@@ -2988,8 +2988,20 @@ impl Dsp {
     /// [`StereoEffect::process_stereo`] calls. This is the only place a
     /// pending NAM capture swap (queued by [`Dsp::load_nam_capture_json`] on
     /// the control thread) is adopted — never mid-block, never per-sample.
+    ///
+    /// Leaves the NAM inference chunk where it is. Production passes the host
+    /// period through [`Self::begin_block_with_frames`].
     pub fn begin_block(&mut self) {
-        self.amp_stage.begin_block();
+        self.begin_block_with_frames(0);
+    }
+
+    /// Same as [`Self::begin_block`], and caps the NAM inference chunk to
+    /// `frames` when the host buffer is shorter than the capture's maximum.
+    /// `frames == 0` does not change the chunk. One callback has to finish
+    /// the chunk it starts; a longer chunk is what the bridge hears as a
+    /// dry/wet stutter.
+    pub fn begin_block_with_frames(&mut self, frames: usize) {
+        self.amp_stage.begin_block(frames);
         self.ir.begin_block();
     }
 
@@ -3300,11 +3312,7 @@ fn set_row(p: &mut Params, kind: StageKind, value: f32) {
 /// applying `amp_model` resets `tone_engine` to Classic.
 pub fn ui_values(p: &Params) -> Vec<(&'static str, f32)> {
     fn b(v: bool) -> f32 {
-        if v {
-            1.0
-        } else {
-            0.0
-        }
+        if v { 1.0 } else { 0.0 }
     }
     fn model_index<T: PartialEq + Copy>(all: &[T], value: T) -> f32 {
         all.iter().position(|m| *m == value).unwrap_or(0) as f32
@@ -4430,6 +4438,10 @@ mod tests {
             dsp.nam_capture_info().is_some(),
             "adopted at block boundary"
         );
+        assert!(
+            dsp.latency_samples() > 0,
+            "a running capture reports its block latency"
+        );
 
         for _ in 0..256 {
             let (l, r) = dsp.process_stereo(0.2, -0.2);
@@ -4437,6 +4449,39 @@ mod tests {
         }
 
         dsp.poll_nam_garbage();
+    }
+
+    /// A short device buffer shrinks the reported NAM latency to that buffer.
+    /// The capture is in the path, so the report stays non-zero. Knob writes
+    /// and the block itself do not touch the heap.
+    #[test]
+    fn nam_capture_latency_tracks_a_short_host_buffer_without_allocating() {
+        let mut dsp = Dsp::new(48_000.0);
+        dsp.apply_ui_param("tone_engine", 1.0);
+        dsp.load_nam_capture_json(TINY_WAVENET_48K, "Short", false, false)
+            .expect("matching rate must load");
+        dsp.begin_block_with_frames(32);
+        assert_eq!(dsp.latency_samples(), 32);
+        assert!(dsp.latency_samples() > 0);
+
+        crate::alloc_probe::reset();
+        crate::alloc_probe::arm();
+        assert!(dsp.apply_ui_param("nam_input_trim", -3.0));
+        assert!(dsp.apply_ui_param("nam_mix", 80.0));
+        assert!(dsp.apply_ui_param("nam_slim_size", 50.0));
+        dsp.begin_block_with_frames(32);
+        for i in 0..32 {
+            let x = (i as f32 * 0.05).sin() * 0.2;
+            let (l, r) = dsp.process_stereo(x, -x);
+            assert!(l.is_finite() && r.is_finite());
+        }
+        crate::alloc_probe::disarm();
+        assert_eq!(
+            crate::alloc_probe::count(),
+            0,
+            "NAM process or a NAM knob write allocated"
+        );
+        assert!(dsp.latency_samples() > 0);
     }
 
     /// A capture built at another rate loads and runs through the rate
@@ -4767,7 +4812,7 @@ mod tests {
         assert!(dsp.apply_ui_param("path_slot_0", 2.0)); // Amp first
         assert!(dsp.apply_ui_param("path_slot_1", 0.0)); // Gate
         assert!(dsp.apply_ui_param("path_slot_2", -1.0)); // clear
-                                                          // Remaining slots still have defaults until overwritten — sanitize packs.
+        // Remaining slots still have defaults until overwritten — sanitize packs.
         let mut order = [None; PATH_SLOTS];
         order[0] = Some(StageKind::Amp);
         order[1] = Some(StageKind::Cab);
@@ -6183,7 +6228,13 @@ mod telemetry_tests {
             .iter()
             .position(|slot| *slot == Some(StageKind::Drive))
             .expect("drive is on the default path");
-        reorder_chain(&mut parked.stage_order, &mut parked.stage_row, from, from, 1);
+        reorder_chain(
+            &mut parked.stage_order,
+            &mut parked.stage_row,
+            from,
+            from,
+            1,
+        );
         parked.row_send[0] = RowSend::Off;
         let mut dry = default_params();
         dry.drive_on = false;
@@ -6223,25 +6274,43 @@ mod telemetry_tests {
     fn new_models_round_trip_and_old_indices_stay_put() {
         assert_eq!(DriveModel::ALL[11], DriveModel::CopperFuzz);
         assert_eq!(DriveModel::from_index(11), DriveModel::CopperFuzz);
-        assert_eq!(DriveModel::from_model_id("glass_boost"), Some(DriveModel::GlassBoost));
+        assert_eq!(
+            DriveModel::from_model_id("glass_boost"),
+            Some(DriveModel::GlassBoost)
+        );
         assert_eq!(DriveModel::ALL[12], DriveModel::GlassBoost);
         assert_eq!(AmpModel::ALL[23], AmpModel::Stealth);
         assert_eq!(AmpModel::from_index(23), AmpModel::Stealth);
-        assert_eq!(AmpModel::from_model_id("park_head"), Some(AmpModel::ParkHead));
+        assert_eq!(
+            AmpModel::from_model_id("park_head"),
+            Some(AmpModel::ParkHead)
+        );
         assert_eq!(AmpModel::ALL[24], AmpModel::ParkHead);
         assert_eq!(CabModel::ALL[11], CabModel::Ir);
         assert_eq!(CabModel::ALL[19], CabModel::Silver1x12);
         assert_eq!(CabModel::from_index(19), CabModel::Silver1x12);
-        assert_eq!(CabModel::from_model_id("closed_1x12"), Some(CabModel::Closed1x12));
+        assert_eq!(
+            CabModel::from_model_id("closed_1x12"),
+            Some(CabModel::Closed1x12)
+        );
         assert_eq!(CabModel::ALL[20], CabModel::Closed1x12);
         assert_eq!(ModModel::ALL[10], ModModel::WideVibe);
-        assert_eq!(ModModel::from_model_id("dimension"), Some(ModModel::Dimension));
+        assert_eq!(
+            ModModel::from_model_id("dimension"),
+            Some(ModModel::Dimension)
+        );
         assert_eq!(ModModel::ALL[11], ModModel::Dimension);
         assert_eq!(DelayModel::ALL[5], DelayModel::Stereo);
-        assert_eq!(DelayModel::from_model_id("slap_echo"), Some(DelayModel::SlapEcho));
+        assert_eq!(
+            DelayModel::from_model_id("slap_echo"),
+            Some(DelayModel::SlapEcho)
+        );
         assert_eq!(DelayModel::ALL[6], DelayModel::SlapEcho);
         assert_eq!(ReverbModel::ALL[3], ReverbModel::Shimmer);
-        assert_eq!(ReverbModel::from_model_id("spring"), Some(ReverbModel::Spring));
+        assert_eq!(
+            ReverbModel::from_model_id("spring"),
+            Some(ReverbModel::Spring)
+        );
         assert_eq!(ReverbModel::ALL[4], ReverbModel::Spring);
         assert_eq!(WahModel::ALL[1], WahModel::TouchWah);
         assert_eq!(WahModel::from_model_id("bass_wah"), Some(WahModel::BassWah));

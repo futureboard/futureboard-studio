@@ -2,8 +2,9 @@
 //! the well — input and output meters, the path's blocks, the selected
 //! block's caption — and four pages on the deck under it:
 //!
-//! * **Home** — the factory presets, and a performance view: the preset,
-//!   four footswitches over chain blocks, the tuner, tap tempo and master;
+//! * **Home** — factory and user presets, the preset name, the cabinet IR,
+//!   and a performance view: four footswitches, the tuner, tap tempo,
+//!   lane 1's wet/dry/wet send, and master;
 //! * **Explore** — every block model by family, searchable, placed into
 //!   the selected slot;
 //! * **Pedalboard** — the selected slot: its model, its knobs, moving or
@@ -23,15 +24,15 @@
 use std::time::{Duration, Instant};
 
 use gpui::{
-    div, px, AnyElement, App, AppContext, Context, FontWeight, InteractiveElement, IntoElement,
-    ParentElement, Render, Rgba, StatefulInteractiveElement, Styled, Window,
+    AnyElement, App, AppContext, Context, FontWeight, InteractiveElement, IntoElement,
+    ParentElement, Render, Rgba, StatefulInteractiveElement, Styled, Window, div, px,
 };
 use rodharerist::{CabModel, Line2Mode, Params, RowSend, StageChannel, StageKind, ToneEngineKind};
 
 use crate::components::controls::fb_tooltip;
 use crate::components::plate::{
-    self, caption, color, color_a, icon, knob, numbers, plate_frame, plate_scale, type_px, words,
-    Dial, DialUnit, KnobCell, KnobLook, FAINT, INK, PALE, SOFT, WHITE,
+    self, Dial, DialUnit, FAINT, INK, KnobCell, KnobLook, PALE, SOFT, WHITE, caption, color,
+    color_a, icon, knob, numbers, plate_frame, plate_scale, type_px, words,
 };
 use crate::components::rodhareist_blocks::{self as blocks, Category, ParamSpec};
 use crate::components::rodhareist_window::RodhareistEditorWindow;
@@ -125,6 +126,10 @@ pub(crate) struct RodUi {
     /// Meters read RMS rather than peak.
     pub meter_rms: bool,
     pub last_tap: Option<Instant>,
+    /// The Home name field. Saved as the `.pst` stem; never a wire parameter.
+    pub preset_name: String,
+    /// Typing goes to the preset name field.
+    pub preset_name_focus: bool,
 }
 
 impl Default for RodUi {
@@ -139,6 +144,8 @@ impl Default for RodUi {
             show_names: true,
             meter_rms: false,
             last_tap: None,
+            preset_name: String::new(),
+            preset_name_focus: false,
         }
     }
 }
@@ -760,6 +767,7 @@ fn header(w: &RodhareistEditorWindow, p: &Params, cx: &mut Cx, s: f32) -> AnyEle
                 .on_click(act(cx, move |this, cx| {
                     this.ui.page = item;
                     this.ui.search_focus = false;
+                    this.ui.preset_name_focus = false;
                     if item == Page::Home {
                         this.refresh_user_presets();
                     }
@@ -1025,11 +1033,16 @@ fn chain_block(
     let block = block
         .on_drop(drop_chain(cx, slot, row))
         .tooltip(fb_tooltip(match entry {
-            Some(kind) => format!(
-                "Slot {} \u{00B7} {} \u{2014} double-click to bypass",
-                slot + 1,
-                blocks::block_name(kind)
-            ),
+            Some(kind) => {
+                let row = p.stage_row[kind as usize] as usize;
+                let wet = lane_controls(p, row).wet;
+                format!(
+                    "Slot {} \u{00B7} {}{} \u{2014} double-click to bypass",
+                    slot + 1,
+                    blocks::block_name(kind),
+                    if wet { " \u{00B7} wet path" } else { "" }
+                )
+            }
             None => format!("Slot {} \u{00B7} empty", slot + 1),
         }))
         .on_click({
@@ -1086,17 +1099,16 @@ fn caption_line(p: &Params, focus: ChainFocus) -> String {
                 Some(StageChannel::Right) => " \u{00B7} right only",
                 _ => "",
             };
-            let row = p.stage_row[kind as usize];
-            let row_note = if row == 0 {
+            let row = p.stage_row[kind as usize] as usize;
+            let lane = lane_controls(p, row);
+            let row_note = if lane.wet {
+                format!(" \u{00B7} lane {} wet path", row + 1)
+            } else if row == 0 && p.line2_mode == Line2Mode::Dry {
+                " \u{00B7} lane 1 dry".to_string()
+            } else if row == 0 {
                 String::new()
             } else {
-                let send = match p.row_send[row as usize - 1] {
-                    RowSend::Off => "off",
-                    RowSend::Serial => "serial",
-                    RowSend::Parallel => "parallel",
-                    RowSend::WetDryWet => "w/d/w",
-                };
-                format!(" \u{00B7} row {} {send}", row + 1)
+                format!(" \u{00B7} lane {} {}", row + 1, lane.short)
             };
             format!(
                 "Slot {} \u{00B7} {} \u{00B7} {}{}{}{}",
@@ -1116,110 +1128,176 @@ fn caption_line(p: &Params, focus: ChainFocus) -> String {
     }
 }
 
-fn step_send(current: f32) -> f32 {
-    const STEPS: [f32; 5] = [0.0, 25.0, 50.0, 75.0, 100.0];
-    STEPS
-        .iter()
-        .copied()
-        .find(|step| *step > current + 0.5)
-        .unwrap_or(0.0)
+/// How a lane meets the main chain, for the plate at the end of the lane.
+struct LaneControls {
+    /// 1-based lane number.
+    number: usize,
+    /// Wet/dry/wet is the mode the lane is actually in.
+    wet: bool,
+    /// Short mode word for the chain caption.
+    short: &'static str,
+    /// Which lane, and what the blocks on it do.
+    detail: String,
+    choices: Vec<(&'static str, bool, f32)>,
+    mode_id: &'static str,
+    send_id: &'static str,
+    send: f32,
+    /// The send is in the sound. A stored amount that this mode ignores stays visible and grey.
+    send_live: bool,
+    send_default: f32,
 }
 
-fn send_button(
-    cx: &Cx,
-    id: usize,
-    label: &'static str,
-    on: bool,
-    s: f32,
-    write: impl Fn(&mut RodhareistEditorWindow, &mut Cx) + 'static,
-) -> AnyElement {
-    let (bg, border, _) = choice_colors(on, false);
-    div()
-        .id(("rodhareist-send", id))
-        .flex()
-        .items_center()
-        .justify_center()
-        .h(px(16.0 * s))
-        .px(px(6.0 * s))
-        .rounded(px(2.0 * s))
-        .border(px(1.0))
-        .border_color(border)
-        .bg(bg)
-        .cursor(gpui::CursorStyle::PointingHand)
-        .child(words(label, 10.0, if on { WHITE } else { PALE }, s))
-        .on_click(act(cx, write))
-        .into_any_element()
-}
-
-/// The lane's split, at its end: line 2 on the main path, a bottom send
-/// on the others. Same buttons as before, sitting on the lane instead of
-/// in a strip under the chain.
-fn lane_send(p: &Params, row: usize, geom: &LaneGeom, cx: &Cx, s: f32) -> AnyElement {
-    let top = LANE_TOP + row as f32 * geom.lane_h + (geom.lane_h - 16.0) * 0.5;
-    let mut buttons: Vec<AnyElement> = Vec::new();
+fn lane_controls(p: &Params, row: usize) -> LaneControls {
+    let row = row.min(3);
+    let number = row + 1;
     if row == 0 {
-        let line2 = [
-            (Line2Mode::Wet, "WET"),
-            (Line2Mode::Dry, "DRY"),
-            (Line2Mode::WetDryWet, "W/D/W"),
-        ];
-        for (index, (mode, label)) in line2.into_iter().enumerate() {
-            buttons.push(send_button(
-                cx,
-                index,
-                label,
-                p.line2_mode == mode,
-                s,
-                move |this, cx| this.set_wire_value("line2_mode", index as f32, cx),
-            ));
+        let wet = p.line2_mode == Line2Mode::WetDryWet;
+        let (short, detail) = match p.line2_mode {
+            Line2Mode::Wet => ("wet", format!("Lane {number} · full chain")),
+            Line2Mode::Dry => ("dry", format!("Lane {number} · dry, before time effects")),
+            Line2Mode::WetDryWet => (
+                "wet path",
+                format!("Lane {number} · blocks here are the wet path"),
+            ),
+        };
+        LaneControls {
+            number,
+            wet,
+            short,
+            detail,
+            choices: vec![
+                ("Wet", p.line2_mode == Line2Mode::Wet, 0.0),
+                ("Dry", p.line2_mode == Line2Mode::Dry, 1.0),
+                ("W/D/W", wet, 2.0),
+            ],
+            mode_id: "line2_mode",
+            send_id: "line2_mix",
+            send: p.line2_mix,
+            send_live: wet,
+            send_default: 70.0,
         }
-        let level = p.line2_mix;
-        buttons.push(send_button(
-            cx,
-            8,
-            "LVL",
-            p.line2_mode == Line2Mode::WetDryWet,
-            s,
-            move |this, cx| this.set_wire_value("line2_mix", step_send(level), cx),
-        ));
-        buttons.push(numbers(format!("{level:.0}"), 11.0, SOFT, s).into_any_element());
     } else {
-        let bottom = [
-            (RowSend::Off, "OFF"),
-            (RowSend::Serial, "SER"),
-            (RowSend::Parallel, "PAR"),
-            (RowSend::WetDryWet, "W/D/W"),
-        ];
-        let send_id = ["row_send_1", "row_send_2", "row_send_3"][row - 1];
-        let level_id = ["row_level_1", "row_level_2", "row_level_3"][row - 1];
         let current = p.row_send[row - 1];
-        let level = p.row_level[row - 1];
-        for (index, (mode, label)) in bottom.into_iter().enumerate() {
-            let id = 20 + (row - 1) * 8 + index;
-            buttons.push(send_button(cx, id, label, current == mode, s, move |this, cx| {
-                this.set_wire_value(send_id, index as f32, cx);
-            }));
+        let wet = current == RowSend::WetDryWet;
+        let (short, detail) = match current {
+            RowSend::Off => ("off", format!("Lane {number} · off")),
+            RowSend::Serial => ("serial", format!("Lane {number} · replaces the chain")),
+            RowSend::Parallel => ("parallel", format!("Lane {number} · adds this lane")),
+            RowSend::WetDryWet => (
+                "wet path",
+                format!("Lane {number} · blocks here are the wet path"),
+            ),
+        };
+        LaneControls {
+            number,
+            wet,
+            short,
+            detail,
+            choices: vec![
+                ("Off", current == RowSend::Off, 0.0),
+                ("Serial", current == RowSend::Serial, 1.0),
+                ("Parallel", current == RowSend::Parallel, 2.0),
+                ("W/D/W", wet, 3.0),
+            ],
+            mode_id: ["row_send_1", "row_send_2", "row_send_3"][row - 1],
+            send_id: ["row_level_1", "row_level_2", "row_level_3"][row - 1],
+            send: p.row_level[row - 1],
+            send_live: current != RowSend::Off,
+            send_default: 100.0,
         }
-        buttons.push(send_button(
-            cx,
-            80 + row,
-            "LVL",
-            current != RowSend::Off,
-            s,
-            move |this, cx| this.set_wire_value(level_id, step_send(level), cx),
-        ));
-        buttons.push(numbers(format!("{level:.0}"), 11.0, SOFT, s).into_any_element());
     }
-    div()
-        .absolute()
-        .left(px(SEND_LEFT * s))
-        .top(px(top * s))
+}
+
+/// The lane's split, at its end. Lane 1 is the main path. Lanes 2–4 are
+/// sends. Wet/dry/wet names the lane and says the blocks on it are the wet
+/// path; the send knob is the amount, live only while that mode uses it.
+fn lane_send(p: &Params, row: usize, geom: &LaneGeom, cx: &mut Cx, s: f32) -> AnyElement {
+    let info = lane_controls(p, row);
+    let top = LANE_TOP + row as f32 * geom.lane_h;
+    let mode_id = info.mode_id;
+    let send_id = info.send_id;
+    let pills = div()
         .flex()
         .flex_row()
         .items_center()
         .gap(px(3.0 * s))
-        .child(numbers(format!("{}", row + 1), 11.0, SOFT, s).w(px(12.0 * s)))
-        .children(buttons)
+        .child(
+            numbers(
+                format!("{}", info.number),
+                11.0,
+                if info.wet { ACCENT } else { SOFT },
+                s,
+            )
+            .w(px(12.0 * s)),
+        )
+        .children(info.choices.iter().copied().map(|(label, on, value)| {
+            plate::pill(
+                ("rodhareist-send", row * 8 + value as usize),
+                label,
+                on,
+                accent(),
+                plate::PillLook::words(16.0, 3.0, 10.5),
+                true,
+                s,
+                act(cx, move |this, cx| this.set_wire_value(mode_id, value, cx)),
+            )
+        }));
+    let dial = Dial::new(
+        send_id,
+        "Send",
+        0.0,
+        100.0,
+        info.send_default,
+        DialUnit::Percent,
+    );
+    let look = KnobLook::small(20.0);
+    let cell = KnobCell::new(44.0, 9.0, 10.0).gap(0.0).label(0.06, SOFT);
+    let send = knob(
+        cx,
+        format!("rodhareist-lane-send-{row}"),
+        dial,
+        info.send,
+        look,
+        cell,
+        accent(),
+        info.send_live,
+        s,
+        move |this: &mut RodhareistEditorWindow, v, cx| this.set_wire_value(send_id, v, cx),
+    );
+    div()
+        .id(("rodhareist-lane", row))
+        .absolute()
+        .left(px(SEND_LEFT * s))
+        .top(px(top * s))
+        .w(px(190.0 * s))
+        .h(px(geom.lane_h * s))
+        .flex()
+        .flex_col()
+        .justify_center()
+        .gap(px(1.0 * s))
+        .overflow_hidden()
+        .tooltip(fb_tooltip(format!(
+            "{}. Drag Send to set the amount. Double-click resets it.",
+            info.detail
+        )))
+        .child(pills)
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(4.0 * s))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_size(type_px(11.0, s))
+                        .line_height(px(13.0 * s))
+                        .text_color(color(if info.wet { WHITE } else { PALE }))
+                        .child(info.detail),
+                )
+                .child(send),
+        )
         .into_any_element()
 }
 
@@ -1257,6 +1335,7 @@ fn display(
     let mut cells: Vec<AnyElement> = Vec::new();
     for row in 0..lanes {
         let mid = LANE_TOP + row as f32 * geom.lane_h + geom.lane_h * 0.5;
+        let wet_lane = lane_controls(p, row).wet;
         wires.push(
             div()
                 .absolute()
@@ -1264,7 +1343,7 @@ fn display(
                 .top(px((mid - 1.0) * s))
                 .w(px(BLOCK_RUN * s))
                 .h(px(2.0 * s))
-                .bg(color(0xb5b5b5))
+                .bg(if wet_lane { accent() } else { color(0xb5b5b5) })
                 .into_any_element(),
         );
         sends.push(lane_send(p, row, &geom, cx, s));
@@ -1320,6 +1399,141 @@ fn display(
 
 // ── Home ───────────────────────────────────────────────────────────────────
 
+fn bank_row(
+    id: (&'static str, usize),
+    mark: &str,
+    name: &str,
+    on: bool,
+    s: f32,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    let (bg, border, _) = choice_colors(on, true);
+    div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .items_center()
+        .flex_shrink_0()
+        .gap(px(8.0 * s))
+        .h(px(32.0 * s))
+        .px(px(8.0 * s))
+        .rounded(px(3.0 * s))
+        .border(px(1.0))
+        .border_color(border)
+        .bg(bg)
+        .cursor(gpui::CursorStyle::PointingHand)
+        .hover(|style| style.bg(color(0x2e2e2e)))
+        .child(numbers(mark.to_string(), 12.0, if on { ACCENT } else { SOFT }, s).w(px(30.0 * s)))
+        .child(words(name.to_string(), 13.0, WHITE, s).truncate())
+        .on_click(on_click)
+        .into_any_element()
+}
+
+fn preset_name_field(w: &RodhareistEditorWindow, cx: &mut Cx, s: f32) -> AnyElement {
+    let focused = w.ui.preset_name_focus;
+    let text = if w.ui.preset_name.is_empty() && !focused {
+        words("Preset name", 13.0, FAINT, s).into_any_element()
+    } else {
+        words(
+            format!("{}{}", w.ui.preset_name, if focused { "|" } else { "" }),
+            13.0,
+            WHITE,
+            s,
+        )
+        .truncate()
+        .into_any_element()
+    };
+    div()
+        .id("rodhareist-preset-name")
+        .flex()
+        .flex_row()
+        .items_center()
+        .flex_1()
+        .min_w(px(0.0))
+        .h(px(32.0 * s))
+        .px(px(8.0 * s))
+        .rounded(px(3.0 * s))
+        .border(px(1.0))
+        .border_color(if focused { accent() } else { color(0x4a4a4a) })
+        .bg(color(0x1f1f1f))
+        .overflow_hidden()
+        .cursor(gpui::CursorStyle::IBeam)
+        .child(text)
+        .tooltip(fb_tooltip("Name for the user preset. Enter saves a .pst."))
+        .on_click(act(cx, |this, cx| {
+            this.ui.search_focus = false;
+            if this.ui.preset_name.is_empty() {
+                this.ui.preset_name = this.suggested_preset_name();
+            }
+            this.ui.preset_name_focus = true;
+            cx.notify();
+        }))
+        .into_any_element()
+}
+
+/// Where the cabinet stands, so a file name is not mistaken for a sounding IR.
+fn ir_path_line(p: &Params) -> String {
+    let on_path = p
+        .stage_order
+        .iter()
+        .flatten()
+        .any(|kind| *kind == StageKind::Cab);
+    if !on_path {
+        return "Cabinet is not on the path".to_string();
+    }
+    if !p.cab_on {
+        return "Cabinet is bypassed".to_string();
+    }
+    if p.cab_model == CabModel::Ir {
+        "Cabinet is the impulse response".to_string()
+    } else {
+        format!("Cabinet is {}", blocks::cab_model_label(p.cab_model))
+    }
+}
+
+fn ir_loaded_label(w: &RodhareistEditorWindow) -> Option<String> {
+    w.ir_loaded_info().map(|(name, secs)| {
+        if secs > 0.0 {
+            format!("{name} ({secs:.2} s)")
+        } else {
+            name
+        }
+    })
+}
+
+/// A project file the host has not accepted. Absent once the IR is really loaded.
+fn ir_unconfirmed_note(w: &RodhareistEditorWindow) -> Option<String> {
+    if w.ir_loaded_info().is_some() || w.ir_loading() || w.ir_error().is_some() {
+        return None;
+    }
+    w.ir_project_name()
+        .map(|name| format!("{name} is named, not loaded"))
+}
+
+fn ir_block(w: &RodhareistEditorWindow, p: &Params, cx: &mut Cx, s: f32) -> AnyElement {
+    let mut block = div()
+        .flex()
+        .flex_col()
+        .gap(px(4.0 * s))
+        .pt(px(4.0 * s))
+        .child(heading("Impulse response", s))
+        .child(load_row(
+            "rodhareist-home-ir",
+            "Load .wav",
+            ir_loaded_label(w),
+            w.ir_loading(),
+            w.ir_error(),
+            w.load_ir_cb(cx),
+            110.0,
+            s,
+        ))
+        .child(words(ir_path_line(p), 12.0, PALE, s));
+    if let Some(note) = ir_unconfirmed_note(w) {
+        block = block.child(words(note, 12.0, ACCENT, s));
+    }
+    block.into_any_element()
+}
+
 fn home(w: &RodhareistEditorWindow, p: &Params, cx: &mut Cx, s: f32) -> Vec<AnyElement> {
     let current = w.preset_status();
     let presets = rodharerist::factory_presets();
@@ -1328,26 +1542,14 @@ fn home(w: &RodhareistEditorWindow, p: &Params, cx: &mut Cx, s: f32) -> Vec<AnyE
         .enumerate()
         .map(|(index, preset)| {
             let on = current.map(|(i, _)| i) == Some(index);
-            let (bg, border, _) = choice_colors(on, true);
-            div()
-                .id(("rodhareist-preset", index))
-                .flex()
-                .flex_row()
-                .items_center()
-                .flex_shrink_0()
-                .gap(px(10.0 * s))
-                .h(px(40.0 * s))
-                .px(px(10.0 * s))
-                .rounded(px(3.0 * s))
-                .border(px(1.0))
-                .border_color(border)
-                .bg(bg)
-                .cursor(gpui::CursorStyle::PointingHand)
-                .hover(|style| style.bg(color(0x2e2e2e)))
-                .child(numbers(preset.id, 12.0, if on { ACCENT } else { SOFT }, s).w(px(30.0 * s)))
-                .child(words(preset.name, 13.0, WHITE, s))
-                .on_click(w.load_preset_cb(cx, index))
-                .into_any_element()
+            bank_row(
+                ("rodhareist-preset", index),
+                preset.id,
+                preset.name,
+                on,
+                s,
+                w.load_preset_cb(cx, index),
+            )
         })
         .collect();
     let loaded_user = w.user_preset_status().map(|(name, _)| name.to_string());
@@ -1357,72 +1559,81 @@ fn home(w: &RodhareistEditorWindow, p: &Params, cx: &mut Cx, s: f32) -> Vec<AnyE
         .enumerate()
         .map(|(index, (name, _))| {
             let on = loaded_user.as_deref() == Some(name.as_str());
-            let (bg, border, _) = choice_colors(on, true);
+            bank_row(
+                ("rodhareist-user-preset", index),
+                "PST",
+                name,
+                on,
+                s,
+                w.load_user_preset_cb(cx, index),
+            )
+        })
+        .collect();
+    let user_list = if user_rows.is_empty() {
+        vec![words("No saved presets", 12.0, SOFT, s).into_any_element()]
+    } else {
+        user_rows
+    };
+    let note = w.preset_note().unwrap_or("").to_string();
+    let has_note = !note.is_empty();
+    let mut list = section(s, 6.0, 262.0)
+        .p(px(12.0 * s))
+        .gap(px(4.0 * s))
+        .child(heading("Presets", s))
+        .child(
             div()
-                .id(("rodhareist-user-preset", index))
                 .flex()
                 .flex_row()
                 .items_center()
-                .flex_shrink_0()
-                .gap(px(10.0 * s))
-                .h(px(40.0 * s))
-                .px(px(10.0 * s))
-                .rounded(px(3.0 * s))
-                .border(px(1.0))
-                .border_color(border)
-                .bg(bg)
-                .cursor(gpui::CursorStyle::PointingHand)
-                .hover(|style| style.bg(color(0x2e2e2e)))
-                .child(numbers("PST", 12.0, if on { ACCENT } else { SOFT }, s).w(px(30.0 * s)))
-                .child(words(name.clone(), 13.0, WHITE, s))
-                .on_click(w.load_user_preset_cb(cx, index))
-                .into_any_element()
-        })
-        .collect();
-    let note = w.preset_note().unwrap_or("").to_string();
-    let has_note = !note.is_empty();
-    let list = section(s, 6.0, 262.0)
-        .p(px(14.0 * s))
-        .gap(px(6.0 * s))
-        .child(heading("Presets", s).mb(px(4.0 * s)))
-        .child(
-            div()
-                .id("rodhareist-save-preset")
-                .flex()
-                .items_center()
-                .justify_center()
-                .h(px(32.0 * s))
-                .rounded(px(3.0 * s))
-                .border(px(1.0))
-                .border_color(color(0x454545))
-                .bg(color(0x2a2a2a))
-                .cursor(gpui::CursorStyle::PointingHand)
-                .hover(|style| style.bg(color(0x2e2e2e)))
-                .child(words("Save .pst", 13.0, WHITE, s))
-                .on_click(w.save_user_preset_cb(cx)),
+                .gap(px(6.0 * s))
+                .child(preset_name_field(w, cx, s))
+                .child(
+                    div()
+                        .id("rodhareist-save-preset")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .h(px(32.0 * s))
+                        .px(px(10.0 * s))
+                        .rounded(px(3.0 * s))
+                        .border(px(1.0))
+                        .border_color(color(0x454545))
+                        .bg(color(0x2a2a2a))
+                        .cursor(gpui::CursorStyle::PointingHand)
+                        .hover(|style| style.bg(color(0x2e2e2e)))
+                        .child(words("Save", 13.0, WHITE, s))
+                        .tooltip(fb_tooltip("Writes a .pst under the name in the field"))
+                        .on_click(w.save_user_preset_cb(cx)),
+                ),
         )
+        .child(heading("Factory", s).mt(px(4.0 * s)))
         .child(
             div()
-                .id("rodhareist-presets")
+                .id("rodhareist-factory-presets")
                 .flex_1()
                 .min_h(px(0.0))
                 .flex()
                 .flex_col()
-                .gap(px(6.0 * s))
+                .gap(px(4.0 * s))
                 .overflow_y_scroll()
-                .children(rows)
-                .child(heading("Your presets", s).mt(px(8.0 * s)).mb(px(2.0 * s)))
-                .children(if user_rows.is_empty() {
-                    vec![words("No saved presets", 12.0, SOFT, s).into_any_element()]
-                } else {
-                    user_rows
-                }),
+                .children(rows),
+        )
+        .child(heading("User", s).mt(px(4.0 * s)))
+        .child(
+            div()
+                .id("rodhareist-user-presets")
+                .flex_1()
+                .min_h(px(0.0))
+                .flex()
+                .flex_col()
+                .gap(px(4.0 * s))
+                .overflow_y_scroll()
+                .children(user_list),
         );
-    let list = if has_note {
-        list.child(words(note, 12.0, ACCENT, s))
-    } else {
-        list
-    };
+    if has_note {
+        list = list.child(words(note, 12.0, ACCENT, s));
+    }
+    let list = list.child(ir_block(w, p, cx, s));
 
     let (kicker, title) = if let Some((user_name, edited)) = w.user_preset_status() {
         (
@@ -1719,26 +1930,21 @@ fn tempo_box(p: &Params, cx: &mut Cx, s: f32) -> AnyElement {
 }
 
 fn line2_box(p: &Params, cx: &mut Cx, s: f32) -> AnyElement {
-    let modes = [
-        (Line2Mode::Wet, "WET"),
-        (Line2Mode::Dry, "DRY"),
-        (Line2Mode::WetDryWet, "W/D/W"),
-    ];
+    let info = lane_controls(p, 0);
     let buttons =
         div()
             .flex()
-            .flex_col()
+            .flex_row()
             .gap(px(4.0 * s))
-            .children(modes.into_iter().enumerate().map(|(index, (mode, label))| {
-                let on = p.line2_mode == mode;
+            .children(info.choices.iter().copied().map(|(label, on, value)| {
                 let (bg, border, _) = choice_colors(on, false);
                 div()
-                    .id(("rodhareist-line2", index))
+                    .id(("rodhareist-line2", value as usize))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .w(px(64.0 * s))
                     .h(px(22.0 * s))
+                    .px(px(8.0 * s))
                     .rounded(px(3.0 * s))
                     .border(px(1.0))
                     .border_color(border)
@@ -1746,28 +1952,42 @@ fn line2_box(p: &Params, cx: &mut Cx, s: f32) -> AnyElement {
                     .cursor(gpui::CursorStyle::PointingHand)
                     .child(words(label, 11.0, if on { WHITE } else { PALE }, s))
                     .on_click(act(cx, move |this, cx| {
-                        this.set_wire_value("line2_mode", index as f32, cx);
+                        this.set_wire_value("line2_mode", value, cx);
                     }))
                     .into_any_element()
             }));
     let dial = Dial::new("line2_mix", "SEND", 0.0, 100.0, 70.0, DialUnit::Percent);
     let look =
         KnobLook::small(40.0).styled(4.0, 14.0, plate::FACE, plate::FACE_EDGE, 1.5, 5.0, 2.2);
-    let cell = KnobCell::new(72.0, 10.0, 11.0).gap(1.0).label(0.08, SOFT);
+    let cell = KnobCell::new(64.0, 10.0, 11.0).gap(1.0).label(0.08, SOFT);
     tile(s)
-        .w(px(168.0 * s))
+        .w(px(220.0 * s))
         .flex()
         .flex_row()
         .items_center()
-        .justify_center()
         .gap(px(8.0 * s))
-        .p(px(6.0 * s))
+        .px(px(8.0 * s))
+        .py(px(6.0 * s))
         .child(
             div()
                 .flex()
                 .flex_col()
+                .flex_1()
+                .min_w(px(0.0))
                 .gap(px(4.0 * s))
-                .child(numbers("LINE 2", 11.0, SOFT, s))
+                .child(numbers(
+                    "LANE 1",
+                    11.0,
+                    if info.wet { ACCENT } else { SOFT },
+                    s,
+                ))
+                .child(
+                    div()
+                        .text_size(type_px(11.0, s))
+                        .line_height(px(13.0 * s))
+                        .text_color(color(if info.wet { WHITE } else { PALE }))
+                        .child(info.detail),
+                )
                 .child(buttons),
         )
         .child(knob(
@@ -1778,7 +1998,7 @@ fn line2_box(p: &Params, cx: &mut Cx, s: f32) -> AnyElement {
             look,
             cell,
             accent(),
-            p.line2_mode == Line2Mode::WetDryWet,
+            info.send_live,
             s,
             |this: &mut RodhareistEditorWindow, v, cx| this.set_wire_value("line2_mix", v, cx),
         ))
@@ -1933,6 +2153,7 @@ fn explore(
             .into_any_element()
         })
         .on_click(act(cx, |this, cx| {
+            this.ui.preset_name_focus = false;
             this.ui.search_focus = true;
             cx.notify();
         }));
@@ -2332,19 +2553,16 @@ fn block_card(
             extras.push(load_row(
                 "rodhareist-load-ir",
                 "Load IR\u{2026}",
-                w.ir_loaded_info().map(|(name, secs)| {
-                    if secs > 0.0 {
-                        format!("{name} ({secs:.2} s)")
-                    } else {
-                        name
-                    }
-                }),
+                ir_loaded_label(w),
                 w.ir_loading(),
                 w.ir_error(),
                 w.load_ir_cb(cx),
                 360.0,
                 s,
             ));
+            if let Some(note) = ir_unconfirmed_note(w) {
+                extras.push(words(note, 12.0, ACCENT, s).into_any_element());
+            }
         }
     }
     if kind == StageKind::Amp && p.tone_engine == ToneEngineKind::NamCapture {
@@ -3008,5 +3226,57 @@ mod tests {
         let four = lane_geom(4, 7);
         assert!(four.size + 6.0 <= four.lane_h);
         assert!(LANE_TOP + 4.0 * four.lane_h <= LANE_BOTTOM + 0.01);
+    }
+
+    #[test]
+    fn default_lanes_stay_wet_on_the_main_path_and_off_below() {
+        let p = rodharerist::default_params();
+        let main = lane_controls(&p, 0);
+        assert_eq!(main.number, 1);
+        assert!(!main.wet);
+        assert!(!main.send_live);
+        assert_eq!(main.detail, "Lane 1 · full chain");
+        assert_eq!(p.line2_mode, Line2Mode::Wet);
+        assert_eq!(p.line2_mix, 70.0);
+        for row in 1..4 {
+            let lane = lane_controls(&p, row);
+            assert!(!lane.wet);
+            assert!(!lane.send_live);
+            assert_eq!(p.row_send[row - 1], RowSend::Off);
+        }
+    }
+
+    #[test]
+    fn wet_dry_wet_names_the_lane_and_the_wet_path() {
+        let mut p = rodharerist::default_params();
+        p.line2_mode = Line2Mode::WetDryWet;
+        let main = lane_controls(&p, 0);
+        assert!(main.wet);
+        assert!(main.send_live);
+        assert_eq!(main.mode_id, "line2_mode");
+        assert_eq!(main.send_id, "line2_mix");
+        assert_eq!(main.detail, "Lane 1 · blocks here are the wet path");
+
+        p.row_send[2] = RowSend::WetDryWet;
+        let lane = lane_controls(&p, 3);
+        assert_eq!(lane.number, 4);
+        assert!(lane.wet);
+        assert!(lane.send_live);
+        assert_eq!(lane.mode_id, "row_send_3");
+        assert_eq!(lane.send_id, "row_level_3");
+        assert_eq!(lane.detail, "Lane 4 · blocks here are the wet path");
+    }
+
+    #[test]
+    fn the_ir_line_names_the_cabinet_only_when_that_model_is_selected() {
+        let p = rodharerist::default_params();
+        assert!(!ir_path_line(&p).contains("impulse"));
+        let mut ir = p;
+        ir.cab_model = CabModel::Ir;
+        assert_eq!(ir_path_line(&ir), "Cabinet is the impulse response");
+        ir.cab_on = false;
+        assert_eq!(ir_path_line(&ir), "Cabinet is bypassed");
+        ir.stage_order = [None; rodharerist::PATH_SLOTS];
+        assert_eq!(ir_path_line(&ir), "Cabinet is not on the path");
     }
 }

@@ -39,16 +39,21 @@ const SAMPLE_RATE_TOLERANCE_HZ: f64 = 0.5;
 /// Roughly how long a runtime swap crossfades for, in milliseconds.
 const SWAP_FADE_MS: f32 = 8.0;
 
-/// Engine samples the capture buffers before running one inference, and
-/// therefore the engine's exact latency while the NAM tone engine is selected.
+/// Largest engine block the capture will buffer before one inference, and the
+/// latency while the host buffer is at least this long.
 ///
 /// nam-rs has two entry points that produce identical output: `process_sample`
 /// and the block kernel `process_buffer`, which pushes a whole chunk through
 /// one weight matrix at a time instead of reloading every matrix per sample.
 /// Measured on a stock "standard" capture the block kernel is ~2.8x faster at
 /// 64 samples (13.6 → 4.8 µs/sample) and ~3.5x at 128. 64 buys most of that
-/// speedup for 1.3 ms at 48 kHz — the trade a per-sample host callback forces,
-/// since the block cannot be computed until its last input sample has arrived.
+/// speedup for 1.3 ms at 48 kHz.
+///
+/// A host buffer shorter than this must not inherit the whole chunk. The
+/// inference cannot start until its last input sample arrives, so a fixed 64
+/// inside a 32-frame callback spends the next period computing samples the
+/// callback does not have time for, and the bridge substitutes dry for that
+/// block. [`NamCapture::begin_block`] caps the live chunk at the host buffer.
 pub const NAM_BLOCK: usize = 64;
 
 /// A `.nam` failed to parse/build, or its sample rate is too far from the
@@ -492,6 +497,12 @@ pub(super) struct NamCapture {
     trim_r: Vec<f32>,
     /// How many samples of the current block have been written.
     fill: usize,
+    /// Samples per inference, and the wet delay. [`NAM_BLOCK`] until a host
+    /// buffer shorter than that is announced; never larger than [`NAM_BLOCK`].
+    quantum: usize,
+    /// A host-buffer change that arrived mid-chunk. Applied the next time
+    /// `fill` wraps, so the delay line is not resized under a partial block.
+    pending_quantum: Option<usize>,
 
     sample_rate: f32,
     dc_hpf: StereoBiquad,
@@ -528,6 +539,8 @@ impl NamCapture {
             trim_l: vec![0.0; NAM_BLOCK],
             trim_r: vec![0.0; NAM_BLOCK],
             fill: 0,
+            quantum: NAM_BLOCK,
+            pending_quantum: None,
             sample_rate: sample_rate.max(1.0),
             dc_hpf: StereoBiquad::none(),
             input_trim: 1.0,
@@ -635,16 +648,15 @@ impl NamCapture {
         self.active.as_ref().map(|rt| rt.info())
     }
 
-    /// Latency this engine adds, in **engine** samples: the [`NAM_BLOCK`] the
-    /// inference buffering costs, plus a rate-adapted capture's interpolation
-    /// delay. The receptive field is not part of it — see
-    /// [`PreparedNamRuntime::latency_samples`].
+    /// Latency this engine adds, in **engine** samples: the live inference
+    /// chunk, plus a rate-adapted capture's interpolation delay. The receptive
+    /// field is not part of it — see [`PreparedNamRuntime::latency_samples`].
     ///
     /// It is reported whether or not a capture is loaded, because the block
     /// buffer runs either way: an empty slot that reported 0 would force the
     /// host to redo delay compensation the moment a capture landed, mid-play.
     pub(super) fn latency_samples(&self) -> usize {
-        NAM_BLOCK
+        self.quantum
             + self
                 .active
                 .as_ref()
@@ -652,10 +664,25 @@ impl NamCapture {
                 .unwrap_or(0)
     }
 
-    /// Audio thread: adopt a pending runtime and retire a finished fade.
-    /// Called once per audio block, never per sample — this is the only place
-    /// the swap happens.
-    pub(super) fn begin_block(&mut self) {
+    /// Audio thread: adopt a pending runtime, retire a finished fade, and cap
+    /// the inference chunk to `frames` when the host buffer is shorter than
+    /// [`NAM_BLOCK`]. `frames == 0` leaves the chunk alone. Called once per
+    /// audio block, never per sample — this is the only place the swap happens.
+    pub(super) fn begin_block(&mut self, frames: usize) {
+        // The host process runs this off the device thread, which never sets
+        // FTZ. A denormal dilation history then misses the same callback.
+        flush_denormals_on_this_thread();
+        if frames > 0 {
+            let quantum = frames.clamp(1, NAM_BLOCK);
+            if self.fill == 0 {
+                self.apply_quantum(quantum);
+            } else if quantum != self.quantum {
+                self.pending_quantum = Some(quantum);
+            } else {
+                self.pending_quantum = None;
+            }
+        }
+
         // Drain a previous overflow now that a block boundary has passed.
         if let Some(carry) = self.retire_overflow.take() {
             if let Some(bounced) = self.channel.retired.put(carry) {
@@ -690,12 +717,12 @@ impl NamCapture {
         }
     }
 
-    /// Audio thread hot path. One sample in, one sample out, delayed by
-    /// [`NAM_BLOCK`]; the inference itself runs once every [`NAM_BLOCK`] calls
-    /// over the whole block. Per sample this is only the DC blocker, the trims
-    /// and the wet/dry mix — the dry side comes out of the same ring as the
-    /// wet, so the two stay phase-aligned. No allocation, no locks, no swap
-    /// logic (see [`Self::begin_block`]).
+    /// Audio thread hot path. One sample in, one sample out, delayed by the
+    /// live chunk ([`NAM_BLOCK`], or the host buffer when that is shorter).
+    /// The inference runs once per chunk. Per sample this is only the DC
+    /// blocker, the trims and the wet/dry mix — the dry side comes out of the
+    /// same ring as the wet, so the two stay phase-aligned. No allocation, no
+    /// locks, no swap logic (see [`Self::begin_block`]).
     #[inline]
     pub(super) fn process(&mut self, left: f32, right: f32) -> (f32, f32) {
         // Read this slot's finished output and the dry sample that produced it
@@ -717,7 +744,7 @@ impl NamCapture {
         self.in_l[self.fill] = left;
         self.in_r[self.fill] = right;
         self.fill += 1;
-        if self.fill >= NAM_BLOCK {
+        if self.fill >= self.quantum {
             self.fill = 0;
             self.run_block();
         }
@@ -732,36 +759,109 @@ impl NamCapture {
 
     /// Run the just-filled input block through the active runtime (and the
     /// retiring one, while a swap crossfades). Called from [`Self::process`]
-    /// every [`NAM_BLOCK`] samples; allocates nothing.
+    /// once per chunk; allocates nothing and does not reset the rate adapter.
     fn run_block(&mut self) {
+        let n = self.quantum;
         let trim = self.input_trim;
-        for i in 0..NAM_BLOCK {
+        for i in 0..n {
             self.trim_l[i] = self.in_l[i] * trim;
             self.trim_r[i] = self.in_r[i] * trim;
         }
 
         match self.active.as_mut() {
             Some(rt) => rt.process_block(
-                &self.trim_l,
-                &self.trim_r,
-                &mut self.out_l,
-                &mut self.out_r,
+                &self.trim_l[..n],
+                &self.trim_r[..n],
+                &mut self.out_l[..n],
+                &mut self.out_r[..n],
                 self.loudness_norm_on,
             ),
             None => {
-                self.out_l.copy_from_slice(&self.trim_l);
-                self.out_r.copy_from_slice(&self.trim_r);
+                self.out_l[..n].copy_from_slice(&self.trim_l[..n]);
+                self.out_r[..n].copy_from_slice(&self.trim_r[..n]);
             }
         }
 
         if let Some(old_rt) = self.fading_out.as_mut() {
             old_rt.process_block(
-                &self.trim_l,
-                &self.trim_r,
-                &mut self.fade_l,
-                &mut self.fade_r,
+                &self.trim_l[..n],
+                &self.trim_r[..n],
+                &mut self.fade_l[..n],
+                &mut self.fade_r[..n],
                 self.loudness_norm_on,
             );
+        }
+
+        if let Some(next) = self.pending_quantum.take() {
+            self.apply_quantum(next);
+        }
+    }
+
+    /// Install `quantum` at a chunk boundary. Growing zeroes the new tail so a
+    /// longer host buffer does not play stale samples from the previous chunk.
+    fn apply_quantum(&mut self, quantum: usize) {
+        let quantum = quantum.clamp(1, NAM_BLOCK);
+        if quantum > self.quantum {
+            for i in self.quantum..quantum {
+                self.out_l[i] = 0.0;
+                self.out_r[i] = 0.0;
+                self.fade_l[i] = 0.0;
+                self.fade_r[i] = 0.0;
+            }
+        }
+        self.quantum = quantum;
+        self.pending_quantum = None;
+    }
+
+    #[cfg(test)]
+    fn testing_reset_adapter(&mut self) {
+        if let Some(rt) = self.active.as_mut() {
+            rt.reset();
+        }
+    }
+}
+
+/// FTZ+DAZ for this thread. The producer is dedicated to audio, so the bits
+/// stay set; restoring them would hand the next callback a denormal model.
+#[inline]
+fn flush_denormals_on_this_thread() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        const MXCSR_FTZ_DAZ: u32 = (1 << 15) | (1 << 6);
+        let mut csr: u32 = 0;
+        // SAFETY: stmxcsr / ldmxcsr touch only this thread's MXCSR, and only
+        // the FTZ and DAZ bits change.
+        unsafe {
+            core::arch::asm!(
+                "stmxcsr [{}]",
+                in(reg) &mut csr,
+                options(nostack, preserves_flags)
+            );
+        }
+        let flushing = csr | MXCSR_FTZ_DAZ;
+        if flushing != csr {
+            unsafe {
+                core::arch::asm!(
+                    "ldmxcsr [{}]",
+                    in(reg) &flushing,
+                    options(nostack, readonly, preserves_flags)
+                );
+            }
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        const FPCR_FZ: u64 = 1 << 24;
+        let value: u64;
+        // SAFETY: reads FPCR, then sets only the FZ bit.
+        unsafe {
+            core::arch::asm!("mrs {}, fpcr", out(reg) value, options(nomem, nostack));
+        }
+        let flushing = value | FPCR_FZ;
+        if flushing != value {
+            unsafe {
+                core::arch::asm!("msr fpcr, {}", in(reg) flushing, options(nomem, nostack));
+            }
         }
     }
 }
@@ -815,7 +915,7 @@ mod tests {
         let mut cap = NamCapture::new(44_100.0);
         cap.configure(0.0, 0.0, 100.0, false, 1.0);
         cap.submit(Box::new(adapted));
-        cap.begin_block();
+        cap.begin_block(0);
         for n in 0..4_000 {
             let x = (n as f32 * 0.02).sin() * 0.3;
             let (l, r) = cap.process(x, -x);
@@ -843,7 +943,7 @@ mod tests {
         let mut cap = NamCapture::new(48_000.0);
         cap.configure(0.0, 0.0, 100.0, false, 1.0);
         cap.submit(Box::new(prepared));
-        cap.begin_block();
+        cap.begin_block(0);
         for _ in 0..64 {
             let (l, r) = cap.process(0.1, -0.1);
             assert!(l.is_finite() && r.is_finite());
@@ -867,7 +967,7 @@ mod tests {
         let first =
             prepare_nam_runtime(TINY_WAVENET_48K, "a".into(), 48_000.0, false, false).unwrap();
         cap.submit(Box::new(first));
-        cap.begin_block();
+        cap.begin_block(0);
         for _ in 0..8 {
             cap.process(0.2, 0.2);
         }
@@ -875,7 +975,7 @@ mod tests {
         let second =
             prepare_nam_runtime(TINY_WAVENET_48K, "b".into(), 48_000.0, false, false).unwrap();
         cap.submit(Box::new(second));
-        cap.begin_block(); // adopts `second`, starts fading `first` out
+        cap.begin_block(0); // adopts `second`, starts fading `first` out
         assert!(cap.fading_out.is_some());
 
         // Run well past the fade window; every sample must stay finite, and
@@ -884,7 +984,7 @@ mod tests {
         for _ in 0..2_000 {
             let (l, r) = cap.process(0.2, -0.2);
             assert!(l.is_finite() && r.is_finite());
-            cap.begin_block();
+            cap.begin_block(0);
         }
         assert!(cap.fading_out.is_none(), "fade must resolve and retire");
 
@@ -906,18 +1006,18 @@ mod tests {
             .expect("load through loader");
         assert_eq!(info.name, "via-loader");
 
-        cap.begin_block();
+        cap.begin_block(0);
         assert_eq!(cap.active_info().map(|i| i.name), Some("via-loader".into()));
 
         // Swap in a second capture and let the fade retire the first.
         loader
             .load_json(TINY_WAVENET_48K, "second", 48_000.0, false, false)
             .expect("second load");
-        cap.begin_block();
+        cap.begin_block(0);
         for _ in 0..2_000 {
             let (l, r) = cap.process(0.2, -0.2);
             assert!(l.is_finite() && r.is_finite());
-            cap.begin_block();
+            cap.begin_block(0);
         }
         assert!(cap.fading_out.is_none());
         loader.collect_garbage(); // drains the retired first capture
@@ -1004,11 +1104,138 @@ mod tests {
         let mut cap = NamCapture::new(48_000.0);
         cap.configure(0.0, 0.0, 100.0, false, 1.0);
         cap.submit(Box::new(prepared));
-        cap.begin_block();
+        cap.begin_block(0);
         assert_eq!(
             cap.latency_samples(),
             NAM_BLOCK,
             "the block buffer is the only latency a native-rate capture adds"
         );
+    }
+
+    /// A host buffer shorter than [`NAM_BLOCK`] must finish inference inside
+    /// that buffer. The latency stays the chunk that actually ran, never 0.
+    #[test]
+    fn inference_chunk_never_exceeds_the_host_buffer() {
+        let prepared = prepare_nam_runtime(TINY_WAVENET_48K, "t".into(), 48_000.0, false, false)
+            .expect("matching rate must load");
+        let mut cap = NamCapture::new(48_000.0);
+        cap.configure(0.0, 0.0, 100.0, true, 1.0);
+        cap.submit(Box::new(prepared));
+
+        cap.begin_block(32);
+        assert_eq!(cap.latency_samples(), 32);
+        for _ in 0..32 {
+            let (l, r) = cap.process(0.25, -0.25);
+            assert!(l.is_finite() && r.is_finite());
+        }
+        assert_eq!(
+            cap.fill, 0,
+            "a 32-frame host buffer must finish its inference inside that buffer"
+        );
+        assert!(cap.latency_samples() > 0);
+
+        cap.begin_block(256);
+        assert_eq!(
+            cap.latency_samples(),
+            NAM_BLOCK,
+            "a longer host buffer stays on the 64-sample kernel"
+        );
+    }
+
+    fn render_adapted(reset_every_block: bool) -> Vec<f32> {
+        // nam-rs's hand-checked tiny net: 0.5 in → 10 out. The all-zero-ish
+        // fixture above is silent, so an adapter reset would be invisible.
+        const PASSING: &str = r#"{
+            "version": "0.5.4", "architecture": "WaveNet",
+            "config": { "layers": [{
+                "input_size": 1, "condition_size": 1, "channels": 1, "head_size": 1,
+                "kernel_size": 1, "dilations": [1], "activation": "ReLU",
+                "gated": false, "head_bias": false
+            }], "head": null, "head_scale": 1.0 },
+            "weights": [1.0, 2.0, 0.5, 1.0, 3.0, 0.1, 0.5, 10.0],
+            "sample_rate": 48000.0
+        }"#;
+        let prepared = prepare_nam_runtime(PASSING, "t".into(), 44_100.0, false, false)
+            .expect("48 kHz capture adapts into 44.1 kHz");
+        let mut cap = NamCapture::new(44_100.0);
+        cap.configure(0.0, 0.0, 100.0, false, 1.0);
+        cap.submit(Box::new(prepared));
+        cap.begin_block(64);
+        assert!(
+            cap.latency_samples() > NAM_BLOCK,
+            "the adapter must add latency, got {}",
+            cap.latency_samples()
+        );
+        let frames = 64;
+        let mut out = Vec::with_capacity(frames * 8);
+        for block in 0..8 {
+            if reset_every_block {
+                cap.testing_reset_adapter();
+            }
+            cap.begin_block(frames);
+            for n in 0..frames {
+                let i = block * frames + n;
+                let x = (i as f32 * 0.07).sin() * 0.5;
+                let (l, _) = cap.process(x, x);
+                out.push(l);
+            }
+        }
+        out
+    }
+
+    /// Resetting the adapter every block is audible. `process` must not do it,
+    /// so a continuous run and a run that resets on purpose disagree.
+    #[test]
+    fn process_does_not_reset_the_rate_adapter_every_block() {
+        let continuous = render_adapted(false);
+        let reset = render_adapted(true);
+        let energy: f32 = continuous.iter().map(|x| x * x).sum();
+        assert!(
+            energy > 1.0e-3,
+            "capture produced silence ({energy}), so an adapter reset would be invisible"
+        );
+        let max_diff = continuous
+            .iter()
+            .zip(&reset)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1.0e-5,
+            "a per-block adapter reset must change the output (max diff {max_diff}); process must not reset it"
+        );
+    }
+
+    /// Steady-state `begin_block` + `process` of a loaded capture, native and
+    /// rate-adapted, including the loudness multiply. One heap hit fails.
+    #[test]
+    fn process_path_does_not_allocate() {
+        fn run(engine_rate: f64, frames: usize) -> u64 {
+            let prepared =
+                prepare_nam_runtime(TINY_WAVENET_48K, "t".into(), engine_rate, false, false)
+                    .expect("capture loads");
+            let mut cap = NamCapture::new(engine_rate as f32);
+            cap.configure(0.0, 0.0, 100.0, true, 0.5);
+            cap.submit(Box::new(prepared));
+            cap.begin_block(frames);
+
+            crate::alloc_probe::reset();
+            crate::alloc_probe::arm();
+            for block in 0..4 {
+                cap.begin_block(frames);
+                cap.configure(block as f32, 0.0, 80.0, true, 0.5);
+                for n in 0..frames {
+                    let x = ((block * frames + n) as f32 * 0.05).sin() * 0.3;
+                    let (l, r) = cap.process(x, -x);
+                    assert!(l.is_finite() && r.is_finite());
+                }
+            }
+            crate::alloc_probe::disarm();
+            let allocations = crate::alloc_probe::count();
+            assert!(cap.latency_samples() > 0);
+            allocations
+        }
+
+        assert_eq!(run(48_000.0, 32), 0, "native 32-frame process allocated");
+        assert_eq!(run(44_100.0, 64), 0, "rate-adapted process allocated");
     }
 }

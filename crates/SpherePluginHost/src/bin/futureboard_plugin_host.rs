@@ -1082,8 +1082,9 @@ impl BuiltinHostProcessor {
         // SAFETY: the dedicated producer thread is the sole DSP accessor.
         match unsafe { &mut *self.dsp.get() } {
             BuiltinDsp::Rodhareist(dsp) => {
-                // Block boundary: adopt any pending NAM/IR swap (never mid-block).
-                dsp.begin_block();
+                // Block boundary: adopt any pending NAM/IR swap (never mid-block)
+                // and keep the NAM inference chunk inside this callback.
+                dsp.begin_block_with_frames(frames);
                 for i in 0..frames {
                     let (l, r) = dsp.process_stereo(in_l[i], in_r[i]);
                     interleaved[i * 2] = l;

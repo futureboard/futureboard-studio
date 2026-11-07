@@ -454,7 +454,9 @@ impl BuiltinFx {
     pub fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
         if let Self::Rodhareist(dsp) = self {
             // A captured amp or cabinet swaps in at a block boundary only.
-            dsp.begin_block();
+            // The capture's inference chunk has to fit this buffer.
+            let frames = left.len().min(right.len());
+            dsp.begin_block_with_frames(frames);
         }
         with_dsp!(self, dsp => {
             for (l, r) in left.iter_mut().zip(right.iter_mut()) {
