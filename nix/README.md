@@ -18,23 +18,21 @@ nix build .#all                 # every app, as result/<name>
 
 nix run                         # Futureboard Studio
 nix run .#livestage-server -- --http 0.0.0.0:8730
-nix run .#apak -- --help
 
 nix develop                     # toolchain + native deps + prefetched SDKs
-nix flake check                 # builds livestage-server + apakinstaller, runs smoke tests
+nix flake check                 # builds livestage-server, runs the smoke test
 ```
 
 ## Packages
 
 | Package               | Contents                                                                                                                                                                                                                                                                                                                                                                         |
 | --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `studio` (`default`)  | `bin/futureboard-studio` (+ `FutureboardNative`). Runtime tree in `libexec/futureboard-studio/` exactly like the xtask package: `FutureboardNative`, `FutureboardPluginHostX64`, `FutureboardPluginScanner`, `bin/{apakinstaller,apak,makeapak}`, `crashpad_handler`, `libonnxruntime.so`, the CEF runtime flat with `locales/`, `Plugins/lib*.so` (every built-in plug-in cdylib), `Resources/`, `build-info.json`. Desktop file, MIME type (`.fbproj`) and icon from `packaging/linux`. |
+| `studio` (`default`)  | `bin/futureboard-studio` (+ `FutureboardNative`). Runtime tree in `libexec/futureboard-studio/` exactly like the xtask package: `FutureboardNative`, `FutureboardPluginHostX64`, `FutureboardPluginScanner`, `crashpad_handler`, `libonnxruntime.so`, the CEF runtime flat with `locales/`, `Plugins/lib*.so` (every built-in plug-in cdylib), `Resources/`, `build-info.json`. Desktop file, MIME type (`.fbproj`) and icon from `packaging/linux`. |
 | `livestage`           | `LiveStage` (GPUI desktop mixer) and `livestage-server`, default features (third-party plug-ins through the plug-in host, which is linked in beside them), web UI embedded.                                                                                                                                                                                                      |
 | `livestage-server`    | Headless `livestage-server`, `--no-default-features` (ALSA, built-in effects only), web UI embedded.                                                                                                                                                                                                                                                                             |
 | `livestage-appliance` | `livestage-server`, `livestage-setup`, `livestage-installer` with `--no-default-features --features appliance`, as `packaging/livestage/make-image.sh` builds them (glibc instead of the image's musl).                                                                                                                                                                         |
 | `jamsession`          | `FutureboardJam`.                                                                                                                                                                                                                                                                                                                                                                |
 | `singer`              | `Singer`.                                                                                                                                                                                                                                                                                                                                                                        |
-| `apakinstaller`       | `apakinstaller` (GUI), `apak`, `makeapak`.                                                                                                                                                                                                                                                                                                                                       |
 | `plugin-host`         | `FutureboardPluginHostX64`, `FutureboardPluginScanner` on their own.                                                                                                                                                                                                                                                                                                             |
 | `cef-helper`          | `futureboard_cef_helper` with a CEF runtime beside it. Futureboard only ships this helper on macOS; on Linux Studio runs CEF subprocesses as itself.                                                                                                                                                                                                                         |
 | `all`                 | A link farm of all of the above.                                                                                                                                                                                                                                                                                                                                                 |
@@ -63,18 +61,6 @@ Other build-time configuration:
 
 - `FUTUREBOARD_AUTH_API_URL` defaults to `https://futureboard.studio`, the same
   public origin CI bakes (override: `authApiUrl`).
-- **APAK trust anchor.** Release builds of the APAK tools require
-  `APAK_VERIFYING_KEY`; the production key is a CI secret and
-  `apak.public.key` is git-ignored. The Nix packages take it from, in order:
-  the `apakVerifyingKey` argument, `APAK_VERIFYING_KEY` when evaluated with
-  `--impure`, otherwise the public **development** key (the one debug builds
-  use), which does not verify official packages:
-
-  ```bash
-  APAK_VERIFYING_KEY="$(cat apak.public.key)" nix build --impure .#studio
-  ```
-
-  `nix eval .#studio.apakTrustAnchor` says which one a build uses.
 - The TONE3000 API key and the Discord client id are not baked (no `.env`,
   as in a fresh clone); Professional Edition is not built.
 

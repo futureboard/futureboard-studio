@@ -303,6 +303,16 @@ impl Live {
         self.image.back()
     }
 
+    /// The stereo-image frames kept for a scope's persistence, oldest first.
+    pub fn image_frames(&self) -> impl ExactSizeIterator<Item = &StereoImageFrame> {
+        self.image.iter()
+    }
+
+    /// The vectorscope's auto-gain, 1–16.
+    pub fn scope_gain(&self) -> f32 {
+        self.scope_gain
+    }
+
     pub fn slot_peaks(&self) -> Option<([f32; BUILTIN_RACK_SLOTS], [f32; BUILTIN_RACK_SLOTS])> {
         self.frame
             .map(|frame| (frame.slot_in_peak, frame.slot_out_peak))

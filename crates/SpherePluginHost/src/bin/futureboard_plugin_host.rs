@@ -311,7 +311,10 @@ enum BuiltinDsp {
     Verbspace(verbspace::Dsp),
     WhiteSharp(Box<whitesharp::Dsp>),
     Echospace(echospace::Dsp),
-    Imager(imager::Dsp),
+    /// The Imager and its side analyser (`imager::telemetry`): the insert's
+    /// input side, beside the shared analyser's mid. Boxed so the variant
+    /// stays the size of the others.
+    Imager(imager::Dsp, Box<SpectrumAnalyzer>),
     Fa2a(fa2a::Dsp),
     Fa76(fa76::Dsp),
     BurnLimit(burnlimit::Dsp),
@@ -732,7 +735,7 @@ impl BuiltinHostProcessor {
             }
         }
         Self {
-            dsp: UnsafeCell::new(BuiltinDsp::Imager(dsp)),
+            dsp: UnsafeCell::new(BuiltinDsp::Imager(dsp, Box::new(SpectrumAnalyzer::new(sr)))),
             spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
             // A stereo imager has no capture or cabinet stage to hand off into.
             nam_loader: None,
@@ -1122,7 +1125,7 @@ impl BuiltinHostProcessor {
                     interleaved[i * 2 + 1] = r;
                 }
             }
-            BuiltinDsp::Imager(dsp) => {
+            BuiltinDsp::Imager(dsp, _) => {
                 for i in 0..frames {
                     let (l, r) = dsp.process_stereo(in_l[i], in_r[i]);
                     interleaved[i * 2] = l;
@@ -1270,6 +1273,10 @@ impl BuiltinHostProcessor {
     fn capture_spectrum(&self, left: &[f32], right: &[f32]) {
         // SAFETY: the dedicated producer thread is the sole accessor.
         unsafe { &mut *self.spectrum.get() }.push_block(left, right);
+        // SAFETY: as above — the producer thread is the sole DSP accessor.
+        if let BuiltinDsp::Imager(_, side) = unsafe { &mut *self.dsp.get() } {
+            side.push_side_block(left, right);
+        }
     }
 
     /// Run an analysis if one is due, returning the frame to publish. `None`
@@ -1327,6 +1334,20 @@ impl BuiltinHostProcessor {
         }
     }
 
+    /// The Imager's side spectrum as its telemetry block
+    /// (`imager::telemetry`), when its side analyser has a fresh analysis;
+    /// `None` for every other core and on the blocks in between. Producer
+    /// thread only (same contract as `process_block`).
+    fn side_spectrum(&self) -> Option<[f32; SpherePluginHost::audio_bridge::BUILTIN_PAD_SLOTS]> {
+        const _: () =
+            assert!(imager::telemetry::SLOTS == SpherePluginHost::audio_bridge::BUILTIN_PAD_SLOTS);
+        // SAFETY: the dedicated producer thread is the sole DSP accessor.
+        match unsafe { &mut *self.dsp.get() } {
+            BuiltinDsp::Imager(_, side) => side.analyze().map(imager::telemetry::side_block),
+            _ => None,
+        }
+    }
+
     /// Per-band gain reduction for a multiband built-in (the Compressor);
     /// `None` for every other core. Published in both of the Compressor's
     /// modes — all zeros in Single — so the editor never keeps drawing a
@@ -1347,7 +1368,7 @@ impl BuiltinHostProcessor {
     fn take_stereo_image(&self) -> Option<SpherePluginHost::audio_bridge::StereoImageFrame> {
         // SAFETY: the dedicated producer thread is the sole DSP accessor.
         match unsafe { &mut *self.dsp.get() } {
-            BuiltinDsp::Imager(dsp) => {
+            BuiltinDsp::Imager(dsp, _) => {
                 let f = dsp.take_image_frame()?;
                 Some(SpherePluginHost::audio_bridge::StereoImageFrame {
                     correlation: f.correlation,
@@ -1475,7 +1496,7 @@ impl BuiltinHostProcessor {
                     slot_out_peak: f.slot_out_peak,
                 })
             }
-            BuiltinDsp::Imager(dsp) => {
+            BuiltinDsp::Imager(dsp, _) => {
                 let f = dsp.meter_frame();
                 Some(SpherePluginHost::audio_bridge::BuiltinMeterFrame {
                     in_peak: f.in_peak,
@@ -1688,7 +1709,7 @@ impl BuiltinHostProcessor {
             // The lookahead, bypassed or not.
             BuiltinDsp::WayGate(dsp) => dsp.latency_samples(),
             BuiltinDsp::Echospace(dsp) => dsp.latency_samples(),
-            BuiltinDsp::Imager(dsp) => dsp.latency_samples(),
+            BuiltinDsp::Imager(dsp, _) => dsp.latency_samples(),
             BuiltinDsp::WrapSynth(_) => 0,
             BuiltinDsp::DrumSampler(dsp) => dsp.latency_samples(),
             BuiltinDsp::QuickSampler(dsp) => dsp.latency_samples(),
@@ -1734,7 +1755,7 @@ impl BuiltinHostProcessor {
             BuiltinDsp::Echospace(dsp) => {
                 let _ = dsp.apply_wire_param(param_id, value);
             }
-            BuiltinDsp::Imager(dsp) => {
+            BuiltinDsp::Imager(dsp, _) => {
                 let _ = dsp.apply_wire_param(param_id, value);
             }
             BuiltinDsp::Fa2a(dsp) => {
@@ -3839,7 +3860,7 @@ fn service_audio_bridge(
         if let Some(image) = b.take_stereo_image() {
             bridge.store_stereo_image(&image);
         }
-        if let Some(levels) = b.pad_levels() {
+        if let Some(levels) = b.pad_levels().or_else(|| b.side_spectrum()) {
             bridge.store_pad_levels(&levels);
         }
         if let Some(reduction) = b.band_reduction() {

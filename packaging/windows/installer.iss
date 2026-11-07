@@ -86,11 +86,6 @@ Name: "desktopicon"; \
     GroupDescription: "Additional shortcuts:"; \
     Flags: unchecked
 
-Name: "fileassoc_apak"; \
-    Description: "Associate .apak packages with APAK Installer"; \
-    GroupDescription: "File associations:"; \
-    Flags: checkedonce
-
 Name: "fileassoc_fbproj"; \
     Description: "Associate .fbproj projects with {#MyAppName}"; \
     GroupDescription: "File associations:"; \
@@ -115,12 +110,6 @@ Name: "{group}\{#MyAppName}"; \
     WorkingDir: "{app}"; \
     IconFilename: "{app}\{#MyAppExeName}"
 
-Name: "{group}\APAK Installer"; \
-    Filename: "{app}\apakinstaller.exe"; \
-    WorkingDir: "{app}"; \
-    IconFilename: "{app}\apakinstaller.exe"; \
-    Check: FileExists(ExpandConstant('{app}\apakinstaller.exe'))
-
 Name: "{group}\Uninstall {#MyAppName}"; \
     Filename: "{uninstallexe}"
 
@@ -131,41 +120,9 @@ Name: "{autodesktop}\{#MyAppName}"; \
     Tasks: desktopicon
 
 [Registry]
-; Associate .apak files with APAK Installer.
-;
 ; HKA resolves to:
 ;   HKCU for per-user installation
 ;   HKLM for all-users installation
-
-Root: HKA; \
-    Subkey: "Software\Classes\.apak"; \
-    ValueType: string; \
-    ValueName: ""; \
-    ValueData: "Futureboard.APAK"; \
-    Flags: uninsdeletevalue; \
-    Tasks: fileassoc_apak
-
-Root: HKA; \
-    Subkey: "Software\Classes\Futureboard.APAK"; \
-    ValueType: string; \
-    ValueName: ""; \
-    ValueData: "Futureboard Audio Package"; \
-    Flags: uninsdeletekey; \
-    Tasks: fileassoc_apak
-
-Root: HKA; \
-    Subkey: "Software\Classes\Futureboard.APAK\DefaultIcon"; \
-    ValueType: string; \
-    ValueName: ""; \
-    ValueData: "{app}\apakinstaller.exe,0"; \
-    Tasks: fileassoc_apak
-
-Root: HKA; \
-    Subkey: "Software\Classes\Futureboard.APAK\shell\open\command"; \
-    ValueType: string; \
-    ValueName: ""; \
-    ValueData: """{app}\apakinstaller.exe"" ""%1"""; \
-    Tasks: fileassoc_apak
 
 ; Associate .fbproj project files with Futureboard Studio. Double-clicking a
 ; project launches `FutureboardNative.exe "<path>"`; the app routes a project

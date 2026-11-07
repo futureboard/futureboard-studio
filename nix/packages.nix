@@ -6,13 +6,6 @@
 {
   pkgs,
   self ? null,
-  # The APAK trust anchor baked into apakinstaller/apak/makeapak. Release
-  # builds refuse to build without one (apps/native/apakinstaller/build.rs).
-  # The production key is a CI secret and `apak.public.key` is git-ignored, so
-  # pass it with `.override { apakVerifyingKey = "..."; }`, or evaluate with
-  # `--impure` and APAK_VERIFYING_KEY in the environment. Without either the
-  # tools trust the public *development* key (see `developmentApakVerifyingKey`).
-  apakVerifyingKey ? null,
   # The public account-service origin baked into SphereUIComponents. CI uses
   # this same default (FUTUREBOARD_AUTH_API_URL in .github/workflows).
   authApiUrl ? "https://futureboard.studio",
@@ -56,20 +49,6 @@ let
 
   rustTarget = stdenv.hostPlatform.rust.cargoShortTarget;
   releaseDir = "target/${rustTarget}/release";
-
-  # `TLWr9q…` is the Ed25519 public key of the development signing seed that
-  # apps/native/apakinstaller/build.rs uses for non-release builds
-  # (0x00…01). It only verifies packages signed with that public seed.
-  developmentApakVerifyingKey = "TLWr9q15+/WrvMr8wmnYXNJlHtS4hbWGnyQa7fCluik=";
-  impureApakKey = builtins.getEnv "APAK_VERIFYING_KEY";
-  apakKey =
-    if apakVerifyingKey != null then
-      apakVerifyingKey
-    else if impureApakKey != "" then
-      impureApakKey
-    else
-      developmentApakVerifyingKey;
-  apakTrustAnchor = if apakKey == developmentApakVerifyingKey then "development" else "configured";
 
   # Libraries GPUI/wgpu and the X11/Wayland stack open with dlopen at run time
   # (Vulkan loader, Wayland client, xkbcommon, Xlib extensions, GL/EGL). They
@@ -181,7 +160,6 @@ let
       needsCef ? false,
       needsCrashpad ? false,
       needsWebui ? false,
-      needsApakKey ? false,
       postBuild ? "",
       installPhase,
       postFixup ? "",
@@ -229,24 +207,15 @@ let
           # handler into the target directory, where the Studio build script's
           # crashpad-handler-bundler picks it up (as in CI).
           CRASHPAD_CACHE_DIR = "${prebuilt.crashpad}";
-        }
-        // lib.optionalAttrs needsApakKey {
-          APAK_VERIFYING_KEY = apakKey;
         };
 
-      preBuild =
-        lib.optionalString needsWebui ''
-          rm -rf apps/native/livestage/webui/dist
-          cp -r ${livestage-webui} apps/native/livestage/webui/dist
-          chmod -R u+w apps/native/livestage/webui/dist
-        ''
-        + lib.optionalString (needsApakKey && apakTrustAnchor == "development") ''
-          echo "note: APAK tools trust the development key; see nix/README.md to bake the production key"
-        '';
+      preBuild = lib.optionalString needsWebui ''
+        rm -rf apps/native/livestage/webui/dist
+        cp -r ${livestage-webui} apps/native/livestage/webui/dist
+        chmod -R u+w apps/native/livestage/webui/dist
+      '';
 
-      passthru = passthru // {
-        inherit apakTrustAnchor;
-      };
+      inherit passthru;
 
       meta = {
         homepage = "https://github.com/arizkami/Futureboard";
@@ -287,16 +256,14 @@ let
   };
 
   # ── Futureboard Studio ───────────────────────────────────────────────────
-  # The app, its sidecars and the APAK tools are built in xtask's single
-  # feature graph (cargo_build::build: the three packages selected together,
-  # sidecar features merged in), then the built-in plug-in cdylibs
-  # (plugins::build_plugins).
+  # The app and its sidecars are built in xtask's single feature graph
+  # (cargo_build::build: both packages selected together, sidecar features
+  # merged in), then the built-in plug-in cdylibs (plugins::build_plugins).
   #
-  # Every binary is a fat-LTO, one-codegen-unit link, and linking
-  # FutureboardNative and the apakinstaller GUI at the same time needs more
-  # than 12 GiB. So the binaries are requested in two cargo runs over the
-  # *same* package/feature selection: the first builds every shared artifact
-  # and links the sidecars and APAK tools, the second only links the Studio
+  # Every binary is a fat-LTO, one-codegen-unit link, so the binaries are
+  # requested in two cargo runs over the *same* package/feature selection to
+  # keep peak link memory down: the first builds every shared artifact and
+  # links the sidecars, the second only links the Studio
   # engine library (libFutureboardEngine_x64.so, which FutureboardNative loads
   # from its own directory) and the launcher. The result is identical to xtask's one invocation (CI
   # instead caps the whole build at CARGO_BUILD_JOBS=2).
@@ -305,8 +272,6 @@ let
     "futureboard_native"
     "-p"
     "sphere-plugin-host"
-    "-p"
-    "apakinstaller"
   ];
   studioFeatures = [
     "sphere-plugin-host/plugin-host-bin"
@@ -320,17 +285,10 @@ let
       "FutureboardPluginHostX64"
       "--bin"
       "FutureboardPluginScanner"
-      "--bin"
-      "apakinstaller"
-      "--bin"
-      "apak"
-      "--bin"
-      "makeapak"
     ];
     buildFeatures = studioFeatures;
     needsCef = true;
     needsCrashpad = true;
-    needsApakKey = true;
 
     postBuild = ''
       cargo build -j "$NIX_BUILD_CORES" --offline --profile release --target ${rustTarget} \
@@ -346,7 +304,7 @@ let
       runHook preInstall
 
       app=$out/libexec/futureboard-studio
-      mkdir -p $app/bin $app/Plugins $app/Resources $out/bin
+      mkdir -p $app/Plugins $app/Resources $out/bin
 
       install -m755 \
         ${releaseDir}/FutureboardNative \
@@ -354,7 +312,6 @@ let
         ${releaseDir}/FutureboardPluginHostX64 \
         ${releaseDir}/FutureboardPluginScanner \
         $app/
-      install -m755 ${releaseDir}/apakinstaller ${releaseDir}/apak ${releaseDir}/makeapak $app/bin/
       install -m755 ${prebuilt.crashpad}/bin/crashpad_handler $app/crashpad_handler
       ln -s ${prebuilt.onnxruntime}/lib/libonnxruntime.so $app/libonnxruntime.so
       ${linkCefRuntime "$app"}
@@ -556,32 +513,6 @@ let
     };
   };
 
-  apakinstaller = mkRustApp {
-    pname = "apakinstaller";
-    cargoBuildFlags = [
-      "-p"
-      "apakinstaller"
-      "--bin"
-      "apakinstaller"
-      "--bin"
-      "apak"
-      "--bin"
-      "makeapak"
-    ];
-    needsApakKey = true;
-    installPhase = ''
-      runHook preInstall
-      mkdir -p $out/bin
-      install -m755 ${releaseDir}/apakinstaller ${releaseDir}/apak ${releaseDir}/makeapak $out/bin/
-      runHook postInstall
-    '';
-    postFixup = addGuiRunpath [ "$out/bin" ];
-    meta = {
-      description = "APAK package installer (GUI) and the apak / makeapak command-line tools";
-      mainProgram = "apakinstaller";
-    };
-  };
-
   # The dedicated CEF subprocess executable. Futureboard's own packaging only
   # ships it on macOS (Linux/Windows Studio runs CEF helpers as itself); it is
   # built here so every workspace app has a package.
@@ -617,7 +548,6 @@ let
       livestage-appliance
       jamsession
       singer
-      apakinstaller
       cef-helper
       plugin-host
       ;

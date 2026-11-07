@@ -156,6 +156,17 @@ impl SpectrumAnalyzer {
         self.since_analysis = self.since_analysis.saturating_add(frames);
     }
 
+    /// [`Self::push_block`] for the side, `(L − R) / 2`, rather than the mid:
+    /// an imager's side spectrum. Same cost, same thread contract.
+    pub fn push_side_block(&mut self, left: &[f32], right: &[f32]) {
+        let frames = left.len().min(right.len());
+        for i in 0..frames {
+            self.ring[self.write] = 0.5 * (left[i] - right[i]);
+            self.write = (self.write + 1) % FFT_SIZE;
+        }
+        self.since_analysis = self.since_analysis.saturating_add(frames);
+    }
+
     /// Whether enough new audio has arrived to justify another transform.
     pub fn analysis_due(&self) -> bool {
         self.since_analysis >= FRAMES_PER_ANALYSIS

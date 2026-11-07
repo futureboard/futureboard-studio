@@ -3,7 +3,7 @@
 //! `FutureboardJam` is a much smaller thing to package than Studio, and the
 //! difference is the point of this module rather than an accident of it. Studio
 //! ships a CEF runtime, two sidecar processes it spawns from its own directory,
-//! the APAK tools, and per-edition feature sets. The jam client ships one
+//! and per-edition feature sets. The jam client ships one
 //! executable: it hosts no plug-ins, spawns nothing, and has no editions —
 //! there is no Professional jam, because a jam is a network client, not a
 //! licensed feature.

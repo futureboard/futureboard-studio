@@ -108,6 +108,16 @@ pub fn factory_presets() -> Vec<FactoryPreset> {
             [80.0, 100.0, 110.0, 120.0],
         ),
         FactoryPreset {
+            name: "Wide Master",
+            // Wider toward the top, the lows narrowed and Mono Bass under
+            // them so nothing below 80 Hz is left in the side.
+            params: Params {
+                width: [40.0, 100.0, 135.0, 170.0],
+                mono_bass: true,
+                ..default_params()
+            },
+        },
+        FactoryPreset {
             name: "Tight Low End",
             // The narrowed lows stay in the mix, folded into the middle.
             params: Params {

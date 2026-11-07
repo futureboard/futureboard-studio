@@ -361,14 +361,14 @@ pub fn scenes() -> Vec<Scene> {
         },
         Scene {
             name: "imager",
-            width: BandKind::Imager.window_size().0,
-            height: BandKind::Imager.window_size().1,
+            width: crate::components::imager_plate::WINDOW_SIZE.0,
+            height: crate::components::imager_plate::WINDOW_SIZE.1,
             open: imager_scene,
         },
         Scene {
             name: "imager-stereoize",
-            width: BandKind::Imager.window_size().0,
-            height: BandKind::Imager.window_size().1,
+            width: crate::components::imager_plate::WINDOW_SIZE.0,
+            height: crate::components::imager_plate::WINDOW_SIZE.1,
             open: imager_stereoize,
         },
         Scene {
@@ -1249,7 +1249,6 @@ fn open_band(
             "compresser",
             compresser::ipc::CompresserState::new(p).to_json(),
         ),
-        BandParams::Imager(p) => ("imager", imager::ipc::ImagerState::new(p).to_json()),
     };
     open_kit(options, cx, kind, plugin, insert, json, 5.0, |_| {})
 }
@@ -1274,54 +1273,73 @@ fn compressor_multi(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHan
     )
 }
 
+/// A side spectrum to go with [`preview_spectrum`]: quieter, and thinner
+/// toward the lows the way a mix's side is — synthetic, for previews only.
+fn preview_side_block() -> PreviewBlock {
+    use SpherePluginHost::spectrum::{MAX_HZ, MIN_HZ, SPECTRUM_BINS};
+    let mid = preview_spectrum();
+    let side: [f32; SPECTRUM_BINS] = std::array::from_fn(|i| {
+        let hz = MIN_HZ * (MAX_HZ / MIN_HZ).powf((i as f32 + 0.5) / SPECTRUM_BINS as f32);
+        let thin = (300.0 / hz).log2().max(0.0) * 7.0;
+        mid[i] - 14.0 - thin
+    });
+    imager::telemetry::side_block(&side)
+}
+
 fn open_imager(
     options: WindowOptions,
     cx: &mut App,
     insert: &'static str,
-    preset: &str,
-    scope: crate::components::plugin_live::ScopeMode,
+    params: imager::Params,
+    then: impl FnOnce(&mut crate::components::imager_plate::ImagerUi) + 'static,
 ) -> Result<AnyWindowHandle> {
-    let crate::components::band_model::BandParams::Imager(p) =
-        band_preset(BandKind::Imager, preset)
-    else {
-        unreachable!("an Imager preset is Imager params");
-    };
-    let json = imager::ipc::ImagerState::new(p).to_json();
-    open_kit(
+    use crate::components::imager_plate::ImagerPlate;
+    crate::components::plate::ensure_fonts(cx);
+    let json = imager::ipc::ImagerState::new(params).to_json();
+    let handle = open_kit(
         options,
         cx,
-        BandKind::Imager,
+        ImagerPlate,
         "imager",
         insert,
         json,
-        5.0,
-        move |editor| {
-            editor.ui.scope = scope;
-            editor.ui.link_bands = true;
-        },
-    )
+        0.0,
+        move |editor| then(&mut editor.ui),
+    )?;
+    if let Some(window) = handle.downcast::<KitWindow<ImagerPlate>>() {
+        let side = preview_side_block();
+        let _ = window.update(cx, |window, _, _| {
+            window.live().borrow_mut().show_pads(side)
+        });
+    }
+    Ok(handle)
+}
+
+fn imager_preset(name: &str) -> imager::Params {
+    imager::factory_presets()
+        .into_iter()
+        .find(|preset| preset.name == name)
+        .map_or_else(imager::default_params, |preset| preset.params)
 }
 
 fn imager_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
-    use crate::components::plugin_live::ScopeMode;
-    open_imager(
-        options,
-        cx,
-        "imager",
-        "Master Polish",
-        ScopeMode::PolarSample,
-    )
+    let params = imager::Params {
+        width: [40.0, 100.0, 135.0, 170.0],
+        mono_bass: true,
+        ..imager::default_params()
+    };
+    open_imager(options, cx, "imager", params, |ui| ui.selected = 2)
 }
 
 fn imager_stereoize(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
-    use crate::components::plugin_live::ScopeMode;
-    open_imager(
-        options,
-        cx,
-        "imager-stereoize",
-        "Natural Space",
-        ScopeMode::PolarLevel,
-    )
+    let mut params = imager_preset("Natural Space");
+    params.global_width = 15.0;
+    params.band_bypass[0] = true;
+    params.solo_band = 3;
+    open_imager(options, cx, "imager-stereoize", params, |ui| {
+        ui.page = crate::components::imager_plate::Page::Stereoize;
+        ui.selected = 3;
+    })
 }
 
 fn open_mix(

@@ -1,5 +1,5 @@
 {
-  description = "Futureboard native apps (Studio, LiveStage, Jam, Singer, APAK tools) built with Nix";
+  description = "Futureboard native apps (Studio, LiveStage, Jam, Singer) built with Nix";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -38,9 +38,6 @@
           livestage-installer = app p.livestage-appliance "livestage-installer" "LiveStage disk installer";
           jamsession = app p.jamsession "FutureboardJam" "Futureboard Audio Jam client";
           singer = app p.singer "Singer" "Singer instrument playground";
-          apakinstaller = app p.apakinstaller "apakinstaller" "APAK package installer";
-          apak = app p.apakinstaller "apak" "APAK command-line tool";
-          makeapak = app p.apakinstaller "makeapak" "APAK package builder";
           plugin-scanner = app p.plugin-host "FutureboardPluginScanner" "Futureboard plug-in scanner";
         }
       );

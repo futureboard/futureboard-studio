@@ -281,15 +281,15 @@ packages are prefetched as fixed-output sources):
 
 ```bash
 nix build .#studio            # also: livestage, livestage-server, livestage-appliance,
-                              # jamsession, singer, apakinstaller, plugin-host, cef-helper, all
+                              # jamsession, singer, plugin-host, cef-helper, all
 nix run                       # Futureboard Studio
 nix run .#livestage-server -- --http 0.0.0.0:8730
 nix develop                   # toolchain, native libraries and SDK paths for cargo
-nix flake check               # smoke tests (embedded LiveStage web UI, apak CLI)
+nix flake check               # smoke test (embedded LiveStage web UI)
 ```
 
 New files must be `git add`ed before a flake sees them. Package contents,
-how each build-time download is handled, the APAK key and hash refreshes are
+how each build-time download is handled and hash refreshes are
 documented in [`nix/README.md`](nix/README.md).
 
 ### macOS universal (Apple Silicon + Intel)
@@ -366,8 +366,7 @@ process so a crashing plug-in cannot take the session down.
 | [`gpui`](crates/gpui)                                                       | The GPUI fork the app is built on                             |
 
 Other native apps share the same crates: `jamsession` (standalone Audio Jam
-client), `singer` (Solfege instrument playground) and `apakinstaller` (signed
-`.apak` package tools). See [ARCHITECTURE.md](ARCHITECTURE.md) for the full map.
+client) and `singer` (Solfege instrument playground). See [ARCHITECTURE.md](ARCHITECTURE.md) for the full map.
 
 Built-in plug-in editors are native GPUI views. The only web code in the
 product is LiveStage's console (`apps/native/livestage/webui`); the earlier
@@ -377,7 +376,7 @@ web, Electron and N-API surfaces have been removed.
 
 ```text
 Futureboard
-├─ apps/native/    studio (the app) · jamsession · singer · apakinstaller · cef_helper
+├─ apps/native/    studio (the app) · jamsession · singer · cef_helper
 ├─ crates/         engine, UI, plug-in host, built-in plug-ins, GPUI fork, services
 ├─ packages/       assets · keymaps · shared (locales, themes, menus, fonts, icons)
 ├─ external/       vendored SDKs (git submodules) and patched dependencies

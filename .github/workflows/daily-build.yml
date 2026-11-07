@@ -34,7 +34,6 @@ jobs:
     needs: version
     runs-on: ${{ matrix.os }}
     env:
-      APAK_VERIFYING_KEY: ${{ secrets.APAK_VERIFYING_KEY }}
       # The account-service base is baked in at compile time
       # (crates/SphereUIComponents/build.rs). CI has no .env, so without
       # this every built Studio reports "sign-in is not configured". It is
