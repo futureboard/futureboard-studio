@@ -13,10 +13,6 @@ on:
   # of a third copy of them. The `release` job below stays skipped for callers
   # because `github.ref` is then the caller's branch, not a tag.
   workflow_call:
-    secrets:
-      APAK_VERIFYING_KEY:
-        description: Public Ed25519 key baked into APAK installers.
-        required: true
     inputs:
       app-version:
         description: Version to build instead of the one in version.json.
@@ -61,7 +57,6 @@ jobs:
     needs: version
     runs-on: ${{ matrix.os }}
     env:
-      APAK_VERIFYING_KEY: ${{ secrets.APAK_VERIFYING_KEY }}
       # The account-service base is baked in at compile time
       # (crates/SphereUIComponents/build.rs). CI has no .env, so without
       # this every built Studio reports "sign-in is not configured". It is

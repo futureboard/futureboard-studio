@@ -1,6 +1,0 @@
-#include <winuser.h>
-
-// Cargo build scripts are package-scoped, so this resource is linked into
-// apakinstaller.exe, apak.exe, and makeapak.exe. The shared manifest must stay
-// asInvoker so these per-user tools never request UAC by default.
-1 RT_MANIFEST "apakinstaller.manifest"

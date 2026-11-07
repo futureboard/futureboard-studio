@@ -1,8 +1,0 @@
-[package]
-id = "publisher.package-id"
-name = "Package Name"
-version = "0.1.0"
-type = "Sample"
-
-[install]
-overwrite = true

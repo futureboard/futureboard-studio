@@ -41,12 +41,4 @@ in
         done
         touch $out
       '';
-
-  # The CLI tools start and print their usage.
-  apak-cli = runCommand "apak-cli-check" { } ''
-    ${packages.apakinstaller}/bin/apak --help > apak.txt
-    ${packages.apakinstaller}/bin/makeapak --help > makeapak.txt
-    cat apak.txt makeapak.txt
-    touch $out
-  '';
 }

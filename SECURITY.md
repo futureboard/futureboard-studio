@@ -91,10 +91,6 @@ A project refers to plug-ins and media **by path**. Treat a project from an
 unknown source the way you would treat any other document that can reference
 files on your machine and on the network.
 
-Add-on packages (`.apak`) are installed only if their Ed25519 signature
-verifies against the key built into the installer. Entry paths are confined
-to the install directory.
-
 Locale (`.ftl`) files are compiled into the application and are not loaded
 from disk at runtime.
 

@@ -30,7 +30,6 @@ out/
 *.local
 .apak.secret
 *.apak.secret
-apps/native/apakinstaller/.apak.secret
 signed.key
 *.signed.key
 
@@ -132,7 +131,7 @@ crates/SphereUIComponents/recent-test.json
 build-private.ps1
 build-private-temporary.py
 
-# APAK keys stay local; CI/release builds receive the public key via Actions secrets.
+# Former APAK key files: the tools are gone, but keep any local copies out of Git.
 /apak.public.key
 
 *.pyc
