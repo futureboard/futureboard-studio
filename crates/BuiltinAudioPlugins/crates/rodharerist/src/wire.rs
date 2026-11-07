@@ -192,8 +192,8 @@ pub fn ui_param_id(index: u32) -> Option<&'static str> {
 mod tests {
     use super::*;
     use crate::dsp::{
-        apply_to_params, default_params, ui_values, AmpModel, CabModel, DelayModel, DriveModel,
-        Dsp, EqModel, ModModel, ReverbModel, StageKind, ToneEngineKind, WahModel,
+        AmpModel, CabModel, DelayModel, DriveModel, Dsp, EqModel, ModModel, ReverbModel, StageKind,
+        ToneEngineKind, WahModel, apply_to_params, default_params, ui_values,
     };
 
     #[test]

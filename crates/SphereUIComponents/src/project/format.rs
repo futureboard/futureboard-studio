@@ -680,8 +680,8 @@ fn encode_midi_note(w: &mut FbWriter, n: &MidiNote) {
     w.write_u8(n.articulation); // v25 (0 = none)
     w.write_u64(n.id); // v26 (0 = mint on load for legacy writers)
     w.write_u8(n.release_velocity); // v26 (0 = unset)
-    // v38: continuous pitch performance. Cent deviations keyed by beats from
-    // the note start, so the shape survives transposition and moves.
+                                    // v38: continuous pitch performance. Cent deviations keyed by beats from
+                                    // the note start, so the shape survives transposition and moves.
     w.write_u32(n.pitch_curve.len() as u32);
     for point in &n.pitch_curve {
         w.write_u64(point.id);
@@ -1126,8 +1126,8 @@ fn encode_track(w: &mut FbWriter, t: &ProjectTrack, version: u32) {
     encode_soundfont_player(w, t.soundfont.as_ref()); // v28
     w.write_bool(t.volume_automation_read); // v32
     encode_solfege_engine(w, t.solfege.as_ref()); // v37
-    // v42: the track's ARA plug-in. Identity only â its edits live in the
-    // project-level document archive keyed by (plug-in, track).
+                                                  // v42: the track's ARA plug-in. Identity only â its edits live in the
+                                                  // project-level document archive keyed by (plug-in, track).
     match &t.ara {
         Some(ara) => {
             w.write_u8(1);

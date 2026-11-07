@@ -22,6 +22,7 @@ pub mod combo_box;
 pub mod command_palette;
 pub mod context_menu;
 pub mod controls;
+pub mod drag_pointer;
 #[cfg(feature = "builtin-plugin-editor")]
 pub mod drum_sampler_menu;
 #[cfg(feature = "builtin-plugin-editor")]
@@ -32,7 +33,6 @@ pub mod edit;
 mod editor_panel;
 mod effect_editor_tab_view;
 pub mod extensions_window;
-pub mod drag_pointer;
 pub mod fader;
 pub mod file_browser;
 pub mod form;
@@ -49,9 +49,9 @@ pub mod menu_bar;
 pub mod menu_dropdown;
 pub mod message_box_dialog;
 pub mod midi_editor_window;
-pub mod midi_tools_dialog;
 pub mod midi_export_dialog;
 pub mod midi_import_dialog;
+pub mod midi_tools_dialog;
 pub mod missing_media_window;
 pub mod mixer_master_strip_view;
 pub mod mixer_meter_layer;
@@ -67,11 +67,17 @@ pub use mixer_tree_sidebar_view::MixerTreeSidebar;
 mod mixer_window;
 pub(crate) use mixer_window::{external_mixer_debug, external_mixer_debug_enabled};
 #[cfg(feature = "builtin-plugin-editor")]
+pub mod airboost_plate;
+#[cfg(feature = "builtin-plugin-editor")]
 pub mod band_model;
 #[cfg(feature = "builtin-plugin-editor")]
 pub mod band_panel;
 #[cfg(feature = "builtin-plugin-editor")]
 pub mod burn_limit_plate;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod deesser_plate;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod duckstep_plate;
 #[cfg(feature = "builtin-plugin-editor")]
 pub mod dyn_model;
 #[cfg(feature = "builtin-plugin-editor")]
@@ -109,7 +115,6 @@ pub mod numeric_edit;
 pub mod panel;
 mod performance_overlay;
 pub mod performance_window;
-pub mod process_explorer_window;
 pub mod piano_roll;
 pub(crate) mod pitch_wheel;
 #[cfg(feature = "builtin-plugin-editor")]
@@ -127,6 +132,7 @@ pub mod plugin_live;
 pub mod plugin_manager;
 pub mod plugin_picker;
 pub mod plugin_shell_text;
+pub mod process_explorer_window;
 pub mod progress_dialog;
 pub mod project_settings_window;
 pub mod project_switcher;
@@ -153,8 +159,6 @@ pub mod slicer_panel;
 pub mod slicer_window;
 pub mod slider;
 pub mod solfege_editor;
-pub mod voxtune;
-pub mod voxtune_panel;
 pub mod song_text_panel;
 pub mod soundfont_player_mdi;
 pub mod soundfont_player_window;
@@ -176,6 +180,8 @@ pub mod virtual_keyboard_window;
 pub mod virtual_speaker_window;
 #[cfg(feature = "gpu-renderer")]
 pub mod visualizer;
+pub mod voxtune;
+pub mod voxtune_panel;
 #[cfg(feature = "builtin-plugin-editor")]
 pub mod white_sharp_meter;
 #[cfg(feature = "builtin-plugin-editor")]
@@ -194,12 +200,6 @@ pub mod wrap_synth_panel;
 pub mod wrap_synth_window;
 #[cfg(feature = "builtin-plugin-editor")]
 pub mod zapp_plate;
-#[cfg(feature = "builtin-plugin-editor")]
-pub mod airboost_plate;
-#[cfg(feature = "builtin-plugin-editor")]
-pub mod deesser_plate;
-#[cfg(feature = "builtin-plugin-editor")]
-pub mod duckstep_plate;
 
 pub use about_window::{open_about_window, AboutWindow};
 pub use add_track_dialog::{

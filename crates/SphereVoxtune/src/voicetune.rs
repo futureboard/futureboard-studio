@@ -2,11 +2,11 @@
 //! and TD-PSOLA offline rendering.
 //! Borrowed from `Futureboard-release/crates/SphereVoiceTune` and upgraded with real TD-PSOLA rendering.
 
-use std::collections::HashMap;
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
 use crate::dsp_core::db_to_linear;
 use crate::shifter::{Control, MAX_FORMANT, Shifter};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum VoiceTuneError {
@@ -601,7 +601,11 @@ impl OfflineVoiceRenderer {
                 shifter.push_control(control);
             }
 
-            let sample = if idx < total { original_samples[idx] } else { 0.0 };
+            let sample = if idx < total {
+                original_samples[idx]
+            } else {
+                0.0
+            };
             let (wet, _) = shifter.process(sample, sample);
             if idx >= latency {
                 output.push(wet[0]);

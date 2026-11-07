@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use sphere_midi_service::mpe::MpeTrackConfiguration;
 use sphere_midi_service::NoteExpression;
 use sphere_soundfont_player::{
-    SoundfontChannels, SoundfontEnvelope, SoundfontPlayerMode, SoundfontRenderQuality,
-    default_channels,
+    default_channels, SoundfontChannels, SoundfontEnvelope, SoundfontPlayerMode,
+    SoundfontRenderQuality,
 };
 use SphereAudioProcessor::StretchParams;
 

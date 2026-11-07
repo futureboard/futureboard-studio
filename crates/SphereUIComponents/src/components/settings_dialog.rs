@@ -47,8 +47,8 @@ use crate::overlay::{
 };
 use crate::settings::{
     DefaultMonitorMode, GpuDevicePreference, MidiDeviceDirection, MidiDeviceSetting, RenderMode,
-    SettingsAudioLatencySnapshot, SettingsModel, SettingsSchema, StudioWindowStyle, ToolBarStyle,
-    TextRenderingBackend,
+    SettingsAudioLatencySnapshot, SettingsModel, SettingsSchema, StudioWindowStyle,
+    TextRenderingBackend, ToolBarStyle,
 };
 use crate::theme::{self, Colors};
 use crate::window_position::{apply_owner_display, centered_window_bounds};

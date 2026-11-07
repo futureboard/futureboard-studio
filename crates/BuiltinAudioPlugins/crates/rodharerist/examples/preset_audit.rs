@@ -36,8 +36,8 @@
 use std::f32::consts::TAU;
 
 use builtin_dsp_core::StereoEffect;
-use rodharerist::{default_params, AmpModel, CabModel, Dsp, MicModel, StageKind, PATH_SLOTS};
-use rustfft::{num_complex::Complex, FftPlanner};
+use rodharerist::{AmpModel, CabModel, Dsp, MicModel, PATH_SLOTS, StageKind, default_params};
+use rustfft::{FftPlanner, num_complex::Complex};
 
 const SR: f32 = 48_000.0;
 /// Long enough for a reverb tail and a few delay repeats to establish.

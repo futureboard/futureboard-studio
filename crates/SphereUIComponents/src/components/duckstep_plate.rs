@@ -15,27 +15,27 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use duckstep::{
-    Band, Feel, MAX_POINTS, Mode, Monitor, Params, Rate, ReleaseSync, SHAPE_PRESETS, Source,
-    Trigger, shape_at, shape_position, shaper_gain, telemetry,
+    shape_at, shape_position, shaper_gain, telemetry, Band, Feel, Mode, Monitor, Params, Rate,
+    ReleaseSync, Source, Trigger, MAX_POINTS, SHAPE_PRESETS,
 };
 use gpui::{
-    Anchor, AnyElement, App, AppContext, ElementId, FontWeight, InteractiveElement, IntoElement,
-    MouseButton, MouseMoveEvent, ParentElement, Rgba, ScrollWheelEvent, SharedString,
-    StatefulInteractiveElement, Styled, Window, anchored, canvas, deferred, div, point, px,
+    anchored, canvas, deferred, div, point, px, Anchor, AnyElement, App, AppContext, ElementId,
+    FontWeight, InteractiveElement, IntoElement, MouseButton, MouseMoveEvent, ParentElement, Rgba,
+    ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Window,
 };
 
 use crate::components::builtin_plugin_editor::builtin_duckstep_params;
 use crate::components::builtin_plugin_editor_window::{BuiltinEditorHostOps, PluginInstanceKey};
-use crate::components::fader::{FaderDrag, drag_to, is_reset_click};
+use crate::components::fader::{drag_to, is_reset_click, FaderDrag};
 use crate::components::fx_model::KnobSpec;
 use crate::components::native_plugin_shell::ShellIdentity;
 use crate::components::plate::{
-    self, Align, CARD_EDGE, Dial, DialUnit, GROUND, ICON, INK, KnobLook, OFF, PALE, SOFT,
-    WELL_EDGE, WHITE, color, color_a, deck, icon, live_slot, numbers, paint_dot, paint_polygon,
-    paint_polyline, paint_text, plate_frame, plate_scale, square, type_px, well, words,
+    self, color, color_a, deck, icon, live_slot, numbers, paint_dot, paint_polygon, paint_polyline,
+    paint_text, plate_frame, plate_scale, square, type_px, well, words, Align, Dial, DialUnit,
+    KnobLook, CARD_EDGE, GROUND, ICON, INK, OFF, PALE, SOFT, WELL_EDGE, WHITE,
 };
 use crate::components::plugin_kit::{
-    Cx, KitEditor, KitModel, KitPreset, KitWindow, LiveBounds, LiveSlot, bank, open_kit_editor,
+    bank, open_kit_editor, Cx, KitEditor, KitModel, KitPreset, KitWindow, LiveBounds, LiveSlot,
 };
 use crate::components::plugin_live::{HistoryPoint, Live};
 

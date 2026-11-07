@@ -64,13 +64,7 @@ impl Tremolo {
         self.configure_kind(rate, depth, shape, TremKind::Opto);
     }
 
-    pub(super) fn configure_kind(
-        &mut self,
-        rate: f32,
-        depth: f32,
-        shape: f32,
-        kind: TremKind,
-    ) {
+    pub(super) fn configure_kind(&mut self, rate: f32, depth: f32, shape: f32, kind: TremKind) {
         self.kind = kind;
         let (lo, span, depth_scale) = match kind {
             // 0.5 Hz → 12 Hz. The original opto.

@@ -112,13 +112,7 @@ impl Chorus {
         self.configure_voice(rate, depth, mix, ChorusVoice::classic());
     }
 
-    pub(super) fn configure_voice(
-        &mut self,
-        rate: f32,
-        depth: f32,
-        mix: f32,
-        voice: ChorusVoice,
-    ) {
+    pub(super) fn configure_voice(&mut self, rate: f32, depth: f32, mix: f32, voice: ChorusVoice) {
         let sr = self.sample_rate;
         let rate_hz = voice.rate_lo + (rate / 10.0).clamp(0.0, 1.0) * voice.rate_span;
         self.lfo_l.set_rate(rate_hz, sr);

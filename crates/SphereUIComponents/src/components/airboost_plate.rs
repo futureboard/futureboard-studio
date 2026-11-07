@@ -10,25 +10,25 @@
 
 use std::sync::Arc;
 
-use SpherePluginHost::spectrum::{MAX_HZ, MIN_HZ, SPECTRUM_BINS};
 use airboost::{AirFreq, Params, Shape, StereoMode};
 use gpui::{
-    AnyElement, App, FontWeight, InteractiveElement, IntoElement, ParentElement, Rgba,
-    StatefulInteractiveElement, Styled, Window, div, px,
+    div, px, AnyElement, App, FontWeight, InteractiveElement, IntoElement, ParentElement, Rgba,
+    StatefulInteractiveElement, Styled, Window,
 };
+use SpherePluginHost::spectrum::{MAX_HZ, MIN_HZ, SPECTRUM_BINS};
 
 use crate::components::builtin_plugin_editor::builtin_airboost_params;
 use crate::components::builtin_plugin_editor_window::{BuiltinEditorHostOps, PluginInstanceKey};
 use crate::components::fx_model::KnobSpec;
 use crate::components::native_plugin_shell::ShellIdentity;
 use crate::components::plate::{
-    self, Align, Dial, DialUnit, FAINT, ICON, INK, KnobCell, KnobLook, PillLook, SOFT, caption,
-    card, card_title, color, color_a, columns, deck, header, icon, knob, legend, live_slot,
-    numbers, paint_dot, paint_polygon, paint_polyline, paint_rect, paint_text, pill, pill_colors,
-    plate_frame, plate_scale, signed, switch, type_px, well, words,
+    self, caption, card, card_title, color, color_a, columns, deck, header, icon, knob, legend,
+    live_slot, numbers, paint_dot, paint_polygon, paint_polyline, paint_rect, paint_text, pill,
+    pill_colors, plate_frame, plate_scale, signed, switch, type_px, well, words, Align, Dial,
+    DialUnit, KnobCell, KnobLook, PillLook, FAINT, ICON, INK, SOFT,
 };
 use crate::components::plugin_kit::{
-    Cx, KitEditor, KitModel, KitPreset, KitWindow, LiveBounds, LiveSlot, bank, open_kit_editor,
+    bank, open_kit_editor, Cx, KitEditor, KitModel, KitPreset, KitWindow, LiveBounds, LiveSlot,
 };
 use crate::components::plugin_live::Live;
 

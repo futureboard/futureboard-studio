@@ -1,8 +1,8 @@
 //! Realtime monophonic pitch detection (decimated + full-rate refined YIN).
 //! Borrowed from `Futureboard-release/crates/BuiltinAudioPlugins/crates/whitesharp/src/detect.rs`.
 
-use biquad::{Biquad, Coefficients, DirectForm1, ToHertz, Type};
 use crate::dsp_core::flush_denormal;
+use biquad::{Biquad, Coefficients, DirectForm1, ToHertz, Type};
 
 const ANALYSIS_RATE: f32 = 12_000.0;
 const ANALYSIS_BAND_HZ: f32 = 4_000.0;
@@ -170,12 +170,9 @@ impl Detector {
         let first = self.filters[0].run(sample);
         let filtered = flush_denormal(self.filters[1].run(first));
         let k = self.power_step;
-        self.power_all = flush_denormal(
-            self.power_all + (sample * sample - self.power_all) * k,
-        );
-        self.power_low = flush_denormal(
-            self.power_low + (filtered * filtered - self.power_low) * k,
-        );
+        self.power_all = flush_denormal(self.power_all + (sample * sample - self.power_all) * k);
+        self.power_low =
+            flush_denormal(self.power_low + (filtered * filtered - self.power_low) * k);
         let full_mask = self.full.len() - 1;
         self.full[self.full_write] = filtered;
         self.full_write = (self.full_write + 1) & full_mask;

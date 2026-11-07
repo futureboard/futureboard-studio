@@ -25,8 +25,8 @@
 use std::sync::OnceLock;
 
 use crate::dsp::{
-    default_params, AmpModel, CabModel, DelayModel, DriveModel, EqModel, Line2Mode, MicModel,
-    ModModel, Params, ReverbModel, StageKind, ToneEngineKind, WahModel, PATH_SLOTS,
+    AmpModel, CabModel, DelayModel, DriveModel, EqModel, Line2Mode, MicModel, ModModel, PATH_SLOTS,
+    Params, ReverbModel, StageKind, ToneEngineKind, WahModel, default_params,
 };
 
 /// One factory preset.
@@ -519,14 +519,16 @@ mod tests {
     #[test]
     fn the_bank_uses_the_new_amps_and_one_wet_dry_wet_rig() {
         let bank = factory_presets();
-        assert!(bank
-            .iter()
-            .any(|p| p.params.amp_model == AmpModel::Princeton));
+        assert!(
+            bank.iter()
+                .any(|p| p.params.amp_model == AmpModel::Princeton)
+        );
         assert!(bank.iter().any(|p| p.params.amp_model == AmpModel::Hundred));
         assert!(bank.iter().any(|p| p.params.amp_model == AmpModel::Mark));
-        assert!(bank
-            .iter()
-            .any(|p| p.params.amp_model == AmpModel::Normal15));
+        assert!(
+            bank.iter()
+                .any(|p| p.params.amp_model == AmpModel::Normal15)
+        );
         let wide: Vec<_> = bank
             .iter()
             .filter(|p| p.params.line2_mode == Line2Mode::WetDryWet)

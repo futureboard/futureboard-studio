@@ -29,13 +29,13 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use cef::rc::Rc as _;
 #[cfg(target_os = "windows")]
 use cef::AcceleratedPaintInfo;
+use cef::rc::Rc as _;
 use cef::{
-    wrap_render_handler, Browser, ImplBrowserHost, ImplRenderHandler, KeyEvent, KeyEventType,
-    MouseButtonType, MouseEvent, PaintElementType, Rect, RenderHandler, ScreenInfo,
-    WrapRenderHandler,
+    Browser, ImplBrowserHost, ImplRenderHandler, KeyEvent, KeyEventType, MouseButtonType,
+    MouseEvent, PaintElementType, Rect, RenderHandler, ScreenInfo, WrapRenderHandler,
+    wrap_render_handler,
 };
 
 // `cef_event_flags_t` values. The `modifiers` fields on `MouseEvent`/`KeyEvent`

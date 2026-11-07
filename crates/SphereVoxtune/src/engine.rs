@@ -11,9 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::audio_io::{DecodedAudio, decode_audio_bytes_to_mono, decode_audio_file_to_mono};
 use crate::backing::Backing;
-use crate::dsp_core::{
-    SoftKneeCompressor, StereoEffect, clamp, db_to_linear,
-};
+use crate::dsp_core::{SoftKneeCompressor, StereoEffect, clamp, db_to_linear};
 use crate::scale::{ALL_NOTES, Scale, nearest_target, refine_scale, scale_mask};
 use crate::shifter::{Control, MAX_FORMANT, Shifter};
 use crate::stretch::Stretcher;
@@ -587,7 +585,10 @@ impl CantoEngine {
     /// Swaps in already-decoded audio (decoded at `self.sample_rate`) and runs
     /// analysis. Split from decoding so callers sharing the engine with an
     /// audio thread can decode without holding the engine lock.
-    pub fn install_decoded(&mut self, decoded: DecodedAudio) -> Result<CantoAnalysisResult, String> {
+    pub fn install_decoded(
+        &mut self,
+        decoded: DecodedAudio,
+    ) -> Result<CantoAnalysisResult, String> {
         self.swap_audio(decoded);
         self.analyze_loaded_audio()
     }
@@ -1605,8 +1606,11 @@ fn segment_canto_notes(frames: &[PitchFrame], key_pc: u8) -> Vec<CantoNote> {
                     let u = k as f32 / (CONTOUR_POINTS - 1) as f32;
                     if u <= split_ratio {
                         let lt = (u / split_ratio).clamp(0.0, 1.0);
-                        combined_contour
-                            .push(clamp(sample_curve(&prev.contour, lt) + shift_cents, -55.0, 55.0));
+                        combined_contour.push(clamp(
+                            sample_curve(&prev.contour, lt) + shift_cents,
+                            -55.0,
+                            55.0,
+                        ));
                         combined_env.push(sample_curve(&prev.envelope, lt));
                     } else {
                         let lt = ((u - split_ratio) / (1.0 - split_ratio)).clamp(0.0, 1.0);
@@ -1720,8 +1724,8 @@ fn split_voiced_segment(
                 notes.push(note);
             }
             note_start_idx = i;
-            plateau_midi = smooth_midi[i..lookahead_end].iter().sum::<f64>()
-                / (lookahead_end - i) as f64;
+            plateau_midi =
+                smooth_midi[i..lookahead_end].iter().sum::<f64>() / (lookahead_end - i) as f64;
         }
     }
 
@@ -1815,8 +1819,7 @@ fn build_pitched_note(
     let drift = smooth_contour[CONTOUR_POINTS - 3] - smooth_contour[5];
     let mut vib_acc = 0.0f32;
     for k in 4..(CONTOUR_POINTS - 2) {
-        let local_mean =
-            (smooth_contour[k - 2] + smooth_contour[k] + smooth_contour[k + 2]) / 3.0;
+        let local_mean = (smooth_contour[k - 2] + smooth_contour[k] + smooth_contour[k + 2]) / 3.0;
         let hp = smooth_contour[k] - local_mean;
         vib_acc += hp * hp;
     }

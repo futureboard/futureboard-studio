@@ -1943,7 +1943,10 @@ mod audio_clip_split_tests {
         assert_eq!(name, "Take Copy");
         assert_eq!(derived_clip_name("Take Copy", "Split"), "Take Split");
         assert_eq!(derived_clip_name("Take Split Copy 2", "Copy"), "Take Copy");
-        assert_eq!(derived_clip_name("Vocal take 2", "Copy"), "Vocal take 2 Copy");
+        assert_eq!(
+            derived_clip_name("Vocal take 2", "Copy"),
+            "Vocal take 2 Copy"
+        );
         assert_eq!(derived_clip_name("Photocopy", "Copy"), "Photocopy Copy");
         assert_eq!(derived_clip_name("Copy", "Copy"), "Copy Copy");
 
@@ -1971,7 +1974,11 @@ mod audio_clip_split_tests {
         for _ in 0..3 {
             let (_, duplicate) = tracks_state.build_clip_duplicate_after("clip-5").unwrap();
             copy = Some((String::new(), duplicate.clone()));
-            let track = tracks_state.tracks.iter_mut().find(|t| t.id == track).unwrap();
+            let track = tracks_state
+                .tracks
+                .iter_mut()
+                .find(|t| t.id == track)
+                .unwrap();
             let original = track.clips.iter_mut().find(|c| c.id == "clip-5").unwrap();
             original.name = duplicate.name;
         }

@@ -12,25 +12,25 @@
 
 use std::sync::Arc;
 
-use SpherePluginHost::spectrum::{MAX_HZ, MIN_HZ, SPECTRUM_BINS};
 use deesser::{Mode, Params, StereoMode};
 use gpui::{
-    AnyElement, App, FontWeight, InteractiveElement, IntoElement, MouseButton, MouseMoveEvent,
-    ParentElement, Rgba, StatefulInteractiveElement, Styled, Window, div, px,
+    div, px, AnyElement, App, FontWeight, InteractiveElement, IntoElement, MouseButton,
+    MouseMoveEvent, ParentElement, Rgba, StatefulInteractiveElement, Styled, Window,
 };
+use SpherePluginHost::spectrum::{MAX_HZ, MIN_HZ, SPECTRUM_BINS};
 
 use crate::components::builtin_plugin_editor::builtin_deesser_params;
 use crate::components::builtin_plugin_editor_window::{BuiltinEditorHostOps, PluginInstanceKey};
 use crate::components::fx_model::KnobSpec;
 use crate::components::native_plugin_shell::ShellIdentity;
 use crate::components::plate::{
-    self, Align, Dial, DialUnit, FACE, FACE_EDGE, FAINT, GROUND, INK, KnobCell, KnobLook, PillLook,
-    SOFT, WELL_EDGE, WHITE, caption, card, card_title, color, color_a, columns, deck, header, icon,
-    knob_reading, legend, live_slot, numbers, paint_polygon, paint_polyline, paint_rect,
-    paint_text, pill, plate_frame, plate_scale, type_px, well,
+    self, caption, card, card_title, color, color_a, columns, deck, header, icon, knob_reading,
+    legend, live_slot, numbers, paint_polygon, paint_polyline, paint_rect, paint_text, pill,
+    plate_frame, plate_scale, type_px, well, Align, Dial, DialUnit, KnobCell, KnobLook, PillLook,
+    FACE, FACE_EDGE, FAINT, GROUND, INK, SOFT, WELL_EDGE, WHITE,
 };
 use crate::components::plugin_kit::{
-    Cx, KitEditor, KitModel, KitPreset, KitWindow, LiveBounds, LiveSlot, bank, open_kit_editor,
+    bank, open_kit_editor, Cx, KitEditor, KitModel, KitPreset, KitWindow, LiveBounds, LiveSlot,
 };
 use crate::components::plugin_live::Live;
 

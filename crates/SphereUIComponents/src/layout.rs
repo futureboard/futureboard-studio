@@ -332,7 +332,9 @@ fn native_audio_backend_from_driver_type(driver_type: &str) -> DirectAudio::Audi
 }
 
 /// Map the persisted Audioguard setting to the engine's level.
-fn engine_audioguard_level(level: crate::settings::AudioguardLevel) -> DirectAudio::AudioguardLevel {
+fn engine_audioguard_level(
+    level: crate::settings::AudioguardLevel,
+) -> DirectAudio::AudioguardLevel {
     use crate::settings::AudioguardLevel as Ui;
     match level {
         Ui::Off => DirectAudio::AudioguardLevel::Off,

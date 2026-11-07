@@ -607,9 +607,9 @@ fn open_jam_from_link(studio: WindowHandle<StudioLayout>, link: String, cx: &mut
     }
     cx.background_executor()
         .spawn(async move {
-            if let Err(error) = sphere_ui_components::jam::run_action(|controller| {
-                controller.join_with_link(&link)
-            }) {
+            if let Err(error) =
+                sphere_ui_components::jam::run_action(|controller| controller.join_with_link(&link))
+            {
                 boot::log(&format!(
                     "fbrd jam link: join failed: {}",
                     error.user_message()
