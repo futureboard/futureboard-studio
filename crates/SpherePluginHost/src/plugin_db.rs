@@ -18,10 +18,10 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use crate::registry::{
-    PluginFormat, PluginKind, PluginStatus, RegistryPlugin, classify_kind, display_category,
+    classify_kind, display_category, PluginFormat, PluginKind, PluginStatus, RegistryPlugin,
 };
 
 /// 1 → 2 added `plugins.sub_categories`; 2 → 3 added `plugins.is_ara`; 3 → 4
@@ -987,11 +987,9 @@ mod tests {
         assert!(super::has_column(&conn, "plugins", "preset_path").unwrap());
         assert!(super::read_all(&conn).unwrap()[0].preset_path.is_none());
         // An instrument without its `.pst` is not offered to the Browser…
-        assert!(
-            super::instrument_presets(&conn, |_| None)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(super::instrument_presets(&conn, |_| None)
+            .unwrap()
+            .is_empty());
         // …unless the scan cache holds one for that plug-in id.
         let cached = std::path::PathBuf::from("C:/cache/Synth.pst");
         let listed =

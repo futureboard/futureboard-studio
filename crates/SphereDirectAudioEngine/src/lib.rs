@@ -79,23 +79,23 @@ pub use crate::audio_source::{
     open_clip_audio_source, read_frame_stereo, sample_source_stereo, ClipAudioSource,
     MappedWavSource,
 };
-pub use crate::engine::{AudioguardLevel, DropoutDiagnostics, DropoutProtectionMode, DropoutReason};
 /// Instruction set of the render kernels: AVX2 by default, SSE as the fallback.
 pub use crate::dsp::simd::{
     active_level as active_simd_level, cpu_supports_avx2, set_simd_level, SimdLevel,
 };
+pub use crate::engine::{
+    AudioguardLevel, DropoutDiagnostics, DropoutProtectionMode, DropoutReason,
+};
 pub use crate::error::SphereAudioError;
 pub use crate::export::{
     arrangement_bounds_samples, beats_to_samples, export_arrangement,
-    render_block_size_for_sample_rate,
     export_arrangement_with_bridges, export_render_job, export_render_job_with_bridges,
-    export_render_job_with_plugins, AraRendererMap, OfflinePlugins,
-    export_tracks_single_pass, export_tracks_single_pass_with_bridges, partial_path_for,
-    record_render_job, render_offline,
-    render_offline_tracks, ArrangementExportRequest,
-    ArrangementExportSummary, ExportCancelToken, ExportError, ExportNormalizeMode, ExportProgress,
-    ExportStage, ExportTailMode, LevelReport, OfflineRenderRequest, OfflineRenderSummary,
-    RenderJob, TrackExportTarget,
+    export_render_job_with_plugins, export_tracks_single_pass,
+    export_tracks_single_pass_with_bridges, partial_path_for, record_render_job,
+    render_block_size_for_sample_rate, render_offline, render_offline_tracks, AraRendererMap,
+    ArrangementExportRequest, ArrangementExportSummary, ExportCancelToken, ExportError,
+    ExportNormalizeMode, ExportProgress, ExportStage, ExportTailMode, LevelReport, OfflinePlugins,
+    OfflineRenderRequest, OfflineRenderSummary, RenderJob, TrackExportTarget,
 };
 pub use crate::jam_bus::{
     is_jam_device, jam_device_id, jam_stream_id, JamAudioBus, JamChannelMode, JamInputSlot,
@@ -118,7 +118,7 @@ pub use crate::plugin_backend::PluginModuleFormat;
 /// Shared automation curve shaping — the UI lane renderer calls this so the drawn
 /// curve matches realtime playback and offline export exactly.
 pub use crate::runtime::automation_curve_factor;
-pub use crate::visualizer_tap::{TapRead, VisualizerTap, visualizer_tap};
+pub use crate::visualizer_tap::{visualizer_tap, TapRead, VisualizerTap};
 // ARA renderers are built by the app (which owns the ARA document) and installed
 // with `AudioEngine::set_ara_renderers`, so the type has to be nameable outside
 // this crate.

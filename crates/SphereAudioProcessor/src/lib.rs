@@ -46,8 +46,8 @@ pub use stem::{
     StemPlatformRuntime, StemSet, UVR_MODEL_RELEASE_BASE, auto_stem_extract_params,
     create_mdx_net_backend, current_stem_platform, default_models_dir, default_stem_extract_params,
     download_model, ensure_models_dir, extract_stems, gpu_available, mdx_net_gpu_params,
-    model_installed, resolve_current_platform_runtime, resolve_device, resolve_installed_model_files,
-    resolve_platform_runtime, set_gpu_detected,
+    model_installed, resolve_current_platform_runtime, resolve_device,
+    resolve_installed_model_files, resolve_platform_runtime, set_gpu_detected,
 };
 pub use stretching::{
     StretchAlgorithm, StretchBackend, StretchError, StretchMode, StretchParams, StretchProcessor,

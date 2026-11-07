@@ -77,8 +77,8 @@ fn main() {
         })
         .collect();
 
-    let host = SpherePluginHost::plugin_host_client::locate_plugin_host_binary()
-        .unwrap_or_else(|error| {
+    let host =
+        SpherePluginHost::plugin_host_client::locate_plugin_host_binary().unwrap_or_else(|error| {
             eprintln!("{error} — build it with `cargo build -p sphere-plugin-host --bins`");
             std::process::exit(2);
         });
@@ -104,7 +104,10 @@ fn main() {
         if editor {
             println!("  editor   {:?}", outcome.editor);
         }
-        println!("  host     lost={:?} exit={:?}", outcome.host_lost, outcome.exit);
+        println!(
+            "  host     lost={:?} exit={:?}",
+            outcome.host_lost, outcome.exit
+        );
         println!("  RESULT   {}", if ok { "OK" } else { "FAILED" });
     }
     println!("\n{} probed, {failures} failed", plugins.len());
@@ -187,14 +190,26 @@ fn probe(host: &Path, scanner: &Path, plugin: &Path, editor: bool, seconds: f32)
     let pid = client.pid();
     println!("  host pid {pid}");
 
-    let _ = client.load_plugin(INSTANCE, &path, &class_id, SAMPLE_RATE, BLOCK, Some("VST3".to_string()));
-    outcome.loaded = wait_for(&client, &mut outcome, Duration::from_secs(60), |event| match event {
-        HostEvent::PluginLoaded { name, .. } | HostEvent::PluginAlreadyLoaded { name, .. } => {
-            Some(Ok(name.clone()))
-        }
-        HostEvent::PluginLoadFailed { error, .. } => Some(Err(error.clone())),
-        _ => None,
-    })
+    let _ = client.load_plugin(
+        INSTANCE,
+        &path,
+        &class_id,
+        SAMPLE_RATE,
+        BLOCK,
+        Some("VST3".to_string()),
+    );
+    outcome.loaded = wait_for(
+        &client,
+        &mut outcome,
+        Duration::from_secs(60),
+        |event| match event {
+            HostEvent::PluginLoaded { name, .. } | HostEvent::PluginAlreadyLoaded { name, .. } => {
+                Some(Ok(name.clone()))
+            }
+            HostEvent::PluginLoadFailed { error, .. } => Some(Err(error.clone())),
+            _ => None,
+        },
+    )
     .or_else(|| Some(Err("no answer".to_string())));
 
     if matches!(outcome.loaded, Some(Ok(_))) {
@@ -226,15 +241,19 @@ fn probe(host: &Path, scanner: &Path, plugin: &Path, editor: bool, seconds: f32)
                     600,
                     96,
                 );
-                outcome.editor =
-                    wait_for(&client, &mut outcome, Duration::from_secs(30), |event| match event {
+                outcome.editor = wait_for(
+                    &client,
+                    &mut outcome,
+                    Duration::from_secs(30),
+                    |event| match event {
                         HostEvent::EditorAttached { result, .. } => {
                             Some(Ok(format!("attached result={result}")))
                         }
                         HostEvent::EditorAttachFailed { error, .. } => Some(Err(error.clone())),
                         _ => None,
-                    })
-                    .or_else(|| Some(Err("no answer".to_string())));
+                    },
+                )
+                .or_else(|| Some(Err("no answer".to_string())));
                 if matches!(outcome.editor, Some(Ok(_))) {
                     // Let it settle, then say what the plug-in built in the
                     // window: an editor that attached but drew nothing shows
@@ -311,11 +330,11 @@ fn print_log_tail(host: &Path, pid: u32) {
 /// to a top-level window and a content child.
 #[cfg(windows)]
 mod window {
-    use windows::core::{PCWSTR, w};
+    use windows::core::{w, PCWSTR};
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CW_USEDEFAULT, CreateWindowExW, DestroyWindow, DispatchMessageW, MSG, PM_REMOVE,
-        PeekMessageW, SW_SHOWNOACTIVATE, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
+        CreateWindowExW, DestroyWindow, DispatchMessageW, PeekMessageW, ShowWindow,
+        TranslateMessage, CW_USEDEFAULT, MSG, PM_REMOVE, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE,
         WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
     };
 
@@ -364,11 +383,11 @@ mod window {
     /// — the editor shell it opens and what the plug-in built inside it —
     /// with class, screen rect, visibility and style.
     pub fn describe(content: u64, host_pid: u32) -> Vec<String> {
-        use windows::Win32::Foundation::{LPARAM, RECT};
         use windows::core::BOOL;
+        use windows::Win32::Foundation::{LPARAM, RECT};
         use windows::Win32::UI::WindowsAndMessaging::{
-            EnumChildWindows, GWL_EXSTYLE, GWL_STYLE, GetClassNameW, GetParent, GetWindowLongPtrW,
-            GetWindowRect, GetWindowThreadProcessId, IsWindowVisible,
+            EnumChildWindows, GetClassNameW, GetParent, GetWindowLongPtrW, GetWindowRect,
+            GetWindowThreadProcessId, IsWindowVisible, GWL_EXSTYLE, GWL_STYLE,
         };
         unsafe extern "system" fn visit(hwnd: HWND, lines: LPARAM) -> BOOL {
             unsafe {

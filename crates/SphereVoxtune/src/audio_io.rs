@@ -228,7 +228,9 @@ pub fn compute_waveform_peaks(mono: &[f32], num_bins: usize) -> Vec<f32> {
     let mut peaks = Vec::with_capacity(bins);
     for b in 0..bins {
         let start = (b * mono.len()) / bins;
-        let end = (((b + 1) * mono.len()) / bins).max(start + 1).min(mono.len());
+        let end = (((b + 1) * mono.len()) / bins)
+            .max(start + 1)
+            .min(mono.len());
         let mut max_abs = 0.0f32;
         for &s in &mono[start..end] {
             let a = s.abs();
@@ -269,9 +271,7 @@ fn decode_via_symphonia_reader(
     let track = format
         .tracks()
         .iter()
-        .find(|t| {
-            t.codec_params.codec != CODEC_TYPE_NULL && t.codec_params.sample_rate.is_some()
-        })
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL && t.codec_params.sample_rate.is_some())
         .ok_or_else(|| "No decodable audio track found in file".to_string())?
         .clone();
 

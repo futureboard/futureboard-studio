@@ -1,12 +1,12 @@
 //! WhiteSharp — realtime pitch correction (Auto mode) DSP processor.
 //! Borrowed from `Futureboard-release/crates/BuiltinAudioPlugins/crates/whitesharp/src/lib.rs`.
 
-use serde::{Deserialize, Serialize};
 use crate::detect::{self, Detector, Estimate};
 use crate::dsp_core::{Smoothed, StereoEffect, clamp, db_to_linear, smoothing_step};
 use crate::scale::{ALL_NOTES, Scale, nearest_target, pitch_class, scale_mask};
 use crate::shifter::{Control, MAX_FORMANT, Shifter};
 use crate::splice::{self, Splicer};
+use serde::{Deserialize, Serialize};
 
 pub const MAX_RETUNE_MS: f32 = 400.0;
 const HUMANIZE_MS: f32 = 350.0;

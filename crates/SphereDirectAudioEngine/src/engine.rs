@@ -1977,8 +1977,7 @@ impl EngineInner {
             }
             mirror.clone()
         };
-        if !lent.is_empty()
-            && !self.wait_for_command_barrier(std::time::Duration::from_millis(500))
+        if !lent.is_empty() && !self.wait_for_command_barrier(std::time::Duration::from_millis(500))
         {
             // No open stream, or a stalled callback: the same grace the bridge
             // handoff falls back to.
@@ -8732,7 +8731,9 @@ mod routing_tests {
     fn send_and_bypass_automation_override_the_controls() {
         use crate::runtime::{volume_db_to_norm, volume_norm_to_linear};
         let mut src = track("src", "audio", vec![send("ret", 1.0)]);
-        src.inserts = vec![super::bridge_insert_tests::bridge_effect_track_with_id("fx")];
+        src.inserts = vec![super::bridge_insert_tests::bridge_effect_track_with_id(
+            "fx",
+        )];
         let send_id = src.sends[0].id.clone();
         src.automation_lanes = vec![
             automation_lane(
@@ -8759,9 +8760,15 @@ mod routing_tests {
         assert!((level - expected).abs() < 1e-6, "{level} vs {expected}");
 
         render::apply_insert_bypass_automation(&mut src, Some(4.0));
-        assert!(!src.inserts[0].active(), "bypassed by its lane while playing");
+        assert!(
+            !src.inserts[0].active(),
+            "bypassed by its lane while playing"
+        );
         render::apply_insert_bypass_automation(&mut src, None);
-        assert!(src.inserts[0].active(), "its own switch stands while stopped");
+        assert!(
+            src.inserts[0].active(),
+            "its own switch stands while stopped"
+        );
 
         // A disabled (Off) lane says nothing: the send's own values stand.
         for lane in &mut src.automation_lanes {
@@ -8788,7 +8795,10 @@ mod routing_tests {
         assert_eq!(render::master_automation_volume(&tracks, None, 4.0), None);
 
         tracks[1].automation_lanes[0].enabled = false;
-        assert_eq!(render::master_automation_volume(&tracks, Some(1), 4.0), None);
+        assert_eq!(
+            render::master_automation_volume(&tracks, Some(1), 4.0),
+            None
+        );
     }
 
     #[test]

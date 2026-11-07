@@ -88,7 +88,10 @@ fn run(stem: &str, blocks: usize, change: impl Fn(usize) -> Option<(u32, f32)>) 
         finite: true,
         ..Run::default()
     };
-    let mut last = [(left[BLOCK - 2], right[BLOCK - 2]), (left[BLOCK - 1], right[BLOCK - 1])];
+    let mut last = [
+        (left[BLOCK - 2], right[BLOCK - 2]),
+        (left[BLOCK - 1], right[BLOCK - 1]),
+    ];
     for block in 0..blocks {
         for i in 0..BLOCK {
             (left[i], right[i]) = signal(n, &mut seed);
@@ -172,7 +175,8 @@ fn turning_every_knob() {
             // Where the effect's own output is flat against a clip, the
             // in-block kink is ~0 and the ratio means nothing (67Clipper's
             // threshold and input reach the clip right at a block edge).
-            let ratio_known = !(stem == "clipper67" && matches!(param.id, "thresholdDb" | "inputDb"));
+            let ratio_known =
+                !(stem == "clipper67" && matches!(param.id, "thresholdDb" | "inputDb"));
             if swept.allocs > 0 {
                 failures.push(format!("{stem} {}: {} allocations", param.id, swept.allocs));
             }
@@ -180,9 +184,14 @@ fn turning_every_knob() {
                 failures.push(format!("{stem} {}: non-finite output", param.id));
             }
             if ratio_known && ratio > MAX_JUMP {
-                failures.push(format!("{stem} {}: steps (edge kink x{ratio:.1})", param.id));
+                failures.push(format!(
+                    "{stem} {}: steps (edge kink x{ratio:.1})",
+                    param.id
+                ));
             }
-            let flag = if swept.allocs > 0 || !swept.finite || swept.max_block_us > budget_us * 0.5
+            let flag = if swept.allocs > 0
+                || !swept.finite
+                || swept.max_block_us > budget_us * 0.5
                 || ratio > 4.0
             {
                 "  <--"

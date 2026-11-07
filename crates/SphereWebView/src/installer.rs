@@ -3,7 +3,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use crate::{
-    validate_cef_path, workspace_cef_path, workspace_root, CefDistributionError, CefTarget,
+    CefDistributionError, CefTarget, validate_cef_path, workspace_cef_path, workspace_root,
 };
 
 /// Downloads and installs the pinned minimal CEF distribution for the host

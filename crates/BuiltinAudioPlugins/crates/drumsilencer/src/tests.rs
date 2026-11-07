@@ -31,14 +31,21 @@ fn noise(len: usize, seed: u32) -> Vec<(f32, f32)> {
 }
 
 fn run(dsp: &mut Dsp, input: &[(f32, f32)]) -> Vec<(f32, f32)> {
-    input.iter().map(|&(l, r)| dsp.process_stereo(l, r)).collect()
+    input
+        .iter()
+        .map(|&(l, r)| dsp.process_stereo(l, r))
+        .collect()
 }
 
 /// The largest difference between `out` and `input` delayed by `latency`.
 fn delay_error(input: &[(f32, f32)], out: &[(f32, f32)], latency: usize) -> f32 {
     let mut worst = 0.0f32;
     for (i, o) in out.iter().enumerate() {
-        let x = if i >= latency { input[i - latency] } else { (0.0, 0.0) };
+        let x = if i >= latency {
+            input[i - latency]
+        } else {
+            (0.0, 0.0)
+        };
         worst = worst.max((o.0 - x.0).abs()).max((o.1 - x.1).abs());
     }
     worst
@@ -97,7 +104,11 @@ fn no_amount_is_transparent_and_remove_plus_solo_is_the_input() {
     assert!(solo.apply_ui_param("mode", 1.0));
     let a = run(&mut remove, &input);
     let b = run(&mut solo, &input);
-    let sum: Vec<(f32, f32)> = a.iter().zip(&b).map(|(x, y)| (x.0 + y.0, x.1 + y.1)).collect();
+    let sum: Vec<(f32, f32)> = a
+        .iter()
+        .zip(&b)
+        .map(|(x, y)| (x.0 + y.0, x.1 + y.1))
+        .collect();
     assert!(delay_error(&input, &sum, remove.latency_samples()) < 1.0e-5);
     // And they really split it: neither is the input on its own.
     assert!(delay_error(&input, &a, remove.latency_samples()) > 1.0e-3);
@@ -146,7 +157,11 @@ fn the_meters_see_the_input_bands() {
     }
     let frame = dsp.meter_frame();
     // 2 kHz is band 3 (1–3 kHz); a 0.5 sine is 0.354 RMS.
-    assert!((frame.input_bands[3] - 0.354).abs() < 0.03, "{:?}", frame.input_bands);
+    assert!(
+        (frame.input_bands[3] - 0.354).abs() < 0.03,
+        "{:?}",
+        frame.input_bands
+    );
     for (b, level) in frame.input_bands.iter().enumerate() {
         if b != 3 {
             assert!(*level < 0.01, "band {b}: {level}");
@@ -197,7 +212,12 @@ fn descriptor_and_presets_agree_with_the_wire() {
     for preset in &bank {
         let mut sanitized = preset.params.clone();
         ipc::sanitize_params(&mut sanitized);
-        assert_eq!(ipc::ui_values(&sanitized), ipc::ui_values(&preset.params), "{}", preset.name);
+        assert_eq!(
+            ipc::ui_values(&sanitized),
+            ipc::ui_values(&preset.params),
+            "{}",
+            preset.name
+        );
     }
 }
 
@@ -206,7 +226,11 @@ fn descriptor_and_presets_agree_with_the_wire() {
 #[test]
 fn the_shipped_weights_are_the_trained_network() {
     let model = embedded_model();
-    assert_eq!(model.hidden(), 192, "model/drumsilencer.dsil is not the trained export");
+    assert_eq!(
+        model.hidden(),
+        192,
+        "model/drumsilencer.dsil is not the trained export"
+    );
 }
 
 /// How much faster than real time one instance runs, at 48 kHz stereo:
@@ -216,7 +240,9 @@ fn the_shipped_weights_are_the_trained_network() {
 #[ignore]
 fn realtime_cost() {
     let model: &'static Model = match std::env::var("DRUMSIL_WEIGHTS") {
-        Ok(path) => Box::leak(Box::new(Model::parse(&std::fs::read(path).unwrap()).unwrap())),
+        Ok(path) => Box::leak(Box::new(
+            Model::parse(&std::fs::read(path).unwrap()).unwrap(),
+        )),
         Err(_) => embedded_model(),
     };
     let mut dsp = Dsp::with_model(SR, model);

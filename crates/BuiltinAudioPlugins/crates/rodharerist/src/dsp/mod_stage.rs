@@ -67,13 +67,16 @@ impl ModStage {
         }
         match self.model {
             ModModel::Chorus => self.chorus.configure(rate, depth, mix),
-            ModModel::Dimension => {
+            ModModel::Dimension => self.chorus.configure_voice(
+                rate,
+                depth,
+                mix,
+                super::chorus::ChorusVoice::dimension(),
+            ),
+            ModModel::TriChorus => {
                 self.chorus
-                    .configure_voice(rate, depth, mix, super::chorus::ChorusVoice::dimension())
+                    .configure_voice(rate, depth, mix, super::chorus::ChorusVoice::tri())
             }
-            ModModel::TriChorus => self
-                .chorus
-                .configure_voice(rate, depth, mix, super::chorus::ChorusVoice::tri()),
             ModModel::Flanger => self.flanger.configure(rate, depth, mix),
             ModModel::ThruZero => self.flanger.configure_voice(
                 rate,
@@ -90,9 +93,10 @@ impl ModStage {
                 self.tremolo
                     .configure_kind(rate, depth, mix, super::tremolo::TremKind::Harmonic)
             }
-            ModModel::BiasTrem => self
-                .tremolo
-                .configure_kind(rate, depth, mix, super::tremolo::TremKind::Bias),
+            ModModel::BiasTrem => {
+                self.tremolo
+                    .configure_kind(rate, depth, mix, super::tremolo::TremKind::Bias)
+            }
             other => {
                 // Every remaining model is a voiced phaser.
                 if let Some(voice) = other.phaser_voice() {

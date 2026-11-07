@@ -216,8 +216,9 @@ impl StemInferBackend for OnnxHtDemucsBackend {
                 format!("Separating segment {}/{n_chunks}", chunk_index + 1),
             ));
 
-            let tensor = Tensor::from_array((input.shape().to_vec(), input.into_raw_vec_and_offset().0))
-                .map_err(|e| backend_err(format!("ONNX input tensor build failed: {e}")))?;
+            let tensor =
+                Tensor::from_array((input.shape().to_vec(), input.into_raw_vec_and_offset().0))
+                    .map_err(|e| backend_err(format!("ONNX input tensor build failed: {e}")))?;
             let outputs = session
                 .run(ort::inputs![input_name.as_str() => tensor])
                 .map_err(|e| backend_err(format!("ONNX inference failed: {e}")))?;

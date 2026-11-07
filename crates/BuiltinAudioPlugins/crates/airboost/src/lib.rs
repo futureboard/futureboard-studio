@@ -1222,7 +1222,10 @@ mod tests {
                 (at_centre - cut).abs() < 0.25,
                 "asked {cut} dB, the centre moved {at_centre} dB"
             );
-            assert!(at_centre < previous, "{cut} dB cut less than the one before");
+            assert!(
+                at_centre < previous,
+                "{cut} dB cut less than the one before"
+            );
             previous = at_centre;
         }
     }

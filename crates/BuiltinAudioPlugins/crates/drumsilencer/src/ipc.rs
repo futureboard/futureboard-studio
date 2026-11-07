@@ -30,12 +30,12 @@ pub const UI_PARAM_IDS: [&str; PARAM_COUNT] =
 /// Inclusive `(min, max)` for every continuous parameter, indexed by wire
 /// index. Booleans and the mode enum carry `(0, 0)`.
 pub(crate) const RANGES: [(f32, f32); PARAM_COUNT] = [
-    (0.0, 0.0),           // power
-    (0.0, 0.0),           // mode
-    (0.0, 100.0),         // amount, %
-    (20.0, 2_000.0),      // lowHz (20 = off)
-    (1_000.0, 20_000.0),  // highHz (20 k = off)
-    (-24.0, 12.0),        // outputDb
+    (0.0, 0.0),          // power
+    (0.0, 0.0),          // mode
+    (0.0, 100.0),        // amount, %
+    (20.0, 2_000.0),     // lowHz (20 = off)
+    (1_000.0, 20_000.0), // highHz (20 k = off)
+    (-24.0, 12.0),       // outputDb
 ];
 
 #[inline]

@@ -364,11 +364,10 @@ mod tests {
             let ran = unsafe { dispatch(count, &job as *const Squares as *const (), square) };
             if !ran {
                 // Another test holds the pool; nothing was run.
-                assert!(
-                    job.output
-                        .iter()
-                        .all(|o| o.load(Ordering::Relaxed) == u32::MAX)
-                );
+                assert!(job
+                    .output
+                    .iter()
+                    .all(|o| o.load(Ordering::Relaxed) == u32::MAX));
                 continue;
             }
             for (i, out) in job.output.iter().enumerate() {

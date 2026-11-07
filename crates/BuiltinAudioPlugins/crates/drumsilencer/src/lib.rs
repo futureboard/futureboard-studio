@@ -106,7 +106,11 @@ impl Mode {
     }
 
     pub fn from_wire(value: f32) -> Self {
-        if value >= 0.5 { Self::Solo } else { Self::Remove }
+        if value >= 0.5 {
+            Self::Solo
+        } else {
+            Self::Remove
+        }
     }
 }
 

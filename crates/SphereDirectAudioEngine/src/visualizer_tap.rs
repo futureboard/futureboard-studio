@@ -16,8 +16,8 @@
 //! — so several windows can read the same ring. A reader that falls more than
 //! a ring's worth behind skips forward and reports the gap.
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::OnceLock;
 
 use crate::input_ring::InputRing;
 
