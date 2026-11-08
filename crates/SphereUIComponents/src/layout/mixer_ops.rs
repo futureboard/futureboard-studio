@@ -2444,6 +2444,25 @@ impl StudioLayout {
             on_add_insert,
             on_remove_insert,
             on_toggle_insert_bypass,
+            on_set_insert_bus: {
+                let this = owner.clone();
+                std::sync::Arc::new(
+                    move |(track_id, insert_id, bus): &(
+                        String,
+                        String,
+                        crate::components::timeline::timeline_state::InsertSignalBus,
+                    ),
+                          _w,
+                          cx| {
+                        let track_id = track_id.clone();
+                        let insert_id = insert_id.clone();
+                        let bus = *bus;
+                        StudioLayout::defer_update(&this, cx, move |this, cx| {
+                            this.set_insert_signal_bus(&track_id, &insert_id, bus, cx);
+                        });
+                    },
+                )
+            },
             on_toggle_channel_bypass: Some({
                 let this = owner.clone();
                 std::sync::Arc::new(

@@ -174,6 +174,9 @@ pub const UI_PARAM_IDS: &[&str] = &[
     "delay2_row",  // 148
     "eq2_row",     // 149
     "comp2_row",   // 150
+    // Compressor voices. Appended: an index in this table is an ABI.
+    "comp_model",  // 151
+    "comp2_model", // 152
 ];
 
 /// String id → wire index. Linear scan over a small table — control/UI
@@ -225,7 +228,7 @@ mod tests {
     /// accidental reorder/insert must fail here, loudly.
     #[test]
     fn wire_indices_are_pinned() {
-        assert_eq!(UI_PARAM_IDS.len(), 151);
+        assert_eq!(UI_PARAM_IDS.len(), 153);
         assert_eq!(ui_param_index("power"), Some(0));
         assert_eq!(ui_param_index("gate_on"), Some(3));
         assert_eq!(ui_param_index("drive_model"), Some(10));
@@ -285,6 +288,8 @@ mod tests {
         assert_eq!(ui_param_index("row_level_3"), Some(135));
         assert_eq!(ui_param_index("gate_row"), Some(136));
         assert_eq!(ui_param_index("comp2_row"), Some(150));
+        assert_eq!(ui_param_index("comp_model"), Some(151));
+        assert_eq!(ui_param_index("comp2_model"), Some(152));
     }
 
     /// Every block that can run on one side has its channel on the wire,

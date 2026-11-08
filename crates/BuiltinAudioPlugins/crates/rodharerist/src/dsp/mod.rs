@@ -326,6 +326,22 @@ pub enum DriveModel {
     SputterFuzz,
     /// "Clean Push" — almost linear level, a hint of soft clip.
     CleanPush,
+    /// "Razor Saw" — hard silicon clip with the mids cut out.
+    RazorSaw,
+    /// "Djent Clamp" — the low strings never reach the diodes.
+    DjentClamp,
+    /// "Chainsaw" — extreme gain, a narrow mid that screams.
+    Chainsaw,
+    /// "Doom Wall" — the whole band clips, dark and huge.
+    DoomWall,
+    /// "Mid Spike" — a narrow mid peak into a hard clip.
+    MidSpike,
+    /// "Ice Pick" — the top clips, the low mids are cut.
+    IcePick,
+    /// "Gate Grind" — opens hard and chokes between notes.
+    GateGrind,
+    /// "Red Lead" — tight, mid-forward, high gain.
+    RedLead,
 }
 
 impl DriveModel {
@@ -351,6 +367,14 @@ impl DriveModel {
         Self::SmoothLead,
         Self::SputterFuzz,
         Self::CleanPush,
+        Self::RazorSaw,
+        Self::DjentClamp,
+        Self::Chainsaw,
+        Self::DoomWall,
+        Self::MidSpike,
+        Self::IcePick,
+        Self::GateGrind,
+        Self::RedLead,
     ];
 
     /// Map the editor model id.
@@ -376,6 +400,14 @@ impl DriveModel {
             "smooth_lead" => Some(Self::SmoothLead),
             "sputter_fuzz" => Some(Self::SputterFuzz),
             "clean_push" => Some(Self::CleanPush),
+            "razor_saw" => Some(Self::RazorSaw),
+            "djent_clamp" => Some(Self::DjentClamp),
+            "chainsaw" => Some(Self::Chainsaw),
+            "doom_wall" => Some(Self::DoomWall),
+            "mid_spike" => Some(Self::MidSpike),
+            "ice_pick" => Some(Self::IcePick),
+            "gate_grind" => Some(Self::GateGrind),
+            "red_lead" => Some(Self::RedLead),
             _ => None,
         }
     }
@@ -474,6 +506,22 @@ pub enum AmpModel {
     /// "Express Lead" — low feedback, a fast exploding power section.
     /// The circuit this follows is a Trainwreck Express.
     ExpressLead,
+    /// "Razor Modern" — four stages, scooped, almost no sag.
+    RazorModern,
+    /// "Mid Cannon" — mid-forward high gain that stays tight.
+    MidCannon,
+    /// "Djent Stack" — the lows are filtered before the first stage.
+    DjentStack,
+    /// "Chainsaw Lead" — a lot of gain and a mid that cuts.
+    ChainsawLead,
+    /// "Blackfire" — stiff modern high gain, more presence than scoop.
+    Blackfire,
+    /// "Crunch Saw" — British mids pushed until the power section grinds.
+    CrunchSaw,
+    /// "Ultra Scoop" — the mids are gone, the lows stay tight.
+    UltraScoop,
+    /// "Slam Head" — tight lows, a forward mid, a hard power section.
+    SlamHead,
 }
 
 impl AmpModel {
@@ -511,6 +559,14 @@ impl AmpModel {
         Self::VintageModern,
         Self::StudioBass,
         Self::ExpressLead,
+        Self::RazorModern,
+        Self::MidCannon,
+        Self::DjentStack,
+        Self::ChainsawLead,
+        Self::Blackfire,
+        Self::CrunchSaw,
+        Self::UltraScoop,
+        Self::SlamHead,
     ];
 
     pub fn from_model_id(id: &str) -> Option<Self> {
@@ -547,6 +603,14 @@ impl AmpModel {
             "vintage_modern" => Some(Self::VintageModern),
             "studio_bass" => Some(Self::StudioBass),
             "express_lead" => Some(Self::ExpressLead),
+            "razor_modern" => Some(Self::RazorModern),
+            "mid_cannon" => Some(Self::MidCannon),
+            "djent_stack" => Some(Self::DjentStack),
+            "chainsaw_lead" => Some(Self::ChainsawLead),
+            "blackfire" => Some(Self::Blackfire),
+            "crunch_saw" => Some(Self::CrunchSaw),
+            "ultra_scoop" => Some(Self::UltraScoop),
+            "slam_head" => Some(Self::SlamHead),
             _ => None,
         }
     }
@@ -628,6 +692,22 @@ pub enum CabModel {
     Alnico1x10,
     /// "Dark 1x15" — sealed fifteen, little top.
     Dark15,
+    /// "Razor 4x12" — tight closed 4x12, the mids cut, the top stays.
+    Razor4x12,
+    /// "Honk Stack 4x12" — a hard mid, early top rolloff.
+    HonkStack,
+    /// "Djent 4x12" — high-passed, scooped, very little body.
+    Djent4x12,
+    /// "Saw Stack 4x12" — a mid spike and a harsh top.
+    SawStack,
+    /// "Cannon 4x12" — mid-forward and tight, less scoop than a modern stack.
+    Cannon4x12,
+    /// "Ice 4x12" — bright, thin, the low mids are gone.
+    Ice4x12,
+    /// "Doom 8x10" — huge low end, dark, compressed.
+    Doom810,
+    /// "Tight 2x12" — small sealed pair, scooped, fast.
+    Tight2x12,
 }
 
 impl CabModel {
@@ -661,6 +741,14 @@ impl CabModel {
         Self::Combo1x15,
         Self::Alnico1x10,
         Self::Dark15,
+        Self::Razor4x12,
+        Self::HonkStack,
+        Self::Djent4x12,
+        Self::SawStack,
+        Self::Cannon4x12,
+        Self::Ice4x12,
+        Self::Doom810,
+        Self::Tight2x12,
     ];
 
     /// The modeled voicings only — [`Self::ALL`] minus [`Self::Ir`], which is
@@ -694,6 +782,14 @@ impl CabModel {
         Self::Combo1x15,
         Self::Alnico1x10,
         Self::Dark15,
+        Self::Razor4x12,
+        Self::HonkStack,
+        Self::Djent4x12,
+        Self::SawStack,
+        Self::Cannon4x12,
+        Self::Ice4x12,
+        Self::Doom810,
+        Self::Tight2x12,
     ];
 
     pub fn from_model_id(id: &str) -> Option<Self> {
@@ -726,6 +822,14 @@ impl CabModel {
             "combo_1x15" => Some(Self::Combo1x15),
             "alnico_1x10" => Some(Self::Alnico1x10),
             "dark_15" => Some(Self::Dark15),
+            "razor_412" => Some(Self::Razor4x12),
+            "honk_stack" => Some(Self::HonkStack),
+            "djent_412" => Some(Self::Djent4x12),
+            "saw_stack" => Some(Self::SawStack),
+            "cannon_412" => Some(Self::Cannon4x12),
+            "ice_412" => Some(Self::Ice4x12),
+            "doom_810" => Some(Self::Doom810),
+            "tight_212" => Some(Self::Tight2x12),
             _ => None,
         }
     }
@@ -805,6 +909,22 @@ pub enum ModModel {
     HarmonicTrem,
     /// "Bias Trem" — a slow, soft bias wobble. Less chop than the opto.
     BiasTrem,
+    /// "Razor Chorus" — deep, fast, the second line a half cycle away.
+    RazorChorus,
+    /// "Metal Jet" — a very short flanger with hard regeneration.
+    MetalJet,
+    /// "Chainsaw Phase" — six stages, high feedback, a fast narrow sweep.
+    ChainsawPhase,
+    /// "Chop Trem" — a fast, hard volume chop.
+    ChopTrem,
+    /// "Panic Vibe" — staggered stages that snap instead of swirl.
+    PanicVibe,
+    /// "Stab Flange" — negative feedback, short, fast.
+    StabFlange,
+    /// "Square Trem" — the wave sits near a square at any depth.
+    SquareTrem,
+    /// "Shred Phase" — twelve stages across the mid, high feedback.
+    ShredPhase,
 }
 
 impl ModModel {
@@ -829,6 +949,14 @@ impl ModModel {
         Self::SlowJet,
         Self::HarmonicTrem,
         Self::BiasTrem,
+        Self::RazorChorus,
+        Self::MetalJet,
+        Self::ChainsawPhase,
+        Self::ChopTrem,
+        Self::PanicVibe,
+        Self::StabFlange,
+        Self::SquareTrem,
+        Self::ShredPhase,
     ];
 
     pub fn from_model_id(id: &str) -> Option<Self> {
@@ -850,6 +978,14 @@ impl ModModel {
             "slow_jet" => Some(Self::SlowJet),
             "harmonic_trem" => Some(Self::HarmonicTrem),
             "bias_trem" => Some(Self::BiasTrem),
+            "razor_chorus" => Some(Self::RazorChorus),
+            "metal_jet" => Some(Self::MetalJet),
+            "chainsaw_phase" => Some(Self::ChainsawPhase),
+            "chop_trem" => Some(Self::ChopTrem),
+            "panic_vibe" => Some(Self::PanicVibe),
+            "stab_flange" => Some(Self::StabFlange),
+            "square_trem" => Some(Self::SquareTrem),
+            "shred_phase" => Some(Self::ShredPhase),
             _ => None,
         }
     }
@@ -866,6 +1002,9 @@ impl ModModel {
             Self::IsanJet => Some(V::IsanJet),
             Self::SoftPhase => Some(V::SoftPhase),
             Self::WideVibe => Some(V::WideVibe),
+            Self::ChainsawPhase => Some(V::Chainsaw),
+            Self::PanicVibe => Some(V::Panic),
+            Self::ShredPhase => Some(V::Shred),
             Self::Chorus
             | Self::Flanger
             | Self::Tremolo
@@ -874,7 +1013,12 @@ impl ModModel {
             | Self::ThruZero
             | Self::SlowJet
             | Self::HarmonicTrem
-            | Self::BiasTrem => None,
+            | Self::BiasTrem
+            | Self::RazorChorus
+            | Self::MetalJet
+            | Self::ChopTrem
+            | Self::StabFlange
+            | Self::SquareTrem => None,
         }
     }
 
@@ -1272,6 +1416,67 @@ fn time_effect_on(p: &Params, stage: StageKind) -> bool {
     }
 }
 
+/// Compressor voice. One topology (`CompStage`); the voice only changes the
+/// knee, the sidechain corner, and how the knobs scale.
+///
+/// APPEND-ONLY: index into `ALL` is the `comp_model` wire value. The first
+/// variant is today's compressor, so a save with no key loads that voice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum CompModel {
+    /// "Studio Compressor" — the knee and sidechain the block always used.
+    #[default]
+    Studio,
+    /// "Smash Box" — a tight knee and a fast attack.
+    Smash,
+    /// "Brick Limit" — almost no knee, the ratio is pushed toward a wall.
+    Brick,
+    /// "Pick Attack" — the sidechain ignores the low strings.
+    PickAttack,
+    /// "Deep Pump" — the release is long and the threshold sits lower.
+    DeepPump,
+    /// "Mid Punch" — the sidechain listens to the mids.
+    MidPunch,
+    /// "Bass Hold" — the low end triggers it, the attack is slower.
+    BassHold,
+    /// "Parallel Crush" — a wide knee and a ratio that still crushes.
+    ParallelCrush,
+    /// "Opto Slam" — a slow attack that then clamps hard.
+    OptoSlam,
+}
+
+impl CompModel {
+    pub const ALL: &'static [Self] = &[
+        Self::Studio,
+        Self::Smash,
+        Self::Brick,
+        Self::PickAttack,
+        Self::DeepPump,
+        Self::MidPunch,
+        Self::BassHold,
+        Self::ParallelCrush,
+        Self::OptoSlam,
+    ];
+
+    pub fn from_model_id(id: &str) -> Option<Self> {
+        match id {
+            "studio" => Some(Self::Studio),
+            "smash" => Some(Self::Smash),
+            "brick" => Some(Self::Brick),
+            "pick_attack" => Some(Self::PickAttack),
+            "deep_pump" => Some(Self::DeepPump),
+            "mid_punch" => Some(Self::MidPunch),
+            "bass_hold" => Some(Self::BassHold),
+            "parallel_crush" => Some(Self::ParallelCrush),
+            "opto_slam" => Some(Self::OptoSlam),
+            _ => None,
+        }
+    }
+
+    pub fn from_index(i: u32) -> Self {
+        Self::ALL.get(i as usize).copied().unwrap_or(Self::Studio)
+    }
+}
+
 /// Full parameter set. Knob ranges match `editorui/src/data.ts` one-to-one so the
 /// React UI and the bridge speak the same units.
 ///
@@ -1307,6 +1512,10 @@ pub struct Params {
     pub wah_on: bool,
 
     pub drive_model: DriveModel,
+    /// Which voice the compressor runs. Missing from an older save, which
+    /// then keeps the studio knee and sidechain.
+    #[serde(default)]
+    pub comp_model: CompModel,
     pub amp_model: AmpModel,
     pub cab_model: CabModel,
     #[serde(default)]
@@ -1591,6 +1800,7 @@ pub struct StageBParams {
     pub eq_high_gain_db: f32,
 
     pub comp_on: bool,
+    pub comp_model: CompModel,
     pub comp_thresh_db: f32,
     pub comp_ratio: f32,
     pub comp_attack_ms: f32,
@@ -1644,6 +1854,7 @@ impl Default for StageBParams {
             eq_high_gain_db: 0.0,
 
             comp_on: true,
+            comp_model: CompModel::Studio,
             comp_thresh_db: default_comp_thresh(),
             comp_ratio: default_comp_ratio(),
             comp_attack_ms: default_comp_attack(),
@@ -1690,6 +1901,7 @@ impl StageBParams {
             eq_high_gain_db: clamp(self.eq_high_gain_db, -15.0, 15.0),
 
             comp_on: self.comp_on,
+            comp_model: self.comp_model,
             comp_thresh_db: clamp(self.comp_thresh_db, -60.0, 0.0),
             comp_ratio: clamp(self.comp_ratio, 1.0, 20.0),
             comp_attack_ms: clamp(self.comp_attack_ms, 0.1, 100.0),
@@ -1767,6 +1979,7 @@ pub fn default_params() -> Params {
         eq_on: true,
         wah_on: true,
         drive_model: DriveModel::Screamer,
+        comp_model: CompModel::Studio,
         amp_model: AmpModel::Mandarin,
         cab_model: CabModel::Vintage4x12,
         mic_model: MicModel::Dynamic,
@@ -2653,6 +2866,7 @@ impl Dsp {
             eq_on: params.eq_on,
             wah_on: params.wah_on,
             drive_model: params.drive_model,
+            comp_model: params.comp_model,
             amp_model: params.amp_model,
             cab_model: params.cab_model,
             mic_model: params.mic_model,
@@ -2883,6 +3097,7 @@ impl Dsp {
             self.gate.set_threshold_db(p.gate_thresh_db);
         }
         if moved!(
+            comp_model,
             comp_thresh_db,
             comp_ratio,
             comp_attack_ms,
@@ -2890,6 +3105,7 @@ impl Dsp {
             comp_makeup_db
         ) {
             self.comp_stage.configure(
+                p.comp_model,
                 p.comp_thresh_db,
                 p.comp_ratio,
                 p.comp_attack_ms,
@@ -3001,6 +3217,7 @@ impl Dsp {
         // types — the only difference is which params block feeds them.
         let b = &p.stage_b;
         if moved!(
+            stage_b.comp_model,
             stage_b.comp_thresh_db,
             stage_b.comp_ratio,
             stage_b.comp_attack_ms,
@@ -3008,6 +3225,7 @@ impl Dsp {
             stage_b.comp_makeup_db
         ) {
             self.comp_b.configure(
+                b.comp_model,
                 b.comp_thresh_db,
                 b.comp_ratio,
                 b.comp_attack_ms,
@@ -3263,6 +3481,7 @@ pub fn apply_to_params(p: &mut Params, id: &str, value: f32) -> bool {
         "eq_on" => p.eq_on = on,
         "wah_on" => p.wah_on = on,
         "drive_model" => p.drive_model = DriveModel::from_index(value.round() as u32),
+        "comp_model" => p.comp_model = CompModel::from_index(value.round() as u32),
         "mod_model" => p.mod_model = ModModel::from_index(value.round() as u32),
         "wah_model" => p.wah_model = WahModel::from_index(value.round() as u32),
         "eq_model" => p.eq_model = EqModel::from_index(value.round() as u32),
@@ -3361,6 +3580,7 @@ pub fn apply_to_params(p: &mut Params, id: &str, value: f32) -> bool {
         "eq2_mid2_gain" => p.stage_b.eq_mid2_gain_db = value,
         "eq2_high_gain" => p.stage_b.eq_high_gain_db = value,
         "comp2_on" => p.stage_b.comp_on = on,
+        "comp2_model" => p.stage_b.comp_model = CompModel::from_index(value.round() as u32),
         "comp2_thresh" => p.stage_b.comp_thresh_db = value,
         "comp2_ratio" => p.stage_b.comp_ratio = value,
         "comp2_attack" => p.stage_b.comp_attack_ms = value,
@@ -3451,6 +3671,7 @@ pub fn ui_values(p: &Params) -> Vec<(&'static str, f32)> {
     out.push(("eq_on", b(p.eq_on)));
     out.push(("wah_on", b(p.wah_on)));
     out.push(("drive_model", model_index(DriveModel::ALL, p.drive_model)));
+    out.push(("comp_model", model_index(CompModel::ALL, p.comp_model)));
     // amp_model before tone_engine (see doc comment).
     out.push(("amp_model", model_index(AmpModel::ALL, p.amp_model)));
     out.push(("cab_model", model_index(CabModel::ALL, p.cab_model)));
@@ -3555,6 +3776,7 @@ pub fn ui_values(p: &Params) -> Vec<(&'static str, f32)> {
     out.push(("eq2_mid2_gain", sb.eq_mid2_gain_db));
     out.push(("eq2_high_gain", sb.eq_high_gain_db));
     out.push(("comp2_on", b(sb.comp_on)));
+    out.push(("comp2_model", model_index(CompModel::ALL, sb.comp_model)));
     out.push(("comp2_thresh", sb.comp_thresh_db));
     out.push(("comp2_ratio", sb.comp_ratio));
     out.push(("comp2_attack", sb.comp_attack_ms));
@@ -5963,6 +6185,14 @@ mod tests {
             ModModel::SlowJet => "slow_jet",
             ModModel::HarmonicTrem => "harmonic_trem",
             ModModel::BiasTrem => "bias_trem",
+            ModModel::RazorChorus => "razor_chorus",
+            ModModel::MetalJet => "metal_jet",
+            ModModel::ChainsawPhase => "chainsaw_phase",
+            ModModel::ChopTrem => "chop_trem",
+            ModModel::PanicVibe => "panic_vibe",
+            ModModel::StabFlange => "stab_flange",
+            ModModel::SquareTrem => "square_trem",
+            ModModel::ShredPhase => "shred_phase",
         }
     }
 
@@ -6773,5 +7003,38 @@ mod telemetry_tests {
         for (i, model) in CabModel::ALL.iter().enumerate() {
             assert_eq!(CabModel::from_index(i as u32), *model);
         }
+        assert_eq!(DriveModel::ALL[19], DriveModel::CleanPush);
+        assert_eq!(DriveModel::ALL[20], DriveModel::RazorSaw);
+        assert_eq!(DriveModel::from_index(27), DriveModel::RedLead);
+        assert_eq!(
+            DriveModel::from_model_id("razor_saw"),
+            Some(DriveModel::RazorSaw)
+        );
+        assert_eq!(AmpModel::ALL[31], AmpModel::ExpressLead);
+        assert_eq!(AmpModel::ALL[32], AmpModel::RazorModern);
+        assert_eq!(AmpModel::from_index(39), AmpModel::SlamHead);
+        assert_eq!(
+            AmpModel::from_model_id("slam_head"),
+            Some(AmpModel::SlamHead)
+        );
+        assert_eq!(CabModel::ALL[27], CabModel::Dark15);
+        assert_eq!(CabModel::ALL[28], CabModel::Razor4x12);
+        assert_eq!(CabModel::from_index(35), CabModel::Tight2x12);
+        assert_eq!(
+            CabModel::from_model_id("doom_810"),
+            Some(CabModel::Doom810)
+        );
+        assert_eq!(ModModel::ALL[16], ModModel::BiasTrem);
+        assert_eq!(ModModel::ALL[17], ModModel::RazorChorus);
+        assert_eq!(ModModel::from_index(24), ModModel::ShredPhase);
+        assert_eq!(
+            ModModel::from_model_id("chainsaw_phase"),
+            Some(ModModel::ChainsawPhase)
+        );
+        assert_eq!(CompModel::ALL[0], CompModel::Studio);
+        assert_eq!(CompModel::from_index(0), CompModel::Studio);
+        assert_eq!(CompModel::from_index(8), CompModel::OptoSlam);
+        assert_eq!(CompModel::from_model_id("studio"), Some(CompModel::Studio));
+        assert_eq!(CompModel::from_index(99), CompModel::Studio);
     }
 }

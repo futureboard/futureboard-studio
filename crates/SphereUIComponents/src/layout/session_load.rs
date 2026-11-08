@@ -1039,6 +1039,16 @@ impl StudioLayout {
             return false;
         }
 
+        // A Rodhareist rig saved in wet/dry/wet grows its send and return
+        // here, after the file's own track count has been checked. A project
+        // that is not split is left alone.
+        let wdw_changed = self
+            .timeline
+            .update(cx, |timeline, _| timeline.state.sync_all_wdw_splits());
+        if wdw_changed {
+            self.mark_dirty();
+        }
+
         // Reopen the ARA sessions this project's clips are bound to, and hand
         // each plug-in its saved document. Runs after the timeline is populated
         // so the graph the plug-in sees matches the restored arrangement, and

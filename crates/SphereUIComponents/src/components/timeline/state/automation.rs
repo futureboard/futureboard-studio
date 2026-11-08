@@ -2341,6 +2341,7 @@ mod mixer_target_tests {
             enabled: true,
             pre_fader: false,
             gain_db: 0.0,
+            wdw: false,
             automated: None,
         });
         state

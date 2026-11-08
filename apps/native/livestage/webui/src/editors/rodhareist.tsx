@@ -97,6 +97,14 @@ const DRIVE_MODELS = [
   'Smooth Lead',
   'Sputter Fuzz',
   'Clean Push',
+  'Razor Saw',
+  'Djent Clamp',
+  'Chainsaw',
+  'Doom Wall',
+  'Mid Spike',
+  'Ice Pick',
+  'Gate Grind',
+  'Red Lead',
 ]
 const AMP_MODELS = [
   'Mandarin 80',
@@ -131,6 +139,14 @@ const AMP_MODELS = [
   'Vintage Modern',
   'Studio Bass',
   'Express Lead',
+  'Razor Modern',
+  'Mid Cannon',
+  'Djent Stack',
+  'Chainsaw Lead',
+  'Blackfire',
+  'Crunch Saw',
+  'Ultra Scoop',
+  'Slam Head',
 ]
 const CAB_MODELS = [
   '1960v Vintage 4x12',
@@ -161,6 +177,14 @@ const CAB_MODELS = [
   'Combo 1x15',
   'Alnico 1x10',
   'Dark 1x15',
+  'Razor 4x12',
+  'Honk Stack 4x12',
+  'Djent 4x12',
+  'Saw Stack 4x12',
+  'Cannon 4x12',
+  'Ice 4x12',
+  'Doom 8x10',
+  'Tight 2x12',
 ]
 /** `CabModel::Ir`: convolution with a loaded file, not a modeled voicing. */
 const CAB_IR = 11
@@ -183,6 +207,26 @@ const MOD_MODELS = [
   'Slow Jet',
   'Harmonic Trem',
   'Bias Trem',
+  'Razor Chorus',
+  'Metal Jet',
+  'Chainsaw Phase',
+  'Chop Trem',
+  'Panic Vibe',
+  'Stab Flange',
+  'Square Trem',
+  'Shred Phase',
+]
+
+const COMP_MODELS = [
+  'Studio Compressor',
+  'Smash Box',
+  'Brick Limit',
+  'Pick Attack',
+  'Deep Pump',
+  'Mid Punch',
+  'Bass Hold',
+  'Parallel Crush',
+  'Opto Slam',
 ]
 const WAH_MODELS = ['Cry Wah', 'Touch Wah', 'Bass Wah', 'Vocal Wah', 'Parked Filter', 'Talk Filter']
 const WAH_TOUCH = 1
@@ -310,7 +354,7 @@ const STAGES: StageInfo[] = [
       ['cab_dist', 'cab_dist', 'Distance'],
     ],
   },
-  { name: 'Comp A', enable: 'comp_on', models: { fixed: 'Studio Compressor' }, rows: compRows('comp') },
+  { name: 'Comp A', enable: 'comp_on', models: { wire: 'comp_model', labels: COMP_MODELS }, rows: compRows('comp') },
   { name: 'EQ A', enable: 'eq_on', models: { wire: 'eq_model', labels: EQ_MODELS }, rows: eqRows('eq') },
   {
     name: 'Wah',
@@ -326,7 +370,7 @@ const STAGES: StageInfo[] = [
   { name: 'Mod B', enable: 'mod2_on', models: { wire: 'mod2_model', labels: MOD_MODELS }, rows: modRows('chorus2') },
   { name: 'Delay B', enable: 'delay2_on', models: { wire: 'delay2_model', labels: DELAY_MODELS }, rows: delayRows('delay2') },
   { name: 'EQ B', enable: 'eq2_on', models: { wire: 'eq2_model', labels: EQ_MODELS }, rows: eqRows('eq2') },
-  { name: 'Comp B', enable: 'comp2_on', models: { fixed: 'Studio Compressor' }, rows: compRows('comp2') },
+  { name: 'Comp B', enable: 'comp2_on', models: { wire: 'comp2_model', labels: COMP_MODELS }, rows: compRows('comp2') },
 ]
 
 /** The NAM capture rows: the descriptor does not list them, so their ranges

@@ -278,6 +278,7 @@ fn aux_send_and_return_signals_are_audible_through_monitor() {
         level: 1.0,
         enabled: true,
         pre_fader: false,
+        wdw: false,
     }];
     let mut dead_group = track("dead-group", "group");
     dead_group.muted = true;

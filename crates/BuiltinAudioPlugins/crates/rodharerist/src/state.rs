@@ -99,6 +99,26 @@ mod tests {
     }
 
     #[test]
+    fn a_save_without_comp_model_loads_the_studio_voice() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&RodhareistState::new(default_params()).to_json().unwrap())
+                .unwrap();
+        let params = value["params"].as_object_mut().unwrap();
+        params.remove("comp_model");
+        params["stage_b"]
+            .as_object_mut()
+            .unwrap()
+            .remove("comp_model");
+        let restored = RodhareistState::from_json(&value.to_string()).unwrap();
+        assert_eq!(restored.schema_version, SCHEMA_VERSION);
+        assert_eq!(restored.params.comp_model, crate::CompModel::Studio);
+        assert_eq!(
+            restored.params.stage_b.comp_model,
+            crate::CompModel::Studio
+        );
+    }
+
+    #[test]
     fn the_dsp_keeps_no_file_names() {
         let mut params = default_params();
         params.nam_file = Some("amp.nam".into());

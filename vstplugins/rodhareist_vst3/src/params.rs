@@ -14,8 +14,8 @@ use nih_plug::params::persist::PersistentField;
 use nih_plug::prelude::*;
 use nih_plug_gpui::EditorContext;
 use rodharerist::{
-    AmpModel, CabModel, DelayModel, DriveModel, EqModel, MicModel, ModModel, ReverbModel,
-    StageChannel, StageKind, ToneEngineKind, WahModel, PATH_SLOTS, UI_PARAM_IDS,
+    AmpModel, CabModel, CompModel, DelayModel, DriveModel, EqModel, MicModel, ModModel, Params,
+    ReverbModel, StageChannel, StageKind, ToneEngineKind, WahModel, PATH_SLOTS, UI_PARAM_IDS,
 };
 
 use crate::components::rodhareist_blocks::{self as blocks, ParamSpec};
@@ -130,6 +130,9 @@ impl RodhareistParams {
         entry.param.begin(&setter);
         entry.param.set_plain(&setter, value);
         entry.param.end(&setter);
+        // The title a host shows for MIDI learn follows the selected stomp.
+        // This runs on the editor thread; the audio thread must not rename.
+        self.wire.refresh_host_names();
     }
 }
 
@@ -223,6 +226,22 @@ impl WireParams {
         }
         p
     }
+
+    /// Republish each parameter title from the live stomp names.
+    ///
+    /// A host that asks again (`getParameterInfo`) sees the new title. The
+    /// VST3 unit id is assigned once, when the parameter map is built, and
+    /// stays the block category. Call this from the editor or from
+    /// `initialize`, never from the audio thread: a rename allocates.
+    pub fn refresh_host_names(&self) {
+        let params = self.to_core_params();
+        let specs = block_specs();
+        for entry in self.entries.iter() {
+            entry
+                .param
+                .set_display_name(&display_name(&params, entry.id, &specs));
+        }
+    }
 }
 
 unsafe impl Params for WireParams {
@@ -277,6 +296,27 @@ impl WireParam {
             WireParam::Bool(p) => setter.end_set_parameter(p),
         }
     }
+
+    fn display_name(&self) -> &str {
+        match self {
+            WireParam::Float(p) => p.name(),
+            WireParam::Int(p) => p.name(),
+            WireParam::Bool(p) => p.name(),
+        }
+    }
+
+    /// Replace the host-visible title when it changed. Unchanged names are
+    /// left alone so a poll does not leak a new string every frame.
+    fn set_display_name(&self, name: &str) {
+        if self.display_name() == name {
+            return;
+        }
+        match self {
+            WireParam::Float(p) => p.set_name(name),
+            WireParam::Int(p) => p.set_name(name),
+            WireParam::Bool(p) => p.set_name(name),
+        }
+    }
 }
 
 fn is_toggle(id: &str) -> bool {
@@ -322,6 +362,7 @@ pub fn choice_labels(id: &str) -> Option<Vec<&'static str>> {
     }
     Some(match id {
         "drive_model" | "drive2_model" => labels(DriveModel::ALL, blocks::drive_model_label),
+        "comp_model" | "comp2_model" => labels(CompModel::ALL, blocks::comp_model_label),
         "amp_model" => labels(AmpModel::ALL, blocks::amp_model_label),
         "cab_model" => labels(CabModel::ALL, blocks::cab_model_label),
         "cab_mic_type" => labels(MicModel::ALL, blocks::mic_model_label),
@@ -441,12 +482,65 @@ pub fn describe(id: &str) -> (String, String) {
     ("Other".into(), id.into())
 }
 
-fn host_name(id: &str) -> String {
+/// The title a host lists for MIDI learn and automation.
+///
+/// The prefix is the selected stomp ("Green Screamer", "Twin Clean"), not
+/// the block category ("Drive A", "Amp"). A second instance of the same
+/// stomp gets " 2" so the two stay distinct. Lanes, the signal path, and
+/// the global trims keep the group `describe` already uses.
+pub fn host_name_for(params: &Params, id: &str) -> String {
+    display_name(params, id, &block_specs())
+}
+
+fn display_name(params: &Params, id: &str, specs: &[(StageKind, ParamSpec)]) -> String {
     let (group, label) = describe(id);
     if group == "Global" {
-        label
+        return label;
+    }
+    if matches!(group.as_str(), "Lanes" | "Signal Path") {
+        return format!("{group} {label}");
+    }
+    match kind_owning(id, specs) {
+        Some(kind) => format!("{} {label}", stomp_title(params, kind)),
+        None => format!("{group} {label}"),
+    }
+}
+
+fn kind_owning(id: &str, specs: &[(StageKind, ParamSpec)]) -> Option<StageKind> {
+    // The microphone select is described on its own, ahead of the block loop.
+    if id == "cab_mic_type" {
+        return Some(StageKind::Cab);
+    }
+    let defaults = rodharerist::default_params();
+    for &kind in StageKind::ALL {
+        if blocks::enable_id(kind) == id || kind.row_id() == id || kind.channel_id() == Some(id) {
+            return Some(kind);
+        }
+        if specs.iter().any(|(k, spec)| *k == kind && spec.id == id) {
+            return Some(kind);
+        }
+        if blocks::models(&defaults, kind)
+            .0
+            .iter()
+            .any(|m| m.wire_id == id)
+        {
+            return Some(kind);
+        }
+    }
+    None
+}
+
+/// The stomp a host should show. The later instance of a repeated name is
+/// "Green Screamer 2"; a different model needs no suffix.
+fn stomp_title(params: &Params, kind: StageKind) -> String {
+    let name = blocks::model_name(params, kind).unwrap_or_else(|| blocks::block_name(kind));
+    let repeated = StageKind::ALL.iter().any(|other| {
+        other.index() < kind.index() && blocks::model_name(params, *other) == Some(name)
+    });
+    if repeated {
+        format!("{name} 2")
     } else {
-        format!("{group} {label}")
+        name.to_string()
     }
 }
 
@@ -468,7 +562,7 @@ fn parse_number(text: &str) -> Option<f32> {
 }
 
 fn build_entry(id: &'static str, default: f32, specs: &[(StageKind, ParamSpec)]) -> WireEntry {
-    let name = host_name(id);
+    let name = host_name_for(&rodharerist::default_params(), id);
 
     if let Some(slot) = path_slot(id) {
         let param = IntParam::new(
@@ -636,6 +730,38 @@ mod tests {
         for id in UI_PARAM_IDS.iter().filter(|id| **id != CLEAR_CLIP) {
             assert_ne!(describe(id).0, "Other", "`{id}` has no group");
         }
+    }
+
+    #[test]
+    fn host_names_follow_the_selected_stomp() {
+        let defaults = rodharerist::default_params();
+        assert_eq!(
+            host_name_for(&defaults, "drive_gain"),
+            "Green Screamer Drive"
+        );
+        let mut rat = defaults.clone();
+        rat.drive_model = DriveModel::Rat;
+        assert_eq!(host_name_for(&rat, "drive_gain"), "Rats Nest Drive");
+        let mut both = rat.clone();
+        both.stage_b.drive_model = DriveModel::Rat;
+        assert_eq!(host_name_for(&both, "drive2_gain"), "Rats Nest 2 Drive");
+        both.stage_b.drive_model = DriveModel::Fuzz;
+        assert_eq!(host_name_for(&both, "drive_gain"), "Rats Nest Drive");
+        assert_eq!(host_name_for(&both, "drive2_gain"), "Face Fuzz Drive");
+        assert_eq!(
+            host_name_for(&defaults, "comp_thresh"),
+            "Studio Compressor Threshold"
+        );
+        let wire = WireParams::new();
+        assert_eq!(
+            wire.get("drive_gain").unwrap().param.display_name(),
+            "Green Screamer Drive"
+        );
+        wire.refresh_host_names();
+        assert_eq!(
+            wire.get("drive_gain").unwrap().param.display_name(),
+            "Green Screamer Drive"
+        );
     }
 
     #[test]

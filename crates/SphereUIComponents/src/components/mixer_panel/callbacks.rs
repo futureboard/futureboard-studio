@@ -78,6 +78,19 @@ pub struct MixerCallbacks {
     /// Toggle bypass on the named insert slot.
     pub on_toggle_insert_bypass:
         std::sync::Arc<dyn Fn(&(String, String), &mut Window, &mut App) + 'static>,
+    /// Move a VST3 insert between the main chain and the wet/dry/wet return.
+    /// `(track_id, insert_id, bus)`.
+    pub on_set_insert_bus: std::sync::Arc<
+        dyn Fn(
+                &(
+                    String,
+                    String,
+                    crate::components::timeline::timeline_state::InsertSignalBus,
+                ),
+                &mut Window,
+                &mut App,
+            ) + 'static,
+    >,
     /// A channel's plug-in bypass, from its inserts rack: bypasses every
     /// effect plug-in on the channel (the track id, or `MASTER_TRACK_ID`)
     /// while any is in use, otherwise brings them all back.
@@ -191,6 +204,15 @@ pub fn noop_mixer_callbacks() -> MixerCallbacks {
         on_add_insert: noop_track.clone(),
         on_remove_insert: noop_insert_pair.clone(),
         on_toggle_insert_bypass: noop_insert_pair.clone(),
+        on_set_insert_bus: std::sync::Arc::new(
+            |_: &(
+                String,
+                String,
+                crate::components::timeline::timeline_state::InsertSignalBus,
+            ),
+             _: &mut Window,
+             _: &mut App| {},
+        ),
         on_toggle_channel_bypass: None,
         on_toggle_vsti_output_group: Arc::new(|_: &String, _: &mut Window, _: &mut App| {}),
         on_toggle_folder: Arc::new(|_: &String, _: &mut Window, _: &mut App| {}),

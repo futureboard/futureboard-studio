@@ -631,6 +631,10 @@ pub struct EngineSendSnapshot {
     /// (default) taps post-fader. Phase 3.
     #[serde(default)]
     pub pre_fader: bool,
+    /// Wet/dry/wet split. Inserts that name this bus run on the return,
+    /// not in the source chain. Older snapshots are ordinary sends.
+    #[serde(default)]
+    pub wdw: bool,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]

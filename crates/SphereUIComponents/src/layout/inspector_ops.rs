@@ -58,6 +58,17 @@ type ProgramSelectionCb = Arc<
         + 'static,
 >;
 type InsertPairCb = Arc<dyn Fn(&(String, String), &mut Window, &mut App) + 'static>;
+type InsertBusCb = Arc<
+    dyn Fn(
+            &(
+                String,
+                String,
+                crate::components::timeline::timeline_state::InsertSignalBus,
+            ),
+            &mut Window,
+            &mut App,
+        ) + 'static,
+>;
 type InsertOpenCb = Arc<dyn Fn(&(String, usize, String), &mut Window, &mut App) + 'static>;
 type InsertPickerCb = Arc<dyn Fn(&(String, usize, bool), &mut Window, &mut App) + 'static>;
 type InsertOutputChannelCb =
@@ -355,6 +366,7 @@ impl StudioLayout {
         let on_open_insert_picker = self.insert_picker_cb(owner.clone());
         let on_remove_insert = self.remove_insert_cb(owner.clone());
         let on_toggle_insert_bypass = self.toggle_insert_bypass_cb(owner.clone());
+        let on_set_insert_bus = self.set_insert_bus_cb(owner.clone());
         let on_toggle_insert_enabled = self.toggle_insert_enabled_cb(owner.clone());
         let on_toggle_insert_output_channel = self.toggle_insert_output_channel_cb(owner.clone());
         let on_drop_insert = self.drop_insert_cb(owner.clone());
@@ -503,6 +515,7 @@ impl StudioLayout {
             on_open_insert_picker,
             on_remove_insert,
             on_toggle_insert_bypass,
+            on_set_insert_bus,
             on_toggle_insert_enabled,
             on_toggle_insert_output_channel,
             on_drop_insert,
@@ -943,6 +956,25 @@ impl StudioLayout {
                 cx.notify();
             });
         })
+    }
+
+    fn set_insert_bus_cb(&self, owner: Entity<Self>) -> InsertBusCb {
+        Arc::new(
+            move |(track_id, insert_id, bus): &(
+                String,
+                String,
+                crate::components::timeline::timeline_state::InsertSignalBus,
+            ),
+                  _w,
+                  cx| {
+                let track_id = track_id.clone();
+                let insert_id = insert_id.clone();
+                let bus = *bus;
+                StudioLayout::defer_update(&owner, cx, move |this, cx| {
+                    this.set_insert_signal_bus(&track_id, &insert_id, bus, cx);
+                });
+            },
+        )
     }
 
     fn toggle_insert_enabled_cb(&self, owner: Entity<Self>) -> InsertPairCb {
