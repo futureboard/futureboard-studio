@@ -6,8 +6,13 @@ on:
       - main
       - master
       - dev
+    # Release tags are bare calendar versions (`2026.11.1-beta2.0.0`, see
+    # version.json); `v*` is kept for a v-prefixed tag, which release.yml also
+    # accepts. Three numeric components keep `nightly` (daily-build.yml) and
+    # the old two-part `2026.06`-style tags out.
     tags:
-      - "v*"
+      - "[0-9]+.[0-9]+.[0-9]+*"
+      - "v[0-9]+.[0-9]+.[0-9]+*"
   workflow_dispatch:
   # Called by `release.yml` so the release build uses these exact steps instead
   # of a third copy of them. The `release` job below stays skipped for callers
@@ -28,6 +33,12 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Read-only by default. Only `release` below publishes, and asks for write
+# itself. As a callee of release.yml this can only narrow what the caller
+# grants, never widen it.
+permissions:
+  contents: read
+
 jobs:
   version:
     name: Read Version
@@ -36,7 +47,7 @@ jobs:
       app-version: ${{ steps.read.outputs.version }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Read app version
         id: read
@@ -62,6 +73,12 @@ jobs:
       # this every built Studio reports "sign-in is not configured". It is
       # a public origin, not a secret; a repository variable can override it.
       FUTUREBOARD_AUTH_API_URL: ${{ vars.FUTUREBOARD_AUTH_API_URL || 'https://futureboard.studio' }}
+      # Release-secret canary, not a key: a fixed, never-valid value exported
+      # under both names `crates/SphereUIComponents/build.rs` reads, so the
+      # scan step below catches a build that bakes it (#241, #273). Fixed
+      # rather than per-run so the build script does not rerun every build.
+      FUTUREBOARD_TONE3000_API_KEY: fb-release-canary-tone3000-3c9e1a7f52d4
+      TONE3000_API_KEY: fb-release-canary-tone3000-3c9e1a7f52d4
       CARGO_BUILD_JOBS: 2
     strategy:
       fail-fast: false
@@ -82,7 +99,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 1
           submodules: false
@@ -126,7 +143,7 @@ jobs:
           echo "libclang: $LIBCLANG_PATH"
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-16
 
       # macOS ships as one universal app. The runner is arm64, so the Intel
       # slice is cross-compiled and both toolchain targets must be present.
@@ -135,11 +152,11 @@ jobs:
         run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
 
       - name: Cache Rust dependencies and CEF
         id: build-cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -215,6 +232,20 @@ jobs:
           echo "FUTUREBOARD_PACKAGE_DIR=$package_dir" >> "$GITHUB_ENV"
           echo "xtask package: $package_dir"
 
+      # #241: a release build must never compile the TONE3000 partner key in.
+      # This job exports a canary under every name the build script reads it
+      # from (see the job env), so if that policy regresses the canary lands
+      # in a shipped binary and this fails before anything is bundled or
+      # uploaded. Every file xtask staged is scanned, all architectures.
+      - name: Scan packaged files for the TONE3000 key canary
+        shell: pwsh
+        run: |
+          $files = @(Get-ChildItem -LiteralPath out/release/community -Recurse -File | ForEach-Object FullName)
+          if ($files.Count -eq 0) { Write-Error 'no packaged files under out/release/community'; exit 1 }
+          Write-Output "Scanning $($files.Count) packaged files"
+          & ./scripts/check-release-secret.ps1 -Canary $env:FUTUREBOARD_TONE3000_API_KEY -Path $files
+          exit $LASTEXITCODE
+
       # Three images per release: macos-arm64, macos-x86_64, and macos-universal.
       # Per-arch packages are already staged by the xtask passes above; the
       # universal tree is their lipo merge. Bundling costs no extra compile.
@@ -258,8 +289,8 @@ jobs:
           Move-Item target/installer/FutureboardStudioSetup.exe "target/installer/Futureboard.Studio-${{ needs.version.outputs.app-version }}-windows-x86_64-Setup.exe"
 
       # Bare `version.json` version (no nightly suffix here — this workflow
-      # only runs on tagged releases), matching the AUR PKGBUILD's `pkgver`
-      # so its hardcoded AppImage filename resolves against this release.
+      # only publishes on tagged releases), matching the AUR PKGBUILD's
+      # `_appver` so its hardcoded AppImage filename resolves against it.
       - name: Build AppImage (Linux)
         if: matrix.os == 'ubuntu-24.04'
         run: |
@@ -286,7 +317,7 @@ jobs:
           ls -lh dist-native-archives/
 
       - name: Upload native runtime artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.native-artifact-name }}-runtime
           path: dist-native-archives/*
@@ -295,7 +326,7 @@ jobs:
 
       - name: Upload native bundle artifact
         if: matrix.native-bundle-glob != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.native-artifact-name }}-bundle
           path: ${{ matrix.native-bundle-glob }}
@@ -311,13 +342,17 @@ jobs:
       contents: write
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      # A tag push checks out a detached HEAD, which `git push` cannot push
+      # from. The AUR bump below lands on the default branch, so check that
+      # branch out instead; nothing else in this job reads the tree.
+      - name: Checkout default branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          ref: ${{ github.event.repository.default_branch }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
@@ -326,7 +361,7 @@ jobs:
         run: ls -lh dist/
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           name: "Futureboard Studio v${{ needs.version.outputs.app-version }}"
           files: dist/*
@@ -336,13 +371,22 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # sync-version.mjs owns the AUR fields: `pkgver` with `-` mapped to `_`
+      # (AUR forbids `-`) and `_appver` with the exact asset version. It also
+      # rewrites other version-carrying files; only the AUR pair is committed.
       - name: Update AUR PKGBUILD version
+        env:
+          VERSION: ${{ needs.version.outputs.app-version }}
+          BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          VERSION="${{ needs.version.outputs.app-version }}"
-          sed -i "s/^pkgver=.*/pkgver=${VERSION}/" packaging/aur/PKGBUILD
-          sed -i "s/^pkgver = .*/pkgver = ${VERSION}/" packaging/aur/.SRCINFO
+          set -euo pipefail
+          node scripts/sync-version.mjs --version "${VERSION}"
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add packaging/aur/PKGBUILD packaging/aur/.SRCINFO
-          git diff --cached --quiet || git commit -m "chore: bump AUR pkgver to ${VERSION} [skip ci]"
-          git push
+          if git diff --cached --quiet; then
+            echo "AUR files already at ${VERSION}; nothing to push."
+            exit 0
+          fi
+          git commit -m "chore: bump AUR pkgver to ${VERSION} [skip ci]"
+          git push origin "HEAD:refs/heads/${BRANCH}"

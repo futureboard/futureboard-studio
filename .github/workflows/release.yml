@@ -3,10 +3,10 @@ name: Release Build
 # Builds the Windows installer, macOS DMG and Linux AppImage, then attaches
 # them to an existing GitHub release without touching its release notes.
 #
-# `build-desktop.yml` already publishes on `v*` tags with generated notes. This
-# workflow is the hand-written-notes path: it uploads assets onto a prepared
-# (usually draft) release and leaves the body alone, so a curated changelog
-# survives the build.
+# `build-desktop.yml` already publishes on pushed version tags (`2026.11.1-…`
+# or `v`-prefixed) with generated notes. This workflow is the
+# hand-written-notes path: it uploads assets onto a prepared (usually draft)
+# release and leaves the body alone, so a curated changelog survives the build.
 #
 # Dispatch only, on purpose. This used to carry a `schedule:` that started the
 # build 90 minutes ahead of a planned release moment, with a date guard making
@@ -56,6 +56,10 @@ concurrency:
   group: release-${{ inputs.tag }}
   cancel-in-progress: false
 
+# Read-only by default; the two jobs below that publish ask for write.
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Build Native
@@ -85,7 +89,7 @@ jobs:
 
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
