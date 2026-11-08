@@ -2006,6 +2006,146 @@ mod audio_clip_split_tests {
         assert_eq!(right.stretch.source_end_samples, 192_000);
     }
 
+    /// A 16-beat Warp clip at 120 BPM over 192 000 source frames, pinned at
+    /// both ends and warped by markers at beats 4, 8 and 12 (issue #275).
+    fn warped_clip() -> ClipState {
+        let mut clip = audio_clip("clip-5", 0.0, 16.0, 0.0);
+        clip.stretch.original_sample_rate = 48_000;
+        clip.stretch.project_sample_rate = 48_000;
+        clip.stretch.original_duration_samples = 192_000;
+        clip.stretch.source_end_samples = 192_000;
+        clip.stretch.mode = StretchMode::Warp;
+        let marker = |id: u64, source_sample: u64, timeline_beat: f64, locked: bool| WarpMarker {
+            id,
+            source_sample,
+            timeline_beat,
+            locked,
+        };
+        clip.stretch.warp_markers = vec![
+            marker(1, 0, 0.0, true),
+            marker(2, 30_000, 4.0, false),
+            marker(3, 100_000, 8.0, false),
+            marker(4, 150_000, 12.0, false),
+            marker(5, 192_000, 16.0, true),
+        ];
+        clip
+    }
+
+    fn warp_beats(clip: &ClipState) -> Vec<(u64, f64, u64)> {
+        clip.stretch
+            .warp_markers
+            .iter()
+            .map(|m| (m.id, m.timeline_beat, m.source_sample))
+            .collect()
+    }
+
+    /// Both halves still pass the project-load sanitizer unchanged.
+    fn assert_markers_survive_sanitize(clip: &ClipState) {
+        let mut sanitized = clip.stretch.clone();
+        sanitized.sanitize_in_place();
+        assert_eq!(sanitized.warp_markers, clip.stretch.warp_markers);
+    }
+
+    #[test]
+    fn split_on_a_warp_marker_keeps_it_as_both_halves_boundary() {
+        let mut state = TimelineState::default();
+        state.bpm = 120.0;
+        let clip = warped_clip();
+        let (left, right) = state.plan_audio_clip_split(&clip, 8.0).expect("split");
+
+        // The windows meet on the audio the marker pins to beat 8.
+        assert_eq!(left.stretch.source_start_samples, 0);
+        assert_eq!(left.stretch.source_end_samples, 100_000);
+        assert_eq!(right.stretch.source_start_samples, 100_000);
+        assert_eq!(right.stretch.source_end_samples, 192_000);
+        // Beat 8 ends the left half and starts the right one, same marker.
+        assert_eq!(
+            warp_beats(&left),
+            vec![(1, 0.0, 0), (2, 4.0, 30_000), (3, 8.0, 100_000)]
+        );
+        assert_eq!(
+            warp_beats(&right),
+            vec![(3, 8.0, 100_000), (4, 12.0, 150_000), (5, 16.0, 192_000)]
+        );
+        assert!(!left.stretch.warp_markers[2].locked);
+        assert!(!right.stretch.warp_markers[0].locked);
+        assert_markers_survive_sanitize(&left);
+        assert_markers_survive_sanitize(&right);
+    }
+
+    #[test]
+    fn split_just_before_a_warp_marker_anchors_the_cut_in_both_halves() {
+        let mut state = TimelineState::default();
+        state.bpm = 120.0;
+        let clip = warped_clip();
+        let (left, right) = state.plan_audio_clip_split(&clip, 7.5).expect("split");
+
+        // 7.5 is 7/8 of the way from (4, 30 000) to (8, 100 000).
+        let cut = 91_250;
+        assert_eq!(left.stretch.source_end_samples, cut);
+        assert_eq!(right.stretch.source_start_samples, cut);
+        assert_eq!(
+            warp_beats(&left),
+            vec![(1, 0.0, 0), (2, 4.0, 30_000), (6, 7.5, cut)]
+        );
+        assert_eq!(
+            warp_beats(&right),
+            vec![
+                (6, 7.5, cut),
+                (3, 8.0, 100_000),
+                (4, 12.0, 150_000),
+                (5, 16.0, 192_000)
+            ]
+        );
+        assert!(left.stretch.warp_markers[2].locked);
+        assert!(right.stretch.warp_markers[0].locked);
+        assert_markers_survive_sanitize(&left);
+        assert_markers_survive_sanitize(&right);
+    }
+
+    #[test]
+    fn split_just_after_a_warp_marker_keeps_it_on_the_left() {
+        let mut state = TimelineState::default();
+        state.bpm = 120.0;
+        let clip = warped_clip();
+        let (left, right) = state.plan_audio_clip_split(&clip, 8.5).expect("split");
+
+        // 8.5 is 1/8 of the way from (8, 100 000) to (12, 150 000).
+        let cut = 106_250;
+        assert_eq!(left.stretch.source_end_samples, cut);
+        assert_eq!(right.stretch.source_start_samples, cut);
+        assert_eq!(
+            warp_beats(&left),
+            vec![
+                (1, 0.0, 0),
+                (2, 4.0, 30_000),
+                (3, 8.0, 100_000),
+                (6, 8.5, cut)
+            ]
+        );
+        assert_eq!(
+            warp_beats(&right),
+            vec![(6, 8.5, cut), (4, 12.0, 150_000), (5, 16.0, 192_000)]
+        );
+        assert_markers_survive_sanitize(&left);
+        assert_markers_survive_sanitize(&right);
+    }
+
+    /// Markers kept for later on a clip out of Warp do not move the cut, but
+    /// one on the split still survives in both halves.
+    #[test]
+    fn split_of_dormant_warp_markers_keeps_the_one_on_the_split() {
+        let mut state = TimelineState::default();
+        state.bpm = 120.0;
+        let mut clip = warped_clip();
+        clip.stretch.mode = StretchMode::Off;
+        let (left, right) = state.plan_audio_clip_split(&clip, 8.0).expect("split");
+        assert_eq!(left.stretch.warp_markers.last().unwrap().id, 3);
+        assert_eq!(right.stretch.warp_markers[0].id, 3);
+        assert_eq!(left.stretch.warp_markers.len(), 3);
+        assert_eq!(right.stretch.warp_markers.len(), 3);
+    }
+
     /// A 4 s, 48 kHz clip at 120 BPM (8 beats), decoded and on a track.
     fn state_with_decoded_clip() -> (TimelineState, String) {
         let mut state = TimelineState::default();
