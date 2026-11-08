@@ -1,5 +1,10 @@
 //! The fader's dB scale, from Studio's mixer state (whose module needs the
 //! whole timeline). Keep it in step with Studio's `volume`.
+//!
+//! `playhead` is Studio's drawing helpers; the editor paints through them.
+
+#[path = "../../../../crates/SphereUIComponents/src/components/timeline/playhead.rs"]
+pub mod playhead;
 
 pub mod timeline_state {
     pub mod volume {

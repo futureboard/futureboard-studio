@@ -40,6 +40,18 @@ impl ShellMeter {
     }
 }
 
+/// Studio claims a bare Space for its transport. In a plug-in the transport
+/// is the host's: the key is never taken here.
+pub fn claim_editor_transport_key(
+    _event: &gpui::KeyDownEvent,
+    _window: &mut Window,
+    _cx: &mut App,
+) -> bool {
+    false
+}
+
+pub fn swallow_editor_transport_key_up(_window: &mut Window, _cx: &mut App) {}
+
 /// Studio's shell with a preset menu in its strip. The plug-in has no strip,
 /// and its host keeps the presets, so the menu is not shown.
 pub fn native_plugin_shell_with(

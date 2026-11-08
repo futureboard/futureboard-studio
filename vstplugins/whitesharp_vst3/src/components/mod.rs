@@ -4,6 +4,8 @@
 
 #[path = "../../../../crates/SphereUIComponents/src/components/controls.rs"]
 pub mod controls;
+#[path = "../../../../crates/SphereUIComponents/src/components/drag_pointer.rs"]
+pub mod drag_pointer;
 #[path = "../../../../crates/SphereUIComponents/src/components/fader.rs"]
 pub mod fader;
 #[path = "../../../../crates/SphereUIComponents/src/components/fx_model.rs"]

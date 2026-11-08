@@ -67,6 +67,7 @@ windows = { version = "0.61", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 # wgpu-hal hands its D3D12 device out as `windows` 0.62 types; the stage's
 # shared texture is created with the same version (as in the DAW).
