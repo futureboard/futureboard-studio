@@ -24,7 +24,7 @@ use builtin_dsp_core::make_eq_coefficients;
 use nam_rs::{Model, NamModel};
 
 use super::StereoBiquad;
-use super::handoff::HandoffCell;
+use super::handoff::{HandoffCell, RetireBin, Retired};
 use super::rate::{MAX_RATIO, MIN_RATIO, RateAdapter};
 
 /// Target integrated loudness (LUFS) captures are normalized to when loudness
@@ -415,11 +415,25 @@ impl PreparedNamRuntime {
 pub struct NamChannel {
     /// Control thread → audio thread: a freshly built runtime awaiting adoption.
     pending: HandoffCell<PreparedNamRuntime>,
-    /// Audio thread → control thread: a retired runtime awaiting disposal.
-    retired: HandoffCell<PreparedNamRuntime>,
+    /// Audio thread → control thread: retired runtimes awaiting disposal.
+    /// Sized so the audio thread always finds a free slot (see
+    /// [`super::handoff::RETIRE_SLOTS`]).
+    retired: RetireBin<PreparedNamRuntime>,
     /// Control thread → audio thread: drop the active capture at the next
     /// block boundary. A later [`NamLoader::submit`] clears it.
     unload: AtomicBool,
+}
+
+/// Control thread: drain the retire bin, then queue `runtime`. The drain has
+/// to come first: it is what bounds the bin to
+/// [`super::handoff::RETIRE_SLOTS`].
+fn submit_to(
+    channel: &NamChannel,
+    runtime: Box<PreparedNamRuntime>,
+) -> (Retired<PreparedNamRuntime>, Option<Box<PreparedNamRuntime>>) {
+    let retired = channel.retired.drain();
+    channel.unload.store(false, Ordering::Release);
+    (retired, channel.pending.put(runtime))
 }
 
 /// Cloneable control-side handle to a [`NamCapture`]'s hand-off cells.
@@ -436,37 +450,38 @@ pub struct NamLoader {
 
 impl NamLoader {
     /// Push a freshly-built runtime for the audio thread to adopt at the next
-    /// block boundary. Returns a runtime the audio thread has already retired
-    /// and a not-yet-adopted one this call displaced, so the caller can drop
-    /// both on this thread. The audio thread never frees a model. Clears a
-    /// pending [`Self::unload`].
+    /// block boundary. Returns every runtime the audio thread has already
+    /// retired and a not-yet-adopted one this call displaced, so the caller
+    /// can drop them on this thread. The audio thread never frees a model.
+    /// Clears a pending [`Self::unload`].
     pub fn submit(
         &self,
         runtime: Box<PreparedNamRuntime>,
-    ) -> (
-        Option<Box<PreparedNamRuntime>>,
-        Option<Box<PreparedNamRuntime>>,
-    ) {
-        let retired = self.channel.retired.take();
-        self.channel.unload.store(false, Ordering::Release);
-        (retired, self.channel.pending.put(runtime))
+    ) -> (Retired<PreparedNamRuntime>, Option<Box<PreparedNamRuntime>>) {
+        submit_to(&self.channel, runtime)
     }
 
     /// Drop the active capture at the next block boundary and return a runtime
     /// that was queued but not yet adopted, for the caller to drop. The audio
-    /// thread only retires the live one; it does not allocate or free.
+    /// thread only retires the live one; it does not allocate or free. The
+    /// retired capture waits for the next [`Self::submit`] or
+    /// [`Self::collect_garbage`].
     pub fn unload(&self) -> Option<Box<PreparedNamRuntime>> {
         let pending = self.channel.pending.take();
         self.channel.unload.store(true, Ordering::Release);
         pending
     }
 
-    /// Drop any runtime the audio thread has retired. Call periodically and
+    /// Drop every runtime the audio thread has retired. Call periodically and
     /// before each [`Self::submit`] as an opportunistic sweep.
     pub fn collect_garbage(&self) {
-        if let Some(dead) = self.channel.retired.take() {
-            drop(dead);
-        }
+        drop(self.channel.retired.drain());
+    }
+
+    /// Captures the audio thread had to leak because every retire slot was
+    /// full. Always 0 unless the retire bound is broken.
+    pub fn leaked_models(&self) -> usize {
+        self.channel.retired.leaked()
     }
 
     /// Parse, build and submit a `.nam` capture in one call (control thread —
@@ -497,10 +512,6 @@ pub(super) struct NamCapture {
     /// The just-replaced runtime, still running so [`Self::process`] can
     /// crossfade away from it instead of cutting over with a click.
     fading_out: Option<Box<PreparedNamRuntime>>,
-    /// A retiree that didn't fit in `retired` (control thread hasn't drained
-    /// it yet). Held here — never dropped on the audio thread — until a later
-    /// block finds `retired` empty again.
-    retire_overflow: Option<Box<PreparedNamRuntime>>,
 
     /// The shared hand-off cells; [`Self::loader`] clones this out.
     channel: Arc<NamChannel>,
@@ -559,10 +570,9 @@ impl NamCapture {
         let mut me = Self {
             active: None,
             fading_out: None,
-            retire_overflow: None,
             channel: Arc::new(NamChannel {
                 pending: HandoffCell::new(),
-                retired: HandoffCell::new(),
+                retired: RetireBin::new(),
                 unload: AtomicBool::new(false),
             }),
             in_l: vec![0.0; NAM_BLOCK],
@@ -668,28 +678,21 @@ impl NamCapture {
     }
 
     /// Control thread: push a freshly-built runtime for the audio thread to
-    /// adopt at the next block boundary. The retired runtime, and any
+    /// adopt at the next block boundary. The retired runtimes, and any
     /// not-yet-adopted one this call displaced, are returned for this thread
     /// to drop. Clears a pending unload.
     pub(super) fn submit(
         &self,
         runtime: Box<PreparedNamRuntime>,
-    ) -> (
-        Option<Box<PreparedNamRuntime>>,
-        Option<Box<PreparedNamRuntime>>,
-    ) {
-        let retired = self.channel.retired.take();
-        self.channel.unload.store(false, Ordering::Release);
-        (retired, self.channel.pending.put(runtime))
+    ) -> (Retired<PreparedNamRuntime>, Option<Box<PreparedNamRuntime>>) {
+        submit_to(&self.channel, runtime)
     }
 
-    /// Control thread: drop any runtime the audio thread has retired. Call
+    /// Control thread: drop every runtime the audio thread has retired. Call
     /// periodically (e.g. an idle/UI timer); also safe to call before
     /// [`Self::submit`] as an opportunistic sweep.
     pub(super) fn poll_garbage(&mut self) {
-        if let Some(dead) = self.channel.retired.take() {
-            drop(dead);
-        }
+        drop(self.channel.retired.drain());
     }
 
     /// Info about the currently active capture, if one is loaded.
@@ -713,12 +716,10 @@ impl NamCapture {
                 .unwrap_or(0)
     }
 
-    /// Park `runtime` for the control thread. One overflow is held here so a
-    /// full retired slot does not free the model on this thread.
+    /// Hand `runtime` to the control thread. Never frees it here: the bin
+    /// always has a free slot, and would leak rather than drop if it did not.
     fn park(&mut self, runtime: Box<PreparedNamRuntime>) {
-        if let Some(bounced) = self.channel.retired.put(runtime) {
-            self.retire_overflow = Some(bounced);
-        }
+        self.channel.retired.retire(runtime);
     }
 
     /// Fade the active capture out to a dry pass-through.
@@ -750,13 +751,6 @@ impl NamCapture {
                 self.pending_quantum = Some(quantum);
             } else {
                 self.pending_quantum = None;
-            }
-        }
-
-        // Drain a previous overflow now that a block boundary has passed.
-        if let Some(carry) = self.retire_overflow.take() {
-            if let Some(bounced) = self.channel.retired.put(carry) {
-                self.retire_overflow = Some(bounced);
             }
         }
 
@@ -796,9 +790,7 @@ impl NamCapture {
 
         if self.fade >= 1.0 {
             if let Some(done) = self.fading_out.take() {
-                if let Some(bounced) = self.channel.retired.put(done) {
-                    self.retire_overflow = Some(bounced);
-                }
+                self.park(done);
             }
         }
     }
@@ -1200,12 +1192,197 @@ mod tests {
                 assert!(l.is_finite() && r.is_finite());
                 cap.begin_block(0);
             }
-            assert!(
-                cap.retire_overflow.is_none(),
-                "swap {i} left a model for the audio thread to free"
-            );
+            assert_eq!(loader.leaked_models(), 0, "swap {i} found no retire slot");
         }
         loader.collect_garbage();
+    }
+
+    /// One step of a load/unload schedule. The control side never sweeps
+    /// garbage on its own, as in the VST3 wrapper: only `submit` drains.
+    #[derive(Clone, Copy, Debug)]
+    enum Step {
+        /// Control: build and submit a new capture.
+        Load,
+        /// Control: unload, taking back a capture that was not adopted yet.
+        Unload,
+        /// Control: an unload that lands after the audio thread has already
+        /// taken the queued capture (the #251 race). Only the flag is set.
+        RacingUnload,
+        /// Audio: one host callback.
+        Block,
+        /// Audio: enough callbacks for the fades to resolve.
+        Settle,
+    }
+
+    /// The control and audio sides of one capture, driven step by step. The
+    /// heap probe is armed around every audio-side call, so a model freed in
+    /// `begin_block` or `process` is counted.
+    struct SwapRig {
+        cap: NamCapture,
+        loader: NamLoader,
+        loads: usize,
+        audio_frees: u64,
+        finite: bool,
+        /// What the control side asked for last.
+        wanted: Option<String>,
+    }
+
+    impl SwapRig {
+        fn new() -> Self {
+            let mut cap = NamCapture::new(48_000.0);
+            cap.configure(0.0, 0.0, 100.0, false, 1.0);
+            let loader = cap.loader();
+            Self {
+                cap,
+                loader,
+                loads: 0,
+                audio_frees: 0,
+                finite: true,
+                wanted: None,
+            }
+        }
+
+        fn step(&mut self, step: Step) {
+            match step {
+                Step::Load => {
+                    let name = format!("m{}", self.loads);
+                    self.loads += 1;
+                    let runtime =
+                        prepare_nam_runtime(TINY_WAVENET_48K, name.clone(), 48_000.0, false, false)
+                            .unwrap();
+                    drop(self.loader.submit(Box::new(runtime)));
+                    self.wanted = Some(name);
+                }
+                Step::Unload => {
+                    drop(self.loader.unload());
+                    self.wanted = None;
+                }
+                Step::RacingUnload => {
+                    self.cap.channel.unload.store(true, Ordering::Release);
+                    self.wanted = None;
+                }
+                Step::Block => self.blocks(1),
+                Step::Settle => self.blocks(16),
+            }
+        }
+
+        fn blocks(&mut self, count: usize) {
+            let mut finite = true;
+            crate::alloc_probe::reset();
+            crate::alloc_probe::arm();
+            for block in 0..count {
+                self.cap.begin_block(NAM_BLOCK);
+                for n in 0..NAM_BLOCK {
+                    let x = ((block * NAM_BLOCK + n) as f32 * 0.05).sin() * 0.2;
+                    let (l, r) = self.cap.process(x, -x);
+                    finite &= l.is_finite() && r.is_finite();
+                }
+            }
+            crate::alloc_probe::disarm();
+            self.audio_frees += crate::alloc_probe::frees();
+            self.finite &= finite;
+        }
+
+        /// Run `steps`, let everything resolve, and check that no model was
+        /// freed on the audio side and the last request is what plays.
+        fn run(steps: &[Step], preloaded: bool) {
+            let mut rig = Self::new();
+            if preloaded {
+                rig.step(Step::Load);
+                rig.step(Step::Settle);
+            }
+            for &step in steps {
+                rig.step(step);
+            }
+            rig.blocks(48);
+            assert_eq!(
+                rig.audio_frees, 0,
+                "{steps:?} (preloaded: {preloaded}) freed on the audio thread"
+            );
+            assert_eq!(rig.loader.leaked_models(), 0, "{steps:?} leaked a model");
+            assert!(rig.finite, "{steps:?} went non-finite");
+            assert!(rig.cap.fading_out.is_none(), "{steps:?} never settled");
+            assert_eq!(
+                rig.cap.active_info().map(|i| i.name),
+                rig.wanted,
+                "{steps:?} (preloaded: {preloaded}) plays the wrong capture"
+            );
+            rig.loader.collect_garbage();
+        }
+    }
+
+    /// Issue #257: two loads within a couple of callbacks fill every retire
+    /// slot, and the unload after them freed a capture inside the callback.
+    #[test]
+    fn an_unload_after_two_quick_loads_frees_nothing_on_the_audio_thread() {
+        use Step::*;
+        SwapRig::run(&[Load, Block, Load, Settle, Unload], true);
+        SwapRig::run(&[Load, Block, Load, Block, Settle, Unload, Settle], true);
+    }
+
+    #[test]
+    fn load_load_unload_frees_nothing_on_the_audio_thread() {
+        use Step::*;
+        for preloaded in [false, true] {
+            SwapRig::run(&[Load, Load, Unload], preloaded);
+            SwapRig::run(&[Load, Block, Load, Block, Unload], preloaded);
+            SwapRig::run(&[Load, Settle, Load, Settle, Unload], preloaded);
+        }
+    }
+
+    #[test]
+    fn load_unload_load_frees_nothing_on_the_audio_thread() {
+        use Step::*;
+        for preloaded in [false, true] {
+            SwapRig::run(&[Load, Unload, Load], preloaded);
+            SwapRig::run(&[Load, Block, Unload, Block, Load], preloaded);
+            SwapRig::run(&[Load, Settle, Unload, Settle, Load], preloaded);
+        }
+    }
+
+    #[test]
+    fn four_rapid_swaps_then_an_unload_free_nothing_on_the_audio_thread() {
+        use Step::*;
+        for preloaded in [false, true] {
+            SwapRig::run(
+                &[Load, Block, Load, Block, Load, Block, Load, Block, Unload],
+                preloaded,
+            );
+            SwapRig::run(&[Load, Load, Load, Load, Settle, Unload], preloaded);
+        }
+    }
+
+    #[test]
+    fn an_unload_during_adoption_frees_nothing_on_the_audio_thread() {
+        use Step::*;
+        for preloaded in [false, true] {
+            SwapRig::run(&[Load, RacingUnload], preloaded);
+            SwapRig::run(&[Load, Block, Load, RacingUnload, Settle], preloaded);
+            SwapRig::run(&[Load, Block, Load, Block, Load, RacingUnload], preloaded);
+        }
+    }
+
+    /// Every schedule of five steps, from an empty slot and from a playing
+    /// capture. Whatever the order, no model is freed on the audio side, and
+    /// the last request wins.
+    #[test]
+    fn no_schedule_frees_a_model_on_the_audio_thread() {
+        use Step::*;
+        const STEPS: [Step; 5] = [Load, Unload, RacingUnload, Block, Settle];
+        const LEN: u32 = 5;
+        for preloaded in [false, true] {
+            for code in 0..STEPS.len().pow(LEN) {
+                let mut rest = code;
+                let steps: Vec<Step> = (0..LEN)
+                    .map(|_| {
+                        let step = STEPS[rest % STEPS.len()];
+                        rest /= STEPS.len();
+                        step
+                    })
+                    .collect();
+                SwapRig::run(&steps, preloaded);
+            }
+        }
     }
 
     /// With no capture loaded the slot passes the signal through — delayed by

@@ -7,8 +7,10 @@
 //! defaults. The host-facing id of each parameter is its wire id, so
 //! automation and saved sessions use the names Studio's projects use.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+use nih_plug::params::persist::PersistentField;
 use nih_plug::prelude::*;
 use nih_plug_gpui::EditorContext;
 use rodharerist::{
@@ -26,22 +28,63 @@ pub struct RodhareistParams {
     /// The `.nam` capture the amp's NAM engine runs: a file name in
     /// `Documents/Futureboard Studio/Rodhareist/NAMs`, as Studio saves it.
     #[persist = "nam-file"]
-    pub nam_file: Arc<RwLock<Option<String>>>,
+    pub nam_file: FileName,
 
     /// The `.wav` impulse response the cabinet convolves with: a file name in
     /// `Documents/Futureboard Studio/Rodhareist/IRs`.
     #[persist = "ir-file"]
-    pub ir_file: Arc<RwLock<Option<String>>>,
+    pub ir_file: FileName,
 
     #[nested]
     pub wire: WireParams,
 }
 
+/// A saved file name, and how many times a state load has written it.
+///
+/// nih-plug runs `initialize` both for a state load and for a plain host
+/// re-activation. Only a state load goes through [`PersistentField::set`],
+/// so the revision tells the two apart. The plug-in's own writes (a load
+/// that succeeded) leave it alone.
+#[derive(Default)]
+pub struct FileName {
+    name: RwLock<Option<String>>,
+    revision: AtomicU64,
+}
+
+impl FileName {
+    pub fn get(&self) -> Option<String> {
+        self.name.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn put(&self, name: Option<String>) {
+        *self.name.write().unwrap_or_else(|e| e.into_inner()) = name;
+    }
+
+    /// Bumped by every state load.
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+}
+
+impl<'a> PersistentField<'a, Option<String>> for FileName {
+    fn set(&self, new_value: Option<String>) {
+        self.put(new_value);
+        self.revision.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn map<F, R>(&self, f: F) -> R
+    where
+        F: Fn(&Option<String>) -> R,
+    {
+        f(&self.name.read().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
 impl Default for RodhareistParams {
     fn default() -> Self {
         Self {
-            nam_file: Arc::new(RwLock::new(None)),
-            ir_file: Arc::new(RwLock::new(None)),
+            nam_file: FileName::default(),
+            ir_file: FileName::default(),
             wire: WireParams::new(),
         }
     }
@@ -49,25 +92,19 @@ impl Default for RodhareistParams {
 
 impl RodhareistParams {
     pub fn nam_file(&self) -> Option<String> {
-        self.nam_file
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.nam_file.get()
     }
 
     pub fn ir_file(&self) -> Option<String> {
-        self.ir_file
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.ir_file.get()
     }
 
     pub fn set_nam_file(&self, name: Option<String>) {
-        *self.nam_file.write().unwrap_or_else(|e| e.into_inner()) = name;
+        self.nam_file.put(name);
     }
 
     pub fn set_ir_file(&self, name: Option<String>) {
-        *self.ir_file.write().unwrap_or_else(|e| e.into_inner()) = name;
+        self.ir_file.put(name);
     }
 
     /// The core params the host values describe, with the files they name:
@@ -162,6 +199,18 @@ impl WireParams {
     /// Every value in entry order, for the editor to see what moved.
     pub fn values(&self) -> Vec<f32> {
         self.entries.iter().map(|e| e.param.plain()).collect()
+    }
+
+    /// The signal path the `path_slot_*` values describe. Not for the audio
+    /// thread (it scans every entry).
+    pub fn path_order(&self) -> [Option<StageKind>; PATH_SLOTS] {
+        let mut order = [None; PATH_SLOTS];
+        for entry in self.entries.iter() {
+            if let EntryKind::PathSlot(slot) = entry.kind {
+                order[slot] = StageKind::from_index(entry.param.plain().round() as i32);
+            }
+        }
+        order
     }
 
     /// The core parameter set these host values describe: the defaults with

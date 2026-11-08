@@ -2,10 +2,10 @@
 //! The audio thread only ever touches the atomics here.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use nih_plug::prelude::AtomicF32;
-use rodharerist::{IrLoader, NamLoader};
+use rodharerist::{IrLoader, NamLoader, StageKind, PATH_SLOTS};
 
 pub const TELEMETRY_SLOTS: usize = rodharerist::telemetry::SLOTS;
 
@@ -34,6 +34,71 @@ pub struct ControlSide {
     /// A finished build submits only if it still owns the generation.
     pub nam_generation: u64,
     pub ir_generation: u64,
+    /// A file picked in the editor that has not finished building. A host
+    /// re-activation leaves it running, or builds it again for a new `Dsp`;
+    /// a state load replaces it.
+    pub nam_pick: Option<Pick>,
+    pub ir_pick: Option<Pick>,
+}
+
+impl ControlSide {
+    /// The handles of a freshly built `Dsp`, with nothing loaded yet.
+    pub fn new(nam: NamLoader, ir: IrLoader, sample_rate: f64) -> Self {
+        Self {
+            nam,
+            ir,
+            sample_rate,
+            nam_loaded: None,
+            ir_loaded: None,
+            nam_generation: 0,
+            ir_generation: 0,
+            nam_pick: None,
+            ir_pick: None,
+        }
+    }
+}
+
+/// What an editor pick handed over: the file's contents, kept until the
+/// build lands so a new `Dsp` can be given the same file.
+#[derive(Clone)]
+pub enum Picked {
+    Capture(Arc<str>),
+    Impulse(Arc<[u8]>),
+}
+
+/// An editor pick still building.
+pub struct Pick {
+    pub name: String,
+    pub data: Picked,
+    /// The file name's state revision when it was picked. A state loaded
+    /// since then is newer than the pick.
+    pub revision: u64,
+    /// The generation and control epoch its build runs under.
+    pub generation: u64,
+    pub epoch: u64,
+}
+
+/// The order a chain edit from the editor is heading to, packed four bits a
+/// slot (stage index + 1, 0 for empty). `NO_PATH_TARGET` when none is.
+const NO_PATH_TARGET: u64 = u64::MAX;
+const _: () = assert!(PATH_SLOTS * 4 < 64 && StageKind::COUNT <= 15);
+
+pub type PathOrder = [Option<StageKind>; PATH_SLOTS];
+
+fn pack_path(order: &PathOrder) -> u64 {
+    order.iter().enumerate().fold(0, |bits, (slot, stage)| {
+        let nibble = stage.map_or(0, |stage| u64::from(stage.index()) + 1);
+        bits | nibble << (slot * 4)
+    })
+}
+
+fn unpack_path(bits: u64) -> PathOrder {
+    std::array::from_fn(|slot| {
+        let nibble = (bits >> (slot * 4)) & 0xF;
+        nibble
+            .checked_sub(1)
+            .and_then(|index| StageKind::from_index(index as i32))
+    })
 }
 
 pub struct Shared {
@@ -56,6 +121,9 @@ pub struct Shared {
 
     /// Editor → audio: reset the sticky clip lights.
     pub clear_clip: AtomicBool,
+    /// Editor → audio: the order a chain edit ends in, published before its
+    /// first slot is written. Packed; see [`pack_path`].
+    path_target: AtomicU64,
 
     /// The loaders of the running `Dsp`; `None` before `initialize`.
     pub control: Mutex<Option<ControlSide>>,
@@ -84,6 +152,7 @@ impl Default for Shared {
             latency: AtomicU32::default(),
             tempo: AtomicF32::default(),
             clear_clip: AtomicBool::default(),
+            path_target: AtomicU64::new(NO_PATH_TARGET),
             control: Mutex::new(None),
             control_epoch: AtomicU64::new(0),
             nam_answers: AtomicU32::default(),
@@ -155,6 +224,48 @@ impl Shared {
             self.latency.load(Ordering::Relaxed),
             self.tempo.load(Ordering::Relaxed),
         )
+    }
+
+    /// Editor: the chain edit about to be written ends in `order`.
+    pub fn publish_path_target(&self, order: &PathOrder) {
+        self.path_target.store(pack_path(order), Ordering::Release);
+    }
+
+    /// The order a chain edit in flight ends in. Audio thread: one atomic
+    /// load, no allocation.
+    pub fn path_target(&self) -> Option<PathOrder> {
+        let bits = self.path_target.load(Ordering::Acquire);
+        (bits != NO_PATH_TARGET).then(|| unpack_path(bits))
+    }
+
+    /// Audio thread: the edit that ends in `order` is over (applied, or its
+    /// slots went elsewhere). A newer edit's target stays.
+    pub fn finish_path_target(&self, order: &PathOrder) {
+        let _ = self.path_target.compare_exchange(
+            pack_path(order),
+            NO_PATH_TARGET,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// A state load or a new `Dsp` takes the chain as it stands.
+    pub fn clear_path_target(&self) {
+        self.path_target.store(NO_PATH_TARGET, Ordering::Release);
+    }
+
+    /// Puts a new `Dsp`'s handles in place. Anything still building was
+    /// aimed at the one replaced and drops itself; an editor pick it
+    /// carried over is built again by the `restore` that follows.
+    pub fn install_control(&self, nam: NamLoader, ir: IrLoader, sample_rate: f64) {
+        let mut next = ControlSide::new(nam, ir, sample_rate);
+        let mut guard = self.control.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(previous) = guard.as_mut() {
+            next.nam_pick = previous.nam_pick.take();
+            next.ir_pick = previous.ir_pick.take();
+        }
+        *guard = Some(next);
+        self.bump_control_epoch();
     }
 
     pub fn bump_control_epoch(&self) {

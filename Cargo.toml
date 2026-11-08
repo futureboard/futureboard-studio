@@ -265,8 +265,13 @@ ndarray = "0.16"
 # High-quality sinc resampler to bring input to the MDX-NET 44.1 kHz contract.
 rubato = "0.16"
 # Archive extraction for the build-time ONNX Runtime download (zip on Windows,
-# gzip+tar on Linux/macOS).
-zip = { version = "2", default-features = false, features = ["deflate"] }
+# gzip+tar on Linux/macOS), and the project ZIP export.
+# `deflate-flate2` keeps flate2's default miniz_oxide backend (what zip 2's
+# `deflate` used); zip 9's `deflate` would switch every flate2 user in the graph
+# to zlib-rs.
+zip = { version = "9.4.2", default-features = false, features = [
+    "deflate-flate2",
+] }
 flate2 = "1"
 symphonia = { version = "0.5", default-features = false, features = [
     "wav",

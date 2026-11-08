@@ -59,6 +59,7 @@ use delay::DelayStage;
 use drive::Drive;
 use eq::EqStage;
 use gate::NoiseGate;
+pub use handoff::Retired;
 pub use ir::{
     IrInfo, IrLoadError, IrLoader, MAX_IR_SECONDS, PARTITION as IR_PARTITION_SAMPLES,
     PreparedIrRuntime, prepare_ir_runtime,

@@ -95,20 +95,29 @@ pub fn ensure_plugin_dirs(root: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Windows opens `CON`, `NUL`, `AUX`, `PRN`, `COM1`–`COM9` and `LPT1`–`LPT9`
-/// as devices even when a file extension follows the name (`COM1.nam`).
+/// Windows opens these names as devices, not files: `CON`, `PRN`, `AUX`,
+/// `NUL`, `COM0`–`COM9` and `LPT0`–`LPT9` (the digit may also be a
+/// superscript `¹`, `²` or `³`), and the console's `CONIN$` and `CONOUT$`.
+/// In any case, and whatever follows the first dot (`COM1.nam`,
+/// `conin$.tar.nam`) or pads the name with spaces (`NUL .wav`).
 fn is_windows_device_name(name: &str) -> bool {
-    let stem = name.split_once('.').map(|(stem, _)| stem).unwrap_or(name);
-    let stem = stem.trim_end_matches([' ', '.']);
-    if stem.is_empty() {
-        return false;
-    }
+    let stem = name.split('.').next().unwrap_or(name).trim_matches(' ');
     let upper = stem.to_ascii_uppercase();
-    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || (upper.len() == 4
-            && (upper.starts_with("COM") || upper.starts_with("LPT"))
-            && upper.as_bytes()[3].is_ascii_digit()
-            && upper.as_bytes()[3] != b'0')
+    if matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) {
+        return true;
+    }
+    let (Some(port), Some(number)) = (upper.get(..3), upper.get(3..)) else {
+        return false;
+    };
+    let mut number = number.chars();
+    matches!(port, "COM" | "LPT")
+        && matches!(
+            (number.next(), number.next()),
+            (Some('0'..='9' | '¹' | '²' | '³'), None)
+        )
 }
 
 /// Sandbox gate: accept only a bare leaf name with a whitelisted extension.
@@ -269,6 +278,69 @@ mod tests {
             sanitize_file_name(Nams, "concert.nam"),
             Some("concert.nam".into())
         );
+    }
+
+    #[test]
+    fn every_windows_device_name_is_refused() {
+        use BuiltinFileKind::*;
+        let mut devices: Vec<String> = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        for port in ["COM", "LPT"] {
+            for digit in "0123456789¹²³".chars() {
+                devices.push(format!("{port}{digit}"));
+            }
+        }
+        for device in &devices {
+            let lower = device.to_lowercase();
+            let mixed: String = device
+                .chars()
+                .enumerate()
+                .map(|(i, c)| {
+                    if i % 2 == 0 {
+                        c.to_ascii_lowercase()
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            for stem in [device.as_str(), &lower, &mixed] {
+                for name in [
+                    format!("{stem}.nam"),
+                    format!("{stem}.NAM"),
+                    format!("{stem} .nam"),
+                    format!("{stem}  .nam"),
+                    format!("{stem}.backup.nam"),
+                    format!(" {stem}.nam"),
+                ] {
+                    assert_eq!(sanitize_file_name(Nams, &name), None, "{name:?}");
+                }
+                assert_eq!(
+                    sanitize_file_name(Irs, &format!("{stem}.wav")),
+                    None,
+                    "{stem}.wav"
+                );
+                // A preset name box adds the extension itself.
+                assert_eq!(sanitize_file_name(Presets, stem), None, "{stem:?}");
+            }
+        }
+        // Names that only start like a device are files.
+        for name in [
+            "console.nam",
+            "COM10.nam",
+            "LPT.nam",
+            "conin.nam",
+            "CONOUT$1.nam",
+            "nul-amp.nam",
+            "COM¹0.nam",
+        ] {
+            assert_eq!(
+                sanitize_file_name(Nams, name),
+                Some(name.to_string()),
+                "{name:?}"
+            );
+        }
     }
 
     #[test]

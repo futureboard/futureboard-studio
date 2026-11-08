@@ -1,6 +1,8 @@
 //! The editor: Studio's Rodhareist window, given host ops that read and
 //! write this plug-in instead of Studio's engine.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,8 +22,9 @@ use crate::components::rodhareist_window::{
     RodhareistEditorWindow, RODHAREIST_WINDOW_HEIGHT, RODHAREIST_WINDOW_WIDTH,
 };
 use crate::files::Task;
-use crate::params::{RodhareistParams, CLEAR_CLIP};
+use crate::params::{EntryKind, RodhareistParams, CLEAR_CLIP};
 use crate::shared::Shared;
+use rodharerist::StageKind;
 
 /// How often the editor looks for host-side param changes (automation, a
 /// host preset, an undo) and for answered file loads.
@@ -184,6 +187,76 @@ impl Render for PluginEditor {
     }
 }
 
+/// A chain edit (add, move, remove a block) reaches `forward_param` as one
+/// call per slot, all inside one UI update. Those writes are collected and
+/// sent at the end of the update, after the order they end in is published:
+/// the host may deliver them over several audio callbacks, and the audio
+/// thread holds the running chain until the published order has arrived.
+#[derive(Clone)]
+struct ChainEdit {
+    params: Arc<RodhareistParams>,
+    shared: Arc<Shared>,
+    context: EditorContext,
+    /// `(slot, wire index, value)` of the edit being collected.
+    staged: Rc<RefCell<Vec<(usize, u32, f32)>>>,
+}
+
+impl ChainEdit {
+    fn new(params: &Arc<RodhareistParams>, shared: &Arc<Shared>, context: &EditorContext) -> Self {
+        Self {
+            params: params.clone(),
+            shared: shared.clone(),
+            context: context.clone(),
+            staged: Rc::new(RefCell::new(Vec::new())),
+        }
+    }
+
+    /// Collects a `path_slot_*` write. `false` for any other parameter.
+    fn stage(&self, index: u32, value: f32, cx: &mut gpui::App) -> bool {
+        let slot = rodharerist::ui_param_id(index)
+            .and_then(|id| self.params.wire.get(id))
+            .and_then(|entry| match entry.kind {
+                EntryKind::PathSlot(slot) => Some(slot),
+                EntryKind::Value => None,
+            });
+        let Some(slot) = slot else {
+            return false;
+        };
+        let first = {
+            let mut staged = self.staged.borrow_mut();
+            let first = staged.is_empty();
+            staged.retain(|(staged_slot, _, _)| *staged_slot != slot);
+            staged.push((slot, index, value));
+            first
+        };
+        if first {
+            let edit = self.clone();
+            cx.defer(move |_cx| edit.flush());
+        }
+        true
+    }
+
+    fn flush(&self) {
+        let staged = std::mem::take(&mut *self.staged.borrow_mut());
+        if staged.is_empty() {
+            return;
+        }
+        // On top of an edit the host is still delivering, not of the values
+        // it has not delivered yet.
+        let mut target = self
+            .shared
+            .path_target()
+            .unwrap_or_else(|| self.params.wire.path_order());
+        for &(slot, _, value) in &staged {
+            target[slot] = StageKind::from_index(value.round() as i32);
+        }
+        self.shared.publish_path_target(&target);
+        for (_, index, value) in staged {
+            self.params.set_from_editor(&self.context, index, value);
+        }
+    }
+}
+
 fn host_ops(
     context: &EditorContext,
     params: &Arc<RodhareistParams>,
@@ -193,18 +266,19 @@ fn host_ops(
     let forward_params = params.clone();
     let forward_shared = shared.clone();
     let forward_context = context.clone();
+    let chain_edit = ChainEdit::new(params, shared, context);
     let meter_shared = shared.clone();
     let status_shared = shared.clone();
     let telemetry_shared = shared.clone();
     let (nam_params, nam_shared) = (params.clone(), shared.clone());
     let (ir_params, ir_shared) = (params.clone(), shared.clone());
     BuiltinEditorHostOps {
-        forward_param: Some(Arc::new(move |_key, index, value, _cx| {
+        forward_param: Some(Arc::new(move |_key, index, value, cx| {
             if Some(index) == clear_clip {
                 forward_shared
                     .clear_clip
                     .store(true, std::sync::atomic::Ordering::Relaxed);
-            } else {
+            } else if !chain_edit.stage(index, value, cx) {
                 forward_params.set_from_editor(&forward_context, index, value);
             }
         })),

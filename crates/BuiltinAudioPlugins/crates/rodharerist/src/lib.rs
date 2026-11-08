@@ -16,7 +16,7 @@ pub use dsp::{
     AmpModel, CabModel, DelayModel, DriveModel, Dsp, EqModel, IR_PARTITION_SAMPLES, IrInfo,
     IrLoadError, IrLoader, Line2Mode, MAX_IR_SECONDS, MicModel, ModModel, NAM_BLOCK_SAMPLES,
     NamCaptureInfo, NamLoadError, NamLoader, PATH_SLOTS, PLUGIN_ID, Params, PreparedIrRuntime,
-    PreparedNamRuntime, ReverbModel, RowSend, StageBParams, StageChannel, StageKind,
+    PreparedNamRuntime, Retired, ReverbModel, RowSend, StageBParams, StageChannel, StageKind,
     ToneEngineKind, WahModel, apply_to_params, default_params, descriptor, prepare_ir_runtime,
     prepare_nam_runtime, reorder_chain, telemetry, ui_values,
 };
@@ -94,8 +94,10 @@ mod tests {
     }
 }
 
-/// Counts heap hits on the thread that armed it. `const` thread-locals so the
-/// counter itself does not allocate on first touch.
+/// Counts heap hits on the thread that armed it, and separately the frees.
+/// `const` thread-locals so the counter itself does not allocate on first
+/// touch. A free while armed on the audio side means a model, or something
+/// else, was dropped inside the callback.
 #[cfg(test)]
 pub(crate) mod alloc_probe {
     use std::alloc::{GlobalAlloc, Layout, System};
@@ -106,6 +108,7 @@ pub(crate) mod alloc_probe {
     thread_local! {
         static ARMED: Cell<bool> = const { Cell::new(false) };
         static COUNT: Cell<u64> = const { Cell::new(0) };
+        static FREES: Cell<u64> = const { Cell::new(0) };
     }
 
     unsafe impl GlobalAlloc for Counting {
@@ -131,6 +134,9 @@ pub(crate) mod alloc_probe {
         }
 
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            if ARMED.with(Cell::get) {
+                FREES.with(|c| c.set(c.get() + 1));
+            }
             unsafe { System.dealloc(ptr, layout) }
         }
     }
@@ -140,6 +146,7 @@ pub(crate) mod alloc_probe {
 
     pub(crate) fn reset() {
         COUNT.with(|c| c.set(0));
+        FREES.with(|c| c.set(0));
     }
 
     pub(crate) fn arm() {
@@ -152,5 +159,10 @@ pub(crate) mod alloc_probe {
 
     pub(crate) fn count() -> u64 {
         COUNT.with(Cell::get)
+    }
+
+    /// Heap frees made on this thread while armed.
+    pub(crate) fn frees() -> u64 {
+        FREES.with(Cell::get)
     }
 }

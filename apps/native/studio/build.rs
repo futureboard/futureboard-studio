@@ -229,7 +229,10 @@ fn extract_lib_from_zip(bytes: &[u8], lib_name: &str) -> Option<Vec<u8>> {
         if !file.is_file() {
             continue;
         }
-        let name = file.name().rsplit('/').next().unwrap_or("").to_string();
+        let Ok(full_name) = file.name() else {
+            continue;
+        };
+        let name = full_name.rsplit('/').next().unwrap_or("").to_string();
         if lib_matches(&name, lib_name) {
             let mut out = Vec::with_capacity(file.size() as usize);
             file.read_to_end(&mut out).ok()?;

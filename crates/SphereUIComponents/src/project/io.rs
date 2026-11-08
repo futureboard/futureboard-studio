@@ -3509,7 +3509,10 @@ mod tests {
         );
 
         let mut zip = zip::ZipArchive::new(File::open(&archive).unwrap()).unwrap();
-        let mut names: Vec<String> = zip.file_names().map(str::to_string).collect();
+        let mut names: Vec<String> = zip
+            .file_names()
+            .map(|name| name.unwrap().into_owned())
+            .collect();
         names.sort();
         assert_eq!(
             names,
@@ -3590,7 +3593,10 @@ mod tests {
         assert!(!PathBuf::from(format!("{}.part", archive.display())).exists());
 
         let mut zip = zip::ZipArchive::new(File::open(&archive).unwrap()).unwrap();
-        let mut names: Vec<String> = zip.file_names().map(str::to_string).collect();
+        let mut names: Vec<String> = zip
+            .file_names()
+            .map(|name| name.unwrap().into_owned())
+            .collect();
         names.sort();
         assert_eq!(
             names,

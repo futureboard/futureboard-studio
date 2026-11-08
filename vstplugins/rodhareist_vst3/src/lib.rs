@@ -15,7 +15,7 @@
 
 use std::num::NonZeroU32;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, PoisonError};
+use std::sync::Arc;
 
 use builtin_dsp_core::StereoEffect;
 use nih_plug::prelude::*;
@@ -29,7 +29,7 @@ mod params;
 mod shared;
 
 use params::{EntryKind, RodhareistParams};
-use shared::{ControlSide, MeterReading, Shared};
+use shared::{MeterReading, PathOrder, Shared};
 
 // Studio's UI modules, under the names its editor files import them by.
 #[allow(dead_code, unused_imports)]
@@ -86,9 +86,10 @@ pub struct Rodhareist {
     /// Host maximum block. The NAM chunk follows this, not each callback's
     /// length, so a short block does not move the reported latency.
     nam_block: usize,
-    /// A path order we held back for one block. The same order again is what
-    /// the host meant; a different one is still a move in progress.
-    held_path: Option<[Option<StageKind>; PATH_SLOTS]>,
+    /// A path order we held back. Without an editor target, the same order
+    /// again is what the host meant; a different one is still a move in
+    /// progress.
+    held_path: Option<PathOrder>,
 }
 
 impl Default for Rodhareist {
@@ -163,18 +164,20 @@ impl Rodhareist {
             self.held_path = None;
             return;
         }
-        // The editor sends a move as one parameter per slot. A block boundary
-        // between those writes either duplicates a stage or, when the block
-        // lands on an empty slot, removes it for one callback. Hold the
-        // previous order. The same incomplete order on the next block is a
-        // deliberate edit (a removal, or a duplicate from a generic editor)
-        // and is applied then; the DSP drops a real duplicate.
+        // The editor sends a move as one parameter per slot, and the host may
+        // hand those writes over across any number of callbacks. Between
+        // them a stage sits in two slots or, when the move lands on an empty
+        // slot, in none. Hold the previous order until the order the editor
+        // published for the edit has arrived. Without such a target (a
+        // generic editor, a host edit) the same incomplete order on the next
+        // block is deliberate (a removal, or a duplicate) and is applied
+        // then; the DSP drops a real duplicate.
         let mut order = [None; PATH_SLOTS];
         for (slot, &entry) in self.path_slots.iter().enumerate() {
             let value = self.params.wire.entries()[entry].param.plain();
             order[slot] = StageKind::from_index(value.round() as i32);
         }
-        if hold_path_order(&mut self.held_path, &applied_path, &order) {
+        if self.hold_path(&applied_path, &order) {
             return;
         }
         for &entry in &self.path_slots {
@@ -185,7 +188,21 @@ impl Rodhareist {
         }
     }
 
-    fn applied_path(&self) -> [Option<StageKind>; PATH_SLOTS] {
+    /// Whether this block keeps the running chain instead of `order`. Ends
+    /// the editor's chain edit once it is over. One atomic load, and a
+    /// compare-exchange when the edit ends.
+    fn hold_path(&mut self, applied: &PathOrder, order: &PathOrder) -> bool {
+        let target = self.shared.path_target();
+        let step = hold_path_order(&mut self.held_path, applied, order, target.as_ref());
+        if step.target_done {
+            if let Some(target) = &target {
+                self.shared.finish_path_target(target);
+            }
+        }
+        step.hold
+    }
+
+    fn applied_path(&self) -> PathOrder {
         let mut order = [None; PATH_SLOTS];
         for (slot, &entry) in self.path_slots.iter().enumerate() {
             let value = self.applied[entry];
@@ -198,29 +215,60 @@ impl Rodhareist {
     }
 }
 
-/// Hold `next` back for one block when it is a move seen halfway: a stage
-/// sits in two slots, or a stage from `previous` has disappeared. The same
+/// What one block does with the slot values it found.
+#[derive(Debug, PartialEq, Eq)]
+struct PathStep {
+    /// Keep the chain that is running.
+    hold: bool,
+    /// The editor's chain edit is over: it arrived, or the slots left its
+    /// way.
+    target_done: bool,
+}
+
+/// Whether a block applies `next`, the chain the slot values describe.
+///
+/// With `target`, the order an editor edit ends in: every order on the way
+/// from `previous` to it (each slot holding its old or its new stage) is
+/// held, for as many blocks as the writes take, and `target` itself is
+/// applied. Anything else ends that edit.
+///
+/// Without one: `next` is held back for one block when it is a move seen
+/// halfway, a stage in two slots or a stage from `previous` gone. The same
 /// `next` again is applied.
 fn hold_path_order(
-    held: &mut Option<[Option<StageKind>; PATH_SLOTS]>,
-    previous: &[Option<StageKind>; PATH_SLOTS],
-    next: &[Option<StageKind>; PATH_SLOTS],
-) -> bool {
-    if path_order_is_mid_move(previous, next) && *held != Some(*next) {
-        *held = Some(*next);
-        true
-    } else {
-        *held = None;
-        false
+    held: &mut Option<PathOrder>,
+    previous: &PathOrder,
+    next: &PathOrder,
+    target: Option<&PathOrder>,
+) -> PathStep {
+    let mut target_done = false;
+    if let Some(target) = target {
+        if next == target {
+            *held = None;
+            return PathStep {
+                hold: false,
+                target_done: true,
+            };
+        }
+        let on_the_way =
+            (0..PATH_SLOTS).all(|slot| next[slot] == previous[slot] || next[slot] == target[slot]);
+        if on_the_way {
+            *held = Some(*next);
+            return PathStep {
+                hold: true,
+                target_done: false,
+            };
+        }
+        target_done = true;
     }
+    let hold = path_order_is_mid_move(previous, next) && *held != Some(*next);
+    *held = hold.then_some(*next);
+    PathStep { hold, target_done }
 }
 
 /// A duplicate stage, or a stage that left the chain without arriving
 /// anywhere else. Empty slots are fine. Adding a stage is not a mid-move.
-fn path_order_is_mid_move(
-    previous: &[Option<StageKind>; PATH_SLOTS],
-    next: &[Option<StageKind>; PATH_SLOTS],
-) -> bool {
+fn path_order_is_mid_move(previous: &PathOrder, next: &PathOrder) -> bool {
     let mut seen = [false; StageKind::COUNT];
     for stage in next.iter().flatten() {
         let index = stage.index() as usize;
@@ -290,21 +338,9 @@ impl Plugin for Rodhareist {
             // A capture or IR is built for one engine rate: a new `Dsp` gets
             // new loaders, and `restore` below rebuilds both at this rate.
             let dsp = Box::new(Dsp::new(sample_rate));
-            *self
-                .shared
-                .control
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner) = Some(ControlSide {
-                nam: dsp.nam_loader(),
-                ir: dsp.ir_loader(),
-                sample_rate: f64::from(sample_rate),
-                nam_loaded: None,
-                ir_loaded: None,
-                nam_generation: 0,
-                ir_generation: 0,
-            });
             // Anything still building was aimed at the `Dsp` we just replaced.
-            self.shared.bump_control_epoch();
+            self.shared
+                .install_control(dsp.nam_loader(), dsp.ir_loader(), f64::from(sample_rate));
             self.dsp = Some(dsp);
             self.sample_rate = sample_rate;
         }
@@ -323,6 +359,10 @@ impl Plugin for Rodhareist {
         for (applied, entry) in self.applied.iter_mut().zip(self.params.wire.entries()) {
             *applied = entry.param.plain();
         }
+        // The chain just applied is the one the host holds; an edit that was
+        // still arriving is part of it or was replaced.
+        self.held_path = None;
+        self.shared.clear_path_target();
         files::restore(&self.shared, &self.params, &self.insert_id);
 
         self.shared
@@ -474,16 +514,72 @@ mod tests {
         // The move's first write: Drive now sits in both slots.
         order[1] = Some(StageKind::Drive);
         let mut held = None;
-        assert!(hold_path_order(&mut held, &previous, &order));
+        assert!(hold_path_order(&mut held, &previous, &order, None).hold);
         order[0] = Some(StageKind::Amp);
-        assert!(!hold_path_order(&mut held, &previous, &order));
+        assert!(!hold_path_order(&mut held, &previous, &order, None).hold);
         // A duplicate left in place by a generic editor is applied on the
         // next block, not held forever. The DSP drops the extra copy.
         let mut duplicate = previous;
         duplicate[2] = Some(StageKind::Drive);
         let mut held = None;
-        assert!(hold_path_order(&mut held, &previous, &duplicate));
-        assert!(!hold_path_order(&mut held, &previous, &duplicate));
+        assert!(hold_path_order(&mut held, &previous, &duplicate, None).hold);
+        assert!(!hold_path_order(&mut held, &previous, &duplicate, None).hold);
+    }
+
+    /// The host may deliver the slot writes of one editor move several
+    /// callbacks apart. The running chain stays until the last one is in.
+    #[test]
+    fn an_editor_move_is_held_until_every_slot_arrives() {
+        let mut plugin = plugin_with_dsp();
+        let mut previous = [None; PATH_SLOTS];
+        previous[0] = Some(StageKind::Drive);
+        previous[1] = Some(StageKind::Amp);
+        previous[2] = Some(StageKind::Cab);
+        // Drive moves onto the empty slot after the cabinet.
+        let mut target = previous;
+        target[0] = None;
+        target[3] = Some(StageKind::Drive);
+        plugin.shared.publish_path_target(&target);
+
+        let mut halfway = previous;
+        halfway[0] = None;
+        for block in 0..8 {
+            assert!(
+                plugin.hold_path(&previous, &halfway),
+                "block {block}: the chain without Drive must not run"
+            );
+        }
+        // The destination written first, from the other direction.
+        let mut doubled = previous;
+        doubled[3] = Some(StageKind::Drive);
+        for block in 0..8 {
+            assert!(plugin.hold_path(&previous, &doubled), "block {block}");
+        }
+        assert!(!plugin.hold_path(&previous, &target));
+        assert_eq!(plugin.shared.path_target(), None, "the move is over");
+
+        // Something other than the move writes the slots: the move is over
+        // and the usual one-block rule applies.
+        plugin.shared.publish_path_target(&target);
+        let mut elsewhere = previous;
+        elsewhere[1] = None;
+        assert!(plugin.hold_path(&previous, &elsewhere));
+        assert_eq!(plugin.shared.path_target(), None);
+        assert!(!plugin.hold_path(&previous, &elsewhere));
+    }
+
+    #[test]
+    fn a_newer_move_keeps_its_target() {
+        let shared = Shared::default();
+        let mut first = [None; PATH_SLOTS];
+        first[0] = Some(StageKind::Amp);
+        let mut second = first;
+        second[1] = Some(StageKind::Cab);
+        shared.publish_path_target(&second);
+        shared.finish_path_target(&first);
+        assert_eq!(shared.path_target(), Some(second));
+        shared.finish_path_target(&second);
+        assert_eq!(shared.path_target(), None);
     }
 
     #[test]
@@ -496,10 +592,10 @@ mod tests {
         let mut halfway = previous;
         halfway[0] = None;
         let mut held = None;
-        assert!(hold_path_order(&mut held, &previous, &halfway));
+        assert!(hold_path_order(&mut held, &previous, &halfway, None).hold);
         let mut done = halfway;
         done[2] = Some(StageKind::Drive);
-        assert!(!hold_path_order(&mut held, &previous, &done));
+        assert!(!hold_path_order(&mut held, &previous, &done, None).hold);
     }
 
     #[test]
@@ -510,8 +606,8 @@ mod tests {
         let mut removed = previous;
         removed[0] = None;
         let mut held = None;
-        assert!(hold_path_order(&mut held, &previous, &removed));
-        assert!(!hold_path_order(&mut held, &previous, &removed));
+        assert!(hold_path_order(&mut held, &previous, &removed, None).hold);
+        assert!(!hold_path_order(&mut held, &previous, &removed, None).hold);
     }
 
     #[test]
