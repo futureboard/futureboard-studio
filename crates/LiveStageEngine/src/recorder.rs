@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use sphere_encoder::{
     AudioEncodeOptions, AudioEncodeSpec, AudioEncoder, AudioFileFormat, AudioSampleFormat,
-    create_encoder,
+    WavEncodeOptions, create_encoder,
 };
 
 use crate::graph::RecordStream;
@@ -20,6 +20,11 @@ use crate::session::{RecordFormat, RecordSettings};
 
 /// Seconds of audio each ring holds while the disk catches up.
 const RING_SECONDS: usize = 4;
+
+/// How often every open file's header is patched to what it holds and its
+/// samples pushed to the disk, so a take cut off by a crash, a kill or a
+/// power loss opens up to at most this long before the end.
+const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
 
 /// A recording in progress.
 pub struct Recording {
@@ -204,6 +209,9 @@ fn open_encoder(
         },
         AudioEncodeOptions {
             format,
+            // A long take outgrows RIFF's 4 GiB (93 minutes of a stereo
+            // 96 kHz float strip); RF64 lets the same file keep going.
+            wav: WavEncodeOptions { rf64: true },
             ..AudioEncodeOptions::default()
         },
     )
@@ -217,7 +225,17 @@ fn write_loop(
     let mut buffer = vec![0.0f32; 16_384];
     let mut errors = Vec::new();
     let mut failed = vec![false; encoders.len()];
+    // Failed writers are not checkpointed either.
+    let mut no_checkpoint = failed.clone();
+    let mut last_checkpoint = Instant::now();
     loop {
+        if last_checkpoint.elapsed() >= CHECKPOINT_INTERVAL {
+            last_checkpoint = Instant::now();
+            for (skip, failed) in no_checkpoint.iter_mut().zip(&failed) {
+                *skip |= *failed;
+            }
+            checkpoint_all(&mut encoders, &mut no_checkpoint, &mut errors);
+        }
         let stopping = stop.load(Ordering::Acquire);
         let mut moved = false;
         for (index, (stream, encoder, path)) in encoders.iter_mut().enumerate() {
@@ -254,6 +272,27 @@ fn write_loop(
         }
     }
     errors
+}
+
+/// Make every file still being written readable as it stands.
+///
+/// A file whose checkpoint fails is reported once and not checkpointed again,
+/// but keeps recording: a take that is only finalized at the end is still
+/// better than one that stopped early.
+fn checkpoint_all(
+    encoders: &mut [(Arc<RecordStream>, Box<dyn AudioEncoder>, PathBuf)],
+    skip: &mut [bool],
+    errors: &mut Vec<String>,
+) {
+    for ((_, encoder, path), skip) in encoders.iter_mut().zip(skip.iter_mut()) {
+        if *skip {
+            continue;
+        }
+        if let Err(error) = encoder.checkpoint() {
+            *skip = true;
+            errors.push(format!("{}: could not checkpoint: {error}", path.display()));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -293,7 +332,47 @@ mod tests {
         for file in &summary.files {
             let bytes = std::fs::metadata(file).unwrap().len();
             assert!(bytes > 4800 * 3, "{} is only {bytes} bytes", file.display());
+            // LiveStage's own player reads what the recorder wrote.
+            let take = crate::playback::probe_file(file).unwrap();
+            assert_eq!(take.frames, 4800, "{}", file.display());
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A take still being written already has a header that sizes what is
+    /// on disk, so one cut off by a crash or a power loss opens up to its
+    /// last checkpoint instead of reading as empty.
+    #[test]
+    fn a_take_in_progress_is_readable_after_a_checkpoint() {
+        let dir =
+            std::env::temp_dir().join(format!("livestage-rec-checkpoint-{}", std::process::id()));
+        let settings = RecordSettings {
+            folder: Some(dir.clone()),
+            bit_depth: 32,
+            ..RecordSettings::default()
+        };
+        let mut recording =
+            Recording::prepare(&settings, 48_000, &[("Vox".to_string(), 2)]).unwrap();
+        recording.start(&settings, 48_000).unwrap();
+        let (_, path, stream) = &recording.tracks[0];
+        let samples = vec![0.5f32; 4800 * 2];
+        assert_eq!(stream.ring.push(&samples), samples.len());
+
+        let deadline = Instant::now() + CHECKPOINT_INTERVAL * 5;
+        let frames = loop {
+            // Mid-take: what any other program opening the file would see.
+            if let Ok(take) = crate::playback::probe_file(path) {
+                if take.frames > 0 {
+                    break take.frames;
+                }
+            }
+            assert!(Instant::now() < deadline, "no checkpoint was written");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(frames, 4800);
+
+        let summary = recording.finish();
+        assert!(summary.errors.is_empty(), "{:?}", summary.errors);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

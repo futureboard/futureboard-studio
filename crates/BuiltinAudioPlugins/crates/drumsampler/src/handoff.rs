@@ -31,6 +31,12 @@ impl<T> HandoffCell<T> {
         (!old_ptr.is_null()).then(|| unsafe { Box::from_raw(old_ptr) })
     }
 
+    /// Whether the slot holds nothing. Wait-free: one atomic load. A slot
+    /// only the caller's thread fills stays empty once it reads empty.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.slot.load(Ordering::Acquire).is_null()
+    }
+
     /// Take whatever is in the slot, leaving it empty. Wait-free: a single
     /// atomic swap, safe to call from a realtime thread.
     pub(crate) fn take(&self) -> Option<Box<T>> {

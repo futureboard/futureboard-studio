@@ -54,6 +54,9 @@ mod stdout_guard {
             if saved < 0 {
                 return PayloadStdout(None);
             }
+            // Never handed down to a helper process a plug-in starts: one
+            // that outlives the scan would keep the parent's pipe open.
+            libc::fcntl(saved, libc::F_SETFD, libc::FD_CLOEXEC);
             if libc::dup2(libc::STDERR_FILENO, libc::STDOUT_FILENO) < 0 {
                 libc::close(saved);
                 return PayloadStdout(None);
@@ -94,6 +97,15 @@ mod stdout_guard {
                 c_close(saved);
                 return PayloadStdout(None);
             }
+            // `_dup` makes an inheritable duplicate. A plug-in that starts a
+            // resident helper (a licensing daemon) with handle inheritance on
+            // would then keep the parent's payload pipe open for as long as
+            // the helper lives; the payload channel is never the helper's.
+            let _ = windows::Win32::Foundation::SetHandleInformation(
+                windows::Win32::Foundation::HANDLE(handle as *mut _),
+                windows::Win32::Foundation::HANDLE_FLAG_INHERIT.0,
+                windows::Win32::Foundation::HANDLE_FLAGS(0),
+            );
             PayloadStdout(Some(ManuallyDrop::new(std::fs::File::from_raw_handle(
                 handle as *mut _,
             ))))

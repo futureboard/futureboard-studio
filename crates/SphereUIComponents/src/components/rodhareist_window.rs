@@ -201,6 +201,19 @@ fn preset_file_stem(name: &str) -> String {
     }
 }
 
+/// Whether saving under `stem` must stop and ask first: another user preset
+/// already has that name. Saving the loaded preset under its own name
+/// updates it, and a name the user was already warned about goes ahead.
+/// Saving under a different name never touches the preset that was loaded.
+fn save_needs_confirm(
+    stem: &str,
+    exists: bool,
+    loaded: Option<&str>,
+    confirmed: Option<&str>,
+) -> bool {
+    exists && loaded != Some(stem) && confirmed != Some(stem)
+}
+
 fn display_name(file_name: &str) -> String {
     std::path::Path::new(file_name)
         .file_stem()
@@ -261,6 +274,9 @@ pub struct RodhareistEditorWindow {
     user_preset: Option<LoadedUserPreset>,
     /// The last save or load failure, shown on the Home preset list.
     preset_note: Option<String>,
+    /// The name Save last stopped on because another user preset already
+    /// has it. Saving that name again replaces the file.
+    replace_confirm: Option<String>,
     /// The chain slot the block editor shows. Editor-local view state —
     /// never saved, never sent to the plug-in.
     pub(crate) chain_focus: Option<ChainFocus>,
@@ -302,6 +318,7 @@ impl RodhareistEditorWindow {
             user_presets: Vec::new(),
             user_preset: None,
             preset_note: None,
+            replace_confirm: None,
             chain_focus: None,
             ui: RodUi::default(),
             search: TextInputState::new("rodhareist-search", cx.focus_handle())
@@ -353,6 +370,7 @@ impl RodhareistEditorWindow {
             self.preset = None;
             self.user_preset = None;
             self.preset_note = None;
+            self.replace_confirm = None;
             self.pads = None;
             self.ui = RodUi::default();
             self.search.set_value("");
@@ -570,6 +588,7 @@ impl RodhareistEditorWindow {
                 this.preset = Some(index);
                 this.user_preset = None;
                 this.preset_note = None;
+                this.replace_confirm = None;
                 this.preset_name.set_value(preset.name);
                 this.release_text_focus(window, cx);
                 this.chain_focus = None;
@@ -653,6 +672,7 @@ impl RodhareistEditorWindow {
                         });
                         this.preset_name.set_value(name);
                         this.preset_note = None;
+                        this.replace_confirm = None;
                         this.chain_focus = None;
                         this.set_params(next, cx);
                     }
@@ -673,14 +693,20 @@ impl RodhareistEditorWindow {
             typed.to_string()
         };
         let stem = preset_file_stem(&name);
-        let dir = user_preset_dir();
-        let path = dir.join(format!("{stem}.pst"));
-        let previous = self.user_preset.as_ref().map(|loaded| loaded.name.clone());
-        let replacing_loaded = previous.as_deref() == Some(stem.as_str());
-        let same_as_suggestion = preset_file_stem(&self.user_preset_save_name()) == stem;
-        if path.exists() && !replacing_loaded && !same_as_suggestion {
-            return Err(format!("A preset named {stem} is already saved"));
+        let path = user_preset_dir().join(format!("{stem}.pst"));
+        let loaded = self.user_preset.as_ref().map(|loaded| loaded.name.as_str());
+        if save_needs_confirm(
+            &stem,
+            path.exists(),
+            loaded,
+            self.replace_confirm.as_deref(),
+        ) {
+            self.replace_confirm = Some(stem.clone());
+            return Err(format!(
+                "A preset named {stem} is already saved. Press Save again to replace it."
+            ));
         }
+        self.replace_confirm = None;
         let json = rodharerist::RodhareistState::new(self.params.clone())
             .to_json()
             .map_err(|e| e.to_string())?;
@@ -697,18 +723,7 @@ impl RodhareistEditorWindow {
             name: stem.clone(),
             params: self.params.clone(),
         });
-        self.preset_name.set_value(stem.clone());
-        if let Some(old) = previous {
-            if old != stem {
-                let old_path = dir.join(format!("{old}.pst"));
-                if old_path != path && old_path.exists() {
-                    if let Err(error) = std::fs::remove_file(&old_path) {
-                        self.refresh_user_presets();
-                        return Err(format!("Saved {stem}. The previous preset stayed: {error}"));
-                    }
-                }
-            }
-        }
+        self.preset_name.set_value(stem);
         self.refresh_user_presets();
         Ok(())
     }
@@ -1381,5 +1396,29 @@ mod tests {
         after.stage_order[0] = Some(rodharerist::StageKind::Wah);
         let diff = wire_diff(&before, &after);
         assert!(!diff.is_empty());
+    }
+
+    /// Issue #195: saving a loaded preset under a new name writes a new file
+    /// (the old one is never touched), and Save asks first before replacing
+    /// any user preset other than the loaded one.
+    #[test]
+    fn save_asks_before_replacing_another_user_preset() {
+        // Clean loaded, saved as a new Crunch: just written.
+        assert!(!save_needs_confirm("Crunch", false, Some("Clean"), None));
+        // Clean loaded and saved as itself: an update, no question.
+        assert!(!save_needs_confirm("Clean", true, Some("Clean"), None));
+        // A factory Plexi Lead loaded over a user Plexi Lead: ask first.
+        assert!(save_needs_confirm("Plexi Lead", true, None, None));
+        // Another user preset's name while Clean is loaded: ask first.
+        assert!(save_needs_confirm("Crunch", true, Some("Clean"), None));
+        // Saving the same name again after the warning replaces it.
+        assert!(!save_needs_confirm(
+            "Plexi Lead",
+            true,
+            None,
+            Some("Plexi Lead")
+        ));
+        // A warning about one name does not cover another.
+        assert!(save_needs_confirm("Crunch", true, None, Some("Plexi Lead")));
     }
 }

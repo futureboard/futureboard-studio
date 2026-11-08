@@ -96,13 +96,13 @@ mod imp {
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetAncestor, GetClassNameW,
         GetClientRect, GetDesktopWindow, GetParent, GetWindow, GetWindowLongPtrW, GetWindowRect,
-        GetWindowThreadProcessId, IsChild, IsWindow, RegisterClassW, SetWindowLongPtrW,
-        SetWindowPos, SetWindowsHookExW, UnhookWindowsHookEx, GA_PARENT, GWLP_HWNDPARENT,
-        GWL_STYLE, GW_CHILD, GW_OWNER, HC_ACTION, HHOOK, HMENU, HWND_TOP, MSG, PM_REMOVE,
-        SWP_NOACTIVATE, SWP_NOZORDER, WH_GETMESSAGE, WINDOW_EX_STYLE, WM_ERASEBKGND, WM_KEYDOWN,
-        WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_NULL, WM_PARENTNOTIFY, WM_RBUTTONDOWN, WM_SETFOCUS,
-        WM_SYSKEYDOWN, WM_XBUTTONDOWN, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
-        WS_POPUP, WS_VISIBLE,
+        GetWindowThreadProcessId, IsChild, IsWindow, RegisterClassW, SetParent, SetWindowLongPtrW,
+        SetWindowPos, SetWindowsHookExW, ShowWindow, UnhookWindowsHookEx, GA_PARENT,
+        GWLP_HWNDPARENT, GWL_STYLE, GW_CHILD, GW_OWNER, HC_ACTION, HHOOK, HMENU, HWND_TOP, MSG,
+        PM_REMOVE, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, WH_GETMESSAGE, WINDOW_EX_STYLE,
+        WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_NULL, WM_PARENTNOTIFY,
+        WM_RBUTTONDOWN, WM_SETFOCUS, WM_SYSKEYDOWN, WM_XBUTTONDOWN, WNDCLASSW, WS_CHILD,
+        WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_POPUP, WS_VISIBLE,
     };
 
     /// Every live content host and what it holds, so the hook can tell a key
@@ -843,6 +843,60 @@ mod imp {
         pub fn is_valid(&self) -> bool {
             unsafe { IsWindow(Some(hwnd_from(self.content_hwnd))).as_bool() }
         }
+
+        /// Hides this child and moves it under a never-shown parking window.
+        ///
+        /// A plug-in host attaches its view to this window from another
+        /// process and lets go of it only when it handles the close request.
+        /// Destroying this window before then — directly, or by destroying
+        /// the editor window it was created in — destroys the plug-in's own
+        /// window under a view that is still attached, which editors such as
+        /// JUCE's assert or crash on. Parked, it outlives its old parent until
+        /// the host reports the view detached; dropping it then destroys it as
+        /// before. Returns whether it was moved; hidden either way.
+        pub fn park(&mut self) -> bool {
+            let content = hwnd_from(self.content_hwnd);
+            // SAFETY: both handles are checked with `IsWindow`; the content
+            // window was created on this (the UI) thread, as was the parking
+            // window.
+            unsafe {
+                if !IsWindow(Some(content)).as_bool() {
+                    return false;
+                }
+                let _ = ShowWindow(content, SW_HIDE);
+                let Some(parking) = parking_window() else {
+                    return false;
+                };
+                if SetParent(content, Some(hwnd_from(parking))).is_err() {
+                    return false;
+                }
+                self.top_hwnd = parking;
+            }
+            true
+        }
+    }
+
+    thread_local! {
+        static PARKING_WINDOW: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// The hidden top-level window parked content children wait under.
+    ///
+    /// Created on first use and kept for the life of the process, so it is
+    /// never destroyed during thread-local teardown at exit.
+    fn parking_window() -> Option<u64> {
+        PARKING_WINDOW.with(|slot| {
+            let current = slot.get();
+            // SAFETY: `IsWindow` accepts any handle value.
+            if current != 0 && unsafe { IsWindow(Some(hwnd_from(current))).as_bool() } {
+                return Some(current);
+            }
+            let window = HiddenHostWindow::create()?;
+            let hwnd = window.hwnd();
+            std::mem::forget(window);
+            slot.set(hwnd);
+            Some(hwnd)
+        })
     }
 
     impl Drop for ContentChildHwnd {
@@ -1057,6 +1111,12 @@ mod imp {
         pub fn is_valid(&self) -> bool {
             self.surface.handle() != 0
         }
+
+        /// Plug-in views are host-owned on macOS; nothing waits on this
+        /// container, so there is nothing to park it for.
+        pub fn park(&mut self) -> bool {
+            false
+        }
     }
 
     fn region_px(rect: ContentRect) -> RegionPx {
@@ -1125,6 +1185,9 @@ mod imp {
         }
         pub fn set_bounds(&self, _rect: ContentRect) {}
         pub fn is_valid(&self) -> bool {
+            false
+        }
+        pub fn park(&mut self) -> bool {
             false
         }
     }

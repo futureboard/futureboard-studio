@@ -85,11 +85,17 @@ SPHERE_AU_HOST_API int sphere_au_parameter_info(
   return 0;
 }
 
-SPHERE_AU_HOST_API size_t sphere_au_get_state(
+SPHERE_AU_HOST_API unsigned char* sphere_au_copy_state(
     const SphereAuInstance* /*instance*/,
-    unsigned char* /*out*/,
-    size_t /*capacity*/) {
-  return 0;
+    size_t* out_len) {
+  if (out_len != nullptr) {
+    *out_len = 0;
+  }
+  return nullptr;
+}
+
+SPHERE_AU_HOST_API void sphere_au_free_state(unsigned char* data) {
+  delete[] data;
 }
 
 SPHERE_AU_HOST_API int sphere_au_set_state(

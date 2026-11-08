@@ -3263,6 +3263,112 @@ mod point_delete_tests {
         assert_eq!(points[0].id, second);
     }
 
+    fn volume_effective(state: &TimelineState, track: &str) -> f32 {
+        state.find_track(track).expect("track").volume_effective
+    }
+
+    /// Volume points at 0 (0.0), 4 (1.0) and 8 (0.0), playhead stopped at 2.
+    fn ramp_with_playhead_at_two(state: &mut TimelineState) -> (String, String, u64) {
+        state.tracks.clear();
+        let track = state.create_audio_track();
+        let lane = state
+            .ensure_automation_lane(&track, AutomationTarget::TrackVolume)
+            .expect("lane");
+        state.transport.playhead_beats = 2.0;
+        state.add_automation_point(&track, &lane, 0.0, 0.0);
+        let peak = state
+            .add_automation_point(&track, &lane, 4.0, 1.0)
+            .expect("peak");
+        state.add_automation_point(&track, &lane, 8.0, 0.0);
+        (track, lane, peak)
+    }
+
+    fn curve_at_playhead(state: &TimelineState, track: &str, lane: &str) -> f32 {
+        let lane = state.automation_lane(track, lane).expect("lane");
+        evaluate_automation(
+            &lane.points,
+            state.transport.playhead_beats as f64,
+            lane.target.default_value(),
+        )
+    }
+
+    /// #175: deleting a point recomputes the effective volume at once, the
+    /// way adding or moving one does, so the fader shows the new curve.
+    #[test]
+    fn deleting_a_point_updates_the_effective_volume() {
+        let mut state = TimelineState::default();
+        let (track, lane, peak) = ramp_with_playhead_at_two(&mut state);
+        let before = volume_effective(&state, &track);
+        assert!(before > 0.1, "the ramp is up at beat 2: {before}");
+
+        assert!(state.delete_automation_point(&track, &lane, peak));
+        let expected = curve_at_playhead(&state, &track, &lane);
+        assert!((volume_effective(&state, &track) - expected).abs() < 1.0e-5);
+        assert!((volume_effective(&state, &track) - before).abs() > 0.1);
+    }
+
+    /// #175: the Delete-key / Cut path (selected points) too.
+    #[test]
+    fn deleting_selected_points_updates_the_effective_volume() {
+        for in_lane in [false, true] {
+            let mut state = TimelineState::default();
+            let (track, lane, peak) = ramp_with_playhead_at_two(&mut state);
+            let before = volume_effective(&state, &track);
+            state.select_automation_point(&track, &lane, peak, false);
+            let removed = if in_lane {
+                state.delete_selected_automation_points_in_lane(&track, &lane)
+            } else {
+                state.delete_selected_automation_points(&track)
+            };
+            assert_eq!(removed, 1);
+            let expected = curve_at_playhead(&state, &track, &lane);
+            assert!((volume_effective(&state, &track) - expected).abs() < 1.0e-5);
+            assert!((volume_effective(&state, &track) - before).abs() > 0.1);
+        }
+    }
+
+    /// #177: Cut copies one lane's selection, so it may only delete that
+    /// lane's selection — a selected point in another lane is not on the
+    /// clipboard and must survive.
+    #[test]
+    fn lane_scoped_delete_keeps_other_lanes_selection() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let track = state.create_audio_track();
+        let volume = state
+            .ensure_automation_lane(&track, AutomationTarget::TrackVolume)
+            .expect("volume lane");
+        let pan = state
+            .ensure_automation_lane(&track, AutomationTarget::TrackPan)
+            .expect("pan lane");
+        let v = state
+            .add_automation_point(&track, &volume, 1.0, 0.5)
+            .expect("volume point");
+        let p = state
+            .add_automation_point(&track, &pan, 1.0, 0.25)
+            .expect("pan point");
+        state.select_automation_point(&track, &volume, v, false);
+        state.select_automation_point(&track, &pan, p, false);
+
+        let copied = state
+            .copy_selected_automation(&track, &volume)
+            .expect("volume selection");
+        assert_eq!(copied.points.len(), 1);
+        assert_eq!(
+            state.delete_selected_automation_points_in_lane(&track, &volume),
+            1
+        );
+        assert!(state
+            .automation_lane(&track, &volume)
+            .unwrap()
+            .points
+            .is_empty());
+        let pan_points = &state.automation_lane(&track, &pan).unwrap().points;
+        assert_eq!(pan_points.len(), 1);
+        assert_eq!(pan_points[0].id, p);
+        assert!(pan_points[0].selected, "the pan selection is left alone");
+    }
+
     /// A point that is not there is not an error, but it must not report a
     /// deletion — the lane uses that answer to decide whether to swallow the
     /// press, and a false positive would eat the context menu.

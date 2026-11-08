@@ -1247,6 +1247,15 @@ impl StudioLayout {
         use SpherePluginHost::ipc::HostEvent;
         use SpherePluginHost::plugin_host_client::ClientEvent;
 
+        // The host has let go of this view. A content child an editor window
+        // released it from -- switching tabs, or closing, so possibly with no
+        // window left to hand this to -- waited for exactly this to go.
+        if matches!(event, ClientEvent::Host(HostEvent::EditorClosed { .. })) {
+            crate::components::plugin_editor_window::release_parked_editor_content(
+                plugin_instance_id,
+            );
+        }
+
         // The GPUI editor window first: it is where a bridged insert's editor
         // lives now. Its own drive loop never drains the shared queue -- this
         // poll is the single drain -- so an event that is not handed over here
@@ -3974,8 +3983,11 @@ impl StudioLayout {
         }
     }
 
-    /// Close the editor window for a slot if one is open. Idempotent. Removing
-    /// the GPUI window drops the entity, which detaches the native view.
+    /// Close a slot's editor if one is open. Idempotent.
+    ///
+    /// A channel's plug-ins share one editor window, one tab each: only this
+    /// slot's tab goes, and the window closes with its last tab. Closing the
+    /// window releases the view before the window goes.
     pub(super) fn close_insert_editor(
         &mut self,
         track_id: &str,
@@ -3984,7 +3996,6 @@ impl StudioLayout {
     ) {
         // Native main-owned bridge editor (default path).
         self.close_bridge_editor(cx, track_id, insert_id);
-        // Legacy GPUI-window editor (FUTUREBOARD_PLUGIN_LEGACY_IN_PROCESS only).
         let key = (track_id.to_string(), insert_id.to_string());
         // Built-in CEF editor: this instance is gone (unloaded/replaced), but
         // the shared browser other instances of the same plugin_id use must
@@ -3992,12 +4003,91 @@ impl StudioLayout {
         // drops the now-gone instance (and reselects/clears active selection
         // if it was the one showing) instead of destroying the window.
         self.refresh_builtin_editor_sidebars(cx);
-        if let Some(handle) = self.plugin_editors.open.remove(&key) {
-            let _ = handle.update(cx, |_, window, _| window.remove_window());
-            eprintln!("[PluginEditorClose] plugin={insert_id} removed_called=true");
-            if std::env::var_os("FUTUREBOARD_PLUGIN_VIEW_DEBUG").is_some() {
-                eprintln!("[plugin-view] close track={track_id} slot={insert_id}");
+        // An ARA editor is bound to a clip, not filed among a channel's tabs.
+        if is_ara_editor_key(insert_id) {
+            if let Some(handle) = self.plugin_editors.open.remove(&key) {
+                let _ = handle.update(cx, |editor, window, cx| editor.close_window(window, cx));
+                eprintln!("[PluginEditorClose] plugin={insert_id} removed_called=true");
             }
+            return;
+        }
+        let window = self
+            .plugin_editors
+            .open
+            .iter()
+            .find(|((track, key_insert), _)| track == track_id && !is_ara_editor_key(key_insert))
+            .map(|((_, key_insert), handle)| (key_insert.clone(), *handle));
+        let Some((key_insert, handle)) = window else {
+            return;
+        };
+        let Ok(active) =
+            handle.update(cx, |editor, _window, _cx| editor.insert_key().1.to_string())
+        else {
+            // The window is gone already (closed from its own titlebar): drop
+            // it and the tabs it was showing.
+            self.plugin_editors
+                .open
+                .retain(|(track, _), _| track != track_id);
+            self.plugin_editors.editor_tabs.remove(track_id);
+            return;
+        };
+        let tabs = self
+            .plugin_editors
+            .editor_tabs
+            .get(track_id)
+            .cloned()
+            .unwrap_or_default();
+        let Some(plan) = plan_editor_tab_detach(&tabs, &key_insert, &active, |id| id == insert_id)
+        else {
+            return;
+        };
+        eprintln!(
+            "[PluginEditorClose] plugin={insert_id} channel={track_id} remaining_tabs={} close_window={}",
+            plan.remaining.len(),
+            plan.close_window
+        );
+        if std::env::var_os("FUTUREBOARD_PLUGIN_VIEW_DEBUG").is_some() {
+            eprintln!("[plugin-view] close track={track_id} slot={insert_id}");
+        }
+        let closes = plan.close_window;
+        self.apply_editor_tab_detach(track_id, &key_insert, handle, plan, cx);
+        if !closes {
+            // The strip drops the tab now, so the window no longer claims the
+            // gone plug-in's events.
+            self.refresh_plugin_editor_chrome(cx);
+        }
+    }
+
+    /// Carries out [`plan_editor_tab_detach`] for one channel's editor window,
+    /// filed under `key_insert`.
+    fn apply_editor_tab_detach(
+        &mut self,
+        track_id: &str,
+        key_insert: &str,
+        handle: gpui::WindowHandle<crate::components::plugin_editor_window::PluginEditorWindow>,
+        plan: EditorTabDetach,
+        cx: &mut Context<Self>,
+    ) {
+        let key = (track_id.to_string(), key_insert.to_string());
+        if plan.close_window {
+            self.plugin_editors.editor_tabs.remove(track_id);
+            self.plugin_editors.open.remove(&key);
+            // The view and the preset list go before the window does.
+            let _ = handle.update(cx, |editor, window, cx| editor.close_window(window, cx));
+            return;
+        }
+        self.plugin_editors
+            .editor_tabs
+            .insert(track_id.to_string(), plan.remaining);
+        if let Some(next) = plan.rekey {
+            if let Some(handle) = self.plugin_editors.open.remove(&key) {
+                self.plugin_editors
+                    .open
+                    .insert((track_id.to_string(), next), handle);
+            }
+        }
+        if let Some(next) = plan.activate {
+            self.select_plugin_editor_tab(track_id, &next, cx);
         }
     }
 
@@ -4259,13 +4349,31 @@ impl StudioLayout {
                 }
                 state.find_insert_slot(track_id, insert_id).is_none()
             };
-            self.plugin_editors
+            // A channel window is filed under one of its tabs; the others
+            // would never be found by their key, and a removed one would stay
+            // on as a tab — on screen, if it was the one showing.
+            let tab_keys: Vec<(String, String)> = self
+                .plugin_editors
+                .editor_tabs
+                .iter()
+                .flat_map(|(track_id, tabs)| {
+                    tabs.iter()
+                        .map(move |insert_id| (track_id.clone(), insert_id.clone()))
+                })
+                .collect();
+            let mut stale: Vec<(String, String)> = Vec::new();
+            for key in self
+                .plugin_editors
                 .open
                 .keys()
-                .filter(is_stale)
-                .chain(self.plugin_editors.bridge.keys().filter(is_stale))
-                .cloned()
-                .collect()
+                .chain(tab_keys.iter())
+                .chain(self.plugin_editors.bridge.keys())
+            {
+                if is_stale(&key) && !stale.contains(key) {
+                    stale.push(key.clone());
+                }
+            }
+            stale
         };
         if stale.is_empty() {
             return;
@@ -4381,31 +4489,8 @@ impl StudioLayout {
                 plan.remaining.len(),
                 plan.close_window
             );
-            let key = (track_id.clone(), key_insert.clone());
-            if plan.close_window {
-                self.plugin_editors.editor_tabs.remove(&track_id);
-                self.plugin_editors.open.remove(&key);
-                // The preset list is a window of its own; it goes first. Dropping
-                // the editor releases the view without unloading the plug-in.
-                let _ = handle.update(cx, |editor, window, cx| {
-                    editor.close_preset_menu(cx);
-                    window.remove_window();
-                });
-                continue;
-            }
-            self.plugin_editors
-                .editor_tabs
-                .insert(track_id.clone(), plan.remaining);
-            if let Some(next) = plan.rekey {
-                if let Some(handle) = self.plugin_editors.open.remove(&key) {
-                    self.plugin_editors
-                        .open
-                        .insert((track_id.clone(), next), handle);
-                }
-            }
-            if let Some(next) = plan.activate {
-                self.select_plugin_editor_tab(&track_id, &next, cx);
-            }
+            // Closing releases the view without unloading the plug-in.
+            self.apply_editor_tab_detach(&track_id, &key_insert, handle, plan, cx);
         }
 
         // Bridge editor sessions. An open shell is the moved plug-in's own
@@ -4486,6 +4571,12 @@ impl StudioLayout {
     /// Close every open plugin editor and release native embed sessions before
     /// application exit (avoids HWND/VST3 teardown during TLS destruction).
     pub(super) fn shutdown_plugin_editors(&mut self, cx: &mut Context<Self>) {
+        // Whole windows, every tab at once: `close_insert_editor` closes one
+        // tab and would bring the window's next one to the front.
+        self.plugin_editors.editor_tabs.clear();
+        for (_, handle) in self.plugin_editors.open.drain() {
+            let _ = handle.update(cx, |editor, window, cx| editor.close_window(window, cx));
+        }
         let keys: Vec<(String, String)> = self
             .plugin_editors
             .open
@@ -4546,6 +4637,11 @@ impl StudioLayout {
                 match load {
                     CatalogLoad::Loaded { catalog, sqlite_ms } => {
                         let count = catalog.plugins.len();
+                        // The modules a project or preset may load are this
+                        // catalog's (see `plugin_module_gate`).
+                        crate::plugin_module_gate::remember_catalog(
+                            catalog.plugins.iter().map(|e| e.path.as_path()),
+                        );
                         let scanned: Vec<SpherePluginHost::RegistryPlugin> = catalog
                             .plugins
                             .iter()
@@ -6705,10 +6801,14 @@ impl StudioLayout {
 
         // An Audio Unit has no module file, so a missing path says nothing about
         // whether the component is installed — the host's load reports that.
-        if !is_builtin && !is_audio_unit && path.is_none_or(|path| !path.exists()) {
-            let reason = path
-                .map(|path| format!("Plugin file not found: {}", path.display()))
-                .unwrap_or_else(|| "Plugin file not found".to_string());
+        // A module file is loaded only when it is there and the plug-in
+        // catalog knows it: a project or preset names it, not the user.
+        let refusal = if is_builtin || is_audio_unit {
+            None
+        } else {
+            crate::plugin_module_gate::module_refusal(false, None, path.map(|p| p.as_path()))
+        };
+        if let Some(reason) = refusal {
             eprintln!("[PluginRestore] failed reason={reason}");
             let _ = self.timeline.update(cx, |timeline, _cx| {
                 timeline.state.set_insert_runtime(
@@ -7516,6 +7616,32 @@ mod insert_ownership_tests {
                 close_window: false,
                 activate: Some("x".into()),
                 rekey: None,
+            })
+        );
+    }
+
+    /// Deleting a plug-in removes only its tab (#201): the window A opened,
+    /// showing B, survives either one being deleted.
+    #[test]
+    fn deleting_a_tabbed_plug_in_removes_only_its_tab() {
+        let deleted_b = plan_editor_tab_detach(&tabs(&["a", "b"]), "a", "b", |id| id == "b");
+        assert_eq!(
+            deleted_b,
+            Some(EditorTabDetach {
+                remaining: tabs(&["a"]),
+                close_window: false,
+                activate: Some("a".into()),
+                rekey: None,
+            })
+        );
+        let deleted_a = plan_editor_tab_detach(&tabs(&["a", "b"]), "a", "b", |id| id == "a");
+        assert_eq!(
+            deleted_a,
+            Some(EditorTabDetach {
+                remaining: tabs(&["b"]),
+                close_window: false,
+                activate: None,
+                rekey: Some("b".into()),
             })
         );
     }

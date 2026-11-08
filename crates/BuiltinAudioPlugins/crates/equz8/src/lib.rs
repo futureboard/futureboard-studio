@@ -11,8 +11,7 @@ use biquad::{Biquad, Coefficients, DirectForm1, ToHertz, Type};
 use builtin_dsp_core::delay::{Smoothed, smoothing_step};
 use builtin_dsp_core::{
     ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, biquad_response_db, clamp,
-    db_to_linear, flush_denormal, linear_to_db, make_eq_coefficients, max_filter_frequency, mix,
-    time_constant,
+    db_to_linear, flush_denormal, linear_to_db, max_filter_frequency, mix, time_constant,
 };
 use serde::{Deserialize, Serialize};
 
@@ -419,21 +418,25 @@ pub fn band_response_at_gain_db(
 }
 
 /// Biquad coefficients for one EQ shape: the shared
-/// [`make_eq_coefficients`], with the Q ceiling raised to [`ipc::Q_MAX`].
-/// Below the shared builder's own ceiling of 12 it *is* the shared builder,
-/// so bands saved before the range widened design the same filters.
+/// [`builtin_dsp_core::make_eq_coefficients`]'s shapes and frequency clamp, with the Q ceiling
+/// raised to [`ipc::Q_MAX`], designed in `f64`.
+///
+/// Every filter here runs in `f64` too. A shelf or cut at tens of hertz at
+/// 176.4/192 kHz puts its poles within a few `f32` steps of z = 1: designed
+/// or run in `f32`, rounding alone lands them outside the unit circle and the
+/// band runs away to NaN.
 fn design(
     kind: &str,
     freq_hz: f32,
     gain_db: f32,
     q: f32,
     sample_rate: f32,
-) -> Option<Coefficients<f32>> {
-    if q <= 12.0 {
-        return make_eq_coefficients(kind, freq_hz, gain_db, q, sample_rate);
-    }
+) -> Option<Coefficients<f64>> {
     let fs = sample_rate.max(1.0);
-    let f0 = clamp(freq_hz, 10.0, max_filter_frequency(fs));
+    let f0 = f64::from(clamp(freq_hz, 10.0, max_filter_frequency(fs)));
+    // The shared builder's floor; this EQ's own ceiling.
+    let q = f64::from(clamp(q, 0.1, ipc::Q_MAX));
+    let gain_db = f64::from(gain_db);
     let filter_type = match kind {
         "bell" => Type::PeakingEQ(gain_db),
         "lowshelf" => Type::LowShelf(gain_db),
@@ -444,7 +447,16 @@ fn design(
         "bandpass" => Type::BandPass,
         _ => return None,
     };
-    Coefficients::<f32>::from_params(filter_type, fs.hz(), f0.hz(), q.min(ipc::Q_MAX)).ok()
+    Coefficients::<f64>::from_params(filter_type, f64::from(fs).hz(), f0.hz(), q).ok()
+}
+
+/// One running biquad, in `f64` (see [`design`]).
+type Filter = DirectForm1<f64>;
+
+/// `x` through `filter`, at the `f32` interface.
+#[inline]
+fn run(filter: &mut Filter, x: f32) -> f32 {
+    filter.run(f64::from(x)) as f32
 }
 
 /// Butterworth section Qs for a cascade of the given (even) filter order:
@@ -472,7 +484,7 @@ fn section_coefficients(
     section: usize,
     gain_db: f32,
     sample_rate: f32,
-) -> Option<Coefficients<f32>> {
+) -> Option<Coefficients<f64>> {
     let count = section_count(band);
     let q = if band.band_type.is_cut() && count > 1 {
         butterworth_q(count * 2, section)
@@ -559,7 +571,7 @@ impl DynamicBandState {
     }
 }
 
-type Cascade = [Option<DirectForm1<f32>>; MAX_SECTIONS];
+type Cascade = [Option<Filter>; MAX_SECTIONS];
 
 const EMPTY_CASCADE: Cascade = [None; MAX_SECTIONS];
 
@@ -575,12 +587,12 @@ pub struct Dsp {
     out_peak: [f32; 2],
     peak_fall: f32,
     /// Band-local detector for dynamic EQ (bandpass around the band centre).
-    detector: [Option<DirectForm1<f32>>; BAND_COUNT],
+    detector: [Option<Filter>; BAND_COUNT],
     dyn_state: [DynamicBandState; BAND_COUNT],
     /// Audition bandpass for the soloed band, per channel. `None` when no band
     /// is soloed — built on the control thread so the audio path only runs it.
-    solo_left: Option<DirectForm1<f32>>,
-    solo_right: Option<DirectForm1<f32>>,
+    solo_left: Option<Filter>,
+    solo_right: Option<Filter>,
     /// Linear output gain and wet share (0..1), smoothed per sample.
     output_gain: Glide,
     mix: Glide,
@@ -761,7 +773,7 @@ impl Dsp {
                 BandType::Bell | BandType::Notch => band.q,
                 _ => SOLO_WIDE_Q,
             };
-            design("bandpass", band.freq, 0.0, q, self.sample_rate).map(DirectForm1::<f32>::new)
+            design("bandpass", band.freq, 0.0, q, self.sample_rate).map(Filter::new)
         } else {
             None
         };
@@ -784,8 +796,7 @@ impl Dsp {
         self.sections[index] = count as u8;
         for section in 0..MAX_SECTIONS {
             let filter = if section < count {
-                section_coefficients(&band, section, applied, self.sample_rate)
-                    .map(DirectForm1::<f32>::new)
+                section_coefficients(&band, section, applied, self.sample_rate).map(Filter::new)
             } else {
                 None
             };
@@ -800,7 +811,7 @@ impl Dsp {
                 BandType::Bell => band.q,
                 _ => SOLO_WIDE_Q,
             };
-            design("bandpass", band.freq, 0.0, q, self.sample_rate).map(DirectForm1::<f32>::new)
+            design("bandpass", band.freq, 0.0, q, self.sample_rate).map(Filter::new)
         } else {
             None
         };
@@ -892,7 +903,7 @@ impl Dsp {
         // defeat the point. Output level still applies so the audition can be
         // matched in loudness.
         if let (Some(solo_l), Some(solo_r)) = (self.solo_left.as_mut(), self.solo_right.as_mut()) {
-            return (solo_l.run(left) * gain, solo_r.run(right) * gain);
+            return (run(solo_l, left) * gain, run(solo_r, right) * gain);
         }
 
         if self.any_dynamic {
@@ -909,7 +920,7 @@ impl Dsp {
                 if band.dynamic && band.band_type.has_gain() && band.range_db.abs() > 1.0e-6 {
                     let detector_in = left.abs().max(right.abs());
                     let detected = match self.detector[index].as_mut() {
-                        Some(filter) => filter.run(detector_in).abs(),
+                        Some(filter) => run(filter, detector_in).abs(),
                         None => detector_in,
                     };
                     let (attack, release, last) = {
@@ -963,10 +974,10 @@ impl Dsp {
     fn run_band(&mut self, index: usize, left: &mut f32, right: &mut f32) {
         for section in 0..self.sections[index] as usize {
             if let Some(filter) = self.left[index][section].as_mut() {
-                *left = filter.run(*left);
+                *left = run(filter, *left);
             }
             if let Some(filter) = self.right[index][section].as_mut() {
-                *right = filter.run(*right);
+                *right = run(filter, *right);
             }
         }
     }
@@ -1218,32 +1229,101 @@ mod tests {
             assert_eq!(band.dyn_mode, DynMode::Above);
             assert_eq!(band.ratio, RATIO_LEGACY);
         }
-        let mut reference: Vec<DirectForm1<f32>> = state
+        // The Cookbook sections the old chain ran, now designed and run in
+        // f64 as the EQ runs them (equal to f32 rounding, not bit for bit).
+        let mut reference: Vec<DirectForm1<f64>> = state
             .params
             .bands
             .iter()
             .map(|band| {
-                builtin_dsp_core::make_eq_biquad(
-                    band.band_type.as_str(),
-                    band.freq,
-                    band.gain_db,
-                    band.q,
-                    48_000.0,
+                let gain = f64::from(band.gain_db);
+                let kind = match band.band_type {
+                    BandType::HighPass => Type::HighPass,
+                    BandType::LowShelf => Type::LowShelf(gain),
+                    BandType::Bell => Type::PeakingEQ(gain),
+                    BandType::Notch => Type::Notch,
+                    BandType::HighShelf => Type::HighShelf(gain),
+                    BandType::LowPass => Type::LowPass,
+                };
+                let coefficients = Coefficients::<f64>::from_params(
+                    kind,
+                    48_000.0.hz(),
+                    f64::from(band.freq).hz(),
+                    f64::from(band.q),
                 )
-                .expect("filter")
+                .expect("filter");
+                DirectForm1::<f64>::new(coefficients)
             })
             .collect();
         let mut dsp = Dsp::new(48_000.0);
         dsp.set_params(state.params);
-        let gain = db_to_linear(-1.5);
+        let gain = f64::from(db_to_linear(-1.5));
         for n in 0..4_000 {
             let x = ((n as f32) * 0.037).sin() * 0.5 + ((n as f32) * 0.31).sin() * 0.2;
-            let mut expected = x;
+            let mut expected = f64::from(x);
             for filter in &mut reference {
                 expected = filter.run(expected);
             }
             let (l, _) = dsp.process_stereo(x, 0.0);
-            assert_eq!(l, expected * gain, "sample {n}");
+            let want = expected * gain;
+            assert!(
+                (f64::from(l) - want).abs() < 1.0e-6,
+                "sample {n}: {l} vs {want}"
+            );
+        }
+    }
+
+    /// A low shelf (or high shelf) cornered at tens of hertz puts its poles
+    /// within a few f32 steps of z = 1 at 176.4/192 kHz; the band must stay
+    /// stable there, at the gain it draws, as it does at 44.1–96 kHz.
+    #[test]
+    fn low_corner_shelves_stay_stable_at_every_rate() {
+        for sr in [
+            44_100.0f32,
+            48_000.0,
+            88_200.0,
+            96_000.0,
+            176_400.0,
+            192_000.0,
+        ] {
+            for (kind, freq, gain, q) in [
+                (BandType::LowShelf, 20.0f32, 13.0f32, 0.6f32),
+                (BandType::LowShelf, 10.0, 18.0, 0.1),
+                (BandType::LowShelf, 30.0, -18.0, 2.0),
+                (BandType::HighShelf, 20.0, -13.0, 0.6),
+                (BandType::HighPass, 10.0, 0.0, 0.7),
+            ] {
+                let mut params = default_params();
+                params.bands[1] = BandParams {
+                    active: true,
+                    band_type: kind,
+                    freq,
+                    gain_db: gain,
+                    q,
+                    ..params.bands[1]
+                };
+                let mut dsp = Dsp::new(sr);
+                dsp.set_params(params.clone());
+                // A −12 dBFS 55 Hz sine riding a little DC, for 8 s.
+                let frames = (sr * 8.0) as usize;
+                let mut peak = 0.0f32;
+                for n in 0..frames {
+                    let x = 0.25 * (std::f32::consts::TAU * 55.0 * n as f32 / sr).sin() + 0.01;
+                    let (l, r) = dsp.process_stereo(x, x);
+                    assert!(
+                        l.is_finite() && r.is_finite(),
+                        "{kind:?} at {sr}: NaN at {n}"
+                    );
+                    peak = peak.max(l.abs());
+                }
+                // Gain at DC and at 55 Hz, as drawn, bounds the steady state.
+                let most = response_db(&params, 1.0, sr).max(response_db(&params, 55.0, sr));
+                let bound = 0.26 * db_to_linear(most) * 1.5;
+                assert!(
+                    peak < bound,
+                    "{kind:?} {freq} Hz {gain} dB at {sr}: peak {peak} over {bound}"
+                );
+            }
         }
     }
 

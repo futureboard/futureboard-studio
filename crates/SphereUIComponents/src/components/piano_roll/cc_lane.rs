@@ -69,6 +69,48 @@ pub(super) fn freehand_cc_samples(
     }
     samples
 }
+/// The points one grid-snapped segment of the CC brush writes (Alt+drag with
+/// the Draw tool): one on every grid line from `first_line` to `last_line` —
+/// the lines nearest the previous and current pointer positions — valued
+/// along the straight line between those two pointer positions
+/// (`(from_beat, from_value)` → `(to_beat, to_value)`) and quantized to the
+/// controller's resolution. Ascending by beat, like the lane.
+pub(super) fn grid_cc_samples(
+    (from_beat, from_value): (f32, f32),
+    (to_beat, to_value): (f32, f32),
+    first_line: f32,
+    last_line: f32,
+    step: f32,
+    value_steps: f32,
+) -> Vec<(f32, f32)> {
+    let quantize = |value: f32| (value.clamp(0.0, 1.0) * value_steps).round() / value_steps;
+    let span = to_beat - from_beat;
+    let value_at = |beat: f32| {
+        if span.abs() <= f32::EPSILON {
+            return to_value;
+        }
+        let t = ((beat - from_beat) / span).clamp(0.0, 1.0);
+        from_value + (to_value - from_value) * t
+    };
+    let (lo, hi) = if first_line <= last_line {
+        (first_line, last_line)
+    } else {
+        (last_line, first_line)
+    };
+    if step <= 0.0 || hi - lo < step * 0.5 {
+        // Still inside one grid cell: the line under the cursor takes the
+        // cursor's value.
+        return vec![(last_line, quantize(to_value))];
+    }
+    let lines = ((hi - lo) / step).round() as usize;
+    (0..=lines.min(65_536))
+        .map(|k| {
+            let beat = if k == lines { hi } else { lo + k as f32 * step };
+            (beat, quantize(value_at(beat)))
+        })
+        .collect()
+}
+
 const CC_POINT_MERGE_EPS: f32 = 1.0e-3;
 
 /// Radius of a CC point handle, in lane pixels. Kept under [`CC_HIT_R`] so a
@@ -268,10 +310,11 @@ impl PianoRoll {
     /// position leaves holes: the drawn line jumps from dot to dot and reads as
     /// stepped rather than drawn. The segment is walked tick by tick at
     /// [`CC_DRAW_TICKS_PER_BEAT`] (see [`freehand_cc_samples`]), free of the
-    /// note grid: a CC curve is continuous data, and a grid-snapped brush left
-    /// only a sparse row of marks. The whole segment is written inside **one**
-    /// timeline update so a fast drag costs one notify per mouse event rather
-    /// than one per sample.
+    /// note grid: a CC curve is continuous data. Holding Alt (the drag's
+    /// `unsnap` is then `false`) asks for the grid instead: the segment
+    /// writes one point per grid line it crosses (see [`grid_cc_samples`]).
+    /// The whole segment is written inside **one** timeline update so a fast
+    /// drag costs one notify per mouse event rather than one per sample.
     pub(super) fn cc_paint_stroke_to(
         &mut self,
         lx: f32,
@@ -283,9 +326,9 @@ impl PianoRoll {
             return;
         };
         let kind = self.active_cc;
-        let last = match &self.drag {
-            PianoDrag::CcPaint { last, .. } => *last,
-            _ => None,
+        let (last, unsnap) = match &self.drag {
+            PianoDrag::CcPaint { last, unsnap, .. } => (*last, *unsnap),
+            _ => (None, true),
         };
         let (from_x, from_y) = last.unwrap_or((lx, ly));
 
@@ -296,13 +339,28 @@ impl PianoRoll {
 
         let from_beat = self.clamp_cc_beat(self.x_to_clip_beat(from_x));
         let to_beat = self.clamp_cc_beat(self.x_to_clip_beat(lx));
-        let edits = freehand_cc_samples(
-            from_beat,
-            value_at(from_y),
-            to_beat,
-            value_at(ly),
-            controller_value_steps(kind),
-        );
+        // Alt asks for the grid explicitly, so it applies whatever the snap
+        // toggle says; a `Free` grid has no lines and stays freehand. An
+        // erase sweep always follows the pointer.
+        let on_grid = !unsnap && !erase && !self.grid_res.is_free();
+        let edits = if on_grid {
+            grid_cc_samples(
+                (from_beat, value_at(from_y)),
+                (to_beat, value_at(ly)),
+                self.clamp_cc_beat(self.snap_to_grid(from_beat)),
+                self.clamp_cc_beat(self.snap_to_grid(to_beat)),
+                self.step_beats(),
+                controller_value_steps(kind),
+            )
+        } else {
+            freehand_cc_samples(
+                from_beat,
+                value_at(from_y),
+                to_beat,
+                value_at(ly),
+                controller_value_steps(kind),
+            )
+        };
 
         let cursor_value = value_at(ly);
         self.drag_value_status = Some(format!(
@@ -1264,9 +1322,10 @@ impl PianoRoll {
                         this.begin_cc_line(lx, ly, unsnap, window, cx);
                         return;
                     }
-                    // Painting (and erasing) is freehand — it draws where the
-                    // pointer is, not on grid steps — and Alt snaps it to the
-                    // grid instead. Every other gesture keeps Alt as "free".
+                    // Painting is freehand — it draws where the pointer is,
+                    // not on grid steps — and Alt snaps it to the grid
+                    // instead; an erase sweep always follows the pointer.
+                    // Every other gesture keeps Alt as "free".
                     if this.tool == PianoTool::Erase {
                         this.begin_cc_paint(true, !free, lx, ly, window, cx);
                         return;
@@ -1449,6 +1508,44 @@ mod tests {
         // Finer than any note grid: consecutive values a few ticks apart.
         let gap = samples[2].0 - samples[1].0;
         assert!(gap < 0.01, "points {gap} beats apart");
+    }
+
+    /// #151: Alt+drag puts the stroke on grid lines only, valued along the
+    /// pointer's path.
+    #[test]
+    fn a_snapped_stroke_writes_one_point_per_grid_line() {
+        // Pointer from beat 0.1 (value 0) to 1.9 (value 1) on a 1/4 grid.
+        let samples = grid_cc_samples((0.1, 0.0), (1.9, 1.0), 0.0, 2.0, 0.25, 127.0);
+        assert_eq!(samples.len(), 9);
+        for (k, (beat, _)) in samples.iter().enumerate() {
+            assert!((beat - k as f32 * 0.25).abs() < 1.0e-6, "{samples:?}");
+        }
+        // Values follow the pointer's line, clamped before and after it, and
+        // land on the controller's 128 steps.
+        assert_eq!(samples[0].1, 0.0);
+        assert_eq!(samples[8].1, 1.0);
+        let mid = samples[4].1; // beat 1.0, t = 0.5
+        assert!((mid - 64.0 / 127.0).abs() < 1.0e-6, "{mid}");
+        assert!(samples
+            .windows(2)
+            .all(|p| p[0].0 < p[1].0 && p[0].1 <= p[1].1));
+    }
+
+    #[test]
+    fn a_snapped_stroke_inside_one_cell_writes_the_line_under_the_cursor() {
+        let samples = grid_cc_samples((1.05, 0.2), (1.1, 0.6), 1.0, 1.0, 0.25, 127.0);
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].0, 1.0);
+        assert!((samples[0].1 - (0.6f32 * 127.0).round() / 127.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn a_leftward_snapped_stroke_is_ascending() {
+        let samples = grid_cc_samples((2.0, 1.0), (1.0, 0.0), 2.0, 1.0, 0.5, 127.0);
+        let beats: Vec<f32> = samples.iter().map(|(b, _)| *b).collect();
+        assert_eq!(beats, vec![1.0, 1.5, 2.0]);
+        assert_eq!(samples[0].1, 0.0);
+        assert_eq!(samples[2].1, 1.0);
     }
 
     #[test]

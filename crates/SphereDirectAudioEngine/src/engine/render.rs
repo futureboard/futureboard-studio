@@ -991,6 +991,11 @@ fn feeds_track(tracks: &[RuntimeTrack], from: usize, to: usize) -> bool {
 /// topological order so chained bus→return feeds land before the target runs.
 /// Sends to non-routing tracks or to self are dropped. No allocation on the
 /// audio thread.
+///
+/// A send with a planned PDC delay (`send_pdc_delay`) feeds the return through
+/// its own delay ring, so sources with different plug-in latency meet aligned
+/// at the return. That ring keeps running while the send is off or at zero, so
+/// switching it back on does not replay stale audio.
 #[inline]
 pub(crate) fn accumulate_sends(
     runtime: &mut RuntimeProject,
@@ -1014,7 +1019,15 @@ pub(crate) fn accumulate_sends(
             let (enabled, level) = track.send_state_at(s, beat);
             (enabled, level, send.return_track_index)
         };
-        if !enabled || level == 0.0 {
+        let delay = runtime
+            .latency_graph
+            .send_pdc_delay
+            .get(src_index)
+            .and_then(|row| row.get(s))
+            .copied()
+            .unwrap_or(0);
+        let audible = enabled && level != 0.0;
+        if !audible && delay == 0 {
             continue;
         }
         // Resolved at build time — no id lookup on the audio thread.
@@ -1025,6 +1038,18 @@ pub(crate) fn accumulate_sends(
             continue;
         }
         let (src, tgt) = two_mut(&mut runtime.tracks, src_index, t);
+        if delay > 0 {
+            crate::latency_graph::accumulate_delayed_send(
+                &src.block_l[..frames],
+                &src.block_r[..frames],
+                &mut tgt.recv_l[..frames],
+                &mut tgt.recv_r[..frames],
+                &mut src.sends[s].pdc,
+                delay,
+                if audible { level } else { 0.0 },
+            );
+            continue;
+        }
         simd::add_scaled_into(&mut tgt.recv_l[..frames], &src.block_l[..frames], level);
         simd::add_scaled_into(&mut tgt.recv_r[..frames], &src.block_r[..frames], level);
     }

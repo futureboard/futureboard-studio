@@ -203,6 +203,37 @@ pub enum MixerSplitAction {
     SetWide(bool),
 }
 
+/// Whether the last two presses on a splitter dragged it. A double-click
+/// resets the racks only when neither of its two presses moved the splitter:
+/// two quick nudges are two drags, not a double-click.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SplitPressHistory {
+    current_moved: bool,
+    previous_moved: bool,
+}
+
+impl SplitPressHistory {
+    /// A new press on a splitter.
+    pub fn press(&mut self) {
+        self.previous_moved = self.current_moved;
+        self.current_moved = false;
+    }
+
+    /// The press being held dragged the splitter.
+    pub fn moved(&mut self) {
+        self.current_moved = true;
+    }
+
+    /// Whether a double-click ending now is a reset.
+    pub fn allows_reset(&self) -> bool {
+        !self.current_moved && !self.previous_moved
+    }
+}
+
+/// How far the pointer may travel between press and release for a click on
+/// a splitter to still count towards a double-click reset.
+pub const SPLIT_CLICK_SLOP_PX: f32 = 1.0;
+
 /// Shared split layout passed into the mixer. Insert/send heights are already
 /// clamped by the owner; `on_action` routes splitter intents back to the owner
 /// so all strips resize together.
@@ -238,6 +269,43 @@ pub struct MixerSplitDrag;
 impl Render for MixerSplitDrag {
     fn render(&mut self, _w: &mut Window, _cx: &mut gpui::Context<Self>) -> impl IntoElement {
         Empty
+    }
+}
+
+#[cfg(test)]
+mod press_history_tests {
+    use super::SplitPressHistory;
+
+    #[test]
+    fn a_still_double_click_resets() {
+        let mut history = SplitPressHistory::default();
+        history.press();
+        history.press();
+        assert!(history.allows_reset());
+    }
+
+    #[test]
+    fn two_quick_nudges_do_not_reset() {
+        let mut history = SplitPressHistory::default();
+        history.press();
+        history.moved();
+        history.press();
+        assert!(!history.allows_reset(), "the first press dragged");
+        history.moved();
+        assert!(!history.allows_reset(), "both presses dragged");
+    }
+
+    #[test]
+    fn a_drag_on_the_second_press_does_not_reset() {
+        let mut history = SplitPressHistory::default();
+        history.press();
+        history.press();
+        history.moved();
+        assert!(!history.allows_reset());
+        // The next still pair resets again.
+        history.press();
+        history.press();
+        assert!(history.allows_reset());
     }
 }
 

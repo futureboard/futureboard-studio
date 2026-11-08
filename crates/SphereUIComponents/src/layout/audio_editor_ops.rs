@@ -123,9 +123,17 @@ impl StudioLayout {
         if !shown || !self.audio_editor.read(cx).owns_edit_commands() {
             return false;
         }
+        // Run it after this StudioLayout update returns: Delete / Cut / Paste
+        // ask the layout for the project folder through the editor's
+        // callbacks, and reading the layout while it is leased here panics
+        // ("cannot read StudioLayout while it is already being updated").
+        // Every command that passed the filter above is one the editor takes.
         let command_id = command_id.to_string();
-        self.audio_editor
-            .update(cx, |editor, cx| editor.run_command(&command_id, cx))
+        let editor = self.audio_editor.downgrade();
+        cx.defer(move |cx| {
+            let _ = editor.update(cx, |editor, cx| editor.run_command(&command_id, cx));
+        });
+        true
     }
 
     /// Play `[start, end)` and stop at `end`, unless playback was already

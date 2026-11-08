@@ -60,6 +60,13 @@ impl ToneStage {
         self.nam.reset();
     }
 
+    /// Empty the NAM engine's chunk, dry line and rate adapter — for a
+    /// capture coming back into the path, so it does not replay the chunk it
+    /// held when it left.
+    pub(super) fn reset_nam(&mut self) {
+        self.nam.reset();
+    }
+
     /// Audio thread: call once per audio block (never per sample) so the NAM
     /// engine can adopt a pending capture swap at a safe boundary. `frames`
     /// is the host buffer about to be processed; `0` leaves the inference

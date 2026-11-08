@@ -385,7 +385,13 @@ impl Render for MixerPanelView {
                 let y: f32 = event.event.position.y.into();
                 (split_for_move.on_action)(MixerSplitAction::ResizeMove(y), w, cx);
             })
-            .on_mouse_up(gpui::MouseButton::Left, move |_e, w, cx| {
+            .on_mouse_up(gpui::MouseButton::Left, {
+                let split = split_for_end.clone();
+                move |_e, w, cx| (split.on_action)(MixerSplitAction::ResizeEnd, w, cx)
+            })
+            // A drag released outside the mixer ends too, or the handle
+            // stays lit as if still held.
+            .on_mouse_up_out(gpui::MouseButton::Left, move |_e, w, cx| {
                 (split_for_end.on_action)(MixerSplitAction::ResizeEnd, w, cx);
             })
             .child(mixer_sub_header(

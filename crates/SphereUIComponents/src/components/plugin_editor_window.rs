@@ -287,6 +287,121 @@ const HOST_OWNED_SHELL_BODY_H: f32 = EDITOR_WINDOW_MIN_HEIGHT - HEADER_H;
 const MIN_PLUGIN_EDITOR_CONTENT_SIZE: i32 = 160;
 const MAX_PLUGIN_EDITOR_PREFERRED_SIZE: i32 = 4096;
 
+/// How long a released content child waits for the host to report the view
+/// detached (`EditorClosed`) before it is destroyed anyway. The host answers in
+/// milliseconds; this only bounds a host that hung or died without saying so.
+const PARKED_CONTENT_MAX_WAIT: Duration = Duration::from_secs(5);
+
+/// Content children whose plug-in view the host was asked to detach, waiting
+/// for it to say it has.
+///
+/// The host attaches the plug-in's view to a content child from another
+/// process and detaches it only when it handles `CloseEditor`, which arrives
+/// after this process has moved on — to another tab, to the crash panel, or to
+/// destroying the editor window. Destroying the child before then destroys the
+/// plug-in's window under an attached view. Each child waits here, hidden and
+/// out of the editor window, until its `EditorClosed` or the deadline.
+struct ParkedContents<T> {
+    entries: Vec<(String, Instant, T)>,
+}
+
+impl<T> ParkedContents<T> {
+    const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    fn park(&mut self, instance_id: String, content: T, now: Instant) {
+        self.entries.push((instance_id, now, content));
+    }
+
+    /// Everything waiting on `instance_id`, which the host has let go of, plus
+    /// whatever has waited past `max_wait`.
+    fn take_released(&mut self, instance_id: &str, now: Instant, max_wait: Duration) -> Vec<T> {
+        self.take_where(|id, parked_at| {
+            id == instance_id || now.saturating_duration_since(parked_at) >= max_wait
+        })
+    }
+
+    /// Whatever has waited past `max_wait`.
+    fn take_expired(&mut self, now: Instant, max_wait: Duration) -> Vec<T> {
+        self.take_where(|_, parked_at| now.saturating_duration_since(parked_at) >= max_wait)
+    }
+
+    fn take_where(&mut self, done: impl Fn(&str, Instant) -> bool) -> Vec<T> {
+        let mut taken = Vec::new();
+        let mut index = 0;
+        while index < self.entries.len() {
+            let (id, parked_at, _) = &self.entries[index];
+            if done(id, *parked_at) {
+                taken.push(self.entries.remove(index).2);
+            } else {
+                index += 1;
+            }
+        }
+        taken
+    }
+}
+
+/// The UI thread's parked content children. At thread exit whatever is left
+/// is forgotten rather than destroyed: the process is ending, and destroying
+/// windows during thread-local teardown is what the shutdown path avoids.
+struct ParkedOnUiThread(ParkedContents<ContentChildHwnd>);
+
+impl Drop for ParkedOnUiThread {
+    fn drop(&mut self) {
+        for (_, _, content) in self.0.entries.drain(..) {
+            std::mem::forget(content);
+        }
+    }
+}
+
+thread_local! {
+    static PARKED_CONTENT: std::cell::RefCell<ParkedOnUiThread> =
+        const { std::cell::RefCell::new(ParkedOnUiThread(ParkedContents::new())) };
+}
+
+/// Hides `content`, moves it out of its editor window and keeps it until the
+/// host reports `instance_id`'s view detached.
+fn park_editor_content(instance_id: String, mut content: ContentChildHwnd) {
+    content.park();
+    let expired = PARKED_CONTENT.with(|parked| {
+        let mut parked = parked.borrow_mut();
+        let now = Instant::now();
+        parked.0.park(instance_id, content, now);
+        parked.0.take_expired(now, PARKED_CONTENT_MAX_WAIT)
+    });
+    // Destroyed outside the borrow: destroying a window dispatches messages.
+    drop(expired);
+}
+
+/// The host reported `instance_id`'s editor closed: its view has let go of
+/// the content child, which can now be destroyed.
+pub(crate) fn release_parked_editor_content(instance_id: &str) {
+    let released = PARKED_CONTENT.with(|parked| {
+        parked
+            .borrow_mut()
+            .0
+            .take_released(instance_id, Instant::now(), PARKED_CONTENT_MAX_WAIT)
+    });
+    drop(released);
+}
+
+/// Destroys parked content children whose host never answered.
+pub(crate) fn sweep_parked_editor_content() {
+    let expired = PARKED_CONTENT.with(|parked| {
+        let mut parked = parked.borrow_mut();
+        if parked.0.entries.is_empty() {
+            return Vec::new();
+        }
+        parked
+            .0
+            .take_expired(Instant::now(), PARKED_CONTENT_MAX_WAIT)
+    });
+    drop(expired);
+}
+
 /// See [`PluginEditorWindow::unsupported_status_for`].
 fn unsupported_status(reason: &LocalEditorCompatibility) -> PluginEditorStatus {
     PluginEditorStatus::Unsupported(reason.message().to_string())
@@ -415,6 +530,9 @@ pub struct PluginEditorWindow {
     /// plug-in editor is a cross-process native window, and holding several of
     /// them live behind one another buys nothing anybody can see.
     tabs: Vec<PluginEditorTab>,
+    /// Set by [`Self::close_window`], which has already released the view;
+    /// `Drop` then has nothing left to ask the host for.
+    released_for_close: bool,
     focus_handle: FocusHandle,
 }
 
@@ -500,6 +618,7 @@ impl PluginEditorWindow {
             window_scale: 1.0,
             window_hwnd: None,
             tabs: Vec::new(),
+            released_for_close: false,
             status,
             wait_ticks: 0,
             tick_scheduled: false,
@@ -2117,17 +2236,42 @@ impl PluginEditorWindow {
             }
         }
         if let Some(host) = self.host.as_mut() {
-            let closing = self.insert_id.clone();
+            // The id the host answers `EditorClosed` with.
+            let closing = if host.shared.is_some() {
+                self.insert_id.clone()
+            } else {
+                format!("{}::{}", self.track_id, self.insert_id)
+            };
             if let Some(shared) = host.shared.as_ref() {
                 if let Ok(mut runtime) = shared.lock() {
                     runtime.close_editor(closing.clone());
                 }
             } else if let Some(client) = host.client.as_mut() {
-                let _ = client.close_editor(format!("{}::{}", self.track_id, closing));
+                let _ = client.close_editor(closing.clone());
             }
-            host.content = None;
+            // The host detaches the view when it handles the close, after this
+            // returns; the content child it is attached to waits for that.
+            if let Some(content) = host.content.take() {
+                park_editor_content(closing, content);
+            }
         }
         self.view_content = None;
+    }
+
+    /// Closes this window, letting go of the plug-in's view first.
+    ///
+    /// Removing the window destroys its native window — and every child
+    /// window in it — at the end of the current update, before this entity is
+    /// dropped. A view still attached then has its window destroyed under it,
+    /// so every close goes through here rather than straight to
+    /// `remove_window`.
+    pub(crate) fn close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The preset list is a window of its own; it goes before the editor it
+        // hangs from, so no platform is left holding an orphan.
+        self.close_preset_menu(cx);
+        self.release_active_view();
+        self.released_for_close = true;
+        window.remove_window();
     }
 
     /// Whether a plug-in view is actually attached in this window.
@@ -2279,8 +2423,11 @@ impl PluginEditorWindow {
                 self.status = PluginEditorStatus::Failed(error);
                 cx.notify();
             }
-            ClientEvent::Host(HostEvent::EditorClosed { .. }) => {
+            ClientEvent::Host(HostEvent::EditorClosed {
+                plugin_instance_id, ..
+            }) => {
                 eprintln!("[plugin-view][host] EditorClosed editor_id={id}");
+                release_parked_editor_content(&plugin_instance_id);
             }
             ClientEvent::Host(HostEvent::EditorChromeAction { action, .. }) => {
                 // Straight onto the queue this window's own strip would have
@@ -2540,6 +2687,10 @@ impl Drop for PluginEditorWindow {
         if crate::shutdown::ShutdownState::global().is_shutting_down() {
             return;
         }
+        // `close_window` already let go of the view, before the window went.
+        if self.released_for_close {
+            return;
+        }
         // Host-process path: ask the host to remove the view (spec Part 6), then
         // let the backend's Drop tear down the content HWND + the host process.
         if let Some(host) = self.host.as_mut() {
@@ -2698,7 +2849,7 @@ impl PluginEditorWindow {
             .text_color(Colors::text_secondary())
             .hover(|s| s.bg(Colors::surface_control_hover()))
             .child("Close")
-            .on_click(|_ev, window, _cx| window.remove_window());
+            .on_click(cx.listener(|this, _ev, window, cx| this.close_window(window, cx)));
 
         div()
             .flex()
@@ -2779,8 +2930,9 @@ impl PluginEditorWindow {
         let reload = button("plugin-editor-reload", "Reload", true).on_click(request(false));
         let reset =
             button("plugin-editor-reset-reload", "Reset & Reload", false).on_click(request(true));
-        let close = button("plugin-editor-close", "Close", false)
-            .on_click(|_ev, window, _cx| window.remove_window());
+        let close = button("plugin-editor-close", "Close", false).on_click(
+            cx.listener(|this: &mut Self, _ev, window, cx| this.close_window(window, cx)),
+        );
 
         let mut panel = div()
             .flex()
@@ -2974,13 +3126,16 @@ impl Render for PluginEditorWindow {
                 self.window_title(),
                 "plugin-editor-window-close",
                 {
-                    // The list is a window of its own; closing the editor with
-                    // it open must not leave it behind on platforms where the
-                    // OS owner relationship does not do it for us.
+                    // The view is let go of, and the preset list (a window of
+                    // its own) closed, before the window goes.
                     let this = cx.entity().downgrade();
                     move |window, cx| {
-                        let _ = this.update(cx, |editor, cx| editor.close_preset_menu(cx));
-                        window.remove_window();
+                        if this
+                            .update(cx, |editor, cx| editor.close_window(window, cx))
+                            .is_err()
+                        {
+                            window.remove_window();
+                        }
                     }
                 },
             ))
@@ -3140,8 +3295,8 @@ pub(crate) fn open_plugin_editor_window(
     options.focus = options.show;
 
     let editor_id = format!("{track_id}::{insert_id}");
-    let result = cx.open_window(options, |_window, cx| {
-        cx.new(|cx| {
+    let result = cx.open_window(options, |window, cx| {
+        let view = cx.new(|cx| {
             PluginEditorWindow::new(
                 track_id,
                 insert_id,
@@ -3151,7 +3306,19 @@ pub(crate) fn open_plugin_editor_window(
                 in_process,
                 cx,
             )
-        })
+        });
+        // A close from the OS (Alt+F4, the taskbar) lets go of the view before
+        // the window goes, like every close from inside the studio.
+        let weak = view.downgrade();
+        window.on_window_should_close(cx, move |_window, cx| {
+            let _ = weak.update(cx, |editor, cx| {
+                editor.close_preset_menu(cx);
+                editor.release_active_view();
+                editor.released_for_close = true;
+            });
+            true
+        });
+        view
     });
     if plugin_view_debug() {
         match &result {
@@ -3276,5 +3443,54 @@ mod platform_support_tests {
         assert_eq!(HOST_OWNED_EDITOR_DPI, 96);
         let (w, h) = DEFAULT_PLUGIN_EDITOR_CONTENT_SIZE;
         assert!(w >= MIN_PLUGIN_EDITOR_CONTENT_SIZE && h >= MIN_PLUGIN_EDITOR_CONTENT_SIZE);
+    }
+}
+
+#[cfg(test)]
+mod parked_content_tests {
+    use super::ParkedContents;
+    use std::time::{Duration, Instant};
+
+    const WAIT: Duration = Duration::from_secs(5);
+
+    /// A content child released by a tab switch or a close goes when the host
+    /// reports that instance's view detached, and not before; another
+    /// instance's report leaves it waiting.
+    #[test]
+    fn parked_content_goes_when_its_own_view_is_detached() {
+        let start = Instant::now();
+        let mut parked = ParkedContents::new();
+        parked.park("a".to_string(), 1, start);
+        parked.park("b".to_string(), 2, start);
+
+        assert!(parked.take_expired(start, WAIT).is_empty());
+        assert_eq!(parked.take_released("b", start, WAIT), vec![2]);
+        assert!(parked.take_released("b", start, WAIT).is_empty());
+        assert_eq!(parked.entries.len(), 1);
+        assert_eq!(parked.take_released("a", start, WAIT), vec![1]);
+        assert!(parked.entries.is_empty());
+    }
+
+    /// A host that never answers (hung, or died with the view) does not keep
+    /// the window around for good.
+    #[test]
+    fn parked_content_is_destroyed_after_the_deadline_without_an_answer() {
+        let start = Instant::now();
+        let mut parked = ParkedContents::new();
+        parked.park("a".to_string(), 1, start);
+        parked.park("b".to_string(), 2, start + Duration::from_secs(3));
+
+        assert!(parked
+            .take_expired(start + Duration::from_secs(4), WAIT)
+            .is_empty());
+        assert_eq!(
+            parked.take_expired(start + Duration::from_secs(5), WAIT),
+            vec![1]
+        );
+        // Any release sweeps what has waited too long, whoever it is for.
+        assert_eq!(
+            parked.take_released("x", start + Duration::from_secs(8), WAIT),
+            vec![2]
+        );
     }
 }

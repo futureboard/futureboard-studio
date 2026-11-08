@@ -303,6 +303,68 @@ fn longest_decay_stays_bounded() {
     }
 }
 
+/// The issue's room: big, short and bass-heavy, so the low band's share of
+/// the loss is far from the middle band's. Gliding the loss toward Freeze or
+/// a long decay must never take any band's loop gain past one.
+fn short_bassy_room() -> Params {
+    Params {
+        size: 100.0,
+        decay_sec: 0.1,
+        bass_mult: 3.0,
+        ..default_params()
+    }
+}
+
+/// Runs `frames` of a 0.5-peak signal, calling `edit` at each frame first,
+/// and returns the output peak; panics on a non-finite sample.
+fn peak_under(dsp: &mut Dsp, frames: usize, mut edit: impl FnMut(&mut Dsp, usize)) -> f32 {
+    let mut peak = 0.0f32;
+    for n in 0..frames {
+        edit(dsp, n);
+        let t = n as f32 / SR;
+        let x = 0.25 * (TAU * 55.0 * t).sin() + 0.25 * (TAU * 1_330.0 * t).sin();
+        let (l, r) = dsp.process_stereo(x, -x);
+        assert!(l.is_finite() && r.is_finite(), "non-finite at sample {n}");
+        peak = peak.max(l.abs()).max(r.abs());
+    }
+    peak
+}
+
+#[test]
+fn freeze_toggling_stays_bounded() {
+    for mix in [30.0, 100.0] {
+        let mut dsp = dsp_with(Params {
+            mix,
+            ..short_bassy_room()
+        });
+        let toggle = (SR * 0.1) as usize;
+        let peak = peak_under(&mut dsp, 48_000 * 4, |dsp, n| {
+            if n > 0 && n % toggle == 0 {
+                let frozen = (n / toggle) % 2 == 1;
+                assert!(dsp.apply_ui_param("freeze", if frozen { 1.0 } else { 0.0 }));
+            }
+        });
+        assert!(peak < 2.0, "freeze toggling at mix {mix}: peak {peak}");
+    }
+}
+
+#[test]
+fn a_decay_jump_stays_bounded() {
+    for (from, to) in [(0.1f32, 20.0f32), (20.0, 0.1)] {
+        let mut dsp = dsp_with(Params {
+            mix: 100.0,
+            decay_sec: from,
+            ..short_bassy_room()
+        });
+        let peak = peak_under(&mut dsp, 48_000 * 3, |dsp, n| {
+            if n == 48_000 {
+                assert!(dsp.apply_ui_param("decaySec", to));
+            }
+        });
+        assert!(peak < 2.0, "decay {from} → {to}: peak {peak}");
+    }
+}
+
 /// A short room left to ring out goes to exact silence: no subnormal ever
 /// leaves the plug-in, and the tank holds none.
 #[test]

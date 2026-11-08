@@ -1436,9 +1436,11 @@ impl AudioEngine {
     }
 
     /// Emit a throttled (~500 ms) `[AudioRealtime]` trace when
-    /// `FUTUREBOARD_INPUT_DEBUG` is set. Call from the UI poll loop; it is a
-    /// cheap no-op when the env var is unset or the throttle window is open.
+    /// `FUTUREBOARD_INPUT_DEBUG` is set, and log the slow-block and MIDI-list
+    /// reports the audio callback published (it never writes them itself).
+    /// Call from the UI poll loop; it is a cheap no-op when nothing is new.
     pub fn log_input_debug(&self) {
+        self.inner.log_callback_diagnostics();
         self.inner.log_input_debug_throttled();
     }
 

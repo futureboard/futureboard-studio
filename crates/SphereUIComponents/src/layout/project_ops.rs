@@ -1999,12 +1999,15 @@ impl StudioLayout {
             .iter()
             .flat_map(|track| track.clips.iter())
             .filter_map(|clip| {
-                let ClipSource::Audio {
-                    source_path: Some(source_path),
-                    ..
-                } = &clip.source
-                else {
-                    return None;
+                // Recorded takes too: a save into another folder copies them
+                // in, and the session must play those copies from now on.
+                let source_path = match &clip.source {
+                    ClipSource::Audio {
+                        source_path: Some(source_path),
+                        ..
+                    }
+                    | ClipSource::Rauf { source_path, .. } => source_path,
+                    _ => return None,
                 };
                 let resolved = if source_path.is_absolute() {
                     source_path.clone()

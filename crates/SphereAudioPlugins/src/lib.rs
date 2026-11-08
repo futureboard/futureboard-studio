@@ -220,6 +220,11 @@ impl Biquad {
         if output.is_finite() {
             output
         } else {
+            // A non-finite sample (from upstream, or a blown-up state) has
+            // poisoned the state too: muting the output alone would leave
+            // the filter at NaN, silent for good. Start over from rest.
+            self.z1 = 0.0;
+            self.z2 = 0.0;
             0.0
         }
     }
@@ -461,5 +466,63 @@ fn param(
         min,
         max,
         unit: unit.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn eq_with_one_band() -> PluginParams {
+        let mut params = PluginParams::new();
+        for band in 2..=8 {
+            params.insert(format!("band{band}Active"), Value::Bool(false));
+        }
+        params.insert("band1Type".to_string(), Value::from("bell"));
+        params.insert("band1Freq".to_string(), Value::from(1_000.0));
+        params.insert("band1Gain".to_string(), Value::from(6.0));
+        params.insert("band1Q".to_string(), Value::from(1.0));
+        params
+    }
+
+    /// One NaN or Inf sample from upstream must not silence the EQ for the
+    /// rest of the session: the next normal samples pass again.
+    #[test]
+    fn the_eq_recovers_from_a_non_finite_sample() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let params = eq_with_one_band();
+            let mut state = AudioPluginDspState::new("sphere.eq8", &params, 48_000);
+            assert_eq!(state.eq_l.len(), 1);
+            let sine =
+                |n: usize| (n as f32 * std::f32::consts::TAU * 1_000.0 / 48_000.0).sin() * 0.25;
+            for n in 0..480 {
+                let _ = process_stereo_sample(
+                    "sphere.eq8",
+                    true,
+                    &params,
+                    &mut state,
+                    sine(n),
+                    sine(n),
+                );
+            }
+            let _ = process_stereo_sample("sphere.eq8", true, &params, &mut state, bad, bad);
+            let mut peak = 0.0f32;
+            for n in 481..4_800 {
+                let (l, r) = process_stereo_sample(
+                    "sphere.eq8",
+                    true,
+                    &params,
+                    &mut state,
+                    sine(n),
+                    sine(n),
+                );
+                assert!(l.is_finite() && r.is_finite(), "{bad}: sample {n}");
+                if n > 2_400 {
+                    peak = peak.max(l.abs()).max(r.abs());
+                }
+            }
+            // +6 dB at its centre: about twice the 0.25 input.
+            assert!(peak > 0.4, "{bad}: the EQ stayed silent (peak {peak})");
+        }
     }
 }

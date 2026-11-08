@@ -17,7 +17,9 @@
 //!
 //! The audio callback does not write files, encode containers, or block on disk
 //! I/O. The recording path uses a bounded preallocated block pool and drops on
-//! backpressure instead of allocating or blocking.
+//! backpressure instead of allocating or blocking; the dropped length reaches
+//! the writer with the next block and is recorded as silence, so the rest of
+//! the take keeps its place on the timeline.
 
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -265,9 +267,92 @@ pub(crate) fn find_input_device_for_host(
 /// How long the disk writer waits for a block before it looks at the stop flag.
 const WRITER_IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
+/// One capture block on its way to the disk writer.
+pub struct RecordBlock {
+    /// Frames the capture side could not hand over (block pool exhausted,
+    /// writer queue full) immediately before `samples`. The writer records
+    /// them as silence, so a drop leaves a hole in the take instead of pulling
+    /// everything after it earlier on the timeline.
+    pub gap_frames: u64,
+    /// Interleaved samples at the capture stream's channel count.
+    pub samples: Vec<i32>,
+}
+
+/// Hand one interleaved capture callback to a take's disk writer.
+///
+/// A callback longer than a pool block is split across as many blocks as it
+/// needs instead of being dropped whole. Frames that cannot be handed over
+/// are added to `gap_frames`, which rides along with the next block that gets
+/// through and is then cleared, so the writer knows exactly where the hole
+/// is. Returns `false` when anything was lost.
+///
+/// Realtime-safe: bounded `try_recv`/`try_send` only, and a pool block is
+/// filled within the capacity the control thread gave it.
+#[inline]
+pub(crate) fn send_capture_block<T: Copy>(
+    data: &[T],
+    channels: usize,
+    to_i32: impl Fn(T) -> i32,
+    audio_tx: &crossbeam_channel::Sender<RecordBlock>,
+    free_rx: &crossbeam_channel::Receiver<Vec<i32>>,
+    free_tx: &crossbeam_channel::Sender<Vec<i32>>,
+    gap_frames: &mut u64,
+) -> bool {
+    let channels = channels.max(1);
+    let mut rest = &data[..data.len() - data.len() % channels];
+    let mut complete = true;
+    while !rest.is_empty() {
+        let Ok(mut block) = free_rx.try_recv() else {
+            *gap_frames += (rest.len() / channels) as u64;
+            return false;
+        };
+        let take = (block.capacity() / channels * channels).min(rest.len());
+        if take == 0 {
+            let _ = free_tx.try_send(block);
+            *gap_frames += (rest.len() / channels) as u64;
+            return false;
+        }
+        let (chunk, tail) = rest.split_at(take);
+        rest = tail;
+        block.clear();
+        block.extend(chunk.iter().copied().map(&to_i32));
+        let message = RecordBlock {
+            gap_frames: *gap_frames,
+            samples: block,
+        };
+        match audio_tx.try_send(message) {
+            Ok(()) => *gap_frames = 0,
+            Err(error) => {
+                let _ = free_tx.try_send(error.into_inner().samples);
+                *gap_frames += (take / channels) as u64;
+                complete = false;
+            }
+        }
+    }
+    complete
+}
+
+/// Append `frames` frames of silence to every writer (a dropped stretch of
+/// input). Disk-writer thread only.
+fn write_silence(writers: &mut [TrackWriterState], frames: u64) {
+    const CHUNK_FRAMES: u64 = 8192;
+    for w in writers {
+        let mut left = frames;
+        while left > 0 && w.error.is_none() {
+            let chunk = left.min(CHUNK_FRAMES) as usize;
+            w.selected.clear();
+            w.selected.resize(chunk * w.input_channels.len(), 0);
+            if let Err(error) = w.writer.write_s32le_interleaved(&w.selected) {
+                w.error = Some(error.to_string());
+            }
+            left -= chunk as u64;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn disk_writer_thread(
-    audio_rx: crossbeam_channel::Receiver<Vec<i32>>,
+    audio_rx: crossbeam_channel::Receiver<RecordBlock>,
     free_tx: crossbeam_channel::Sender<Vec<i32>>,
     mut writers: Vec<TrackWriterState>,
     sample_rate: u32,
@@ -287,8 +372,11 @@ fn disk_writer_thread(
     // The wait is short because it is how long Stop takes to close the files:
     // at 200 ms every take sat out most of it after the last block.
     loop {
-        let mut block = match audio_rx.recv_timeout(WRITER_IDLE_POLL) {
-            Ok(block) => block,
+        let RecordBlock {
+            gap_frames,
+            samples: mut block,
+        } = match audio_rx.recv_timeout(WRITER_IDLE_POLL) {
+            Ok(message) => message,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 if stop_flag.load(Ordering::Acquire) {
                     break;
@@ -297,6 +385,12 @@ fn disk_writer_thread(
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         };
+        // Input the capture side had to drop just before this block: keep its
+        // length as silence so everything after stays on the timeline.
+        if gap_frames > 0 {
+            write_silence(&mut writers, gap_frames);
+            total_frames += gap_frames;
+        }
         let frames = block.len().checked_div(input_ch).unwrap_or(0);
         if frames == 0 {
             block.clear();
@@ -531,7 +625,7 @@ fn reset_failed_own_stream_start(shared: &crate::engine::SharedState) {
 fn build_f32_input_stream(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
-    tx: crossbeam_channel::Sender<Vec<i32>>,
+    tx: crossbeam_channel::Sender<RecordBlock>,
     free_rx: crossbeam_channel::Receiver<Vec<i32>>,
     free_tx: crossbeam_channel::Sender<Vec<i32>>,
     active: Arc<AtomicBool>,
@@ -580,6 +674,9 @@ fn build_f32_input_stream(
             bin_count: 0,
         })
         .collect();
+
+    // Input frames lost since the last block reached the writer.
+    let mut record_gap_frames = 0u64;
 
     #[cfg(target_os = "linux")]
     let rt_announcer = crate::backend::cpal_backend::spawn_capture_rt_promoter();
@@ -742,28 +839,19 @@ fn build_f32_input_stream(
                 }
 
                 // 2. Record path → disk writer worker (only while armed/active).
-                if capture_active {
-                    match free_rx.try_recv() {
-                        Ok(mut block) => {
-                            if block.capacity() < data.len() {
-                                dropped_blocks.fetch_add(1, Ordering::Relaxed);
-                                shared.record_ring_overruns.fetch_add(1, Ordering::Relaxed);
-                                let _ = free_tx.try_send(block);
-                                return;
-                            }
-                            block.clear();
-                            block.extend(data.iter().copied().map(f32_to_s32));
-                            if let Err(error) = tx.try_send(block) {
-                                dropped_blocks.fetch_add(1, Ordering::Relaxed);
-                                shared.record_ring_overruns.fetch_add(1, Ordering::Relaxed);
-                                let _ = free_tx.try_send(error.into_inner());
-                            }
-                        }
-                        Err(_) => {
-                            dropped_blocks.fetch_add(1, Ordering::Relaxed);
-                            shared.record_ring_overruns.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
+                if capture_active
+                    && !send_capture_block(
+                        data,
+                        ch,
+                        f32_to_s32,
+                        &tx,
+                        &free_rx,
+                        &free_tx,
+                        &mut record_gap_frames,
+                    )
+                {
+                    dropped_blocks.fetch_add(1, Ordering::Relaxed);
+                    shared.record_ring_overruns.fetch_add(1, Ordering::Relaxed);
                 }
             },
             |err| eprintln!("[SphereAudio] Input stream error: {err}"),
@@ -896,7 +984,7 @@ fn build_track_writers(
 /// is the per-block capacity in interleaved samples; blocks are preallocated so
 /// the capture callback never grows one on the audio thread.
 struct RecordingPipeline {
-    audio_tx: crossbeam_channel::Sender<Vec<i32>>,
+    audio_tx: crossbeam_channel::Sender<RecordBlock>,
     free_rx: crossbeam_channel::Receiver<Vec<i32>>,
     free_tx: crossbeam_channel::Sender<Vec<i32>>,
     finalize_rx: std::sync::mpsc::Receiver<Vec<RecordingResult>>,
@@ -913,7 +1001,7 @@ fn spawn_recording_pipeline(
 ) -> RecordingPipeline {
     // Bounded channel: if the disk writer falls behind, `try_send` drops the
     // block rather than blocking the audio callback.
-    let (audio_tx, audio_rx) = bounded::<Vec<i32>>(pool_blocks);
+    let (audio_tx, audio_rx) = bounded::<RecordBlock>(pool_blocks);
     let (free_tx, free_rx) = bounded::<Vec<i32>>(pool_blocks);
     for _ in 0..pool_blocks {
         let _ = free_tx.try_send(Vec::with_capacity(pool_block_samples.max(1)));
@@ -1231,6 +1319,7 @@ pub(crate) fn start_recording_live_tap(
             .iter()
             .map(|&(_, l, r)| crate::capture_tap::PreviewAccum::new(l, r))
             .collect(),
+        gap_frames: 0,
     };
 
     eprintln!(
@@ -1356,6 +1445,7 @@ pub(crate) fn start_recording_asio_tap(
             .iter()
             .map(|&(_, l, r)| crate::backend::asio_session::PreviewAccum::new(l, r))
             .collect(),
+        gap_frames: 0,
     };
 
     eprintln!(
@@ -1694,5 +1784,184 @@ mod preview_track_tests {
             preview_tracks_for(&tracks, 2).len(),
             crate::input_ring::MAX_RECORDING_PREVIEW_TRACKS
         );
+    }
+}
+
+#[cfg(test)]
+mod dropped_input_tests {
+    use super::*;
+    use crossbeam_channel::{Receiver, Sender};
+
+    struct Pool {
+        audio_tx: Sender<RecordBlock>,
+        audio_rx: Receiver<RecordBlock>,
+        free_tx: Sender<Vec<i32>>,
+        free_rx: Receiver<Vec<i32>>,
+    }
+
+    /// `blocks` pool blocks of `block_samples` capacity, and a writer queue
+    /// that holds `queue` blocks.
+    fn pool(blocks: usize, block_samples: usize, queue: usize) -> Pool {
+        let (audio_tx, audio_rx) = bounded::<RecordBlock>(queue);
+        let (free_tx, free_rx) = bounded::<Vec<i32>>(blocks.max(1));
+        for _ in 0..blocks {
+            free_tx
+                .try_send(Vec::with_capacity(block_samples))
+                .expect("seed pool");
+        }
+        Pool {
+            audio_tx,
+            audio_rx,
+            free_tx,
+            free_rx,
+        }
+    }
+
+    fn send(pool: &Pool, data: &[i32], gap: &mut u64) -> bool {
+        send_capture_block(
+            data,
+            2,
+            |s| s,
+            &pool.audio_tx,
+            &pool.free_rx,
+            &pool.free_tx,
+            gap,
+        )
+    }
+
+    /// #163: a block dropped because the pool ran dry is not forgotten — its
+    /// length travels with the next block that gets through.
+    #[test]
+    fn a_dropped_block_reaches_the_writer_as_a_gap_before_the_next() {
+        let pool = pool(1, 4, 4);
+        let mut gap = 0;
+        assert!(send(&pool, &[1, 1, 2, 2], &mut gap));
+        // The only pool block is queued: this one is lost.
+        assert!(!send(&pool, &[3, 3, 4, 4], &mut gap));
+        assert_eq!(gap, 2);
+
+        let first = pool.audio_rx.try_recv().expect("first block");
+        assert_eq!(
+            (first.gap_frames, first.samples.as_slice()),
+            (0, &[1, 1, 2, 2][..])
+        );
+        pool.free_tx.try_send(first.samples).unwrap();
+
+        assert!(send(&pool, &[5, 5, 6, 6], &mut gap));
+        let next = pool.audio_rx.try_recv().expect("next block");
+        assert_eq!(
+            next.gap_frames, 2,
+            "the lost frames must precede this block"
+        );
+        assert_eq!(next.samples, vec![5, 5, 6, 6]);
+        assert_eq!(gap, 0);
+    }
+
+    /// #163: a full writer queue loses the block the same way.
+    #[test]
+    fn a_full_writer_queue_is_counted_as_a_gap() {
+        let pool = pool(2, 4, 1);
+        let mut gap = 0;
+        assert!(send(&pool, &[1, 1], &mut gap));
+        assert!(!send(&pool, &[2, 2, 3, 3], &mut gap));
+        assert_eq!(gap, 2);
+        // The block went back to the pool rather than leaking out of it.
+        assert_eq!(pool.free_rx.len(), 1);
+    }
+
+    /// #163: a capture callback longer than one pool block (ALSA after an
+    /// xrun, a 100 ms period at 192 kHz) used to be dropped whole every time.
+    /// It is split across blocks instead.
+    #[test]
+    fn an_oversized_callback_is_split_across_blocks() {
+        let pool = pool(3, 4, 4);
+        let mut gap = 0;
+        let data = [1, 1, 2, 2, 3, 3, 4, 4, 5, 5];
+        assert!(send(&pool, &data, &mut gap));
+        assert_eq!(gap, 0);
+        let mut joined = Vec::new();
+        while let Ok(block) = pool.audio_rx.try_recv() {
+            assert_eq!(block.gap_frames, 0);
+            joined.extend(block.samples);
+        }
+        assert_eq!(joined, data);
+    }
+
+    /// #163: the writer records a gap as silence of the same length, so audio
+    /// after a drop stays where it was played instead of moving earlier.
+    #[test]
+    fn the_writer_fills_a_gap_with_silence() {
+        let dir = std::env::temp_dir().join(format!("fb_rec_gap_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let final_path = dir.join("take.rauf");
+        let writer = RaufWriter::create(
+            &final_path,
+            RaufConfig {
+                sample_rate: 48_000,
+                channels: 2,
+                sample_format: RaufSampleFormat::S32,
+                interleaved: true,
+                project_start_sample: 0,
+                take_id: [0; 16],
+            },
+        )
+        .unwrap();
+        let state = TrackWriterState {
+            track_id: "t".into(),
+            track_name: "T".into(),
+            writer,
+            input_channels: vec![0, 1],
+            out_channels: 2,
+            final_path: final_path.clone(),
+            relative_path: "recordings/take.rauf".into(),
+            sidecar_path: dir.join("take.rauf.json"),
+            sidecar_relative_path: "recordings/take.rauf.json".into(),
+            take_id: "00".into(),
+            project_start_sample: 0,
+            error: None,
+            selected: Vec::new(),
+        };
+
+        let (audio_tx, audio_rx) = bounded::<RecordBlock>(4);
+        let (free_tx, _free_rx) = bounded::<Vec<i32>>(4);
+        let (finalize_tx, finalize_rx) = std::sync::mpsc::channel();
+        audio_tx
+            .send(RecordBlock {
+                gap_frames: 0,
+                samples: vec![1, -1, 2, -2],
+            })
+            .unwrap();
+        audio_tx
+            .send(RecordBlock {
+                gap_frames: 3,
+                samples: vec![3, -3, 4, -4],
+            })
+            .unwrap();
+        drop(audio_tx);
+        disk_writer_thread(
+            audio_rx,
+            free_tx,
+            vec![state],
+            48_000,
+            2,
+            0.0,
+            finalize_tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        let results = finalize_rx.recv().unwrap();
+        assert!(results[0].success, "{:?}", results[0].error);
+        assert!((results[0].duration_seconds - 7.0 / 48_000.0).abs() < 1e-12);
+
+        let reader = sphere_encoder::rauf::RaufReader::open(&final_path).unwrap();
+        assert_eq!(reader.header().frames_written, 7);
+        let bytes = std::fs::read(&final_path).unwrap();
+        let data = &bytes[reader.header().data_offset as usize..];
+        let samples: Vec<i32> = data
+            .chunks_exact(4)
+            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        assert_eq!(samples, vec![1, -1, 2, -2, 0, 0, 0, 0, 0, 0, 3, -3, 4, -4]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

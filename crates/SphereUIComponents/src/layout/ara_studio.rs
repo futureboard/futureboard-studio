@@ -407,7 +407,12 @@ impl StudioLayout {
             .filter_map(|track| track.ara.as_ref())
             .find(|binding| binding.plugin_id == plugin_id)?;
         let path = Path::new(&binding.plugin_path);
-        if binding.class_id.is_empty() || !path.exists() {
+        // The binding comes from the project: its file loads only when the
+        // plug-in catalog knows it (see `plugin_module_gate`).
+        if binding.class_id.is_empty()
+            || !path.exists()
+            || crate::plugin_module_gate::check_module(path).is_err()
+        {
             return None;
         }
         let name = path

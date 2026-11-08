@@ -2085,7 +2085,17 @@ fn vertical_split_handle(
             cx.new(|_| MixerSplitDrag)
         })
         .on_click(move |e: &ClickEvent, w, cx| {
-            if e.click_count() >= 2 {
+            // A double-click that travelled is a nudge; the owner also checks
+            // that neither press dragged the splitter.
+            let still = match e {
+                ClickEvent::Mouse(click) => {
+                    let travel = click.up.position - click.down.position;
+                    f32::from(travel.x).abs() <= SPLIT_CLICK_SLOP_PX
+                        && f32::from(travel.y).abs() <= SPLIT_CLICK_SLOP_PX
+                }
+                ClickEvent::Keyboard(_) => false,
+            };
+            if e.click_count() >= 2 && still {
                 on_dbl(MixerSplitAction::Reset(target), w, cx);
             }
         })
@@ -3199,6 +3209,13 @@ pub(crate) fn mixer_pinned_width() -> f32 {
     2.0 * strip_width() + 1.0
 }
 
+/// Width of the scrolling channel-strip row in a mixer `window_w` wide with a
+/// `tree_w` tree beside it. The one measure the strips are laid out with and
+/// that reveal / focus scroll against, docked or popped out.
+pub(crate) fn mixer_strip_viewport_width(window_w: f32, tree_w: f32) -> f32 {
+    (window_w - tree_w - mixer_pinned_width()).max(100.0)
+}
+
 /// Whether the channel strips overflow the scroller and so get a scrollbar
 /// row. The row is reserved out of the strip height — not drawn over the
 /// strips, where it used to sit on the coloured name plates and could hardly
@@ -3733,7 +3750,13 @@ pub fn mixer_panel(
                 let y: f32 = event.event.position.y.into();
                 (split_for_move.on_action)(MixerSplitAction::ResizeMove(y), w, cx);
             })
-            .on_mouse_up(gpui::MouseButton::Left, move |_e, w, cx| {
+            .on_mouse_up(gpui::MouseButton::Left, {
+                let split = split_for_end.clone();
+                move |_e, w, cx| (split.on_action)(MixerSplitAction::ResizeEnd, w, cx)
+            })
+            // A drag released outside the mixer ends too, or the handle
+            // stays lit as if still held.
+            .on_mouse_up_out(gpui::MouseButton::Left, move |_e, w, cx| {
                 (split_for_end.on_action)(MixerSplitAction::ResizeEnd, w, cx);
             })
             .child(mixer_sub_header(
@@ -3850,7 +3873,12 @@ pub fn mixer_panel(
             let y: f32 = event.event.position.y.into();
             (split_for_move.on_action)(MixerSplitAction::ResizeMove(y), w, cx);
         })
-        .on_mouse_up(gpui::MouseButton::Left, move |_e, w, cx| {
+        .on_mouse_up(gpui::MouseButton::Left, {
+            let split = split_for_end.clone();
+            move |_e, w, cx| (split.on_action)(MixerSplitAction::ResizeEnd, w, cx)
+        })
+        // A drag released outside the mixer ends too.
+        .on_mouse_up_out(gpui::MouseButton::Left, move |_e, w, cx| {
             (split_for_end.on_action)(MixerSplitAction::ResizeEnd, w, cx);
         })
         .child(mixer_sub_header(
@@ -4185,6 +4213,28 @@ fn pinned_meter(
     match meter_layer {
         Some(layout) => meter_slot(layout, source).into_any_element(),
         None => meter_surface(level_l, level_r, hold_l, hold_r, clip).into_any_element(),
+    }
+}
+
+#[cfg(test)]
+mod strip_viewport_tests {
+    use super::{mixer_pinned_width, mixer_scroll_x_to_reveal, mixer_strip_viewport_width};
+    use crate::components::mixer_panel::strip_width;
+
+    /// The pinned Master and Control Room are two strips wide, not 90 px: a
+    /// strip whose right edge sits under them is not on screen, so revealing
+    /// it scrolls.
+    #[test]
+    fn the_pinned_pair_is_taken_out_of_the_strip_row() {
+        let w = strip_width();
+        assert!(mixer_pinned_width() > 2.0 * w);
+        let viewport = mixer_strip_viewport_width(1180.0, 200.0);
+        assert_eq!(viewport, 1180.0 - 200.0 - mixer_pinned_width());
+        // The first strip that does not fit whole, while it would have
+        // with only 90 px pinned.
+        let index = (viewport / w).floor() as usize;
+        assert!((index + 1) as f32 * w <= 1180.0 - 200.0 - 90.0);
+        assert!(mixer_scroll_x_to_reveal(index, 0.0, viewport, 40).is_some());
     }
 }
 

@@ -766,6 +766,9 @@ fn build_engine_inserts_for(
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned())
                 .filter(|p| !p.trim().is_empty())?;
+            // In-process, the engine itself would load it: only a module the
+            // plug-in catalog knows (see `plugin_module_gate`).
+            crate::plugin_module_gate::check_module(std::path::Path::new(&path)).ok()?;
 
             let mut params: std::collections::HashMap<String, serde_json::Value> =
                 std::collections::HashMap::new();

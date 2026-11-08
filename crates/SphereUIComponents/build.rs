@@ -13,7 +13,10 @@
 //! Two values are baked:
 //! - `FUTUREBOARD_AUTH_API_URL` — public account-service origin, not a secret.
 //! - `FUTUREBOARD_TONE3000_API_KEY` — TONE3000 partner Bearer key for Rodhareist
-//!   NAM A2 catalog fetch. Native-only; it never crosses the CEF editor bridge.
+//!   NAM A2 catalog fetch, **in debug (developer) builds only**. A key compiled
+//!   into a binary can be read back out of it, and release binaries — nightlies
+//!   included — are handed out, so a release build never carries it: it reads
+//!   the key from its runtime environment, or has TONE3000 browsing off.
 
 use std::path::{Path, PathBuf};
 
@@ -37,8 +40,13 @@ fn main() {
     if let Some(url) = resolve_auth_api_url(&dotenv_path) {
         println!("cargo:rustc-env=FUTUREBOARD_AUTH_API_URL={url}");
     }
-    if let Some(key) = resolve_tone3000_api_key(&dotenv_path) {
-        println!("cargo:rustc-env=FUTUREBOARD_TONE3000_API_KEY={key}");
+    // Cargo sets PROFILE to "debug" for the dev and test profiles and to
+    // "release" for release and every profile built on it.
+    let developer_build = std::env::var("PROFILE").is_ok_and(|profile| profile == "debug");
+    if developer_build {
+        if let Some(key) = resolve_tone3000_api_key(&dotenv_path) {
+            println!("cargo:rustc-env=FUTUREBOARD_TONE3000_API_KEY={key}");
+        }
     }
 }
 

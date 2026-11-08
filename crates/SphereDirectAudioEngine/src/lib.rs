@@ -45,11 +45,15 @@ pub mod native;
 mod parallel;
 pub mod plugin_backend;
 pub mod plugin_bridge;
+#[cfg(test)]
+mod realtime_alloc_tests;
 pub mod recording;
 pub mod render_capture;
 mod runtime;
 mod streaming_source;
 pub mod tempo_map;
+#[cfg(test)]
+mod test_alloc;
 pub mod time_signature_map;
 pub mod transport;
 pub mod types;

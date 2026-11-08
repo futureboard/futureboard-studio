@@ -12,8 +12,11 @@
 // Threading contract, matching `BuiltinHostProcessor`:
 //   * open / close / state / parameter enumeration: control thread (IPC).
 //   * render / parameter values / MIDI: the single audio producer thread.
-// The Rust wrapper serializes control calls against render with one mutex, the
-// same way the VST3 voice mutex serializes `setState` against `process`.
+// The Rust wrapper serializes reset / latency against render with one mutex.
+// State save/restore (ClassInfo) and the Cocoa editor deliberately do not take
+// it: Audio Units expect those property calls from a non-render thread while
+// rendering, and one producer thread serves every plug-in in the host, so a
+// slow serialization under that lock would stall all of them.
 
 #include <stddef.h>
 
@@ -126,16 +129,24 @@ SPHERE_AU_HOST_API int sphere_au_parameter_info(
     SphereAuParameterInfo* out_info);
 
 /// Opaque state: the unit's `kAudioUnitProperty_ClassInfo` property list
-/// serialized as a binary plist. Copies at most `capacity` bytes into `out` and
-/// returns the full byte length, so a zero-capacity call sizes the buffer.
-/// Returns 0 when the unit has no state. Control thread.
-SPHERE_AU_HOST_API size_t sphere_au_get_state(
+/// serialized once as a binary plist into a new buffer, so the bytes returned
+/// are exactly one snapshot (never a size from one serialization and bytes
+/// from another). `*out_len` receives the length. Returns null when the unit
+/// has no state or the buffer cannot be allocated; release a non-null result
+/// with `sphere_au_free_state`. Control thread. Like every AU host, this runs
+/// concurrently with render — ClassInfo is a non-render-thread property — so
+/// the caller must not hold the render lock across it.
+SPHERE_AU_HOST_API unsigned char* sphere_au_copy_state(
     const SphereAuInstance* instance,
-    unsigned char* out,
-    size_t capacity);
+    size_t* out_len);
 
-/// Restore bytes produced by `sphere_au_get_state`. Returns non-zero on
-/// success. Control thread, serialized against render by the caller.
+/// Release a buffer returned by `sphere_au_copy_state`.
+SPHERE_AU_HOST_API void sphere_au_free_state(unsigned char* data);
+
+/// Restore bytes produced by `sphere_au_copy_state`. Returns non-zero on
+/// success. Control thread; like the save, it runs concurrently with render
+/// (a ClassInfo restore is a non-render-thread property set), so a slow
+/// restore stalls only this command, never the host's block producer.
 SPHERE_AU_HOST_API int sphere_au_set_state(
     SphereAuInstance* instance,
     const unsigned char* data,

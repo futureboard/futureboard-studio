@@ -451,7 +451,9 @@ export interface MidiMap {
 }
 
 export interface RemoteSettings {
-  osc: { enabled: boolean; port: number; feedback: boolean }
+  /** `network`/`allow`: OSC on the network, for the listed controllers only
+   * (set in remote.json; the page keeps them as they are). */
+  osc: { enabled: boolean; port: number; feedback: boolean; network: boolean; allow: string[] }
   midi: { inputs: string[]; outputs: string[]; feedback: boolean; maps: MidiMap[] }
 }
 

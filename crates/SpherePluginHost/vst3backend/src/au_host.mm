@@ -29,6 +29,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -881,12 +882,14 @@ SPHERE_AU_HOST_API int sphere_au_parameter_info(
   return 1;
 }
 
-SPHERE_AU_HOST_API size_t sphere_au_get_state(
+SPHERE_AU_HOST_API unsigned char* sphere_au_copy_state(
     const SphereAuInstance* instance,
-    unsigned char* out,
-    size_t capacity) {
-  if (instance == nullptr || instance->unit == nullptr) {
-    return 0;
+    size_t* out_len) {
+  if (out_len != nullptr) {
+    *out_len = 0;
+  }
+  if (instance == nullptr || instance->unit == nullptr || out_len == nullptr) {
+    return nullptr;
   }
   CFPropertyListRef plist = nullptr;
   UInt32 size = sizeof(plist);
@@ -894,20 +897,29 @@ SPHERE_AU_HOST_API size_t sphere_au_get_state(
           instance->unit, kAudioUnitProperty_ClassInfo, kAudioUnitScope_Global, 0, &plist, &size) !=
           noErr ||
       plist == nullptr) {
-    return 0;
+    return nullptr;
   }
   CFDataRef data =
       CFPropertyListCreateData(kCFAllocatorDefault, plist, kCFPropertyListBinaryFormat_v1_0, 0, nullptr);
   CFRelease(plist);
   if (data == nullptr) {
-    return 0;
+    return nullptr;
   }
+  // One serialization, one copy: the length and the bytes come from the same
+  // CFData, so a unit whose state changes between two property reads can no
+  // longer produce a silently truncated blob.
   const size_t len = static_cast<size_t>(CFDataGetLength(data));
-  if (out != nullptr && capacity > 0) {
-    CFDataGetBytes(data, CFRangeMake(0, static_cast<CFIndex>(std::min(len, capacity))), out);
+  unsigned char* bytes = len > 0 ? new (std::nothrow) unsigned char[len] : nullptr;
+  if (bytes != nullptr) {
+    CFDataGetBytes(data, CFRangeMake(0, static_cast<CFIndex>(len)), bytes);
+    *out_len = len;
   }
   CFRelease(data);
-  return len;
+  return bytes;
+}
+
+SPHERE_AU_HOST_API void sphere_au_free_state(unsigned char* data) {
+  delete[] data;
 }
 
 SPHERE_AU_HOST_API int sphere_au_set_state(

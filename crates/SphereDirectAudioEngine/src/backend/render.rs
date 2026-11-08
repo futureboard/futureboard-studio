@@ -471,6 +471,43 @@ impl LocalAudioState {
         self.reset_metronome_schedule(position_sample, sample_rate);
     }
 
+    /// Realtime form of [`Self::set_tempo_map`]: swaps `tempo_map` in, and
+    /// hands the previous map back through it for the caller to retire off
+    /// the audio thread. No allocation or free.
+    pub fn swap_tempo_map(
+        &mut self,
+        tempo_map: &mut crate::tempo_map::RuntimeTempoMapSnapshot,
+        position_sample: u64,
+        sample_rate: u32,
+    ) {
+        std::mem::swap(&mut self.tempo_map, tempo_map);
+        self.reset_metronome_schedule(position_sample, sample_rate);
+    }
+
+    /// After a graph swap: make the metronome use `graph_map`. `spare` is the
+    /// copy of it the control thread packed with the graph
+    /// ([`RuntimeProject::metronome_tempo_map`]); when it is used it receives
+    /// the metronome's previous map, which the caller retires. Only a graph
+    /// that arrived without a copy is cloned here.
+    pub fn follow_graph_tempo_map(
+        &mut self,
+        graph_map: &crate::tempo_map::RuntimeTempoMapSnapshot,
+        spare: &mut Option<crate::tempo_map::RuntimeTempoMapSnapshot>,
+        position_sample: u64,
+        sample_rate: u32,
+    ) {
+        if self.tempo_map.segments == graph_map.segments {
+            self.reset_metronome_schedule(position_sample, sample_rate);
+            return;
+        }
+        match spare {
+            Some(map) if map.segments == graph_map.segments => {
+                self.swap_tempo_map(map, position_sample, sample_rate);
+            }
+            _ => self.set_tempo_map(graph_map.clone(), position_sample, sample_rate),
+        }
+    }
+
     pub fn set_time_signature(
         &mut self,
         numerator: u32,
@@ -713,7 +750,7 @@ pub fn drain_commands(
             shared.live_events.fetch_add(1, Ordering::Relaxed);
         }
         match cmd {
-            EngineCommand::LoadProject(next_runtime) => {
+            EngineCommand::LoadProject(mut next_runtime) => {
                 if callback_debug_enabled() {
                     eprintln!(
                         "[DAUx] LoadProject: {} tracks, {} clips (sr={})",
@@ -725,9 +762,12 @@ pub fn drain_commands(
                 // Swap in the new graph and retire the old one to the
                 // background dropper — never run its destructor on this
                 // realtime thread (frees buffers / munmaps sources / destroys
-                // VST3 handles). See `crate::graveyard`.
+                // VST3 handles). See `crate::graveyard`. Swapped through the
+                // command's box rather than moved out of it: moving out frees
+                // the box here.
                 runtime.all_notes_off("project_load");
-                let old = std::mem::replace(runtime, *next_runtime);
+                std::mem::swap(runtime, &mut *next_runtime);
+                let mut old = next_runtime;
                 runtime.sample_rate = output_sample_rate;
                 // The plugin-bridge sinks (Stage 3b) are carried across the
                 // reload by `EngineInner::load_project`, which copies its
@@ -735,7 +775,14 @@ pub fn drain_commands(
                 // per-insert handles there. Cloning the map and re-resolving
                 // every insert used to happen right here, on the audio thread,
                 // in the same callback as Play.
-                runtime.bridge_editor_active = old.bridge_editor_active.clone();
+                //
+                // The open-editor set moves across by swap: cloning it allocated
+                // a set and a String per open editor here. The new graph's
+                // (empty) set leaves with `old` through the graveyard.
+                std::mem::swap(
+                    &mut runtime.bridge_editor_active,
+                    &mut old.bridge_editor_active,
+                );
                 runtime.inherit_midi_programs_sent(&old);
                 // The panic the all_notes_off above pushed into the (preserved)
                 // sinks still needs flushing through the new graph.
@@ -746,7 +793,6 @@ pub fn drain_commands(
                 // bypass a lowered master on the first blocks after LoadProject.
                 runtime.smoothed_master_gain =
                     f32_load(shared.master_volume.load(Ordering::Relaxed));
-                crate::graveyard::retire(old);
                 // Transport/audio-graph separation: a graph swap must never
                 // change the user's transport state.  If the transport was
                 // Running when the swap arrived (e.g. an insert was added
@@ -759,15 +805,20 @@ pub fn drain_commands(
                 local.playing_local = was_playing;
                 let pos = shared.position_samples.load(Ordering::Relaxed);
                 runtime.reset_midi_playback(pos);
-                // Cloning the segment vector here allocates (and frees the old
-                // one) on the audio thread. A project sync almost never changes
-                // the tempo, so compare first and re-arm the schedule without
-                // touching the heap when it has not.
-                if local.tempo_map.segments == runtime.tempo_map.segments {
-                    local.reset_metronome_schedule(pos, output_sample_rate);
-                } else {
-                    local.set_tempo_map(runtime.tempo_map.clone(), pos, output_sample_rate);
-                }
+                // The metronome follows the new graph's tempo map through the
+                // copy `load_project` packed with it; the metronome's previous
+                // map leaves with `old`. No clone or free here.
+                std::mem::swap(
+                    &mut runtime.metronome_tempo_map,
+                    &mut old.metronome_tempo_map,
+                );
+                local.follow_graph_tempo_map(
+                    &runtime.tempo_map,
+                    &mut old.metronome_tempo_map,
+                    pos,
+                    output_sample_rate,
+                );
+                crate::graveyard::retire(old);
                 let old_state = crate::engine::AudioEngineState::from_u8(
                     shared.engine_state.load(Ordering::Relaxed),
                 );
@@ -945,11 +996,15 @@ pub fn drain_commands(
                 shared.position_samples.store(next_pos, Ordering::Relaxed);
                 local.set_tempo_map(runtime.tempo_map.clone(), next_pos, output_sample_rate);
             }
-            EngineCommand::SetTempoMap(map) => {
+            EngineCommand::SetTempoMap(mut change) => {
+                // Prepared on the control thread: swaps only. Everything
+                // replaced goes back into `change` and leaves through the
+                // graveyard.
                 let pos = shared.position_samples.load(Ordering::Relaxed);
-                let next_pos = runtime.apply_tempo_map(map, pos);
+                let next_pos = runtime.install_tempo_change(&mut change, pos);
                 shared.position_samples.store(next_pos, Ordering::Relaxed);
-                local.set_tempo_map(runtime.tempo_map.clone(), next_pos, output_sample_rate);
+                local.swap_tempo_map(&mut change.metronome_map, next_pos, output_sample_rate);
+                crate::graveyard::retire_tempo_change(change);
             }
             EngineCommand::SetTimeSignature(num, den) => {
                 let pos = shared.position_samples.load(Ordering::Relaxed);
@@ -1252,8 +1307,9 @@ pub fn drain_commands(
 
 // ── Core f32 stereo render ────────────────────────────────────────────────────
 
-/// Output-callback block of the last slow-block log (throttle: one watchdog
-/// log per ~200 callbacks so a sustained stall cannot flood stderr).
+/// Output-callback block of the last slow-block report (throttle: one
+/// watchdog report per ~200 callbacks so a sustained stall cannot flood the
+/// log the control thread writes).
 static SLOW_CALLBACK_LAST_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Fill interleaved f32 output data (stereo, `channels` wide).
@@ -1262,8 +1318,8 @@ static SLOW_CALLBACK_LAST_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic:
 /// Realtime-safe — no allocation, no locking.
 ///
 /// Wraps the render kernel with the callback-duration watchdog (audio-hang
-/// spec §12): publishes last/max duration to [`SharedState`] and emits a
-/// throttled warning when a block exceeds the realtime budget.
+/// spec §12): publishes last/max duration to [`SharedState`] and a throttled
+/// slow-block report when a block uses half its realtime budget or more.
 pub fn fill_output_f32(
     data: &mut [f32],
     channels: usize,
@@ -1300,25 +1356,17 @@ pub fn fill_output_f32(
         let last = SLOW_CALLBACK_LAST_LOG.load(Ordering::Relaxed);
         if cb.wrapping_sub(last) > 200 {
             SLOW_CALLBACK_LAST_LOG.store(cb, Ordering::Relaxed);
-            let state = crate::engine::AudioEngineState::from_u8(
-                shared.engine_state.load(Ordering::Relaxed),
-            );
-            // `error` means the block genuinely missed its deadline (the device
-            // starves); `warning` means it is over halfway there.
-            let severity = if deadline_us > 0 && elapsed_us >= deadline_us {
-                "error"
-            } else {
-                "warning"
-            };
-            let load_pct = if deadline_us > 0 {
-                (elapsed_us as u64 * 100 / deadline_us as u64) as u32
-            } else {
-                0
-            };
-            eprintln!(
-                "[AudioCallback] slow block severity={severity} duration_us={elapsed_us} deadline_us={deadline_us} load={load_pct}% state={} frames={frames}",
-                state.as_str()
-            );
+            // Published, not printed: formatting and writing stderr here added
+            // time to a block that was already late. The control thread logs
+            // it (`EngineInner::log_callback_diagnostics`).
+            shared.slow_block_report.publish(crate::engine::SlowBlock {
+                elapsed_us,
+                deadline_us,
+                frames: frames.min(u32::MAX as u64) as u32,
+                state: crate::engine::AudioEngineState::from_u8(
+                    shared.engine_state.load(Ordering::Relaxed),
+                ),
+            });
         }
     }
     frames

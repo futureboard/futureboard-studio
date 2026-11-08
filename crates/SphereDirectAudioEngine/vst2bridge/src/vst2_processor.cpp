@@ -288,7 +288,9 @@ intptr_t vst2_audio_master(AEffect *effect, int32_t opcode, int32_t index,
 
   case audioMasterIOChanged:
     // Latency and/or IO count changed. The host re-reads initialDelay via
-    // get_latency_samples on the control thread; nothing to do here.
+    // get_latency_samples on the control thread. A new IO count needs no
+    // reallocation: the channel pointer arrays cover kMaxPluginChannels with
+    // valid buffers, and process_planar checks the live counts every block.
     return 1;
 
   case audioMasterSizeWindow:
@@ -393,14 +395,19 @@ void SphereDauxVst2Processor::allocate_audio_scratch(int input_channels_needed,
 
   input_storage.assign(static_cast<size_t>(in_ch) * f, 0.f);
   output_storage.assign(static_cast<size_t>(out_ch) * f, 0.f);
+  spare_input_plane.assign(static_cast<size_t>(f), 0.f);
+  spare_output_plane.assign(static_cast<size_t>(f), 0.f);
+  // Every entry up to kMaxPluginChannels points at a real buffer: a plug-in
+  // reads exactly `numInputs` / `numOutputs` pointers, which can exceed the
+  // channels the bridge reads, and can change after open.
   for (int c = 0; c < in_ch; ++c)
     input_channels[c] = input_storage.data() + static_cast<size_t>(c) * f;
-  for (int c = in_ch; c < kMaxBridgeChannels; ++c)
-    input_channels[c] = nullptr;
+  for (int c = in_ch; c < kMaxPluginChannels; ++c)
+    input_channels[c] = spare_input_plane.data();
   for (int c = 0; c < out_ch; ++c)
     output_channels[c] = output_storage.data() + static_cast<size_t>(c) * f;
-  for (int c = out_ch; c < kMaxBridgeChannels; ++c)
-    output_channels[c] = nullptr;
+  for (int c = out_ch; c < kMaxPluginChannels; ++c)
+    output_channels[c] = spare_output_plane.data();
 
   allocated_input_channels = in_ch;
   allocated_output_channels = out_ch;
@@ -434,6 +441,20 @@ bool SphereDauxVst2Processor::setup(double sr) {
 
   dispatch(effOpen);
   opened = true;
+
+  // Plug-ins may settle their IO inside effOpen (a configurable multi-out
+  // sampler, an Ambisonics tool picking its order), so the counts read above
+  // are only provisional.
+  num_inputs = std::max(0, effect->numInputs);
+  num_outputs = std::max(0, effect->numOutputs);
+  if (num_inputs > kMaxPluginChannels || num_outputs > kMaxPluginChannels) {
+    std::ostringstream err;
+    err << "VST2 plug-in declares " << num_inputs << " inputs and "
+        << num_outputs << " outputs; Futureboard hosts at most "
+        << kMaxPluginChannels << " per direction";
+    vst2_set_last_error(err.str());
+    return false;
+  }
 
   dispatch(effSetSampleRate, 0, 0, nullptr, static_cast<float>(sample_rate));
   dispatch(effSetBlockSize, 0, kMaxProcessFrames);
@@ -688,6 +709,15 @@ bool SphereDauxVst2Processor::process_planar(
     return false;
   if (frames <= 0 || frames > allocated_frames)
     return false;
+  // The plug-in may change its IO at any time (audioMasterIOChanged); read the
+  // live counts. Past the pointer arrays' cap the block is not processed — the
+  // caller passes the signal through dry — instead of letting processReplacing
+  // read beyond them. No allocation here: the arrays already cover the cap.
+  const int live_inputs = effect->numInputs;
+  const int live_outputs = effect->numOutputs;
+  if (live_inputs < 0 || live_outputs < 0 ||
+      live_inputs > kMaxPluginChannels || live_outputs > kMaxPluginChannels)
+    return false;
 
   apply_pending_params();
   prepare_midi_events(events, event_count);
@@ -713,6 +743,11 @@ bool SphereDauxVst2Processor::process_planar(
       std::memset(dst, 0, sizeof(float) * static_cast<size_t>(frames));
     }
   }
+  // Inputs past the real planes share the spare plane; keep it silent even if
+  // a plug-in wrote into its inputs last block.
+  if (live_inputs > allocated_input_channels && !spare_input_plane.empty())
+    std::memset(spare_input_plane.data(), 0,
+                sizeof(float) * static_cast<size_t>(frames));
 
   // processReplacing overwrites its outputs, but a plug-in that leaves a
   // channel untouched would otherwise expose the previous block, so clear

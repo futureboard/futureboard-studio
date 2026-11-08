@@ -33,12 +33,11 @@ pub struct MixerTreeDirty {
     pub filter: bool,
     pub expansion: bool,
     pub selection: bool,
-    pub hover: bool,
 }
 
 impl MixerTreeDirty {
     pub fn any(&self) -> bool {
-        self.routing || self.filter || self.expansion || self.selection || self.hover
+        self.routing || self.filter || self.expansion || self.selection
     }
 
     pub fn needs_visible_rows(&self) -> bool {
@@ -66,7 +65,6 @@ pub struct MixerTreeRenderCache {
     pub filter: String,
     pub show_only_selected_group: bool,
     pub selected_channel_id: Option<String>,
-    pub hovered_row: Option<usize>,
     pub model_rebuild_count: u64,
     pub visible_rows_rebuild_count: u64,
 }
@@ -86,19 +84,6 @@ impl MixerTreeRenderCache {
 
     pub fn mark_selection_dirty(&mut self) {
         self.dirty.selection = true;
-    }
-
-    pub fn set_hovered_row(&mut self, row: Option<usize>) -> bool {
-        if self.hovered_row == row {
-            return false;
-        }
-        self.hovered_row = row;
-        self.dirty.hover = true;
-        true
-    }
-
-    pub fn clear_hover_dirty(&mut self) {
-        self.dirty.hover = false;
     }
 
     pub fn sync_routing_key(

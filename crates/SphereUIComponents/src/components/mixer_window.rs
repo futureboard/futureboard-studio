@@ -14,8 +14,8 @@ use gpui::{
 
 use crate::components::mixer_meter_layer::{MixerMeterOverlay, SharedMeterLayout};
 use crate::components::mixer_panel::{
-    clamp_mixer_section_height_px, mixer_panel, mixer_pinned_width, MixerCallbacks, MixerSplit,
-    MixerSplitAction, MixerSplitTarget, MixerView, VstiOutputMeterState,
+    clamp_mixer_section_height_px, mixer_panel, MixerCallbacks, MixerSplit, MixerSplitAction,
+    MixerSplitTarget, MixerView, VstiOutputMeterState,
 };
 use crate::components::mixer_tree_sidebar::MIXER_TREE_COLLAPSED_RAIL_WIDTH;
 use crate::components::mixer_tree_sidebar_view::MixerTreeSidebar;
@@ -106,6 +106,10 @@ pub struct MixerSnapshot {
     pub tree_sidebar_enabled: bool,
     pub tree_sidebar_collapsed: bool,
     pub tree_sidebar_width_px: f32,
+    /// The project's spatial format, which picks pan knobs or room placement
+    /// on each strip. Carried here because the window's callbacks are built
+    /// once, when it opens.
+    pub spatial_format: solfege_spatialaudio::SpatialFormat,
     /// A context menu opened *from this window*: its position in this window's
     /// coordinates, and the entries to draw.
     ///
@@ -254,7 +258,8 @@ impl Render for MixerWindowBody {
         } else {
             0.0
         };
-        let mixer_viewport_width = (viewport_width - tree_width - mixer_pinned_width()).max(100.0);
+        let mixer_viewport_width =
+            crate::components::mixer_panel::mixer_strip_viewport_width(viewport_width, tree_width);
         let mixer_viewport_height = (viewport_height - mixer_window_chrome_height()).max(0.0);
         let mixer_split = MixerSplit {
             insert_px: clamp_mixer_section_height_px(snapshot.mixer_insert_section_px),
@@ -264,6 +269,8 @@ impl Render for MixerWindowBody {
             on_action: self.on_mixer_split.clone(),
         };
         let i18n = I18n::from_app(cx);
+        let mut callbacks = self.callbacks.clone();
+        callbacks.spatial_format = snapshot.spatial_format;
 
         div()
             .flex()
@@ -277,7 +284,7 @@ impl Render for MixerWindowBody {
                 &snapshot.monitor,
                 snapshot.selected_track_id.as_deref(),
                 &snapshot.selected_track_ids,
-                self.callbacks.clone(),
+                callbacks,
                 &snapshot.collapsed_vsti_output_groups,
                 &snapshot.hidden_mixer_channels,
                 &snapshot.vsti_output_meters,

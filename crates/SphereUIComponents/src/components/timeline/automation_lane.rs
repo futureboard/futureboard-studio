@@ -72,11 +72,14 @@ pub enum AutomationLaneAction {
 }
 
 /// Sub-lane mouse-down payload:
-/// `(track_id, lane_id, beat, value_norm, additive, alt, click_count)`.
-/// `alt` enables the curve-tension edit; `click_count` distinguishes a double
-/// click (Alt+double-click resets a segment to linear).
+/// `(track_id, lane_id, beat, value_norm, additive, alt, click_count, hit_beat)`.
+/// `beat` is grid-snapped — where a new point goes; `hit_beat` is the
+/// unsnapped beat under the cursor — what point and segment hit-testing use,
+/// so a point drawn between grid lines can still be grabbed. `alt` enables
+/// the curve-tension edit; `click_count` distinguishes a double click
+/// (Alt+double-click resets a segment to linear).
 pub type AutomationDownCallback = std::sync::Arc<
-    dyn Fn(&(String, String, f32, f32, bool, bool, u32), &mut gpui::Window, &mut gpui::App)
+    dyn Fn(&(String, String, f32, f32, bool, bool, u32, f32), &mut gpui::Window, &mut gpui::App)
         + 'static,
 >;
 
@@ -99,7 +102,8 @@ pub type AutomationLaneActionCallback = std::sync::Arc<
 
 /// Sub-lane hover payload: `(track_id, lane_id, beat, value_norm)`. Fired on
 /// mouse-move over a lane so the editor can resolve the hovered point/segment;
-/// `beat` is snapped exactly like the mouse-down path so hover and click agree.
+/// `beat` is unsnapped, the same beat the mouse-down path hit-tests with, so
+/// hover and click agree on what is under the cursor.
 pub type AutomationHoverCallback = std::sync::Arc<
     dyn Fn(&(String, String, f32, f32), &mut gpui::Window, &mut gpui::App) + 'static,
 >;
@@ -580,6 +584,7 @@ pub fn automation_lane(
                             additive,
                             alt,
                             click_count,
+                            raw_beat.max(0.0),
                         ),
                         window,
                         cx,
@@ -623,8 +628,10 @@ pub fn automation_lane(
         }
 
         // Hover tracking: resolve the point/segment under the cursor on move, and
-        // clear it when the cursor leaves the lane. Same snapped beat as the click
-        // path so the hovered target matches what a click would grab.
+        // clear it when the cursor leaves the lane. Unsnapped, the same beat the
+        // click path hit-tests with, so the hovered target matches what a click
+        // would grab — snapping the probe moved it off any point between grid
+        // lines.
         if let Some(hover_cb) = on_automation_hover.clone() {
             let state_for = std::rc::Rc::clone(gesture);
             let tid = track_id.clone();
@@ -638,9 +645,7 @@ pub fn automation_lane(
                 let wx: f32 = event.position.x.into();
                 let wy: f32 = event.position.y.into();
                 let lane_x = state_for.lane_x_from_window_x(wx);
-                let raw_beat = state_for.x_to_beats(lane_x);
-                let snapped_sec = state_for.snap_time(raw_beat * state_for.seconds_per_beat());
-                let beat = (snapped_sec / state_for.seconds_per_beat()).max(0.0);
+                let beat = state_for.x_to_beats(lane_x).max(0.0);
                 let content_y = state_for.content_y_from_window_y(wy);
                 let local_y = content_y - lane_y_abs;
                 let value = automation_y_to_value(local_y, lane_height);

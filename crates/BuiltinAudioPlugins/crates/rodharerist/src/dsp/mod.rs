@@ -2302,6 +2302,81 @@ pub struct Dsp {
     /// Nothing has played since construction or the last reset: a power
     /// edit now is a state being applied and lands without a fade.
     fresh: bool,
+    /// The input, delayed by the latency the rig reports: what Power off and
+    /// the dry side of the Power fade play, so switching the rig off keeps
+    /// the timing the host compensates for instead of jumping early.
+    bypass: BypassDelay,
+    /// [`Self::latency_samples`] as of the last edit or block start — the
+    /// delay `bypass` applies.
+    bypass_delay: usize,
+    /// Frames [`StereoEffect::process_stereo`] has taken, Power off included.
+    frame: u64,
+    /// The frame each [`Held`] engine last ran on. One that sat a frame out
+    /// is emptied before it runs again.
+    held_ran: [u64; Held::COUNT],
+}
+
+/// Engines whose state outlasts the input by far more than a few samples. One
+/// that sat out a frame — switched off, removed from the path, parked on an
+/// Off row, Power off, the cabinet on its modeled voicing, the Tone slot on
+/// another engine — is cleared when it next runs, so it never resumes a tail
+/// of audio from before it stopped.
+#[derive(Debug, Clone, Copy)]
+enum Held {
+    Delay,
+    Delay2,
+    Reverb,
+    Ir,
+    Nam,
+}
+
+impl Held {
+    const COUNT: usize = 5;
+}
+
+/// Longest delay [`BypassDelay`] can apply, plus one. A power of two; it
+/// covers the largest latency the rig reports — a full NAM chunk with the
+/// widest rate adapter, plus the IR partition.
+const BYPASS_LINE: usize = 512;
+
+const _: () = assert!(BYPASS_LINE.is_power_of_two());
+const _: () = assert!(nam::NAM_BLOCK + nam::MAX_ADAPTER_LATENCY + ir::PARTITION < BYPASS_LINE);
+
+/// A fixed stereo delay line for the bypassed signal. Sized once; the audio
+/// path only writes and reads one slot each per frame.
+#[derive(Debug, Clone)]
+struct BypassDelay {
+    left: Vec<f32>,
+    right: Vec<f32>,
+    pos: usize,
+}
+
+impl BypassDelay {
+    fn new() -> Self {
+        Self {
+            left: vec![0.0; BYPASS_LINE],
+            right: vec![0.0; BYPASS_LINE],
+            pos: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.left.fill(0.0);
+        self.right.fill(0.0);
+        self.pos = 0;
+    }
+
+    /// Writes one frame and returns the one `delay` frames older (`delay`
+    /// below [`BYPASS_LINE`]; 0 returns the frame just written).
+    #[inline]
+    fn push(&mut self, left: f32, right: f32, delay: usize) -> (f32, f32) {
+        let mask = BYPASS_LINE - 1;
+        self.left[self.pos] = left;
+        self.right[self.pos] = right;
+        let read = (self.pos + BYPASS_LINE - (delay & mask)) & mask;
+        self.pos = (self.pos + 1) & mask;
+        (self.left[read], self.right[read])
+    }
 }
 
 /// Power's 0–1 crossfade. It walks linearly toward its end and is heard
@@ -2468,6 +2543,10 @@ impl Dsp {
             tuner: Tuner::new(sr),
             power: PowerFade::new(true, sr),
             fresh: true,
+            bypass: BypassDelay::new(),
+            bypass_delay: 0,
+            frame: 0,
+            held_ran: [0; Held::COUNT],
         };
         dsp.apply_params();
         dsp.power.set(dsp.params.power);
@@ -2529,10 +2608,29 @@ impl Dsp {
     }
 
     /// Replace the whole parameter set (clamps to legal ranges) and recompute
-    /// — a state being loaded, so Power lands as saved, without a fade.
+    /// — a state being loaded, so Power and the cabinet engine land as
+    /// saved, without a fade.
     pub fn set_params(&mut self, params: Params) {
         self.update_params(params);
+        self.settle_fades();
+    }
+
+    /// Puts Power and the cabinet's modeled/IR crossfade where the params
+    /// point.
+    fn settle_fades(&mut self) {
         self.power.settle();
+        self.settle_cab_engine();
+    }
+
+    /// Puts the cabinet's modeled/IR crossfade on the engine the params
+    /// name. A restored IR cabinet must start on the IR — at the latency
+    /// already reported — rather than fade in from the modeled voicing.
+    fn settle_cab_engine(&mut self) {
+        self.cab_ir_blend = if self.params.cab_model == CabModel::Ir {
+            1.0
+        } else {
+            0.0
+        };
     }
 
     /// Takes `params` (clamped to legal ranges) and reconfigures only the
@@ -2642,15 +2740,10 @@ impl Dsp {
         self.apply_power();
     }
 
-    /// Points the Power fade at `params.power`. Waking from a settled off
-    /// empties the delay and reverb lines, so what was playing when it went
-    /// off does not come back as a tail.
+    /// Points the Power fade at `params.power`. Waking from off empties the
+    /// delay, reverb, IR and NAM lines as they next run (see [`Held`]), so
+    /// what was playing when it went off does not come back as a tail.
     fn apply_power(&mut self) {
-        if self.params.power && self.power.is_off() && !self.fresh {
-            self.delay.reset();
-            self.delay_b.reset();
-            self.reverb.reset();
-        }
         self.power.set(self.params.power);
         if self.fresh {
             self.power.settle();
@@ -2977,11 +3070,24 @@ impl Dsp {
                 b.delay_fb_r,
             );
         }
+        if self.fresh {
+            // Nothing has played: this is a state being applied, and the
+            // cabinet engine it names is the one the first sample hears.
+            self.settle_cab_engine();
+        }
+        self.refresh_bypass_delay();
     }
 
     /// Replace the Helix path order (control thread).
     pub fn set_path_order(&mut self, order: [Option<StageKind>; PATH_SLOTS]) {
         self.params.stage_order = sanitize_stage_order(order);
+        self.refresh_bypass_delay();
+    }
+
+    /// Re-reads the delay the bypassed signal takes. After every edit and at
+    /// each block start — the two places the reported latency can move.
+    fn refresh_bypass_delay(&mut self) {
+        self.bypass_delay = self.latency_samples().min(BYPASS_LINE - 1);
     }
 
     /// Audio thread: call once per audio block, before the block's per-sample
@@ -3003,6 +3109,8 @@ impl Dsp {
     pub fn begin_block_with_frames(&mut self, frames: usize) {
         self.amp_stage.begin_block(frames);
         self.ir.begin_block();
+        // An adopted capture or a new chunk size moves the latency.
+        self.refresh_bypass_delay();
     }
 
     /// Control thread: parse and build a `.nam` capture, then queue it for the
@@ -3101,17 +3209,27 @@ impl Dsp {
 
     /// Total latency this instance reports to the host, in samples: the NAM
     /// engine's inference block plus the IR convolution's partition, counting
-    /// each only while the stage that carries it is actually in the path.
+    /// each only while the stage that carries it actually runs — in the path,
+    /// switched on, and not parked on an Off row.
+    ///
+    /// Power does not change it. Power off plays the input delayed by this
+    /// same amount, so the rig's timing stays what the host compensates
+    /// whether it is on, off or fading, and toggling it never moves the
+    /// project's delay compensation.
     pub fn latency_samples(&self) -> usize {
         let p = &self.params;
-        let in_path = |kind: StageKind| p.stage_order.iter().flatten().any(|s| *s == kind);
-        let nam =
-            if p.amp_on && in_path(StageKind::Amp) && p.tone_engine == ToneEngineKind::NamCapture {
-                self.nam_latency_samples()
-            } else {
-                0
-            };
-        let ir = if p.cab_on && in_path(StageKind::Cab) && p.cab_model == CabModel::Ir {
+        let runs = |kind: StageKind| {
+            let row = row_of(&p.stage_row, kind);
+            p.stage_order.iter().flatten().any(|s| *s == kind)
+                && (row == 0 || p.row_send[row - 1] != RowSend::Off)
+        };
+        let nam = if p.amp_on && runs(StageKind::Amp) && p.tone_engine == ToneEngineKind::NamCapture
+        {
+            self.nam_latency_samples()
+        } else {
+            0
+        };
+        let ir = if p.cab_on && runs(StageKind::Cab) && p.cab_model == CabModel::Ir {
             self.ir.latency_samples()
         } else {
             0
@@ -3545,6 +3663,7 @@ impl StereoEffect for Dsp {
         self.in_gain.snap();
         self.out_gain.snap();
         self.power.settle();
+        self.bypass.clear();
         self.fresh = true;
     }
 
@@ -3587,8 +3706,14 @@ impl StereoEffect for Dsp {
         if self.params.tuner_on {
             self.tuner.push((left + right) * 0.5 * self.in_gain.value());
         }
+        // Counted with Power off too, so every held engine sees the gap.
+        self.frame = self.frame.wrapping_add(1);
+        // Off is the input at the rig's reported latency: the host keeps
+        // compensating that delay, and the fade blends two signals that line
+        // up instead of combing.
+        let (dry_l, dry_r) = self.bypass.push(left, right, self.bypass_delay);
         if self.power.is_off() {
-            return (left, right);
+            return (dry_l, dry_r);
         }
         self.fresh = false;
         let on = self.power.next();
@@ -3599,7 +3724,7 @@ impl StereoEffect for Dsp {
         // woken empty would otherwise take the input starting mid-wave and
         // play that step back a repeat later.
         let (l, r) = self.run(left * on, right * on);
-        (left + (l - left) * on, right + (r - right) * on)
+        (dry_l + (l - dry_l) * on, dry_r + (r - dry_r) * on)
     }
 }
 
@@ -3895,17 +4020,41 @@ impl Dsp {
         (l, r)
     }
 
+    /// Whether `held` sat out the frame before this one — and from now on,
+    /// that it ran on this one. Call it on every frame the engine runs.
+    #[inline]
+    fn resumes(&mut self, held: Held) -> bool {
+        let last = std::mem::replace(&mut self.held_ran[held as usize], self.frame);
+        last.wrapping_add(1) != self.frame && last != self.frame
+    }
+
     /// One frame through `stage`, or `None` while it is switched off.
     #[inline]
     fn run_stage(&mut self, stage: StageKind, l: f32, r: f32) -> Option<(f32, f32)> {
         Some(match stage {
             StageKind::Gate if self.params.gate_on => self.gate.process(l, r),
             StageKind::Drive if self.params.drive_on => self.drive.process(l, r),
-            StageKind::Amp if self.params.amp_on => self.amp_stage.process(l, r),
+            StageKind::Amp if self.params.amp_on => {
+                if self.params.tone_engine == ToneEngineKind::NamCapture && self.resumes(Held::Nam)
+                {
+                    self.amp_stage.reset_nam();
+                }
+                self.amp_stage.process(l, r)
+            }
             StageKind::Mod if self.params.mod_on => self.mod_stage.process(l, r),
             StageKind::Wah if self.params.wah_on => self.wah.process(l, r),
-            StageKind::Delay if self.params.delay_on => self.delay.process(l, r),
-            StageKind::Reverb if self.params.reverb_on => self.reverb.process(l, r),
+            StageKind::Delay if self.params.delay_on => {
+                if self.resumes(Held::Delay) {
+                    self.delay.reset();
+                }
+                self.delay.process(l, r)
+            }
+            StageKind::Reverb if self.params.reverb_on => {
+                if self.resumes(Held::Reverb) {
+                    self.reverb.reset();
+                }
+                self.reverb.process(l, r)
+            }
             StageKind::Cab if self.params.cab_on => {
                 // Two cabinet engines behind one slot: the modeled
                 // voicings and the IR convolution. Only the selected one
@@ -3921,6 +4070,9 @@ impl Dsp {
                     (self.cab_ir_blend - self.cab_ir_step).max(target)
                 };
                 let blend = self.cab_ir_blend;
+                if blend > 0.0 && self.resumes(Held::Ir) {
+                    self.ir.reset();
+                }
                 if blend <= 0.0 {
                     self.cab.process(l, r)
                 } else if blend >= 1.0 {
@@ -3940,7 +4092,12 @@ impl Dsp {
             StageKind::Eq if self.params.eq_on => self.eq_stage.process(l, r),
             StageKind::Drive2 if self.params.stage_b.drive_on => self.drive_b.process(l, r),
             StageKind::Mod2 if self.params.stage_b.mod_on => self.mod_b.process(l, r),
-            StageKind::Delay2 if self.params.stage_b.delay_on => self.delay_b.process(l, r),
+            StageKind::Delay2 if self.params.stage_b.delay_on => {
+                if self.resumes(Held::Delay2) {
+                    self.delay_b.reset();
+                }
+                self.delay_b.process(l, r)
+            }
             StageKind::Eq2 if self.params.stage_b.eq_on => self.eq_b.process(l, r),
             StageKind::Comp2 if self.params.stage_b.comp_on => self.comp_b.process(l, r),
             _ => return None,
@@ -5927,6 +6084,297 @@ mod tests {
         let a = render(&mut edited, 9_600);
         let b = render(&mut full, 9_600);
         assert_eq!(a, b);
+    }
+
+    /// Feed `input` (both channels) and return the left output, starting a
+    /// block every 64 frames the way the host does.
+    fn feed(dsp: &mut Dsp, input: &[f32]) -> Vec<f32> {
+        input
+            .iter()
+            .enumerate()
+            .map(|(n, &x)| {
+                if n % 64 == 0 {
+                    dsp.begin_block();
+                }
+                dsp.process_stereo(x, x).0
+            })
+            .collect()
+    }
+
+    fn impulse(n: usize) -> Vec<f32> {
+        let mut x = vec![0.0; n];
+        x[0] = 1.0;
+        x
+    }
+
+    /// A rig with a NAM amp and an IR cab in the path, both loaded.
+    fn nam_ir_rig(mut params: Params) -> Dsp {
+        let mut dsp = Dsp::new(48_000.0);
+        params.stage_order = [None; PATH_SLOTS];
+        params.stage_order[0] = Some(StageKind::Amp);
+        params.stage_order[1] = Some(StageKind::Cab);
+        params.tone_engine = ToneEngineKind::NamCapture;
+        params.cab_model = CabModel::Ir;
+        dsp.set_params(params);
+        dsp.load_nam_capture_json(TINY_WAVENET_48K, "Amp", false, false)
+            .expect("capture loads");
+        dsp.load_ir_wav(&test_ir_wav(512, 48_000), "Cab")
+            .expect("IR loads");
+        dsp.begin_block();
+        dsp
+    }
+
+    /// Issue #166: Power off plays the input at the latency the rig reports,
+    /// so the host's compensation stays right, and the report does not move.
+    #[test]
+    fn power_off_keeps_the_reported_latency_true() {
+        let mut p = default_params();
+        p.power = false;
+        let mut dsp = nam_ir_rig(p);
+        let latency = dsp.latency_samples();
+        assert_eq!(latency, NAM_BLOCK_SAMPLES + IR_PARTITION_SAMPLES);
+        let out = feed(&mut dsp, &impulse(latency + 64));
+        for (n, &y) in out.iter().enumerate() {
+            let expected = if n == latency { 1.0 } else { 0.0 };
+            assert_eq!(y, expected, "power-off output at {n}");
+        }
+        assert!(dsp.apply_ui_param("power", 1.0));
+        assert_eq!(dsp.latency_samples(), latency, "Power moved the latency");
+    }
+
+    /// Issue #166: the Power fade blends the rig with a dry signal at the same
+    /// delay. A sine whose half period is the IR partition would cancel
+    /// against an undelayed dry halfway through the fade (the ratio below
+    /// reaching -1). Aligned, the only dip left is the rig's own input fade
+    /// on waking, which bottoms out near 0.52.
+    #[test]
+    fn the_power_fade_does_not_comb() {
+        let mut dsp = Dsp::new(48_000.0);
+        path_of(&mut dsp, &[StageKind::Cab]);
+        // No file: the IR slot is the input delayed by its partition.
+        assert!(dsp.select_model("cab", "ir"));
+        let latency = dsp.latency_samples();
+        assert_eq!(latency, IR_PARTITION_SAMPLES);
+        let period = 2 * IR_PARTITION_SAMPLES;
+        let x = |n: usize| (n as f32 * std::f32::consts::TAU / period as f32).sin() * 0.5;
+        let mut n = 0;
+        for edit in [None, Some(0.0), None, Some(1.0), None] {
+            if let Some(power) = edit {
+                assert!(dsp.apply_ui_param("power", power));
+            }
+            for _ in 0..4_800 {
+                if n % 64 == 0 {
+                    dsp.begin_block();
+                }
+                let y = dsp.process_stereo(x(n), x(n)).0;
+                if n >= latency {
+                    let reference = x(n - latency);
+                    if reference.abs() > 0.2 {
+                        let ratio = y / reference;
+                        assert!(
+                            ratio > 0.45,
+                            "the power fade combed at {n}: {y} against {reference}"
+                        );
+                    }
+                }
+                n += 1;
+            }
+        }
+    }
+
+    /// Issue #166: an Amp or Cab parked on an Off row does not run, so its
+    /// latency is not reported either.
+    #[test]
+    fn a_stage_on_an_off_row_reports_no_latency() {
+        let mut p = default_params();
+        p.row_send[0] = RowSend::Off;
+        p.stage_row[StageKind::Cab as usize] = 1;
+        let dsp = nam_ir_rig(p.clone());
+        assert_eq!(dsp.latency_samples(), NAM_BLOCK_SAMPLES);
+
+        p.stage_row[StageKind::Amp as usize] = 1;
+        let mut dsp = nam_ir_rig(p);
+        assert_eq!(dsp.latency_samples(), 0);
+        let out = feed(&mut dsp, &impulse(512));
+        assert_eq!(out[0], 1.0, "the parked rig is a straight wire");
+        assert!(out[1..].iter().all(|&y| y == 0.0));
+    }
+
+    /// Issue #156: a state restored with the IR cabinet starts on the IR —
+    /// nothing before the reported latency, no fade from the modeled cab.
+    #[test]
+    fn a_restored_ir_cabinet_starts_on_the_ir() {
+        let mut dsp = Dsp::new(48_000.0);
+        let mut p = default_params();
+        p.stage_order = [None; PATH_SLOTS];
+        p.stage_order[0] = Some(StageKind::Cab);
+        p.cab_model = CabModel::Ir;
+        dsp.set_params(p);
+        dsp.load_ir_wav(&test_ir_wav(512, 48_000), "Cab")
+            .expect("IR loads");
+        dsp.begin_block();
+        let latency = dsp.latency_samples();
+        assert_eq!(latency, IR_PARTITION_SAMPLES);
+        let out = feed(&mut dsp, &impulse(latency * 4));
+        assert!(
+            out[..latency].iter().all(|&y| y == 0.0),
+            "audio before the reported latency: {:?}",
+            &out[..8]
+        );
+        assert!(out[latency..].iter().any(|&y| y.abs() > 1.0e-3));
+    }
+
+    /// What `dsp` plays from a silent input after `wake` re-enables a block,
+    /// against a twin that never heard the burst. The difference is a tail
+    /// that should have gone with the audio that made it.
+    fn stale_tail(
+        params: Params,
+        load: impl Fn(&mut Dsp),
+        sleep: &str,
+        sleep_value: f32,
+        wake_value: f32,
+    ) -> f32 {
+        let run = |burst: bool| {
+            let mut dsp = Dsp::new(48_000.0);
+            dsp.set_params(params.clone());
+            load(&mut dsp);
+            let input: Vec<f32> = (0..4_800)
+                .map(|n| {
+                    if burst {
+                        (n as f32 * 0.05).sin() * 0.5
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+            feed(&mut dsp, &input);
+            assert!(dsp.apply_ui_param(sleep, sleep_value));
+            feed(&mut dsp, &vec![0.0; 48_000]);
+            assert!(dsp.apply_ui_param(sleep, wake_value));
+            feed(&mut dsp, &vec![0.0; 48_000])
+        };
+        let heard = run(true);
+        let clean = run(false);
+        heard
+            .iter()
+            .zip(&clean)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max)
+    }
+
+    fn only(stage: StageKind) -> Params {
+        let mut p = default_params();
+        p.stage_order = [None; PATH_SLOTS];
+        p.stage_order[0] = Some(stage);
+        p
+    }
+
+    /// Issue #167: a Delay or Reverb switched back on starts empty, however
+    /// it was taken out of the path.
+    #[test]
+    fn a_time_block_switched_back_on_does_not_replay_its_old_tail() {
+        let mut delay = only(StageKind::Delay);
+        delay.delay_on = true;
+        delay.delay_model = DelayModel::Digital;
+        delay.delay_time_ms = 300.0;
+        delay.delay_fb = 80.0;
+        delay.delay_mix = 100.0;
+        let mut reverb = only(StageKind::Reverb);
+        reverb.reverb_on = true;
+        reverb.reverb_decay_s = 10.0;
+        reverb.reverb_mix = 100.0;
+        let mut delay2 = only(StageKind::Delay2);
+        delay2.stage_b.delay_on = true;
+        delay2.stage_b.delay_time_ms = 300.0;
+        delay2.stage_b.delay_fb = 80.0;
+        delay2.stage_b.delay_mix = 100.0;
+        let mut parked = delay.clone();
+        parked.stage_row[StageKind::Delay as usize] = 1;
+        parked.row_send[0] = RowSend::Serial;
+        let none = |_: &mut Dsp| {};
+        let delay_index = StageKind::Delay.index() as f32;
+        let cases = [
+            (
+                "delay off/on",
+                stale_tail(delay.clone(), none, "delay_on", 0.0, 1.0),
+            ),
+            (
+                "reverb off/on",
+                stale_tail(reverb, none, "reverb_on", 0.0, 1.0),
+            ),
+            (
+                "delay2 off/on",
+                stale_tail(delay2, none, "delay2_on", 0.0, 1.0),
+            ),
+            (
+                "delay removed and re-added",
+                stale_tail(delay, none, "path_slot_0", -1.0, delay_index),
+            ),
+            (
+                "row off and back",
+                stale_tail(parked, none, "row_send_1", 0.0, 1.0),
+            ),
+        ];
+        for (case, tail) in cases {
+            assert!(tail < 1.0e-6, "{case}: stale tail {tail}");
+        }
+    }
+
+    /// Issue #167: the IR cabinet and the NAM capture also start clean when
+    /// the slot comes back to them.
+    #[test]
+    fn the_ir_and_nam_engines_do_not_replay_a_frozen_chunk() {
+        let mut cab = only(StageKind::Cab);
+        cab.cab_model = CabModel::Ir;
+        let ir_tail = stale_tail(
+            cab,
+            |dsp| {
+                dsp.load_ir_wav(&test_ir_wav(512, 48_000), "Cab")
+                    .expect("IR loads");
+            },
+            "cab_model",
+            CabModel::ALL
+                .iter()
+                .position(|m| *m == CabModel::Modern4x12)
+                .unwrap() as f32,
+            CabModel::ALL
+                .iter()
+                .position(|m| *m == CabModel::Ir)
+                .unwrap() as f32,
+        );
+        assert!(ir_tail < 1.0e-6, "IR cab: stale tail {ir_tail}");
+
+        let mut amp = only(StageKind::Amp);
+        amp.tone_engine = ToneEngineKind::NamCapture;
+        let nam_tail = stale_tail(
+            amp,
+            |dsp| {
+                dsp.load_nam_capture_json(TINY_WAVENET_48K, "Amp", false, false)
+                    .expect("capture loads");
+            },
+            "tone_engine",
+            ToneEngineKind::Bypass.index() as f32,
+            ToneEngineKind::NamCapture.index() as f32,
+        );
+        assert!(nam_tail < 1.0e-6, "NAM: stale tail {nam_tail}");
+    }
+
+    /// The largest latency the rig can report fits the bypass line.
+    #[test]
+    fn the_bypass_line_covers_the_widest_latency() {
+        let mut dsp = Dsp::new(44_100.0);
+        let mut p = default_params();
+        p.stage_order = [None; PATH_SLOTS];
+        p.stage_order[0] = Some(StageKind::Amp);
+        p.stage_order[1] = Some(StageKind::Cab);
+        p.tone_engine = ToneEngineKind::NamCapture;
+        p.cab_model = CabModel::Ir;
+        dsp.set_params(p);
+        dsp.load_nam_capture_json(TINY_WAVENET_48K, "Amp", false, false)
+            .expect("capture adapts");
+        dsp.begin_block();
+        assert!(dsp.latency_samples() > NAM_BLOCK_SAMPLES + IR_PARTITION_SAMPLES);
+        assert!(dsp.latency_samples() < BYPASS_LINE);
     }
 }
 

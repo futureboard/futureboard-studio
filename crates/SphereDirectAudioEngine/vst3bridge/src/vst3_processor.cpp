@@ -2774,8 +2774,7 @@ sphere_daux_vst3_process_stereo_sample(SphereDauxVst3Processor *processor,
   processor->input_r = in_r;
   processor->output_l = 0.f;
   processor->output_r = 0.f;
-  processor->input_bus.numChannels = 2;
-  processor->input_bus.channelBuffers32 = processor->input_channels;
+  processor->bind_idle_main_input();
   processor->output_bus.numChannels = 2;
   processor->output_bus.channelBuffers32 = processor->output_channels;
   processor->output_bus.silenceFlags = 0;
@@ -2840,12 +2839,8 @@ extern "C" int sphere_daux_vst3_process_stereo_block_with_midi(
 
   processor->prepare_process_io(events, event_count);
 
-  float *input_channels[2] = {
-      const_cast<float *>(in_l),
-      const_cast<float *>(in_r),
-  };
-  processor->input_bus.numChannels = 2;
-  processor->input_bus.channelBuffers32 = input_channels;
+  // Shaped to the negotiated main-input layout, never a fixed two channels.
+  processor->bind_main_input(in_l, in_r, frames);
   processor->process_data.numSamples = frames;
   processor->process_data.numInputs =
       processor->audio_input_bus_count > 0 ? 1 : 0;
@@ -2973,7 +2968,7 @@ extern "C" int sphere_daux_vst3_process_stereo_block_with_midi(
   processor->process_data.numOutputs =
       processor->output_bus_count_for_process();
   processor->process_data.inputEvents = nullptr;
-  processor->input_bus.channelBuffers32 = processor->input_channels;
+  processor->bind_idle_main_input();
   processor->output_bus.channelBuffers32 = processor->output_channels;
   processor->process_data.inputs =
       processor->audio_input_bus_count > 0 ? &processor->input_bus : nullptr;
@@ -3003,12 +2998,8 @@ extern "C" int sphere_daux_vst3_process_main_output_block_with_midi(
 
   processor->prepare_process_io(events, event_count);
 
-  float *input_channels[2] = {
-      const_cast<float *>(in_l),
-      const_cast<float *>(in_r),
-  };
-  processor->input_bus.numChannels = 2;
-  processor->input_bus.channelBuffers32 = input_channels;
+  // Shaped to the negotiated main-input layout, never a fixed two channels.
+  processor->bind_main_input(in_l, in_r, frames);
   processor->process_data.numSamples = frames;
   processor->process_data.numInputs =
       processor->audio_input_bus_count > 0 ? 1 : 0;
@@ -3118,7 +3109,7 @@ extern "C" int sphere_daux_vst3_process_main_output_block_with_midi(
   processor->process_data.numOutputs =
       processor->output_bus_count_for_process();
   processor->process_data.inputEvents = nullptr;
-  processor->input_bus.channelBuffers32 = processor->input_channels;
+  processor->bind_idle_main_input();
   processor->output_bus.numChannels = 2;
   processor->output_bus.channelBuffers32 = processor->output_channels;
   processor->process_data.inputs =

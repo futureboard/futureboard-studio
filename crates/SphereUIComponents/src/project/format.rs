@@ -405,6 +405,16 @@ impl FbWriter {
 
 // ââ Low-level reader ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
+/// Entries reserved up front for a list whose count comes from the file. A
+/// damaged or hostile count must not become one huge allocation, which aborts
+/// the process instead of failing the load: the list grows as entries are
+/// actually read, and a count past the data ends in `UnexpectedEof` first.
+const MAX_PREALLOCATED_ENTRIES: usize = 1024;
+
+fn prealloc(count: usize) -> usize {
+    count.min(MAX_PREALLOCATED_ENTRIES)
+}
+
 pub struct FbReader<'a> {
     cur: Cursor<&'a [u8]>,
 }
@@ -485,8 +495,23 @@ impl<'a> FbReader<'a> {
         Ok(self.read_u8()? != 0)
     }
 
-    fn read_str(&mut self) -> Result<String, ProjectError> {
+    /// A length the file gives for what follows, checked against what is
+    /// left before anything is allocated for it.
+    fn read_len(&mut self, field: &'static str) -> Result<usize, ProjectError> {
         let len = self.read_u32()? as usize;
+        let remaining = self.remaining();
+        if len > remaining {
+            return Err(ProjectError::UnexpectedEof {
+                needed: len,
+                remaining,
+                field,
+            });
+        }
+        Ok(len)
+    }
+
+    fn read_str(&mut self) -> Result<String, ProjectError> {
+        let len = self.read_len("string bytes")?;
         let mut buf = vec![0u8; len];
         self.read_exact_field(&mut buf, "string bytes")?;
         String::from_utf8(buf).map_err(|_| ProjectError::Corrupted("invalid UTF-8 string".into()))
@@ -549,7 +574,7 @@ impl<'a> FbReader<'a> {
     }
 
     fn read_bytes(&mut self) -> Result<Vec<u8>, ProjectError> {
-        let len = self.read_u32()? as usize;
+        let len = self.read_len("byte blob")?;
         let mut buf = vec![0u8; len];
         self.read_exact_field(&mut buf, "byte blob")?;
         Ok(buf)
@@ -1458,7 +1483,7 @@ fn decode_song_text_event(r: &mut FbReader) -> Result<ProjectSongTextEvent, Proj
                     "invalid Song Text syllable count".to_string(),
                 ));
             }
-            let mut syllables = Vec::with_capacity(syllable_count);
+            let mut syllables = Vec::with_capacity(prealloc(syllable_count));
             for _ in 0..syllable_count {
                 syllables.push(ProjectLyricSyllable {
                     text: r.read_str()?,
@@ -1956,7 +1981,7 @@ fn read_ara_count(r: &mut FbReader, min_entry_bytes: usize) -> Result<usize, Pro
 fn decode_ara_identity(r: &mut FbReader) -> Result<ProjectAraIdentity, ProjectError> {
     // Two empty strings, rate, frames, channels, option tag.
     let count = read_ara_count(r, 4 + 4 + 8 + 8 + 4 + 1)?;
-    let mut sources = Vec::with_capacity(count);
+    let mut sources = Vec::with_capacity(prealloc(count));
     for _ in 0..count {
         sources.push(ProjectAraArchivedSource {
             persistent_id: read_bounded_str(r)?,
@@ -1973,7 +1998,7 @@ fn decode_ara_identity(r: &mut FbReader) -> Result<ProjectAraIdentity, ProjectEr
     }
     // Three empty strings.
     let count = read_ara_count(r, 4 * 3)?;
-    let mut modifications = Vec::with_capacity(count);
+    let mut modifications = Vec::with_capacity(prealloc(count));
     for _ in 0..count {
         modifications.push(ProjectAraArchivedModification {
             persistent_id: read_bounded_str(r)?,
@@ -1993,7 +2018,7 @@ type AraIdentityEntries = Vec<(String, String, ProjectAraIdentity)>;
 fn decode_ara_identities(r: &mut FbReader) -> Result<AraIdentityEntries, ProjectError> {
     // Two empty strings and an identity with two empty lists and no key.
     let count = read_ara_count(r, 4 + 4 + 4 + 4 + 1)?;
-    let mut entries = Vec::with_capacity(count);
+    let mut entries = Vec::with_capacity(prealloc(count));
     for _ in 0..count {
         let plugin_id = read_bounded_str(r)?;
         let track_id = read_bounded_str(r)?;
@@ -2009,7 +2034,7 @@ fn decode_ara_orphans(r: &mut FbReader) -> Result<Vec<ProjectAraDocument>, Proje
             "invalid ARA orphan count".to_string(),
         ));
     }
-    let mut orphans = Vec::with_capacity(count);
+    let mut orphans = Vec::with_capacity(prealloc(count));
     for _ in 0..count {
         let plugin_id = read_bounded_str(r)?;
         let track_id = read_bounded_str(r)?;
@@ -2052,7 +2077,7 @@ fn decode_ara_deferred(r: &mut FbReader) -> Result<Vec<DeferredEntry>, ProjectEr
             "invalid ARA kept-back count".to_string(),
         ));
     }
-    let mut entries = Vec::with_capacity(count);
+    let mut entries = Vec::with_capacity(prealloc(count));
     for _ in 0..count {
         let plugin_id = read_bounded_str(r)?;
         let track_id = read_bounded_str(r)?;
@@ -2352,7 +2377,7 @@ fn decode_view_automation(
             "invalid automation expansion count".to_string(),
         ));
     }
-    let mut entries = Vec::with_capacity(count);
+    let mut entries = Vec::with_capacity(prealloc(count));
     for _ in 0..count {
         let track_id = r.read_str()?;
         let selected_target = match r.read_u8()? {
@@ -2480,7 +2505,7 @@ fn decode_audio_connection(r: &mut FbReader) -> Result<ProjectAudioConnection, P
             "invalid audio connection binding count".to_string(),
         ));
     }
-    let mut port_bindings = Vec::with_capacity(binding_count);
+    let mut port_bindings = Vec::with_capacity(prealloc(binding_count));
     for _ in 0..binding_count {
         port_bindings.push(ProjectAudioPortBinding {
             logical_channel: r.read_u32()?,
@@ -2656,7 +2681,7 @@ fn decode_automation_lane(r: &mut FbReader, version: u32) -> Result<AutomationLa
         (AutomationTargetDesc::default(), true)
     };
     let count = r.read_u32()? as usize;
-    let mut points = Vec::with_capacity(count);
+    let mut points = Vec::with_capacity(prealloc(count));
     for _ in 0..count {
         let beat = r.read_f32()?;
         let value = r.read_f32()?;
@@ -2762,7 +2787,7 @@ fn decode_controller_lane(
     let height = r.read_f32()?;
     let collapsed = r.read_bool()?;
     let count = r.read_u32()? as usize;
-    let mut points = Vec::with_capacity(count);
+    let mut points = Vec::with_capacity(prealloc(count));
     for _ in 0..count {
         let beat = r.read_f32()?;
         let value = r.read_f32()?;
@@ -2823,7 +2848,7 @@ fn decode_stretch(r: &mut FbReader, version: u32) -> Result<AudioClipStretchStat
     let pan = r.read_f32()?;
     let marker_count = r.read_u32()? as usize;
     let retained_marker_count = marker_count.min(AudioClipStretchState::MAX_WARP_MARKERS);
-    let mut warp_markers = Vec::with_capacity(retained_marker_count);
+    let mut warp_markers = Vec::with_capacity(prealloc(retained_marker_count));
     for marker_index in 0..marker_count {
         let marker = WarpMarker {
             id: r.read_u64()?,
@@ -2838,7 +2863,7 @@ fn decode_stretch(r: &mut FbReader, version: u32) -> Result<AudioClipStretchStat
     let gain_envelope = if version >= 47 {
         let point_count = r.read_u32()? as usize;
         let retained_point_count = point_count.min(ClipEnvelope::MAX_POINTS);
-        let mut points = Vec::with_capacity(retained_point_count);
+        let mut points = Vec::with_capacity(prealloc(retained_point_count));
         for point_index in 0..point_count {
             let point = EnvelopePoint {
                 id: r.read_u64()?,
@@ -2951,14 +2976,14 @@ fn decode_clip(r: &mut FbReader, version: u32) -> Result<ProjectClip, ProjectErr
         },
         2 => {
             let count = r.read_u32()? as usize;
-            let mut notes = Vec::with_capacity(count);
+            let mut notes = Vec::with_capacity(prealloc(count));
             for _ in 0..count {
                 notes.push(decode_midi_note(r, version)?);
             }
             // v5: controller lanes follow the notes; older files have none.
             let controller_lanes = if version >= 5 {
                 let lane_count = r.read_u32()? as usize;
-                let mut lanes = Vec::with_capacity(lane_count);
+                let mut lanes = Vec::with_capacity(prealloc(lane_count));
                 for _ in 0..lane_count {
                     lanes.push(decode_controller_lane(r, version)?);
                 }
@@ -2968,7 +2993,7 @@ fn decode_clip(r: &mut FbReader, version: u32) -> Result<ProjectClip, ProjectErr
             };
             let sysex_events = if version >= 23 {
                 let event_count = r.read_u32()? as usize;
-                let mut events = Vec::with_capacity(event_count);
+                let mut events = Vec::with_capacity(prealloc(event_count));
                 for _ in 0..event_count {
                     events.push(decode_sysex_event(r)?);
                 }
@@ -2979,7 +3004,7 @@ fn decode_clip(r: &mut FbReader, version: u32) -> Result<ProjectClip, ProjectErr
             // v25: direction articulation events; older files have none.
             let articulations = if version >= 25 {
                 let event_count = r.read_u32()? as usize;
-                let mut events = Vec::with_capacity(event_count);
+                let mut events = Vec::with_capacity(prealloc(event_count));
                 for _ in 0..event_count {
                     events.push(MidiArticulation {
                         beat: r.read_f32()?,
@@ -3076,7 +3101,7 @@ fn decode_track_input_routing(r: &mut FbReader) -> Result<V33TrackInputRouting, 
             if count == 0 {
                 V33TrackInputRouting::None
             } else {
-                let mut channels = Vec::with_capacity(count);
+                let mut channels = Vec::with_capacity(prealloc(count));
                 for _ in 0..count {
                     channels.push(r.read_u32()?);
                 }
@@ -3206,7 +3231,7 @@ fn decode_track(r: &mut FbReader, version: u32) -> Result<ProjectTrack, ProjectE
         }
     }
     let send_count = r.read_u32()? as usize;
-    let mut sends = Vec::with_capacity(send_count);
+    let mut sends = Vec::with_capacity(prealloc(send_count));
     for _ in 0..send_count {
         let id = r.read_str()?;
         let target_track_id = r.read_str()?;
@@ -3224,19 +3249,19 @@ fn decode_track(r: &mut FbReader, version: u32) -> Result<ProjectTrack, ProjectE
     routing.sends = sends;
 
     let insert_count = r.read_u32()? as usize;
-    let mut inserts = Vec::with_capacity(insert_count);
+    let mut inserts = Vec::with_capacity(prealloc(insert_count));
     for _ in 0..insert_count {
         inserts.push(decode_insert(r, version)?);
     }
 
     let lane_count = r.read_u32()? as usize;
-    let mut automation_lanes = Vec::with_capacity(lane_count);
+    let mut automation_lanes = Vec::with_capacity(prealloc(lane_count));
     for _ in 0..lane_count {
         automation_lanes.push(decode_automation_lane(r, version)?);
     }
 
     let clip_count = r.read_u32()? as usize;
-    let mut clips = Vec::with_capacity(clip_count);
+    let mut clips = Vec::with_capacity(prealloc(clip_count));
     for _ in 0..clip_count {
         clips.push(decode_clip(r, version)?);
     }
@@ -3427,7 +3452,7 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
     let master_volume_norm = r.read_f32()?;
     let master_inserts = if version >= 15 {
         let insert_count = r.read_u32()? as usize;
-        let mut inserts = Vec::with_capacity(insert_count);
+        let mut inserts = Vec::with_capacity(prealloc(insert_count));
         for _ in 0..insert_count {
             inserts.push(decode_insert(&mut r, version)?);
         }
@@ -3447,13 +3472,13 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
     };
 
     let track_count = r.read_u32()? as usize;
-    let mut tracks = Vec::with_capacity(track_count);
+    let mut tracks = Vec::with_capacity(prealloc(track_count));
     for _ in 0..track_count {
         tracks.push(decode_track(&mut r, version)?);
     }
 
     let asset_count = r.read_u32()? as usize;
-    let mut assets = Vec::with_capacity(asset_count);
+    let mut assets = Vec::with_capacity(prealloc(asset_count));
     for _ in 0..asset_count {
         assets.push(decode_asset(&mut r, version)?);
     }
@@ -3461,7 +3486,7 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
     // Tempo automation markers (v7+). Pre-v7 files have none. v8+ stores ids.
     let mut tempo_points = if version >= 7 {
         let count = r.read_u32()? as usize;
-        let mut points = Vec::with_capacity(count);
+        let mut points = Vec::with_capacity(prealloc(count));
         for _ in 0..count {
             let id = if version >= 8 {
                 r.read_str()?
@@ -3486,7 +3511,7 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
 
     let time_signature_points = if version >= 9 {
         let count = r.read_u32()? as usize;
-        let mut points = Vec::with_capacity(count);
+        let mut points = Vec::with_capacity(prealloc(count));
         for _ in 0..count {
             // Field order must match `encode_body`: id, beat, numerator,
             // denominator, grouping. (A previous build read these out of order,
@@ -3499,7 +3524,7 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
             let denominator = r.read_u32()? as u16;
             let grouping = if version >= 10 {
                 let count = r.read_u32()? as usize;
-                let mut groups = Vec::with_capacity(count);
+                let mut groups = Vec::with_capacity(prealloc(count));
                 for _ in 0..count {
                     groups.push(r.read_u32()? as u16);
                 }
@@ -3522,7 +3547,7 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
 
     let (timeline_markers, timeline_regions) = if version >= 13 {
         let marker_count = r.read_u32()? as usize;
-        let mut markers = Vec::with_capacity(marker_count);
+        let mut markers = Vec::with_capacity(prealloc(marker_count));
         for _ in 0..marker_count {
             markers.push(ProjectTimelineMarker {
                 id: r.read_str()?,
@@ -3533,7 +3558,7 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
             });
         }
         let region_count = r.read_u32()? as usize;
-        let mut regions = Vec::with_capacity(region_count);
+        let mut regions = Vec::with_capacity(prealloc(region_count));
         for _ in 0..region_count {
             regions.push(ProjectTimelineRegion {
                 id: r.read_str()?,
@@ -3551,17 +3576,17 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
     let (tree_expanded_node_ids, tree_pinned_channel_ids, tree_hidden_channel_ids) =
         if version >= 20 {
             let expanded_count = r.read_u32()? as usize;
-            let mut tree_expanded_node_ids = Vec::with_capacity(expanded_count);
+            let mut tree_expanded_node_ids = Vec::with_capacity(prealloc(expanded_count));
             for _ in 0..expanded_count {
                 tree_expanded_node_ids.push(r.read_str()?);
             }
             let pinned_count = r.read_u32()? as usize;
-            let mut tree_pinned_channel_ids = Vec::with_capacity(pinned_count);
+            let mut tree_pinned_channel_ids = Vec::with_capacity(prealloc(pinned_count));
             for _ in 0..pinned_count {
                 tree_pinned_channel_ids.push(r.read_str()?);
             }
             let hidden_count = r.read_u32()? as usize;
-            let mut tree_hidden_channel_ids = Vec::with_capacity(hidden_count);
+            let mut tree_hidden_channel_ids = Vec::with_capacity(prealloc(hidden_count));
             for _ in 0..hidden_count {
                 tree_hidden_channel_ids.push(r.read_str()?);
             }
@@ -3582,7 +3607,7 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
                 "invalid Song Text event count".to_string(),
             ));
         }
-        let mut events = Vec::with_capacity(count);
+        let mut events = Vec::with_capacity(prealloc(count));
         for _ in 0..count {
             events.push(decode_song_text_event(&mut r)?);
         }
@@ -3615,7 +3640,7 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
                 "invalid audio connection count".to_string(),
             ));
         }
-        let mut connections: Vec<ProjectAudioConnection> = Vec::with_capacity(count);
+        let mut connections: Vec<ProjectAudioConnection> = Vec::with_capacity(prealloc(count));
         for _ in 0..count {
             let connection = decode_audio_connection(&mut r)?;
             if connections
@@ -3672,7 +3697,7 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
                 "invalid ARA document count".to_string(),
             ));
         }
-        let mut documents = Vec::with_capacity(count);
+        let mut documents = Vec::with_capacity(prealloc(count));
         for _ in 0..count {
             documents.push(ProjectAraDocument {
                 plugin_id: r.read_str()?,
@@ -3715,7 +3740,7 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
                     "invalid marker SysEx message count".to_string(),
                 ));
             }
-            let mut messages = Vec::with_capacity(message_count);
+            let mut messages = Vec::with_capacity(prealloc(message_count));
             for _ in 0..message_count {
                 messages.push(r.read_bytes()?);
             }
@@ -3734,7 +3759,7 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
                 "invalid chord event count".to_string(),
             ));
         }
-        let mut events = Vec::with_capacity(count);
+        let mut events = Vec::with_capacity(prealloc(count));
         for _ in 0..count {
             let id = r.read_u64()?;
             let start_beat = r.read_f64()?;
@@ -4285,6 +4310,43 @@ mod tests {
         bytes.extend_from_slice(&body);
         bytes.extend_from_slice(&checksum.to_le_bytes());
         bytes
+    }
+
+    /// A length or count far past the data must fail the load, not make the
+    /// reader allocate what the field claims (which aborts the process).
+    #[test]
+    fn oversized_lengths_and_counts_fail_the_load_instead_of_allocating() {
+        let mut r = FbReader::new(&[0xFF, 0xFF, 0xFF, 0xFF, b'a']);
+        assert!(matches!(
+            r.read_str(),
+            Err(ProjectError::UnexpectedEof { .. })
+        ));
+        let mut r = FbReader::new(&[0xFF, 0xFF, 0xFF, 0x7F, 1, 2, 3]);
+        assert!(matches!(
+            r.read_bytes(),
+            Err(ProjectError::UnexpectedEof { .. })
+        ));
+
+        // A v1 automation lane: empty id and name, visible, then a point count
+        // of u32::MAX with no points after it.
+        let mut w = FbWriter::new();
+        w.write_str("");
+        w.write_str("");
+        w.write_bool(true);
+        w.write_u32(u32::MAX);
+        let bytes = w.into_bytes();
+        let mut r = FbReader::new(&bytes);
+        assert!(matches!(
+            decode_automation_lane(&mut r, 1),
+            Err(ProjectError::UnexpectedEof { .. })
+        ));
+
+        // A whole file whose first string (the project id) claims 4 GiB, with
+        // a checksum that matches the tampered body.
+        let mut body = encode_body(&FutureboardProject::new("Damaged"));
+        body[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let file = project_bytes_with_version(body, PROJECT_VERSION);
+        assert!(decode_project(&file).is_err());
     }
 
     /// Encoded size of the v54 view section for `view`, which ends every body.

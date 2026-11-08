@@ -117,9 +117,18 @@ plain HTTP + WebSocket server:
   also rejects cross-origin pages, and responses forbid framing.
 - **No TLS.** PINs, tokens and console traffic are visible to anyone who can
   observe the network.
-- **OSC remote control** (UDP, port 8000) is off by default. When enabled it
-  binds to the same address as the web console and **does not require a
-  login**.
+- **OSC remote control** (UDP, port 8000) is off by default and **does not
+  require a login**. When enabled it listens on loopback only. To use it from
+  controllers on the network, set `osc.network` and list the controllers'
+  addresses in `osc.allow` (`remote.json`, or an admin's `set_remote`); it
+  then binds to the web console's address and drops packets from any other
+  address. A source address is not a credential: on a network where UDP
+  sources can be forged, anyone there can still drive it.
+- **Connection slots:** a connection must send its request within 10 seconds,
+  and a web-console connection that has not logged in (or entered the setup
+  code) within 2 minutes is closed. When every slot is taken, the server
+  closes a connection that never logged in to make room, so logged-in
+  operators can always connect.
 
 Treat a LiveStage console that is reachable from a network as having control of
 the show: mixer, recording, plug-in loading from the scanned catalog, and on

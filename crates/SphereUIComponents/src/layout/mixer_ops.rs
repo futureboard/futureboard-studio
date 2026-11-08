@@ -41,6 +41,8 @@ pub(crate) struct MixerViewState {
     pub split_resize_start_send_px: f32,
     /// Active splitter-drag target, if a drag is in progress.
     pub split_active_target: Option<MixerSplitTarget>,
+    /// Whether the last presses on a splitter dragged it (double-click reset).
+    pub split_presses: crate::components::mixer_panel::SplitPressHistory,
     /// Which strip sections show, and Narrow or Wide strips (session-only).
     pub view: MixerView,
     pub vsti_output_meters: HashMap<String, VstiOutputMeterState>,
@@ -98,6 +100,7 @@ impl Default for MixerViewState {
             split_resize_start_insert_px: 0.0,
             split_resize_start_send_px: 0.0,
             split_active_target: None,
+            split_presses: Default::default(),
             view: MixerView::default(),
             vsti_output_meters: HashMap::new(),
             vsti_meter_generation: 0,
@@ -147,9 +150,9 @@ impl StudioLayout {
             .cached_bounds
             .map(|b| f32::from(b.size.width))
             .unwrap_or(1280.0);
-        // The pinned Master and Control Room strips and the rule before them.
-        let pinned_w = crate::components::mixer_panel::mixer_pinned_width();
-        let mixer_viewport_width = (window_w - tree_w - pinned_w).max(100.0);
+        // Less the pinned Master and Control Room strips and the rule before them.
+        let mixer_viewport_width =
+            crate::components::mixer_panel::mixer_strip_viewport_width(window_w, tree_w);
         // The dock's top rule, its tab strip and the mixer's own sub-header.
         let chrome_h = 1.0 + crate::theme::size::COMFORTABLE + MIXER_SUB_HEADER_H;
         let mixer_viewport_height = (self.bottom_panel_state.height_px - chrome_h).max(0.0);
@@ -315,6 +318,7 @@ impl StudioLayout {
             tree_sidebar_enabled: self.mixer_view.tree_sidebar_enabled,
             tree_sidebar_collapsed: self.mixer_view.tree_sidebar_collapsed,
             tree_sidebar_width_px: self.mixer_view.tree_sidebar_width_px,
+            spatial_format: timeline.state.spatial_mix.format,
             // Filled by `push_mixer_snapshot_to_window`: building the entries
             // needs `&mut Context`, which a snapshot clone does not have.
             context_menu: None,
@@ -645,7 +649,10 @@ impl StudioLayout {
                 let tree_width = self.mixer_tree_sidebar_width();
                 handle
                     .update(cx, |_, window, _| {
-                        (f32::from(window.bounds().size.width) - tree_width - 90.0).max(100.0)
+                        crate::components::mixer_panel::mixer_strip_viewport_width(
+                            f32::from(window.bounds().size.width),
+                            tree_width,
+                        )
                     })
                     .unwrap_or_else(|_| self.mixer_panel_viewport_metrics(cx).0)
             }
@@ -874,7 +881,7 @@ impl StudioLayout {
             StudioLayout::defer_update(&owner_focus, cx, move |layout, cx| {
                 let tree_w = layout.mixer_tree_sidebar_width();
                 let viewport =
-                    (window_w - tree_w - 90.0).max(crate::components::mixer_panel::strip_width());
+                    crate::components::mixer_panel::mixer_strip_viewport_width(window_w, tree_w);
                 layout.mixer_focus_channel(&id, viewport, cx);
             });
         });
@@ -1125,12 +1132,16 @@ impl StudioLayout {
                 self.mixer_view.split_resize_start_send_px =
                     clamp_mixer_section_height_px(self.mixer_view.send_section_px);
                 self.mixer_view.split_active_target = Some(target);
+                self.mixer_view.split_presses.press();
             }
             MixerSplitAction::ResizeMove(y) => {
                 let Some(target) = self.mixer_view.split_active_target else {
                     return;
                 };
                 let delta = y - self.mixer_view.split_resize_start_y;
+                if delta.abs() > crate::components::mixer_panel::SPLIT_CLICK_SLOP_PX {
+                    self.mixer_view.split_presses.moved();
+                }
                 match target {
                     MixerSplitTarget::InsertSend => {
                         let new_px = clamp_mixer_section_height_px(
@@ -1159,6 +1170,9 @@ impl StudioLayout {
                 self.mixer_view.split_active_target = None;
             }
             MixerSplitAction::Reset(target) => {
+                if !self.mixer_view.split_presses.allows_reset() {
+                    return;
+                }
                 match target {
                     MixerSplitTarget::InsertSend => {
                         self.mixer_view.insert_section_px = MIXER_INSERT_SECTION_DEFAULT_PX;
@@ -1196,6 +1210,15 @@ impl StudioLayout {
     /// The docked mixer is on screen, so its meter overlay paints.
     pub(super) fn docked_mixer_meters_visible(&self) -> bool {
         self.panels.bottom_docked && self.active_bottom_tab == crate::components::BottomTab::Mixer
+    }
+
+    /// The docked mixer's tree filter has the keyboard. Gated on the docked
+    /// tree being on screen: a hidden field keeps its focus handle, and
+    /// trusting that would swallow text keys for good.
+    pub(super) fn docked_mixer_tree_filter_focused(&self, window: &Window, cx: &gpui::App) -> bool {
+        self.docked_mixer_meters_visible()
+            && self.mixer_view.tree_sidebar_enabled
+            && self.mixer_tree_sidebar.read(cx).is_filter_focused(window)
     }
 
     pub(super) fn mixer_panel_chrome_visible(&self) -> bool {

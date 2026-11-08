@@ -399,6 +399,18 @@ struct SphereDauxVst3Processor {
   float *output_channels[2] = {&output_l, &output_r};
   Steinberg::Vst::AudioBusBuffers input_bus{};
   Steinberg::Vst::AudioBusBuffers output_bus{};
+  /// Most channels one VST3 bus can carry: a SpeakerArrangement is a 64-bit
+  /// speaker mask.
+  static constexpr int kMaxInputBusChannels = 64;
+  /// Channel pointers handed to the plug-in for its main input bus, one per
+  /// channel of the negotiated layout (`bind_main_input`). A plug-in reads
+  /// `numChannels` entries from this array, so it must never be shorter.
+  std::array<float *, kMaxInputBusChannels> main_input_ptrs{};
+  /// Mono downmix of the host's stereo input, for a mono main input.
+  std::array<float, kMaxProcessFrames> main_input_downmix{};
+  /// Silence for main-input channels past the host's stereo pair (surround,
+  /// ambisonic). Re-zeroed per block in case a plug-in writes its inputs.
+  std::array<float, kMaxProcessFrames> main_input_silence{};
   Steinberg::Vst::ProcessContext process_context{};
   Steinberg::Vst::ProcessData process_data{};
   int audio_input_bus_count{0};
@@ -689,6 +701,42 @@ struct SphereDauxVst3Processor {
     }
   }
 
+  /// Point the main input bus at the host's stereo pair, shaped to the layout
+  /// the plug-in negotiated (`main_audio_input_channel_count`): a mono input
+  /// gets a downmix, a wider one gets L/R on its first two channels and
+  /// silence on the rest. Passing a fixed two channels made a mono plug-in
+  /// overrun its own buffers, a surround one read past the pointer array, and
+  /// a strict one refuse to process. Realtime-safe: preallocated planes, at
+  /// most one pass over `frames`.
+  void bind_main_input(const float *in_l, const float *in_r, int frames) {
+    const int channels = std::max(
+        1, std::min(main_audio_input_channel_count, kMaxInputBusChannels));
+    const int n = std::max(0, std::min(frames, kMaxProcessFrames));
+    if (channels == 1) {
+      for (int i = 0; i < n; ++i) {
+        main_input_downmix[i] = 0.5f * (in_l[i] + in_r[i]);
+      }
+      main_input_ptrs[0] = main_input_downmix.data();
+    } else {
+      main_input_ptrs[0] = const_cast<float *>(in_l);
+      main_input_ptrs[1] = const_cast<float *>(in_r);
+      if (channels > 2) {
+        std::fill(main_input_silence.begin(), main_input_silence.begin() + n,
+                  0.0f);
+        for (int ch = 2; ch < channels; ++ch) {
+          main_input_ptrs[ch] = main_input_silence.data();
+        }
+      }
+    }
+    input_bus.numChannels = channels;
+    input_bus.silenceFlags = 0;
+    input_bus.channelBuffers32 = main_input_ptrs.data();
+  }
+
+  /// Rebind the main input to the single-sample members between blocks, so
+  /// `input_bus` never keeps pointers into a finished block's buffers.
+  void bind_idle_main_input() { bind_main_input(&input_l, &input_r, 1); }
+
   bool setup(double sample_rate) {
     const double sr = sample_rate > 0.0 ? sample_rate : 44100.0;
 
@@ -883,6 +931,36 @@ struct SphereDauxVst3Processor {
                    main_audio_input_channel_count,
                    main_audio_output_channel_count);
     }
+    // The main input is fed with exactly the channel count the plug-in ended
+    // up with — whether it took our request or kept its own default — so ask
+    // it now rather than trusting the pre-negotiation bus info.
+    if (audio_input_bus_count > 0) {
+      Steinberg::Vst::SpeakerArrangement negotiated =
+          Steinberg::Vst::SpeakerArr::kEmpty;
+      Steinberg::Vst::BusInfo negotiated_info{};
+      if (processor->getBusArrangement(Steinberg::Vst::kInput, 0,
+                                       negotiated) == Steinberg::kResultOk &&
+          Steinberg::Vst::SpeakerArr::getChannelCount(negotiated) > 0) {
+        main_audio_input_channel_count =
+            Steinberg::Vst::SpeakerArr::getChannelCount(negotiated);
+        input_arrangement = negotiated;
+      } else if (component->getBusInfo(Steinberg::Vst::kAudio,
+                                       Steinberg::Vst::kInput, 0,
+                                       negotiated_info) ==
+                     Steinberg::kResultOk &&
+                 negotiated_info.channelCount > 0) {
+        main_audio_input_channel_count =
+            static_cast<int>(negotiated_info.channelCount);
+      }
+      main_audio_input_channel_count =
+          std::min(main_audio_input_channel_count, kMaxInputBusChannels);
+      std::fprintf(stderr,
+                   "[SphereVST3] main input negotiated channels=%d "
+                   "arrangement=0x%llx\n",
+                   main_audio_input_channel_count,
+                   static_cast<unsigned long long>(input_arrangement));
+    }
+    bind_idle_main_input();
 
     // Activate audio buses. Multi-output instruments can expose each mixer
     // route as a separate output bus, not as channels inside bus 0, so every

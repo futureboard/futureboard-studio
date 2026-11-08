@@ -150,6 +150,9 @@ impl StudioLayout {
             .map(|stats| stats.sample_rate)
             .unwrap_or(0);
         self.refresh_builtin_editor_chrome(sample_rate, cx);
+        // Content children a closed or switched editor left waiting on a host
+        // that never answered.
+        crate::components::plugin_editor_window::sweep_parked_editor_content();
         if self.plugin_editors.open.is_empty() {
             return;
         }
@@ -397,12 +400,8 @@ impl StudioLayout {
             self.plugin_editors
                 .open
                 .retain(|(track, _), _| track != track_id);
-            // The preset list is a window of its own; it goes before the editor
-            // it hangs from, so no platform is left holding an orphan.
-            let _ = handle.update(cx, |editor, window, cx| {
-                editor.close_preset_menu(cx);
-                window.remove_window();
-            });
+            // The view and the preset list go before the window does.
+            let _ = handle.update(cx, |editor, window, cx| editor.close_window(window, cx));
             return;
         };
         if was_active {

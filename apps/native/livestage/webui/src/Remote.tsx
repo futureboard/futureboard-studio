@@ -24,7 +24,7 @@ import { explain, notify, request, useStore } from './store.ts'
 import './access.css'
 
 const DEFAULT_REMOTE: RemoteSettings = {
-  osc: { enabled: false, port: 8000, feedback: true },
+  osc: { enabled: false, port: 8000, feedback: true, network: false, allow: [] },
   midi: { inputs: [], outputs: [], feedback: true, maps: [] },
 }
 
@@ -38,6 +38,10 @@ function readRemote(raw: unknown): RemoteSettings {
       enabled: osc.enabled === true,
       port: typeof osc.port === 'number' ? osc.port : DEFAULT_REMOTE.osc.port,
       feedback: osc.feedback !== false,
+      // Kept as the server has them, so saving another setting here never
+      // closes (or opens) OSC to the network.
+      network: osc.network === true,
+      allow: Array.isArray(osc.allow) ? osc.allow.filter((a): a is string => typeof a === 'string') : [],
     },
     midi: {
       inputs: Array.isArray(midi.inputs) ? midi.inputs : [],

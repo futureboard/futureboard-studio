@@ -92,6 +92,12 @@ struct SphereDauxVst2Processor {
   static constexpr int kMaxBridgeBuses = 16;
   static constexpr int kMaxProcessFrames = 8192;
   static constexpr int kMaxMidiEvents = 256;
+  /// Most inputs or outputs a plug-in may declare. `processReplacing` reads
+  /// `numInputs` / `numOutputs` entries from the pointer arrays below, so
+  /// they are sized to this cap and every entry stays valid; a plug-in over
+  /// it is refused at load (or bypassed if it grows past it later) instead of
+  /// being handed a short array.
+  static constexpr int kMaxPluginChannels = 256;
 
   // ── Module + instance ─────────────────────────────────────────────────────
 #if defined(_WIN32)
@@ -124,8 +130,14 @@ struct SphereDauxVst2Processor {
   // Non-interleaved planar storage plus the channel pointer arrays VST2 wants.
   std::vector<float> input_storage;  // kMaxBridgeChannels * kMaxProcessFrames
   std::vector<float> output_storage; // kMaxBridgeChannels * kMaxProcessFrames
-  std::array<float *, kMaxBridgeChannels> input_channels{};
-  std::array<float *, kMaxBridgeChannels> output_channels{};
+  // Channels past the bridge's read window (a 64-output sampler, a
+  // higher-order Ambisonics tool, or a plug-in that grew its IO after open)
+  // all share one silent input plane and one throwaway output plane, so every
+  // pointer the plug-in can reach is a real buffer.
+  std::vector<float> spare_input_plane;  // kMaxProcessFrames
+  std::vector<float> spare_output_plane; // kMaxProcessFrames
+  std::array<float *, kMaxPluginChannels> input_channels{};
+  std::array<float *, kMaxPluginChannels> output_channels{};
   int allocated_frames{0};
   int allocated_input_channels{0};
   int allocated_output_channels{0};

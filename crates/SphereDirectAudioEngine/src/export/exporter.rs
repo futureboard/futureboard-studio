@@ -15,7 +15,7 @@ use super::offline_renderer::{
     render_offline_mix_and_tracks_with_plugins, render_offline_with_plugins, OfflinePlugins,
 };
 use super::render_progress::{ExportCancelToken, ExportProgress, ExportStage};
-use super::render_request::{ExportNormalizeMode, ExportTailMode, OfflineRenderRequest};
+use super::render_request::{ExportNormalizeMode, OfflineRenderRequest, SilenceTail, TailBlock};
 use super::ExportError;
 
 /// A full arrangement export request: where to write, in what container, and
@@ -502,12 +502,10 @@ pub fn record_render_job(
     let write_from = render.start_sample.saturating_add(latency_frames);
     let content_end = write_from.saturating_add(content);
     let write_to = content_end.saturating_add(tail_cap);
-    let until_silence = match render.tail {
-        ExportTailMode::UntilSilence { threshold_db, .. } => {
-            Some(10f32.powf(threshold_db / 20.0).clamp(0.0, 1.0))
-        }
-        _ => None,
-    };
+    // UntilSilence: quiet tail chunks are held back per file until the tail
+    // sounds again (a gap between repeats, written then) or stays quiet for
+    // the hold (the end, dropped). See `SilenceTail`.
+    let mut silence = SilenceTail::new(render.tail, capture.sample_rate());
     on_progress(ExportProgress::stage_only(ExportStage::Preparing, total));
 
     let requests: Vec<&ArrangementExportRequest> = job.requests().collect();
@@ -526,6 +524,7 @@ pub fn record_render_job(
     let channels = usize::from(render.channels.max(1));
     let mut lane_buffers = vec![Vec::<f32>::new(); capture.lanes()];
     let mut out = Vec::<f32>::new();
+    let mut held = vec![Vec::<f32>::new(); lanes.len()];
     let chunk = (capture.sample_rate() as usize / 20).max(256);
     let mut next_sample: Option<u64> = None; // transport sample of the next frame read
     let mut last_data = std::time::Instant::now();
@@ -579,6 +578,20 @@ pub fn record_render_job(
             // The part of this chunk inside [write_from, write_to).
             let from = write_from.saturating_sub(chunk_start).min(frames as u64) as usize;
             let to = write_to.saturating_sub(chunk_start).min(frames as u64) as usize;
+            // Past the content, the master decides whether this chunk is
+            // written, held back, or the end of the tail.
+            let verdict = match silence.as_mut() {
+                Some(tail) if chunk_start >= content_end && to > from => {
+                    let master_peak = lane_buffers[0][from * 2..to * 2]
+                        .iter()
+                        .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+                    tail.observe(master_peak, (to - from) as u64)
+                }
+                _ => TailBlock::Audible,
+            };
+            if verdict == TailBlock::Ended {
+                return Ok(());
+            }
             if to > from {
                 for (file, &lane) in lanes.iter().enumerate() {
                     let stereo = &lane_buffers[lane][from * 2..to * 2];
@@ -591,6 +604,16 @@ pub fn record_render_job(
                             out.extend(std::iter::repeat(0.0).take(channels - 2));
                         }
                     }
+                    if verdict == TailBlock::Quiet {
+                        held[file].extend_from_slice(&out);
+                        continue;
+                    }
+                    if !held[file].is_empty() {
+                        // A gap between repeats, not the end: write it first.
+                        meters[file].feed(&held[file]);
+                        encoders[file].write_interleaved_f32(&held[file])?;
+                        held[file].clear();
+                    }
                     meters[file].feed(&out);
                     encoders[file].write_interleaved_f32(&out)?;
                 }
@@ -602,19 +625,9 @@ pub fn record_render_job(
                 written,
                 total.max(1),
             ));
+            // At the cap, whatever quiet stretch is still held back is dropped.
             if reached >= write_to {
                 return Ok(());
-            }
-            // UntilSilence: past the content, stop on the first quiet chunk.
-            if let Some(threshold) = until_silence {
-                if chunk_start >= content_end {
-                    let master_peak = lane_buffers[0][..frames * 2]
-                        .iter()
-                        .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
-                    if master_peak < threshold {
-                        return Ok(());
-                    }
-                }
             }
         }
     })();

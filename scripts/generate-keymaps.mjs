@@ -1,7 +1,15 @@
 /**
- * Generate keyboard shortcut profiles from native-menu.json.
+ * Generate the DAW keyboard shortcut profiles.
  *
- * Output: packages/keymaps/{default,ableton,cubase,fl_studio,pro_tools,studio_one}.json
+ * Output: packages/keymaps/{ableton,cubase,fl_studio,pro_tools,studio_one}.json
+ *
+ * Each profile ships only the keys it changes. Studio layers every built-in
+ * profile on the hand-authored, scoped `default.json` (see `KeymapManager`),
+ * so a profile that also carried a copy of the menu manifest's shortcuts would
+ * re-impose stale keys the default has since moved, and two commands would
+ * end up sharing one key. A `null` takes the default's key away from a
+ * command. `KeymapManager`'s `no_shipped_profile_has_conflicts` test checks
+ * the result against the default.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -9,39 +17,7 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(__dirname, "..");
-const menuPath = path.join(root, "packages/shared/generated/native-menu.json");
 const outDir = path.join(root, "packages/keymaps");
-
-/** @typedef {{ version: number, generatedAt: string, menus: { items: unknown[] }[] }} MenuManifest */
-
-/** @param {unknown[]} items @param {Record<string, string|null>} out */
-function walkMenuItems(items, out) {
-  for (const raw of items) {
-    const item = /** @type {{ command?: string; shortcut?: string|null; children?: unknown[] }} */ (raw);
-    if (item.children?.length) walkMenuItems(item.children, out);
-    if (item.command && item.command !== "noop") {
-      out[item.command] = item.shortcut ?? null;
-    }
-  }
-}
-
-/** @param {MenuManifest} menu */
-function extractDefaultBindings(menu) {
-  /** @type {Record<string, string|null>} */
-  const bindings = {};
-  for (const group of menu.menus) walkMenuItems(group.items, bindings);
-  return bindings;
-}
-
-/** @param {Record<string, string|null>} bindings */
-function assignedOnly(bindings) {
-  /** @type {Record<string, string>} */
-  const out = {};
-  for (const [command, shortcut] of Object.entries(bindings)) {
-    if (shortcut) out[command] = shortcut;
-  }
-  return out;
-}
 
 /**
  * Extra bindings that exist in the default keymap but are not present in
@@ -132,21 +108,27 @@ const DAW_OVERRIDES = {
     "transport:record": "F9",
     "transport:toggle-loop": "Ctrl+L",
     "transport:toggle-metronome": "O",
+    // Ctrl+E splits; export is Ctrl+Shift+R below.
     "clip:split-at-playhead": "Ctrl+E",
+    "file:export-arrangement": null,
     "midi:quantize": "Ctrl+U",
     "edit:deselect-all": "Ctrl+Shift+A",
     "file:export-audio": "Ctrl+Shift+R",
+    // Insert Return Track; Live has no instrument-track key.
+    "track:add-return": "Ctrl+Alt+T",
+    "track:add-instrument": null,
     "panel:toggle-browser": "Ctrl+Alt+B",
     "tools:select-pen": "B",
     "tools:select-pointer": null,
     "tools:select-cut": null,
     "tools:select-glue": null,
     "tools:select-time": null,
+    // A is Automation Arm; Live has no track-arm key.
     "tools:select-automation": "A",
+    "track:arm": null,
     "timeline:toggle-snap": null,
     "marker:add": null,
     "audio:bounce-in-place": "Ctrl+J",
-    "audio:render-selection": "Ctrl+Shift+R",
     "view:zoom-in": "+",
     "view:zoom-out": "-",
     "view:reset-zoom": null,
@@ -171,10 +153,13 @@ const DAW_OVERRIDES = {
     "tools:select-glue": "4",
     "tools:select-time": "6",
     "tools:select-mute": "7",
-    "tools:select-automation": "A",
+    // Cubase has no automation tool; 7 went to Mute and A stays Arm.
+    "tools:select-automation": null,
     "timeline:toggle-snap": null,
     "marker:add": null,
+    // Ctrl+T is Add Track; Cubase has no separate audio-track key.
     "track:show-add-dialog": "Ctrl+T",
+    "track:add-audio": null,
     "track:add-midi": "Ctrl+Shift+I",
     "audio:bounce-in-place": "Ctrl+Shift+B",
     "audio:render-selection": "Alt+Shift+R",
@@ -186,21 +171,25 @@ const DAW_OVERRIDES = {
     "midi:transpose-octave-up": "Ctrl+Shift+ArrowUp",
     "midi:transpose-octave-down": "Ctrl+Shift+ArrowDown",
     "panel:toggle-browser": null,
+    // F3 is the MixConsole; the performance meter gives the key up. (F2 is
+    // the Transport Panel in Cubase, so the editor keeps its default key and
+    // F2 stays Rename.)
     "panel:toggle-mixer": "F3",
+    "view:toggle-perf-metrics": null,
     "panel:toggle-inspector": null,
     "panel:toggle-device-panel": null,
-    "panel:toggle-midi-editor": "F2",
     "tools:command-palette": null,
   },
   fl_studio: {
     "transport:stop": "Ctrl+Space",
+    // Ctrl+M is the metronome; FL has no minimize key.
     "transport:toggle-metronome": "Ctrl+M",
+    "window:minimize": null,
     "transport:go-to-start": null,
     "transport:go-to-end": null,
     "transport:rewind": "Numpad/",
     "transport:fast-forward": "Numpad0",
     "clip:split-at-playhead": null,
-    "timeline:toggle-snap": "Backspace",
     "tools:select-pointer": null,
     "tools:select-pen": null,
     "tools:select-cut": null,
@@ -228,9 +217,11 @@ const DAW_OVERRIDES = {
     // this keymap format cannot express (a `+`-separated accelerator cannot
     // carry a `Numpad+` base key). Only the bindings that survive on a laptop
     // keyboard are mapped here; the rest keep the Futureboard default.
+    // Return (go to start) stays unmapped: a global key may not take the
+    // song text editor's Enter; Home still goes to the start.
     "transport:record": "F12",
-    "transport:go-to-start": "Return",
     "transport:toggle-loop": "Ctrl+Shift+L",
+    "window:lyric-editor": null,
     // "Separate Clip at Selection" takes Ctrl+E from export-arrangement.
     "clip:split-at-playhead": "Ctrl+E",
     "file:export-arrangement": null,
@@ -246,6 +237,7 @@ const DAW_OVERRIDES = {
     "tools:select-automation": null,
     // Edit modes F1–F4; Grid mode is the snap equivalent.
     "timeline:toggle-snap": "F4",
+    "window:audio-connections": null,
     // "New Tracks…" takes Ctrl+Shift+N from Futureboard's new-from-template.
     "track:show-add-dialog": "Ctrl+Shift+N",
     "project:new-from-template": null,
@@ -346,42 +338,25 @@ const PROFILES = [
   },
 ];
 
-/**
- * @param {Record<string, string|null>} base
- * @param {Record<string, string|null>|undefined} overrides
- */
-function mergeBindings(base, overrides) {
-  const merged = { ...base };
-  if (!overrides) return merged;
-  for (const [command, shortcut] of Object.entries(overrides)) {
-    if (shortcut === null) delete merged[command];
-    else merged[command] = shortcut;
-  }
-  return merged;
-}
-
 function main() {
-  const menu = /** @type {MenuManifest} */ (
-    JSON.parse(fs.readFileSync(menuPath, "utf8"))
-  );
-  const defaultBindings = extractDefaultBindings(menu);
-
   fs.mkdirSync(outDir, { recursive: true });
 
   for (const profile of PROFILES) {
-    const merged = mergeBindings(defaultBindings, profile.overrides);
+    const bindings = Object.fromEntries(
+      Object.entries(profile.overrides ?? {}).sort(([a], [b]) => a.localeCompare(b)),
+    );
     const payload = {
       version: 1,
       id: profile.id,
       label: profile.label,
       description: profile.description,
-      sourceMenuVersion: menu.version,
-      generatedAt: new Date().toISOString(),
-      bindings: assignedOnly(merged),
+      extends: "default",
+      bindings,
     };
     const outPath = path.join(outDir, `${profile.id}.json`);
-    fs.writeFileSync(outPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
-    console.log(`wrote ${outPath} (${Object.keys(payload.bindings).length} bindings)`);
+    fs.writeFileSync(outPath, `${JSON.stringify(payload, null, 2)}
+`, "utf8");
+    console.log(`wrote ${outPath} (${Object.keys(bindings).length} bindings)`);
   }
 }
 

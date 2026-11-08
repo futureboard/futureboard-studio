@@ -5,10 +5,12 @@
 //! NAM A2 file**, then loads the bytes through the existing `.nam` path.
 //!
 //! No OAuth and no per-user login. Authenticate with a TONE3000 API key
-//! (`t3k_cs_…` secret, or an equivalent Bearer credential). The key is baked
-//! at build time from `FUTUREBOARD_TONE3000_API_KEY` / `TONE3000_API_KEY` or
-//! the workspace `.env` (`option_env!`), and a process env of the same names
-//! still overrides it at runtime. Direct API calls use
+//! (`t3k_cs_…` secret, or an equivalent Bearer credential), read from the
+//! process environment (`FUTUREBOARD_TONE3000_API_KEY` / `TONE3000_API_KEY`).
+//! Only a debug (developer) build also bakes it from the build environment or
+//! the workspace `.env` (`option_env!`, see `build.rs`): a release binary is
+//! handed out, and a key inside it can be read back out by anyone, so a
+//! release build never carries one. Direct API calls use
 //! `Authorization: Bearer <key>` as TONE3000 documents for server-side
 //! fetch. The key never crosses the CEF bridge.
 
@@ -94,7 +96,8 @@ pub fn configured() -> bool {
     api_key().is_some()
 }
 
-/// Baked by `build.rs` from the build environment or workspace `.env`.
+/// Baked by `build.rs` from the build environment or workspace `.env` — in a
+/// debug build only; always `None` in a release build.
 const BAKED_API_KEY: Option<&str> = option_env!("FUTUREBOARD_TONE3000_API_KEY");
 
 fn api_key() -> Option<String> {
@@ -126,7 +129,7 @@ fn bearer_get(
     timeout_secs: u64,
 ) -> Result<reqwest::blocking::Response, String> {
     let key = api_key().ok_or_else(|| {
-        "TONE3000 API key is not configured (bake FUTUREBOARD_TONE3000_API_KEY at build, or set it at runtime)".to_string()
+        "TONE3000 API key is not configured (set FUTUREBOARD_TONE3000_API_KEY in the environment Studio runs in)".to_string()
     })?;
     let url = if path_and_query.starts_with("http://") || path_and_query.starts_with("https://") {
         path_and_query.to_string()

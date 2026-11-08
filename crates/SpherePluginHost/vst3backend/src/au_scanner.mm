@@ -5,6 +5,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -206,23 +208,18 @@ static std::vector<AuScanEntry> enumerate_audio_units() {
   return entries;
 }
 
-static char* allocate_json_payload(const std::string& json) {
-  char* payload =
-      static_cast<char*>(std::malloc(json.size() + 1));
+// Every SpherePluginHostString handed to Rust is released by
+// `sphere_plugin_host_free_string` (vst3_scanner.cpp), which uses `delete[]`.
+// Allocate with the matching `new[]`, and report out-of-memory as a null
+// payload (Rust turns that into a scan error) rather than handing back a
+// static string the caller would then free.
+static SpherePluginHostString make_json_string(const std::string& json) {
+  char* payload = new (std::nothrow) char[json.size() + 1];
   if (payload == nullptr) {
-    return nullptr;
+    return SpherePluginHostString{nullptr, 0};
   }
   std::memcpy(payload, json.data(), json.size());
   payload[json.size()] = '\0';
-  return payload;
-}
-
-static SpherePluginHostString make_json_string(const std::string& json) {
-  char* payload = allocate_json_payload(json);
-  if (payload == nullptr) {
-    static const char fallback[] = "[]";
-    return SpherePluginHostString{fallback, sizeof(fallback) - 1};
-  }
   return SpherePluginHostString{payload, json.size()};
 }
 

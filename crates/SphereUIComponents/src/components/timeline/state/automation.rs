@@ -1681,8 +1681,6 @@ impl TimelineState {
             .unwrap_or(0)
     }
 
-    /// Delete every selected automation point on a track. Committed edit —
-    /// caller marks dirty once. Returns how many were removed.
     /// Remove one automation point by id. Returns `true` when it was there.
     ///
     /// The single-point counterpart to
@@ -1701,12 +1699,22 @@ impl TimelineState {
         let before = lane.points.len();
         lane.points.retain(|point| point.id != point_id);
         let removed = before != lane.points.len();
-        if removed && automation_debug_enabled() {
-            eprintln!("[automation] delete_point track={track_id} lane={lane_id} id={point_id}");
+        if removed {
+            if automation_debug_enabled() {
+                eprintln!(
+                    "[automation] delete_point track={track_id} lane={lane_id} id={point_id}"
+                );
+            }
+            // The curve under the playhead changed: the fader and its readout
+            // follow it now, as they do for an added or moved point.
+            let playhead = self.transport.playhead_beats;
+            self.recompute_effective_volumes(playhead, "point_delete");
         }
         removed
     }
 
+    /// Delete every selected automation point on a track, in every lane.
+    /// Committed edit — caller marks dirty once. Returns how many were removed.
     pub fn delete_selected_automation_points(&mut self, track_id: &str) -> usize {
         let Some((lanes, _)) = self.automation_host_mut(track_id) else {
             return 0;
@@ -1717,13 +1725,41 @@ impl TimelineState {
             lane.points.retain(|p| !p.selected);
             removed += before - lane.points.len();
         }
-        if removed > 0 && automation_debug_enabled() {
+        self.after_selected_points_deleted(track_id, removed);
+        removed
+    }
+
+    /// Delete the selected points of one lane only — what Cut removes, since
+    /// Cut copies one lane's selection ([`Self::copy_selected_automation`]) and
+    /// must not take points from other lanes that never reach the clipboard.
+    /// Committed edit. Returns how many were removed.
+    pub fn delete_selected_automation_points_in_lane(
+        &mut self,
+        track_id: &str,
+        lane_id: &str,
+    ) -> usize {
+        let Some(lane) = self.lane_mut(track_id, lane_id) else {
+            return 0;
+        };
+        let before = lane.points.len();
+        lane.points.retain(|p| !p.selected);
+        let removed = before - lane.points.len();
+        self.after_selected_points_deleted(track_id, removed);
+        removed
+    }
+
+    fn after_selected_points_deleted(&mut self, track_id: &str, removed: usize) {
+        if removed == 0 {
+            return;
+        }
+        if automation_debug_enabled() {
             eprintln!(
                 "[automation] delete_points track={} count={}",
                 track_id, removed
             );
         }
-        removed
+        let playhead = self.transport.playhead_beats;
+        self.recompute_effective_volumes(playhead, "point_delete");
     }
 
     // ── Automation sub-lane actions (lane header controls) ────────────────────
