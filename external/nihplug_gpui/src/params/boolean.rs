@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use super::internals::ParamPtr;
+use super::name_cell::NameCell;
 use super::{Param, ParamFlags, ParamMut};
 
 /// A simple boolean parameter.
@@ -36,7 +37,7 @@ pub struct BoolParam {
     value_changed: Option<Arc<dyn Fn(bool) + Send + Sync>>,
 
     /// The parameter's human readable display name.
-    name: String,
+    name: NameCell,
     /// If this parameter has been marked as polyphonically modulatable, then this will be a unique
     /// integer identifying the parameter. Because this value is determined by the plugin itself,
     /// the plugin can easily map
@@ -65,9 +66,9 @@ impl Debug for BoolParam {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // This uses the above `Display` instance to show the value
         if self.value.load(Ordering::Relaxed) != self.unmodulated_value.load(Ordering::Relaxed) {
-            write!(f, "{}: {} (modulated)", &self.name, &self)
+            write!(f, "{}: {} (modulated)", self.name.get(), &self)
         } else {
-            write!(f, "{}: {}", &self.name, &self)
+            write!(f, "{}: {}", self.name.get(), &self)
         }
     }
 }
@@ -79,7 +80,7 @@ impl Param for BoolParam {
     type Plain = bool;
 
     fn name(&self) -> &str {
-        &self.name
+        self.name.get()
     }
 
     fn unit(&self) -> &'static str {
@@ -241,11 +242,16 @@ impl BoolParam {
             flags: ParamFlags::default(),
             value_changed: None,
 
-            name: name.into(),
+            name: NameCell::new(name),
             poly_modulation_id: None,
             value_to_string: None,
             string_to_value: None,
         }
+    }
+
+    /// Replace the display name a host reads from [`Param::name`].
+    pub fn set_name(&self, name: impl Into<String>) {
+        self.name.set(name);
     }
 
     /// The field's current plain value, after monophonic modulation has been applied. Equivalent to

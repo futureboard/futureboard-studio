@@ -361,6 +361,9 @@ pub struct ProjectInsert {
     /// Mixer-only collapsed/expanded view flag for this instrument's VSTi
     /// multi-out group. Visual state only — never affects routing.
     pub multiout_collapsed: bool,
+    /// v63: which mix bus this insert processes on. `0` is the track's main
+    /// chain. `1` is the wet/dry/wet send/return. Older files load as main.
+    pub signal_bus: u8,
     pub plugin: Option<ProjectPluginInstance>,
 }
 
@@ -374,6 +377,7 @@ impl Default for ProjectInsert {
             enabled_audio_output_channels: Vec::new(),
             plugin_is_instrument: None,
             multiout_collapsed: false,
+            signal_bus: 0,
             plugin: None,
         }
     }
@@ -504,6 +508,8 @@ pub struct ProjectSend {
     pub enabled: bool,
     pub pre_fader: bool,
     pub gain_db: f32,
+    /// v63: this send exists for a wet/dry/wet split. Older files load `false`.
+    pub wdw: bool,
 }
 
 // ── Automation ────────────────────────────────────────────────────────────────
@@ -1227,6 +1233,7 @@ fn timeline_insert_to_project(idx: usize, slot: &InsertSlotState) -> ProjectInse
         enabled_audio_output_channels: slot.enabled_audio_output_channels.clone(),
         plugin_is_instrument: slot.plugin_is_instrument,
         multiout_collapsed: slot.multiout_collapsed,
+        signal_bus: slot.signal_bus.tag(),
         plugin,
     }
 }
@@ -1310,6 +1317,9 @@ pub(crate) fn project_insert_to_timeline(pi: &ProjectInsert) -> InsertSlotState 
                 active_output_buses: None,
                 multiout_collapsed: pi.multiout_collapsed,
                 pending_open_editor: false,
+                signal_bus: crate::components::timeline::timeline_state::InsertSignalBus::from_tag(
+                    pi.signal_bus,
+                ),
                 vst3_state: (!plugin.state.state_bytes.is_empty())
                     .then(|| std::sync::Arc::new(plugin.state.state_bytes.clone())),
             }
@@ -1535,6 +1545,7 @@ impl From<&TimelineState> for FutureboardProject {
                                 enabled: s.enabled,
                                 pre_fader: s.pre_fader,
                                 gain_db: s.gain_db,
+                                wdw: s.wdw,
                             })
                             .collect(),
                     },
@@ -2264,6 +2275,7 @@ pub fn apply_to_timeline(
                         enabled: s.enabled,
                         pre_fader: s.pre_fader,
                         gain_db: s.gain_db,
+                        wdw: s.wdw,
                         automated: None,
                     }
                 })
@@ -3378,7 +3390,7 @@ mod v33_routing_adapter_tests {
         let bytes = crate::project::format::encode_project(&FutureboardProject::new("current"));
         let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
         assert_eq!(version, crate::project::format::PROJECT_VERSION);
-        assert_eq!(crate::project::format::PROJECT_VERSION, 62);
+        assert_eq!(crate::project::format::PROJECT_VERSION, 63);
     }
 
     // ── v35 Master / Monitor output routing ─────────────────────────────────

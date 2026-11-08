@@ -167,7 +167,10 @@ pub const PROJECT_MAGIC: &[u8; 8] = b"FBSTUD1\0";
 /// (Read 0, Touch 1, Latch 2, Write 3) after its points. A pre-v61 lane reads.
 /// v62 appends the master bus's automation lanes after its inserts, then a
 /// flag for whether the arrangement shows them. A pre-v62 master has none.
-pub const PROJECT_VERSION: u32 = 62;
+/// v63 appends each insert's mix bus (`0` main, `1` wet/dry/wet) after its
+/// plugin blob, and a flag on each send for the wet/dry/wet split. A pre-v63
+/// insert is on the main bus and no send is a split send.
+pub const PROJECT_VERSION: u32 = 63;
 
 /// Oldest on-disk format version whose migration to the current one is
 /// supported (see [`super::migrate`]): v30, which introduced arrangement
@@ -644,7 +647,7 @@ fn encode_plugin_instance(w: &mut FbWriter, inst: &ProjectPluginInstance) {
     encode_plugin_state_blob(w, &inst.state);
 }
 
-fn encode_insert(w: &mut FbWriter, ins: &ProjectInsert) {
+fn encode_insert(w: &mut FbWriter, ins: &ProjectInsert, version: u32) {
     w.write_str(&ins.id);
     w.write_u32(ins.slot_index);
     w.write_bool(ins.bypassed);
@@ -669,6 +672,10 @@ fn encode_insert(w: &mut FbWriter, ins: &ProjectInsert) {
             w.write_u8(1);
             encode_plugin_instance(w, inst);
         }
+    }
+    // v63: main bus (0) or the wet/dry/wet send/return (1).
+    if version >= 63 {
+        w.write_u8(ins.signal_bus);
     }
 }
 
@@ -1131,11 +1138,14 @@ fn encode_track(w: &mut FbWriter, t: &ProjectTrack, version: u32) {
         w.write_bool(s.enabled);
         w.write_bool(s.pre_fader);
         w.write_f32(s.gain_db);
+        if version >= 63 {
+            w.write_bool(s.wdw);
+        }
     }
     // inserts
     w.write_u32(t.inserts.len() as u32);
     for ins in &t.inserts {
-        encode_insert(w, ins);
+        encode_insert(w, ins, version);
     }
     // automation lanes
     w.write_u32(t.automation_lanes.len() as u32);
@@ -1619,7 +1629,7 @@ fn encode_body_versioned(project: &FutureboardProject, version: u32) -> Vec<u8> 
     w.write_f32(project.mixer.master_volume_norm);
     w.write_u32(project.mixer.master_inserts.len() as u32);
     for ins in &project.mixer.master_inserts {
-        encode_insert(&mut w, ins);
+        encode_insert(&mut w, ins, version);
     }
     if version >= 62 {
         w.write_u32(project.mixer.master_automation_lanes.len() as u32);
@@ -2644,6 +2654,7 @@ fn decode_insert(r: &mut FbReader, version: u32) -> Result<ProjectInsert, Projec
             )));
         }
     };
+    let signal_bus = if version >= 63 { r.read_u8()? } else { 0 };
     Ok(ProjectInsert {
         id,
         slot_index,
@@ -2652,6 +2663,7 @@ fn decode_insert(r: &mut FbReader, version: u32) -> Result<ProjectInsert, Projec
         enabled_audio_output_channels,
         plugin_is_instrument,
         multiout_collapsed,
+        signal_bus,
         plugin,
     })
 }
@@ -3238,12 +3250,14 @@ fn decode_track(r: &mut FbReader, version: u32) -> Result<ProjectTrack, ProjectE
         let enabled = r.read_bool()?;
         let pre_fader = r.read_bool()?;
         let gain_db = r.read_f32()?;
+        let wdw = if version >= 63 { r.read_bool()? } else { false };
         sends.push(ProjectSend {
             id,
             target_track_id,
             enabled,
             pre_fader,
             gain_db,
+            wdw,
         });
     }
     routing.sends = sends;
@@ -4638,6 +4652,7 @@ mod tests {
             enabled_audio_output_channels: vec![1, 2, 3, 4],
             plugin_is_instrument: Some(false),
             multiout_collapsed: true,
+            signal_bus: 0,
             plugin: None,
         });
 
@@ -4655,6 +4670,45 @@ mod tests {
             decoded.mixer.master_inserts[0].plugin_is_instrument,
             Some(false),
             "the registry-resolved effect role must roundtrip"
+        );
+    }
+
+    /// v63 keeps which bus a plug-in sits on, and which send is the
+    /// wet/dry/wet split. A file from the previous version has neither
+    /// byte and comes back as a main-bus insert and an ordinary send.
+    #[test]
+    fn insert_bus_and_wdw_send_roundtrip_v63_and_default_on_v62() {
+        let mut project = FutureboardProject::new("WDW Bus");
+        let mut track = track_with_clip(empty_clip_with_stretch(sample_stretch()));
+        track.clips.clear();
+        track.inserts.push(ProjectInsert {
+            id: "vst".to_string(),
+            signal_bus: 1,
+            ..ProjectInsert::default()
+        });
+        track.routing.sends.push(ProjectSend {
+            id: "send-wdw".to_string(),
+            target_track_id: "ret-wdw".to_string(),
+            enabled: true,
+            pre_fader: false,
+            gain_db: 0.0,
+            wdw: true,
+        });
+        project.tracks.push(track);
+
+        let decoded = decode_project(&encode_project(&project)).expect("v63 decode");
+        assert_eq!(decoded.tracks[0].inserts[0].signal_bus, 1);
+        assert!(decoded.tracks[0].routing.sends[0].wdw);
+
+        let old = decode_project_with_options(&encode_project_as(&project, 62), true)
+            .expect("v62 decode");
+        assert_eq!(
+            old.tracks[0].inserts[0].signal_bus, 0,
+            "a pre-v63 insert stays on the main bus"
+        );
+        assert!(
+            !old.tracks[0].routing.sends[0].wdw,
+            "a pre-v63 send is not a wet/dry/wet split"
         );
     }
 

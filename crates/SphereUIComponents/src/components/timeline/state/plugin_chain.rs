@@ -290,6 +290,41 @@ pub struct PluginParameterState {
     pub unit: String,
 }
 
+/// Which mix bus an insert processes on.
+///
+/// `Main` is the track's own chain, and the only bus an older project has.
+/// `Wdw` is the wet/dry/wet send/return created while a Rodhareist split is
+/// on: the instance stays on this track, and the graph runs it on that return.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InsertSignalBus {
+    #[default]
+    Main,
+    Wdw,
+}
+
+impl InsertSignalBus {
+    pub fn from_tag(tag: u8) -> Self {
+        match tag {
+            1 => Self::Wdw,
+            _ => Self::Main,
+        }
+    }
+
+    pub fn tag(self) -> u8 {
+        match self {
+            Self::Main => 0,
+            Self::Wdw => 1,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Main => "Main",
+            Self::Wdw => "WDW",
+        }
+    }
+}
+
 /// UI-side mirror of `project::ProjectInsert`. The runtime owns the
 /// actual plugin processor; this struct only stores descriptor +
 /// transient UI state (bypass, load status, last-seen parameters).
@@ -342,6 +377,8 @@ pub struct InsertSlotState {
     pub multiout_collapsed: bool,
     /// When true, open the plugin editor once runtime reaches Active/Loaded.
     pub pending_open_editor: bool,
+    /// Mix bus this insert processes on. Missing project data is [`InsertSignalBus::Main`].
+    pub signal_bus: InsertSignalBus,
     /// Opaque per-plugin state bytes for project persistence. Despite the
     /// name, this is not VST3-specific: `timeline_insert_to_project` /
     /// `project_insert_to_timeline` round-trip it for *any* `plugin_id`,
@@ -391,6 +428,7 @@ impl InsertSlotState {
             active_output_buses: None,
             multiout_collapsed: false,
             pending_open_editor: false,
+            signal_bus: InsertSignalBus::Main,
             vst3_state: None,
         }
     }
@@ -616,6 +654,46 @@ impl TimelineState {
         self.insert_slots(track_id)?
             .iter()
             .find(|slot| slot.id == insert_id)
+    }
+
+    /// Put a VST3 insert on the main chain or the wet/dry/wet return.
+    ///
+    /// The wet bus is only a choice while that return exists and its send is
+    /// on. Anything else stays on the main bus: the selector cannot store a
+    /// bus the graph will not run.
+    pub fn set_insert_signal_bus(
+        &mut self,
+        track_id: &str,
+        insert_id: &str,
+        bus: InsertSignalBus,
+    ) -> bool {
+        if bus == InsertSignalBus::Wdw && !self.track_has_live_wdw_return(track_id) {
+            return false;
+        }
+        let Some(slot) = self
+            .insert_slots_mut(track_id)
+            .and_then(|slots| slots.iter_mut().find(|slot| slot.id == insert_id))
+        else {
+            return false;
+        };
+        if slot.plugin_format != Some(InsertPluginFormat::Vst3) || slot.signal_bus == bus {
+            return false;
+        }
+        slot.signal_bus = bus;
+        true
+    }
+
+    pub fn track_has_live_wdw_return(&self, track_id: &str) -> bool {
+        let Some(track) = self.tracks.iter().find(|track| track.id == track_id) else {
+            return false;
+        };
+        track.sends.iter().any(|send| {
+            send.wdw
+                && send.enabled
+                && self.tracks.iter().any(|target| {
+                    target.id == send.target_track_id && target.track_type == TrackType::Return
+                })
+        })
     }
 
     pub fn insert_owner_ids_containing(&self, insert_id: &str) -> Vec<String> {

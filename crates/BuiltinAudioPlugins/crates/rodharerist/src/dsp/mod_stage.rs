@@ -57,11 +57,20 @@ impl ModStage {
             // two phaser voices is the exception: `Phaser::configure` swaps
             // the cascade itself and clears only what the new one cannot use.
             match model {
-                ModModel::Chorus | ModModel::Dimension | ModModel::TriChorus => self.chorus.reset(),
-                ModModel::Flanger | ModModel::ThruZero | ModModel::SlowJet => self.flanger.reset(),
-                ModModel::Tremolo | ModModel::HarmonicTrem | ModModel::BiasTrem => {
-                    self.tremolo.reset()
-                }
+                ModModel::Chorus
+                | ModModel::Dimension
+                | ModModel::TriChorus
+                | ModModel::RazorChorus => self.chorus.reset(),
+                ModModel::Flanger
+                | ModModel::ThruZero
+                | ModModel::SlowJet
+                | ModModel::MetalJet
+                | ModModel::StabFlange => self.flanger.reset(),
+                ModModel::Tremolo
+                | ModModel::HarmonicTrem
+                | ModModel::BiasTrem
+                | ModModel::ChopTrem
+                | ModModel::SquareTrem => self.tremolo.reset(),
                 _ => {}
             }
         }
@@ -77,6 +86,12 @@ impl ModStage {
                 self.chorus
                     .configure_voice(rate, depth, mix, super::chorus::ChorusVoice::tri())
             }
+            ModModel::RazorChorus => self.chorus.configure_voice(
+                rate,
+                depth,
+                mix,
+                super::chorus::ChorusVoice::razor(),
+            ),
             ModModel::Flanger => self.flanger.configure(rate, depth, mix),
             ModModel::ThruZero => self.flanger.configure_voice(
                 rate,
@@ -88,6 +103,18 @@ impl ModStage {
                 self.flanger
                     .configure_voice(rate, depth, mix, super::flanger::FlangerVoice::slow())
             }
+            ModModel::MetalJet => self.flanger.configure_voice(
+                rate,
+                depth,
+                mix,
+                super::flanger::FlangerVoice::metal(),
+            ),
+            ModModel::StabFlange => self.flanger.configure_voice(
+                rate,
+                depth,
+                mix,
+                super::flanger::FlangerVoice::stab(),
+            ),
             ModModel::Tremolo => self.tremolo.configure(rate, depth, mix),
             ModModel::HarmonicTrem => {
                 self.tremolo
@@ -96,6 +123,14 @@ impl ModStage {
             ModModel::BiasTrem => {
                 self.tremolo
                     .configure_kind(rate, depth, mix, super::tremolo::TremKind::Bias)
+            }
+            ModModel::ChopTrem => {
+                self.tremolo
+                    .configure_kind(rate, depth, mix, super::tremolo::TremKind::Chop)
+            }
+            ModModel::SquareTrem => {
+                self.tremolo
+                    .configure_kind(rate, depth, mix, super::tremolo::TremKind::Square)
             }
             other => {
                 // Every remaining model is a voiced phaser.
@@ -109,15 +144,20 @@ impl ModStage {
     #[inline]
     pub(super) fn process(&mut self, left: f32, right: f32) -> (f32, f32) {
         match self.model {
-            ModModel::Chorus | ModModel::Dimension | ModModel::TriChorus => {
-                self.chorus.process(left, right)
-            }
-            ModModel::Flanger | ModModel::ThruZero | ModModel::SlowJet => {
-                self.flanger.process(left, right)
-            }
-            ModModel::Tremolo | ModModel::HarmonicTrem | ModModel::BiasTrem => {
-                self.tremolo.process(left, right)
-            }
+            ModModel::Chorus
+            | ModModel::Dimension
+            | ModModel::TriChorus
+            | ModModel::RazorChorus => self.chorus.process(left, right),
+            ModModel::Flanger
+            | ModModel::ThruZero
+            | ModModel::SlowJet
+            | ModModel::MetalJet
+            | ModModel::StabFlange => self.flanger.process(left, right),
+            ModModel::Tremolo
+            | ModModel::HarmonicTrem
+            | ModModel::BiasTrem
+            | ModModel::ChopTrem
+            | ModModel::SquareTrem => self.tremolo.process(left, right),
             _ => self.phaser.process(left, right),
         }
     }

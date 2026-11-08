@@ -557,6 +557,7 @@ mod tests {
             level_lane: None,
             enabled_lane: None,
             pdc: PdcDelayLine::default(),
+            wdw: false,
         }
     }
 

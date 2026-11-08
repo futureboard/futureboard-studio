@@ -40,6 +40,17 @@ impl ChorusVoice {
         }
     }
 
+    /// Deep and fast. The second line sits a half cycle away.
+    pub(super) fn razor() -> Self {
+        Self {
+            base_s: 0.014,
+            depth_s: 0.010,
+            rate_lo: 0.6,
+            rate_span: 9.0,
+            phase: 0.5,
+        }
+    }
+
     /// Longer and slower, the second line a third of a cycle away.
     pub(super) fn tri() -> Self {
         Self {

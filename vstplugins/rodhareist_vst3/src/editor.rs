@@ -120,6 +120,8 @@ impl PluginEditor {
         })
         .detach();
 
+        // A model change that arrived while this editor was closed.
+        params.wire.refresh_host_names();
         Self {
             seen: params.wire.values(),
             answers: shared.answers(),
@@ -153,6 +155,9 @@ impl PluginEditor {
         let values = self.params.wire.values();
         if values != self.seen {
             self.seen = values;
+            // Host automation of a model (the editor did not call
+            // `set_from_editor`) still has to rename the MIDI titles.
+            self.params.wire.refresh_host_names();
             self.window
                 .update(cx, |window, cx| window.sync_from_mirror(cx));
         }

@@ -26,6 +26,10 @@ pub(super) enum TremKind {
     Opto,
     Harmonic,
     Bias,
+    /// Fast, and the wave is already close to a square.
+    Chop,
+    /// The shape floor sits near a square even with the mix knob low.
+    Square,
 }
 
 impl Tremolo {
@@ -72,12 +76,20 @@ impl Tremolo {
             TremKind::Harmonic => (0.4, 8.0, 1.0),
             // Slower, and it never chops all the way down.
             TremKind::Bias => (0.15, 4.5, 0.55),
+            TremKind::Chop => (2.5, 14.0, 1.0),
+            TremKind::Square => (1.2, 10.0, 1.0),
         };
         let rate_hz = lo + (rate / 10.0).clamp(0.0, 1.0) * span;
         self.lfo.set_rate(rate_hz, self.sample_rate);
         self.depth
             .set_target((depth / 10.0).clamp(0.0, 1.0) * depth_scale);
-        self.shape.set_target((shape / 100.0).clamp(0.0, 1.0));
+        let shape = (shape / 100.0).clamp(0.0, 1.0);
+        let shape = match kind {
+            TremKind::Chop => shape.max(0.72),
+            TremKind::Square => shape.max(0.92),
+            _ => shape,
+        };
+        self.shape.set_target(shape);
     }
 
     #[inline]
@@ -92,7 +104,7 @@ impl Tremolo {
         // Unipolar gain, 1 at LFO peak, (1 - depth) at trough.
         let wave = shaped.clamp(-1.0, 1.0);
         match self.kind {
-            TremKind::Opto | TremKind::Bias => {
+            TremKind::Opto | TremKind::Bias | TremKind::Chop | TremKind::Square => {
                 let gain = 1.0 - depth * 0.5 * (1.0 - wave);
                 (left * gain, right * gain)
             }

@@ -30,6 +30,9 @@ pub struct SendSlotState {
     /// Realtime currently honours post-fader only (pre-fader is a refinement).
     pub pre_fader: bool,
     pub gain_db: f32,
+    /// Created for a Rodhareist wet/dry/wet split. Ordinary sends are `false`,
+    /// including every send loaded from a project that predates the split.
+    pub wdw: bool,
     /// What its automation lanes play at the playhead — `(on, gain dB)` — when
     /// a lane in Read has something to say. UI-only, refreshed on the playback
     /// tick by [`TimelineState::recompute_effective_volumes`]; `gain_db` and
@@ -663,6 +666,7 @@ impl TimelineState {
             enabled: true,
             pre_fader: false,
             gain_db: 0.0,
+            wdw: false,
             automated: None,
         });
         if routing_debug_enabled() {
@@ -815,6 +819,228 @@ impl TimelineState {
         send.enabled = !send.enabled;
         Some(send.enabled)
     }
+
+    /// Bring every track's wet/dry/wet send in line with the Rodhareist
+    /// inserts actually on it. A track that is not split gains nothing.
+    pub fn sync_all_wdw_splits(&mut self) -> bool {
+        let ids: Vec<String> = self.tracks.iter().map(|track| track.id.clone()).collect();
+        let mut changed = false;
+        for id in ids {
+            changed |= self.sync_wdw_split(&id);
+        }
+        changed
+    }
+
+    /// One send and one return while a Rodhareist wet/dry/wet split is on,
+    /// and neither while it is off. Other sends and returns stay.
+    pub fn sync_wdw_split(&mut self, track_id: &str) -> bool {
+        let wants = self
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .is_some_and(|track| track.inserts.iter().any(insert_requests_wdw));
+        self.apply_wdw_split(track_id, wants)
+    }
+
+    fn apply_wdw_split(&mut self, track_id: &str, on: bool) -> bool {
+        if !self.tracks.iter().any(|track| track.id == track_id) {
+            return false;
+        }
+        if on {
+            let existing = self
+                .tracks
+                .iter()
+                .find(|track| track.id == track_id)
+                .and_then(|track| track.sends.iter().find(|send| send.wdw))
+                .map(|send| (send.target_track_id.clone(), send.enabled));
+            if let Some((target, enabled)) = existing {
+                let target_ok = self
+                    .tracks
+                    .iter()
+                    .any(|track| track.id == target && track.track_type == TrackType::Return);
+                if target_ok {
+                    if enabled {
+                        return false;
+                    }
+                    if let Some(send) = self
+                        .tracks
+                        .iter_mut()
+                        .find(|track| track.id == track_id)
+                        .and_then(|track| track.sends.iter_mut().find(|send| send.wdw))
+                    {
+                        send.enabled = true;
+                    }
+                    return true;
+                }
+            }
+            if let Some(track) = self.tracks.iter_mut().find(|track| track.id == track_id) {
+                track.sends.retain(|send| !send.wdw);
+            }
+            let name = next_wdw_return_name(self);
+            let return_id = self.create_track(CreateTrackOptions {
+                track_type: TrackType::Return,
+                name,
+                color: self.track_color_for_index(self.tracks.len()),
+                volume: volume::db_to_norm(0.0),
+                pan: 0.0,
+                armed: false,
+                input_monitor: InputMonitorMode::Off,
+            });
+            let Some(send_id) = self.add_send_to_target(track_id, &return_id) else {
+                self.delete_track(&return_id);
+                return false;
+            };
+            if let Some(send) = self
+                .tracks
+                .iter_mut()
+                .find(|track| track.id == track_id)
+                .and_then(|track| track.sends.iter_mut().find(|send| send.id == send_id))
+            {
+                send.wdw = true;
+                send.enabled = true;
+                send.pre_fader = false;
+                send.gain_db = 0.0;
+            }
+            return true;
+        }
+
+        let owned: Vec<(String, String)> = self
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .map(|track| {
+                track
+                    .sends
+                    .iter()
+                    .filter(|send| send.wdw)
+                    .map(|send| (send.id.clone(), send.target_track_id.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if owned.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        for (send_id, target) in owned {
+            if self.wdw_return_is_private(&target, track_id) {
+                self.remove_send(track_id, &send_id);
+                if self.tracks.iter().any(|track| track.id == target) {
+                    self.delete_track(&target);
+                }
+                changed = true;
+            } else if let Some(send) = self
+                .tracks
+                .iter_mut()
+                .find(|track| track.id == track_id)
+                .and_then(|track| track.sends.iter_mut().find(|send| send.id == send_id))
+            {
+                if send.enabled {
+                    send.enabled = false;
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    /// The return was created for this split and nothing else uses it, so
+    /// turning the split off can remove it without touching other routing.
+    fn wdw_return_is_private(&self, return_id: &str, owner_track_id: &str) -> bool {
+        let Some(ret) = self.tracks.iter().find(|track| track.id == return_id) else {
+            return true;
+        };
+        if ret.track_type != TrackType::Return || !ret.inserts.is_empty() || !ret.clips.is_empty() {
+            return false;
+        }
+        !self.tracks.iter().any(|track| {
+            track.sends.iter().any(|send| {
+                send.target_track_id == return_id && !(track.id == owner_track_id && send.wdw)
+            })
+        })
+    }
+}
+
+fn next_wdw_return_name(state: &TimelineState) -> String {
+    let taken = |name: &str| state.tracks.iter().any(|track| track.name == name);
+    if !taken("WDW") {
+        return "WDW".to_string();
+    }
+    let mut index = 2u32;
+    loop {
+        let name = format!("WDW {index}");
+        if !taken(&name) {
+            return name;
+        }
+        index += 1;
+    }
+}
+
+/// Whether this insert's Rodhareist rig is in wet/dry/wet. The live editor
+/// mirror wins over the last saved blob, which lags a gesture until save.
+pub fn insert_requests_wdw(slot: &InsertSlotState) -> bool {
+    let Some(plugin_id) = slot.plugin_id.as_deref() else {
+        return false;
+    };
+    if !is_rodhareist_plugin(plugin_id) {
+        return false;
+    }
+    // The Rodhareist param model ships with the built-in editor. A build
+    // without that feature has no wire to read, so it never grows a split.
+    #[cfg(feature = "builtin-plugin-editor")]
+    {
+        if let Some(params) =
+            crate::components::builtin_plugin_editor::builtin_rodhareist_params(&slot.id)
+        {
+            return rodhareist_params_are_wdw(&params);
+        }
+        let Some(bytes) = slot.vst3_state.as_ref() else {
+            return false;
+        };
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            return false;
+        };
+        return rodharerist::RodhareistState::from_json(text)
+            .map(|state| rodhareist_params_are_wdw(&state.params))
+            .unwrap_or(false);
+    }
+    #[cfg(not(feature = "builtin-plugin-editor"))]
+    {
+        false
+    }
+}
+
+pub fn is_rodhareist_plugin(plugin_id: &str) -> bool {
+    plugin_id
+        .rsplit([':', '/'])
+        .next()
+        .unwrap_or(plugin_id)
+        .eq_ignore_ascii_case("rodharerist")
+}
+
+/// A Rodhareist wire edit that can turn the studio split on or off.
+pub fn rodhareist_wdw_wire(plugin_id: &str, index: u32) -> bool {
+    #[cfg(feature = "builtin-plugin-editor")]
+    {
+        return is_rodhareist_plugin(plugin_id)
+            && matches!(
+                rodharerist::ui_param_id(index),
+                Some("line2_mode" | "row_send_1" | "row_send_2" | "row_send_3")
+            );
+    }
+    #[cfg(not(feature = "builtin-plugin-editor"))]
+    {
+        let _ = (plugin_id, index);
+        false
+    }
+}
+
+#[cfg(feature = "builtin-plugin-editor")]
+fn rodhareist_params_are_wdw(params: &rodharerist::Params) -> bool {
+    params.line2_mode == rodharerist::Line2Mode::WetDryWet
+        || params
+            .row_send
+            .iter()
+            .any(|send| *send == rodharerist::RowSend::WetDryWet)
 }
 
 #[cfg(test)]
@@ -1188,5 +1414,161 @@ mod tests {
         let layout = state.track_row_layout();
         assert_eq!(layout.row_for_track(&bus_id).unwrap().height, 0.0);
         assert!(layout.row_for_track(&audio_id).unwrap().height > 0.0);
+    }
+
+    #[cfg(feature = "builtin-plugin-editor")]
+    fn rodhareist_json(wdw: bool) -> std::sync::Arc<Vec<u8>> {
+        let mut params = rodharerist::default_params();
+        if wdw {
+            params.line2_mode = rodharerist::Line2Mode::WetDryWet;
+        }
+        let json = rodharerist::RodhareistState::new(params)
+            .to_json()
+            .expect("rodhareist state");
+        std::sync::Arc::new(json.into_bytes())
+    }
+
+    #[cfg(feature = "builtin-plugin-editor")]
+    fn install_rodhareist(state: &mut TimelineState, track_id: &str, wdw: bool) -> String {
+        let slot_id = state.add_insert(track_id).expect("insert");
+        let slot = state
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == track_id)
+            .and_then(|track| track.inserts.iter_mut().find(|slot| slot.id == slot_id))
+            .expect("slot");
+        slot.plugin_id = Some("builtin:rodharerist".to_string());
+        slot.display_name = "Rodhareist".to_string();
+        slot.vst3_state = Some(rodhareist_json(wdw));
+        slot_id
+    }
+
+    #[cfg(feature = "builtin-plugin-editor")]
+    fn wdw_sends<'a>(state: &'a TimelineState, track_id: &str) -> Vec<&'a SendSlotState> {
+        state
+            .find_track(track_id)
+            .unwrap()
+            .sends
+            .iter()
+            .filter(|send| send.wdw)
+            .collect()
+    }
+
+    #[cfg(feature = "builtin-plugin-editor")]
+    #[test]
+    fn wdw_off_does_not_grow_a_send() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let audio = create_track(&mut state, TrackType::Audio, "Guitar");
+        install_rodhareist(&mut state, &audio, false);
+        let before = state.tracks.len();
+        assert!(!state.sync_wdw_split(&audio));
+        assert!(wdw_sends(&state, &audio).is_empty());
+        assert_eq!(state.tracks.len(), before);
+        assert!(!state.sync_all_wdw_splits());
+    }
+
+    #[cfg(feature = "builtin-plugin-editor")]
+    #[test]
+    fn wdw_on_creates_one_send_and_keeps_other_routing() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let audio = create_track(&mut state, TrackType::Audio, "Guitar");
+        let hall = create_track(&mut state, TrackType::Return, "Hall");
+        let user_send = state.add_send_to_target(&audio, &hall).expect("user send");
+        install_rodhareist(&mut state, &audio, true);
+
+        assert!(state.sync_wdw_split(&audio));
+        assert!(!state.sync_wdw_split(&audio), "a second sync is a no-op");
+        let sends = wdw_sends(&state, &audio);
+        assert_eq!(sends.len(), 1);
+        assert!(sends[0].enabled);
+        assert!(!sends[0].pre_fader);
+        let return_id = sends[0].target_track_id.clone();
+        let ret = state.find_track(&return_id).unwrap();
+        assert_eq!(ret.track_type, TrackType::Return);
+        assert_eq!(ret.name, "WDW");
+        assert!(state
+            .find_track(&audio)
+            .unwrap()
+            .sends
+            .iter()
+            .any(|send| send.id == user_send && !send.wdw));
+
+        // The rig leaves wet/dry/wet. The private return goes with it.
+        // The Hall send does not.
+        let slot_id = state.find_track(&audio).unwrap().inserts[0].id.clone();
+        {
+            let slot = state
+                .tracks
+                .iter_mut()
+                .find(|track| track.id == audio)
+                .unwrap()
+                .inserts
+                .iter_mut()
+                .find(|slot| slot.id == slot_id)
+                .unwrap();
+            slot.vst3_state = Some(rodhareist_json(false));
+        }
+        assert!(state.sync_wdw_split(&audio));
+        assert!(wdw_sends(&state, &audio).is_empty());
+        assert!(state.find_track(&return_id).is_none());
+        assert!(state.find_track(&hall).is_some());
+        assert_eq!(
+            state.find_track(&audio).unwrap().sends.len(),
+            1,
+            "the user's send stays"
+        );
+        assert_eq!(state.find_track(&audio).unwrap().sends[0].id, user_send);
+    }
+
+    #[cfg(feature = "builtin-plugin-editor")]
+    #[test]
+    fn wdw_vst3_bus_choice_needs_a_live_return() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let audio = create_track(&mut state, TrackType::Audio, "Guitar");
+        install_rodhareist(&mut state, &audio, false);
+        let vst = state.add_insert(&audio).expect("vst");
+        {
+            let slot = state
+                .tracks
+                .iter_mut()
+                .find(|track| track.id == audio)
+                .unwrap()
+                .inserts
+                .iter_mut()
+                .find(|slot| slot.id == vst)
+                .unwrap();
+            slot.plugin_format = Some(InsertPluginFormat::Vst3);
+            slot.plugin_id = Some("vst3:test".to_string());
+        }
+        assert!(!state.set_insert_signal_bus(&audio, &vst, InsertSignalBus::Wdw));
+        assert_eq!(
+            state.find_insert_slot(&audio, &vst).unwrap().signal_bus,
+            InsertSignalBus::Main
+        );
+
+        let slot_id = state.find_track(&audio).unwrap().inserts[0].id.clone();
+        {
+            let slot = state
+                .tracks
+                .iter_mut()
+                .find(|track| track.id == audio)
+                .unwrap()
+                .inserts
+                .iter_mut()
+                .find(|slot| slot.id == slot_id)
+                .unwrap();
+            slot.vst3_state = Some(rodhareist_json(true));
+        }
+        assert!(state.sync_wdw_split(&audio));
+        assert!(state.set_insert_signal_bus(&audio, &vst, InsertSignalBus::Wdw));
+        assert_eq!(
+            state.find_insert_slot(&audio, &vst).unwrap().signal_bus,
+            InsertSignalBus::Wdw
+        );
+        assert!(state.set_insert_signal_bus(&audio, &vst, InsertSignalBus::Main));
+        assert!(!state.set_insert_signal_bus(&audio, &slot_id, InsertSignalBus::Wdw));
     }
 }

@@ -47,6 +47,28 @@ impl FlangerVoice {
         }
     }
 
+    /// Very short, hard positive regeneration, a fast sweep.
+    pub(super) fn metal() -> Self {
+        Self {
+            base_s: 0.0009,
+            depth_s: 0.0006,
+            rate_lo: 0.5,
+            rate_span: 9.0,
+            feedback: 0.82,
+        }
+    }
+
+    /// Short, negative feedback, faster than the thru-zero voice.
+    pub(super) fn stab() -> Self {
+        Self {
+            base_s: 0.0014,
+            depth_s: 0.0010,
+            rate_lo: 0.8,
+            rate_span: 7.0,
+            feedback: -0.74,
+        }
+    }
+
     /// Slower, longer, more regeneration.
     pub(super) fn slow() -> Self {
         Self {

@@ -2021,6 +2021,9 @@ fn render_project_block_interleaved_core(
                 audible: true,
             });
         }
+        for job in &jobs {
+            apply_wdw_bus_inserts(runtime, job.track_index, frames, transport);
+        }
         run_track_chains(&mut runtime.tracks, &jobs, frames, transport);
         for job in &jobs {
             let track_index = job.track_index;
@@ -2604,46 +2607,115 @@ pub fn apply_track_chain_block(
     let instrument_ix = track.midi_instrument_insert_ix;
     let midi_events = &track.midi_block_events;
     for (ix, insert) in track.inserts.iter_mut().enumerate() {
+        // Wet/dry/wet inserts stay owned by this track (params, host, editor)
+        // and run later, on the split's return. Skipping them here is what
+        // takes them out of the main chain.
+        if insert.signal_bus == crate::runtime::SIGNAL_BUS_WDW {
+            continue;
+        }
         let midi = instrument_ix
             .filter(|&i| i == ix)
             .map(|_| midi_events.as_slice());
-        // What this one insert costs, so a plug-in's own editor can say what it
-        // is spending. Two clock reads per insert per block, no allocation and
-        // no lock -- the same instrument the callback already applies to itself.
-        let started = std::time::Instant::now();
-        if insert.kind_tag == crate::runtime::RuntimeInsertKind::ExternalBridge {
-            // Arc clone (refcount bump only) so the sink can be borrowed
-            // alongside the &mut insert.
-            let bridge_sink = insert.bridge_sink.clone();
-            apply_external_bridge_insert_block(
-                &mut track.block_l[..frames],
-                &mut track.block_r[..frames],
-                insert,
-                midi,
-                bridge_sink.as_deref(),
-                ix,
-                transport,
-            );
-        } else {
-            apply_insert_block(
-                &mut track.block_l[..frames],
-                &mut track.block_r[..frames],
-                insert,
-                midi,
-                transport,
-            );
-        }
-        publish_insert_cpu(insert, started.elapsed());
-        // Audioguard: an insert writing NaN / infinity is silenced at the
-        // insert, so the next one in the chain never sees it, and bypassed
-        // when it keeps doing it.
-        if insert.active() && crate::audioguard::process_level().protects() {
-            insert
-                .guard
-                .check_output(&mut track.block_l[..frames], &mut track.block_r[..frames]);
-        }
+        process_chain_insert(
+            &mut track.block_l[..frames],
+            &mut track.block_r[..frames],
+            insert,
+            ix,
+            midi,
+            transport,
+        );
     }
     silence_nonfinite_block(&mut track.block_l[..frames], &mut track.block_r[..frames]);
+}
+
+/// Run one insert on `block_*`. The chain and the wet/dry/wet return share
+/// this so a plug-in moved onto the return still goes through the same host.
+fn process_chain_insert(
+    block_l: &mut [f32],
+    block_r: &mut [f32],
+    insert: &mut RuntimeInsert,
+    ix: usize,
+    midi: Option<&[crate::vst3_processor::Vst3MidiEvent]>,
+    transport: RuntimeTransportContext,
+) {
+    // What this one insert costs, so a plug-in's own editor can say what it
+    // is spending. Two clock reads per insert per block, no allocation and
+    // no lock -- the same instrument the callback already applies to itself.
+    let started = std::time::Instant::now();
+    if insert.kind_tag == crate::runtime::RuntimeInsertKind::ExternalBridge {
+        // Arc clone (refcount bump only) so the sink can be borrowed
+        // alongside the &mut insert.
+        let bridge_sink = insert.bridge_sink.clone();
+        apply_external_bridge_insert_block(
+            block_l,
+            block_r,
+            insert,
+            midi,
+            bridge_sink.as_deref(),
+            ix,
+            transport,
+        );
+    } else {
+        apply_insert_block(block_l, block_r, insert, midi, transport);
+    }
+    publish_insert_cpu(insert, started.elapsed());
+    // Audioguard: an insert writing NaN / infinity is silenced at the
+    // insert, so the next one in the chain never sees it, and bypassed
+    // when it keeps doing it.
+    if insert.active() && crate::audioguard::process_level().protects() {
+        insert.guard.check_output(block_l, block_r);
+    }
+}
+
+/// Source index of the enabled wet/dry/wet send that feeds `return_index`.
+/// A scan of the send list, no allocation and no id lookup: the return index
+/// was resolved when the graph was built.
+fn wdw_source_index(tracks: &[RuntimeTrack], return_index: usize) -> Option<usize> {
+    tracks.iter().position(|track| {
+        track
+            .sends
+            .iter()
+            .any(|send| send.wdw && send.enabled && send.return_track_index == Some(return_index))
+    })
+}
+
+/// Run the source track's wet/dry/wet inserts on the return's block.
+///
+/// Called after the return has copied its receive buffer and before its own
+/// inserts, on the audio thread, one return at a time. The source track is
+/// finished for this block, so borrowing its inserts here does not alias a
+/// chain that is still running.
+fn apply_wdw_bus_inserts(
+    runtime: &mut RuntimeProject,
+    return_index: usize,
+    frames: usize,
+    transport: RuntimeTransportContext,
+) {
+    let Some(src) = wdw_source_index(&runtime.tracks, return_index) else {
+        return;
+    };
+    if src == return_index || src >= runtime.tracks.len() {
+        return;
+    }
+    let (src_track, ret) = two_mut(&mut runtime.tracks, src, return_index);
+    let frames = frames.min(ret.block_l.len()).min(ret.block_r.len());
+    if frames == 0 {
+        return;
+    }
+    for (ix, insert) in src_track.inserts.iter_mut().enumerate() {
+        if insert.signal_bus != crate::runtime::SIGNAL_BUS_WDW {
+            continue;
+        }
+        process_chain_insert(
+            &mut ret.block_l[..frames],
+            &mut ret.block_r[..frames],
+            insert,
+            ix,
+            None,
+            transport,
+        );
+    }
+    silence_nonfinite_block(&mut ret.block_l[..frames], &mut ret.block_r[..frames]);
 }
 
 /// Replace a block holding NaN or infinity with silence, at the channel that

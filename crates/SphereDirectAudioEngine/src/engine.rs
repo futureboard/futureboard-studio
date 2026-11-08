@@ -8043,6 +8043,7 @@ mod bridge_insert_tests {
                 vsti_output_children: Vec::new(),
                 scratch_multi: Vec::new(),
                 chain_latency_samples: 0,
+                signal_bus: 0,
             }],
             sends: Vec::new(),
             automation_lanes: Vec::new(),
@@ -8381,6 +8382,7 @@ mod bridge_insert_tests {
             level_lane: None,
             enabled_lane: None,
             pdc: Default::default(),
+            wdw: false,
         }];
         let mut ret = bridge_effect_track(1.0);
         ret.id = "ret".to_string();
@@ -8551,6 +8553,7 @@ mod bridge_insert_tests {
             vsti_output_children: Vec::new(),
             scratch_multi: Vec::new(),
             chain_latency_samples: 0,
+            signal_bus: 0,
         }
     }
 
@@ -8928,6 +8931,7 @@ mod routing_tests {
             level_lane: None,
             enabled_lane: None,
             pdc: Default::default(),
+            wdw: false,
         }
     }
 

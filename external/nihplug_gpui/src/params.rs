@@ -18,6 +18,7 @@ mod boolean;
 pub mod enums;
 mod float;
 mod integer;
+mod name_cell;
 
 pub mod internals;
 pub mod persist;

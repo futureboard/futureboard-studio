@@ -46,8 +46,8 @@ use crate::components::text_input::{
 };
 use crate::components::timeline::timeline_state::{
     volume, vsti_output_child_channels_for_bus_layout, AudioClipStretchState, ClipType,
-    InsertLoadStatus, InsertSlotState, StretchTiming, TrackAudioFormat, TrackMidiInputRouting,
-    TrackOutputRouting, TrackState, TrackType,
+    InsertLoadStatus, InsertPluginFormat, InsertSignalBus, InsertSlotState, StretchTiming,
+    TrackAudioFormat, TrackMidiInputRouting, TrackOutputRouting, TrackState, TrackType,
 };
 use crate::i18n::I18n;
 use crate::overlay::{inspector_combo_menu_position, OverlayAnchor};
@@ -73,6 +73,7 @@ type MpeConfigurationCb =
 type ProgramSelectionCb =
     Arc<dyn Fn(&(String, MidiProgramSelection), &mut Window, &mut App) + 'static>;
 type InsertPairCb = Arc<dyn Fn(&(String, String), &mut Window, &mut App) + 'static>;
+type InsertBusCb = Arc<dyn Fn(&(String, String, InsertSignalBus), &mut Window, &mut App) + 'static>;
 type InsertOpenCb = Arc<dyn Fn(&(String, usize, String), &mut Window, &mut App) + 'static>;
 type InsertPickerCb = Arc<dyn Fn(&(String, usize, bool), &mut Window, &mut App) + 'static>;
 type InsertOutputChannelCb =
@@ -198,6 +199,8 @@ pub struct InspectorCallbacks {
     pub on_open_insert_picker: InsertPickerCb,
     pub on_remove_insert: InsertPairCb,
     pub on_toggle_insert_bypass: InsertPairCb,
+    /// Move a VST3 insert between the main chain and the wet/dry/wet return.
+    pub on_set_insert_bus: InsertBusCb,
     pub on_toggle_insert_enabled: InsertPairCb,
     pub on_toggle_insert_output_channel: InsertOutputChannelCb,
     /// Drop commit for a dragged FX/insert slot — a reorder within its chain or
@@ -271,6 +274,7 @@ impl InspectorCallbacks {
             on_open_insert_picker: noop(),
             on_remove_insert: noop(),
             on_toggle_insert_bypass: noop(),
+            on_set_insert_bus: Arc::new(|_: &(String, String, InsertSignalBus), _, _| {}),
             on_toggle_insert_enabled: noop(),
             on_toggle_insert_output_channel: noop(),
             on_drop_insert: noop(),
@@ -2137,6 +2141,41 @@ fn plugin_state_label(slot: &InsertSlotState) -> String {
 ///
 /// # The instrument row does not drag
 ///
+const INSERT_BUS_OPTIONS: &[InspectorSelectOption<InsertSignalBus>] = &[
+    InspectorSelectOption {
+        label: "Main",
+        value: InsertSignalBus::Main,
+    },
+    InspectorSelectOption {
+        label: "WDW",
+        value: InsertSignalBus::Wdw,
+    },
+];
+
+/// Bus for a VST3 effect while the track's wet/dry/wet return is live.
+/// Main keeps it in this channel's chain. WDW runs it on that return.
+fn insert_bus_row(
+    track: &TrackState,
+    slot: &InsertSlotState,
+    callbacks: &InspectorCallbacks,
+) -> impl IntoElement {
+    let track_id = track.id.clone();
+    let insert_id = slot.id.clone();
+    let on_set = callbacks.on_set_insert_bus.clone();
+    field_row(
+        "Bus",
+        inspector_select(
+            gpui::SharedString::from(format!("insert-bus-{}", slot.id)),
+            slot.signal_bus,
+            INSERT_BUS_OPTIONS,
+            false,
+            move |bus, window, cx| {
+                on_set(&(track_id.clone(), insert_id.clone(), bus), window, cx);
+            },
+        ),
+    )
+}
+
 /// Which slot is the instrument is decided by position (slot 0), so the
 /// instrument row is click-only: it is neither a drag source nor a drop
 /// target, and nothing can be dropped in front of it. An effect row owns
@@ -2786,6 +2825,7 @@ fn insert_effects_section(track: &TrackState, callbacks: &InspectorCallbacks) ->
     let mut chain = div().flex().flex_col();
 
     let effects = track.effect_inserts();
+    let wdw_live = track.sends.iter().any(|send| send.wdw && send.enabled);
     for (offset, slot) in effects.iter().enumerate() {
         chain = chain.child(plugin_slot_row(
             track,
@@ -2796,6 +2836,9 @@ fn insert_effects_section(track: &TrackState, callbacks: &InspectorCallbacks) ->
             false,
             row_gap,
         ));
+        if wdw_live && slot.plugin_format == Some(InsertPluginFormat::Vst3) {
+            chain = chain.child(insert_bus_row(track, slot, callbacks));
+        }
     }
     // End of the chain — rendered for an empty chain too, so it can take a
     // plug-in dragged from another channel. Rows cover the places in front of
