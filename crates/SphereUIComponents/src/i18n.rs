@@ -307,36 +307,53 @@ mod tests {
                     i18n.tr(locale.language_key())
                 );
             }
+            if ui != Locale::EnUs {
+                assert_ne!(
+                    i18n.tr(Locale::LoLa.language_key()),
+                    I18n::new(Locale::EnUs.code()).tr(Locale::LoLa.language_key()),
+                    "{} leaves `{}` untranslated",
+                    ui.code(),
+                    Locale::LoLa.language_key()
+                );
+            }
         }
+        assert_eq!(I18n::new("en-US").tr("settings.language.lo"), "Lao");
+        assert_eq!(I18n::new("ja-JP").tr("settings.language.lo"), "ラオ語");
+        assert_eq!(I18n::new("lo-LA").tr("settings.language.lo"), "ລາວ");
+        assert_eq!(I18n::new("th-TH").tr("settings.language.lo"), "ลาว");
+        assert_eq!(I18n::new("zh-CN").tr("settings.language.lo"), "老挝语");
     }
 
-    /// #215: every key the UI code asks for must be defined by every shipped
-    /// locale, English included. A key counts as asked for when it is passed
-    /// literally to `tr`/`tr_vars`, or when it appears as a string literal and
-    /// some shipped catalog defines it (keys reached through `label_key()`
-    /// tables). `tr_or` keys that no catalog defines carry their own English
-    /// fallback and are not checked here.
+    /// #215, #259: every shipped locale, English included, must define every
+    /// key the UI can ask for. That is every key any shipped catalog defines
+    /// (so a stale `en-US` copy cannot silently drop a key the translations
+    /// still carry), every key passed literally to `tr`/`tr_vars`, and every
+    /// key reached through a table: `Locale::language_key` (the language
+    /// picker) and `SettingsTab::label_key` (the settings sidebar). The tables
+    /// are listed explicitly so a key dropped from *every* catalog at once is
+    /// still caught. `tr_or` keys that no catalog defines carry their own
+    /// English fallback and are not checked here.
     #[test]
     fn every_key_the_code_asks_for_exists_in_every_locale() {
         let catalogs: BTreeMap<String, BTreeSet<String>> = shipped_catalogs()
             .into_iter()
             .map(|(code, source)| (code, catalog_keys(&source)))
             .collect();
-        let known: BTreeSet<&String> = catalogs.values().flatten().collect();
-
+        let mut asked: BTreeSet<String> = catalogs.values().flatten().cloned().collect();
+        for locale in Locale::ALL {
+            asked.insert(locale.language_key().to_string());
+        }
+        for tab in crate::components::settings_dialog::SettingsTab::all() {
+            asked.insert(tab.label_key().to_string());
+        }
         let mut files = Vec::new();
         rust_sources(Path::new(SRC_DIR), &mut files);
-        let mut asked = BTreeSet::new();
         for file in &files {
             let source = std::fs::read_to_string(file).expect("read source");
             direct_tr_keys(&source, &mut asked);
-            for literal in source.split('"').skip(1) {
-                if looks_like_key(literal) && known.contains(&literal.to_string()) {
-                    asked.insert(literal.to_string());
-                }
-            }
         }
         assert!(asked.contains("settings.tab.experimental"));
+        assert!(asked.contains("settings.language.lo"));
 
         let mut missing = Vec::new();
         for (code, keys) in &catalogs {
