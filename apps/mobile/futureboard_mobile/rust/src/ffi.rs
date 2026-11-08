@@ -2,14 +2,64 @@
 
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
-use std::sync::Mutex;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use serde::Deserialize;
 
-use crate::engine::{StudioMobileEngine, TrackKind};
+use crate::engine::{MicInputRing, StudioMobileEngine, TrackKind};
+use crate::plugin_host::plugin_catalog;
 
 pub struct FbEngineHandle {
     inner: Mutex<StudioMobileEngine>,
+    mic_ring: Arc<MicInputRing>,
+    lock_misses: AtomicU32,
+}
+
+impl FbEngineHandle {
+    pub fn new(sample_rate: u32) -> Self {
+        let engine = StudioMobileEngine::new(sample_rate);
+        let mic_ring = engine.mic_ring();
+        Self {
+            inner: Mutex::new(engine),
+            mic_ring,
+            lock_misses: AtomicU32::new(0),
+        }
+    }
+
+    pub fn lock(&self) -> MutexGuard<'_, StudioMobileEngine> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub fn try_lock(&self) -> Option<MutexGuard<'_, StudioMobileEngine>> {
+        match self.inner.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
+            Err(TryLockError::WouldBlock) => None,
+        }
+    }
+
+    /// Non-blocking audio-thread render: uses `try_lock` and outputs silence if a control
+    /// call currently holds the engine mutex.
+    pub fn render_realtime(&self, out_interleaved: &mut [f32], frames: usize) -> bool {
+        let Some(mut engine) = self.try_lock() else {
+            out_interleaved.fill(0.0);
+            self.lock_misses.fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        engine.render_interleaved_stereo(out_interleaved, frames);
+        true
+    }
+
+    /// Lock-free audio-thread microphone push into the bounded SPSC ring buffer.
+    pub fn push_mic_input_realtime(&self, in_samples: &[f32], channels: usize) -> usize {
+        self.mic_ring.push_interleaved(in_samples, channels.max(1))
+    }
+
+    pub fn lock_misses(&self) -> u32 {
+        self.lock_misses.load(Ordering::Relaxed)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -157,10 +207,7 @@ fn from_c_str(ptr: *const c_char) -> Option<String> {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fb_engine_new(sample_rate: u32) -> *mut FbEngineHandle {
-    let engine = StudioMobileEngine::new(sample_rate);
-    Box::into_raw(Box::new(FbEngineHandle {
-        inner: Mutex::new(engine),
-    }))
+    Box::into_raw(Box::new(FbEngineHandle::new(sample_rate)))
 }
 
 #[unsafe(no_mangle)]
@@ -190,12 +237,15 @@ pub unsafe extern "C" fn fb_engine_render_f32(
     if handle.is_null() || out_interleaved.is_null() || frames == 0 {
         return;
     }
-    let slice = unsafe { std::slice::from_raw_parts_mut(out_interleaved, (frames as usize) * 2) };
-    let Ok(mut engine) = (unsafe { (*handle).inner.lock() }) else {
+    let len = (frames as usize).saturating_mul(2);
+    let res = catch_unwind(AssertUnwindSafe(|| unsafe {
+        let slice = std::slice::from_raw_parts_mut(out_interleaved, len);
+        (*handle).render_realtime(slice, frames as usize);
+    }));
+    if res.is_err() {
+        let slice = unsafe { std::slice::from_raw_parts_mut(out_interleaved, len) };
         slice.fill(0.0);
-        return;
-    };
-    engine.render_interleaved_stereo(slice, frames as usize);
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -208,10 +258,10 @@ pub unsafe extern "C" fn fb_engine_push_mic_input(
     if handle.is_null() || in_samples.is_null() || sample_count == 0 {
         return;
     }
-    let slice = unsafe { std::slice::from_raw_parts(in_samples, sample_count as usize) };
-    if let Ok(mut engine) = unsafe { (*handle).inner.lock() } {
-        engine.push_mic_input_interleaved(slice, channels.max(1) as usize);
-    }
+    let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
+        let slice = std::slice::from_raw_parts(in_samples, sample_count as usize);
+        (*handle).push_mic_input_realtime(slice, channels.max(1) as usize);
+    }));
 }
 
 #[unsafe(no_mangle)]
@@ -339,10 +389,12 @@ pub unsafe extern "C" fn fb_engine_get_snapshot_json(handle: *mut FbEngineHandle
     if handle.is_null() {
         return to_c_string("{}".to_string());
     }
-    let Ok(mut engine) = (unsafe { (*handle).inner.lock() }) else {
-        return to_c_string("{}".to_string());
+    let snap = {
+        let Ok(mut engine) = (unsafe { (*handle).inner.lock() }) else {
+            return to_c_string("{}".to_string());
+        };
+        engine.snapshot()
     };
-    let snap = engine.snapshot();
     to_c_string(serde_json::to_string(&snap).unwrap_or_else(|_| "{}".to_string()))
 }
 
@@ -351,10 +403,12 @@ pub unsafe extern "C" fn fb_engine_get_telemetry_json(handle: *mut FbEngineHandl
     if handle.is_null() {
         return to_c_string("{}".to_string());
     }
-    let Ok(engine) = (unsafe { (*handle).inner.lock() }) else {
-        return to_c_string("{}".to_string());
+    let tel = {
+        let Ok(engine) = (unsafe { (*handle).inner.lock() }) else {
+            return to_c_string("{}".to_string());
+        };
+        engine.telemetry()
     };
-    let tel = engine.telemetry();
     to_c_string(serde_json::to_string(&tel).unwrap_or_else(|_| "{}".to_string()))
 }
 
@@ -363,10 +417,7 @@ pub unsafe extern "C" fn fb_engine_get_catalog_json(handle: *mut FbEngineHandle)
     if handle.is_null() {
         return to_c_string("[]".to_string());
     }
-    let Ok(engine) = (unsafe { (*handle).inner.lock() }) else {
-        return to_c_string("[]".to_string());
-    };
-    let cat = engine.catalog();
+    let cat = plugin_catalog();
     to_c_string(serde_json::to_string(&cat).unwrap_or_else(|_| "[]".to_string()))
 }
 

@@ -837,15 +837,9 @@ impl BuiltinPluginInstance {
                 }
             }
             BuiltinDsp::Wrapsynth { dsp, scratch } => {
-                if scratch.len() < frames * 2 {
-                    scratch.resize(frames * 2, 0.0);
-                }
-                scratch[..frames * 2].fill(0.0);
-                dsp.process_block(&mut scratch[..frames * 2], frames);
-                for i in 0..frames {
-                    left[i] += scratch[i * 2];
-                    right[i] += scratch[i * 2 + 1];
-                }
+                add_interleaved_instrument(scratch, left, right, frames, |buf, n| {
+                    dsp.process_block(buf, n)
+                });
             }
             BuiltinDsp::Meowsyn(d) => {
                 for i in 0..frames {
@@ -862,26 +856,14 @@ impl BuiltinPluginInstance {
                 }
             }
             BuiltinDsp::Quicksampler { dsp, scratch } => {
-                if scratch.len() < frames * 2 {
-                    scratch.resize(frames * 2, 0.0);
-                }
-                scratch[..frames * 2].fill(0.0);
-                dsp.process_block(&mut scratch[..frames * 2], frames);
-                for i in 0..frames {
-                    left[i] += scratch[i * 2];
-                    right[i] += scratch[i * 2 + 1];
-                }
+                add_interleaved_instrument(scratch, left, right, frames, |buf, n| {
+                    dsp.process_block(buf, n)
+                });
             }
             BuiltinDsp::Slicer { dsp, scratch } => {
-                if scratch.len() < frames * 2 {
-                    scratch.resize(frames * 2, 0.0);
-                }
-                scratch[..frames * 2].fill(0.0);
-                dsp.process_block(&mut scratch[..frames * 2], frames);
-                for i in 0..frames {
-                    left[i] += scratch[i * 2];
-                    right[i] += scratch[i * 2 + 1];
-                }
+                add_interleaved_instrument(scratch, left, right, frames, |buf, n| {
+                    dsp.process_block(buf, n)
+                });
             }
             BuiltinDsp::Soundfont {
                 player,
@@ -891,20 +873,24 @@ impl BuiltinPluginInstance {
                 pan,
                 ..
             } => {
-                if left_buf.len() < frames {
-                    left_buf.resize(frames, 0.0);
-                    right_buf.resize(frames, 0.0);
-                }
-                left_buf[..frames].fill(0.0);
-                right_buf[..frames].fill(0.0);
-                let _ = player.render(&mut left_buf[..frames], &mut right_buf[..frames]);
                 let g = 10.0f32.powf(*gain_db / 20.0);
                 let angle = (pan.clamp(-1.0, 1.0) + 1.0) * std::f32::consts::FRAC_PI_4;
                 let gl = angle.cos() * g;
                 let gr = angle.sin() * g;
-                for i in 0..frames {
-                    left[i] += left_buf[i] * gl;
-                    right[i] += right_buf[i] * gr;
+                // Render in chunks no larger than the preallocated buffers so the audio
+                // thread never grows them.
+                let chunk = left_buf.len().min(right_buf.len()).max(1);
+                let mut offset = 0;
+                while offset < frames {
+                    let n = (frames - offset).min(chunk);
+                    left_buf[..n].fill(0.0);
+                    right_buf[..n].fill(0.0);
+                    let _ = player.render(&mut left_buf[..n], &mut right_buf[..n]);
+                    for i in 0..n {
+                        left[offset + i] += left_buf[i] * gl;
+                        right[offset + i] += right_buf[i] * gr;
+                    }
+                    offset += n;
                 }
             }
         }
@@ -1032,6 +1018,31 @@ fn process_effect_loop<E: StereoEffect + ?Sized>(
         let (ol, or) = effect.process_stereo(left[i], right[i]);
         left[i] = if ol.is_finite() { ol } else { 0.0 };
         right[i] = if or.is_finite() { or } else { 0.0 };
+    }
+}
+
+/// Renders an interleaved-stereo instrument into `left`/`right` (additively) through the
+/// preallocated `scratch` buffer, in chunks of at most `scratch.len() / 2` frames, so the
+/// audio thread never grows `scratch`.
+fn add_interleaved_instrument(
+    scratch: &mut [f32],
+    left: &mut [f32],
+    right: &mut [f32],
+    frames: usize,
+    mut process_block: impl FnMut(&mut [f32], usize),
+) {
+    let chunk = (scratch.len() / 2).max(1);
+    let mut offset = 0;
+    while offset < frames {
+        let n = (frames - offset).min(chunk);
+        let buf = &mut scratch[..n * 2];
+        buf.fill(0.0);
+        process_block(buf, n);
+        for i in 0..n {
+            left[offset + i] += buf[i * 2];
+            right[offset + i] += buf[i * 2 + 1];
+        }
+        offset += n;
     }
 }
 
