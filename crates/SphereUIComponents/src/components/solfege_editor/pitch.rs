@@ -638,8 +638,12 @@ impl SolfegeEditorPanel {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let (view_w, _) = self.pitch.grid_size();
-        let (start_beat, end_beat) = viewport.visible_beats(view_w);
-        let labels: Vec<gpui::AnyElement> = viewport
+        let clip_start = ctx.map(|c| c.clip_start_beat).unwrap_or(0.0);
+        // The song's bars and numbers, shifted into this clip's frame, so the
+        // marks sit on the lines the grid draws and "1 Bar" snaps to.
+        let song = viewport.song_frame_for_clip(clip_start);
+        let (start_beat, end_beat) = song.visible_beats(view_w);
+        let labels: Vec<gpui::AnyElement> = song
             .ruler_marks_in(start_beat, end_beat, meter)
             .into_iter()
             .flat_map(|mark| {
@@ -671,7 +675,6 @@ impl SolfegeEditorPanel {
             })
             .collect();
 
-        let clip_start = ctx.map(|c| c.clip_start_beat).unwrap_or(0.0);
         let seekable = ctx.is_some();
 
         div()
@@ -717,7 +720,12 @@ impl SolfegeEditorPanel {
                                 return;
                             };
                             let viewport = this.viewport(cx);
-                            let beat = viewport.snap(viewport.x_to_beat(local_x)).max(0.0);
+                            let meter = EditorMeter::from_map(
+                                &this.timeline.read(cx).state.time_signature_map,
+                            );
+                            let beat = viewport
+                                .snap_in_clip(viewport.x_to_beat(local_x), &meter, clip_start)
+                                .max(0.0);
                             this.timeline.update(cx, |tl, tcx| {
                                 tl.seek_to_beat(clip_start + beat, tcx);
                             });
@@ -746,7 +754,13 @@ impl SolfegeEditorPanel {
         let empty = notes.is_empty();
 
         let keys = self.render_pitch_keys(viewport);
-        let painter = self.build_pitch_canvas(notes, trajectory, viewport, meter.clone());
+        let painter = self.build_pitch_canvas(
+            notes,
+            trajectory,
+            viewport,
+            meter.clone(),
+            ctx.clip_start_beat,
+        );
         let marquee = match &self.pitch.drag {
             Some(PitchDrag::Marquee {
                 origin, current, ..
@@ -1040,6 +1054,7 @@ impl SolfegeEditorPanel {
         trajectory: Rc<PitchTrajectory>,
         viewport: PianoRollViewport,
         meter: EditorMeter,
+        clip_start: f32,
     ) -> gpui::AnyElement {
         let capture = self.pitch.grid_bounds.clone();
         let selected_note = self.pitch.selected_note;
@@ -1096,8 +1111,11 @@ impl SolfegeEditorPanel {
                 }
 
                 // ── Timing grid ───────────────────────────────────────────
-                let (start_beat, end_beat) = viewport.visible_beats(view_w);
-                for (x, kind) in viewport.grid_lines_in(start_beat, end_beat, &meter) {
+                // The song's bar lines, shifted into this clip's frame: the
+                // lines "1 Bar" snaps to.
+                let song = viewport.song_frame_for_clip(clip_start);
+                let (start_beat, end_beat) = song.visible_beats(view_w);
+                for (x, kind) in song.grid_lines_in(start_beat, end_beat, &meter) {
                     if x < 0.0 || x > view_w {
                         continue;
                     }
@@ -2387,6 +2405,7 @@ mod tests {
             scroll_y: 0.0,
             key_lane_width: 72.0,
             snap_step_beats: 0.25,
+            snap_to_bars: false,
             sub_step_beats: 0.25,
             grid_width: 600.0,
             grid_height: 240.0,
@@ -2553,5 +2572,61 @@ mod tests {
         let curve = PitchCurve::from_points(PitchCurve::line(0.0, 1.0, -50.0, 50.0));
         let simplified = simplify_curve_range(&curve, 0.0, 1.0, PITCH_SIMPLIFY_CENTS);
         assert_eq!(simplified, curve);
+    }
+
+    /// #263: for a clip that starts off a bar line (song beat 2 in 4/4, 3/4
+    /// from song beat 8), the bar lines the Pitch grid and ruler draw are the
+    /// ones "1 Bar" snaps to: clip beats 2, 6, 9, 12, 15 (song 4, 8, 11, 14,
+    /// 17), not the clip-local 0, 4, 8.
+    #[test]
+    fn drawn_bar_lines_are_the_bar_snap_lines_for_a_clip_off_the_bar() {
+        use crate::components::piano_roll::GridLineKind;
+        use crate::components::timeline::timeline_state::{TimeSignatureMap, TimeSignaturePoint};
+
+        let mut v = viewport();
+        v.ppb = 20.0;
+        v.scroll_x = 10.0;
+        v.snap_to_bars = true;
+        let meter = EditorMeter::from_map(&TimeSignatureMap::with_points(vec![
+            TimeSignaturePoint::with_id("m0", 0.0, 4, 4),
+            TimeSignaturePoint::with_id("m1", 8.0, 3, 4),
+        ]));
+        let origin = 2.0;
+        let song = v.song_frame_for_clip(origin);
+        let (start, end) = song.visible_beats(v.ppb * 16.0);
+        // `x_to_beat` clamps at zero; the line before the clip must stay
+        // negative so it is filtered out, not read as clip beat 0.
+        let in_clip = |x: f32| (x + v.scroll_x) / v.ppb;
+
+        let grid: Vec<f32> = song
+            .grid_lines_in(start, end, &meter)
+            .into_iter()
+            .filter(|(_, kind)| *kind == GridLineKind::Bar)
+            .map(|(x, _)| in_clip(x))
+            .filter(|beat| *beat > -1.0e-3)
+            .collect();
+        let ruler: Vec<f32> = song
+            .ruler_marks_in(start, end, &meter)
+            .into_iter()
+            .filter(|mark| mark.on_bar)
+            .map(|mark| in_clip(mark.x))
+            .filter(|beat| *beat > -1.0e-3)
+            .collect();
+        let expected = [2.0, 6.0, 9.0, 12.0];
+        for (drawn, want) in grid.iter().zip(expected) {
+            assert!((drawn - want).abs() < 1.0e-3, "grid {grid:?}");
+        }
+        for (drawn, want) in ruler.iter().zip(expected) {
+            assert!((drawn - want).abs() < 1.0e-3, "ruler {ruler:?}");
+        }
+        assert!(grid.len() >= expected.len() && ruler.len() >= expected.len());
+
+        // Every drawn bar line is a snap position, and a beat near one snaps
+        // onto it.
+        for line in &grid {
+            assert!((v.snap_in_clip(*line, &meter, origin) - line).abs() < 1.0e-3);
+            assert!((v.snap_in_clip(line + 0.4, &meter, origin) - line).abs() < 1.0e-3);
+            assert!((v.snap_in_clip(line - 0.4, &meter, origin) - line).abs() < 1.0e-3);
+        }
     }
 }

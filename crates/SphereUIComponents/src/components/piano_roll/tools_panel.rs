@@ -20,8 +20,8 @@ use super::*;
 use crate::components::controls::FbSegment;
 use crate::components::timeline::timeline_state::{
     conform_to_chords, delete_overlaps, invert_pitches, legato_notes, quantize_notes,
-    retrograde_notes, scale_note_lengths, set_note_lengths, transpose_in_scale, voice_chords,
-    ChordVoicing, MidiScale, QuantizeSpec, QuantizeTarget,
+    quantize_notes_on_grid, retrograde_notes, scale_note_lengths, set_note_lengths,
+    transpose_in_scale, voice_chords, ChordVoicing, MidiScale, QuantizeSpec, QuantizeTarget,
 };
 use sphere_midi_service::{ExpressionCurve, ExpressionPoint};
 
@@ -83,6 +83,26 @@ fn join_grid(base: GridRes, triplet: bool) -> GridRes {
 
 fn has_triplet(base: GridRes) -> bool {
     join_grid(base, true) != base
+}
+
+/// The editor's one quantize pass, run by the tool, `Q` and the hover
+/// preview alike. `bars` (meter and clip origin) quantizes to the bar lines
+/// drawn over the clip, as the "1 Bar" note grid snaps (#262); otherwise the
+/// fixed step of `spec`, counted from clip beat 0.
+pub(super) fn quantize_in(
+    notes: &mut [MidiNoteState],
+    ids: &HashSet<u64>,
+    spec: QuantizeSpec,
+    target: QuantizeTarget,
+    bars: Option<(&EditorMeter, f32)>,
+) -> usize {
+    match bars {
+        Some((meter, origin)) => {
+            let grid = MeterGrid::new(meter, GridStep::Bar, f64::from(origin));
+            quantize_notes_on_grid(notes, ids, grid, spec, target)
+        }
+        None => quantize_notes(notes, ids, spec, target),
+    }
 }
 
 /// Shape written by a Note Expression preset.
@@ -282,15 +302,26 @@ impl PianoRoll {
         });
     }
 
+    /// The meter and edited clip's song origin "1 Bar" quantizes against, or
+    /// `None` when the quantize grid is a fixed step from clip beat 0.
+    pub(super) fn quantize_bars(&self) -> Option<(&EditorMeter, f32)> {
+        (self.quantize_res == GridRes::Bar).then(|| (&self.meter, self.edit_origin()))
+    }
+
     pub(super) fn tool_quantize(&mut self, target: QuantizeTarget, cx: &mut Context<Self>) {
         let spec = self.quantize_spec();
+        // Owned, so the transform can run while the roll is borrowed mutably.
+        let bars = self
+            .quantize_bars()
+            .map(|(meter, origin)| (meter.clone(), origin));
         let label = match target {
             QuantizeTarget::Start => "Quantize",
             QuantizeTarget::End => "Quantize Ends",
             QuantizeTarget::Length => "Quantize Lengths",
         };
         self.run_note_tool(label, cx, move |notes, ids| {
-            quantize_notes(notes, ids, spec, target)
+            let bars = bars.as_ref().map(|(meter, origin)| (meter, *origin));
+            quantize_in(notes, ids, spec, target, bars)
         });
     }
 

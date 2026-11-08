@@ -116,12 +116,7 @@ impl PianoRoll {
             return Vec::new();
         };
         let (lo, hi) = normalize_range(*start_beat, *end_beat);
-        let minimum = if self.snap_on && !self.grid_res.is_free() && !*unsnap {
-            self.step_beats().max(MIN_NOTE_BEATS)
-        } else {
-            MIN_NOTE_BEATS
-        };
-        let duration = (hi - lo).max(minimum);
+        let duration = self.drawn_note_length(lo, hi, *unsnap);
         let x = self.clip_beat_to_x(lo);
         let w = (duration * self.ppb).max(3.0);
         let h = self.note_row_h() - 2.0;
@@ -2824,8 +2819,12 @@ impl PianoRoll {
                     start,
                     Some(insp_stepper(
                         "pr-note-start",
-                        cx.listener(move |this, _, _w, cx| this.nudge_selected_start(-step, cx)),
-                        cx.listener(move |this, _, _w, cx| this.nudge_selected_start(step, cx)),
+                        cx.listener(move |this, _, _w, cx| {
+                            this.nudge_selected_start(false, step, cx)
+                        }),
+                        cx.listener(move |this, _, _w, cx| {
+                            this.nudge_selected_start(true, step, cx)
+                        }),
                     )),
                 )
                 .into_any_element(),
@@ -2837,10 +2836,10 @@ impl PianoRoll {
                     Some(insp_stepper(
                         "pr-note-len",
                         cx.listener(move |this, _, _w, cx| {
-                            this.nudge_selected_length(-fine_step, cx)
+                            this.nudge_selected_length(false, fine_step, cx)
                         }),
                         cx.listener(move |this, _, _w, cx| {
-                            this.nudge_selected_length(fine_step, cx)
+                            this.nudge_selected_length(true, fine_step, cx)
                         }),
                     )),
                 )
@@ -3379,11 +3378,12 @@ impl PianoRoll {
                 .collect()
         };
         let before: Vec<f32> = notes.iter().map(|n| n.start).collect();
-        crate::components::timeline::timeline_state::quantize_notes(
+        super::tools_panel::quantize_in(
             &mut notes,
             &ids,
             self.quantize_spec(),
             crate::components::timeline::timeline_state::QuantizeTarget::Start,
+            self.quantize_bars(),
         );
         notes
             .iter()

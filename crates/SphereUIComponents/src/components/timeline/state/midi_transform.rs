@@ -14,6 +14,7 @@
 
 use std::collections::HashSet;
 
+use super::musical_snap::{MeterBars, MeterGrid};
 use super::{MidiNoteState, MidiScale, ScaleKind, MIN_NOTE_BEATS};
 
 impl super::TimelineState {
@@ -154,6 +155,119 @@ pub fn quantize_notes(
             QuantizeTarget::Length => {
                 let steps = (note.duration / spec.step).round().max(1.0);
                 let duration = spec.pull(note.duration, steps * spec.step);
+                (note.start, duration.max(MIN_NOTE_BEATS))
+            }
+        };
+        if changed_f32(start, note.start) || changed_f32(duration, note.duration) {
+            note.start = start;
+            note.duration = duration;
+            changed += 1;
+        }
+    }
+    changed
+}
+
+/// Lines a [`quantize_notes_on_grid`] length walk visits at most, so a
+/// degenerate grid cannot stall the UI thread.
+const MAX_QUANTIZE_LINES: usize = 1 << 16;
+
+/// The grid line nearest clip beat `beat` that is not before the clip start.
+/// A clip that starts off a bar line has the bar line before it outside the
+/// clip, so a note near its start goes to the first line inside it.
+fn grid_nearest_in_clip<M: MeterBars + ?Sized>(grid: MeterGrid<'_, M>, beat: f32) -> f32 {
+    let at = f64::from(beat);
+    let (below, above) = grid.cell(at);
+    let line = if below < -f64::from(EPS) {
+        above
+    } else {
+        grid.snap(at)
+    };
+    (line as f32).max(0.0)
+}
+
+/// The first grid line strictly after clip beat `beat`.
+fn grid_after<M: MeterBars + ?Sized>(grid: MeterGrid<'_, M>, beat: f32) -> f32 {
+    let at = f64::from(beat);
+    let mut line = grid.next_line(grid.line_at_or_before(at));
+    for _ in 0..4 {
+        if line > at + f64::from(EPS) {
+            break;
+        }
+        line = grid.next_line(line);
+    }
+    line as f32
+}
+
+/// The length nearest `duration` that is a whole number of grid cells (at
+/// least one) from `start`, keeping `start`'s place in its cell: the rule
+/// Duplicate measures by ([`MeterGrid::duplicate_offset`]), so across a meter
+/// change "one bar" is the bar the meter makes it there.
+fn grid_length<M: MeterBars + ?Sized>(grid: MeterGrid<'_, M>, start: f32, duration: f32) -> f32 {
+    let start = f64::from(start);
+    let duration = f64::from(duration);
+    let anchor = grid.line_at_or_before(start);
+    let into_cell = start - anchor;
+    let mut line = grid.next_line(anchor);
+    let mut shorter = line + into_cell - start;
+    for _ in 0..MAX_QUANTIZE_LINES {
+        if duration <= shorter {
+            break;
+        }
+        line = grid.next_line(line);
+        let longer = line + into_cell - start;
+        if duration <= longer {
+            // A tie takes the longer length, as `round` does on one grid.
+            return if duration - shorter < longer - duration {
+                shorter as f32
+            } else {
+                longer as f32
+            };
+        }
+        shorter = longer;
+    }
+    shorter as f32
+}
+
+/// [`quantize_notes`] against the editor's meter-aware note grid instead of
+/// a fixed step counted from clip beat 0: what "1 Bar" quantizes against.
+///
+/// Positions are clip-local; `grid` carries the clip's song origin, so the
+/// lines are the bar lines drawn over the clip: a clip that starts off a bar
+/// line quantizes to the bar lines inside it, and a meter change inside the
+/// clip changes the bar length from the change on. Only `spec.strength` is
+/// used: the grid supplies the lines, and swing (a delay of every second
+/// line) is a subdivision feel with no meaning for whole bars.
+pub fn quantize_notes_on_grid<M: MeterBars + ?Sized>(
+    notes: &mut [MidiNoteState],
+    ids: &HashSet<u64>,
+    grid: MeterGrid<'_, M>,
+    spec: QuantizeSpec,
+    target: QuantizeTarget,
+) -> usize {
+    if spec.strength <= 0.0 {
+        return 0;
+    }
+    let mut changed = 0;
+    for note in selected(notes, ids) {
+        let (start, duration) = match target {
+            QuantizeTarget::Start => {
+                let start = spec
+                    .pull(note.start, grid_nearest_in_clip(grid, note.start))
+                    .max(0.0);
+                (start, note.duration)
+            }
+            QuantizeTarget::End => {
+                let end = note.start + note.duration;
+                let mut grid_end = grid_nearest_in_clip(grid, end);
+                if grid_end <= note.start + EPS {
+                    grid_end = grid_after(grid, note.start);
+                }
+                let end = spec.pull(end, grid_end);
+                (note.start, (end - note.start).max(MIN_NOTE_BEATS))
+            }
+            QuantizeTarget::Length => {
+                let length = grid_length(grid, note.start, note.duration);
+                let duration = spec.pull(note.duration, length);
                 (note.start, duration.max(MIN_NOTE_BEATS))
             }
         };
@@ -1498,5 +1612,77 @@ mod tests {
         let ids = all(&notes);
         assert_eq!(find_short_notes(&notes, &ids, 0.125), vec![notes[0].id]);
         assert_eq!(find_quiet_notes(&notes, &ids, 20), vec![notes[1].id]);
+    }
+
+    /// Bars of 4/4 to beat 8, then 3/4: bar lines at 0, 4, 8, 11, 14, ...
+    fn four_then_three() -> super::super::TimeSignatureMap {
+        use super::super::{TimeSignatureMap, TimeSignaturePoint};
+        TimeSignatureMap::with_points(vec![
+            TimeSignaturePoint::with_id("m0", 0.0, 4, 4),
+            TimeSignaturePoint::with_id("m1", 8.0, 3, 4),
+        ])
+    }
+
+    /// #262: a clip at song beat 2 in 4/4 has its bar lines at clip beats 2,
+    /// 6, ... (song 4, 8, ...). A note at clip beat 1 quantizes to clip beat 2
+    /// (song beat 4), not clip beat 0 (song beat 2, mid-bar).
+    #[test]
+    fn bar_quantize_follows_the_bar_lines_of_a_clip_off_the_bar() {
+        use super::super::GridStep;
+        let map = four_then_three();
+        let grid = MeterGrid::new(&map, GridStep::Bar, 2.0);
+        let mut notes = vec![note(60, 1.0, 1.0), note(62, 0.5, 1.0), note(64, 5.0, 1.0)];
+        let ids = all(&notes);
+        assert_eq!(
+            quantize_notes_on_grid(&mut notes, &ids, grid, spec(4.0), QuantizeTarget::Start),
+            3
+        );
+        assert_eq!(notes[0].start, 2.0);
+        // The bar line before the clip is outside it: the first one inside.
+        assert_eq!(notes[1].start, 2.0);
+        // Song beat 7 is nearer song beat 8 (clip 6) than song beat 4.
+        assert_eq!(notes[2].start, 6.0);
+    }
+
+    /// #262: after a 3/4 change at beat 8 the bar lines are 8, 11, 14, so a
+    /// note near beat 11 quantizes to 11 (a fixed 4-beat step from beat 0
+    /// put it on 12, which is not a bar line).
+    #[test]
+    fn bar_quantize_follows_a_meter_change() {
+        use super::super::GridStep;
+        let map = four_then_three();
+        let grid = MeterGrid::new(&map, GridStep::Bar, 0.0);
+        let mut notes = vec![note(60, 11.6, 1.0), note(62, 13.0, 1.0)];
+        let ids = all(&notes);
+        quantize_notes_on_grid(&mut notes, &ids, grid, spec(4.0), QuantizeTarget::Start);
+        assert_eq!(notes[0].start, 11.0);
+        assert_eq!(notes[1].start, 14.0);
+
+        // Ends land on bar lines; an end before the first line after the
+        // start goes to that line.
+        let mut ends = vec![note(60, 8.0, 2.2), note(62, 8.0, 0.3)];
+        let ids = all(&ends);
+        quantize_notes_on_grid(&mut ends, &ids, grid, spec(4.0), QuantizeTarget::End);
+        assert_eq!(ends[0].duration, 3.0);
+        assert_eq!(ends[1].duration, 3.0);
+
+        // Lengths are whole 3/4 bars from a note on the change.
+        let mut lengths = vec![note(60, 8.0, 2.0), note(62, 8.0, 5.0), note(64, 4.0, 5.0)];
+        let ids = all(&lengths);
+        quantize_notes_on_grid(&mut lengths, &ids, grid, spec(4.0), QuantizeTarget::Length);
+        assert_eq!(lengths[0].duration, 3.0);
+        assert_eq!(lengths[1].duration, 6.0);
+        // From beat 4: one bar is 4 beats (to 8), two bars 7 (to 11).
+        assert_eq!(lengths[2].duration, 4.0);
+
+        // Strength pulls part of the way.
+        let mut soft = vec![note(60, 10.0, 1.0)];
+        let ids = all(&soft);
+        let half = QuantizeSpec {
+            strength: 0.5,
+            ..spec(4.0)
+        };
+        quantize_notes_on_grid(&mut soft, &ids, grid, half, QuantizeTarget::Start);
+        assert_eq!(soft[0].start, 10.5);
     }
 }

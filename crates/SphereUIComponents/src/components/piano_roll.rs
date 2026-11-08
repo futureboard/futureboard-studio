@@ -353,6 +353,10 @@ pub struct PianoRollViewport {
     pub key_lane_width: f32,
     /// Current snap step in beats; `0.0` when snapping is off.
     pub snap_step_beats: f32,
+    /// Snapping is on with the "1 Bar" grid: snap to the meter's bar lines
+    /// ([`Self::snap_in_clip`]), which `snap_step_beats` — the bar length at
+    /// the clip start — cannot describe after a meter change.
+    pub snap_to_bars: bool,
     /// Grid subdivision in beats, independent of the snap toggle — the grid
     /// stays visible when snapping is off.
     pub sub_step_beats: f32,
@@ -378,6 +382,32 @@ impl PianoRollViewport {
     #[inline]
     pub fn snap(&self, beat: f32) -> f32 {
         snap_beat_to_step(beat, self.snap_step_beats)
+    }
+
+    /// This transform on the song axis, for a surface that lays out the
+    /// clip-local beats of a clip starting `origin` beats into the song (the
+    /// Solfege lanes and Pitch tab): song beat `s` lands at the x of clip beat
+    /// `s - origin`. Grid lines and ruler marks come from the song's meter
+    /// through it, so the bar lines drawn there are the ones
+    /// [`Self::snap_in_clip`] snaps to (#263).
+    pub fn song_frame_for_clip(&self, origin: f32) -> Self {
+        Self {
+            scroll_x: self.scroll_x + origin * self.ppb,
+            ..*self
+        }
+    }
+
+    /// Snap clip-local `beat` of a clip that starts `origin` beats into the
+    /// song to the grid the notes snap to. On the "1 Bar" grid that is the
+    /// bar lines of `meter` — the ones drawn, through every meter change and
+    /// in a clip that starts off a bar line (#263); a fixed step is
+    /// [`Self::snap`]. Honors the snap toggle like [`Self::snap`].
+    pub fn snap_in_clip(&self, beat: f32, meter: &EditorMeter, origin: f32) -> f32 {
+        if !self.snap_to_bars {
+            return self.snap(beat);
+        }
+        let grid = MeterGrid::new(meter, GridStep::Bar, f64::from(origin));
+        (grid.snap(f64::from(beat)) as f32).max(0.0)
     }
 
     /// First and last beat visible in `width` pixels of lane.
@@ -749,6 +779,83 @@ fn duplicate_offset(grid: Option<MeterGrid<'_, EditorMeter>>, start: f32, end: f
         Some(grid) => (grid.duplicate_offset(f64::from(start), f64::from(start + span)) as f32)
             .max(MIN_NOTE_BEATS),
     }
+}
+
+/// Length of a note drawn over clip beats `[lo, hi]`: whole grid steps from
+/// `lo`, at least one, measured the way Duplicate measures
+/// ([`duplicate_offset`]) — so a "1 Bar" note is as long as the bar the meter
+/// makes it where the note starts, not the bar at the clip start (#262).
+/// With no grid (snapping off, `Free`, or Shift) the drawn span as it is.
+fn drawn_note_length(grid: Option<MeterGrid<'_, EditorMeter>>, lo: f32, hi: f32) -> f32 {
+    duplicate_offset(grid, lo, hi)
+}
+
+/// Where a drum hit clicked at clip beat `beat` lands: the start of the grid
+/// cell it was clicked in, the way a step sequencer fills a cell. On the
+/// "1 Bar" grid the cell is the bar drawn there (#262). With no grid, where
+/// it was clicked.
+fn drum_cell_start(grid: Option<MeterGrid<'_, EditorMeter>>, beat: f32) -> f32 {
+    match grid {
+        Some(grid) => (grid.line_at_or_before(f64::from(beat)) as f32).max(0.0),
+        None => beat.max(0.0),
+    }
+}
+
+/// Where a note starting at clip beat `beat` goes when nudged one grid step
+/// (`forward` or back). A fixed step moves it by the step, keeping its place
+/// between lines. The "1 Bar" grid walks the bar lines drawn over the clip —
+/// the next one after the note, or the one before it — so across a meter
+/// change, or in a clip that starts off a bar line, the note lands on a bar
+/// line instead of one clip-start bar from where it was (#262). With no grid
+/// (`Free`) it moves by `free_step`.
+fn nudged_start(
+    grid: Option<MeterGrid<'_, EditorMeter>>,
+    beat: f32,
+    forward: bool,
+    free_step: f32,
+) -> f32 {
+    let step = match grid.map(|grid| (grid, grid.step())) {
+        Some((grid, GridStep::Bar)) => {
+            let at = f64::from(beat);
+            let line = grid.line_at_or_before(at);
+            let target = if forward {
+                grid.next_line(line)
+            } else if at - line > 1.0e-4 {
+                line
+            } else {
+                grid.line_at_or_before(line - 1.0e-3)
+            };
+            return (target as f32).max(0.0);
+        }
+        Some((_, GridStep::Beats(step))) => step as f32,
+        None => free_step,
+    };
+    let delta = if forward { step } else { -step };
+    (beat + delta).max(0.0)
+}
+
+/// A note's length after one fine step of the inspector's Length stepper
+/// (`forward` lengthens). On the "1 Bar" grid the step is a quarter of the
+/// bar drawn at the note's end — the bar it grows into, or the one it shrinks
+/// back through — so in 3/4 it is 0.75, not a quarter of a 4/4 bar (#262).
+/// Otherwise `fine_step`.
+fn nudged_length(
+    grid: Option<MeterGrid<'_, EditorMeter>>,
+    start: f32,
+    duration: f32,
+    forward: bool,
+    fine_step: f32,
+) -> f32 {
+    let step = match grid {
+        Some(grid) if grid.step() == GridStep::Bar => {
+            let end = f64::from(start + duration);
+            let (lo, hi) = grid.cell(if forward { end } else { end - 1.0e-3 });
+            ((hi - lo) as f32 * 0.25).max(MIN_NOTE_BEATS)
+        }
+        _ => fine_step.max(MIN_NOTE_BEATS),
+    };
+    let delta = if forward { step } else { -step };
+    (duration + delta).max(MIN_NOTE_BEATS)
 }
 
 /// The clip beats a snapped controller stroke or ramp from `a` to `b` writes
@@ -2044,6 +2151,7 @@ impl PianoRoll {
                 pitch,
                 start_beat,
                 end_beat,
+                unsnap,
                 ..
             } => {
                 let (lo, hi) = normalize_range(*start_beat, *end_beat);
@@ -2051,7 +2159,7 @@ impl PianoRoll {
                     "Draw {} · {:.2}+{:.2}",
                     note_name(*pitch as i32),
                     lo,
-                    (hi - lo).max(self.step_beats())
+                    self.drawn_note_length(lo, hi, *unsnap)
                 )
             }
             PianoDrag::Move {
@@ -2212,8 +2320,8 @@ impl PianoRoll {
                 }
             }
             "midi:quantize" | "midi.quantize" => self.quantize_selection(cx),
-            "midi:nudge-left" => self.nudge_selected_start(-self.step_beats(), cx),
-            "midi:nudge-right" => self.nudge_selected_start(self.step_beats(), cx),
+            "midi:nudge-left" => self.nudge_selected_start(false, self.step_beats(), cx),
+            "midi:nudge-right" => self.nudge_selected_start(true, self.step_beats(), cx),
             "midi:transpose-up" | "midi.transpose_up" => self.transpose_selection(1, cx),
             "midi:transpose-down" | "midi.transpose_down" => self.transpose_selection(-1, cx),
             "midi:transpose-octave-up" => self.transpose_selection(12, cx),
@@ -2499,8 +2607,10 @@ impl PianoRoll {
         self.preview_all_notes_off(reason, cx);
     }
 
-    /// Bar length at the edited clip's start — the step "1 Bar" nudges,
-    /// quantizes and draws by.
+    /// Bar length at the edited clip's start. Only a scalar summary for
+    /// what cannot follow the meter (the published viewport step, the stretch
+    /// handle's step): snapping, nudging, drawing, drum hits and quantize go
+    /// through the meter-aware [`Self::edit_grid`] instead.
     fn bar_beats(&self) -> f32 {
         self.meter.bar_beats_at(self.edit_origin())
     }
@@ -2536,6 +2646,22 @@ impl PianoRoll {
     /// it. `None` for `Free`.
     fn edit_grid(&self) -> Option<MeterGrid<'_, EditorMeter>> {
         note_grid(&self.meter, self.grid_res, self.ppb, self.edit_origin())
+    }
+
+    /// [`Self::edit_grid`] when a gesture snaps: snapping on, a grid with
+    /// lines, and no Shift (`unsnap`). `None` otherwise.
+    fn snapping_grid(&self, unsnap: bool) -> Option<MeterGrid<'_, EditorMeter>> {
+        if unsnap || !self.snap_on {
+            return None;
+        }
+        self.edit_grid()
+    }
+
+    /// Length of the note a draw from clip beat `lo` to `hi` creates — the
+    /// commit, its preview and the status line all read it (see
+    /// [`drawn_note_length`]).
+    pub(super) fn drawn_note_length(&self, lo: f32, hi: f32, unsnap: bool) -> f32 {
+        drawn_note_length(self.snapping_grid(unsnap), lo, hi)
     }
 
     /// Same as [`Self::snap_beats`], but `unsnap` (live Shift state of the
@@ -3226,6 +3352,7 @@ impl PianoRoll {
                 self.ppb,
                 self.bar_beats(),
             ),
+            snap_to_bars: self.snap_on && self.grid_res == GridRes::Bar,
             sub_step_beats: self.step_beats().max(MIN_NOTE_BEATS),
             grid_width,
             grid_height,
@@ -4995,16 +5122,7 @@ impl PianoRoll {
             return;
         };
         let (lo, hi) = normalize_range(start_beat, end_beat);
-        let step = self.step_beats().max(MIN_NOTE_BEATS);
-        let minimum = if self.snap_on && !self.grid_res.is_free() && !unsnap {
-            step
-        } else {
-            MIN_NOTE_BEATS
-        };
-        let mut duration = (hi - lo).max(minimum);
-        if self.snap_on && !self.grid_res.is_free() && !unsnap {
-            duration = ((duration / step).ceil() * step).max(MIN_NOTE_BEATS);
-        }
+        let duration = self.drawn_note_length(lo, hi, unsnap);
         // Do not clamp the note into the current clip length — a note drawn past
         // the clip end auto-expands the clip (see `CreateMidiNote::execute`).
         // `MidiNoteState::new` clamps start >= 0, pitch 0..=127, dur >= MIN.
@@ -5790,11 +5908,7 @@ impl PianoRoll {
     /// was clicked in, not the nearest line. Off the grid (Shift, snap off, or
     /// a free grid) the hit lands where it was clicked.
     fn drum_step_start(&self, beat: f32, unsnap: bool) -> f32 {
-        let step = self.step_beats();
-        if unsnap || !self.snap_on || self.grid_res.is_free() || step <= 0.0 {
-            return beat.max(0.0);
-        }
-        ((beat / step).floor() * step).max(0.0)
+        drum_cell_start(self.snapping_grid(unsnap), beat)
     }
 
     /// Move the selected hits `rows_down` lanes (negative is up), as one
@@ -6338,7 +6452,14 @@ impl PianoRoll {
         });
     }
 
-    fn nudge_selected_start(&mut self, delta_beats: f32, cx: &mut Context<Self>) {
+    /// Move the selected notes one grid step `forward` or back (see
+    /// [`nudged_start`]); `free_step` is the step when the grid is `Free`.
+    pub(super) fn nudge_selected_start(
+        &mut self,
+        forward: bool,
+        free_step: f32,
+        cx: &mut Context<Self>,
+    ) {
         let Some(clip_id) = self.editing_clip_id(cx) else {
             return;
         };
@@ -6346,6 +6467,7 @@ impl PianoRoll {
         if ids.is_empty() {
             return;
         }
+        let grid = self.edit_grid();
         let updates: Vec<(u64, f32, u8)> = self
             .timeline
             .read(cx)
@@ -6356,7 +6478,7 @@ impl PianoRoll {
                     .iter()
                     .filter(|note| ids.contains(&note.id))
                     .filter_map(|note| {
-                        let new_start = (note.start + delta_beats).max(0.0);
+                        let new_start = nudged_start(grid, note.start, forward, free_step);
                         ((note.start - new_start).abs() > 1.0e-4)
                             .then_some((note.id, new_start, note.pitch))
                     })
@@ -6372,7 +6494,15 @@ impl PianoRoll {
         });
     }
 
-    fn nudge_selected_length(&mut self, delta_beats: f32, cx: &mut Context<Self>) {
+    /// Lengthen (`forward`) or shorten the selected notes by the inspector's
+    /// fine step (see [`nudged_length`]); `fine_step` is that step off the
+    /// "1 Bar" grid.
+    pub(super) fn nudge_selected_length(
+        &mut self,
+        forward: bool,
+        fine_step: f32,
+        cx: &mut Context<Self>,
+    ) {
         let Some(clip_id) = self.editing_clip_id(cx) else {
             return;
         };
@@ -6380,6 +6510,7 @@ impl PianoRoll {
         if ids.is_empty() {
             return;
         }
+        let grid = self.edit_grid();
         let updates: Vec<(u64, f32)> = self
             .timeline
             .read(cx)
@@ -6390,7 +6521,8 @@ impl PianoRoll {
                     .iter()
                     .filter(|note| ids.contains(&note.id))
                     .filter_map(|note| {
-                        let duration = (note.duration + delta_beats).max(MIN_NOTE_BEATS);
+                        let duration =
+                            nudged_length(grid, note.start, note.duration, forward, fine_step);
                         ((note.duration - duration).abs() > 1.0e-4).then_some((note.id, duration))
                     })
                     .collect()
@@ -7701,6 +7833,7 @@ mod editor_meter_tests {
             scroll_y: 0.0,
             key_lane_width: 0.0,
             snap_step_beats: sub,
+            snap_to_bars: false,
             sub_step_beats: sub,
             grid_width: 2000.0,
             grid_height: 400.0,
@@ -8048,6 +8181,7 @@ mod meter_grid_tests {
             scroll_y: 0.0,
             key_lane_width: 0.0,
             snap_step_beats: 1.0,
+            snap_to_bars: false,
             sub_step_beats: 1.0,
             grid_width: 2000.0,
             grid_height: 400.0,
@@ -8098,6 +8232,138 @@ mod meter_grid_tests {
             let beat = f64::from(i) * 0.25;
             assert_eq!(song.bar_span(beat), editor.bar_span(beat), "beat {beat}");
         }
+    }
+
+    /// #262 step 3: with a 3/4 change at beat 8, "1 Bar" nudges walk the
+    /// drawn bar lines 4, 8, 11, 14 — one step on from beat 8 is 11, not 12.
+    #[test]
+    fn bar_nudge_walks_the_drawn_bar_lines() {
+        let m = four_then_three();
+        let grid = note_grid(&m, GridRes::Bar, 96.0, 0.0);
+        assert_eq!(nudged_start(grid, 8.0, true, 0.0), 11.0);
+        assert_eq!(nudged_start(grid, 11.0, true, 0.0), 14.0);
+        assert_eq!(nudged_start(grid, 11.0, false, 0.0), 8.0);
+        assert_eq!(nudged_start(grid, 8.0, false, 0.0), 4.0);
+        // Off a line: forward to the next line, back to the line before it.
+        assert_eq!(nudged_start(grid, 9.5, true, 0.0), 11.0);
+        assert_eq!(nudged_start(grid, 9.5, false, 0.0), 8.0);
+        // Never before the clip start.
+        assert_eq!(nudged_start(grid, 0.0, false, 0.0), 0.0);
+
+        // A clip at song beat 2 in 4/4: its bar lines are clip beats 2, 6, …
+        let off_bar = note_grid(&m, GridRes::Bar, 96.0, 2.0);
+        assert_eq!(nudged_start(off_bar, 0.0, true, 0.0), 2.0);
+        assert_eq!(nudged_start(off_bar, 1.0, true, 0.0), 2.0);
+        assert_eq!(nudged_start(off_bar, 2.0, true, 0.0), 6.0);
+        // Song beat 8 is the 3/4 change: the next bar line is song beat 11.
+        assert_eq!(nudged_start(off_bar, 6.0, true, 0.0), 9.0);
+
+        // A fixed step still moves by the step, keeping the note's offset;
+        // no grid (Free) moves by the step the caller gives.
+        let quarter = note_grid(&m, GridRes::Quarter, 96.0, 2.0);
+        assert_eq!(nudged_start(quarter, 1.5, true, 0.0), 2.5);
+        assert_eq!(nudged_start(quarter, 1.5, false, 0.0), 0.5);
+        assert_eq!(nudged_start(None, 1.5, true, 0.25), 1.75);
+        assert_eq!(nudged_start(None, 1.5, true, 0.0), 1.5);
+    }
+
+    /// #262: the inspector's fine Length step on "1 Bar" is a quarter of the
+    /// bar at the note's end: 1 beat in 4/4, 0.75 in 3/4.
+    #[test]
+    fn bar_length_nudge_follows_the_bar_at_the_note_end() {
+        let m = four_then_three();
+        let grid = note_grid(&m, GridRes::Bar, 96.0, 0.0);
+        assert_eq!(nudged_length(grid, 0.0, 2.0, true, 9.0), 3.0);
+        assert_eq!(nudged_length(grid, 8.0, 1.0, true, 9.0), 1.75);
+        // Shrinking back across the change uses the 4/4 bar before it.
+        assert_eq!(nudged_length(grid, 4.0, 4.0, false, 9.0), 3.0);
+        assert_eq!(nudged_length(grid, 4.0, 5.0, false, 9.0), 4.25);
+        // A clip at song beat 2: clip beat 6 + 1 is song 9, in 3/4.
+        let off_bar = note_grid(&m, GridRes::Bar, 96.0, 2.0);
+        assert_eq!(nudged_length(off_bar, 6.0, 1.0, true, 9.0), 1.75);
+        // Other grids keep the caller's fine step.
+        let quarter = note_grid(&m, GridRes::Quarter, 96.0, 0.0);
+        assert_eq!(nudged_length(quarter, 0.0, 1.0, true, 0.25), 1.25);
+        assert_eq!(nudged_length(None, 0.0, 1.0, false, 0.25), 0.75);
+    }
+
+    /// #262: a drum hit fills the bar it was clicked in — the bar drawn there.
+    #[test]
+    fn bar_drum_hits_land_on_the_drawn_bar() {
+        let m = four_then_three();
+        let grid = note_grid(&m, GridRes::Bar, 96.0, 0.0);
+        assert_eq!(drum_cell_start(grid, 9.5), 8.0);
+        assert_eq!(drum_cell_start(grid, 12.2), 11.0);
+        // A clip at song beat 2: the bar from song beat 4 starts at clip 2.
+        let off_bar = note_grid(&m, GridRes::Bar, 96.0, 2.0);
+        assert_eq!(drum_cell_start(off_bar, 3.2), 2.0);
+        assert_eq!(drum_cell_start(off_bar, 7.5), 6.0);
+        // Before the first bar line inside the clip: the clip start.
+        assert_eq!(drum_cell_start(off_bar, 1.0), 0.0);
+        // A fixed step counts from the clip start, as before.
+        let quarter = note_grid(&m, GridRes::Quarter, 96.0, 2.0);
+        assert_eq!(drum_cell_start(quarter, 1.7), 1.0);
+        assert_eq!(drum_cell_start(None, 1.7), 1.7);
+    }
+
+    /// #262: a "1 Bar" note drawn in the 3/4 section is three beats long,
+    /// and one drawn across it counts the bars there.
+    #[test]
+    fn bar_drawn_notes_are_as_long_as_the_bar_they_start_in() {
+        let m = four_then_three();
+        let grid = note_grid(&m, GridRes::Bar, 96.0, 0.0);
+        assert_eq!(drawn_note_length(grid, 0.0, 0.0), 4.0);
+        assert_eq!(drawn_note_length(grid, 8.0, 8.0), 3.0);
+        assert_eq!(drawn_note_length(grid, 8.0, 11.0), 3.0);
+        assert_eq!(drawn_note_length(grid, 8.0, 12.0), 6.0);
+        assert_eq!(drawn_note_length(grid, 4.0, 9.0), 7.0);
+        // A fixed step rounds up to whole steps, at least one.
+        let quarter = note_grid(&m, GridRes::Quarter, 96.0, 0.0);
+        assert_eq!(drawn_note_length(quarter, 1.0, 1.0), 1.0);
+        assert_eq!(drawn_note_length(quarter, 1.0, 2.5), 2.0);
+        // Unsnapped: the span as drawn.
+        assert_eq!(drawn_note_length(None, 1.0, 2.5), 1.5);
+    }
+
+    /// #263: the Solfege lanes and the Pitch ruler snap "1 Bar" to the drawn
+    /// bar lines through the shared viewport — after a 3/4 change at beat 8
+    /// that is beat 11, not 12 — and in a clip that starts off a bar line.
+    #[test]
+    fn viewport_bar_snap_follows_the_meter_and_the_clip_origin() {
+        let m = four_then_three();
+        let v = PianoRollViewport {
+            ppb: 20.0,
+            scroll_x: 0.0,
+            row_h: 12.0,
+            scroll_y: 0.0,
+            key_lane_width: 0.0,
+            snap_step_beats: 4.0,
+            snap_to_bars: true,
+            sub_step_beats: 1.0,
+            grid_width: 2000.0,
+            grid_height: 400.0,
+        };
+        assert_eq!(v.snap_in_clip(10.6, &m, 0.0), 11.0);
+        assert_eq!(v.snap_in_clip(11.4, &m, 0.0), 11.0);
+        assert_eq!(v.snap_in_clip(13.0, &m, 0.0), 14.0);
+        // Clip at song beat 2: bar lines at clip beats 2, 6, 9 (song 4, 8, 11).
+        assert_eq!(v.snap_in_clip(1.5, &m, 2.0), 2.0);
+        assert_eq!(v.snap_in_clip(8.4, &m, 2.0), 9.0);
+        // The same beats the note grid snaps to.
+        let notes = note_grid(&m, GridRes::Bar, 96.0, 2.0).expect("bar grid");
+        for i in 0..=80 {
+            let beat = i as f32 * 0.23;
+            let note = (notes.snap(f64::from(beat)) as f32).max(0.0);
+            assert_eq!(v.snap_in_clip(beat, &m, 2.0), note, "beat {beat}");
+        }
+        // A fixed step (or snapping off) keeps the plain step snap.
+        let fixed = PianoRollViewport {
+            snap_to_bars: false,
+            snap_step_beats: 1.0,
+            ..v
+        };
+        assert_eq!(fixed.snap_in_clip(10.6, &m, 0.0), 11.0);
+        assert_eq!(fixed.snap_in_clip(11.6, &m, 0.0), 12.0);
     }
 }
 

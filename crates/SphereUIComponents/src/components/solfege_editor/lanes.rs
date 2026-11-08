@@ -29,7 +29,7 @@ use gpui::{
 };
 
 use crate::components::edit::edit_commands::EditCommand;
-use crate::components::piano_roll::PianoRollViewport;
+use crate::components::piano_roll::{EditorMeter, PianoRollViewport};
 use crate::components::timeline::timeline_state::{
     AccentState, MidiControllerKind, MidiControllerPoint, MidiNoteState,
 };
@@ -291,8 +291,10 @@ impl SolfegeEditorPanel {
             return;
         };
         let viewport = self.viewport(cx);
+        // The project's meter, so "1 Bar" lands on the bar lines the notes do.
+        let meter = EditorMeter::from_map(&self.timeline.read(cx).state.time_signature_map);
         let beat = viewport
-            .snap(viewport.x_to_beat(local.0))
+            .snap_in_clip(viewport.x_to_beat(local.0), &meter, ctx.clip_start_beat)
             .clamp(0.0, ctx.clip_beats);
         let value = value_from_y(local.1, height);
         let clip_id = ctx.clip_id.clone();
