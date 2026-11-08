@@ -942,6 +942,7 @@ settings.tab.audio = เสียง
 settings.tab.audio.description = Driver, อุปกรณ์, Sample Rate, Buffer และ Latency
 settings.tab.editing = การแก้ไข
 settings.tab.editing.description = เมาส์, Snap Grid และประวัติ Undo
+settings.tab.experimental = ฟีเจอร์ทดลอง
 settings.tab.files-media = ไฟล์และสื่อ
 settings.tab.files-media.description = โปรเจกต์ Samples การบันทึก และตำแหน่ง Cache
 settings.tab.general = ทั่วไป
