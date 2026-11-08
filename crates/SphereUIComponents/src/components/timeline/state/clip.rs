@@ -382,6 +382,93 @@ fn derived_audio_clip_beats(
     Some(beats.max(MIN_AUDIO_CLIP_BEATS))
 }
 
+/// How close (in beats) a warp marker must sit to a split to count as being on
+/// it. Splits and markers both snap to the grid, so an on-grid pair is exact;
+/// this only absorbs the `f32` → `f64` round trip of the split beat.
+const WARP_SPLIT_MARKER_EPSILON_BEATS: f64 = 1.0e-4;
+
+/// The source frame a warped clip plays at absolute `beat`, resolved the way
+/// the engine resolves it (`tempo_locked_anchors` / `build_warp_segments`):
+/// the clip start pins `source_start`, the clip end pins `source_end`, every
+/// marker strictly inside the clip whose frame moves forward adds an anchor,
+/// and the source is linear in beats between anchors.
+fn warp_split_source_sample(
+    clip: &ClipState,
+    beat: f64,
+    source_start: u64,
+    source_end: u64,
+) -> u64 {
+    let clip_start = clip.start_beat.max(0.0) as f64;
+    let duration = clip.duration_beats.max(0.0) as f64;
+    let (start, end) = (source_start as f64, source_end.max(source_start) as f64);
+    let rel = (beat - clip_start).clamp(0.0, duration);
+    let mut prev = (0.0, start);
+    let mut next = (duration, end);
+    for marker in &clip.stretch.warp_markers {
+        let marker_beat = marker.timeline_beat - clip_start;
+        let frame = (marker.source_sample as f64).clamp(start, end);
+        if !(marker_beat > prev.0 && marker_beat < duration && frame > prev.1) {
+            continue;
+        }
+        if marker_beat <= rel {
+            prev = (marker_beat, frame);
+        } else {
+            next = (marker_beat, frame);
+            break;
+        }
+    }
+    let span = next.0 - prev.0;
+    let frame = if span > f64::EPSILON {
+        prev.1 + (next.1 - prev.1) * ((rel - prev.0) / span)
+    } else {
+        prev.1
+    };
+    frame.round().clamp(start, end) as u64
+}
+
+/// Divide `markers` between the two halves of a split at absolute `split_at`.
+///
+/// A marker on the split is the boundary both halves share, so it stays in
+/// both: as the left half's end anchor and the right half's start anchor, same
+/// id, same beat. With `boundary_source` (the clip is warping), a split
+/// between markers adds a locked anchor at the cut to each half, the way the
+/// audio editor pins a warped clip's ends, so neither half starts or ends
+/// unanchored; the anchor sits on the frame both source windows meet at.
+fn split_warp_markers(
+    markers: &[WarpMarker],
+    left: &mut Vec<WarpMarker>,
+    right: &mut Vec<WarpMarker>,
+    split_at: f64,
+    boundary_source: Option<u64>,
+) {
+    let on_split = |marker: &WarpMarker| {
+        (marker.timeline_beat - split_at).abs() <= WARP_SPLIT_MARKER_EPSILON_BEATS
+    };
+    let boundary = markers
+        .iter()
+        .find(|marker| on_split(marker))
+        .map(|marker| WarpMarker {
+            timeline_beat: split_at,
+            source_sample: boundary_source.unwrap_or(marker.source_sample),
+            ..marker.clone()
+        })
+        .or_else(|| {
+            boundary_source.map(|source_sample| WarpMarker {
+                id: markers.iter().map(|marker| marker.id).max().unwrap_or(0) + 1,
+                source_sample,
+                timeline_beat: split_at,
+                locked: true,
+            })
+        });
+
+    left.retain(|marker| marker.timeline_beat < split_at && !on_split(marker));
+    right.retain(|marker| marker.timeline_beat > split_at && !on_split(marker));
+    if let Some(boundary) = boundary {
+        left.push(boundary.clone());
+        right.insert(0, boundary);
+    }
+}
+
 impl TimelineState {
     /// Re-derive every audio clip's musical length from the audio it actually
     /// plays, at the current project tempo. Returns `true` when anything moved.
@@ -544,28 +631,37 @@ impl TimelineState {
             // The split point's time into the clip comes through the tempo map,
             // the axis the waveform is drawn on, so under tempo automation the
             // halves meet on the audio under the razor line.
-            let frames_per_second = clip.source_frames_per_played_second(self.bpm as f64);
-            let split_seconds = self.clip_local_seconds_at_beat(clip, split_beat as f64);
-            let split_samples = (split_seconds * frames_per_second).round().max(0.0) as u64;
             let source_start = clip.stretch.source_start_samples;
             let source_end = if clip.stretch.source_end_samples > source_start {
                 clip.stretch.source_end_samples
             } else {
                 clip.stretch.original_duration_samples
             };
+            let split_at = split_beat as f64;
+            let warped =
+                clip.stretch.mode == StretchMode::Warp && !clip.stretch.warp_markers.is_empty();
             if source_end > source_start {
-                let source_split = source_start.saturating_add(split_samples).min(source_end);
+                let source_split = if warped {
+                    // A warped clip plays its markers, not the global ratio:
+                    // cut the source where the warp map puts the razor line,
+                    // so each half's implicit edge anchor lands on the same
+                    // audio the markers pin there.
+                    warp_split_source_sample(clip, split_at, source_start, source_end)
+                } else {
+                    let frames_per_second = clip.source_frames_per_played_second(self.bpm as f64);
+                    let split_seconds = self.clip_local_seconds_at_beat(clip, split_at);
+                    let split_samples = (split_seconds * frames_per_second).round().max(0.0) as u64;
+                    source_start.saturating_add(split_samples).min(source_end)
+                };
                 left.stretch.apply_trim(source_start, source_split);
                 right.stretch.apply_trim(source_split, source_end);
-                // Each half keeps only the warp markers that fall inside it.
-                let split_at = split_beat as f64;
-                left.stretch
-                    .warp_markers
-                    .retain(|marker| marker.timeline_beat < split_at);
-                right
-                    .stretch
-                    .warp_markers
-                    .retain(|marker| marker.timeline_beat > split_at);
+                split_warp_markers(
+                    &clip.stretch.warp_markers,
+                    &mut left.stretch.warp_markers,
+                    &mut right.stretch.warp_markers,
+                    split_at,
+                    warped.then_some(source_split),
+                );
             }
             // The outer fades stay where they were; the cut itself gets none.
             // Copying them put a fade-out and a fade-in — a dip — on every cut.
