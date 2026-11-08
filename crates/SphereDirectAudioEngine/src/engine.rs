@@ -7380,6 +7380,8 @@ where
                     // (Legacy NAPI path) Software monitoring is handled by the
                     // DAUx/cpal render kernel via the input ring; the old
                     // sample-and-hold monitor was removed (warble).
+                    // Stereo and wider layouts always take this block kernel.
+                    // Mono stays on the per-sample path.
                     for (out_frame, frame) in data.chunks_mut(ch).zip(scratch.chunks(ch)) {
                         let l = frame[0];
                         let r = frame[1];
@@ -7392,47 +7394,6 @@ where
                         peak_r = peak_r.max(r.abs());
                         sum_sq_l += l * l;
                         sum_sq_r += r * r;
-                    }
-                } else if ch >= 2 {
-                    let metronome_graph_max_samples =
-                        crate::backend::render::metronome_graph_max_latency_samples(&runtime);
-                    let metronome_delay_samples =
-                        crate::backend::render::metronome_compensation_delay_samples(&runtime);
-                    for frame in data.chunks_mut(ch) {
-                        let (tone_l, tone_r) = if gen_tone {
-                            (
-                                osc_l.next_sample() * TEST_TONE_AMPLITUDE * master_vol,
-                                osc_r.next_sample() * TEST_TONE_AMPLITUDE * master_vol,
-                            )
-                        } else {
-                            (0.0, 0.0)
-                        };
-                        let (project_l, project_r) = if playing_local {
-                            render_project_sample(&mut runtime, base_sample + frames, master_vol)
-                        } else {
-                            (0.0, 0.0)
-                        };
-                        let click = metronome.metronome_sample(
-                            base_sample + frames,
-                            frames,
-                            output_sample_rate,
-                            playing_local,
-                            metronome_graph_max_samples,
-                            metronome_delay_samples,
-                        ) * master_vol;
-                        let l = tone_l + project_l + click;
-                        let r = tone_r + project_r + click;
-                        frame[0] = T::dithered_from_f32(l, &mut dither);
-                        frame[1] = T::dithered_from_f32(r, &mut dither);
-                        // Extra channels get silence.
-                        for extra in frame.iter_mut().skip(2) {
-                            *extra = T::dithered_from_f32(0.0, &mut dither);
-                        }
-                        peak_l = peak_l.max(l.abs());
-                        peak_r = peak_r.max(r.abs());
-                        sum_sq_l += l * l;
-                        sum_sq_r += r * r;
-                        frames += 1;
                     }
                 } else if ch == 1 {
                     let metronome_graph_max_samples =

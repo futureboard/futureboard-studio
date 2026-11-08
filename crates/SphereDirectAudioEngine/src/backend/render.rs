@@ -1670,41 +1670,8 @@ fn fill_output_f32_inner(
         // Live monitoring is mixed below via the input ring (single, clean
         // path) — the old per-block sample-and-hold monitor was removed because
         // it held one input sample across the whole output block (warble).
-    } else if channels >= 2 {
-        let metronome_graph_max_samples = metronome_graph_max_latency_samples(runtime);
-        let metronome_delay_samples = metronome_compensation_delay_samples(runtime);
-        for frame in data.chunks_mut(channels) {
-            let (tone_l, tone_r) = if gen_tone {
-                (
-                    local.osc_l.next_sample() * TEST_TONE_AMPLITUDE * master_vol,
-                    local.osc_r.next_sample() * TEST_TONE_AMPLITUDE * master_vol,
-                )
-            } else {
-                (0.0, 0.0)
-            };
-            let (proj_l, proj_r) = if transport_playing {
-                render_project_sample(runtime, base_sample + frames, master_vol)
-            } else {
-                (0.0, 0.0)
-            };
-            let click = local.metronome_sample(
-                base_sample + frames,
-                frames,
-                runtime.sample_rate,
-                transport_playing,
-                metronome_graph_max_samples,
-                metronome_delay_samples,
-            ) * master_vol;
-            let l = tone_l + proj_l + click;
-            let r = tone_r + proj_r + click;
-            // Live monitor is added afterwards from the input ring (see below).
-            frame[0] = l;
-            frame[1] = r;
-            for extra in frame.iter_mut().skip(2) {
-                *extra = 0.0;
-            }
-            frames += 1;
-        }
+        // Stereo and wider layouts always take this block kernel, including
+        // while the transport is stopped. Mono stays on the per-sample path.
     } else if channels == 1 {
         let metronome_graph_max_samples = metronome_graph_max_latency_samples(runtime);
         let metronome_delay_samples = metronome_compensation_delay_samples(runtime);
