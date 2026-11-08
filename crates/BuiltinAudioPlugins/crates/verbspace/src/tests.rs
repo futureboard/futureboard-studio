@@ -434,6 +434,58 @@ fn freeze_holds_the_tail_after_the_input_stops() {
     assert!(l.abs().max(r.abs()) < early * 0.01);
 }
 
+/// Freeze toggles and large Decay jumps on a running tail stay bounded
+/// when Bass Mult is above 1 (#197): the absorption's gain and its low
+/// shelf glide independently, so mid-transition `gain × low` used to pass
+/// unity at DC and the tank fed itself to Inf — a peak of ~2,550 for a
+/// 0.5 input, and non-finite output after rapid toggling.
+#[test]
+fn freeze_toggle_and_decay_jump_stay_bounded_with_bass_mult() {
+    // The issue's settings: Size 100 %, Decay 0.10 s, Bass Mult 3.0,
+    // Mix 30 % (default).
+    let issue = Params {
+        size: 100.0,
+        decay_sec: 0.10,
+        bass_mult: 3.0,
+        ..default_params()
+    };
+    let tone = |n: usize| {
+        let t = n as f32 / SR;
+        (TAU * 110.0 * t).sin() * 0.4 + (TAU * 330.0 * t).sin() * 0.1
+    };
+    // Freeze on and off every 100 ms on a running tail.
+    let mut dsp = dsp_with(issue.clone());
+    let mut peak = 0.0f32;
+    for n in 0..(48_000 * 3) {
+        if n >= 48_000 && n % 4_800 == 0 {
+            let frozen = (n / 4_800) % 2 == 0;
+            assert!(dsp.apply_ui_param("freeze", if frozen { 1.0 } else { 0.0 }));
+        }
+        let x = tone(n);
+        let (l, r) = dsp.process_stereo(x, x);
+        assert!(l.is_finite() && r.is_finite(), "non-finite at sample {n}");
+        peak = peak.max(l.abs()).max(r.abs());
+    }
+    assert!(peak < 2.0, "freeze toggling ran away: peak {peak}");
+
+    // A Decay jump alone, 0.1 s to 20 s and back.
+    let mut dsp = dsp_with(issue);
+    let mut peak = 0.0f32;
+    for n in 0..(48_000 * 5) {
+        if n == 48_000 {
+            assert!(dsp.apply_ui_param("decaySec", 20.0));
+        }
+        if n == 48_000 * 3 {
+            assert!(dsp.apply_ui_param("decaySec", 0.1));
+        }
+        let x = tone(n);
+        let (l, r) = dsp.process_stereo(x, x);
+        assert!(l.is_finite() && r.is_finite(), "non-finite at sample {n}");
+        peak = peak.max(l.abs()).max(r.abs());
+    }
+    assert!(peak < 2.0, "decay jump ran away: peak {peak}");
+}
+
 /// Dragging any space control on a running tail bends it; it never steps. A
 /// step shows as a sample-to-sample jump out of proportion to the level
 /// around it; a glide only bends the pitch for the moment it lasts.
