@@ -17,15 +17,15 @@
 //! front. Switching the width dial ([`PreparedNamRuntime::set_slim_size`]) is
 //! a single index write — real-time-safe, no rebuild.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use builtin_dsp_core::make_eq_coefficients;
 use nam_rs::{Model, NamModel};
 
-use super::handoff::HandoffCell;
-use super::rate::{RateAdapter, MAX_RATIO, MIN_RATIO};
 use super::StereoBiquad;
+use super::handoff::HandoffCell;
+use super::rate::{MAX_RATIO, MIN_RATIO, RateAdapter};
 
 /// Target integrated loudness (LUFS) captures are normalized to when loudness
 /// normalization is enabled, matching the reference NAM plugin's convention.
@@ -436,12 +436,20 @@ pub struct NamLoader {
 
 impl NamLoader {
     /// Push a freshly-built runtime for the audio thread to adopt at the next
-    /// block boundary. A not-yet-adopted runtime already waiting is returned
-    /// so the caller can drop it on this thread (safe: the audio thread never
-    /// touched it). Clears a pending [`Self::unload`].
-    pub fn submit(&self, runtime: Box<PreparedNamRuntime>) -> Option<Box<PreparedNamRuntime>> {
+    /// block boundary. Returns a runtime the audio thread has already retired
+    /// and a not-yet-adopted one this call displaced, so the caller can drop
+    /// both on this thread. The audio thread never frees a model. Clears a
+    /// pending [`Self::unload`].
+    pub fn submit(
+        &self,
+        runtime: Box<PreparedNamRuntime>,
+    ) -> (
+        Option<Box<PreparedNamRuntime>>,
+        Option<Box<PreparedNamRuntime>>,
+    ) {
+        let retired = self.channel.retired.take();
         self.channel.unload.store(false, Ordering::Release);
-        self.channel.pending.put(runtime)
+        (retired, self.channel.pending.put(runtime))
     }
 
     /// Drop the active capture at the next block boundary and return a runtime
@@ -660,15 +668,19 @@ impl NamCapture {
     }
 
     /// Control thread: push a freshly-built runtime for the audio thread to
-    /// adopt at the next block boundary. Any not-yet-adopted runtime already
-    /// waiting is returned (safe to drop here: the audio thread never touched
-    /// it). Clears a pending unload.
+    /// adopt at the next block boundary. The retired runtime, and any
+    /// not-yet-adopted one this call displaced, are returned for this thread
+    /// to drop. Clears a pending unload.
     pub(super) fn submit(
         &self,
         runtime: Box<PreparedNamRuntime>,
-    ) -> Option<Box<PreparedNamRuntime>> {
+    ) -> (
+        Option<Box<PreparedNamRuntime>>,
+        Option<Box<PreparedNamRuntime>>,
+    ) {
+        let retired = self.channel.retired.take();
         self.channel.unload.store(false, Ordering::Release);
-        self.channel.pending.put(runtime)
+        (retired, self.channel.pending.put(runtime))
     }
 
     /// Control thread: drop any runtime the audio thread has retired. Call
@@ -701,6 +713,27 @@ impl NamCapture {
                 .unwrap_or(0)
     }
 
+    /// Park `runtime` for the control thread. One overflow is held here so a
+    /// full retired slot does not free the model on this thread.
+    fn park(&mut self, runtime: Box<PreparedNamRuntime>) {
+        if let Some(bounced) = self.channel.retired.put(runtime) {
+            self.retire_overflow = Some(bounced);
+        }
+    }
+
+    /// Fade the active capture out to a dry pass-through.
+    fn fade_to_dry(&mut self) {
+        if let Some(old) = self.active.take() {
+            self.fading_out = Some(old);
+            self.fade = 0.0;
+            self.fade_l.copy_from_slice(&self.out_l);
+            self.fade_r.copy_from_slice(&self.out_r);
+            // The wet side becomes the dry pass-through. Drop the adapter
+            // delay or a partial mix combs against it.
+            self.dry_delay = 0;
+        }
+    }
+
     /// Audio thread: adopt a pending runtime, retire a finished fade, and cap
     /// the inference chunk to `frames` when the host buffer is shorter than
     /// [`NAM_BLOCK`]. `frames == 0` leaves the chunk alone. Called once per
@@ -730,36 +763,34 @@ impl NamCapture {
         // Only start a new swap once any in-progress fade has fully resolved,
         // so at most one runtime is ever "in flight" toward retirement.
         // An unload that arrives mid-fade stays set and is honored once the
-        // fade finishes, unless a newer submit cleared it.
+        // fade finishes, unless a newer submit cleared it. Adopting does not
+        // clear the flag: an unload that lands after the runtime is taken
+        // has to stay set, or this block would erase it.
         if self.fading_out.is_none() {
             if let Some(new_rt) = self.channel.pending.take() {
-                self.channel.unload.store(false, Ordering::Release);
-                if let Some(old) = self.active.replace(new_rt) {
-                    self.fading_out = Some(old);
-                    self.fade = 0.0;
-                    // The current block was already computed by the outgoing
-                    // runtime. Seed the fade buffer with it so the crossfade
-                    // blends continuous audio for the rest of this block
-                    // instead of whatever an earlier swap left behind.
-                    self.fade_l.copy_from_slice(&self.out_l);
-                    self.fade_r.copy_from_slice(&self.out_r);
+                if self.channel.unload.load(Ordering::Acquire) {
+                    self.park(new_rt);
+                    self.fade_to_dry();
+                } else {
+                    if let Some(old) = self.active.replace(new_rt) {
+                        self.fading_out = Some(old);
+                        self.fade = 0.0;
+                        // The current block was already computed by the outgoing
+                        // runtime. Seed the fade buffer with it so the crossfade
+                        // blends continuous audio for the rest of this block
+                        // instead of whatever an earlier swap left behind.
+                        self.fade_l.copy_from_slice(&self.out_l);
+                        self.fade_r.copy_from_slice(&self.out_r);
+                    }
+                    self.dry_delay = self
+                        .active
+                        .as_ref()
+                        .map_or(0, |rt| rt.latency_samples)
+                        .min(MAX_ADAPTER_LATENCY - 1);
+                    self.apply_slim_size();
                 }
-                self.dry_delay = self
-                    .active
-                    .as_ref()
-                    .map_or(0, |rt| rt.latency_samples)
-                    .min(MAX_ADAPTER_LATENCY - 1);
-                self.apply_slim_size();
             } else if self.channel.unload.swap(false, Ordering::AcqRel) {
-                if let Some(old) = self.active.take() {
-                    self.fading_out = Some(old);
-                    self.fade = 0.0;
-                    self.fade_l.copy_from_slice(&self.out_l);
-                    self.fade_r.copy_from_slice(&self.out_r);
-                    // The wet side becomes the dry pass-through. Drop the
-                    // adapter delay or a partial mix combs against it.
-                    self.dry_delay = 0;
-                }
+                self.fade_to_dry();
             }
         }
 
@@ -1117,6 +1148,63 @@ mod tests {
         }
         assert!(cap.active_info().is_none(), "the capture is gone");
         assert!(cap.fading_out.is_none(), "the fade retired it");
+        loader.collect_garbage();
+    }
+
+    /// An unload that arrives after a runtime is queued, and before the audio
+    /// thread has finished adopting it, must win. Clearing the flag while
+    /// adopting would leave the queued capture running.
+    #[test]
+    fn an_unload_during_adoption_removes_the_capture() {
+        let mut cap = NamCapture::new(48_000.0);
+        cap.configure(0.0, 0.0, 100.0, false, 1.0);
+        let loader = cap.loader();
+        loader
+            .load_json(TINY_WAVENET_48K, "a", 48_000.0, false, false)
+            .expect("load");
+        cap.begin_block(0);
+        assert!(cap.active_info().is_some());
+
+        let queued =
+            prepare_nam_runtime(TINY_WAVENET_48K, "b".into(), 48_000.0, false, false).unwrap();
+        drop(loader.submit(Box::new(queued)));
+        cap.channel.unload.store(true, Ordering::Release);
+        cap.begin_block(0);
+        for _ in 0..2_000 {
+            let (l, r) = cap.process(0.2, -0.2);
+            assert!(l.is_finite() && r.is_finite());
+            cap.begin_block(0);
+        }
+        assert!(
+            cap.active_info().is_none(),
+            "the queued capture must not stay active"
+        );
+        loader.collect_garbage();
+    }
+
+    /// Four swaps in a row used to fill the single retired slot and free the
+    /// overflow on the audio thread. `submit` has to take that slot first.
+    #[test]
+    fn four_swaps_never_overflow_the_retired_slot() {
+        let mut cap = NamCapture::new(48_000.0);
+        cap.configure(0.0, 0.0, 100.0, false, 1.0);
+        let loader = cap.loader();
+        for i in 0..4 {
+            let prepared =
+                prepare_nam_runtime(TINY_WAVENET_48K, format!("c{i}"), 48_000.0, false, false)
+                    .unwrap();
+            drop(loader.submit(Box::new(prepared)));
+            cap.begin_block(0);
+            for _ in 0..2_000 {
+                let (l, r) = cap.process(0.2, -0.2);
+                assert!(l.is_finite() && r.is_finite());
+                cap.begin_block(0);
+            }
+            assert!(
+                cap.retire_overflow.is_none(),
+                "swap {i} left a model for the audio thread to free"
+            );
+        }
         loader.collect_garbage();
     }
 

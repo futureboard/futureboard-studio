@@ -73,6 +73,8 @@ pub mod airboost_plate;
 #[cfg(feature = "builtin-plugin-editor")]
 pub mod band_model;
 #[cfg(feature = "builtin-plugin-editor")]
+pub mod builtin_preset_menu;
+#[cfg(feature = "builtin-plugin-editor")]
 pub mod burn_limit_plate;
 #[cfg(feature = "builtin-plugin-editor")]
 pub mod compressor_plate;
@@ -99,8 +101,6 @@ pub mod fx_model;
 #[cfg(feature = "builtin-plugin-editor")]
 pub mod gate_model;
 pub mod gpu_editor_diagnostics;
-#[cfg(feature = "builtin-plugin-editor")]
-pub mod builtin_preset_menu;
 #[cfg(feature = "builtin-plugin-editor")]
 pub mod imager_plate;
 pub mod inspector_kit;

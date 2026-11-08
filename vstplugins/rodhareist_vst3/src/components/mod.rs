@@ -22,8 +22,8 @@ pub mod rodhareist_window;
 pub mod text_input;
 
 pub mod builtin_plugin_editor;
-pub mod context_menu;
 pub mod builtin_plugin_editor_window;
+pub mod context_menu;
 pub mod native_plugin_shell;
 pub mod plugin_kit;
 pub mod timeline;

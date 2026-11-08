@@ -44,14 +44,14 @@
 //! is allocated in [`prepare_ir_runtime`] or [`IrConvolver::new`].
 //! [`IrConvolver::process`] performs no allocation, locking or logging.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
 
 use super::handoff::HandoffCell;
-use super::wav::{parse_wav, WavError};
+use super::wav::{WavError, parse_wav};
 
 /// Convolution partition size, in samples — also the engine's exact latency.
 /// 128 samples is 2.7 ms at 48 kHz: short enough to play through, long enough
@@ -562,12 +562,19 @@ pub struct IrLoader {
 
 impl IrLoader {
     /// Push a freshly-built runtime for the audio thread to adopt at the next
-    /// block boundary. A not-yet-adopted runtime already waiting is returned
-    /// so the caller can drop it (safe: the audio thread never touched it).
-    /// Clears a pending [`Self::unload`].
-    pub fn submit(&self, runtime: Box<PreparedIrRuntime>) -> Option<Box<PreparedIrRuntime>> {
+    /// block boundary. Returns a runtime the audio thread has already retired
+    /// and a not-yet-adopted one this call displaced, for the caller to drop.
+    /// The audio thread never frees a model. Clears a pending [`Self::unload`].
+    pub fn submit(
+        &self,
+        runtime: Box<PreparedIrRuntime>,
+    ) -> (
+        Option<Box<PreparedIrRuntime>>,
+        Option<Box<PreparedIrRuntime>>,
+    ) {
+        let retired = self.channel.retired.take();
         self.channel.unload.store(false, Ordering::Release);
-        self.channel.pending.put(runtime)
+        (retired, self.channel.pending.put(runtime))
     }
 
     /// Drop any runtime the audio thread has retired.
@@ -695,11 +702,19 @@ impl IrConvolver {
         }
     }
 
-    /// Control thread: push a freshly-built runtime. A runtime already waiting
-    /// is returned for this thread to drop. Clears a pending unload.
-    pub(super) fn submit(&self, runtime: Box<PreparedIrRuntime>) -> Option<Box<PreparedIrRuntime>> {
+    /// Control thread: push a freshly-built runtime. The retired runtime, and
+    /// any one already waiting, are returned for this thread to drop. Clears
+    /// a pending unload.
+    pub(super) fn submit(
+        &self,
+        runtime: Box<PreparedIrRuntime>,
+    ) -> (
+        Option<Box<PreparedIrRuntime>>,
+        Option<Box<PreparedIrRuntime>>,
+    ) {
+        let retired = self.channel.retired.take();
         self.channel.unload.store(false, Ordering::Release);
-        self.channel.pending.put(runtime)
+        (retired, self.channel.pending.put(runtime))
     }
 
     /// Control thread: drop any runtime the audio thread has retired.
@@ -741,16 +756,25 @@ impl IrConvolver {
 
         if self.staged.is_none() {
             if let Some(new_rt) = self.channel.pending.take() {
-                self.clear_when_silent = false;
-                self.channel.unload.store(false, Ordering::Release);
-                if self.active.is_none() {
-                    // Nothing playing through the slot yet — no need to duck.
-                    self.active = Some(new_rt);
-                    self.gain = 1.0;
-                    self.ducking = false;
+                // Adopting does not clear the unload flag. An unload that
+                // lands after this runtime is taken has to stay set.
+                if self.channel.unload.load(Ordering::Acquire) {
+                    self.retire(new_rt);
+                    if self.active.is_some() {
+                        self.clear_when_silent = true;
+                        self.ducking = true;
+                    }
                 } else {
-                    self.staged = Some(new_rt);
-                    self.ducking = true;
+                    self.clear_when_silent = false;
+                    if self.active.is_none() {
+                        // Nothing playing through the slot yet — no need to duck.
+                        self.active = Some(new_rt);
+                        self.gain = 1.0;
+                        self.ducking = false;
+                    } else {
+                        self.staged = Some(new_rt);
+                        self.ducking = true;
+                    }
                 }
             } else if self.channel.unload.swap(false, Ordering::AcqRel) && self.active.is_some() {
                 self.clear_when_silent = true;
@@ -952,6 +976,61 @@ mod tests {
         }
         assert!(cleared, "the IR is unloaded after the duck");
         assert!(conv.active_info().is_none());
+        loader.collect_garbage();
+    }
+
+    /// An unload that arrives after an IR is queued must win over that IR.
+    #[test]
+    fn an_unload_during_adoption_removes_the_ir() {
+        let mut conv = IrConvolver::new(SR as f32);
+        let loader = conv.loader();
+        loader.submit(Box::new(
+            prepare_ir_runtime(&wav_file(&test_ir(200), 1, SR as u32), "a".into(), SR).unwrap(),
+        ));
+        conv.begin_block();
+        assert!(conv.active_info().is_some());
+
+        drop(loader.submit(Box::new(
+            prepare_ir_runtime(&wav_file(&test_ir(200), 1, SR as u32), "b".into(), SR).unwrap(),
+        )));
+        conv.channel.unload.store(true, Ordering::Release);
+        let input: Vec<f32> = (0..4_096).map(|n| (n as f32 * 0.05).sin() * 0.2).collect();
+        let out = render(&mut conv, &input);
+        for (n, y) in out.iter().enumerate() {
+            assert!(y.is_finite(), "non-finite at {n}");
+        }
+        assert!(
+            conv.active_info().is_none(),
+            "the queued IR must not stay active"
+        );
+        loader.collect_garbage();
+    }
+
+    /// Repeated submits must drain the retired slot, or the fourth swap frees
+    /// a model on the audio thread.
+    #[test]
+    fn four_swaps_never_overflow_the_retired_slot() {
+        let mut conv = IrConvolver::new(SR as f32);
+        let loader = conv.loader();
+        let input: Vec<f32> = (0..4_096).map(|n| (n as f32 * 0.05).sin() * 0.2).collect();
+        for i in 0..4 {
+            drop(
+                loader.submit(Box::new(
+                    prepare_ir_runtime(
+                        &wav_file(&test_ir(128 + i * 16), 1, SR as u32),
+                        format!("c{i}"),
+                        SR,
+                    )
+                    .unwrap(),
+                )),
+            );
+            let out = render(&mut conv, &input);
+            assert!(out.iter().all(|y| y.is_finite()));
+            assert!(
+                conv.retire_overflow.is_none(),
+                "swap {i} left a model for the audio thread to free"
+            );
+        }
         loader.collect_garbage();
     }
 

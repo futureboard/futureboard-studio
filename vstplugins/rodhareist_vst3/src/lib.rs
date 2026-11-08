@@ -83,6 +83,12 @@ pub struct Rodhareist {
     /// Mono input on a mono → stereo layout: the left channel is the signal.
     mono_input: bool,
     latency: u32,
+    /// Host maximum block. The NAM chunk follows this, not each callback's
+    /// length, so a short block does not move the reported latency.
+    nam_block: usize,
+    /// A path order we held back for one block. The same order again is what
+    /// the host meant; a different one is still a move in progress.
+    held_path: Option<[Option<StageKind>; PATH_SLOTS]>,
 }
 
 impl Default for Rodhareist {
@@ -111,6 +117,8 @@ impl Default for Rodhareist {
             tone_engine,
             mono_input: false,
             latency: 0,
+            nam_block: 1,
+            held_path: None,
         }
     }
 }
@@ -120,65 +128,111 @@ impl Rodhareist {
     /// `Dsp`. Allocation-free: values are compared per block, and a string id
     /// is only matched for a value that actually changed.
     fn apply_param_changes(&mut self) {
-        let Some(dsp) = self.dsp.as_deref_mut() else {
+        if self.dsp.is_none() {
             return;
-        };
+        }
+        let applied_path = self.applied_path();
         let mut path_changed = false;
         let mut amp_model_changed = false;
-        for (i, entry) in self.params.wire.entries().iter().enumerate() {
-            let value = entry.param.plain();
-            // The DSP puts the engine back on Classic when the amp model
-            // moves; the host's `tone_engine` stays authoritative.
-            let force = amp_model_changed && i == self.tone_engine;
-            if value == self.applied[i] && !force {
-                continue;
-            }
-            match entry.kind {
-                // Remembered below, once the whole order is a real chain.
-                // A move writes several slots; storing one of them now would
-                // hide the rest of the move from the next block.
-                EntryKind::PathSlot(_) => path_changed = true,
-                EntryKind::Value => {
-                    self.applied[i] = value;
-                    dsp.apply_ui_param(entry.id, value);
-                    amp_model_changed |= i == self.amp_model;
+        {
+            let Some(dsp) = self.dsp.as_deref_mut() else {
+                return;
+            };
+            for (i, entry) in self.params.wire.entries().iter().enumerate() {
+                let value = entry.param.plain();
+                // The DSP puts the engine back on Classic when the amp model
+                // moves; the host's `tone_engine` stays authoritative.
+                let force = amp_model_changed && i == self.tone_engine;
+                if value == self.applied[i] && !force {
+                    continue;
+                }
+                match entry.kind {
+                    // Remembered below, once the whole order is a real chain.
+                    // A move writes several slots; storing one of them now would
+                    // hide the rest of the move from the next block.
+                    EntryKind::PathSlot(_) => path_changed = true,
+                    EntryKind::Value => {
+                        self.applied[i] = value;
+                        dsp.apply_ui_param(entry.id, value);
+                        amp_model_changed |= i == self.amp_model;
+                    }
                 }
             }
         }
         if !path_changed {
+            self.held_path = None;
             return;
         }
-        // The editor sends a move as one parameter per slot. If a block
-        // boundary falls between those writes the same stage sits in two
-        // slots, and the DSP would drop one of them for that block. Hold
-        // the previous order until every slot of the move is visible.
+        // The editor sends a move as one parameter per slot. A block boundary
+        // between those writes either duplicates a stage or, when the block
+        // lands on an empty slot, removes it for one callback. Hold the
+        // previous order. The same incomplete order on the next block is a
+        // deliberate edit (a removal, or a duplicate from a generic editor)
+        // and is applied then; the DSP drops a real duplicate.
         let mut order = [None; PATH_SLOTS];
         for (slot, &entry) in self.path_slots.iter().enumerate() {
             let value = self.params.wire.entries()[entry].param.plain();
             order[slot] = StageKind::from_index(value.round() as i32);
         }
-        if !path_order_is_ready(&order) {
+        if hold_path_order(&mut self.held_path, &applied_path, &order) {
             return;
         }
         for &entry in &self.path_slots {
             self.applied[entry] = self.params.wire.entries()[entry].param.plain();
         }
-        dsp.set_path_order(order);
+        if let Some(dsp) = self.dsp.as_deref_mut() {
+            dsp.set_path_order(order);
+        }
+    }
+
+    fn applied_path(&self) -> [Option<StageKind>; PATH_SLOTS] {
+        let mut order = [None; PATH_SLOTS];
+        for (slot, &entry) in self.path_slots.iter().enumerate() {
+            let value = self.applied[entry];
+            order[slot] = value
+                .is_finite()
+                .then(|| StageKind::from_index(value.round() as i32))
+                .flatten();
+        }
+        order
     }
 }
 
-/// A chain the DSP can take in one step: no stage occupies two slots. Empty
-/// slots are fine. A duplicate is a move observed halfway.
-fn path_order_is_ready(order: &[Option<StageKind>; PATH_SLOTS]) -> bool {
+/// Hold `next` back for one block when it is a move seen halfway: a stage
+/// sits in two slots, or a stage from `previous` has disappeared. The same
+/// `next` again is applied.
+fn hold_path_order(
+    held: &mut Option<[Option<StageKind>; PATH_SLOTS]>,
+    previous: &[Option<StageKind>; PATH_SLOTS],
+    next: &[Option<StageKind>; PATH_SLOTS],
+) -> bool {
+    if path_order_is_mid_move(previous, next) && *held != Some(*next) {
+        *held = Some(*next);
+        true
+    } else {
+        *held = None;
+        false
+    }
+}
+
+/// A duplicate stage, or a stage that left the chain without arriving
+/// anywhere else. Empty slots are fine. Adding a stage is not a mid-move.
+fn path_order_is_mid_move(
+    previous: &[Option<StageKind>; PATH_SLOTS],
+    next: &[Option<StageKind>; PATH_SLOTS],
+) -> bool {
     let mut seen = [false; StageKind::COUNT];
-    for stage in order.iter().flatten() {
+    for stage in next.iter().flatten() {
         let index = stage.index() as usize;
         if index >= seen.len() || seen[index] {
-            return false;
+            return true;
         }
         seen[index] = true;
     }
-    true
+    previous
+        .iter()
+        .flatten()
+        .any(|stage| !seen[stage.index() as usize])
 }
 
 impl Plugin for Rodhareist {
@@ -258,8 +312,13 @@ impl Plugin for Rodhareist {
         // A state load lands here too: take the whole parameter set as saved,
         // power included, without fades.
         let core = self.params.wire.to_core_params();
+        // The NAM chunk is the host's maximum block, capped inside the DSP.
+        // A callback shorter than that maximum must not change it: hosts that
+        // split blocks would otherwise restart delay compensation every time.
+        self.nam_block = (buffer_config.max_buffer_size as usize).max(1);
         if let Some(dsp) = self.dsp.as_deref_mut() {
             dsp.set_params(core);
+            dsp.begin_block_with_frames(self.nam_block);
         }
         for (applied, entry) in self.applied.iter_mut().zip(self.params.wire.entries()) {
             *applied = entry.param.plain();
@@ -299,10 +358,10 @@ impl Plugin for Rodhareist {
         }
 
         // A queued capture or IR is adopted here, at the block boundary.
-        // The host period caps the NAM inference chunk. `begin_block` alone
-        // leaves it at 64, so a 32-sample buffer infers on every other
-        // callback and reports 64 samples of latency.
-        dsp.begin_block_with_frames(buffer.samples());
+        // The chunk is the host maximum from `initialize`, not this
+        // callback's length. A fixed 32-sample host therefore infers inside
+        // 32 samples, and a host that varies the callback keeps one latency.
+        dsp.begin_block_with_frames(self.nam_block);
         match buffer.as_slice() {
             [left, right, ..] => {
                 if mono_input {
@@ -407,15 +466,65 @@ mod tests {
 
     #[test]
     fn a_half_moved_chain_is_not_applied() {
-        let mut order = [None; PATH_SLOTS];
-        order[0] = Some(StageKind::Drive);
-        order[1] = Some(StageKind::Amp);
-        assert!(path_order_is_ready(&order));
+        let mut previous = [None; PATH_SLOTS];
+        previous[0] = Some(StageKind::Drive);
+        previous[1] = Some(StageKind::Amp);
+        let mut order = previous;
+        assert!(!path_order_is_mid_move(&previous, &order));
         // The move's first write: Drive now sits in both slots.
         order[1] = Some(StageKind::Drive);
-        assert!(!path_order_is_ready(&order));
+        let mut held = None;
+        assert!(hold_path_order(&mut held, &previous, &order));
         order[0] = Some(StageKind::Amp);
-        assert!(path_order_is_ready(&order));
+        assert!(!hold_path_order(&mut held, &previous, &order));
+        // A duplicate left in place by a generic editor is applied on the
+        // next block, not held forever. The DSP drops the extra copy.
+        let mut duplicate = previous;
+        duplicate[2] = Some(StageKind::Drive);
+        let mut held = None;
+        assert!(hold_path_order(&mut held, &previous, &duplicate));
+        assert!(!hold_path_order(&mut held, &previous, &duplicate));
+    }
+
+    #[test]
+    fn a_move_onto_an_empty_slot_waits_for_the_destination() {
+        let mut previous = [None; PATH_SLOTS];
+        previous[0] = Some(StageKind::Drive);
+        previous[1] = Some(StageKind::Amp);
+        // Source cleared first. Drive is missing, and that must not be applied
+        // as the chain. The next write puts Drive in the empty slot.
+        let mut halfway = previous;
+        halfway[0] = None;
+        let mut held = None;
+        assert!(hold_path_order(&mut held, &previous, &halfway));
+        let mut done = halfway;
+        done[2] = Some(StageKind::Drive);
+        assert!(!hold_path_order(&mut held, &previous, &done));
+    }
+
+    #[test]
+    fn a_deliberate_removal_applies_on_the_next_block() {
+        let mut previous = [None; PATH_SLOTS];
+        previous[0] = Some(StageKind::Drive);
+        previous[1] = Some(StageKind::Amp);
+        let mut removed = previous;
+        removed[0] = None;
+        let mut held = None;
+        assert!(hold_path_order(&mut held, &previous, &removed));
+        assert!(!hold_path_order(&mut held, &previous, &removed));
+    }
+
+    #[test]
+    fn the_nam_chunk_stays_on_the_host_maximum() {
+        let mut plugin = plugin_with_dsp();
+        plugin.nam_block = 32;
+        let dsp = plugin.dsp.as_deref_mut().unwrap();
+        dsp.begin_block_with_frames(plugin.nam_block);
+        assert_eq!(dsp.nam_latency_samples(), 32);
+        // A later callback is shorter. The plug-in passes the maximum again,
+        // so the reported latency does not move.
+        dsp.begin_block_with_frames(plugin.nam_block);
+        assert_eq!(dsp.nam_latency_samples(), 32);
     }
 
     #[test]
