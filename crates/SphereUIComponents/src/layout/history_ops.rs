@@ -218,6 +218,11 @@ impl StudioLayout {
             let before = crate::components::builtin_plugin_editor::builtin_state_replay(
                 &plugin_id, insert_id,
             );
+            // And the sample files it plays: a sampler's audio is not a
+            // parameter, so it is sent apart from the replay (#265).
+            let before_samples = crate::components::builtin_plugin_editor::builtin_sample_names(
+                &plugin_id, insert_id,
+            );
             // Replace, not seed: the insert already has live state, and a
             // seed leaves that alone — which made a preset load, a paste and
             // an undo of either a no-op (#234).
@@ -231,6 +236,7 @@ impl StudioLayout {
             }
             let baseline = (!before.is_empty()).then_some(before);
             self.replay_builtin_insert_state(insert_id, baseline, cx);
+            self.reload_changed_builtin_samples(insert_id, &plugin_id, &before_samples, cx);
             self.refresh_builtin_editor_sidebars(cx);
         } else if let Some(runtime) = self.plugin_editors.bridge_runtime.clone() {
             if let Ok(mut runtime) = runtime.lock() {
