@@ -1379,6 +1379,10 @@ const EXTENSIBLE_GUID_SUFFIX: [u8; 14] = [
 /// valid-bits + channel-mask). A short fmt chunk, a GUID suffix mismatch, or
 /// an unrecognised subformat keeps the 0xFFFE tag so callers still report
 /// "unsupported WAV format code: 65534".
+///
+/// Valid bits are deliberately ignored: spec-compliant files left-justify
+/// valid bits in the container, so decoding at the container depth yields
+/// the correct amplitude (see `extensible_pcm_24bit_valid20_decodes`).
 fn resolve_extensible_format(fmt_body: &[u8], tag: u16) -> u16 {
     const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
     if tag != WAVE_FORMAT_EXTENSIBLE || fmt_body.len() < 40 {
@@ -1879,6 +1883,18 @@ mod audition_head_tests {
     /// GUID carries `subformat` (1 = PCM, 3 = IEEE float). `samples` are raw
     /// little-endian interleaved sample bytes.
     fn wav_extensible_bytes(subformat: u16, bits: u16, samples: &[u8]) -> Vec<u8> {
+        wav_extensible_bytes_valid(subformat, bits, bits, samples)
+    }
+
+    /// Same as [`wav_extensible_bytes`] but with an explicit valid-bits
+    /// count, for files whose valid bits are fewer than the container depth
+    /// (e.g. 20-bit samples in a 24-bit container).
+    fn wav_extensible_bytes_valid(
+        subformat: u16,
+        bits: u16,
+        valid_bits: u16,
+        samples: &[u8],
+    ) -> Vec<u8> {
         let channels = 2u16;
         let sample_rate = 48_000u32;
         let bytes_per_sample = (bits / 8) as usize;
@@ -1897,7 +1913,7 @@ mod audition_head_tests {
         out.extend_from_slice(&(bytes_per_frame as u16).to_le_bytes());
         out.extend_from_slice(&bits.to_le_bytes());
         out.extend_from_slice(&22u16.to_le_bytes()); // cbSize
-        out.extend_from_slice(&bits.to_le_bytes()); // valid bits per sample
+        out.extend_from_slice(&valid_bits.to_le_bytes()); // valid bits per sample
         out.extend_from_slice(&0x3u32.to_le_bytes()); // channel mask: FL|FR
                                                       // KSDATAFORMAT_SUBTYPE GUID: {subformat, 0000-0010-8000-00aa00389b71}
         out.extend_from_slice(&subformat.to_le_bytes());
@@ -2056,6 +2072,7 @@ mod audition_head_tests {
 
     /// Issue #286: IEEE-float subformat decodes like the plain float tag,
     /// including values above 0 dBFS, which the float arm does not clamp.
+    /// Covers the head decode (`read_wav_header`) as well as the full decode.
     #[test]
     fn extensible_float32_decodes() {
         let vals = [0.5f32, -0.25, 0.0, 1.5];
@@ -2067,11 +2084,78 @@ mod audition_head_tests {
         let path = temp_wav("ext-float32");
         std::fs::write(&path, wav_extensible_bytes(3, 32, &samples)).unwrap();
         let decoded = load_audio_file(path.to_str().unwrap());
+        let head = load_audio_file_head(path.to_str().unwrap(), AUDITION_PREVIEW_SECONDS);
         let _ = std::fs::remove_file(&path);
         let decoded = decoded.expect("EXTENSIBLE float32 must decode");
+        let head = head.expect("EXTENSIBLE float32 head decode must succeed");
+        assert_eq!(head.frames, vals.len());
+        assert_eq!(head.samples, decoded.samples);
 
         let expected: Vec<f32> = vals.iter().flat_map(|v| [*v, *v]).collect();
         assert_eq!(decoded.samples, expected);
+    }
+
+    /// Issue #286: valid bits fewer than the container depth still decode
+    /// correctly — spec-compliant files left-justify valid bits, so a
+    /// 20-bit value stored in a 24-bit container decodes at its 20-bit
+    /// amplitude. Locks in the "valid bits are ignored" assumption.
+    #[test]
+    fn extensible_pcm_24bit_valid20_decodes() {
+        // 20-bit values, left-justified into 24-bit containers (<< 4).
+        let raw20: [i32; 4] = [0x40000, -0x40000, 0, 0x7FFFF];
+        let mut samples = Vec::new();
+        for v in raw20 {
+            let stored = v << 4;
+            let b = [
+                (stored & 0xFF) as u8,
+                ((stored >> 8) & 0xFF) as u8,
+                ((stored >> 16) & 0xFF) as u8,
+            ];
+            samples.extend_from_slice(&b);
+            samples.extend_from_slice(&b);
+        }
+        let path = temp_wav("ext-pcm24-valid20");
+        std::fs::write(&path, wav_extensible_bytes_valid(1, 24, 20, &samples)).unwrap();
+        let decoded = load_audio_file(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        let decoded = decoded.expect("EXTENSIBLE PCM 24-bit/valid-20 must decode");
+
+        let expected: Vec<f32> = raw20
+            .iter()
+            .flat_map(|v| [(*v as f32) / 524_288.0, (*v as f32) / 524_288.0])
+            .collect();
+        assert_eq!(decoded.samples.len(), expected.len());
+        for (got, want) in decoded.samples.iter().zip(expected.iter()) {
+            assert!((got - want).abs() < 1e-6, "got {got}, want {want}");
+        }
+    }
+
+    /// Issue #286: the waveform path works on an EXTENSIBLE file —
+    /// `generate_audio_peaks` must produce the full LOD ladder with the
+    /// finest LOD spanning the fixture's peaks.
+    #[test]
+    fn extensible_pcm_16bit_waveform_peaks() {
+        let frames = 600usize;
+        let mut samples = Vec::new();
+        for i in 0..frames {
+            let v: i16 = if i % 2 == 0 { 16_383 } else { -16_383 };
+            samples.extend_from_slice(&v.to_le_bytes());
+            samples.extend_from_slice(&v.to_le_bytes());
+        }
+        let path = temp_wav("ext-pcm16-peaks");
+        std::fs::write(&path, wav_extensible_bytes(1, 16, &samples)).unwrap();
+        let peaks = generate_audio_peaks(&path);
+        let _ = std::fs::remove_file(&path);
+        let peaks = peaks.expect("EXTENSIBLE PCM 16-bit must produce peaks");
+
+        assert_eq!(peaks.channels, 2);
+        assert_eq!(peaks.total_frames, frames as u64);
+        assert_eq!(peaks.lods.len(), PEAK_LOD_LEVELS.len());
+        let finest = &peaks.lods[0];
+        assert_eq!(finest.samples_per_peak, PEAK_LOD_LEVELS[0]);
+        let first = finest.peaks.first().expect("at least one peak");
+        assert!((first.max - 0.5).abs() < 1e-3, "max was {}", first.max);
+        assert!((first.min + 0.5).abs() < 1e-3, "min was {}", first.min);
     }
 
     /// An EXTENSIBLE file whose subformat is neither PCM nor float must keep
