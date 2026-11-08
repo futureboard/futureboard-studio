@@ -133,25 +133,52 @@ impl Rodhareist {
             if value == self.applied[i] && !force {
                 continue;
             }
-            self.applied[i] = value;
             match entry.kind {
+                // Remembered below, once the whole order is a real chain.
+                // A move writes several slots; storing one of them now would
+                // hide the rest of the move from the next block.
                 EntryKind::PathSlot(_) => path_changed = true,
                 EntryKind::Value => {
+                    self.applied[i] = value;
                     dsp.apply_ui_param(entry.id, value);
                     amp_model_changed |= i == self.amp_model;
                 }
             }
         }
-        if path_changed {
-            // The whole order at once: slot-by-slot writes would pass through
-            // transient duplicates the DSP resolves by dropping a stage.
-            let mut order = [None; PATH_SLOTS];
-            for (slot, &entry) in self.path_slots.iter().enumerate() {
-                order[slot] = StageKind::from_index(self.applied[entry].round() as i32);
-            }
-            dsp.set_path_order(order);
+        if !path_changed {
+            return;
         }
+        // The editor sends a move as one parameter per slot. If a block
+        // boundary falls between those writes the same stage sits in two
+        // slots, and the DSP would drop one of them for that block. Hold
+        // the previous order until every slot of the move is visible.
+        let mut order = [None; PATH_SLOTS];
+        for (slot, &entry) in self.path_slots.iter().enumerate() {
+            let value = self.params.wire.entries()[entry].param.plain();
+            order[slot] = StageKind::from_index(value.round() as i32);
+        }
+        if !path_order_is_ready(&order) {
+            return;
+        }
+        for &entry in &self.path_slots {
+            self.applied[entry] = self.params.wire.entries()[entry].param.plain();
+        }
+        dsp.set_path_order(order);
     }
+}
+
+/// A chain the DSP can take in one step: no stage occupies two slots. Empty
+/// slots are fine. A duplicate is a move observed halfway.
+fn path_order_is_ready(order: &[Option<StageKind>; PATH_SLOTS]) -> bool {
+    let mut seen = [false; StageKind::COUNT];
+    for stage in order.iter().flatten() {
+        let index = stage.index() as usize;
+        if index >= seen.len() || seen[index] {
+            return false;
+        }
+        seen[index] = true;
+    }
+    true
 }
 
 impl Plugin for Rodhareist {
@@ -219,7 +246,11 @@ impl Plugin for Rodhareist {
                 sample_rate: f64::from(sample_rate),
                 nam_loaded: None,
                 ir_loaded: None,
+                nam_generation: 0,
+                ir_generation: 0,
             });
+            // Anything still building was aimed at the `Dsp` we just replaced.
+            self.shared.bump_control_epoch();
             self.dsp = Some(dsp);
             self.sample_rate = sample_rate;
         }
@@ -268,7 +299,10 @@ impl Plugin for Rodhareist {
         }
 
         // A queued capture or IR is adopted here, at the block boundary.
-        dsp.begin_block();
+        // The host period caps the NAM inference chunk. `begin_block` alone
+        // leaves it at 64, so a 32-sample buffer infers on every other
+        // callback and reports 64 samples of latency.
+        dsp.begin_block_with_frames(buffer.samples());
         match buffer.as_slice() {
             [left, right, ..] => {
                 if mono_input {
@@ -369,6 +403,19 @@ mod tests {
             *plugin.dsp.as_deref().unwrap().params(),
             plugin.params.wire.to_core_params()
         );
+    }
+
+    #[test]
+    fn a_half_moved_chain_is_not_applied() {
+        let mut order = [None; PATH_SLOTS];
+        order[0] = Some(StageKind::Drive);
+        order[1] = Some(StageKind::Amp);
+        assert!(path_order_is_ready(&order));
+        // The move's first write: Drive now sits in both slots.
+        order[1] = Some(StageKind::Drive);
+        assert!(!path_order_is_ready(&order));
+        order[0] = Some(StageKind::Amp);
+        assert!(path_order_is_ready(&order));
     }
 
     #[test]

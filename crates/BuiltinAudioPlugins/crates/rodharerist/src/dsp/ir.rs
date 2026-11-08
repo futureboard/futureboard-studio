@@ -44,13 +44,14 @@
 //! is allocated in [`prepare_ir_runtime`] or [`IrConvolver::new`].
 //! [`IrConvolver::process`] performs no allocation, locking or logging.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
 
 use super::handoff::HandoffCell;
-use super::wav::{WavError, parse_wav};
+use super::wav::{parse_wav, WavError};
 
 /// Convolution partition size, in samples — also the engine's exact latency.
 /// 128 samples is 2.7 ms at 48 kHz: short enough to play through, long enough
@@ -545,6 +546,9 @@ pub struct IrChannel {
     pending: HandoffCell<PreparedIrRuntime>,
     /// Audio thread → control thread: a retired runtime awaiting disposal.
     retired: HandoffCell<PreparedIrRuntime>,
+    /// Control thread → audio thread: drop the active IR once the duck
+    /// reaches silence. A later [`IrLoader::submit`] clears it.
+    unload: AtomicBool,
 }
 
 /// Cloneable control-side handle to an [`IrConvolver`]'s hand-off cells.
@@ -558,12 +562,12 @@ pub struct IrLoader {
 
 impl IrLoader {
     /// Push a freshly-built runtime for the audio thread to adopt at the next
-    /// block boundary. A not-yet-adopted runtime already waiting is dropped
-    /// here (safe: the audio thread never touched it).
-    pub fn submit(&self, runtime: Box<PreparedIrRuntime>) {
-        if let Some(bumped) = self.channel.pending.put(runtime) {
-            drop(bumped);
-        }
+    /// block boundary. A not-yet-adopted runtime already waiting is returned
+    /// so the caller can drop it (safe: the audio thread never touched it).
+    /// Clears a pending [`Self::unload`].
+    pub fn submit(&self, runtime: Box<PreparedIrRuntime>) -> Option<Box<PreparedIrRuntime>> {
+        self.channel.unload.store(false, Ordering::Release);
+        self.channel.pending.put(runtime)
     }
 
     /// Drop any runtime the audio thread has retired.
@@ -588,10 +592,19 @@ impl IrLoader {
         Ok(info)
     }
 
+    /// Queue an unload of the active IR. The not-yet-adopted runtime, if any,
+    /// is returned for the caller to drop. The audio thread ducks to silence
+    /// and then retires the live one — it does not free it.
+    pub fn unload(&self) -> Option<Box<PreparedIrRuntime>> {
+        let pending = self.channel.pending.take();
+        self.channel.unload.store(true, Ordering::Release);
+        pending
+    }
+
     /// Unload whatever IR is active, returning the cabinet slot to a dry pass
-    /// through. Signalled by submitting nothing and clearing on the audio side
-    /// — see [`IrConvolver::request_unload`].
+    /// through, and drop a runtime the audio thread has already retired.
     pub fn clear(&self) {
+        drop(self.unload());
         self.collect_garbage();
     }
 }
@@ -605,6 +618,9 @@ pub(super) struct IrConvolver {
     /// A retiree the control thread hasn't drained yet. Held here — never
     /// dropped on the audio thread — until a later block finds `retired` empty.
     retire_overflow: Option<Box<PreparedIrRuntime>>,
+    /// Set with an unload, cleared when a replacement is staged. Honored once
+    /// the duck reaches silence and nothing is waiting to take the slot.
+    clear_when_silent: bool,
 
     sample_rate: f32,
     in_l: Vec<f32>,
@@ -627,10 +643,12 @@ impl IrConvolver {
             channel: Arc::new(IrChannel {
                 pending: HandoffCell::new(),
                 retired: HandoffCell::new(),
+                unload: AtomicBool::new(false),
             }),
             active: None,
             staged: None,
             retire_overflow: None,
+            clear_when_silent: false,
             sample_rate: sr,
             in_l: vec![0.0; PARTITION],
             in_r: vec![0.0; PARTITION],
@@ -677,11 +695,11 @@ impl IrConvolver {
         }
     }
 
-    /// Control thread: push a freshly-built runtime.
-    pub(super) fn submit(&self, runtime: Box<PreparedIrRuntime>) {
-        if let Some(bumped) = self.channel.pending.put(runtime) {
-            drop(bumped);
-        }
+    /// Control thread: push a freshly-built runtime. A runtime already waiting
+    /// is returned for this thread to drop. Clears a pending unload.
+    pub(super) fn submit(&self, runtime: Box<PreparedIrRuntime>) -> Option<Box<PreparedIrRuntime>> {
+        self.channel.unload.store(false, Ordering::Release);
+        self.channel.pending.put(runtime)
     }
 
     /// Control thread: drop any runtime the audio thread has retired.
@@ -723,6 +741,8 @@ impl IrConvolver {
 
         if self.staged.is_none() {
             if let Some(new_rt) = self.channel.pending.take() {
+                self.clear_when_silent = false;
+                self.channel.unload.store(false, Ordering::Release);
                 if self.active.is_none() {
                     // Nothing playing through the slot yet — no need to duck.
                     self.active = Some(new_rt);
@@ -732,15 +752,24 @@ impl IrConvolver {
                     self.staged = Some(new_rt);
                     self.ducking = true;
                 }
+            } else if self.channel.unload.swap(false, Ordering::AcqRel) && self.active.is_some() {
+                self.clear_when_silent = true;
+                self.ducking = true;
             }
         }
 
         if self.ducking && self.gain <= 0.0 {
             if let Some(mut new_rt) = self.staged.take() {
+                self.clear_when_silent = false;
                 new_rt.clear();
                 if let Some(old) = self.active.replace(new_rt) {
                     self.retire(old);
                 }
+            } else if self.clear_when_silent {
+                if let Some(old) = self.active.take() {
+                    self.retire(old);
+                }
+                self.clear_when_silent = false;
             }
             self.ducking = false;
         }
@@ -895,6 +924,35 @@ mod tests {
         conv.begin_block();
         assert_eq!(conv.latency_samples(), PARTITION);
         assert_eq!(conv.active_info().map(|i| i.name), Some("cab".into()));
+    }
+
+    /// Unload ducks to silence and then leaves the dry pass-through. The
+    /// runtime is retired, not dropped, on the audio side.
+    #[test]
+    fn unload_returns_the_slot_to_a_dry_pass_through() {
+        let mut conv = IrConvolver::new(SR as f32);
+        let prepared =
+            prepare_ir_runtime(&wav_file(&test_ir(200), 1, SR as u32), "cab".into(), SR).unwrap();
+        let loader = conv.loader();
+        loader.submit(Box::new(prepared));
+        conv.begin_block();
+        assert!(conv.active_info().is_some());
+
+        drop(loader.unload());
+        let mut cleared = false;
+        for n in 0..4_096 {
+            if n % PARTITION == 0 {
+                conv.begin_block();
+            }
+            let (l, r) = conv.process(0.2, -0.2);
+            assert!(l.is_finite() && r.is_finite());
+            if conv.active_info().is_none() {
+                cleared = true;
+            }
+        }
+        assert!(cleared, "the IR is unloaded after the duck");
+        assert!(conv.active_info().is_none());
+        loader.collect_garbage();
     }
 
     /// With no IR loaded the slot must pass the signal through unchanged, just

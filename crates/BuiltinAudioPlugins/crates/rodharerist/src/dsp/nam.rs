@@ -17,14 +17,15 @@
 //! front. Switching the width dial ([`PreparedNamRuntime::set_slim_size`]) is
 //! a single index write — real-time-safe, no rebuild.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use builtin_dsp_core::make_eq_coefficients;
 use nam_rs::{Model, NamModel};
 
-use super::StereoBiquad;
 use super::handoff::HandoffCell;
-use super::rate::{MAX_RATIO, MIN_RATIO, RateAdapter};
+use super::rate::{RateAdapter, MAX_RATIO, MIN_RATIO};
+use super::StereoBiquad;
 
 /// Target integrated loudness (LUFS) captures are normalized to when loudness
 /// normalization is enabled, matching the reference NAM plugin's convention.
@@ -416,6 +417,9 @@ pub struct NamChannel {
     pending: HandoffCell<PreparedNamRuntime>,
     /// Audio thread → control thread: a retired runtime awaiting disposal.
     retired: HandoffCell<PreparedNamRuntime>,
+    /// Control thread → audio thread: drop the active capture at the next
+    /// block boundary. A later [`NamLoader::submit`] clears it.
+    unload: AtomicBool,
 }
 
 /// Cloneable control-side handle to a [`NamCapture`]'s hand-off cells.
@@ -432,12 +436,21 @@ pub struct NamLoader {
 
 impl NamLoader {
     /// Push a freshly-built runtime for the audio thread to adopt at the next
-    /// block boundary. A not-yet-adopted runtime already waiting is dropped
-    /// here (safe: the audio thread never touched it).
-    pub fn submit(&self, runtime: Box<PreparedNamRuntime>) {
-        if let Some(bumped) = self.channel.pending.put(runtime) {
-            drop(bumped);
-        }
+    /// block boundary. A not-yet-adopted runtime already waiting is returned
+    /// so the caller can drop it on this thread (safe: the audio thread never
+    /// touched it). Clears a pending [`Self::unload`].
+    pub fn submit(&self, runtime: Box<PreparedNamRuntime>) -> Option<Box<PreparedNamRuntime>> {
+        self.channel.unload.store(false, Ordering::Release);
+        self.channel.pending.put(runtime)
+    }
+
+    /// Drop the active capture at the next block boundary and return a runtime
+    /// that was queued but not yet adopted, for the caller to drop. The audio
+    /// thread only retires the live one; it does not allocate or free.
+    pub fn unload(&self) -> Option<Box<PreparedNamRuntime>> {
+        let pending = self.channel.pending.take();
+        self.channel.unload.store(true, Ordering::Release);
+        pending
     }
 
     /// Drop any runtime the audio thread has retired. Call periodically and
@@ -542,6 +555,7 @@ impl NamCapture {
             channel: Arc::new(NamChannel {
                 pending: HandoffCell::new(),
                 retired: HandoffCell::new(),
+                unload: AtomicBool::new(false),
             }),
             in_l: vec![0.0; NAM_BLOCK],
             in_r: vec![0.0; NAM_BLOCK],
@@ -647,11 +661,14 @@ impl NamCapture {
 
     /// Control thread: push a freshly-built runtime for the audio thread to
     /// adopt at the next block boundary. Any not-yet-adopted runtime already
-    /// waiting is dropped here (safe: the audio thread never touched it).
-    pub(super) fn submit(&self, runtime: Box<PreparedNamRuntime>) {
-        if let Some(bumped) = self.channel.pending.put(runtime) {
-            drop(bumped);
-        }
+    /// waiting is returned (safe to drop here: the audio thread never touched
+    /// it). Clears a pending unload.
+    pub(super) fn submit(
+        &self,
+        runtime: Box<PreparedNamRuntime>,
+    ) -> Option<Box<PreparedNamRuntime>> {
+        self.channel.unload.store(false, Ordering::Release);
+        self.channel.pending.put(runtime)
     }
 
     /// Control thread: drop any runtime the audio thread has retired. Call
@@ -712,8 +729,11 @@ impl NamCapture {
 
         // Only start a new swap once any in-progress fade has fully resolved,
         // so at most one runtime is ever "in flight" toward retirement.
+        // An unload that arrives mid-fade stays set and is honored once the
+        // fade finishes, unless a newer submit cleared it.
         if self.fading_out.is_none() {
             if let Some(new_rt) = self.channel.pending.take() {
+                self.channel.unload.store(false, Ordering::Release);
                 if let Some(old) = self.active.replace(new_rt) {
                     self.fading_out = Some(old);
                     self.fade = 0.0;
@@ -730,6 +750,16 @@ impl NamCapture {
                     .map_or(0, |rt| rt.latency_samples)
                     .min(MAX_ADAPTER_LATENCY - 1);
                 self.apply_slim_size();
+            } else if self.channel.unload.swap(false, Ordering::AcqRel) {
+                if let Some(old) = self.active.take() {
+                    self.fading_out = Some(old);
+                    self.fade = 0.0;
+                    self.fade_l.copy_from_slice(&self.out_l);
+                    self.fade_r.copy_from_slice(&self.out_r);
+                    // The wet side becomes the dry pass-through. Drop the
+                    // adapter delay or a partial mix combs against it.
+                    self.dry_delay = 0;
+                }
             }
         }
 
@@ -1059,6 +1089,35 @@ mod tests {
         assert!(cap.fading_out.is_none());
         loader.collect_garbage(); // drains the retired first capture
         assert_eq!(cap.active_info().map(|i| i.name), Some("second".into()));
+    }
+
+    /// A state with no capture must stop the one that was running. The model
+    /// is retired for the control thread to drop, not freed on the audio side.
+    #[test]
+    fn unload_retires_the_capture_back_to_a_dry_pass_through() {
+        let mut cap = NamCapture::new(48_000.0);
+        cap.configure(0.0, 0.0, 100.0, false, 1.0);
+        let loader = cap.loader();
+        loader
+            .load_json(TINY_WAVENET_48K, "loaded", 48_000.0, false, false)
+            .expect("load");
+        cap.begin_block(0);
+        assert!(cap.active_info().is_some());
+
+        drop(loader.unload());
+        cap.begin_block(0);
+        assert!(
+            cap.fading_out.is_some() || cap.active_info().is_none(),
+            "unload starts a fade off the model"
+        );
+        for _ in 0..2_000 {
+            let (l, r) = cap.process(0.2, -0.2);
+            assert!(l.is_finite() && r.is_finite());
+            cap.begin_block(0);
+        }
+        assert!(cap.active_info().is_none(), "the capture is gone");
+        assert!(cap.fading_out.is_none(), "the fade retired it");
+        loader.collect_garbage();
     }
 
     /// With no capture loaded the slot passes the signal through — delayed by
