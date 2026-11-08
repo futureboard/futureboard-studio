@@ -91,5 +91,25 @@ unmaintained = "workspace"
 unsound = "workspace"
 
 ignore = [
-    # "RUSTSEC-0000-0000",
+    # zip 0.6.6 and zstd-safe 5.0.2+zstd.1.5.2 (via zstd 0.11) exist in
+    # Cargo.lock only as build-dependencies of `crashpad-rs-sys` v0.2.7 (git
+    # tag, `zip = "0.6"` with default features). v0.2.7 is the latest upstream
+    # tag and needs a crashpad-rs release to move to zip >= 9. Our own `zip`
+    # is 9.x and not affected. Neither crate is linked into any Studio binary.
+    #
+    # Reachability: the build script calls zip only in
+    # `crashpad-sys/build/tools.rs` (`download_gn` / `download_ninja`), which
+    # runs for the `vendored` strategy (macOS x86_64, Linux aarch64, iOS,
+    # Android). Prebuilt targets (Windows x86_64, Linux x86_64, macOS arm64)
+    # unpack a .tar.gz with the system `tar`; Windows ARM64 (`vendored-depot`)
+    # uses depot_tools. Where zip runs, it opens the GN/Ninja archive fetched
+    # over HTTPS from fixed Chrome-infra / ninja-build URLs and copies one named
+    # entry with `by_index` + `io::copy`; it never calls `extract()`.
+    #
+    # Remove these when crashpad-rs drops zip 0.6 (tracked in #261).
+    { id = "RUSTSEC-2026-0367", reason = "zip 0.6.6: SUID/SGID kept by extract(); crashpad-rs-sys build script never calls extract()" },
+    { id = "RUSTSEC-2026-0368", reason = "zip 0.6.6: extract() symlink escape; crashpad-rs-sys build script never calls extract()" },
+    { id = "RUSTSEC-2026-0369", reason = "zip 0.6.6: extract() permissions via symlink; crashpad-rs-sys build script never calls extract()" },
+    { id = "RUSTSEC-2026-0429", reason = "zip 0.6.6: extract() abort on large symlink entry; crashpad-rs-sys build script never calls extract()" },
+    { id = "RUSTSEC-2026-0403", reason = "zstd-safe 5.0.2: legacy-frame streaming decode; only reachable if crashpad-rs-sys's pinned GN/Ninja download has a zstd entry, build-time only" },
 ]

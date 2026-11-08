@@ -228,7 +228,7 @@ cpal = "0.15"
 crc32fast = "1"
 crossbeam-channel = "0.5"
 heapless = "0.9.2"
-memmap2 = "0.9"
+memmap2 = "0.9.11"
 midir = "0.9"
 rustfft = "6"
 # EBU R128 loudness (LUFS / LRA / true peak). MIT.
@@ -313,7 +313,7 @@ tokio = { version = "1" }
 # Serialization / data / IDs
 # =============================================================================
 
-anyhow = "1.0.86"
+anyhow = "1.0.103"
 bitflags = "2.6.0"
 chrono = { version = "0.4", features = ["serde"] }
 indexmap = { version = "2.7.0", features = ["serde"] }

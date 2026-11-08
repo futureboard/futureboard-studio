@@ -135,3 +135,11 @@ build-private-temporary.py
 /apak.public.key
 
 *.pyc
+
+# Workspace members resolve from the root Cargo.lock; cargo ignores a
+# member's own lockfile, which only goes stale (#283).
+/apps/native/studio/Cargo.lock
+/crates/SphereUIComponents/Cargo.lock
+/crates/SphereAudioPlugins/Cargo.lock
+/crates/SphereDirectAudioEngine/Cargo.lock
+/crates/SpherePluginHost/Cargo.lock

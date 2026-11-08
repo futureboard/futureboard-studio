@@ -49,7 +49,7 @@ accesskit = "0.24"
 accesskit_macos = "0.26"
 accesskit_unix = "0.21"
 accesskit_windows = "0.33"
-anyhow = "1.0.86"
+anyhow = "1.0.103"
 async-channel = "2.3"
 # 0.13 (not 0.11): the gpui_linux file-chooser code uses `ashpd::Uri`, which
 # only exists in ashpd 0.13+. async-io matches gpui's smol-based executor.
