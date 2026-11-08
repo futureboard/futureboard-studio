@@ -584,7 +584,7 @@ impl<P: Vst3Plugin> IEditController for Wrapper<P> {
     ) -> tresult {
         check_null_ptr!(info);
 
-        if param_index < 0 || param_index > self.get_parameter_count() {
+        if param_index < 0 || param_index >= self.get_parameter_count() {
             return kInvalidArgument;
         }
 
@@ -1946,5 +1946,194 @@ impl<P: Vst3Plugin> IUnitInfo for Wrapper<P> {
         _data: SharedVstPtr<dyn IBStream>,
     ) -> tresult {
         kInvalidArgument
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio_setup::{AudioIOLayout, PortNames};
+    use crate::buffer::Buffer;
+    use crate::context::process::ProcessContext;
+    use crate::params::range::FloatRange;
+    use crate::params::{FloatParam, Param, Params};
+    use crate::plugin::{Plugin, ProcessStatus};
+    use crate::prelude::{ParamPtr, Vst3SubCategory};
+    use vst3_sys::vst::ParameterInfo;
+
+    /// Minimal single-parameter plugin without MIDI CCs, mirroring the plugins named in
+    /// futureboard/futureboard-studio#319 (Rodhareist, WhiteSharp, Voxtune).
+    struct TestParams {
+        pub gain: FloatParam,
+    }
+
+    // NOTE: the `Params` derive macro emits absolute `::nih_plug::...` paths, so it
+    // cannot be used inside the `nih_plug` crate itself; implement the trait by hand.
+    unsafe impl Params for TestParams {
+        fn param_map(&self) -> Vec<(String, ParamPtr, String)> {
+            vec![("gain".to_string(), self.gain.as_ptr(), String::new())]
+        }
+    }
+
+    impl Default for TestParams {
+        fn default() -> Self {
+            Self {
+                gain: FloatParam::new("Gain", 1.0, FloatRange::Linear { min: 0.0, max: 1.0 }),
+            }
+        }
+    }
+
+    struct TestPlugin {
+        params: Arc<TestParams>,
+    }
+
+    impl Default for TestPlugin {
+        fn default() -> Self {
+            Self {
+                params: Arc::new(TestParams::default()),
+            }
+        }
+    }
+
+    impl Plugin for TestPlugin {
+        type SysExMessage = ();
+        type BackgroundTask = ();
+
+        const NAME: &'static str = "Test";
+        const VENDOR: &'static str = "Test";
+        const URL: &'static str = "https://example.com";
+        const EMAIL: &'static str = "test@example.com";
+        const VERSION: &'static str = "0.0.1";
+        const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
+            main_input_channels: NonZeroU32::new(2),
+            main_output_channels: NonZeroU32::new(2),
+            aux_input_ports: &[],
+            aux_output_ports: &[],
+            names: PortNames::const_default(),
+        }];
+
+        fn params(&self) -> Arc<dyn Params> {
+            self.params.clone()
+        }
+
+        fn process(
+            &mut self,
+            _buffer: &mut Buffer,
+            _aux: &mut AuxiliaryBuffers,
+            _context: &mut impl ProcessContext<Self>,
+        ) -> ProcessStatus {
+            ProcessStatus::Normal
+        }
+    }
+
+    impl Vst3Plugin for TestPlugin {
+        const VST3_CLASS_ID: [u8; 16] = *b"TestPlugTestPlug";
+        const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[Vst3SubCategory::Fx];
+    }
+
+    /// Same single-parameter plugin, but accepting MIDI CCs: the reported count then
+    /// also covers the 130 * 16 generated MIDI parameters.
+    struct TestMidiPlugin {
+        params: Arc<TestParams>,
+    }
+
+    impl Default for TestMidiPlugin {
+        fn default() -> Self {
+            Self {
+                params: Arc::new(TestParams::default()),
+            }
+        }
+    }
+
+    impl Plugin for TestMidiPlugin {
+        type SysExMessage = ();
+        type BackgroundTask = ();
+
+        const NAME: &'static str = "TestMidi";
+        const VENDOR: &'static str = "Test";
+        const URL: &'static str = "https://example.com";
+        const EMAIL: &'static str = "test@example.com";
+        const VERSION: &'static str = "0.0.1";
+        const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
+            main_input_channels: NonZeroU32::new(2),
+            main_output_channels: NonZeroU32::new(2),
+            aux_input_ports: &[],
+            aux_output_ports: &[],
+            names: PortNames::const_default(),
+        }];
+        const MIDI_INPUT: MidiConfig = MidiConfig::MidiCCs;
+
+        fn params(&self) -> Arc<dyn Params> {
+            self.params.clone()
+        }
+
+        fn process(
+            &mut self,
+            _buffer: &mut Buffer,
+            _aux: &mut AuxiliaryBuffers,
+            _context: &mut impl ProcessContext<Self>,
+        ) -> ProcessStatus {
+            ProcessStatus::Normal
+        }
+    }
+
+    impl Vst3Plugin for TestMidiPlugin {
+        const VST3_CLASS_ID: [u8; 16] = *b"TestMidiTestMidi";
+        const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[Vst3SubCategory::Fx];
+    }
+
+    fn parameter_info<P: Vst3Plugin>(wrapper: &Wrapper<P>, param_index: i32) -> tresult {
+        let mut info = unsafe { std::mem::zeroed::<ParameterInfo>() };
+        unsafe { wrapper.get_parameter_info(param_index, &mut info) }
+    }
+
+    #[test]
+    fn get_parameter_info_rejects_index_equal_to_parameter_count() {
+        let wrapper = Wrapper::<TestPlugin>::new();
+        let count = unsafe { wrapper.get_parameter_count() };
+        assert_eq!(count, 1);
+
+        // Regression test for futureboard/futureboard-studio#319: index == count used to
+        // slip past the guard and index out of bounds into `param_hashes`, panicking
+        // inside the VST3 interface and aborting the host.
+        assert_eq!(
+            parameter_info(&wrapper, count),
+            kInvalidArgument,
+            "index equal to the parameter count must be rejected"
+        );
+    }
+
+    #[test]
+    fn get_parameter_info_boundary_control_cases() {
+        let wrapper = Wrapper::<TestPlugin>::new();
+        let count = unsafe { wrapper.get_parameter_count() };
+        assert_eq!(count, 1);
+
+        // Last valid index still returns the parameter.
+        assert_eq!(parameter_info(&wrapper, count - 1), kResultOk);
+        // One past the end is rejected, like index == count.
+        assert_eq!(parameter_info(&wrapper, count + 1), kInvalidArgument);
+        // Negative indices are rejected.
+        assert_eq!(parameter_info(&wrapper, -1), kInvalidArgument);
+    }
+
+    #[test]
+    fn get_parameter_info_rejects_index_equal_to_count_with_midi_ccs() {
+        let wrapper = Wrapper::<TestMidiPlugin>::new();
+        let count = unsafe { wrapper.get_parameter_count() };
+        // 1 real parameter + 130 MIDI CCs/pressure/bend * 16 channels.
+        assert_eq!(count, 1 + 130 * 16);
+
+        // With the old `>` guard this returned a bogus "MIDI Ch. 17 CC 0" entry
+        // (relative index 2080 wraps through `% 130`) instead of an error.
+        assert_eq!(
+            parameter_info(&wrapper, count),
+            kInvalidArgument,
+            "index equal to the parameter count must be rejected for MIDI CC plugins too"
+        );
+        // The last real entries on both sides of the split still work.
+        assert_eq!(parameter_info(&wrapper, 0), kResultOk);
+        assert_eq!(parameter_info(&wrapper, count - 1), kResultOk);
+        assert_eq!(parameter_info(&wrapper, 1), kResultOk);
     }
 }
