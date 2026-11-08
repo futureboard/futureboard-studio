@@ -1,7 +1,7 @@
 //! What the audio thread, the editor and the background task thread share.
 //! The audio thread only ever touches the atomics here.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use nih_plug::prelude::AtomicF32;
@@ -30,6 +30,10 @@ pub struct ControlSide {
     /// changed.
     pub nam_loaded: Option<String>,
     pub ir_loaded: Option<String>,
+    /// Bumped when a newer load or unload supersedes one still building.
+    /// A finished build submits only if it still owns the generation.
+    pub nam_generation: u64,
+    pub ir_generation: u64,
 }
 
 pub struct Shared {
@@ -55,6 +59,9 @@ pub struct Shared {
 
     /// The loaders of the running `Dsp`; `None` before `initialize`.
     pub control: Mutex<Option<ControlSide>>,
+    /// Bumped each time `control` is replaced (a new sample rate, a new
+    /// `Dsp`). A build started against the previous one must not submit.
+    control_epoch: AtomicU64,
     /// Bumped when the DSP answered a capture or an IR load, so the editor
     /// re-reads that file's status.
     nam_answers: AtomicU32,
@@ -78,6 +85,7 @@ impl Default for Shared {
             tempo: AtomicF32::default(),
             clear_clip: AtomicBool::default(),
             control: Mutex::new(None),
+            control_epoch: AtomicU64::new(0),
             nam_answers: AtomicU32::default(),
             ir_answers: AtomicU32::default(),
         }
@@ -147,6 +155,14 @@ impl Shared {
             self.latency.load(Ordering::Relaxed),
             self.tempo.load(Ordering::Relaxed),
         )
+    }
+
+    pub fn bump_control_epoch(&self) {
+        self.control_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub fn control_epoch(&self) -> u64 {
+        self.control_epoch.load(Ordering::Acquire)
     }
 
     pub fn answered(&self, capture: bool) {
