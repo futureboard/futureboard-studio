@@ -3070,9 +3070,6 @@ impl Timeline {
         }
     }
 
-    /// Mouse-down inside an automation lane: hit-test a point (select + begin
-    /// move), else add a point (Pen) or start a marquee (Pointer).
-    #[allow(clippy::too_many_arguments)]
     /// Delete the automation point under the cursor. Returns `true` if one was
     /// there, which is what tells the lane whether to swallow the click.
     ///
@@ -3142,11 +3139,20 @@ impl Timeline {
             .set_automation_lane_points(&stroke.track_id, &stroke.lane_id, points);
     }
 
+    /// Mouse-down inside an automation lane: hit-test a point (select + begin
+    /// move), else add a point (Pen) or start a marquee (Pointer).
+    ///
+    /// `beat` is grid-snapped and places new points; `hit_beat` is the
+    /// unsnapped beat under the cursor and is what the point, segment and
+    /// marquee hit-tests use — a snapped probe sits on a grid line, not on a
+    /// point recorded between two of them.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn begin_automation_interaction(
         &mut self,
         track_id: &str,
         lane_id: &str,
         beat: f32,
+        hit_beat: f32,
         value: f32,
         additive: bool,
         alt: bool,
@@ -3179,7 +3185,7 @@ impl Timeline {
 
         if let Some(point_id) = self
             .state
-            .automation_point_at(track_id, &lane_id, beat, value, beat_tol, value_tol)
+            .automation_point_at(track_id, &lane_id, hit_beat, value, beat_tol, value_tol)
         {
             // A press on a point that is already part of a selection keeps the
             // selection, so the whole group can be dragged — collapsing it here
@@ -3218,7 +3224,7 @@ impl Timeline {
             if let Some(left_id) = self.state.automation_segment_left_point_at(
                 track_id,
                 &lane_id,
-                beat,
+                hit_beat,
                 value,
                 value_tol * 1.5,
             ) {
@@ -3329,9 +3335,11 @@ impl Timeline {
                 self.automation_marquee = Some(AutomationMarquee {
                     track_id: track_id.to_string(),
                     lane_id,
-                    start_beat: beat,
+                    // Unsnapped, like every later corner the move handler
+                    // sets: a marquee selects what is drawn under it.
+                    start_beat: hit_beat,
                     start_value: value,
-                    cur_beat: beat,
+                    cur_beat: hit_beat,
                     cur_value: value,
                     additive,
                     started: false,

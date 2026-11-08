@@ -55,8 +55,11 @@ const REFRESH: Duration = Duration::from_millis(33);
 const ACCOUNT_MENU_ANCHOR_TOP: f32 =
     sphere_ui_components::components::title_bar::TITLEBAR_HEIGHT + 44.0;
 
-/// Publish keys, as the controller reports them.
-const KEY_MASTER: &str = "master";
+/// The publish key of the live input, as the controller reports it.
+///
+/// It is the only thing this application sends. Its master mix is the room —
+/// every performer it hears — so sending that back would loop them through
+/// the room again; the controller refuses it for a host that takes the room.
 const KEY_LIVE_INPUT: &str = "live-input";
 
 pub struct JamApp {
@@ -331,15 +334,16 @@ impl JamApp {
         cx.notify();
     }
 
-    /// Start or stop one of the two things this machine can send.
-    fn set_send(&mut self, key: &'static str, send: bool, cx: &mut Context<Self>) {
+    /// Start or stop sending this machine's input.
+    fn set_send(&mut self, send: bool, cx: &mut Context<Self>) {
         cx.background_executor()
             .spawn(async move {
-                let result = jam::with_controller(|controller| match (key, send) {
-                    (KEY_LIVE_INPUT, true) => controller.publish_live_input(),
-                    (KEY_LIVE_INPUT, false) => controller.unpublish_live_input(),
-                    (_, true) => controller.publish_master(),
-                    (_, false) => controller.unpublish_master(),
+                let result = jam::with_controller(|controller| {
+                    if send {
+                        controller.publish_live_input()
+                    } else {
+                        controller.unpublish_live_input()
+                    }
                 });
                 if let Err(error) = result {
                     eprintln!("[jam-app] send toggle failed: {}", error.user_message());
@@ -543,7 +547,6 @@ impl JamApp {
             .publishing
             .iter()
             .any(|key| key == KEY_LIVE_INPUT);
-        let sending_master = self.state.publishing.iter().any(|key| key == KEY_MASTER);
         let monitoring = self.monitor.self_monitor();
         let gain = self.input_gain;
 
@@ -622,24 +625,7 @@ impl JamApp {
                         },
                         connected,
                         cx.listener(move |this, _event, _window, cx| {
-                            this.set_send(KEY_LIVE_INPUT, !sending_mic, cx);
-                        }),
-                    ))
-                    .child(fb_button(
-                        "jam-app-send-master",
-                        if sending_master {
-                            "Mix ·  on"
-                        } else {
-                            "Mix · off"
-                        },
-                        if sending_master {
-                            FbButtonKind::Primary
-                        } else {
-                            FbButtonKind::Default
-                        },
-                        connected,
-                        cx.listener(move |this, _event, _window, cx| {
-                            this.set_send(KEY_MASTER, !sending_master, cx);
+                            this.set_send(!sending_mic, cx);
                         }),
                     ))
                     // Hearing yourself is not the same as being heard, and it

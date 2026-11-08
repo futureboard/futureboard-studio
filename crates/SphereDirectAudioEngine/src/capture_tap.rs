@@ -99,7 +99,7 @@ impl PreviewAccum {
 /// Built by [`crate::recording`] on the control thread, carried in boxed, and
 /// handed back through the trash channel when the take ends.
 pub struct RecordSink {
-    pub audio_tx: Sender<Vec<i32>>,
+    pub audio_tx: Sender<crate::recording::RecordBlock>,
     pub free_rx: Receiver<Vec<i32>>,
     pub free_tx: Sender<Vec<i32>>,
     /// Preview bin width in frames, from the take's sample rate.
@@ -125,6 +125,9 @@ pub struct RecordSink {
     pub monitor: PreviewAccum,
     /// One per armed track, in `shared.recording_preview_track_ids` order.
     pub tracks: Vec<PreviewAccum>,
+    /// Input frames lost since the last block reached the writer; sent with
+    /// the next one (see [`crate::recording::send_capture_block`]).
+    pub gap_frames: u64,
 }
 
 /// Control-thread handle: install a take's sink, remove it, reclaim it.
@@ -312,22 +315,18 @@ impl CaptureTapCallback {
             .store(f32_store(decayed.max(record_peak)), Ordering::Relaxed);
 
         // Hand the block to the disk writer. Every failure path returns the
-        // block to the pool and counts a drop; none of them blocks or allocates.
-        match sink.free_rx.try_recv() {
-            Ok(mut block) => {
-                if block.capacity() < data.len() {
-                    count_drop(sink, shared);
-                    let _ = sink.free_tx.try_send(block);
-                    return;
-                }
-                block.clear();
-                block.extend(data.iter().copied().map(crate::recording::f32_to_s32));
-                if let Err(error) = sink.audio_tx.try_send(block) {
-                    count_drop(sink, shared);
-                    let _ = sink.free_tx.try_send(error.into_inner());
-                }
-            }
-            Err(_) => count_drop(sink, shared),
+        // block to the pool, counts a drop and keeps the lost length for the
+        // writer to fill with silence; none of them blocks or allocates.
+        if !crate::recording::send_capture_block(
+            data,
+            channels,
+            crate::recording::f32_to_s32,
+            &sink.audio_tx,
+            &sink.free_rx,
+            &sink.free_tx,
+            &mut sink.gap_frames,
+        ) {
+            count_drop(sink, shared);
         }
     }
 }
@@ -342,8 +341,10 @@ fn count_drop(sink: &RecordSink, shared: &SharedState) {
 mod tests {
     use super::*;
 
-    fn sink(active: Arc<AtomicBool>) -> (RecordSink, Receiver<Vec<i32>>) {
-        let (audio_tx, audio_rx) = bounded::<Vec<i32>>(4);
+    use crate::recording::RecordBlock;
+
+    fn sink(active: Arc<AtomicBool>) -> (RecordSink, Receiver<RecordBlock>) {
+        let (audio_tx, audio_rx) = bounded::<RecordBlock>(4);
         let (free_tx, free_rx) = bounded::<Vec<i32>>(4);
         for _ in 0..4 {
             let _ = free_tx.try_send(Vec::with_capacity(1024));
@@ -360,6 +361,7 @@ mod tests {
                 first_capture_sample: Arc::new(AtomicU64::new(u64::MAX)),
                 monitor: PreviewAccum::new(0, 1),
                 tracks: vec![PreviewAccum::new(0, 1)],
+                gap_frames: 0,
             },
             audio_rx,
         )
@@ -384,7 +386,10 @@ mod tests {
         callback.drain_commands();
         assert!(callback.has_sink());
         callback.capture_block(&block, 2, &shared);
-        assert_eq!(audio_rx.try_recv().expect("captured block").len(), 4);
+        assert_eq!(
+            audio_rx.try_recv().expect("captured block").samples.len(),
+            4
+        );
 
         control.clear();
         callback.drain_commands();

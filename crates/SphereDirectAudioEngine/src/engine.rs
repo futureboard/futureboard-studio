@@ -382,6 +382,90 @@ pub(crate) fn record_output_callback_timing(
     }
 }
 
+/// One slow output block, as the callback saw it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlowBlock {
+    pub elapsed_us: u32,
+    pub deadline_us: u32,
+    pub frames: u32,
+    pub state: AudioEngineState,
+}
+
+impl SlowBlock {
+    /// `error` when the block missed its deadline (the device starved),
+    /// `warning` when it was over halfway there.
+    pub fn severity(&self) -> &'static str {
+        if self.deadline_us > 0 && self.elapsed_us >= self.deadline_us {
+            "error"
+        } else {
+            "warning"
+        }
+    }
+
+    pub fn load_pct(&self) -> u32 {
+        if self.deadline_us > 0 {
+            (self.elapsed_us as u64 * 100 / self.deadline_us as u64) as u32
+        } else {
+            0
+        }
+    }
+}
+
+/// Latest-value mailbox for the slow-block watchdog: the audio callback
+/// publishes with three relaxed stores and a release increment, the control
+/// thread takes what is new. The callback used to `eprintln!` the line itself
+/// — formatting, a stderr lock and a write, in exactly the blocks that were
+/// already close to their deadline.
+///
+/// Only the most recent report is kept: a sustained stall is one line per
+/// drain, not a backlog. A report overwritten while the reader copies it can
+/// come out mixed; it is a diagnostic line, never a control input.
+#[derive(Debug, Default)]
+pub struct SlowBlockReport {
+    seq: AtomicU64,
+    timing: AtomicU64,
+    detail: AtomicU64,
+    /// Control side: the sequence last taken.
+    taken: AtomicU64,
+}
+
+impl SlowBlockReport {
+    /// Audio thread. Atomics only.
+    #[inline]
+    pub fn publish(&self, block: SlowBlock) {
+        self.timing.store(
+            (u64::from(block.elapsed_us) << 32) | u64::from(block.deadline_us),
+            Ordering::Relaxed,
+        );
+        self.detail.store(
+            (u64::from(block.frames) << 8) | block.state as u64,
+            Ordering::Relaxed,
+        );
+        self.seq.fetch_add(1, Ordering::Release);
+    }
+
+    /// Control thread: the latest report if one arrived since the last take,
+    /// with how many were published in between (including it).
+    pub fn take(&self) -> Option<(SlowBlock, u64)> {
+        let seq = self.seq.load(Ordering::Acquire);
+        let taken = self.taken.swap(seq, Ordering::Relaxed);
+        if seq == taken {
+            return None;
+        }
+        let timing = self.timing.load(Ordering::Relaxed);
+        let detail = self.detail.load(Ordering::Relaxed);
+        Some((
+            SlowBlock {
+                elapsed_us: (timing >> 32) as u32,
+                deadline_us: timing as u32,
+                frames: (detail >> 8) as u32,
+                state: AudioEngineState::from_u8(detail as u8),
+            },
+            seq.wrapping_sub(taken),
+        ))
+    }
+}
+
 /// Identity of everything in `snapshot` except its MIDI clips, plus the build
 /// parameters a graph depends on. Two snapshots with the same key build the
 /// same graph apart from the MIDI schedule. The MIDI is taken out for the
@@ -615,6 +699,10 @@ pub struct SharedState {
     pub max_callback_us: AtomicU32,
     /// Blocks that exceeded the 2 ms debug threshold.
     pub slow_callback_count: AtomicU64,
+    /// The latest slow block the callback flagged, for the control thread to
+    /// log ([`EngineInner::log_callback_diagnostics`]). The callback never
+    /// formats or writes the line itself.
+    pub slow_block_report: SlowBlockReport,
 
     // ── Dropout protection (Part 2; audio ↔ control) ──────────────────────
     /// Active [`DropoutProtectionMode`] as `u8` (control → audio). Default
@@ -788,6 +876,7 @@ impl Default for SharedState {
             active_voices: AtomicU32::new(0),
             max_callback_us: AtomicU32::new(0),
             slow_callback_count: AtomicU64::new(0),
+            slow_block_report: SlowBlockReport::default(),
             dropout_protection_mode: AtomicU8::new(AudioguardLevel::Normal as u8),
             guard_pending_frames: AtomicU64::new(0),
             guard_played_cursor: AtomicU64::new(0),
@@ -1566,7 +1655,16 @@ impl EngineInner {
         let metronome_enabled = self.shared.metronome_enabled.load(Ordering::Relaxed);
         let metronome_gain = f32_load(self.shared.metronome_gain.load(Ordering::Relaxed));
         let metronome_sound = self.shared.metronome_sound.load(Ordering::Relaxed);
-        let _ = self.send_command(EngineCommand::SetTempoMap(tempo_map));
+        // The new graph was built from the project, so it already plays this
+        // map: no schedule to re-time, only the metronome to seed.
+        let _ = self.send_command(EngineCommand::SetTempoMap(Box::new(
+            crate::command::TempoMapChange {
+                metronome_map: tempo_map.clone(),
+                map: tempo_map,
+                midi: None,
+                sample_rate: 0,
+            },
+        )));
         let _ = self.send_command(EngineCommand::SetTimeSignatureMap(time_signature_map));
         let _ = self.send_command(EngineCommand::SetMetronomeVoice {
             volume: metronome_gain,
@@ -1829,16 +1927,18 @@ impl EngineInner {
     ) -> Result<(), SphereAudioError> {
         let snapshot = crate::runtime::build_tempo_map_from_points(default_bpm, &points);
         transport::store_f64_bits(&self.shared.bpm_bits, default_bpm);
-        if let Some(project) = self.project.lock().as_mut() {
+        // Held to the send, like `load_project` and `replace_midi_schedule`
+        // hold it across their mirror update and send: the schedule re-timed
+        // below is then the one the callback's graph holds when this arrives.
+        let mut project = self.project.lock();
+        if let Some(project) = project.as_mut() {
             project.bpm = default_bpm;
             project.tempo_points = points;
         }
-        // Applying a tempo map on the audio thread recomputes and re-sorts every
-        // MIDI event list. Play, every project sync, and every settings change
-        // push a map, almost always the same one — so gate on what was actually
-        // sent last. (Not on `self.runtime`'s copy: that mirror is only written
-        // by `load_project`, so 120 -> 140 -> 120 would drop the second push and
-        // leave the callback at 140.)
+        // Play, every project sync, and every settings change push a map,
+        // almost always the same one — so gate on what was actually sent last.
+        // (Not on the mirror's map: a stream opened later rebuilds its graph
+        // from the project, so the mirror cannot say what the callback plays.)
         {
             let mut last_sent = self.last_sent_tempo_map.lock();
             if last_sent.segments == snapshot.segments {
@@ -1846,7 +1946,49 @@ impl EngineInner {
             }
             *last_sent = snapshot.clone();
         }
-        self.send_command(EngineCommand::SetTempoMap(snapshot))
+        // Re-time the MIDI schedule here, on the control thread: the callback
+        // used to recompute and re-sort every event list (allocating the sort
+        // buffer) and clone and free tempo maps, in one block, mid-playback.
+        // Built from the mirror, which holds the same schedule as the running
+        // graph; the callback swaps it in, or re-times its own in place without
+        // allocating if the two have drifted apart.
+        let (mut mirror_midi, mirror_rate) = {
+            let mirror = self.runtime.lock();
+            (
+                crate::runtime::RuntimeMidiData {
+                    midi_clips: mirror.midi_clips.clone(),
+                    midi_tracks: mirror.midi_tracks.clone(),
+                },
+                mirror.sample_rate,
+            )
+        };
+        let live_rate = match self.shared.sample_rate.load(Ordering::Relaxed) {
+            0 => mirror_rate,
+            rate => rate,
+        };
+        mirror_midi.retime(&snapshot, mirror_rate);
+        let mut realtime_midi = mirror_midi.realtime_copy();
+        if live_rate != mirror_rate {
+            realtime_midi.retime(&snapshot, live_rate);
+        }
+        realtime_midi.prepare_block_event_buffers();
+        {
+            let mut mirror = self.runtime.lock();
+            mirror.tempo_map = snapshot.clone();
+            mirror.midi_clips = mirror_midi.midi_clips;
+            mirror.midi_tracks = mirror_midi.midi_tracks;
+        }
+        crate::graveyard::prime();
+        let result = self.send_command(EngineCommand::SetTempoMap(Box::new(
+            crate::command::TempoMapChange {
+                metronome_map: snapshot.clone(),
+                map: snapshot,
+                midi: Some(realtime_midi),
+                sample_rate: live_rate,
+            },
+        )));
+        drop(project);
+        result
     }
 
     pub fn set_insert_param(
@@ -2503,6 +2645,33 @@ impl EngineInner {
             return Vec::new();
         };
         drain_preview_ring(&self.shared.preview_rings[slot], from_index)
+    }
+
+    /// Control thread: log what the audio callback published since the last
+    /// call — the latest slow block (the callback no longer prints it), and
+    /// any instrument MIDI block list the callback had to grow. A few atomic
+    /// loads when there is nothing new; call it from a poll loop.
+    pub fn log_callback_diagnostics(&self) {
+        if let Some((block, reports)) = self.shared.slow_block_report.take() {
+            eprintln!(
+                "[AudioCallback] slow block severity={} duration_us={} deadline_us={} load={}% state={} frames={} reports_since_last_log={reports}",
+                block.severity(),
+                block.elapsed_us,
+                block.deadline_us,
+                block.load_pct(),
+                block.state.as_str(),
+                block.frames,
+            );
+        }
+        static MIDI_GROWTHS_LOGGED: AtomicU64 = AtomicU64::new(0);
+        let growths = crate::runtime::midi_block_list_growths();
+        let logged = MIDI_GROWTHS_LOGGED.swap(growths, Ordering::Relaxed);
+        if growths != logged {
+            eprintln!(
+                "[AudioCallback] the callback grew an instrument MIDI block list {} time(s) (total {growths}): a graph or schedule reached it without its list sized off the audio thread",
+                growths.wrapping_sub(logged)
+            );
+        }
     }
 
     /// Throttled (≈500 ms) raw-input-peak trace, gated by
@@ -3603,6 +3772,9 @@ impl EngineInner {
             mirror.install_midi_schedule(mirror_copy);
         }
         *current_project = Some(snapshot);
+        // A denser schedule brings its own larger per-block event lists, so the
+        // callback never grows one (see `RuntimeMidiTrack::block_events_spare`).
+        schedule.prepare_block_event_buffers();
         let result = self.send_command(EngineCommand::ReplaceMidi(Box::new(schedule)));
         drop(current_project);
         match result {
@@ -3980,6 +4152,9 @@ impl EngineInner {
         let device_block = self.status.lock().buffer_size as usize;
         runtime.reserve_track_blocks(device_block.max(1024));
         *self.runtime.lock() = runtime.clone();
+        // The metronome's copy of the tempo map travels with the graph, so the
+        // swap hands it over instead of cloning it on the audio thread.
+        runtime.metronome_tempo_map = Some(runtime.tempo_map.clone());
         *current_project = Some(snapshot.clone());
         let load_result = self.send_command(EngineCommand::LoadProject(Box::new(runtime)));
         if matches!(load_result, Ok(()) | Err(SphereAudioError::EngineNotOpen)) {
@@ -6426,6 +6601,9 @@ where
     let ch = config.channels as usize;
     let mut runtime = initial_runtime;
     runtime.sample_rate = output_sample_rate;
+    // Often a clone of the control thread's mirror, whose per-block MIDI lists
+    // came back empty: size them here, not in the callback.
+    runtime.reserve_midi_block_events();
 
     let stream = device
         .build_output_stream::<T, _, _>(
@@ -6480,14 +6658,26 @@ where
                             // the realtime thread — its destructor frees
                             // buffers / munmaps sources / destroys VST3 handles
                             // and must not run here. See `crate::graveyard`.
-                            let old = std::mem::replace(&mut runtime, *next_runtime);
+                            // Swapped through the command's box rather than
+                            // moved out of it: moving out frees the box here.
+                            let mut old = next_runtime;
+                            std::mem::swap(&mut runtime, &mut *old);
                             runtime.sample_rate = output_sample_rate;
-                            // Preserve the plugin-bridge sinks across reloads (Stage 3b).
-                            runtime.plugin_bridge_sinks = old.plugin_bridge_sinks.clone();
-                            // Re-cache the per-insert sink handles on the fresh
-                            // graph (the block path reads insert.bridge_sink).
-                            runtime.resolve_bridge_sinks();
-                            runtime.bridge_editor_active = old.bridge_editor_active.clone();
+                            // The plugin-bridge sinks (Stage 3b) arrive already
+                            // carried and resolved: `load_project` copies its
+                            // control-thread mirror into the graph and resolves
+                            // the per-insert handles before sending it. Cloning
+                            // the map and re-resolving (which can grow insert
+                            // scratch) here was heap work on the audio thread.
+                            //
+                            // The open-editor set moves across by swap rather
+                            // than a clone (a set plus a String per open
+                            // editor); the new graph's empty set leaves with
+                            // `old` through the graveyard.
+                            std::mem::swap(
+                                &mut runtime.bridge_editor_active,
+                                &mut old.bridge_editor_active,
+                            );
                             runtime.inherit_midi_programs_sent(&old);
                             // The panic pushed into the preserved sinks above
                             // still needs flushing through the new graph.
@@ -6496,8 +6686,15 @@ where
                             runtime.smoothed_master_gain =
                                 f32_load(shared.master_volume.load(Ordering::Relaxed));
                             let pos = shared.position_samples.load(Ordering::Relaxed);
-                            metronome.set_tempo_map(
-                                runtime.tempo_map.clone(),
+                            // Through the copy `load_project` packed with the
+                            // graph: no clone or free on this thread.
+                            std::mem::swap(
+                                &mut runtime.metronome_tempo_map,
+                                &mut old.metronome_tempo_map,
+                            );
+                            metronome.follow_graph_tempo_map(
+                                &runtime.tempo_map,
+                                &mut old.metronome_tempo_map,
                                 pos,
                                 output_sample_rate,
                             );
@@ -6671,11 +6868,18 @@ where
                             let next_pos = runtime.apply_tempo_map(map, pos);
                             shared.position_samples.store(next_pos, Ordering::Relaxed);
                         }
-                        EngineCommand::SetTempoMap(map) => {
+                        EngineCommand::SetTempoMap(mut change) => {
+                            // Prepared on the control thread: swaps only (see
+                            // the DAUx arm in `backend::render`).
                             let pos = shared.position_samples.load(Ordering::Relaxed);
-                            metronome.set_tempo_map(map.clone(), pos, output_sample_rate);
-                            let next_pos = runtime.apply_tempo_map(map, pos);
+                            let next_pos = runtime.install_tempo_change(&mut change, pos);
                             shared.position_samples.store(next_pos, Ordering::Relaxed);
+                            metronome.swap_tempo_map(
+                                &mut change.metronome_map,
+                                next_pos,
+                                output_sample_rate,
+                            );
+                            crate::graveyard::retire_tempo_change(change);
                         }
                         EngineCommand::SetTimeSignature(num, den) => {
                             let pos = shared.position_samples.load(Ordering::Relaxed);
@@ -8156,6 +8360,7 @@ mod bridge_insert_tests {
             pre_fader: false,
             level_lane: None,
             enabled_lane: None,
+            pdc: Default::default(),
         }];
         let mut ret = bridge_effect_track(1.0);
         ret.id = "ret".to_string();
@@ -8702,6 +8907,7 @@ mod routing_tests {
             pre_fader: false,
             level_lane: None,
             enabled_lane: None,
+            pdc: Default::default(),
         }
     }
 

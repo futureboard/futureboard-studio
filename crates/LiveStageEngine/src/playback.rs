@@ -83,25 +83,92 @@ fn is_audio_file(path: &Path) -> bool {
         .is_some_and(|e| AUDIO_EXTENSIONS.iter().any(|a| e.eq_ignore_ascii_case(a)))
 }
 
-/// A FLAC file read with its STREAMINFO's minimum block size corrected.
+/// A take file read with a few header bytes replaced, so symphonia accepts
+/// what the recorder writes.
 ///
-/// `flacenc` (what the recorder's FLAC encoder uses) writes the last
-/// block's length as the minimum block size. symphonia then takes the
-/// fixed-blocksize stream for a variable one and accepts none of its frames.
-/// When the first frame says the stream is fixed-blocksize, the minimum is
-/// read as the maximum, as the FLAC format has it.
-struct FlacFile {
+/// * **FLAC** ([`Self::flac`]): `flacenc` (what the recorder's FLAC encoder
+///   uses) writes the last block's length as the minimum block size.
+///   symphonia then takes the fixed-blocksize stream for a variable one and
+///   accepts none of its frames. When the first frame says the stream is
+///   fixed-blocksize, the minimum is read as the maximum, as the FLAC format
+///   has it.
+/// * **WAV** ([`Self::wav`]): a take that outgrew 4 GiB is RF64, which
+///   symphonia does not read. It is presented as RIFF with `ds64` turned
+///   into a skipped `JUNK` chunk and the data size taken from `ds64`, capped
+///   at what a RIFF size can say: symphonia plays the first 4 GiB of such a
+///   take (about 93 minutes of a stereo 96 kHz float strip) and no more.
+///   Every other WAV is read as it is.
+struct PatchedFile {
     file: std::fs::File,
     len: u64,
     pos: u64,
-    /// Bytes 8..10 (STREAMINFO's minimum block size) as read instead.
-    min_block: Option<[u8; 2]>,
+    /// `(offset, byte)` read in place of the file's own byte at `offset`.
+    patches: Vec<(u64, u8)>,
 }
 
-impl FlacFile {
+impl PatchedFile {
     const MIN_BLOCK_AT: u64 = 8;
 
-    fn open(path: &Path) -> std::io::Result<Self> {
+    fn patch(&mut self, at: u64, bytes: &[u8]) {
+        for (i, byte) in bytes.iter().enumerate() {
+            self.patches.push((at + i as u64, *byte));
+        }
+    }
+
+    fn wav(path: &Path) -> std::io::Result<Self> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = std::fs::File::open(path)?;
+        let len = file.metadata()?.len();
+        let mut source = Self {
+            file,
+            len,
+            pos: 0,
+            patches: Vec::new(),
+        };
+        let mut head = [0u8; 12];
+        if source.file.read_exact(&mut head).is_ok()
+            && &head[0..4] == b"RF64"
+            && &head[8..12] == b"WAVE"
+        {
+            source.patch(0, b"RIFF");
+            source.patch(4, &u32::MAX.to_le_bytes());
+            let mut data_size: Option<u64> = None;
+            let mut at = 12u64;
+            // A handful of chunks precede `data`; never walk a broken file forever.
+            for _ in 0..64 {
+                let mut chunk = [0u8; 8];
+                source.file.seek(SeekFrom::Start(at))?;
+                if source.file.read_exact(&mut chunk).is_err() {
+                    break;
+                }
+                let size = u64::from(u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]));
+                match &chunk[0..4] {
+                    b"ds64" => {
+                        let mut sizes = [0u8; 16];
+                        source.file.read_exact(&mut sizes)?;
+                        data_size = Some(u64::from_le_bytes(sizes[8..16].try_into().unwrap()));
+                        source.patch(at, b"JUNK");
+                    }
+                    b"data" => {
+                        let real = if size == u64::from(u32::MAX) {
+                            data_size.unwrap_or(size)
+                        } else {
+                            size
+                        };
+                        let shown = real.min(u64::from(u32::MAX)) as u32;
+                        source.patch(at + 4, &shown.to_le_bytes());
+                        break;
+                    }
+                    _ => {}
+                }
+                at += 8 + size + (size & 1);
+            }
+        }
+        source.file.seek(SeekFrom::Start(0))?;
+        Ok(source)
+    }
+
+    fn flac(path: &Path) -> std::io::Result<Self> {
         use std::io::{Read, Seek, SeekFrom};
         let mut file = std::fs::File::open(path)?;
         let len = file.metadata()?.len();
@@ -128,24 +195,25 @@ impl FlacFile {
             }
         }
         file.seek(SeekFrom::Start(0))?;
-        Ok(Self {
+        let mut source = Self {
             file,
             len,
             pos: 0,
-            min_block,
-        })
+            patches: Vec::new(),
+        };
+        if let Some(fix) = min_block {
+            source.patch(Self::MIN_BLOCK_AT, &fix);
+        }
+        Ok(source)
     }
 }
 
-impl std::io::Read for FlacFile {
+impl std::io::Read for PatchedFile {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.file.read(buf)?;
-        if let Some(fix) = self.min_block {
-            for (i, byte) in fix.iter().enumerate() {
-                let at = Self::MIN_BLOCK_AT + i as u64;
-                if (self.pos..self.pos + n as u64).contains(&at) {
-                    buf[(at - self.pos) as usize] = *byte;
-                }
+        for &(at, byte) in &self.patches {
+            if (self.pos..self.pos + n as u64).contains(&at) {
+                buf[(at - self.pos) as usize] = byte;
             }
         }
         self.pos += n as u64;
@@ -153,14 +221,14 @@ impl std::io::Read for FlacFile {
     }
 }
 
-impl std::io::Seek for FlacFile {
+impl std::io::Seek for PatchedFile {
     fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
         self.pos = self.file.seek(to)?;
         Ok(self.pos)
     }
 }
 
-impl symphonia::core::io::MediaSource for FlacFile {
+impl symphonia::core::io::MediaSource for PatchedFile {
     fn is_seekable(&self) -> bool {
         true
     }
@@ -177,9 +245,9 @@ fn open_format(path: &Path) -> Result<(Box<dyn FormatReader>, u32), String> {
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("flac"));
     let source: Box<dyn symphonia::core::io::MediaSource> = if flac {
-        Box::new(FlacFile::open(path).map_err(failed)?)
+        Box::new(PatchedFile::flac(path).map_err(failed)?)
     } else {
-        Box::new(std::fs::File::open(path).map_err(failed)?)
+        Box::new(PatchedFile::wav(path).map_err(failed)?)
     };
     let stream = MediaSourceStream::new(source, Default::default());
     let mut hint = Hint::new();
@@ -1177,6 +1245,70 @@ mod tests {
         // Kick stays on channel 2; Snare stays unassigned (it was saved so);
         // New has no channel of its stem.
         assert_eq!(assigned, [Some(2), None, None]);
+    }
+
+    /// A float WAV as the recorder writes it once a take outgrows RIFF:
+    /// `RF64`, `ds64` with the real sizes, and `0xFFFFFFFF` in the RIFF and
+    /// data size fields. Small here; only the header matters.
+    fn rf64_file(path: &Path, channels: u16, samples: &[f32]) {
+        let data: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let frames = (samples.len() / usize::from(channels)) as u64;
+        let block = channels * 4;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RF64");
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(b"ds64");
+        bytes.extend_from_slice(&28u32.to_le_bytes());
+        bytes.extend_from_slice(&(72 + data.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&frames.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(b"fmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&3u16.to_le_bytes());
+        bytes.extend_from_slice(&channels.to_le_bytes());
+        bytes.extend_from_slice(&48_000u32.to_le_bytes());
+        bytes.extend_from_slice(&(48_000 * u32::from(block)).to_le_bytes());
+        bytes.extend_from_slice(&block.to_le_bytes());
+        bytes.extend_from_slice(&32u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        bytes.extend_from_slice(&data);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// symphonia reads no RF64, so a take that outgrew 4 GiB would refuse to
+    /// load at all. Presented as RIFF it opens with its real length and plays
+    /// its samples.
+    #[test]
+    fn an_rf64_take_opens_with_its_length_and_samples() {
+        let dir = std::env::temp_dir().join(format!("livestage-rf64-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Kick.wav");
+        let samples: Vec<f32> = (0..2000).map(|i| i as f32 / 4000.0).collect();
+        rf64_file(&path, 2, &samples);
+
+        let file = probe_file(&path).unwrap();
+        assert_eq!((file.channels, file.rate, file.frames), (2, 48_000, 1000));
+
+        let (mut format, track) = open_format(&path).unwrap();
+        let params = format.tracks()[0].codec_params.clone();
+        let mut decoder = symphonia::default::get_codecs()
+            .make(&params, &DecoderOptions::default())
+            .unwrap();
+        let mut decoded = Vec::new();
+        while let Ok(packet) = format.next_packet() {
+            if packet.track_id() != track {
+                continue;
+            }
+            let audio = decoder.decode(&packet).unwrap();
+            let mut buffer = SampleBuffer::<f32>::new(audio.capacity() as u64, *audio.spec());
+            buffer.copy_interleaved_ref(audio);
+            decoded.extend_from_slice(buffer.samples());
+        }
+        assert_eq!(decoded, samples);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

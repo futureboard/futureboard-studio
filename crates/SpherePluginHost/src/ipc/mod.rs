@@ -237,7 +237,7 @@ pub enum HostCommand {
     },
     /// Load a `.nam` neural capture into a built-in DSP instance (rodharerist's
     /// Tone/Amp slot). `json` is the raw `.nam` file text — the newline-framed
-    /// transport caps a line at 128 MiB, ample for real captures. The host
+    /// transport caps a line at [`MAX_FRAME_BYTES`], ample for real captures. The host
     /// parses/builds on its IPC thread and hands the runtime to the audio
     /// producer for block-boundary adoption; it replies
     /// [`HostEvent::BuiltinNamCaptureResult`] either way.
@@ -727,23 +727,64 @@ fn default_shows_insert_controls() -> bool {
 }
 
 /// Serialize `msg` as a single JSON line (object + `\n`) and flush.
+///
+/// A frame the peer would refuse (over [`MAX_FRAME_BYTES`]) is not written at
+/// all: the call fails with an error for which [`is_frame_too_large`] is true,
+/// so the caller can report that one request as failed instead of sending a
+/// line the receiver has to throw away.
 pub fn write_frame<W: Write>(writer: &mut W, msg: &impl Serialize) -> io::Result<()> {
+    write_frame_limited(writer, msg, MAX_FRAME_BYTES)
+}
+
+fn write_frame_limited<W: Write>(
+    writer: &mut W,
+    msg: &impl Serialize,
+    max_bytes: u64,
+) -> io::Result<()> {
     let line = serde_json::to_string(msg).map_err(io::Error::other)?;
+    // `+ 1` for the newline the reader counts as part of the frame.
+    if line.len() as u64 + 1 > max_bytes {
+        return Err(frame_too_large(line.len() as u64 + 1, max_bytes));
+    }
     writer.write_all(line.as_bytes())?;
     writer.write_all(b"\n")?;
     writer.flush()
 }
 
 /// Maximum size of a single newline-delimited frame. Frames carry base64
-/// plugin-state blobs, so the cap is generous — but bounded so a stuck or
-/// hostile peer cannot drive unbounded memory growth with one giant,
-/// newline-less line.
-pub const MAX_FRAME_BYTES: u64 = 128 * 1024 * 1024;
+/// plugin-state blobs (4/3 of the raw size), and samplers or vocal tools that
+/// embed imported audio produce states of hundreds of megabytes, so the cap is
+/// generous — but bounded so a stuck or hostile peer cannot drive unbounded
+/// memory growth with one giant, newline-less line. The bound is only a
+/// ceiling; nothing is preallocated to it.
+pub const MAX_FRAME_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Message carried by the error [`write_frame`] / [`read_frame`] return for a
+/// frame over the size cap.
+const FRAME_TOO_LARGE: &str = "IPC frame exceeds maximum size";
+
+fn frame_too_large(bytes: u64, max_bytes: u64) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("{FRAME_TOO_LARGE} ({bytes} > {max_bytes} bytes)"),
+    )
+}
+
+/// True when `error` is the size-cap refusal from [`write_frame`] or
+/// [`read_frame`]. It concerns one frame only: the stream stays aligned on the
+/// next line, so a reader should drop that frame and keep going rather than
+/// treat the peer as lost.
+pub fn is_frame_too_large(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::InvalidData && error.to_string().starts_with(FRAME_TOO_LARGE)
+}
 
 /// Read one newline-delimited JSON frame, skipping blank lines.
 ///
 /// Returns `Ok(None)` on EOF (the peer closed the pipe — for the client this
 /// means the host exited/crashed; for the host it means the main app is gone).
+/// A frame over [`MAX_FRAME_BYTES`] is consumed through its newline without
+/// being buffered and reported with an error for which [`is_frame_too_large`]
+/// holds; the next call reads the following frame.
 pub fn read_frame<T: DeserializeOwned, R: BufRead>(reader: &mut R) -> io::Result<Option<T>> {
     read_frame_limited(reader, MAX_FRAME_BYTES)
 }
@@ -754,27 +795,64 @@ fn read_frame_limited<T: DeserializeOwned, R: BufRead>(
     reader: &mut R,
     max_bytes: u64,
 ) -> io::Result<Option<T>> {
-    let mut line = String::new();
+    // Bytes, not `read_line`: a cap that cuts a multi-byte UTF-8 character
+    // must still be recognized as an oversized frame, not a decoding error.
+    let mut line = Vec::new();
     loop {
         line.clear();
         // Bound the read so a frame without a trailing newline cannot grow
-        // `line` past the ceiling. `take` caps this single `read_line` call.
-        let read = reader.by_ref().take(max_bytes + 1).read_line(&mut line)?;
+        // `line` past the ceiling. `take` caps this single `read_until` call.
+        let read = reader
+            .by_ref()
+            .take(max_bytes + 1)
+            .read_until(b'\n', &mut line)?;
         if read == 0 {
             return Ok(None); // EOF
         }
         if read as u64 > max_bytes {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "IPC frame exceeds maximum size",
-            ));
+            let ended = line.last() == Some(&b'\n');
+            // Free the partial line before draining the rest of it, so one
+            // oversized frame costs at most `max_bytes` of memory and leaves
+            // the stream positioned on the next frame.
+            drop(std::mem::take(&mut line));
+            let skipped = if ended { 0 } else { skip_line(reader)? };
+            return Err(frame_too_large(read as u64 + skipped, max_bytes));
         }
-        let trimmed = line.trim();
+        let text = std::str::from_utf8(&line)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let trimmed = text.trim();
         if trimmed.is_empty() {
             continue;
         }
         let msg = serde_json::from_str::<T>(trimmed).map_err(io::Error::other)?;
         return Ok(Some(msg));
+    }
+}
+
+/// Consume input through the next newline (or EOF) without buffering it.
+/// Returns the number of bytes consumed.
+fn skip_line<R: BufRead>(reader: &mut R) -> io::Result<u64> {
+    let mut skipped = 0u64;
+    loop {
+        let (consumed, done) = {
+            let available = match reader.fill_buf() {
+                Ok(available) => available,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            };
+            if available.is_empty() {
+                return Ok(skipped); // EOF inside the oversized frame
+            }
+            match available.iter().position(|byte| *byte == b'\n') {
+                Some(newline) => (newline + 1, true),
+                None => (available.len(), false),
+            }
+        };
+        reader.consume(consumed);
+        skipped += consumed as u64;
+        if done {
+            return Ok(skipped);
+        }
     }
 }
 
@@ -963,6 +1041,89 @@ mod tests {
         let mut reader = Cursor::new(line.into_bytes());
         let result: io::Result<Option<HostCommand>> = read_frame_limited(&mut reader, 16);
         assert!(result.is_err(), "oversized frame must be rejected");
+    }
+
+    /// One oversized frame (a huge plug-in state) must cost only that frame:
+    /// the stream stays aligned, so the next command still arrives and the
+    /// reader does not have to declare the peer lost.
+    #[test]
+    fn oversized_frame_is_skipped_and_the_next_frame_still_reads() {
+        let mut buf =
+            format!("{{\"cmd\":\"Ping\",\"pad\":\"{}\"}}\n", "x".repeat(200)).into_bytes();
+        write_frame(&mut buf, &HostCommand::Shutdown).unwrap();
+        let mut reader = io::BufReader::with_capacity(8, Cursor::new(buf));
+
+        let error = read_frame_limited::<HostCommand, _>(&mut reader, 64)
+            .expect_err("oversized frame must be refused");
+        assert!(is_frame_too_large(&error), "unexpected error: {error}");
+        assert_eq!(
+            read_frame_limited::<HostCommand, _>(&mut reader, 64).unwrap(),
+            Some(HostCommand::Shutdown)
+        );
+        assert_eq!(
+            read_frame_limited::<HostCommand, _>(&mut reader, 64).unwrap(),
+            None
+        );
+    }
+
+    /// The cap can fall inside a multi-byte character; that is still an
+    /// oversized frame, not a fatal decoding error.
+    #[test]
+    fn oversized_frame_cut_inside_a_utf8_character_is_still_skipped() {
+        let mut buf = format!("\"{}\"\n", "é".repeat(40)).into_bytes();
+        write_frame(&mut buf, &HostCommand::Ping).unwrap();
+        let mut reader = Cursor::new(buf);
+        // 1 quote byte + 2-byte characters: a 16-byte cap ends mid-character.
+        let error = read_frame_limited::<HostCommand, _>(&mut reader, 16).unwrap_err();
+        assert!(is_frame_too_large(&error), "unexpected error: {error}");
+        assert_eq!(
+            read_frame_limited::<HostCommand, _>(&mut reader, 16).unwrap(),
+            Some(HostCommand::Ping)
+        );
+    }
+
+    /// A newline that lands exactly on the cap must not swallow the next frame.
+    #[test]
+    fn oversized_frame_ending_on_the_cap_keeps_the_next_frame() {
+        let mut buf = format!("{}\n", "x".repeat(16)).into_bytes(); // 17 bytes
+        write_frame(&mut buf, &HostCommand::Ping).unwrap();
+        let mut reader = Cursor::new(buf);
+        let error = read_frame_limited::<HostCommand, _>(&mut reader, 16).unwrap_err();
+        assert!(is_frame_too_large(&error));
+        assert_eq!(
+            read_frame_limited::<HostCommand, _>(&mut reader, 16).unwrap(),
+            Some(HostCommand::Ping)
+        );
+    }
+
+    /// The sender refuses a frame the receiver would refuse, and writes
+    /// nothing, so the caller can answer that one request as failed.
+    #[test]
+    fn write_frame_refuses_an_oversized_frame_without_writing() {
+        let event = HostEvent::PluginState {
+            plugin_instance_id: "track1:insert1".into(),
+            ok: true,
+            component_b64: "A".repeat(256),
+            controller_b64: String::new(),
+        };
+        let mut buf = Vec::new();
+        let error = write_frame_limited(&mut buf, &event, 128).unwrap_err();
+        assert!(is_frame_too_large(&error), "unexpected error: {error}");
+        assert!(buf.is_empty(), "nothing may reach the pipe");
+
+        write_frame_limited(&mut buf, &event, MAX_FRAME_BYTES).unwrap();
+        assert!(buf.ends_with(b"\n"));
+        assert!(!is_frame_too_large(&io::Error::other("broken pipe")));
+    }
+
+    /// A ~100 MB plug-in state (≈134 MB as base64) used to exceed the cap and
+    /// take the whole host down; it must fit now.
+    #[test]
+    fn a_hundred_megabyte_state_fits_in_one_frame() {
+        let raw_state = 100 * 1024 * 1024u64;
+        let base64_len = raw_state.div_ceil(3) * 4;
+        // Envelope (event tag, ids, field names) is well under 1 KiB.
+        assert!(base64_len + 1024 < MAX_FRAME_BYTES);
     }
 
     #[test]

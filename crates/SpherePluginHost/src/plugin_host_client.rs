@@ -322,6 +322,11 @@ pub fn locate_plugin_host_binary() -> Result<PathBuf, PluginHostClientError> {
     }
 }
 
+/// How long [`PluginHostClient::join_reader`] waits, once the host process has
+/// exited, for its stdout pipe to reach EOF. Bytes in flight arrive well
+/// within it; only a pipe some other process still holds outlasts it.
+const READER_JOIN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// A live connection to one `FutureboardPluginHostX64.exe` process.
 ///
 /// Drop sends `Shutdown` (best-effort) and then kills the child, so a dropped
@@ -466,6 +471,13 @@ impl PluginHostClient {
                             if tx.send(ClientEvent::Host(event)).is_err() {
                                 break; // client dropped
                             }
+                        }
+                        // One frame over the size cap (say a huge plug-in
+                        // state) is dropped on its own; the stream is still
+                        // aligned and every other plug-in in the host is fine.
+                        // The request it answered times out like any other.
+                        Err(error) if ipc::is_frame_too_large(&error) => {
+                            eprintln!("[plugin-bridge] dropped host event: {error}");
                         }
                         // EOF or malformed frame → the host is gone/unusable.
                         Ok(None) | Err(_) => {
@@ -907,10 +919,30 @@ impl PluginHostClient {
     }
 
     /// Join the stdout reader thread after the host has exited.
+    ///
+    /// Bounded: the reader only ends at EOF, and the pipe reaches EOF only
+    /// once every process holding its write end has closed it. A plug-in that
+    /// started a resident helper (a licensing daemon) can have handed that end
+    /// down, and an unbounded join then froze Studio's quit until the helper
+    /// exited. The host itself is gone by now, so a reader still blocked after
+    /// [`READER_JOIN_GRACE`] is left detached; it exits on its own when the
+    /// helper closes the pipe, and its events go nowhere.
     pub fn join_reader(&mut self) {
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
+        let Some(reader) = self.reader.take() else {
+            return;
+        };
+        let deadline = std::time::Instant::now() + READER_JOIN_GRACE;
+        while !reader.is_finished() {
+            if std::time::Instant::now() >= deadline {
+                eprintln!(
+                    "[plugin-bridge] host stdout still open after exit (inherited by a helper process?); \
+                     reader detached"
+                );
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        let _ = reader.join();
     }
 }
 

@@ -433,6 +433,10 @@ pub fn analyze_samples(
     })
 }
 
+/// Stereo frames `render_stereo_i16` renders per pass through its scratch.
+/// Covers every usual Android burst in one pass; longer callbacks loop.
+const I16_RENDER_CHUNK_FRAMES: usize = 1024;
+
 #[derive(Debug, Clone)]
 pub struct CantoEngine {
     sample_rate: f32,
@@ -485,7 +489,8 @@ pub struct CantoEngine {
     /// Index of the note that contained the playhead last sample; checked
     /// first so the per-sample lookup is O(1) inside a note.
     active_hint: usize,
-    /// Reused by `render_stereo_i16`; grows only when a larger block arrives.
+    /// `render_stereo_i16`'s float buffer: [`I16_RENDER_CHUNK_FRAMES`] stereo
+    /// frames, allocated once here and never grown.
     scratch: Vec<f32>,
     /// The sung pitch of the loaded audio (see [`PitchTrack`]).
     pitch_track: PitchTrack,
@@ -535,7 +540,7 @@ impl CantoEngine {
             audition_tail: None,
             audition_fade: None,
             active_hint: 0,
-            scratch: Vec::new(),
+            scratch: vec![0.0; I16_RENDER_CHUNK_FRAMES * 2],
             pitch_track: PitchTrack::default(),
             backing: None,
         }
@@ -1313,15 +1318,27 @@ impl CantoEngine {
         self.meter_level
     }
 
+    /// Renders into the Android front end's `i16` callback buffer.
+    ///
+    /// Runs on the audio callback, whose size is the device's and can grow
+    /// after a route change, so it never sizes a buffer to it: a callback
+    /// longer than the preallocated scratch is rendered in chunks of
+    /// [`I16_RENDER_CHUNK_FRAMES`]. A callback within one chunk renders exactly
+    /// as one `render_stereo_f32` call; a longer one steps the meter once per
+    /// chunk.
     pub fn render_stereo_i16(&mut self, out_interleaved: &mut [i16]) -> f32 {
         let mut scratch = std::mem::take(&mut self.scratch);
-        if scratch.len() < out_interleaved.len() {
-            scratch.resize(out_interleaved.len(), 0.0);
-        }
-        let float_buf = &mut scratch[..out_interleaved.len()];
-        let level = self.render_stereo_f32(float_buf);
-        for (dst, &src) in out_interleaved.iter_mut().zip(float_buf.iter()) {
-            *dst = (clamp(src, -0.99, 0.99) * i16::MAX as f32) as i16;
+        // Whole stereo frames per chunk, so no chunk splits a frame.
+        let chunk_len = scratch.len() & !1;
+        let mut level = self.meter_level;
+        if chunk_len > 0 {
+            for out_chunk in out_interleaved.chunks_mut(chunk_len) {
+                let float_buf = &mut scratch[..out_chunk.len()];
+                level = self.render_stereo_f32(float_buf);
+                for (dst, &src) in out_chunk.iter_mut().zip(float_buf.iter()) {
+                    *dst = (clamp(src, -0.99, 0.99) * i16::MAX as f32) as i16;
+                }
+            }
         }
         self.scratch = scratch;
         level
@@ -2047,5 +2064,47 @@ mod backing_tests {
         let mut out = vec![1.0f32; 400];
         engine.render_stereo_f32(&mut out);
         assert!(out.iter().all(|&s| s == 0.0), "stopped: no backing");
+    }
+}
+
+#[cfg(test)]
+mod i16_render_tests {
+    use super::*;
+
+    fn playing_sine(sr: u32) -> CantoEngine {
+        let mut engine = CantoEngine::new(sr as f32);
+        let samples = (0..sr as usize)
+            .map(|i| 0.5 * (i as f32 * 220.0 * std::f32::consts::TAU / sr as f32).sin())
+            .collect();
+        engine.load_mono_samples(samples, sr).unwrap();
+        engine.loop_enabled = false;
+        engine.set_playing(true);
+        engine
+    }
+
+    /// A callback larger than any before it (first callback, route change)
+    /// must not grow the scratch on the audio thread, and rendering it in
+    /// chunks must produce the same samples as one pass.
+    #[test]
+    fn a_long_i16_callback_renders_in_chunks_without_growing_the_scratch() {
+        let sr = 48_000;
+        let frames = I16_RENDER_CHUNK_FRAMES * 3 + 77;
+        let mut chunked = playing_sine(sr);
+        let scratch_ptr = chunked.scratch.as_ptr();
+        let scratch_cap = chunked.scratch.capacity();
+        let mut out = vec![0i16; frames * 2];
+        chunked.render_stereo_i16(&mut out);
+        assert_eq!(chunked.scratch.as_ptr(), scratch_ptr, "scratch reallocated");
+        assert_eq!(chunked.scratch.capacity(), scratch_cap);
+
+        let mut whole = playing_sine(sr);
+        let mut reference = vec![0.0f32; frames * 2];
+        whole.render_stereo_f32(&mut reference);
+        let expected: Vec<i16> = reference
+            .iter()
+            .map(|&s| (clamp(s, -0.99, 0.99) * i16::MAX as f32) as i16)
+            .collect();
+        assert!(out.iter().any(|&s| s != 0), "the take is heard");
+        assert_eq!(out, expected);
     }
 }

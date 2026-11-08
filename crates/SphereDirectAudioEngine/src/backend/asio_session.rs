@@ -55,7 +55,7 @@ pub enum AsioInputCommand {
 /// `Sender` disconnect (which finalizes the disk writer) and the box
 /// deallocation both happen off the audio thread.
 pub struct RecordSink {
-    pub audio_tx: Sender<Vec<i32>>,
+    pub audio_tx: Sender<crate::recording::RecordBlock>,
     pub free_rx: Receiver<Vec<i32>>,
     pub free_tx: Sender<Vec<i32>>,
     /// Preview-waveform bin width in frames (from the take's sample rate).
@@ -74,6 +74,9 @@ pub struct RecordSink {
     /// a take will arm. Allocated once on the control thread and only mutated
     /// in place afterwards, so the realtime path still never allocates.
     pub preview_accums: Vec<PreviewAccum>,
+    /// Input frames lost since the last block reached the writer; sent with
+    /// the next one (see [`crate::recording::send_capture_block`]).
+    pub gap_frames: u64,
 }
 
 /// Per-track preview bin accumulator. Mirrors the own-stream path's private
@@ -708,6 +711,10 @@ impl CallbackRecordSinkState {
         self.active.as_deref()
     }
 
+    fn active_mut(&mut self) -> Option<&mut RecordSink> {
+        self.active.as_deref_mut()
+    }
+
     /// The per-track preview accumulators of the live take, if there is one.
     /// Empty for a take that armed no track the preview can describe.
     fn preview_accums_mut(&mut self) -> &mut [PreviewAccum] {
@@ -949,28 +956,22 @@ fn build_input_fanout_typed<T: AsioInputSample>(
                 }
 
                 // 4. Record fan-out → disk writer (only while a take is live).
+                // A lost stretch is kept as silence by the writer (see
+                // `send_capture_block`), so the take stays on the timeline.
                 if capture_active {
-                    if let Some(sink) = record_sink.active() {
-                        match sink.free_rx.try_recv() {
-                            Ok(mut block) => {
-                                if block.capacity() < data.len() {
-                                    sink.dropped_blocks.fetch_add(1, Ordering::Relaxed);
-                                    shared.record_ring_overruns.fetch_add(1, Ordering::Relaxed);
-                                    let _ = sink.free_tx.try_send(block);
-                                } else {
-                                    block.clear();
-                                    block.extend(data.iter().copied().map(T::to_record_i32));
-                                    if let Err(error) = sink.audio_tx.try_send(block) {
-                                        sink.dropped_blocks.fetch_add(1, Ordering::Relaxed);
-                                        shared.record_ring_overruns.fetch_add(1, Ordering::Relaxed);
-                                        let _ = sink.free_tx.try_send(error.into_inner());
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                sink.dropped_blocks.fetch_add(1, Ordering::Relaxed);
-                                shared.record_ring_overruns.fetch_add(1, Ordering::Relaxed);
-                            }
+                    if let Some(sink) = record_sink.active_mut() {
+                        let complete = crate::recording::send_capture_block(
+                            data,
+                            channels,
+                            T::to_record_i32,
+                            &sink.audio_tx,
+                            &sink.free_rx,
+                            &sink.free_tx,
+                            &mut sink.gap_frames,
+                        );
+                        if !complete {
+                            sink.dropped_blocks.fetch_add(1, Ordering::Relaxed);
+                            shared.record_ring_overruns.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
@@ -1001,7 +1002,7 @@ mod tests {
         }
     }
 
-    fn record_sink() -> (Box<RecordSink>, Receiver<Vec<i32>>) {
+    fn record_sink() -> (Box<RecordSink>, Receiver<crate::recording::RecordBlock>) {
         let (audio_tx, audio_rx) = bounded(1);
         let (free_tx, free_rx) = bounded(1);
         (
@@ -1013,16 +1014,17 @@ mod tests {
                 capture_on_transport: false,
                 dropped_blocks: Arc::new(AtomicU64::new(0)),
                 preview_accums: Vec::new(),
+                gap_frames: 0,
             }),
             audio_rx,
         )
     }
 
-    fn assert_sink_is_alive(audio_rx: &Receiver<Vec<i32>>) {
+    fn assert_sink_is_alive(audio_rx: &Receiver<crate::recording::RecordBlock>) {
         assert!(matches!(audio_rx.try_recv(), Err(TryRecvError::Empty)));
     }
 
-    fn assert_sink_was_dropped(audio_rx: &Receiver<Vec<i32>>) {
+    fn assert_sink_was_dropped(audio_rx: &Receiver<crate::recording::RecordBlock>) {
         assert!(matches!(
             audio_rx.try_recv(),
             Err(TryRecvError::Disconnected)

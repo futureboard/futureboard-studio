@@ -17,8 +17,8 @@ use crate::components::mixer_tree_sidebar::{
     MIXER_TREE_COLLAPSED_RAIL_WIDTH,
 };
 use crate::components::text_input::{
-    bind_mouse_selection, text_field_with_callbacks, TextInputCallbacks, TextInputContextCb,
-    TextInputState,
+    bind_mouse_selection, text_field_with_callbacks, TextInputAction, TextInputCallbacks,
+    TextInputContextCb, TextInputState,
 };
 use crate::components::timeline::timeline::Timeline;
 use crate::components::timeline::timeline_state::TimelineState;
@@ -205,8 +205,37 @@ impl MixerTreeSidebar {
         true
     }
 
+    /// Typing in the filter field. The owning window's root lets text keys
+    /// through while the field is focused (see `is_filter_focused`), so they
+    /// edit the field here instead of running shortcuts.
+    fn handle_filter_key(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.filter_input.is_focused(window) {
+            return;
+        }
+        match self.filter_input.handle_key_with_clipboard(event, Some(cx)) {
+            TextInputAction::Pass => return,
+            // Escape clears the filter, then gives the keyboard back.
+            TextInputAction::Cancel => {
+                if self.filter_input.value.is_empty() {
+                    window.blur();
+                } else {
+                    self.filter_input.set_value("");
+                }
+            }
+            TextInputAction::Consumed | TextInputAction::Submit => {}
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
     fn apply_filter_debounce(&mut self, cx: &Context<Self>) {
-        let current = self.filter_input.value.clone();
+        // Trimmed, as `sync_routing_from_layout` hands it to the cache.
+        let current = self.filter_input.value.trim().to_string();
         if current == self.last_filter_applied {
             return;
         }
@@ -264,7 +293,6 @@ impl Render for MixerTreeSidebar {
 
         let rows = self.cache.visible_rows.clone();
         let row_count = rows.len();
-        let hovered = self.cache.hovered_row;
         let scroll = self.scroll.clone();
 
         let collapse_sidebar = callbacks.on_toggle_sidebar.clone();
@@ -338,6 +366,9 @@ impl Render for MixerTreeSidebar {
             .py(px(4.0))
             .border_b(px(1.0))
             .border_color(Colors::border_subtle())
+            .on_key_down(
+                cx.listener(|this, event, window, cx| this.handle_filter_key(event, window, cx)),
+            )
             .child(text_field_with_callbacks(
                 &self.filter_input,
                 self.filter_focused,
@@ -345,19 +376,9 @@ impl Render for MixerTreeSidebar {
             ));
 
         let cbs = callbacks.clone();
-        let sidebar_entity = cx.entity().clone();
         let list = uniform_list("mixer-tree-list", row_count, move |range, _window, _cx| {
             range
-                .map(|i| {
-                    tree_row_element(
-                        &rows[i],
-                        cbs.clone(),
-                        i,
-                        hovered == Some(i),
-                        sidebar_entity.clone(),
-                    )
-                    .into_any_element()
-                })
+                .map(|i| tree_row_element(&rows[i], cbs.clone(), i).into_any_element())
                 .collect::<Vec<_>>()
         })
         .track_scroll(&scroll)
@@ -440,8 +461,6 @@ fn tree_row_element(
     row: &MixerTreeVisibleRow,
     callbacks: MixerTreeCallbacks,
     row_index: usize,
-    hovered: bool,
-    sidebar_entity: Entity<MixerTreeSidebar>,
 ) -> impl IntoElement {
     let node_id = row.node_id.as_str();
     let channel_id = row.channel_id.as_deref();
@@ -490,6 +509,7 @@ fn tree_row_element(
     let is_group = channel_id.is_none();
     let rest = TREE_PANEL_BG();
     let selected_bg = Colors::composite(rest, Colors::state_selected());
+    let hover_bg = Colors::composite(rest, Colors::state_hover());
 
     let mut row_el = div()
         .flex()
@@ -503,20 +523,10 @@ fn tree_row_element(
         .gap(px(4.0))
         .id(("mixer-tree-row", row_index))
         .cursor(gpui::CursorStyle::PointingHand)
-        .on_mouse_move({
-            let entity = sidebar_entity.clone();
-            move |_event, _window, cx| {
-                let _ = entity.update(cx, |sidebar, cx| {
-                    if sidebar.cache.set_hovered_row(Some(row_index)) {
-                        sidebar.cache.clear_hover_dirty();
-                        cx.notify();
-                    }
-                });
-            }
-        })
-        .when(hovered && !row.selected, |el| {
-            el.bg(Colors::composite(rest, Colors::state_hover()))
-        })
+        // GPUI's own hover: it follows the row under the pointer as rows
+        // change and ends when the pointer leaves, which a stored row index
+        // did not.
+        .when(!row.selected, |el| el.hover(move |s| s.bg(hover_bg)))
         // Selected: the lifted row and the accent edge, as everywhere else.
         .border_l(px(2.0))
         .border_color(if row.selected {

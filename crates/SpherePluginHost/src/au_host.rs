@@ -8,10 +8,12 @@
 //! parameter's own min/max.
 //!
 //! Thread contract: [`AuHostProcessor::render`] runs on the audio producer
-//! thread; state, parameter enumeration, and reset run on the IPC thread. Both
-//! go through one mutex, which is the same way the VST3 voice mutex serializes
-//! `setState` against `process` (see `plugin_host_preview::set_instance_state`).
-//! Loads are rare and short; the block path never contends in steady state.
+//! thread; state, parameter enumeration, and reset run on the IPC thread.
+//! Render, MIDI, parameter values, reset and latency share one mutex. State
+//! save/restore does not: Audio Units expect ClassInfo to be read and written
+//! from a non-render thread while rendering, and the producer thread serves
+//! every plug-in in this host, so a slow serialization under the mutex would
+//! stall all of them (see [`AuHostProcessor::state`]).
 
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_uchar, c_uint};
@@ -107,11 +109,9 @@ extern "C" {
         index: c_uint,
         out_info: *mut AuParameterInfoRaw,
     ) -> c_int;
-    fn sphere_au_get_state(
-        instance: *const SphereAuInstance,
-        out: *mut c_uchar,
-        capacity: usize,
-    ) -> usize;
+    fn sphere_au_copy_state(instance: *const SphereAuInstance, out_len: *mut usize)
+        -> *mut c_uchar;
+    fn sphere_au_free_state(data: *mut c_uchar);
     fn sphere_au_set_state(
         instance: *mut SphereAuInstance,
         data: *const c_uchar,
@@ -134,11 +134,12 @@ extern "C" {
 /// Owns the native instance pointer and closes it exactly once.
 struct AuInstancePtr(*mut SphereAuInstance);
 
-// SAFETY: render/state/parameter calls go through the owning `Mutex`. Cocoa
-// editor calls only touch the native instance's editor fields and intentionally
-// run without holding that render mutex: real AU hosts create and manage views
-// on the main thread while the Audio Unit continues rendering. `&self` keeps
-// the native instance alive for the full duration of every such call.
+// SAFETY: render/parameter/MIDI/reset calls go through the owning `Mutex`.
+// Cocoa editor calls and ClassInfo state save/restore intentionally run without
+// holding that render mutex: real AU hosts create views and read/write
+// ClassInfo on a non-render thread while the Audio Unit continues rendering,
+// and those calls do not touch the native instance's render buffers. `&self`
+// keeps the native instance alive for the full duration of every such call.
 unsafe impl Send for AuInstancePtr {}
 unsafe impl Sync for AuInstancePtr {}
 
@@ -181,6 +182,13 @@ impl AuHostProcessor {
     /// potentially slow Cocoa plug-in view factory runs. Holding this mutex
     /// while UADx constructs its view can otherwise stall audio for >100 ms.
     fn editor_instance(&self) -> *mut SphereAuInstance {
+        self.unlocked_instance()
+    }
+
+    /// The stable native pointer, for control calls that must run concurrently
+    /// with render (editor, ClassInfo state). The mutex is held only to read
+    /// the pointer, which never changes after `open`.
+    fn unlocked_instance(&self) -> *mut SphereAuInstance {
         self.instance.lock().0
     }
 
@@ -348,27 +356,39 @@ impl AuHostProcessor {
 
     /// Opaque state bytes (a binary plist of the unit's ClassInfo), for project
     /// persistence. `None` when the unit reports no state.
+    ///
+    /// Runs without the render mutex, like every AU host's ClassInfo save: the
+    /// property is meant to be read from a non-render thread while the unit
+    /// renders, and one producer thread serves every plug-in in this host, so
+    /// holding the mutex across a large sampler's serialization made the whole
+    /// host miss its deadline. The bytes come from a single native
+    /// serialization, so they can no longer be truncated by a state that grew
+    /// between a sizing call and a copy call.
     pub fn state(&self) -> Option<Vec<u8>> {
-        let instance = self.instance.lock();
-        let len = unsafe { sphere_au_get_state(instance.0, std::ptr::null_mut(), 0) };
-        if len == 0 {
+        let instance = self.unlocked_instance();
+        let mut len = 0usize;
+        // SAFETY: `&self` keeps the native instance alive for the call.
+        let data = unsafe { sphere_au_copy_state(instance, &mut len) };
+        if data.is_null() {
             return None;
         }
-        let mut bytes = vec![0u8; len];
-        let written = unsafe { sphere_au_get_state(instance.0, bytes.as_mut_ptr(), bytes.len()) };
-        if written == 0 {
-            return None;
-        }
-        bytes.truncate(written.min(len));
-        Some(bytes)
+        // SAFETY: the native side allocated exactly `len` bytes at `data`.
+        let bytes = unsafe { std::slice::from_raw_parts(data, len) }.to_vec();
+        unsafe { sphere_au_free_state(data) };
+        (!bytes.is_empty()).then_some(bytes)
     }
 
+    /// Restore bytes from [`Self::state`]. Like the save, this does not hold the
+    /// render mutex: a ClassInfo restore is a non-render-thread property set,
+    /// and a sampler reloading its samples must not stall every co-hosted
+    /// plug-in's block.
     pub fn set_state(&self, bytes: &[u8]) -> bool {
         if bytes.is_empty() {
             return false;
         }
-        let instance = self.instance.lock();
-        unsafe { sphere_au_set_state(instance.0, bytes.as_ptr(), bytes.len()) != 0 }
+        let instance = self.unlocked_instance();
+        // SAFETY: `&self` keeps the native instance alive for the call.
+        unsafe { sphere_au_set_state(instance, bytes.as_ptr(), bytes.len()) != 0 }
     }
 
     /// Open the unit's custom Cocoa view in the plugin-host process. The

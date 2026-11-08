@@ -13,7 +13,7 @@ use crate::runtime::{clip_dsp_debug_enabled, describe_clip_dsp_state, RuntimePro
 use crate::types::EngineProjectSnapshot;
 
 use super::render_progress::{ExportCancelToken, ExportProgress, ExportStage};
-use super::render_request::{ExportTailMode, OfflineRenderRequest};
+use super::render_request::{ExportTailMode, OfflineRenderRequest, SilenceTail, TailBlock};
 use super::ExportError;
 
 /// Per-block callback receiving each rendered mixer-channel tap (stereo, in
@@ -593,13 +593,14 @@ fn render_offline_impl(
     let mut peak = 0.0f32;
     let mut progress_throttle = 0u32;
 
-    let until_silence = matches!(request.tail, ExportTailMode::UntilSilence { .. });
-    let silence_threshold = match request.tail {
-        ExportTailMode::UntilSilence { threshold_db, .. } => {
-            10f32.powf(threshold_db / 20.0).clamp(0.0, 1.0)
-        }
-        _ => 0.0,
-    };
+    // UntilSilence: quiet tail blocks are held back here until the tail
+    // either sounds again (they were a gap between repeats, and are written)
+    // or stays quiet for the hold (it has ended, and they are dropped).
+    let mut silence = SilenceTail::new(request.tail, request.sample_rate);
+    let mut held_mix: Vec<f32> = Vec::new();
+    let mut held_taps: Vec<Vec<f32>> = vec![Vec::new(); track_taps.len()];
+    let mut held_frames = 0usize;
+    let mut held_peak = 0.0f32;
 
     loop {
         if cancel.is_cancelled() {
@@ -707,26 +708,60 @@ fn render_offline_impl(
                     }
                 }
             }
-            peak = peak.max(block_peak);
-            on_block(out_slice)?;
-            if capture_tracks {
-                if emit_from > 0 {
-                    for tap in &mut track_taps {
-                        let src = emit_from * 2;
-                        let len = emit_len * 2;
-                        if tap.len() >= src + len {
-                            tap.copy_within(src..src + len, 0);
-                        }
+            if capture_tracks && emit_from > 0 {
+                for tap in &mut track_taps {
+                    let src = emit_from * 2;
+                    let len = emit_len * 2;
+                    if tap.len() >= src + len {
+                        tap.copy_within(src..src + len, 0);
                     }
                 }
-                on_track_block(&track_taps, emit_len)?;
             }
-            written = written.saturating_add(emit_len as u64);
 
-            // UntilSilence: stop once content is done and the emitted peak has
-            // decayed below threshold.
-            if produced >= content_end && until_silence && block_peak < silence_threshold {
-                stop_for_silence = true;
+            // UntilSilence decides past the content whether this block is
+            // written now, held back, or the end of the tail.
+            let verdict = match silence.as_mut() {
+                Some(tail) if produced >= content_end => tail.observe(block_peak, emit_len as u64),
+                _ => TailBlock::Audible,
+            };
+            match verdict {
+                TailBlock::Audible => {
+                    if held_frames > 0 {
+                        // A gap between repeats, not the end: write it first.
+                        peak = peak.max(held_peak);
+                        on_block(&held_mix)?;
+                        if capture_tracks {
+                            on_track_block(&held_taps, held_frames)?;
+                        }
+                        written = written.saturating_add(held_frames as u64);
+                        held_mix.clear();
+                        held_taps.iter_mut().for_each(Vec::clear);
+                        held_frames = 0;
+                        held_peak = 0.0;
+                    }
+                    peak = peak.max(block_peak);
+                    on_block(out_slice)?;
+                    if capture_tracks {
+                        on_track_block(&track_taps, emit_len)?;
+                    }
+                    written = written.saturating_add(emit_len as u64);
+                }
+                TailBlock::Quiet => {
+                    held_mix.extend_from_slice(out_slice);
+                    if capture_tracks {
+                        for (held, tap) in held_taps.iter_mut().zip(&track_taps) {
+                            match tap.get(..emit_len * 2) {
+                                Some(block) => held.extend_from_slice(block),
+                                // A track that rendered nothing is silence.
+                                None => held.resize(held.len() + emit_len * 2, 0.0),
+                            }
+                        }
+                    }
+                    held_frames += emit_len;
+                    held_peak = held_peak.max(block_peak);
+                }
+                // Quiet for the whole hold: the held blocks are dropped.
+                TailBlock::Ended => stop_for_silence = true,
             }
         }
 
@@ -1041,6 +1076,7 @@ mod tests {
             track_plugin_latency: vec![512, 0, 128],
             track_output_latency: vec![512, 0, 128],
             track_pdc_delay: vec![0, 512, 0],
+            send_pdc_delay: Vec::new(),
             max_path_latency_samples: 512,
             master_plugin_latency: 128,
         };
@@ -1049,6 +1085,129 @@ mod tests {
         assert_eq!(tap_latency_frames(&lg, 0, Some(2), mix), 512);
         assert_eq!(tap_latency_frames(&lg, 1, Some(2), mix), 512);
         assert_eq!(tap_latency_frames(&lg, 2, Some(2), mix), 640);
+    }
+
+    /// A bridged instrument playing a dry hit and then its echoes: a 50 ms
+    /// burst every 500 ms, each 0.4 of the last (a 1/4-note delay at 120 BPM
+    /// with 40 % feedback), silent between bursts.
+    #[derive(Debug, Default)]
+    struct EchoSink {
+        position: std::sync::atomic::AtomicU64,
+        fresh: std::sync::atomic::AtomicBool,
+    }
+
+    const ECHO_PERIOD: u64 = 24_000;
+    const ECHO_BURST: u64 = 2_400;
+
+    fn echo_level(frame: u64) -> f32 {
+        let n = frame / ECHO_PERIOD;
+        if frame % ECHO_PERIOD < ECHO_BURST && n < 64 {
+            0.5 * 0.4f32.powi(n as i32)
+        } else {
+            0.0
+        }
+    }
+
+    impl crate::plugin_bridge::PluginBridgeSink for EchoSink {
+        fn dsp_ready(&self) -> bool {
+            true
+        }
+        fn read_output(&self, out_l: &mut [f32], out_r: &mut [f32], frames: usize) -> usize {
+            use std::sync::atomic::Ordering;
+            if !self.fresh.swap(false, Ordering::AcqRel) {
+                return 0;
+            }
+            let n = frames.min(out_l.len()).min(out_r.len());
+            let start = self.position.fetch_add(n as u64, Ordering::AcqRel);
+            for i in 0..n {
+                let value = echo_level(start + i as u64);
+                out_l[i] = value;
+                out_r[i] = value;
+            }
+            n
+        }
+        fn push_midi(&self, _: u8, _: u8, _: u8, _: u32) {}
+        fn write_input(&self, _: &[f32], _: &[f32], _: usize) {}
+        fn request_block(&self, _frames: u32) {
+            self.fresh.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// The reported case, end to end: "Until silence" past content that is
+    /// only the dry hit. The render keeps every echo still above -60 dB
+    /// through the silent gaps between them, ends after the last one without
+    /// writing the silence it waited through, and keeps the stems aligned
+    /// with the mixdown.
+    #[test]
+    fn until_silence_keeps_echoes_across_the_gaps_between_them() {
+        let mut snapshot = silence_snapshot(48_000);
+        snapshot.tracks[0]
+            .inserts
+            .push(crate::types::EngineInsertSnapshot {
+                id: "echo".to_string(),
+                kind: "external-bridge-plugin".to_string(),
+                enabled: true,
+                params: Default::default(),
+                state: None,
+            });
+        let sink: crate::plugin_bridge::SharedPluginBridgeSink =
+            std::sync::Arc::new(EchoSink::default());
+        let sinks: PluginBridgeSinkMap = [("echo".to_string(), sink)].into_iter().collect();
+        let request = OfflineRenderRequest {
+            tail: ExportTailMode::UntilSilence {
+                max_seconds: 10.0,
+                threshold_db: -60.0,
+            },
+            ..request(0, ECHO_BURST)
+        };
+
+        let mut mix = Vec::new();
+        let mut tap_frames = 0usize;
+        let summary = render_offline_mix_and_tracks_with_bridges(
+            &snapshot,
+            &request,
+            &ExportCancelToken::new(),
+            1.0,
+            Some(&sinks),
+            true,
+            &mut |block| {
+                mix.extend_from_slice(block);
+                Ok(())
+            },
+            &mut |taps, frames| {
+                assert!(taps.iter().all(|tap| tap.len() >= frames * 2));
+                tap_frames += frames;
+                Ok(())
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+
+        let frames = summary.frames_rendered;
+        assert_eq!(mix.len() as u64, frames * 2);
+        assert_eq!(tap_frames as u64, frames, "the stems stay with the mixdown");
+
+        // Echo n peaks at 0.5 * 0.4^n: at or above -60 dB (0.001) up to
+        // n = 6, so the last sound written is the sixth echo, six silent gaps
+        // after the dry hit. (Where it lands depends on the bridge's block
+        // timing, so it is found in the audio rather than computed.)
+        let last_loud = mix
+            .chunks_exact(2)
+            .rposition(|frame| frame[0].abs() >= 0.001)
+            .expect("the render holds sound") as u64;
+        let last_echo = mix[last_loud as usize * 2].abs();
+        assert!(
+            (last_echo - 0.5 * 0.4f32.powi(6)).abs() < 1e-4,
+            "the render ended on {last_echo} at frame {last_loud}, not on the sixth echo"
+        );
+        assert!(
+            last_loud > 6 * ECHO_PERIOD - request.block_size as u64,
+            "the sixth echo is in place: {last_loud}"
+        );
+        assert!(
+            frames - (last_loud + 1) < request.block_size as u64,
+            "the silence after the last echo is not written: {frames} frames, last sound at {last_loud}"
+        );
     }
 
     #[test]

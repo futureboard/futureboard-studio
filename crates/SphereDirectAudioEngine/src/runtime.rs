@@ -1808,6 +1808,9 @@ pub struct RuntimeSend {
     pub level_lane: Option<usize>,
     /// The owning track's Send On/Off automation lane for this send, likewise.
     pub enabled_lane: Option<usize>,
+    /// Delay ring aligning this feed with the return's other feeds
+    /// (`RuntimeLatencyGraph::send_pdc_delay`). Sized with the track rings.
+    pub pdc: crate::latency_graph::PdcDelayLine,
 }
 
 /// Shape of one clip fade ramp.
@@ -2519,6 +2522,68 @@ pub struct RuntimeMidiTrack {
     pub preview_active: Vec<(u8, u8)>,
     /// MIDI tracks routed into this one ([`RuntimeMidiEvent::source`]).
     pub sources: Vec<RuntimeMidiSource>,
+    /// A block-event list the control thread preallocated for this schedule's
+    /// densest block ([`midi_block_event_capacity`]), for a running graph whose
+    /// track list is smaller: installing the schedule swaps it in
+    /// ([`RuntimeProject::adopt_midi_block_event_buffers`]) so the callback
+    /// never grows the list. Empty when the base capacity is enough.
+    pub block_events_spare: Vec<Vst3MidiEvent>,
+}
+
+/// Every in-process instrument track's per-block event list holds at least
+/// this many events.
+const MIDI_BLOCK_EVENT_BASE_CAPACITY: usize = 256;
+
+/// Block the per-block MIDI lists are sized for: the longest block the graph's
+/// track buffers take. Sizing for it rather than for the open device keeps the
+/// lists right for every path that schedules blocks — any device buffer, a
+/// device that hands over a longer block than it announced, offline export —
+/// at the cost of a few kilobytes on dense tracks only.
+const MIDI_BLOCK_WINDOW: usize = DEFAULT_AUDIO_BLOCK_CAPACITY;
+
+/// Events one MIDI track can queue for its in-process instrument in a single
+/// render block of `block_frames`: the densest `block_frames` window of
+/// `events` (sorted by sample) twice over — a loop-wrap block carries the end
+/// of one pass and the start of the next — plus a note-off for every sounding
+/// note (128, the `active` capacity), the stop/seek controller panic (four
+/// per channel) and a little room for live preview and program changes.
+pub(crate) fn midi_block_event_capacity(events: &[RuntimeMidiEvent], block_frames: usize) -> usize {
+    let window = block_frames.clamp(1, DEFAULT_AUDIO_BLOCK_CAPACITY) as u64;
+    let mut densest = 0usize;
+    let mut start = 0usize;
+    for end in 0..events.len() {
+        while events[end].sample.saturating_sub(events[start].sample) >= window {
+            start += 1;
+        }
+        densest = densest.max(end - start + 1);
+    }
+    (2 * densest + 128 + 16 * 4 + 32).max(MIDI_BLOCK_EVENT_BASE_CAPACITY)
+}
+
+/// Times the callback had to grow an instrument track's per-block MIDI list
+/// because a graph reached it without the list being sized off the audio
+/// thread. Every path that hands a graph or a schedule to the callback sizes
+/// it, so this should stay zero; it is logged off the audio thread by
+/// [`crate::engine::EngineInner::log_callback_diagnostics`] so a path that
+/// does not shows up instead of hiding.
+static MIDI_BLOCK_LIST_GROWTHS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Total [`MIDI_BLOCK_LIST_GROWTHS`].
+pub fn midi_block_list_growths() -> u64 {
+    MIDI_BLOCK_LIST_GROWTHS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Queue `event` for a track's in-process instrument this block. Within the
+/// capacity reserved off the audio thread this never allocates. A full list
+/// still takes the event — losing a note-off would leave a note stuck — but
+/// the growth is counted and reported, never silent.
+#[inline]
+fn push_midi_block_event(events: &mut Vec<Vst3MidiEvent>, event: Vst3MidiEvent) -> bool {
+    if events.len() == events.capacity() {
+        MIDI_BLOCK_LIST_GROWTHS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    events.push(event);
+    true
 }
 
 /// A project's MIDI schedule on its own: what a note edit changes, swapped
@@ -2527,6 +2592,46 @@ pub struct RuntimeMidiTrack {
 pub struct RuntimeMidiData {
     pub midi_clips: Vec<RuntimeMidiClip>,
     pub midi_tracks: Vec<RuntimeMidiTrack>,
+}
+
+impl RuntimeMidiData {
+    /// Control thread: give each track the block-event list its densest block
+    /// needs, when that is more than the base capacity every graph track
+    /// starts with. See [`RuntimeMidiTrack::block_events_spare`].
+    pub fn prepare_block_event_buffers(&mut self) {
+        for track in &mut self.midi_tracks {
+            let need = midi_block_event_capacity(&track.events, MIDI_BLOCK_WINDOW);
+            track.block_events_spare = if need > MIDI_BLOCK_EVENT_BASE_CAPACITY {
+                Vec::with_capacity(need)
+            } else {
+                Vec::new()
+            };
+        }
+    }
+
+    /// Control thread: re-time this schedule for `tempo_map` (see
+    /// [`retime_midi_lists`]).
+    pub fn retime(&mut self, tempo_map: &RuntimeTempoMapSnapshot, sample_rate: u32) {
+        retime_midi_lists(
+            &mut self.midi_clips,
+            &mut self.midi_tracks,
+            tempo_map,
+            sample_rate.max(1) as f64,
+        );
+    }
+
+    /// Control thread: a copy ready to be swapped into a running graph. A
+    /// plain clone keeps no spare capacity, and the callback pushes into each
+    /// track's sounding-note lists, so they get the capacity
+    /// [`build_midi_runtime`] gives them.
+    pub fn realtime_copy(&self) -> Self {
+        let mut copy = self.clone();
+        for track in &mut copy.midi_tracks {
+            track.active.reserve(128);
+            track.preview_active.reserve(128);
+        }
+        copy
+    }
 }
 
 /// Whether `events` (the unplayed part of a schedule) end the note on
@@ -2553,6 +2658,11 @@ pub struct RuntimeProject {
     pub has_solo: bool,
     /// Authoritative hold-mode tempo map for beat/time/sample conversion.
     pub tempo_map: RuntimeTempoMapSnapshot,
+    /// A second copy of [`Self::tempo_map`], made by the control thread for
+    /// the metronome when this graph is sent to a running stream, so the
+    /// graph swap hands it over instead of cloning on the audio thread. `None`
+    /// on a graph nobody sends (the control-thread mirror, offline renders).
+    pub metronome_tempo_map: Option<RuntimeTempoMapSnapshot>,
     /// Structural MIDI clips (logging / inspection).
     pub midi_clips: Vec<RuntimeMidiClip>,
     /// Per-track scheduling state driven by the audio callback.
@@ -2923,6 +3033,59 @@ impl RuntimeProject {
                 }
             }
         }
+        // After `retarget_sample_rate` on a stream's graph: a lower rate packs
+        // the same MIDI into fewer frames.
+        self.reserve_midi_block_events();
+    }
+
+    /// Size every instrument track's per-block MIDI list for the densest block
+    /// of its schedule ([`midi_block_event_capacity`]), off the audio thread.
+    /// A schedule swapped in later brings its own larger list when it needs
+    /// one ([`Self::adopt_midi_block_event_buffers`]).
+    pub fn reserve_midi_block_events(&mut self) {
+        // Every track holds at least the base list (live preview reaches
+        // tracks with no schedule; a cloned graph's lists come back empty).
+        for track in &mut self.tracks {
+            let events = &mut track.midi_block_events;
+            if events.capacity() < MIDI_BLOCK_EVENT_BASE_CAPACITY {
+                events.reserve(MIDI_BLOCK_EVENT_BASE_CAPACITY - events.len());
+            }
+        }
+        for midi_track in &self.midi_tracks {
+            let Some(track) = midi_track
+                .track_index
+                .and_then(|index| self.tracks.get_mut(index))
+            else {
+                continue;
+            };
+            let need = midi_block_event_capacity(&midi_track.events, MIDI_BLOCK_WINDOW);
+            let events = &mut track.midi_block_events;
+            if events.capacity() < need {
+                events.reserve(need - events.len());
+            }
+        }
+    }
+
+    /// Audio thread, right after a MIDI schedule is swapped in: take each
+    /// track's preallocated block-event list where it is larger than the one
+    /// the graph has. Anything already queued this block moves with it (it
+    /// fits: the new list is the larger). The smaller list stays in the
+    /// schedule and leaves with it through the graveyard. No allocation.
+    pub(crate) fn adopt_midi_block_event_buffers(&mut self) {
+        for midi_track in &mut self.midi_tracks {
+            let Some(track) = midi_track
+                .track_index
+                .and_then(|index| self.tracks.get_mut(index))
+            else {
+                continue;
+            };
+            let spare = &mut midi_track.block_events_spare;
+            if spare.capacity() > track.midi_block_events.capacity() {
+                spare.clear();
+                spare.extend_from_slice(&track.midi_block_events);
+                std::mem::swap(spare, &mut track.midi_block_events);
+            }
+        }
     }
 
     /// Rebuild all sample-rate-derived runtime state for an already-cached graph.
@@ -3124,22 +3287,32 @@ impl RuntimeProject {
     /// the vectors' capacity, so callers that have checked capacity first can
     /// use it on the audio thread.
     fn fit_track_pdc_len(track: &mut RuntimeTrack, frames: usize) {
-        let old_len = track.pdc_delay_l.len();
+        Self::fit_pdc_ring_len(
+            &mut track.pdc_delay_l,
+            &mut track.pdc_delay_r,
+            &mut track.pdc_write_pos,
+            frames,
+        );
+    }
+
+    /// [`Self::fit_track_pdc_len`] for any stereo ring (track or send).
+    fn fit_pdc_ring_len(l: &mut Vec<f32>, r: &mut Vec<f32>, write_pos: &mut usize, frames: usize) {
+        let old_len = l.len();
         if old_len < frames {
             // Growing the ring invalidates the write cursor — reset so we
             // never read uninitialized slots. Same-size refreshes (common
             // when bridge latency reports tick) must leave the cursor alone
             // or mid-playback compensation clicks.
-            track.pdc_delay_l.resize(frames, 0.0);
-            track.pdc_delay_r.resize(frames, 0.0);
-            track.pdc_write_pos = 0;
+            l.resize(frames, 0.0);
+            r.resize(frames, 0.0);
+            *write_pos = 0;
         } else if old_len > frames {
-            track.pdc_delay_l.truncate(frames);
-            track.pdc_delay_r.truncate(frames);
+            l.truncate(frames);
+            r.truncate(frames);
             if frames > 0 {
-                track.pdc_write_pos %= frames;
+                *write_pos %= frames;
             } else {
-                track.pdc_write_pos = 0;
+                *write_pos = 0;
             }
         }
     }
@@ -3160,6 +3333,12 @@ impl RuntimeProject {
             track.pdc_delay_l.reserve_exact(extra_l);
             track.pdc_delay_r.reserve_exact(extra_r);
             Self::fit_track_pdc_len(track, frames);
+            for send in &mut track.sends {
+                let line = &mut send.pdc;
+                line.l.reserve_exact(reserved.saturating_sub(line.l.len()));
+                line.r.reserve_exact(reserved.saturating_sub(line.r.len()));
+                Self::fit_pdc_ring_len(&mut line.l, &mut line.r, &mut line.write_pos, frames);
+            }
         }
     }
 
@@ -3175,7 +3354,12 @@ impl RuntimeProject {
     fn fit_pdc_delay_capacity_realtime(&mut self) -> bool {
         let frames = Self::pdc_buffer_frames(self.latency_graph.max_path_latency_samples);
         let fits = self.tracks.iter().all(|track| {
-            frames <= track.pdc_delay_l.capacity() && frames <= track.pdc_delay_r.capacity()
+            frames <= track.pdc_delay_l.capacity()
+                && frames <= track.pdc_delay_r.capacity()
+                && track
+                    .sends
+                    .iter()
+                    .all(|send| frames <= send.pdc.l.capacity() && frames <= send.pdc.r.capacity())
         });
         if !fits {
             return false;
@@ -3190,6 +3374,14 @@ impl RuntimeProject {
                 Self::fit_track_pdc_len(track, frames);
                 track.pdc_delay_l.fill(0.0);
                 track.pdc_delay_r.fill(0.0);
+            }
+            for send in &mut track.sends {
+                let line = &mut send.pdc;
+                if line.l.len() < frames {
+                    Self::fit_pdc_ring_len(&mut line.l, &mut line.r, &mut line.write_pos, frames);
+                    line.l.fill(0.0);
+                    line.r.fill(0.0);
+                }
             }
         }
         true
@@ -3214,6 +3406,11 @@ impl RuntimeProject {
             track.pdc_delay_l.fill(0.0);
             track.pdc_delay_r.fill(0.0);
             track.pdc_write_pos = 0;
+            for send in &mut track.sends {
+                send.pdc.l.fill(0.0);
+                send.pdc.r.fill(0.0);
+                send.pdc.write_pos = 0;
+            }
         }
     }
 
@@ -3356,6 +3553,8 @@ impl RuntimeProject {
         let clip_tempo_map =
             (!tempo_map_is_flat_at(&clip_tempo_map, snapshot.bpm)).then_some(&clip_tempo_map);
         let mut clips = Vec::new();
+        // Media path of each entry in `clips`, for `assign_stream_lanes`.
+        let mut clip_paths: Vec<&str> = Vec::new();
         let mut skipped_no_path = 0u32;
         let mut skipped_decode_err = 0u32;
         let mut loaded_from_cache = 0u32;
@@ -3433,7 +3632,14 @@ impl RuntimeProject {
                 continue;
             };
             clips.push(runtime_clip);
+            clip_paths.push(path);
         }
+        loaded_fresh += assign_stream_lanes(
+            &mut clips,
+            &clip_paths,
+            decoded_by_path,
+            &mut open_clip_audio_source,
+        );
 
         if skipped_no_path > 0 || skipped_decode_err > 0 || loaded_fresh > 0 {
             eprintln!(
@@ -3662,6 +3868,7 @@ impl RuntimeProject {
                         pre_fader: send.pre_fader,
                         level_lane: None,
                         enabled_lane: None,
+                        pdc: Default::default(),
                     })
                     .collect(),
                 automation_lanes: t
@@ -3689,7 +3896,7 @@ impl RuntimeProject {
                 ara_r: vec![0.0; DEFAULT_AUDIO_BLOCK_CAPACITY],
                 ara_silence: vec![0.0; DEFAULT_AUDIO_BLOCK_CAPACITY],
                 ara_latency_samples: 0,
-                midi_block_events: Vec::with_capacity(256),
+                midi_block_events: Vec::with_capacity(MIDI_BLOCK_EVENT_BASE_CAPACITY),
                 solfege_pitch_events: Vec::with_capacity(1024),
                 solfege_articulation_events: Vec::with_capacity(256),
                 midi_instrument_insert_ix,
@@ -3929,6 +4136,7 @@ impl RuntimeProject {
             clips,
             has_solo,
             tempo_map,
+            metronome_tempo_map: None,
             midi_clips,
             midi_tracks,
             // Filled by `resolve_indices()` below.
@@ -3974,6 +4182,9 @@ impl RuntimeProject {
         // control-thread path leaves behind — without it the first bridge
         // latency the callback observes would have nowhere to grow into.
         project.ensure_pdc_delay_capacity();
+        // The instrument tracks' per-block MIDI lists, sized for the schedule
+        // (every graph, live or offline, starts with lists that hold it).
+        project.reserve_midi_block_events();
         Ok(project)
     }
 
@@ -4088,6 +4299,7 @@ impl RuntimeProject {
     pub fn replace_midi_schedule(&mut self, next: &mut RuntimeMidiData, position_sample: u64) {
         std::mem::swap(&mut self.midi_clips, &mut next.midi_clips);
         std::mem::swap(&mut self.midi_tracks, &mut next.midi_tracks);
+        self.adopt_midi_block_event_buffers();
         for midi_track in &mut self.midi_tracks {
             midi_track.cursor = midi_track
                 .events
@@ -4185,40 +4397,95 @@ impl RuntimeProject {
     /// Rebuild MIDI event sample positions from canonical beat positions after a
     /// tempo-map change. Returns the sample position that preserves the current
     /// musical playhead beat under the new map.
+    ///
+    /// Control-thread / offline form: the replaced map is dropped here. The
+    /// callback uses [`Self::install_tempo_change`].
     pub fn apply_tempo_map(
         &mut self,
-        tempo_map: RuntimeTempoMapSnapshot,
+        mut tempo_map: RuntimeTempoMapSnapshot,
+        position_sample: u64,
+    ) -> u64 {
+        self.install_tempo_map(&mut tempo_map, None, position_sample)
+    }
+
+    /// Apply a tempo change prepared by the control thread. Realtime-safe:
+    /// every replaced part (map, metronome map, schedule) goes back into
+    /// `change` for the caller to retire off the audio thread, and the
+    /// metronome copy is left in `change.metronome_map` for the caller to swap
+    /// into the metronome. Returns the new transport position.
+    pub fn install_tempo_change(
+        &mut self,
+        change: &mut crate::command::TempoMapChange,
+        position_sample: u64,
+    ) -> u64 {
+        // A schedule timed at another rate than this graph runs at is no use.
+        let retimed = change
+            .midi
+            .as_mut()
+            .filter(|_| change.sample_rate == self.sample_rate);
+        self.install_tempo_map(&mut change.map, retimed, position_sample)
+    }
+
+    /// Swap `tempo_map` in (the previous map comes back through it) and move
+    /// the MIDI schedule onto it: by swapping in `retimed` when it is this
+    /// graph's schedule already re-timed for the map, otherwise by re-timing
+    /// the schedule in place. Neither path allocates or frees.
+    fn install_tempo_map(
+        &mut self,
+        tempo_map: &mut RuntimeTempoMapSnapshot,
+        retimed: Option<&mut RuntimeMidiData>,
         position_sample: u64,
     ) -> u64 {
         // Identical segments mean an identical beat<->sample mapping, so the
         // rebuild below would recompute every event to the value it already
-        // holds and re-sort every list — on the audio thread, in the same
-        // callback as Play. `revision` is bumped per rebuild, so two
-        // structurally identical maps built independently compare unequal;
-        // compare the segments, which are the mapping.
+        // holds. `revision` is bumped per rebuild, so two structurally
+        // identical maps built independently compare unequal; compare the
+        // segments, which are the mapping.
         if self.tempo_map.segments == tempo_map.segments {
             return position_sample;
         }
         let sr = self.sample_rate.max(1) as f64;
         let current_beat = self.tempo_map.beat_at_samples(position_sample, sr);
         self.all_notes_off("tempo_change");
-        self.tempo_map = tempo_map;
-        for clip in &mut self.midi_clips {
-            for event in &mut clip.events {
-                event.sample = self.tempo_map.samples_at_beat(event.beat, sr);
-            }
-            sort_midi_events(&mut clip.events);
-        }
+        std::mem::swap(&mut self.tempo_map, tempo_map);
         let next_position = self.tempo_map.samples_at_beat(current_beat, sr);
-        for mt in &mut self.midi_tracks {
-            for event in &mut mt.events {
-                event.sample = self.tempo_map.samples_at_beat(event.beat, sr);
+        match retimed.filter(|data| self.midi_schedule_matches(data)) {
+            Some(data) => {
+                std::mem::swap(&mut self.midi_clips, &mut data.midi_clips);
+                std::mem::swap(&mut self.midi_tracks, &mut data.midi_tracks);
+                self.adopt_midi_block_event_buffers();
             }
-            sort_midi_events(&mut mt.events);
+            None => retime_midi_lists(
+                &mut self.midi_clips,
+                &mut self.midi_tracks,
+                &self.tempo_map,
+                sr,
+            ),
+        }
+        for mt in &mut self.midi_tracks {
             mt.cursor = mt.events.partition_point(|ev| ev.sample < next_position);
             mt.active.clear();
         }
         next_position
+    }
+
+    /// Whether `data` is this graph's MIDI schedule (same tracks, routed to
+    /// the same graph tracks, same events), differing at most in timing. A
+    /// tempo change re-timed off the audio thread is only swapped in when it
+    /// is; anything else (a schedule edit that has not landed yet, a preview
+    /// track the callback added) re-times in place instead.
+    fn midi_schedule_matches(&self, data: &RuntimeMidiData) -> bool {
+        self.midi_clips.len() == data.midi_clips.len()
+            && self.midi_tracks.len() == data.midi_tracks.len()
+            && self
+                .midi_tracks
+                .iter()
+                .zip(&data.midi_tracks)
+                .all(|(live, next)| {
+                    live.track_index == next.track_index
+                        && live.events.len() == next.events.len()
+                        && live.track_id == next.track_id
+                })
     }
 
     /// Static-tempo shortcut used by legacy `SetBpm` commands.
@@ -4460,7 +4727,7 @@ impl RuntimeProject {
                                 }
                             }
                         } else {
-                            self.tracks[ti].midi_block_events.push(midi_ev);
+                            push_midi_block_event(&mut self.tracks[ti].midi_block_events, midi_ev);
                         }
                     } else if vst3_debug {
                         eprintln!(
@@ -4835,8 +5102,7 @@ impl RuntimeProject {
                         "[PluginMidiIn] plugin=builtin_soundfont_player {event_type} ch={channel} pitch={pitch} offset=0"
                     );
                 }
-                self.tracks[ti].midi_block_events.push(event);
-                return true;
+                return push_midi_block_event(&mut self.tracks[ti].midi_block_events, event);
             }
             if verbose {
                 eprintln!(
@@ -4861,8 +5127,7 @@ impl RuntimeProject {
                 plugin_id
             );
         }
-        self.tracks[ti].midi_block_events.push(event);
-        true
+        push_midi_block_event(&mut self.tracks[ti].midi_block_events, event)
     }
 
     fn set_preview_active(&mut self, track_id: &str, channel: u8, pitch: u8, active: bool) {
@@ -4880,6 +5145,7 @@ impl RuntimeProject {
                 active: Vec::with_capacity(128),
                 preview_active: Vec::with_capacity(128),
                 sources: Vec::new(),
+                block_events_spare: Vec::new(),
             });
             let Some(mt) = self
                 .midi_tracks
@@ -4932,32 +5198,34 @@ impl RuntimeProject {
                     continue;
                 }
             };
-            let events = std::mem::take(&mut track.midi_block_events);
-            if track.block_l.len() < frames || track.block_r.len() < frames {
-                continue;
+            // Read in place and cleared after: taking the list left the track
+            // with a capacity-0 list (every later event regrew it) and freed
+            // the taken one, both on the audio thread.
+            if track.block_l.len() >= frames && track.block_r.len() >= frames {
+                track.block_l[..frames].fill(0.0);
+                track.block_r[..frames].fill(0.0);
+                let insert = &mut track.inserts[insert_ix];
+                if let Some(vst3) = insert
+                    .vst3
+                    .as_mut()
+                    .filter(|vst3| vst3.is_processor_valid())
+                {
+                    if insert.scratch_l.len() < frames {
+                        insert.scratch_l.resize(frames, 0.0);
+                        insert.scratch_r.resize(frames, 0.0);
+                    }
+                    insert.scratch_l[..frames].fill(0.0);
+                    insert.scratch_r[..frames].fill(0.0);
+                    let _ = vst3.process_stereo_block_with_midi(
+                        &insert.scratch_l[..frames],
+                        &insert.scratch_r[..frames],
+                        &mut track.block_l[..frames],
+                        &mut track.block_r[..frames],
+                        &track.midi_block_events,
+                    );
+                }
             }
-            track.block_l[..frames].fill(0.0);
-            track.block_r[..frames].fill(0.0);
-            let insert = &mut track.inserts[insert_ix];
-            let Some(vst3) = insert.vst3.as_mut() else {
-                continue;
-            };
-            if !vst3.is_processor_valid() {
-                continue;
-            }
-            if insert.scratch_l.len() < frames {
-                insert.scratch_l.resize(frames, 0.0);
-                insert.scratch_r.resize(frames, 0.0);
-            }
-            insert.scratch_l[..frames].fill(0.0);
-            insert.scratch_r[..frames].fill(0.0);
-            let _ = vst3.process_stereo_block_with_midi(
-                &insert.scratch_l[..frames],
-                &insert.scratch_r[..frames],
-                &mut track.block_l[..frames],
-                &mut track.block_r[..frames],
-                &events,
-            );
+            track.midi_block_events.clear();
         }
     }
 
@@ -5761,47 +6029,23 @@ fn push_all_notes_off_for_track(
         }
         return;
     }
+    let events = &mut project.tracks[ti].midi_block_events;
     for &(channel, pitch) in active {
-        project.tracks[ti]
-            .midi_block_events
-            .push(Vst3MidiEvent::note_off(sample_offset, channel, pitch, 0.0));
+        push_midi_block_event(
+            events,
+            Vst3MidiEvent::note_off(sample_offset, channel, pitch, 0.0),
+        );
     }
     if !controllers {
         return;
     }
     for channel in 0..16 {
-        project.tracks[ti]
-            .midi_block_events
-            .push(Vst3MidiEvent::control_change(
-                sample_offset,
-                channel,
-                64,
-                0.0,
-            ));
-        project.tracks[ti]
-            .midi_block_events
-            .push(Vst3MidiEvent::control_change(
-                sample_offset,
-                channel,
-                123,
-                0.0,
-            ));
-        project.tracks[ti]
-            .midi_block_events
-            .push(Vst3MidiEvent::control_change(
-                sample_offset,
-                channel,
-                120,
-                0.0,
-            ));
-        project.tracks[ti]
-            .midi_block_events
-            .push(Vst3MidiEvent::control_change(
-                sample_offset,
-                channel,
-                121,
-                0.0,
-            ));
+        for controller in [64, 123, 120, 121] {
+            push_midi_block_event(
+                events,
+                Vst3MidiEvent::control_change(sample_offset, channel, controller, 0.0),
+            );
+        }
     }
 }
 
@@ -5952,11 +6196,54 @@ fn resolve_overlapping_notes(events: Vec<RuntimeMidiEvent>) -> Vec<RuntimeMidiEv
 }
 
 fn sort_midi_events(events: &mut [RuntimeMidiEvent]) {
-    events.sort_by(|a, b| {
-        a.sample
-            .cmp(&b.sample)
-            .then(midi_event_priority(a.kind).cmp(&midi_event_priority(b.kind)))
-    });
+    events.sort_by(midi_event_order);
+}
+
+fn midi_event_order(a: &RuntimeMidiEvent, b: &RuntimeMidiEvent) -> std::cmp::Ordering {
+    a.sample
+        .cmp(&b.sample)
+        .then(midi_event_priority(a.kind).cmp(&midi_event_priority(b.kind)))
+}
+
+/// Recompute every event's sample from its beat under `tempo_map` and restore
+/// the schedule order. Allocation-free, so the callback can use it as the
+/// fallback when no re-timed schedule was prepared for it.
+///
+/// The lists were sorted under a previous map, and beat -> sample is monotonic
+/// under every map (tempo is clamped positive), so re-timing can only reorder
+/// events that share a sample before or after it. A stable insertion sort
+/// therefore costs one pass plus those few local swaps, and never needs the
+/// buffer `sort_by` takes.
+fn retime_midi_lists(
+    clips: &mut [RuntimeMidiClip],
+    tracks: &mut [RuntimeMidiTrack],
+    tempo_map: &RuntimeTempoMapSnapshot,
+    sample_rate: f64,
+) {
+    for clip in clips {
+        retime_midi_events(&mut clip.events, tempo_map, sample_rate);
+    }
+    for track in tracks {
+        retime_midi_events(&mut track.events, tempo_map, sample_rate);
+    }
+}
+
+fn retime_midi_events(
+    events: &mut [RuntimeMidiEvent],
+    tempo_map: &RuntimeTempoMapSnapshot,
+    sample_rate: f64,
+) {
+    for event in events.iter_mut() {
+        event.sample = tempo_map.samples_at_beat(event.beat, sample_rate);
+    }
+    // Stable insertion sort, in place.
+    for i in 1..events.len() {
+        let mut j = i;
+        while j > 0 && midi_event_order(&events[j - 1], &events[j]).is_gt() {
+            events.swap(j - 1, j);
+            j -= 1;
+        }
+    }
 }
 
 /// Ordering at one sample is part of the transport contract. Expression reset
@@ -6461,6 +6748,7 @@ fn build_midi_runtime(
                 cursor: 0,
                 active,
                 preview_active: Vec::with_capacity(128),
+                block_events_spare: Vec::new(),
             }
         })
         .collect();
@@ -7204,6 +7492,91 @@ const CLIP_GAIN_RAMP_SECONDS: f64 = 0.008;
 pub(crate) fn clip_gain_step(sample_rate: u32) -> f32 {
     let samples = CLIP_GAIN_RAMP_SECONDS * f64::from(sample_rate.max(1));
     (1.0 - (-1.0 / samples).exp()) as f32
+}
+
+/// Cache key of the `lane`th extra stream of `path`; lane 0 is the shared
+/// `path` entry itself. NUL never appears in a path, so these keys cannot
+/// collide with one and are easy to tell apart when pruning.
+fn stream_lane_key(path: &str, lane: usize) -> String {
+    format!("{path}\u{0}stream-lane:{lane}")
+}
+
+/// Give clips of one disk-streamed file that overlap in time their own stream.
+///
+/// A [`crate::streaming_source::StreamingSource`] follows a single read cursor.
+/// Every clip of a file used to get the one cached source, so two clips playing
+/// different parts of the file at once (a double-tracked section, a crossfade
+/// within one take) pulled that cursor back and forth and both dropped out.
+///
+/// Clips are packed into lanes by timeline position, greedily: a clip joins the
+/// first lane whose last clip has ended, so the number of streams is the most
+/// clips of that file that ever sound together — a comp of many back-to-back
+/// slices still shares one. Lane 0 keeps the `path` entry; lane `n` is cached
+/// under [`stream_lane_key`] so rebuilds (edits, undo) reuse the open stream,
+/// and lanes no clip uses any more are dropped from the cache here.
+///
+/// Control thread only: opens files and allocates. Returns how many streams it
+/// opened.
+fn assign_stream_lanes(
+    clips: &mut [RuntimeClip],
+    clip_paths: &[&str],
+    cache: &mut HashMap<String, Arc<ClipAudioSource>>,
+    open: &mut dyn FnMut(&str) -> Result<ClipAudioSource, String>,
+) -> u32 {
+    let mut by_path: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (index, clip) in clips.iter().enumerate() {
+        if clip.source.is_streaming() {
+            if let Some(&path) = clip_paths.get(index) {
+                by_path.entry(path).or_default().push(index);
+            }
+        }
+    }
+
+    let mut used_lanes = std::collections::HashSet::new();
+    let mut opened = 0u32;
+    for (path, mut indices) in by_path {
+        if indices.len() < 2 {
+            continue;
+        }
+        indices.sort_by_key(|&index| (clips[index].start_sample, index));
+        let mut lane_ends: Vec<u64> = Vec::new();
+        for index in indices {
+            let start = clips[index].start_sample;
+            let end = start.saturating_add(clips[index].duration_samples);
+            let lane = match lane_ends.iter().position(|&lane_end| lane_end <= start) {
+                Some(lane) => lane,
+                None => {
+                    lane_ends.push(0);
+                    lane_ends.len() - 1
+                }
+            };
+            lane_ends[lane] = end;
+            if lane == 0 {
+                continue;
+            }
+            let key = stream_lane_key(path, lane);
+            let source = match cache.get(&key) {
+                Some(existing) => Arc::clone(existing),
+                None => match open(path) {
+                    Ok(source) => {
+                        opened += 1;
+                        let source = Arc::new(source);
+                        cache.insert(key.clone(), Arc::clone(&source));
+                        source
+                    }
+                    Err(e) => {
+                        // Keep the shared stream: worse playback, not none.
+                        eprintln!("[SphereAudio] extra stream for '{path}' failed: {e}");
+                        continue;
+                    }
+                },
+            };
+            used_lanes.insert(key);
+            clips[index].source = source;
+        }
+    }
+    cache.retain(|key, _| !key.contains('\u{0}') || used_lanes.contains(key));
+    opened
 }
 
 fn build_clip_runtime(
@@ -9209,5 +9582,114 @@ mod loopback_resolve_tests {
                 mode: crate::jam_bus::JamChannelMode::Left,
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod stream_lane_tests {
+    use super::*;
+    use crate::streaming_source::StreamingSource;
+
+    /// A short stereo 16-bit WAV; only its existence matters here.
+    fn write_wav(path: &std::path::Path) {
+        let frames = 4_800u32;
+        let data_len = frames * 4;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&48_000u32.to_le_bytes());
+        bytes.extend_from_slice(&(48_000u32 * 4).to_le_bytes());
+        bytes.extend_from_slice(&4u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        bytes.resize(44 + data_len as usize, 0);
+        std::fs::write(path, bytes).expect("write test wav");
+    }
+
+    fn open_stream(path: &str) -> Result<ClipAudioSource, String> {
+        StreamingSource::open(path).map(|source| ClipAudioSource::Streaming(Arc::new(source)))
+    }
+
+    fn clip(
+        id: &str,
+        path: &str,
+        start_beat: f64,
+        duration_beats: f64,
+        source: &Arc<ClipAudioSource>,
+    ) -> RuntimeClip {
+        let snapshot = EngineClipSnapshot {
+            id: id.to_string(),
+            track_id: "track".to_string(),
+            asset_id: "asset".to_string(),
+            media_path: Some(path.to_string()),
+            start_beat,
+            duration_beats,
+            offset_seconds: 0.0,
+            gain: 1.0,
+            muted: false,
+            ara_rendered: false,
+            fades: None,
+            stretch: StretchParams::default(),
+            audio_process: None,
+        };
+        build_clip_runtime(&snapshot, Arc::clone(source), 2.0, 48_000, None).expect("runtime clip")
+    }
+
+    /// #188: clips of one disk-streamed file that sound at the same time must
+    /// not share a stream (one read cursor); clips that follow each other can.
+    #[test]
+    fn overlapping_clips_of_one_streamed_file_get_their_own_stream() {
+        let file = std::env::temp_dir().join(format!("fb_stream_lanes_{}.wav", std::process::id()));
+        write_wav(&file);
+        let path = file.to_str().expect("utf-8 temp path").to_string();
+
+        let shared = Arc::new(open_stream(&path).expect("open stream"));
+        let mut cache = HashMap::new();
+        cache.insert(path.clone(), Arc::clone(&shared));
+        // a: beats 0..4, b: 2..6 (overlaps a), c: 4..8 (starts as a ends).
+        let layout = |shared: &Arc<ClipAudioSource>| {
+            vec![
+                clip("a", &path, 0.0, 4.0, shared),
+                clip("b", &path, 2.0, 4.0, shared),
+                clip("c", &path, 4.0, 4.0, shared),
+            ]
+        };
+        let paths = vec![path.as_str(); 3];
+
+        let mut clips = layout(&shared);
+        let opened = assign_stream_lanes(&mut clips, &paths, &mut cache, &mut open_stream);
+        assert_eq!(opened, 1, "two clips overlap at most, so one extra stream");
+        assert!(Arc::ptr_eq(&clips[0].source, &shared));
+        assert!(
+            !Arc::ptr_eq(&clips[1].source, &shared),
+            "b plays while a does and must have its own stream"
+        );
+        assert!(clips[1].source.is_streaming());
+        assert!(
+            Arc::ptr_eq(&clips[2].source, &shared),
+            "c starts when a ends and reuses its stream"
+        );
+
+        // A rebuild reuses the open lane instead of opening the file again.
+        let lane = Arc::clone(&clips[1].source);
+        let mut rebuilt = layout(&shared);
+        assert_eq!(
+            assign_stream_lanes(&mut rebuilt, &paths, &mut cache, &mut open_stream),
+            0
+        );
+        assert!(Arc::ptr_eq(&rebuilt[1].source, &lane));
+
+        // With nothing overlapping any more the extra stream is released.
+        let mut alone = vec![clip("a", &path, 0.0, 4.0, &shared)];
+        assign_stream_lanes(&mut alone, &paths[..1], &mut cache, &mut open_stream);
+        assert_eq!(cache.len(), 1);
+
+        drop((clips, rebuilt, alone, lane, shared, cache));
+        let _ = std::fs::remove_file(&file);
     }
 }

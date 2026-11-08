@@ -1,5 +1,24 @@
 use crate::runtime::RuntimeProject;
 
+/// A tempo-map change, prepared on the control thread so the callback only
+/// swaps: it neither clones a map, nor re-times and re-sorts a MIDI schedule,
+/// nor frees what it replaces (every replaced part goes back into this box,
+/// which leaves through the graveyard).
+#[derive(Debug)]
+pub struct TempoMapChange {
+    /// The graph's new map.
+    pub map: crate::tempo_map::RuntimeTempoMapSnapshot,
+    /// The same map again, for the metronome.
+    pub metronome_map: crate::tempo_map::RuntimeTempoMapSnapshot,
+    /// The running graph's MIDI schedule already re-timed for `map`. `None`
+    /// when the graph already plays `map` (re-seeding a new stream); a
+    /// schedule that no longer matches the running graph is ignored and the
+    /// graph re-times its own in place, without allocating.
+    pub midi: Option<crate::runtime::RuntimeMidiData>,
+    /// The sample rate `midi` was timed at.
+    pub sample_rate: u32,
+}
+
 /// Commands sent from the control thread to the audio callback via a
 /// lock-free bounded channel.  The audio callback drains these with
 /// `try_recv()` at the top of each block — no blocking, no allocation.
@@ -228,7 +247,9 @@ pub enum EngineCommand {
     /// Set project tempo for metronome scheduling (static tempo shortcut).
     SetBpm(f64),
     /// Replace the authoritative tempo map used for beat/time/sample conversion.
-    SetTempoMap(crate::tempo_map::RuntimeTempoMapSnapshot),
+    /// Everything the callback needs is prepared on the control thread; see
+    /// [`TempoMapChange`].
+    SetTempoMap(Box<TempoMapChange>),
     /// Set project time signature for metronome accent scheduling.
     SetTimeSignature(u32, u32),
     /// Replace the authoritative time-signature map for metronome accents.

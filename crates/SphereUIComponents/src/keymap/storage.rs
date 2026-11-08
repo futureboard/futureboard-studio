@@ -32,7 +32,8 @@ impl Default for LegacyBindings {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 enum LegacyBindings {
-    Map(HashMap<String, String>),
+    /// `{action: key}`; a `null` key takes the action's base key away.
+    Map(HashMap<String, Option<String>>),
     List(Vec<KeyBinding>),
 }
 
@@ -81,7 +82,7 @@ pub fn load_profile_json(text: &str) -> Result<KeymapProfile, String> {
             .into_iter()
             .map(|(action, keys)| KeyBinding {
                 action,
-                keys: vec![keys],
+                keys: keys.into_iter().collect(),
                 context: None,
                 args: None,
                 when: None,
@@ -313,6 +314,14 @@ mod tests {
         assert_eq!(profile.name, "Old");
         assert_eq!(profile.bindings[0].keys, ["F9"]);
         assert_eq!(profile.bindings[0].context, None);
+    }
+
+    #[test]
+    fn a_v1_null_unbinds() {
+        let profile =
+            load_profile_json(r#"{ "version": 1, "bindings": { "tools:select-glue": null } }"#)
+                .unwrap();
+        assert!(profile.bindings[0].keys.is_empty());
     }
 
     #[test]

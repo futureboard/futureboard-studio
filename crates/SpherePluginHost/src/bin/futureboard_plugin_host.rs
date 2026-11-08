@@ -4002,6 +4002,12 @@ fn run_ipc_loop(mut out: IpcOut, shutdown: Arc<AtomicBool>) {
                         eprintln!("[plugin-host] stdin eof; parent likely exited; shutting down");
                         break;
                     }
+                    // A command over the size cap (say a huge plug-in state)
+                    // costs only that command; exiting here would take every
+                    // co-hosted plug-in down with it.
+                    Err(error) if ipc::is_frame_too_large(&error) => {
+                        eprintln!("[plugin-host] dropped command: {error}");
+                    }
                     Err(_) => break,
                 }
             }
@@ -5660,6 +5666,16 @@ fn dispatch(
             // every editor callback/resize/redraw reference before releasing the
             // processor so no late completion can touch the destroyed instance.
             registry.remove(&plugin_instance_id);
+            // A worker-thread load still in flight is cancelled here: without
+            // its pending entry, `drain_plugin_load_results` drops the late
+            // instance instead of registering it and reporting `PluginLoaded`
+            // after `PluginUnloaded`.
+            if let Some(pending) = pending_plugin_loads.remove(&plugin_instance_id) {
+                eprintln!(
+                    "[PluginHost] unload cancels pending load id={plugin_instance_id} request_id={}",
+                    pending.request_id
+                );
+            }
             pending_editor_attaches.remove(&plugin_instance_id);
             pending_resizes.remove(&plugin_instance_id);
             delayed_redraws.retain(|entry| entry.instance_id != plugin_instance_id);
@@ -5882,14 +5898,12 @@ fn dispatch(
                     "[plugin-host-au] get_state instance={plugin_instance_id} ok={ok} bytes={}",
                     bytes.len()
                 );
-                let _ = ipc::write_frame(
+                write_plugin_state_reply(
                     out,
-                    &HostEvent::PluginState {
-                        plugin_instance_id,
-                        ok,
-                        component_b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
-                        controller_b64: String::new(),
-                    },
+                    plugin_instance_id,
+                    ok,
+                    base64::engine::general_purpose::STANDARD.encode(&bytes),
+                    String::new(),
                 );
                 return;
             }
@@ -5901,16 +5915,12 @@ fn dispatch(
                 state.component.len(),
                 state.controller.len()
             );
-            let _ = ipc::write_frame(
+            write_plugin_state_reply(
                 out,
-                &HostEvent::PluginState {
-                    plugin_instance_id,
-                    ok,
-                    component_b64: base64::engine::general_purpose::STANDARD
-                        .encode(&state.component),
-                    controller_b64: base64::engine::general_purpose::STANDARD
-                        .encode(&state.controller),
-                },
+                plugin_instance_id,
+                ok,
+                base64::engine::general_purpose::STANDARD.encode(&state.component),
+                base64::engine::general_purpose::STANDARD.encode(&state.controller),
             );
         }
         HostCommand::GetPluginParameters { plugin_instance_id } => {
@@ -6035,6 +6045,49 @@ fn dispatch(
     }
 }
 
+/// Answer `GetPluginState`. A state too large for one IPC frame is answered
+/// `ok: false` for that instance alone, so the studio keeps the state it last
+/// captured instead of losing the frame stream (and with it every co-hosted
+/// plug-in) to a line the reader has to refuse.
+fn write_plugin_state_reply(
+    out: &mut IpcOut,
+    plugin_instance_id: String,
+    ok: bool,
+    component_b64: String,
+    controller_b64: String,
+) {
+    let event = HostEvent::PluginState {
+        plugin_instance_id,
+        ok,
+        component_b64,
+        controller_b64,
+    };
+    let Err(error) = ipc::write_frame(out, &event) else {
+        return;
+    };
+    let HostEvent::PluginState {
+        plugin_instance_id, ..
+    } = event
+    else {
+        return;
+    };
+    if !ipc::is_frame_too_large(&error) {
+        return; // the pipe itself failed; the parent sees EOF
+    }
+    eprintln!(
+        "[plugin-host-state] get_state instance={plugin_instance_id} state too large for IPC: {error}"
+    );
+    let _ = ipc::write_frame(
+        out,
+        &HostEvent::PluginState {
+            plugin_instance_id,
+            ok: false,
+            component_b64: String::new(),
+            controller_b64: String::new(),
+        },
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn schedule_plugin_load(
     plugin_instance_id: String,
@@ -6125,9 +6178,13 @@ fn drain_plugin_load_results(
     out: &mut IpcOut,
 ) {
     while let Ok(result) = load_result_rx.try_recv() {
-        let Some(pending) = pending_plugin_loads.remove(&result.plugin_instance_id) else {
+        let Some(pending) = take_pending_load_for_result(
+            pending_plugin_loads,
+            &result.plugin_instance_id,
+            result.request_id,
+        ) else {
             eprintln!(
-                "[PLUGIN LOAD FAILURE]\nrequest_id={}\nplugin_name={}\nfailure_stage=late_result_after_timeout\nreason=load completed after timeout\ntimed_out = true\nplugin_instance_created={}\ncomponent_created={}\ncontroller_created={}\nroutes_created=false\nrollback_completed = true\napp_alive = true",
+                "[PLUGIN LOAD FAILURE]\nrequest_id={}\nplugin_name={}\nfailure_stage=late_result_after_timeout_or_unload\nreason=load completed after it timed out, was unloaded, or was superseded\ntimed_out = true\nplugin_instance_created={}\ncomponent_created={}\ncontroller_created={}\nroutes_created=false\nrollback_completed = true\napp_alive = true",
                 result.request_id,
                 result.name,
                 result.processor.is_some(),
@@ -6137,10 +6194,6 @@ fn drain_plugin_load_results(
             drop(result.processor);
             continue;
         };
-        if pending.request_id != result.request_id {
-            drop(result.processor);
-            continue;
-        }
         finalize_plugin_load(
             result,
             pending.sample_rate,
@@ -6149,6 +6202,65 @@ fn drain_plugin_load_results(
             preview,
             out,
         );
+    }
+}
+
+/// The pending entry a finished worker load answers, removed — or `None` when
+/// the load is no longer wanted: it timed out, its insert was unloaded, or a
+/// newer load for the same instance id replaced it. A stale result must not
+/// consume the newer request's entry, or that newer load would be dropped too.
+fn take_pending_load_for_result(
+    pending_plugin_loads: &mut HashMap<String, PendingPluginLoad>,
+    plugin_instance_id: &str,
+    request_id: u64,
+) -> Option<PendingPluginLoad> {
+    if pending_plugin_loads.get(plugin_instance_id)?.request_id != request_id {
+        return None;
+    }
+    pending_plugin_loads.remove(plugin_instance_id)
+}
+
+#[cfg(test)]
+mod pending_load_tests {
+    use super::*;
+
+    fn pending(id: &str, request_id: u64) -> PendingPluginLoad {
+        PendingPluginLoad {
+            request_id,
+            plugin_instance_id: id.to_string(),
+            plugin_path: "C:/VST3/Slow.vst3".into(),
+            class_id: "ABCD".into(),
+            name: "Slow".into(),
+            sample_rate: 48_000,
+            max_block_size: 256,
+            started_at: Instant::now(),
+            stage: "create_instance",
+        }
+    }
+
+    #[test]
+    fn a_result_for_an_unloaded_insert_is_not_registered() {
+        // UnloadPlugin removed the pending entry while the worker was loading.
+        let mut loads = HashMap::new();
+        loads.insert("t1:i1".to_string(), pending("t1:i1", 7));
+        loads.remove("t1:i1");
+        assert!(take_pending_load_for_result(&mut loads, "t1:i1", 7).is_none());
+    }
+
+    #[test]
+    fn a_stale_result_leaves_the_newer_load_for_the_same_insert_pending() {
+        // Removed and re-added under the same id: request 7 is stale, 8 is live.
+        let mut loads = HashMap::new();
+        loads.insert("t1:i1".to_string(), pending("t1:i1", 8));
+        assert!(take_pending_load_for_result(&mut loads, "t1:i1", 7).is_none());
+        assert!(
+            loads.contains_key("t1:i1"),
+            "the stale result must not consume the newer request's entry"
+        );
+        let live = take_pending_load_for_result(&mut loads, "t1:i1", 8)
+            .expect("the current request is still wanted");
+        assert_eq!(live.request_id, 8);
+        assert!(loads.is_empty());
     }
 }
 

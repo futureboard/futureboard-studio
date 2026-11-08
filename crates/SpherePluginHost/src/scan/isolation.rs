@@ -101,10 +101,8 @@ fn run_scanner_process(
         .stderr(Stdio::piped())
         .spawn()?;
 
-    let stdout_pipe = child.stdout.take();
-    let stderr_pipe = child.stderr.take();
-    let stdout_reader = std::thread::spawn(move || read_pipe(stdout_pipe));
-    let stderr_reader = std::thread::spawn(move || read_pipe(stderr_pipe));
+    let stdout_reader = PipeDrain::spawn(child.stdout.take());
+    let stderr_reader = PipeDrain::spawn(child.stderr.take());
 
     let deadline = Instant::now() + timeout;
     let status = loop {
@@ -121,20 +119,70 @@ fn run_scanner_process(
         }
     };
 
+    // The child is gone, but its pipes only reach EOF once every process
+    // holding their write ends has closed them — and a plug-in that started a
+    // resident helper (a licensing daemon) while it loaded may have handed
+    // them down to it. Waiting for EOF then ignored the timeout and stalled
+    // the whole sweep for as long as the helper lived, so the drain gets a
+    // short grace and then keeps whatever has arrived.
+    let drain_deadline = Instant::now() + PIPE_DRAIN_GRACE;
     Ok(ProcessCapture {
         status,
-        stdout: stdout_reader.join().unwrap_or_default(),
-        stderr: stderr_reader.join().unwrap_or_default(),
+        stdout: stdout_reader.finish(drain_deadline),
+        stderr: stderr_reader.finish(drain_deadline),
     })
 }
 
-fn read_pipe<R: Read>(pipe: Option<R>) -> String {
-    let Some(mut pipe) = pipe else {
-        return String::new();
-    };
-    let mut buf = Vec::new();
-    let _ = pipe.read_to_end(&mut buf);
-    String::from_utf8_lossy(&buf).into_owned()
+/// How long a scanner child's pipes may stay open after the child has exited
+/// before the parent stops waiting for EOF. Output still in flight when the
+/// child exits arrives well within this; only a pipe held open by some other
+/// process (a helper the plug-in started) outlasts it.
+const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// One child pipe drained on its own thread into a shared buffer, so the
+/// parent can take what has arrived without waiting for EOF.
+struct PipeDrain {
+    buffer: std::sync::Arc<parking_lot::Mutex<Vec<u8>>>,
+    eof: std::sync::mpsc::Receiver<()>,
+}
+
+impl PipeDrain {
+    fn spawn<R: Read + Send + 'static>(pipe: Option<R>) -> Self {
+        let buffer = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (eof_tx, eof) = std::sync::mpsc::channel();
+        if let Some(mut pipe) = pipe {
+            let sink = buffer.clone();
+            // Detached on purpose: if a helper process keeps the pipe open,
+            // this thread stays parked in `read` until the helper exits and
+            // must not hold the scan up meanwhile.
+            let _ = std::thread::Builder::new()
+                .name("plugin-scan-pipe".into())
+                .spawn(move || {
+                    let mut chunk = [0u8; 8192];
+                    loop {
+                        match pipe.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(read) => sink.lock().extend_from_slice(&chunk[..read]),
+                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                            Err(_) => break,
+                        }
+                    }
+                    let _ = eof_tx.send(());
+                });
+        } else {
+            let _ = eof_tx.send(());
+        }
+        Self { buffer, eof }
+    }
+
+    /// Wait for EOF until `deadline`, then return everything read so far.
+    fn finish(self, deadline: Instant) -> String {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        // Disconnected (the thread could not start) is as final as EOF.
+        let _ = self.eof.recv_timeout(remaining);
+        let bytes = std::mem::take(&mut *self.buffer.lock());
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
 }
 
 /// Pull the JSON payload out of a scanner child's stdout.
@@ -902,6 +950,89 @@ mod payload_tests {
     fn output_with_no_payload_is_rejected() {
         assert_eq!(extract_payload_json(""), None);
         assert_eq!(extract_payload_json("[info] only chatter\n"), None);
+    }
+}
+
+#[cfg(test)]
+mod pipe_drain_tests {
+    use super::{run_scanner_process, PipeDrain};
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
+    /// A pipe whose write end some other process still holds: it delivers what
+    /// was written, then never reaches EOF.
+    struct HeldOpenPipe {
+        sent: bool,
+        _never: std::sync::mpsc::Receiver<()>,
+        _keep: std::sync::mpsc::Sender<()>,
+    }
+
+    impl Read for HeldOpenPipe {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.sent {
+                self.sent = true;
+                let payload = b"payload";
+                buf[..payload.len()].copy_from_slice(payload);
+                return Ok(payload.len());
+            }
+            // Blocks forever: the sender is alive in `_keep`.
+            let _ = self._never.recv();
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn a_pipe_that_never_closes_still_yields_its_output_by_the_deadline() {
+        let (keep, never) = std::sync::mpsc::channel();
+        let drain = PipeDrain::spawn(Some(HeldOpenPipe {
+            sent: false,
+            _never: never,
+            _keep: keep,
+        }));
+        let started = Instant::now();
+        let output = drain.finish(Instant::now() + Duration::from_millis(300));
+        assert_eq!(output, "payload");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "finish waited for EOF instead of its deadline"
+        );
+    }
+
+    #[test]
+    fn a_closed_pipe_returns_everything_without_waiting_out_the_deadline() {
+        let drain = PipeDrain::spawn(Some(std::io::Cursor::new(b"all of it".to_vec())));
+        let started = Instant::now();
+        let output = drain.finish(Instant::now() + Duration::from_secs(30));
+        assert_eq!(output, "all of it");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(
+            PipeDrain::spawn(None::<std::io::Empty>).finish(Instant::now()),
+            ""
+        );
+    }
+
+    /// End to end on Windows: the "scanner" exits at once but leaves a helper
+    /// (`ping`, started detached) holding its stderr pipe for ~15 s. The run
+    /// must come back with the stdout it wrote instead of waiting for the
+    /// helper.
+    #[cfg(windows)]
+    #[test]
+    fn a_helper_holding_the_scanner_pipes_does_not_stall_the_run() {
+        let mut command = std::process::Command::new("cmd");
+        command.args(["/C", "echo payload& start /B ping -n 16 127.0.0.1 >NUL"]);
+        let started = Instant::now();
+        let capture = run_scanner_process(&mut command, Duration::from_secs(30)).expect("cmd runs");
+        let elapsed = started.elapsed();
+        assert!(capture.success(), "cmd should exit cleanly");
+        assert!(
+            capture.stdout.contains("payload"),
+            "stdout={:?}",
+            capture.stdout
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "run waited {elapsed:?} for the helper to release the pipe"
+        );
     }
 }
 

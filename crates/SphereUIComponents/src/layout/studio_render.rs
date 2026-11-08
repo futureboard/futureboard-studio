@@ -1154,7 +1154,10 @@ impl Render for StudioLayout {
                     text_input_focused: shortcut_keydown_target
                         .read(cx)
                         .is_text_editing_context(window)
-                        || song_text_input_focused,
+                        || song_text_input_focused
+                        || shortcut_keydown_target
+                            .read(cx)
+                            .docked_mixer_tree_filter_focused(window, cx),
                 };
                 let focused_widget_kind = shortcut_keydown_target.read(cx).focused_widget_kind(window);
                 let key_for_diag = event.keystroke.key.clone();

@@ -30,9 +30,9 @@ use windows::core::GUID;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
     eMultimedia, eRender, IAudioClient, IAudioRenderClient, IMMDevice, IMMDeviceEnumerator,
-    MMDeviceEnumerator, AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-    AUDCLNT_STREAMFLAGS_NOPERSIST, DEVICE_STATE_ACTIVE, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
-    WAVEFORMATEXTENSIBLE_0,
+    MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_EXCLUSIVE,
+    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_NOPERSIST, DEVICE_STATE_ACTIVE,
+    WAVEFORMATEX, WAVEFORMATEXTENSIBLE, WAVEFORMATEXTENSIBLE_0,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
@@ -699,6 +699,21 @@ unsafe fn open_exclusive_stream(
         }
     };
 
+    // Pre-roll one period of silence before Start, as the exclusive-mode
+    // event-driven protocol asks. Without it the endpoint's first period is
+    // whatever the buffer held, and the first event arrives with nothing queued.
+    let preroll = match render.GetBuffer(actual_buf) {
+        Ok(_) => render.ReleaseBuffer(actual_buf, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = preroll {
+        let _ = info_tx.send(Err(format!(
+            "WASAPI Exclusive: silent pre-roll failed: {e}"
+        )));
+        let _ = CloseHandle(buf_event);
+        return false;
+    }
+
     if let Err(e) = client.Start() {
         let _ = info_tx.send(Err(format!("IAudioClient::Start: {e}")));
         let _ = CloseHandle(buf_event);
@@ -759,11 +774,13 @@ unsafe fn open_exclusive_stream(
             break;
         }
 
-        let padding = client.GetCurrentPadding().unwrap_or(actual_buf);
-        let frames = actual_buf.saturating_sub(padding);
-        if frames == 0 {
-            continue;
-        }
+        // Exclusive event-driven streams are double-buffered by the driver:
+        // every event asks for exactly one full period. `GetCurrentPadding` is
+        // not meaningful here (Microsoft: do not size exclusive event-driven
+        // writes from it), and drivers that report non-zero padding at event
+        // time made the old `actual_buf - padding` write short or skip
+        // periods — heard as periodic dropouts.
+        let frames = actual_buf;
 
         let buf_ptr = match render.GetBuffer(frames) {
             Ok(p) => p,
@@ -775,9 +792,9 @@ unsafe fn open_exclusive_stream(
 
         let out_len = frames as usize * device_ch;
         // `scratch` is preallocated to `actual_buf * device_ch` and `frames`
-        // can never exceed `actual_buf` (`saturating_sub` above), so `out_len`
-        // never exceeds `scratch.len()` here. Clamp defensively instead of
-        // growing — growing would allocate on the audio thread.
+        // is exactly `actual_buf`, so `out_len` equals `scratch.len()` here.
+        // Clamp defensively instead of growing — growing would allocate on the
+        // audio thread.
         let total = out_len.min(scratch.len());
         let block = &mut scratch[..total];
         // `fill_output_f32` fully overwrites every sample of `block` on every

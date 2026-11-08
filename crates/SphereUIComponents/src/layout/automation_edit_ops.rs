@@ -143,8 +143,10 @@ impl StudioLayout {
         self.automation_clipboard.points = Some(copied);
         self.automation_clipboard.last = LastCopied::Automation;
         if cut {
+            // Only the lane that was copied: a selection in another lane is
+            // not on the clipboard, so deleting it would lose it for good.
             self.edit_automation_lanes(&track_id, cx, |state| {
-                state.delete_selected_automation_points(&track_id)
+                state.delete_selected_automation_points_in_lane(&track_id, &lane_id)
             });
         }
         true

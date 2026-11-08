@@ -24,10 +24,10 @@ use crate::runtime::RuntimeProject;
 /// flight; if it somehow fills, [`retire`] falls back to dropping in place.
 const GRAVEYARD_CAPACITY: usize = 64;
 
-fn sender() -> &'static Sender<RuntimeProject> {
-    static GY: OnceLock<Sender<RuntimeProject>> = OnceLock::new();
+fn sender() -> &'static Sender<Box<RuntimeProject>> {
+    static GY: OnceLock<Sender<Box<RuntimeProject>>> = OnceLock::new();
     GY.get_or_init(|| {
-        let (tx, rx) = bounded::<RuntimeProject>(GRAVEYARD_CAPACITY);
+        let (tx, rx) = bounded::<Box<RuntimeProject>>(GRAVEYARD_CAPACITY);
         // Dedicated thread: blocks on recv (non-realtime) and drops each
         // retired graph here, well away from the audio callback. Exits when
         // the last sender is gone — but the sender is a process-lifetime
@@ -70,15 +70,17 @@ pub fn prime() {
     let _ = audio_file_sender();
     let _ = ara_sender();
     let _ = midi_sender();
+    let _ = tempo_sender();
 }
 
-/// Hand a retired runtime graph to the background dropper.
+/// Hand a retired runtime graph to the background dropper, still in the box
+/// it arrived in (moving it out would free the box on the audio thread).
 ///
 /// Realtime-safe: a bounded-channel `try_send` performs no allocation. If the
 /// channel is full (pathological — implies the background thread is wedged),
 /// the value is dropped in place as a last resort rather than leaked.
 #[inline]
-pub fn retire(old: RuntimeProject) {
+pub fn retire(old: Box<RuntimeProject>) {
     if let Err(err) = sender().try_send(old) {
         drop(err.into_inner());
     }
@@ -112,6 +114,30 @@ fn midi_sender() -> &'static Sender<Box<crate::runtime::RuntimeMidiData>> {
 #[inline]
 pub fn retire_midi(old: Box<crate::runtime::RuntimeMidiData>) {
     if let Err(err) = midi_sender().try_send(old) {
+        drop(err.into_inner());
+    }
+}
+
+fn tempo_sender() -> &'static Sender<Box<crate::command::TempoMapChange>> {
+    static GY: OnceLock<Sender<Box<crate::command::TempoMapChange>>> = OnceLock::new();
+    GY.get_or_init(|| {
+        let (tx, rx) = bounded::<Box<crate::command::TempoMapChange>>(GRAVEYARD_CAPACITY);
+        let _ = std::thread::Builder::new()
+            .name("daux-tempo-graveyard".to_string())
+            .spawn(move || {
+                while let Ok(old) = rx.recv() {
+                    drop(old);
+                }
+            });
+        tx
+    })
+}
+
+/// Dispose an applied tempo change — it now holds the replaced tempo maps and
+/// MIDI schedule — away from the realtime callback.
+#[inline]
+pub fn retire_tempo_change(old: Box<crate::command::TempoMapChange>) {
+    if let Err(err) = tempo_sender().try_send(old) {
         drop(err.into_inner());
     }
 }

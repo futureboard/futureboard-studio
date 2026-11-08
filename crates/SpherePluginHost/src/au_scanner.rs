@@ -53,7 +53,11 @@ pub fn validate_au_component(component_id: &str) -> Result<bool, PluginScanError
         .map_err(|_| PluginScanError::InvalidComponent(component_id.to_string()))?;
     let native = unsafe { sphere_au_validate_component_json(c_id.as_ptr()) };
     if native.data.is_null() {
-        return Ok(false);
+        // The native side only returns null when it could not allocate the
+        // result; that is a validator failure, not a component verdict.
+        return Err(PluginScanError::AudioUnitMetadataFailed(
+            "native validator returned null".into(),
+        ));
     }
     let json = unsafe { CStr::from_ptr(native.data) }
         .to_string_lossy()

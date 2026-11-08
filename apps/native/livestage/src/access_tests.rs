@@ -66,6 +66,7 @@ fn server(clients: u64) -> (Server, Vec<Receiver<String>>) {
     let mut server = Server {
         options,
         clients: Vec::new(),
+        admissions: HashMap::new(),
         catalog: Vec::new(),
         sent_revision: None,
         sent_history: None,

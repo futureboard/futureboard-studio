@@ -74,6 +74,7 @@ pub mod overlay;
 pub mod paths;
 pub mod perf;
 pub mod platform_chrome;
+pub mod plugin_module_gate;
 pub mod pre_studio_install;
 pub mod project;
 pub mod session_shutdown;

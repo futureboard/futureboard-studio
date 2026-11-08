@@ -95,21 +95,30 @@ impl PadBuffer {
     }
 }
 
+/// Retired buffers that can wait for the control thread at once. Every
+/// `submit` drains them all before it hands over its buffer, and only one
+/// buffer is ever pending, so between two drains the audio thread can adopt
+/// at most two buffers — the one pending at the first drain and the one that
+/// submit hands over — and retire at most two.
+const RETIRE_SLOTS: usize = 2;
+
 /// Control-thread <-> audio-thread hand-off for one pad's sample buffer.
 ///
 /// Thread contract mirrors `rodharerist`'s `IrLoader`: exactly one control
 /// thread calls `submit`/`collect_garbage`; only the audio thread calls
 /// `adopt_pending`, and only ever from [`Dsp::note_on`] or [`Dsp::reset`].
+/// The audio thread fills `retired` slots, the control thread only empties
+/// them, so a slot the audio thread sees empty stays empty until it fills it.
 struct PadChannel {
     pending: HandoffCell<PadBuffer>,
-    retired: HandoffCell<PadBuffer>,
+    retired: [HandoffCell<PadBuffer>; RETIRE_SLOTS],
 }
 
 impl PadChannel {
     fn new() -> Self {
         Self {
             pending: HandoffCell::new(),
-            retired: HandoffCell::new(),
+            retired: std::array::from_fn(|_| HandoffCell::new()),
         }
     }
 }
@@ -124,8 +133,10 @@ impl PadLoader {
     /// Drop any buffer the audio thread has retired (safe: it was already
     /// unlinked from the live pad on the audio thread).
     pub fn collect_garbage(&self) {
-        if let Some(dead) = self.channel.retired.take() {
-            drop(dead);
+        for slot in &self.channel.retired {
+            if let Some(dead) = slot.take() {
+                drop(dead);
+            }
         }
     }
 
@@ -160,19 +171,33 @@ impl PadRuntime {
     }
 
     /// Audio-thread only: adopt a pending buffer if one is waiting, retiring
-    /// (never dropping in place) whatever was live before it.
-    fn adopt_pending(&mut self) {
-        if let Some(fresh) = self.channel.pending.take() {
-            if let Some(old) = self.buffer.replace(fresh) {
-                if let Some(bumped) = self.channel.retired.put(old) {
-                    // The control thread never drained the previous retiree -
-                    // drop it here. This only happens if two loads land
-                    // before a single `collect_garbage`, which is not the
-                    // realtime path.
-                    drop(bumped);
-                }
+    /// (never dropping in place) whatever was live before it. Returns whether
+    /// the live buffer changed, so the caller can stop the voices still
+    /// reading the old one.
+    ///
+    /// Nothing is freed here. The old buffer goes to an empty retire slot; if
+    /// none were free (the [`RETIRE_SLOTS`] bound says they always are) the
+    /// pending buffer simply waits for the next trigger.
+    fn adopt_pending(&mut self) -> bool {
+        let slot = if self.buffer.is_some() {
+            match self.channel.retired.iter().position(HandoffCell::is_empty) {
+                Some(slot) => Some(slot),
+                None => return false,
+            }
+        } else {
+            None
+        };
+        let Some(fresh) = self.channel.pending.take() else {
+            return false;
+        };
+        if let (Some(old), Some(slot)) = (self.buffer.replace(fresh), slot) {
+            // The slot read empty and only this thread fills it, so nothing
+            // comes back; were it ever to, leak it rather than free here.
+            if let Some(bumped) = self.channel.retired[slot].put(old) {
+                std::mem::forget(bumped);
             }
         }
+        true
     }
 }
 
@@ -746,7 +771,18 @@ impl Dsp {
         self.master_gain = db_to_linear(self.params.master_gain_db);
     }
 
+    /// A free voice, or the one to steal: the quietest, then the oldest. A
+    /// voice still in its attack counts as full level — a hit triggered in
+    /// this very block has not rendered yet and sits at level 0, and stealing
+    /// it would let a second simultaneous hit silence the first.
     fn allocate_voice(&self) -> usize {
+        let weight = |voice: &Voice| {
+            if voice.stage == EnvStage::Attack {
+                1.0
+            } else {
+                voice.env
+            }
+        };
         self.voices
             .iter()
             .position(|voice| !voice.active)
@@ -755,13 +791,22 @@ impl Dsp {
                     .iter()
                     .enumerate()
                     .min_by(|(_, left), (_, right)| {
-                        left.env
-                            .partial_cmp(&right.env)
+                        weight(left)
+                            .partial_cmp(&weight(right))
                             .unwrap_or(std::cmp::Ordering::Equal)
                             .then_with(|| left.age.cmp(&right.age))
                     })
                     .map_or(0, |(index, _)| index)
             })
+    }
+
+    /// Stops every voice playing `pad_index`, at once.
+    fn silence_pad(&mut self, pad_index: usize) {
+        for voice in &mut self.voices {
+            if voice.pad_index == pad_index {
+                voice.active = false;
+            }
+        }
     }
 
     fn pad_index_for_note(&self, note: u8) -> Option<usize> {
@@ -787,7 +832,9 @@ impl Dsp {
     fn render_raw(buffer: &PadBuffer, voice: &mut Voice) -> (f32, f32) {
         let length = voice.last.saturating_sub(voice.first);
         let offset = voice.position.floor() as usize;
-        if length < 2 || offset + 1 >= length {
+        // A region past the buffer's end (never captured from this buffer)
+        // ends the voice instead of indexing out of bounds.
+        if length < 2 || offset + 1 >= length || voice.last > buffer.frames {
             voice.active = false;
             return (0.0, 0.0);
         }
@@ -830,11 +877,16 @@ impl Instrument for Dsp {
         let Some(pad_index) = self.pad_index_for_note(note) else {
             return;
         };
-        self.pads[pad_index].adopt_pending();
+        if self.pads[pad_index].adopt_pending() {
+            // Voices still ringing on this pad captured a region of the
+            // buffer just retired; reading the new one with it runs off its
+            // end. They stop here.
+            self.silence_pad(pad_index);
+        }
         let Some(buffer) = self.pads[pad_index]
             .buffer
             .as_ref()
-            .filter(|buffer| buffer.frames > 0)
+            .filter(|buffer| playable_frames(buffer) > 0)
         else {
             return;
         };
@@ -842,7 +894,7 @@ impl Instrument for Dsp {
         // must never be cloned on this thread.
         let pad = &self.params.pads[pad_index];
         let choke_group = pad.choke_group;
-        let (first, last) = region_frames(pad, buffer.frames);
+        let (first, last) = region_frames(pad, playable_frames(buffer));
         let tune = f64::from(pad.tune_semitones + self.params.master_tune);
         let sensitivity = clamp(pad.velocity_sensitivity, 0.0, 100.0) / 100.0;
         let velocity = f32::from(velocity.min(127)) / 127.0;
@@ -1008,6 +1060,15 @@ impl Dsp {
         self.out_clip |= left.abs().max(right.abs()) * self.master_gain >= 1.0;
         (out_l, out_r)
     }
+}
+
+/// Frames `buffer` can actually be read at: its stated length, never past
+/// what its samples hold.
+#[inline]
+fn playable_frames(buffer: &PadBuffer) -> usize {
+    buffer
+        .frames
+        .min(buffer.samples.len() / buffer.channels.max(1))
 }
 
 #[inline]
@@ -1388,5 +1449,97 @@ mod tests {
         // The pads it did not have open at their defaults, on their notes.
         assert_eq!(state.params.pads[16].sample_name, None);
         assert_eq!(state.params.pads[63].note, 36 + 63);
+    }
+
+    /// Replacing or clearing a pad's sample while it rings, then hitting it
+    /// again, must not read the old voices' region out of the new buffer.
+    #[test]
+    fn replacing_or_clearing_a_ringing_pad_is_safe() {
+        for replacement in [Some(100usize), Some(1), None] {
+            let mut dsp = Dsp::new(RATE);
+            load(&mut dsp, 0, buffer_with_tone(48_000, RATE));
+            dsp.note_on(36, 127);
+            let _ = render(&mut dsp, 2_000);
+            assert!(dsp.voices.iter().any(|voice| voice.active));
+            let buffer = match replacement {
+                Some(frames) => buffer_with_tone(frames, RATE),
+                None => PadBuffer::empty(),
+            };
+            load(&mut dsp, 0, buffer);
+            dsp.note_on(36, 127);
+            let out = render(&mut dsp, 4_000);
+            assert!(out.iter().all(|(l, r)| l.is_finite() && r.is_finite()));
+            // Only the new sample can still be sounding: it is 100 frames
+            // at most, so the pad is quiet well before 4 000.
+            assert!(dsp.voices.iter().all(|voice| !voice.active));
+        }
+    }
+
+    /// A buffer that claims more frames than its samples hold plays what it
+    /// holds and stops, never past the end.
+    #[test]
+    fn a_short_buffer_never_reads_past_its_samples() {
+        let mut dsp = Dsp::new(RATE);
+        let mut buffer = buffer_with_tone(100, RATE);
+        buffer.frames = 10_000;
+        load(&mut dsp, 0, buffer);
+        dsp.note_on(36, 127);
+        let out = render(&mut dsp, 1_000);
+        assert!(out.iter().all(|(l, r)| l.is_finite() && r.is_finite()));
+        assert!(dsp.voices.iter().all(|voice| !voice.active));
+    }
+
+    /// Loads landing faster than the control thread drains retired buffers
+    /// (a submit's drain runs just before the audio thread retires the last
+    /// one) still hand every old buffer back to the control thread: none is
+    /// freed on the audio thread.
+    #[test]
+    fn every_retired_buffer_returns_to_the_control_thread() {
+        let mut dsp = Dsp::new(RATE);
+        let loader = dsp.pad_loader(0).unwrap();
+        loader.submit(Box::new(buffer_with_tone(1_000, RATE)));
+        dsp.note_on(36, 127); // adopts O
+        loader.submit(Box::new(buffer_with_tone(2_000, RATE)));
+        dsp.note_on(36, 127); // adopts A, retires O
+        // The next submit's drain ran before that retirement: B lands with
+        // O still waiting.
+        assert!(
+            loader
+                .channel
+                .pending
+                .put(Box::new(buffer_with_tone(3_000, RATE)))
+                .is_none()
+        );
+        dsp.note_on(36, 127); // adopts B, retires A beside O
+        assert_eq!(dsp.pads[0].buffer.as_ref().unwrap().frames, 3_000);
+        let mut retired: Vec<usize> = loader
+            .channel
+            .retired
+            .iter()
+            .filter_map(|slot| slot.take().map(|buffer| buffer.frames))
+            .collect();
+        retired.sort_unstable();
+        assert_eq!(retired, vec![1_000, 2_000]);
+    }
+
+    /// With every voice busy, two hits in the same block both sound: each
+    /// steals an older voice, not the other's.
+    #[test]
+    fn simultaneous_hits_steal_old_voices_not_each_other() {
+        let mut dsp = Dsp::new(RATE);
+        for pad in 0..3 {
+            load(&mut dsp, pad, buffer_with_tone(96_000, RATE));
+        }
+        for _ in 0..MAX_VOICES {
+            dsp.note_on(36, 127);
+            let _ = render(&mut dsp, 16);
+        }
+        assert!(dsp.voices.iter().all(|voice| voice.active));
+        dsp.note_on(37, 127);
+        dsp.note_on(38, 127);
+        let _ = render(&mut dsp, 256);
+        let levels = dsp.pad_levels();
+        assert!(levels[1] > 0.01, "the first hit was stolen: {}", levels[1]);
+        assert!(levels[2] > 0.01, "the second hit was stolen: {}", levels[2]);
     }
 }

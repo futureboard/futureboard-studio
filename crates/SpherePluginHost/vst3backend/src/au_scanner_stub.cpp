@@ -1,13 +1,18 @@
 #include "sphere_plugin_host_vst3.h"
 
-#include <cstdlib>
 #include <cstring>
+#include <new>
 
 namespace {
 
+// Rust releases every returned string with `sphere_plugin_host_free_string`
+// (`delete[]`), so the payload must come from `new[]`, never static storage.
 SpherePluginHostString empty_json_array() {
-  static const char payload[] = "[]";
-  return SpherePluginHostString{payload, sizeof(payload) - 1};
+  static const char kEmpty[] = "[]";
+  auto* data = new (std::nothrow) char[sizeof(kEmpty)];
+  if (!data) return {nullptr, 0};
+  std::memcpy(data, kEmpty, sizeof(kEmpty));
+  return {data, sizeof(kEmpty) - 1};
 }
 
 }  // namespace

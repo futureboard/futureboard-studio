@@ -1265,19 +1265,12 @@ impl SettingsSchema {
     /// failure and never panics.
     pub fn persist_default_project_directory(dir: Option<PathBuf>) {
         let path = FutureboardPaths::resolve().settings_file;
-        let mut schema = SettingsModel::load_from_path(&path);
-        schema.general.default_project_directory = dir.filter(|p| !p.as_os_str().is_empty());
-        schema.validate_and_clamp();
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        match serde_json::to_string_pretty(&schema) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
-                    eprintln!("[settings] failed to persist default project dir: {e}");
-                }
-            }
-            Err(e) => eprintln!("[settings] failed to serialize settings: {e}"),
+        let dir = dir.filter(|p| !p.as_os_str().is_empty());
+        let result = update_settings_file(&path, |schema| {
+            schema.general.default_project_directory = dir;
+        });
+        if let Err(e) = result {
+            eprintln!("[settings] failed to persist default project dir: {e}");
         }
     }
 
@@ -1285,19 +1278,11 @@ impl SettingsSchema {
     /// surface, where the global [`SettingsModel`] may not exist yet.
     pub fn persist_plugin_scan_prompt_answered() {
         let path = FutureboardPaths::resolve().settings_file;
-        let mut schema = SettingsModel::load_from_path(&path);
-        schema.general.plugin_scan_prompt_answered = true;
-        schema.validate_and_clamp();
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        match serde_json::to_string_pretty(&schema) {
-            Ok(json) => {
-                if let Err(error) = std::fs::write(&path, json) {
-                    eprintln!("[settings] failed to persist plug-in scan prompt: {error}");
-                }
-            }
-            Err(error) => eprintln!("[settings] failed to serialize settings: {error}"),
+        let result = update_settings_file(&path, |schema| {
+            schema.general.plugin_scan_prompt_answered = true;
+        });
+        if let Err(error) = result {
+            eprintln!("[settings] failed to persist plug-in scan prompt: {error}");
         }
     }
 
@@ -1436,19 +1421,97 @@ fn persist_sanitized_audio_driver(path: &Path, schema: &mut SettingsSchema) {
     if schema.hardware.audio.driver_type == before {
         return;
     }
+    if let Err(error) = write_settings_now(path, schema) {
+        eprintln!("[settings] failed to persist sanitized audio driver: {error}");
+    }
+}
+
+/// The order settings saves were made in. `SettingsModel::save_to_disk`
+/// writes from a background thread per change, so two quick changes race;
+/// each save takes a number here, on the thread that made the change, and a
+/// save older than what is already on disk is dropped instead of written.
+static SETTINGS_SAVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// One writer at a time, and the newest save number each settings file holds.
+static SETTINGS_WRITTEN: std::sync::Mutex<Option<std::collections::HashMap<PathBuf, u64>>> =
+    std::sync::Mutex::new(None);
+
+fn next_settings_save_seq() -> u64 {
+    SETTINGS_SAVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn settings_write_lock(
+) -> std::sync::MutexGuard<'static, Option<std::collections::HashMap<PathBuf, u64>>> {
+    // A writer that panicked left nothing half-done on disk (see
+    // `write_settings_file`), so the lock is still good to use.
+    SETTINGS_WRITTEN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Replace the settings file with `schema`, atomically: the JSON goes to a
+/// sibling temporary file, is flushed to disk, and is then renamed over the
+/// old file. A crash or power loss mid-save leaves the previous settings, never
+/// a truncated file that the next launch would throw away for defaults.
+fn write_settings_file(path: &Path, schema: &SettingsSchema) -> std::io::Result<()> {
+    use std::io::Write;
+    let json = serde_json::to_string_pretty(schema)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)?;
     }
-    match serde_json::to_string_pretty(&schema) {
-        Ok(json) => {
-            if let Err(error) = std::fs::write(path, json) {
-                eprintln!("[settings] failed to persist sanitized audio driver: {error}");
-            }
-        }
-        Err(error) => {
-            eprintln!("[settings] failed to serialize sanitized audio driver: {error}");
-        }
+    let mut tmp_name = path.as_os_str().to_owned();
+    tmp_name.push(".tmp");
+    let tmp = PathBuf::from(tmp_name);
+    let written = (|| {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()
+    })()
+    .and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
+    written
+}
+
+/// Write save number `seq` of `path`, unless a newer save already landed.
+/// Returns whether it was written.
+fn write_settings_in_order(
+    path: &Path,
+    schema: &SettingsSchema,
+    seq: u64,
+) -> std::io::Result<bool> {
+    let mut guard = settings_write_lock();
+    let written = guard.get_or_insert_with(Default::default);
+    if written.get(path).is_some_and(|&newest| newest > seq) {
+        return Ok(false);
+    }
+    write_settings_file(path, schema)?;
+    written.insert(path.to_path_buf(), seq);
+    Ok(true)
+}
+
+/// Write `schema` now, as the newest save of `path`.
+fn write_settings_now(path: &Path, schema: &SettingsSchema) -> std::io::Result<()> {
+    write_settings_in_order(path, schema, next_settings_save_seq()).map(|_| ())
+}
+
+/// Read, change and write the settings file as one step, so no other save
+/// can land between the read and the write and be lost.
+fn update_settings_file(
+    path: &Path,
+    change: impl FnOnce(&mut SettingsSchema),
+) -> std::io::Result<()> {
+    let mut guard = settings_write_lock();
+    let mut schema = SettingsModel::read_from_path(path);
+    change(&mut schema);
+    schema.validate_and_clamp();
+    write_settings_file(path, &schema)?;
+    guard
+        .get_or_insert_with(Default::default)
+        .insert(path.to_path_buf(), next_settings_save_seq());
+    Ok(())
 }
 
 /// Tell Audio Connections which devices Audio Device Setup has selected: a
@@ -1474,6 +1537,12 @@ impl SettingsModel {
     }
 
     pub fn load_from_path(path: &Path) -> SettingsSchema {
+        let _guard = settings_write_lock();
+        Self::read_from_path(path)
+    }
+
+    /// `load_from_path` for a caller already holding the settings write lock.
+    fn read_from_path(path: &Path) -> SettingsSchema {
         if path.exists() {
             match std::fs::read_to_string(path) {
                 Ok(content) => match serde_json::from_str::<SettingsSchema>(&content) {
@@ -1483,9 +1552,7 @@ impl SettingsModel {
                         let backup_path = path.with_extension("json.backup");
                         let _ = std::fs::rename(path, &backup_path);
                         let default_schema = SettingsSchema::default();
-                        if let Ok(json) = serde_json::to_string_pretty(&default_schema) {
-                            let _ = std::fs::write(path, json);
-                        }
+                        let _ = write_settings_file(path, &default_schema);
                         default_schema
                     }
                 },
@@ -1496,33 +1563,21 @@ impl SettingsModel {
             }
         } else {
             let default_schema = SettingsSchema::default();
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if let Ok(json) = serde_json::to_string_pretty(&default_schema) {
-                let _ = std::fs::write(path, json);
-            }
+            let _ = write_settings_file(path, &default_schema);
             default_schema
         }
     }
 
+    /// Save the current settings off the UI thread. Saves land in the order
+    /// they were made, each atomically (see `write_settings_file`).
     pub fn save_to_disk(&self) {
         let path = self.path.clone();
         let schema = self.current.clone();
+        let seq = next_settings_save_seq();
 
         std::thread::spawn(move || {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            match serde_json::to_string_pretty(&schema) {
-                Ok(json) => {
-                    if let Err(e) = std::fs::write(&path, json) {
-                        eprintln!("[settings] failed to write settings file: {e}");
-                    }
-                }
-                Err(e) => {
-                    eprintln!("[settings] failed to serialize settings: {e}");
-                }
+            if let Err(e) = write_settings_in_order(&path, &schema, seq) {
+                eprintln!("[settings] failed to write settings file: {e}");
             }
         });
     }
@@ -1662,6 +1717,80 @@ mod tests {
         );
         assert!(schema.hardware.audio.device_out.is_empty());
         assert!(schema.hardware.audio.device_in.is_empty());
+    }
+
+    fn scratch_settings_path(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fb-settings-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("settings.json")
+    }
+
+    fn tempo_on_disk(path: &Path) -> f64 {
+        let text = std::fs::read_to_string(path).unwrap();
+        let schema: SettingsSchema = serde_json::from_str(&text).unwrap();
+        schema.general.project_defaults.tempo
+    }
+
+    /// A save replaces the file whole and leaves no temporary file beside it.
+    #[test]
+    fn a_save_replaces_the_file_atomically() {
+        let path = scratch_settings_path("atomic");
+        std::fs::write(&path, "{}").unwrap();
+        let mut schema = SettingsSchema::default();
+        schema.general.project_defaults.tempo = 133.0;
+        write_settings_now(&path, &schema).unwrap();
+        assert_eq!(tempo_on_disk(&path), 133.0);
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers, vec![std::ffi::OsString::from("settings.json")]);
+        // The format is the same pretty JSON as before.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            serde_json::to_string_pretty(&schema).unwrap()
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// An older save that reaches the disk after a newer one is dropped, so
+    /// the latest change always wins however the writer threads are ordered.
+    #[test]
+    fn the_latest_save_wins_when_writers_race() {
+        let path = scratch_settings_path("race");
+        let saves: Vec<(u64, SettingsSchema)> = (0..16)
+            .map(|i| {
+                let mut schema = SettingsSchema::default();
+                schema.general.project_defaults.tempo = 100.0 + i as f64;
+                (next_settings_save_seq(), schema)
+            })
+            .collect();
+        // Writers start in reverse, the oldest last.
+        let handles: Vec<_> = saves
+            .into_iter()
+            .rev()
+            .map(|(seq, schema)| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    write_settings_in_order(&path, &schema, seq).unwrap();
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(tempo_on_disk(&path), 115.0);
+
+        // A read-modify-write keeps the newest save and lands after it.
+        update_settings_file(&path, |schema| {
+            schema.general.plugin_scan_prompt_answered = true
+        })
+        .unwrap();
+        let schema = SettingsModel::load_from_path(&path);
+        assert_eq!(schema.general.project_defaults.tempo, 115.0);
+        assert!(schema.general.plugin_scan_prompt_answered);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]

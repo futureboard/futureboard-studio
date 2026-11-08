@@ -752,6 +752,8 @@ fn prepare_portable_assets(
     layout.ensure_dirs()?;
 
     let mut copied: Vec<(PathBuf, String)> = Vec::new();
+    // Takes copied in by this save: source → project-relative copy.
+    let mut copied_takes: Vec<(PathBuf, String)> = Vec::new();
     let mut assets: Vec<ProjectAsset> = Vec::new();
     let mut offline: Vec<PathBuf> = Vec::new();
 
@@ -811,6 +813,25 @@ fn prepare_portable_assets(
                     note_offline(&mut offline, source_abs);
                 } else if let Some(relative) = path_relative_to_project(&source_abs, project_root) {
                     *source_path = PathBuf::from(path_to_project_string(&relative));
+                } else {
+                    // A take outside this folder: recorded into the folder a
+                    // Save As, Save Copy or archive is leaving. Copied in like
+                    // external audio, or the new project keeps playing it from
+                    // the old one and loses it with that folder.
+                    let sidecar = metadata_path
+                        .as_deref()
+                        .map(|path| resolve_source_for_save(path, project_root))
+                        .unwrap_or_else(|| take_sidecar_path(&source_abs));
+                    let copy = copy_take_into_project(
+                        &source_abs,
+                        &sidecar,
+                        project_root,
+                        &mut copied_takes,
+                    )?;
+                    *source_path = PathBuf::from(&copy.take);
+                    if let Some(sidecar) = copy.sidecar {
+                        *metadata_path = Some(PathBuf::from(sidecar));
+                    }
                 }
                 if let Some(metadata_path) = metadata_path {
                     let metadata_abs = resolve_source_for_save(metadata_path, project_root);
@@ -1229,6 +1250,122 @@ fn offline_project_relative(source_abs: &Path, project_root: &Path) -> Option<St
         .strip_prefix(root)
         .ok()
         .map(path_to_project_string)
+}
+
+/// Folder recorded takes go into, under the project folder (see the engine's
+/// recorder).
+const RECORDINGS_DIR: &str = "Recordings";
+
+/// A take's sidecar as a project names it: `<take>.rauf.json`.
+fn take_sidecar_path(take: &Path) -> PathBuf {
+    let mut path = take.as_os_str().to_os_string();
+    path.push(".json");
+    PathBuf::from(path)
+}
+
+/// Where a take copied into a project went, project-relative.
+struct CopiedTake {
+    take: String,
+    /// Its sidecar, when the source had one.
+    sidecar: Option<String>,
+}
+
+/// Copy the take `source` (with its sidecar `sidecar`, when that exists) from
+/// another folder into `project_root`'s `Recordings` folder, under its own
+/// name when that is free or already holds the same take, else a numbered
+/// one. Copied once per save however many clips play it (`copied`).
+fn copy_take_into_project(
+    source: &Path,
+    sidecar: &Path,
+    project_root: &Path,
+    copied: &mut Vec<(PathBuf, String)>,
+) -> Result<CopiedTake, ProjectError> {
+    let with_sidecar = |take: String| {
+        let sidecar_rel = format!("{take}.json");
+        let present = resolve_project_relative_path(project_root, &sidecar_rel).is_file();
+        CopiedTake {
+            take,
+            sidecar: present.then_some(sidecar_rel),
+        }
+    };
+    if let Some((_, relative)) = copied.iter().find(|(known, _)| same_source(known, source)) {
+        return Ok(with_sidecar(relative.clone()));
+    }
+
+    let folder = project_root.join(RECORDINGS_DIR);
+    fs::create_dir_all(&folder)?;
+    let file_name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(sanitize_project_name)
+        .unwrap_or_else(|| "take.rauf".to_string());
+    let stem = Path::new(&file_name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("take")
+        .to_string();
+    let ext = Path::new(&file_name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_string();
+
+    let mut dest = None;
+    for index in 0..=999 {
+        let name = match (index, ext.is_empty()) {
+            (0, _) => file_name.clone(),
+            (_, true) => format!("{stem}-{index}"),
+            (_, false) => format!("{stem}-{index}.{ext}"),
+        };
+        let candidate = folder.join(name);
+        if !candidate.exists() {
+            fs::copy(source, &candidate)?;
+            dest = Some(candidate);
+            break;
+        }
+        // A copy an earlier Save Copy into this folder already made.
+        if same_file_content(&candidate, source) {
+            dest = Some(candidate);
+            break;
+        }
+    }
+    let dest = dest.ok_or_else(|| {
+        ProjectError::Corrupted(format!(
+            "could not create a unique take filename for {}",
+            source.display()
+        ))
+    })?;
+    let dest_sidecar = take_sidecar_path(&dest);
+    if sidecar.is_file() && !dest_sidecar.exists() {
+        fs::copy(sidecar, &dest_sidecar)?;
+    }
+    eprintln!(
+        "[ProjectSave] take copied into project={} source={}",
+        dest.display(),
+        source.display()
+    );
+    let relative = dest
+        .strip_prefix(project_root)
+        .map(path_to_project_string)
+        .map_err(|_| {
+            ProjectError::Corrupted(format!(
+                "copied take escaped project folder: {}",
+                dest.display()
+            ))
+        })?;
+    copied.push((source.to_path_buf(), relative.clone()));
+    Ok(with_sidecar(relative))
+}
+
+/// Whether two files hold the same bytes: equal lengths, then equal hashes.
+fn same_file_content(a: &Path, b: &Path) -> bool {
+    let len = |path: &Path| fs::metadata(path).map(|meta| meta.len()).ok();
+    match (len(a), len(b)) {
+        (Some(x), Some(y)) if x == y => {
+            matches!((audio_fingerprint(a), audio_fingerprint(b)), (Some(x), Some(y)) if x == y)
+        }
+        _ => false,
+    }
 }
 
 /// A freeze bounce inside the project folder is saved relative to it, so the
@@ -3219,6 +3356,177 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    fn take_clip(id: &str, take: &Path) -> ProjectClip {
+        ProjectClip {
+            source: ClipSource::Rauf {
+                asset_id: format!("take-{id}"),
+                source_path: take.to_path_buf(),
+                metadata_path: Some(take_sidecar_path(take)),
+                sample_format: "s32le".to_string(),
+                sample_rate: 48_000,
+                channels: 1,
+                start_frame: 0,
+                length_frames: 0,
+            },
+            ..audio_clip(id, take)
+        }
+    }
+
+    fn take_source(project: &FutureboardProject, clip: usize) -> (PathBuf, Option<PathBuf>) {
+        match &project.tracks[0].clips[clip].source {
+            ClipSource::Rauf {
+                source_path,
+                metadata_path,
+                ..
+            } => (source_path.clone(), metadata_path.clone()),
+            other => panic!("expected a take, got {other:?}"),
+        }
+    }
+
+    /// A project `SongA` with a recorded take (two clips of it, as a split
+    /// leaves them), saved in its own folder under `base`.
+    fn project_with_a_take(base: &Path) -> (FutureboardProject, PathBuf) {
+        let root_a = base.join("SongA");
+        let take = root_a.join("Recordings").join("SongA_take.rauf");
+        fs::create_dir_all(take.parent().unwrap()).unwrap();
+        fs::write(&take, b"RAUF recorded take bytes").unwrap();
+        fs::write(take_sidecar_path(&take), b"{\"take\":1}").unwrap();
+        let mut project = FutureboardProject::new("SongA");
+        project.tracks.push(audio_track(
+            "t1",
+            vec![take_clip("c1", &take), take_clip("c2", &take)],
+        ));
+        let file_a = root_a.join("SongA.fbproj");
+        save_project(&mut project, &file_a).unwrap();
+        assert_eq!(
+            take_source(&project, 0).0,
+            PathBuf::from("Recordings/SongA_take.rauf"),
+            "a take inside its own folder stays where it is"
+        );
+        (load_project_strict(&file_a).unwrap(), root_a)
+    }
+
+    /// The reported case: Save As into a new folder copies the recorded take
+    /// in, and the new project plays it after the old folder is gone.
+    #[test]
+    fn save_as_copies_recorded_takes_into_the_new_folder() {
+        let base = temp_dir("take-save-as");
+        let (mut project, root_a) = project_with_a_take(&base);
+        let root_b = base.join("SongB");
+        let file_b = root_b.join("SongB.fbproj");
+        let report = save_project_with_report_from(&mut project, &file_b, Some(&root_a)).unwrap();
+        assert!(report.offline_media.is_empty());
+
+        let copied = root_b.join("Recordings").join("SongA_take.rauf");
+        assert_eq!(fs::read(&copied).unwrap(), b"RAUF recorded take bytes");
+        assert_eq!(
+            fs::read(take_sidecar_path(&copied)).unwrap(),
+            b"{\"take\":1}"
+        );
+        for clip in 0..2 {
+            assert_eq!(
+                take_source(&project, clip),
+                (
+                    PathBuf::from("Recordings/SongA_take.rauf"),
+                    Some(PathBuf::from("Recordings/SongA_take.rauf.json"))
+                )
+            );
+        }
+        // Copied once for both clips.
+        assert_eq!(
+            fs::read_dir(root_b.join("Recordings")).unwrap().count(),
+            2,
+            "the take and its sidecar"
+        );
+
+        fs::remove_dir_all(&root_a).unwrap();
+        let reopened = load_project_strict(&file_b).unwrap();
+        let (path, metadata) = take_source(&reopened, 0);
+        assert_eq!(path, copied);
+        assert!(path.exists(), "plays with SongA gone");
+        assert_eq!(metadata, Some(take_sidecar_path(&copied)));
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// Save Copy into a folder an earlier copy already filled reuses the take
+    /// there; a different take under the same name gets a numbered name and
+    /// never overwrites it.
+    #[test]
+    fn a_take_copy_is_reused_when_identical_and_never_overwrites_another() {
+        let base = temp_dir("take-save-copy");
+        let (project, root_a) = project_with_a_take(&base);
+        let root_b = base.join("Copy");
+        let file_b = root_b.join("Copy.fbproj");
+        let mut first = project.clone();
+        save_project_with_report_from(&mut first, &file_b, Some(&root_a)).unwrap();
+        let mut second = project.clone();
+        save_project_with_report_from(&mut second, &file_b, Some(&root_a)).unwrap();
+        assert_eq!(
+            take_source(&second, 0).0,
+            PathBuf::from("Recordings/SongA_take.rauf")
+        );
+
+        // Another recording under the same name, copied into the same folder.
+        fs::write(
+            root_a.join("Recordings").join("SongA_take.rauf"),
+            b"a different take, same name",
+        )
+        .unwrap();
+        let mut third = project;
+        save_project_with_report_from(&mut third, &file_b, Some(&root_a)).unwrap();
+        assert_eq!(
+            take_source(&third, 0).0,
+            PathBuf::from("Recordings/SongA_take-1.rauf")
+        );
+        assert_eq!(
+            fs::read(root_b.join("Recordings").join("SongA_take.rauf")).unwrap(),
+            b"RAUF recorded take bytes",
+            "the earlier copy is untouched"
+        );
+        assert_eq!(
+            fs::read(root_b.join("Recordings").join("SongA_take-1.rauf")).unwrap(),
+            b"a different take, same name"
+        );
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// Export as ZIP carries the takes too, so the archive opens on another
+    /// machine with its recordings, and none is reported as left outside.
+    #[test]
+    fn a_project_archive_holds_its_recorded_takes() {
+        let base = temp_dir("take-archive");
+        let (mut project, root_a) = project_with_a_take(&base);
+        let archive = base.join("SongA.zip");
+        let report = export_project_archive(&mut project, &archive, Some(&root_a)).unwrap();
+        assert!(
+            report.external_media.is_empty(),
+            "{:?}",
+            report.external_media
+        );
+
+        let mut zip = zip::ZipArchive::new(File::open(&archive).unwrap()).unwrap();
+        let mut names: Vec<String> = zip.file_names().map(str::to_string).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "SongA/Recordings/SongA_take.rauf",
+                "SongA/Recordings/SongA_take.rauf.json",
+                "SongA/SongA.fbproj"
+            ]
+        );
+        let mut take = Vec::new();
+        zip.by_name("SongA/Recordings/SongA_take.rauf")
+            .unwrap()
+            .read_to_end(&mut take)
+            .unwrap();
+        assert_eq!(take, b"RAUF recorded take bytes");
+
+        let _ = fs::remove_dir_all(base);
     }
 
     /// The archive is the project folder a save makes, under one top folder:

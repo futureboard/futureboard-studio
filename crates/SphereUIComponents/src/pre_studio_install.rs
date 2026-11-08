@@ -252,15 +252,13 @@ fn restore_bridge_target(
         .as_deref()
         .is_some_and(SpherePluginHost::builtin_audio_bridge_supported);
     let is_audio_unit = !is_builtin && slot.plugin_format == Some(InsertPluginFormat::Au);
-    let has_module_file = slot
-        .plugin_format
-        .is_none_or(InsertPluginFormat::has_module_file);
-    if !is_builtin && has_module_file && !slot.plugin_path.as_ref().is_some_and(|p| p.exists()) {
-        let reason = slot
-            .plugin_path
-            .as_ref()
-            .map(|p| format!("Plugin file not found: {}", p.display()))
-            .unwrap_or_else(|| "Plugin file not found".to_string());
+    // Not there, or not a module this machine's plug-in catalog knows: a
+    // project must not make Studio load a module from wherever it names.
+    if let Some(reason) = crate::plugin_module_gate::module_refusal(
+        is_builtin,
+        slot.plugin_format,
+        slot.plugin_path.as_deref(),
+    ) {
         timeline_state.set_insert_runtime(
             &target.track_id,
             &target.slot_id,

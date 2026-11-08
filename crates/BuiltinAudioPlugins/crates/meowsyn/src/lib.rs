@@ -1,8 +1,10 @@
 //! MeowSyn — compact polyphonic soft-synth.
 //!
 //! Phase 3 (hard). Oscillators come from the MIT/Apache [`fundsp`] crate
-//! (`default-features = false`). Voice graphs are rebuilt on note-on (control
-//! path); the audio callback only ticks prebuilt units.
+//! (`default-features = false`). Every voice builds one graph per shape when
+//! the synth is created; a note-on only retunes the chosen one through its
+//! shared frequencies and resets its phase. Note-on runs inside the render
+//! callback, so it never allocates or frees.
 
 use std::fmt;
 
@@ -119,6 +121,18 @@ enum Stage {
     Release,
 }
 
+impl OscShape {
+    const ALL: [Self; 3] = [Self::SoftSaw, Self::Square, Self::Sine];
+
+    fn index(self) -> usize {
+        match self {
+            Self::SoftSaw => 0,
+            Self::Square => 1,
+            Self::Sine => 2,
+        }
+    }
+}
+
 struct Voice {
     active: bool,
     note: u8,
@@ -128,13 +142,21 @@ struct Voice {
     /// When the voice's note started, in note-ons: the oldest is stolen last
     /// resort, never one a note of the same chord just started.
     age: u64,
-    unit: Box<dyn AudioUnit>,
+    /// The two detuned oscillators' frequencies, read by every graph below.
+    freq: Shared,
+    freq_detuned: Shared,
+    /// One prebuilt graph per [`OscShape`], indexed by [`OscShape::index`].
+    units: [Box<dyn AudioUnit>; 3],
+    /// The graph this note plays.
+    shape: usize,
 }
 
 impl Voice {
+    /// Allocates: control path only (construction).
     fn silent(sample_rate: f32) -> Self {
-        let mut unit: Box<dyn AudioUnit> = Box::new(soft_saw_hz(440.0));
-        unit.set_sample_rate(f64::from(sample_rate));
+        let freq = shared(440.0);
+        let freq_detuned = shared(440.0);
+        let units = OscShape::ALL.map(|shape| build_unit(shape, &freq, &freq_detuned, sample_rate));
         Self {
             active: false,
             note: 0,
@@ -142,24 +164,39 @@ impl Voice {
             stage: Stage::Idle,
             env: 0.0,
             age: 0,
-            unit,
+            freq,
+            freq_detuned,
+            units,
+            shape: 0,
         }
+    }
+
+    /// Retunes the voice for `shape` at `freq_hz` and restarts its phase.
+    /// Two atomic stores and a phase reset: allocation-free.
+    fn tune(&mut self, shape: OscShape, freq_hz: f32, detune_cents: f32) {
+        self.freq.set_value(freq_hz);
+        self.freq_detuned
+            .set_value(freq_hz * 2.0f32.powf(detune_cents / 1200.0));
+        self.shape = shape.index();
+        self.units[self.shape].reset();
     }
 }
 
+/// Two detuned oscillators of `shape`, following `freq` and `freq_detuned`.
 fn build_unit(
     shape: OscShape,
-    freq_hz: f32,
-    detune_cents: f32,
+    freq: &Shared,
+    freq_detuned: &Shared,
     sample_rate: f32,
 ) -> Box<dyn AudioUnit> {
-    let detune = 2.0f32.powf(detune_cents / 1200.0);
-    let f1 = freq_hz;
-    let f2 = freq_hz * detune;
     let mut unit: Box<dyn AudioUnit> = match shape {
-        OscShape::SoftSaw => Box::new((soft_saw_hz(f1) + soft_saw_hz(f2)) * 0.5),
-        OscShape::Square => Box::new((square_hz(f1) + square_hz(f2)) * 0.5),
-        OscShape::Sine => Box::new((sine_hz(f1) + sine_hz(f2)) * 0.5),
+        OscShape::SoftSaw => {
+            Box::new(((var(freq) >> soft_saw()) + (var(freq_detuned) >> soft_saw())) * 0.5)
+        }
+        OscShape::Square => {
+            Box::new(((var(freq) >> square()) + (var(freq_detuned) >> square())) * 0.5)
+        }
+        OscShape::Sine => Box::new(((var(freq) >> sine()) + (var(freq_detuned) >> sine())) * 0.5),
     };
     unit.set_sample_rate(f64::from(sample_rate));
     unit
@@ -330,7 +367,9 @@ impl Instrument for Dsp {
             voice.active = false;
             voice.stage = Stage::Idle;
             voice.env = 0.0;
-            voice.unit.reset();
+            for unit in &mut voice.units {
+                unit.reset();
+            }
         }
         self.lp_z_l = 0.0;
         self.lp_z_r = 0.0;
@@ -339,7 +378,9 @@ impl Instrument for Dsp {
     fn set_sample_rate(&mut self, sample_rate: f32) {
         self.sample_rate = sample_rate.max(1.0);
         for voice in &mut self.voices {
-            voice.unit.set_sample_rate(f64::from(self.sample_rate));
+            for unit in &mut voice.units {
+                unit.set_sample_rate(f64::from(self.sample_rate));
+            }
         }
         self.apply_params();
     }
@@ -350,22 +391,17 @@ impl Instrument for Dsp {
             return;
         }
         let idx = self.alloc_voice(note);
-        let unit = build_unit(
-            self.params.shape,
-            midi_to_hz(note),
-            self.params.detune_cents,
-            self.sample_rate,
-        );
         self.age = self.age.wrapping_add(1);
         let age = self.age;
+        let (shape, detune) = (self.params.shape, self.params.detune_cents);
         let voice = &mut self.voices[idx];
+        voice.tune(shape, midi_to_hz(note), detune);
         voice.active = true;
         voice.note = note;
         voice.velocity = f32::from(velocity) / 127.0;
         voice.stage = Stage::Attack;
         voice.env = 0.0;
         voice.age = age;
-        voice.unit = unit;
     }
 
     fn note_off(&mut self, note: u8) {
@@ -391,7 +427,8 @@ impl Instrument for Dsp {
             if !self.voices[i].active {
                 continue;
             }
-            let sample = self.voices[i].unit.get_mono() * env * self.voices[i].velocity;
+            let voice = &mut self.voices[i];
+            let sample = voice.units[voice.shape].get_mono() * env * voice.velocity;
             mix_l += sample;
             mix_r += sample;
         }
@@ -413,6 +450,69 @@ impl Instrument for Dsp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    /// Counts every allocation and free made on the calling thread, so a
+    /// test can watch the render path alone.
+    struct Counting;
+
+    thread_local! {
+        static HEAP_EVENTS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn count_heap_event() {
+        let _ = HEAP_EVENTS.try_with(|events| events.set(events.get() + 1));
+    }
+
+    fn heap_events() -> usize {
+        HEAP_EVENTS.with(Cell::get)
+    }
+
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            count_heap_event();
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            count_heap_event();
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static COUNTING: Counting = Counting;
+
+    /// Fast chords on every shape: note-ons, note-offs and rendering, as the
+    /// render callback runs them, never touch the heap.
+    #[test]
+    fn fast_playing_never_allocates_on_the_render_thread() {
+        let mut dsp = Dsp::new(48_000.0);
+        for shape in OscShape::ALL {
+            let mut params = default_params();
+            params.shape = shape;
+            dsp.set_params(params);
+            let before = heap_events();
+            let mut peak = 0.0f32;
+            for chord in 0..64u8 {
+                let root = 36 + ((u32::from(chord) * 5) % 36) as u8;
+                for step in [0, 4, 7, 11, 14] {
+                    dsp.note_on(root + step, 100);
+                }
+                for _ in 0..64 {
+                    let (l, r) = dsp.process_stereo();
+                    peak = peak.max(l.abs()).max(r.abs());
+                }
+                for step in [0, 4, 7, 11, 14] {
+                    dsp.note_off(root + step);
+                }
+            }
+            let events = heap_events() - before;
+            assert_eq!(events, 0, "{shape:?}: {events} heap events while playing");
+            assert!(peak > 0.01, "{shape:?} stayed silent");
+        }
+    }
 
     #[test]
     fn note_renders_nonzero() {

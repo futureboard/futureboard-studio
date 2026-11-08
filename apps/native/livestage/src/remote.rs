@@ -72,12 +72,26 @@ pub struct RemoteSettings {
     pub midi: MidiSettings,
 }
 
+/// OSC carries no log-in: whoever can send to the port drives the mix as an
+/// engineer. So it listens on this machine only (loopback) unless `network`
+/// is set — which only an admin can do (`set_remote`), or whoever edits
+/// `remote.json` — and then it takes packets only from the controllers named
+/// in `allow` (and this machine). A sender address is not a password (UDP
+/// sources can be forged on a network that allows it); `allow` keeps every
+/// other machine on the network out, not a determined one on the same
+/// segment.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OscSettings {
     pub enabled: bool,
     pub port: u16,
     pub feedback: bool,
+    /// Listen where the web UI does (`--http`'s address) instead of on
+    /// loopback.
+    pub network: bool,
+    /// The controllers' addresses OSC takes packets from when `network` is
+    /// set. Required then.
+    pub allow: Vec<IpAddr>,
 }
 
 impl Default for OscSettings {
@@ -86,8 +100,29 @@ impl Default for OscSettings {
             enabled: false,
             port: 8000,
             feedback: true,
+            network: false,
+            allow: Vec::new(),
         }
     }
+}
+
+/// Where OSC listens: loopback (of the web UI's address family) unless the
+/// settings open it to the network, then the web UI's address.
+pub fn osc_bind_ip(settings: &OscSettings, web_ip: IpAddr) -> IpAddr {
+    if settings.network {
+        return web_ip;
+    }
+    match web_ip {
+        IpAddr::V4(_) => IpAddr::from([127, 0, 0, 1]),
+        IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+    }
+}
+
+/// Whether OSC takes a packet from `from`: this machine always, another one
+/// only when listed.
+pub fn osc_sender_allowed(allow: &[IpAddr], from: IpAddr) -> bool {
+    let from = from.to_canonical();
+    from.is_loopback() || allow.iter().any(|a| a.to_canonical() == from)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -149,6 +184,24 @@ pub enum MapMode {
 pub fn validate(mut settings: RemoteSettings) -> Result<RemoteSettings, String> {
     if settings.osc.port == 0 {
         return Err("the OSC port is 1 to 65535".to_string());
+    }
+    // Unauthenticated control from anywhere on the network is not a mode:
+    // network OSC names the machines it takes commands from.
+    settings.osc.allow.dedup();
+    if settings.osc.network && settings.osc.allow.is_empty() {
+        return Err(
+            "OSC on the network needs the controllers' addresses (osc.allow); without them it \
+             listens on this machine only"
+                .to_string(),
+        );
+    }
+    if settings
+        .osc
+        .allow
+        .iter()
+        .any(|ip| ip.is_unspecified() || ip.is_multicast())
+    {
+        return Err("osc.allow lists controllers' own addresses, one each".to_string());
     }
     let mut maps: Vec<MidiMap> = Vec::with_capacity(settings.midi.maps.len());
     for mut map in settings.midi.maps {
@@ -791,6 +844,8 @@ struct Counters {
     received: AtomicU64,
     /// OSC datagrams that did not parse.
     unreadable: AtomicU64,
+    /// OSC datagrams from a machine not in `osc.allow`, dropped unread.
+    strangers: AtomicU64,
 }
 
 /// The inbound queue as remote producers see it: bounded at [`QUEUE`]
@@ -846,7 +901,12 @@ impl Drop for OscSocket {
     }
 }
 
-fn start_osc(ip: IpAddr, port: u16, sender: RemoteSender) -> Result<OscSocket, String> {
+fn start_osc(
+    ip: IpAddr,
+    port: u16,
+    allow: Vec<IpAddr>,
+    sender: RemoteSender,
+) -> Result<OscSocket, String> {
     let socket = UdpSocket::bind((ip, port)).map_err(|e| format!("OSC on {ip}:{port}: {e}"))?;
     let local = socket.local_addr().map_err(|e| e.to_string())?;
     socket
@@ -864,6 +924,12 @@ fn start_osc(ip: IpAddr, port: u16, sender: RemoteSender) -> Result<OscSocket, S
                     let Ok((len, from)) = reader.recv_from(&mut buffer) else {
                         continue; // the poll timeout, or a reset from a gone peer
                     };
+                    // Before it is parsed or queued: a stranger must not
+                    // crowd the queue the allowed controllers share.
+                    if !osc_sender_allowed(&allow, from.ip()) {
+                        sender.counters.strangers.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                     sender.counters.received.fetch_add(1, Ordering::Relaxed);
                     match osc::decode(&buffer[..len]) {
                         Ok(packet) => {
@@ -900,7 +966,8 @@ pub struct Remote {
     settings: RemoteSettings,
     /// `None` in tests: nothing listens.
     sender: Option<RemoteSender>,
-    /// Where OSC listens: the web UI's address.
+    /// The web UI's address: where OSC listens when `osc.network` is set
+    /// (otherwise loopback, see [`osc_bind_ip`]).
     ip: IpAddr,
     osc: Option<OscSocket>,
     osc_error: Option<String>,
@@ -969,11 +1036,28 @@ impl Remote {
         remote.apply(settings);
         if let Some(osc) = &remote.osc {
             log.push(format!("OSC remote on udp://{}", osc.local));
-            if !osc.local.ip().is_loopback() {
-                log.push(
-                    "OSC is open to the network: anyone who can reach it controls this mixer"
-                        .to_string(),
-                );
+            if osc.local.ip().is_loopback() {
+                if !remote.ip.is_loopback() {
+                    log.push(
+                        "OSC listens on this machine only; for controllers on the network set \
+                         osc.network and list their addresses in osc.allow (remote.json, or the \
+                         web UI's admin)"
+                            .to_string(),
+                    );
+                }
+            } else {
+                let allowed: Vec<String> = remote
+                    .settings
+                    .osc
+                    .allow
+                    .iter()
+                    .map(IpAddr::to_string)
+                    .collect();
+                log.push(format!(
+                    "OSC is open to the network for {} only: they control this mixer without \
+                     logging in",
+                    allowed.join(", ")
+                ));
             }
         }
         if let Some(error) = &remote.osc_error {
@@ -1002,6 +1086,8 @@ impl Remote {
     fn apply(&mut self, settings: RemoteSettings) {
         let osc_moved = settings.osc.enabled != self.settings.osc.enabled
             || settings.osc.port != self.settings.osc.port
+            || settings.osc.network != self.settings.osc.network
+            || settings.osc.allow != self.settings.osc.allow
             || (settings.osc.enabled && self.osc.is_none());
         self.settings = settings;
         if osc_moved {
@@ -1012,7 +1098,12 @@ impl Remote {
             if self.settings.osc.enabled {
                 match &self.sender {
                     Some(sender) => {
-                        match start_osc(self.ip, self.settings.osc.port, sender.clone()) {
+                        match start_osc(
+                            osc_bind_ip(&self.settings.osc, self.ip),
+                            self.settings.osc.port,
+                            self.settings.osc.allow.clone(),
+                            sender.clone(),
+                        ) {
                             Ok(osc) => self.osc = Some(osc),
                             Err(error) => self.osc_error = Some(error),
                         }
@@ -1042,6 +1133,7 @@ impl Remote {
                 "subscribers": self.subscribers.len(),
                 "received": count(|c| c.received.load(Ordering::Relaxed)),
                 "unreadable": count(|c| c.unreadable.load(Ordering::Relaxed)),
+                "strangers": count(|c| c.strangers.load(Ordering::Relaxed)),
             },
             "midi": self.midi.status(),
             "dropped": count(|c| c.dropped.load(Ordering::Relaxed)),
@@ -1762,7 +1854,8 @@ mod tests {
         let defaults = RemoteSettings::default();
         assert_eq!(
             serde_json::to_value(&defaults).unwrap(),
-            json!({"osc": {"enabled": false, "port": 8000, "feedback": true},
+            json!({"osc": {"enabled": false, "port": 8000, "feedback": true,
+                           "network": false, "allow": []},
                    "midi": {"inputs": [], "outputs": [], "feedback": true, "maps": []}})
         );
         for bad in [
@@ -1770,9 +1863,71 @@ mod tests {
             json!({"midi": {"maps": [{"midi": {"channel": 1, "kind": "cc", "number": 128}, "target": "/talk"}]}}),
             json!({"midi": {"maps": [{"midi": {"channel": 1, "kind": "cc", "number": 1}, "target": "/ch/1/name"}]}}),
             json!({"osc": {"port": 0}}),
+            // On the network only for named controllers.
+            json!({"osc": {"enabled": true, "network": true}}),
+            json!({"osc": {"enabled": true, "network": true, "allow": ["0.0.0.0"]}}),
         ] {
             let settings: RemoteSettings = serde_json::from_value(bad.clone()).unwrap();
             assert!(validate(settings).is_err(), "{bad}");
+        }
+    }
+
+    /// A `remote.json` from before `network` existed still loads, and its OSC
+    /// moves to this machine only, whatever address the web UI is on.
+    #[test]
+    fn osc_listens_on_this_machine_unless_opened_to_named_controllers() {
+        let old: RemoteSettings =
+            serde_json::from_value(json!({"osc": {"enabled": true, "port": 9000}})).unwrap();
+        let old = validate(old).unwrap();
+        assert!(!old.osc.network);
+        let lan: IpAddr = "0.0.0.0".parse().unwrap();
+        assert_eq!(osc_bind_ip(&old.osc, lan), IpAddr::from([127, 0, 0, 1]));
+        assert_eq!(
+            osc_bind_ip(&old.osc, "::".parse().unwrap()),
+            "::1".parse::<IpAddr>().unwrap()
+        );
+
+        let open: RemoteSettings = serde_json::from_value(json!({
+            "osc": {"enabled": true, "port": 9000, "network": true, "allow": ["10.0.0.20"]}
+        }))
+        .unwrap();
+        let open = validate(open).unwrap();
+        assert_eq!(osc_bind_ip(&open.osc, lan), lan);
+        let allow = &open.osc.allow;
+        assert!(osc_sender_allowed(allow, "10.0.0.20".parse().unwrap()));
+        assert!(osc_sender_allowed(
+            allow,
+            "::ffff:10.0.0.20".parse().unwrap()
+        ));
+        assert!(osc_sender_allowed(allow, "127.0.0.1".parse().unwrap()));
+        assert!(!osc_sender_allowed(allow, "10.0.0.21".parse().unwrap()));
+        assert!(!osc_sender_allowed(&[], "10.0.0.20".parse().unwrap()));
+    }
+
+    /// A real socket: with the defaults, OSC is bound to loopback even when
+    /// the web UI is on every interface, and what it receives is queued.
+    #[test]
+    fn the_osc_socket_binds_loopback_by_default() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sender = RemoteSender::new(tx);
+        let settings = OscSettings::default();
+        let osc = start_osc(
+            osc_bind_ip(&settings, "0.0.0.0".parse().unwrap()),
+            0,
+            settings.allow.clone(),
+            sender,
+        )
+        .unwrap();
+        assert!(osc.local.ip().is_loopback());
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let message = osc::message_bytes(&OscMessage {
+            address: "/scene/next".to_string(),
+            args: Vec::new(),
+        });
+        client.send_to(&message, osc.local).unwrap();
+        match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            Inbound::Remote(RemoteIn::Osc { from, .. }) => assert!(from.ip().is_loopback()),
+            _ => panic!("an OSC event"),
         }
     }
 

@@ -13,14 +13,17 @@ impl PianoRoll {
         let mut duration = n.duration;
         match &self.drag {
             PianoDrag::Move {
-                prev,
+                ids,
                 dx_beats,
                 dpitch,
                 anchor_start,
                 unsnap,
                 ..
             } => {
-                if prev.iter().any(|(id, _, _)| *id == n.id) {
+                // A hash lookup: this runs for every visible note on every
+                // frame, and a scan of the moved notes made a select-all drag
+                // O(notes × selected).
+                if ids.contains(&n.id) {
                     // Snap only the grabbed anchor, then apply its delta to every
                     // peer so an off-grid multi-selection keeps internal spacing.
                     let snapped_anchor = self.snap_beats_live(*anchor_start + *dx_beats, *unsnap);
@@ -33,9 +36,7 @@ impl PianoRoll {
                 delta_dur,
                 ..
             } => {
-                if let Some((_, prev_duration)) =
-                    prev_durs.iter().find(|(note_id, _)| *note_id == n.id)
-                {
+                if let Some(prev_duration) = prev_durs.get(&n.id) {
                     duration = (*prev_duration + *delta_dur).max(MIN_NOTE_BEATS);
                 }
             }
@@ -527,6 +528,9 @@ impl Render for PianoRoll {
             self.cancel_active_gesture(cx);
         }
         self.prune_transient_state(cx, clip_id.as_deref());
+        // Follow-playhead and the wheel scroll without a pointer move: keep a
+        // note drag under the cursor through it.
+        self.refresh_drag_from_pointer();
         self.drop_stale_tool_session(cx);
 
         if clip_id != self.last_editing_clip {

@@ -304,16 +304,23 @@ pub fn make_eq_coefficients(
 /// The magnitude, in dB, of the biquad `coefficients` at `freq_hz` — what a
 /// filter built from them does to a sine at that frequency. For drawing a
 /// curve from the very coefficients the audio path runs; never called there.
-pub fn biquad_response_db(coefficients: &Coefficients<f32>, freq_hz: f32, sample_rate: f32) -> f32 {
+/// Takes `f32` or `f64` coefficients.
+pub fn biquad_response_db<C: Copy + Into<f64>>(
+    coefficients: &Coefficients<C>,
+    freq_hz: f32,
+    sample_rate: f32,
+) -> f32 {
     let w = std::f64::consts::TAU * f64::from(freq_hz) / f64::from(sample_rate.max(1.0));
     let (cos1, sin1) = (w.cos(), w.sin());
     let (cos2, sin2) = ((2.0 * w).cos(), (2.0 * w).sin());
     let c = coefficients;
+    let (b0, b1, b2): (f64, f64, f64) = (c.b0.into(), c.b1.into(), c.b2.into());
+    let (a1, a2): (f64, f64) = (c.a1.into(), c.a2.into());
     // H(z) = (b0 + b1 z⁻¹ + b2 z⁻²) / (1 + a1 z⁻¹ + a2 z⁻²) at z = e^{jw}.
-    let num_re = f64::from(c.b0) + f64::from(c.b1) * cos1 + f64::from(c.b2) * cos2;
-    let num_im = -(f64::from(c.b1) * sin1 + f64::from(c.b2) * sin2);
-    let den_re = 1.0 + f64::from(c.a1) * cos1 + f64::from(c.a2) * cos2;
-    let den_im = -(f64::from(c.a1) * sin1 + f64::from(c.a2) * sin2);
+    let num_re = b0 + b1 * cos1 + b2 * cos2;
+    let num_im = -(b1 * sin1 + b2 * sin2);
+    let den_re = 1.0 + a1 * cos1 + a2 * cos2;
+    let den_im = -(a1 * sin1 + a2 * sin2);
     let power =
         (num_re * num_re + num_im * num_im) / (den_re * den_re + den_im * den_im).max(1e-30);
     (10.0 * power.max(1e-30).log10()) as f32

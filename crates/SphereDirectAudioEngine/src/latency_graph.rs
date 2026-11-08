@@ -19,6 +19,9 @@ pub struct RuntimeLatencyGraph {
     /// Delay applied to post-fader **main output** after sends, so dry/wet
     /// paths that diverge through return FX still align at the master bus.
     pub track_pdc_delay: Vec<u32>,
+    /// Delay applied to each send's feed, indexed `[track][send]`, so every
+    /// source feeding one return arrives there aligned with the slowest.
+    pub send_pdc_delay: Vec<Vec<u32>>,
     /// Maximum path latency to the master summing bus (before master inserts).
     pub max_path_latency_samples: u32,
     pub master_plugin_latency: u32,
@@ -222,6 +225,10 @@ pub fn plan_runtime_latency_graph(
         track_plugin_latency: vec![0; n],
         track_output_latency: vec![0; n],
         track_pdc_delay: vec![0; n],
+        send_pdc_delay: tracks
+            .iter()
+            .map(|track| vec![0; track.sends.len()])
+            .collect(),
         max_path_latency_samples: 0,
         master_plugin_latency: 0,
     };
@@ -257,6 +264,12 @@ pub fn recompute_runtime_latency_graph(
         || graph.track_plugin_latency.len() != n
         || graph.track_output_latency.len() != n
         || graph.track_pdc_delay.len() != n
+        || graph.send_pdc_delay.len() != n
+        || graph
+            .send_pdc_delay
+            .iter()
+            .zip(tracks)
+            .any(|(row, track)| row.len() != track.sends.len())
     {
         return;
     }
@@ -267,6 +280,7 @@ pub fn recompute_runtime_latency_graph(
         track_plugin_latency: plugin_latency,
         track_output_latency: output_latency,
         track_pdc_delay,
+        send_pdc_delay,
         max_path_latency_samples,
         master_plugin_latency,
     } = graph;
@@ -334,21 +348,28 @@ pub fn recompute_runtime_latency_graph(
     // A recompute reuses the previous plan's vector, so the delays every branch
     // below skips have to be cleared rather than left at their old values.
     track_pdc_delay.fill(0);
+    for row in send_pdc_delay.iter_mut() {
+        row.fill(0);
+    }
     if pdc_enabled && *max_path_latency_samples > 0 {
+        // Latency every feed of routing track `idx` is aligned to on arrival:
+        // the slowest feed, which is what its output latency was planned on.
+        let feed_latency = |idx: usize| output_latency[idx].saturating_sub(plugin_latency[idx]);
         for idx in 0..n {
             if Some(idx) == master_index || is_master_track_type(&tracks[idx].track_type) {
                 continue;
             }
-            // Main-output → bus/return feeders must not take PDC on the feeder
-            // hop. The bus already carries upstream latency in its path and
-            // compensates once before summing to master. Delaying both the
-            // feeder and the bus double-compensates and makes bus-routed audio
-            // late vs direct-to-master tracks by exactly that extra delay.
-            // Send→return is different: the dry main still goes to master, so
-            // the source keeps its delay (applied after the pre-PDC send tap).
-            if resolve_output_target_index(idx, tracks)
-                .is_some_and(|target| is_routing_track_type(&tracks[target].track_type))
+            // A main-output → bus/return feeder only has to line up with the
+            // other feeds of that bus: the bus already carries the slowest
+            // feed in its path and compensates once toward master. Delaying
+            // the feeder by the master-path amount as well double-compensates,
+            // and not delaying it at all leaves the faster feeds early inside
+            // the bus — a kick and a look-ahead-limited snare in one drum
+            // group flam by the limiter's latency.
+            if let Some(target) = resolve_output_target_index(idx, tracks)
+                .filter(|&target| is_routing_track_type(&tracks[target].track_type))
             {
+                track_pdc_delay[idx] = feed_latency(target).saturating_sub(output_latency[idx]);
                 continue;
             }
             // PDC delay is relative to the *main/dry* path so return-FX latency
@@ -357,6 +378,71 @@ pub fn recompute_runtime_latency_graph(
                 main_path_to_master(idx, tracks, output_latency, plugin_latency, master_index);
             track_pdc_delay[idx] = (*max_path_latency_samples).saturating_sub(path);
         }
+        // Send feeds tap before the main-path delay, so each gets its own
+        // alignment to the return it feeds. Planned for disabled sends too, so
+        // automation switching one on lands it aligned.
+        for (idx, track) in tracks.iter().enumerate() {
+            if is_master_track_type(&track.track_type) {
+                continue;
+            }
+            for (slot, send) in track.sends.iter().enumerate() {
+                if let Some(ret_idx) = send.return_track_index.filter(|&ret| ret < n) {
+                    send_pdc_delay[idx][slot] =
+                        feed_latency(ret_idx).saturating_sub(output_latency[idx]);
+                }
+            }
+        }
+    }
+}
+
+/// One PDC delay ring (stereo) with its write cursor. Sized on the control
+/// thread; only rewritten in place on the audio thread.
+#[derive(Debug, Clone, Default)]
+pub struct PdcDelayLine {
+    pub l: Vec<f32>,
+    pub r: Vec<f32>,
+    pub write_pos: usize,
+}
+
+/// Add `input`, delayed by `delay_samples` through `line` and scaled by
+/// `gain`, into `out`. The ring advances even at gain 0 so a send switched
+/// back on resumes in time instead of replaying stale audio. A ring too short
+/// for the delay passes the feed through undelayed, like
+/// [`apply_pdc_delay_block`]. Allocation-free.
+#[inline]
+pub fn accumulate_delayed_send(
+    input_l: &[f32],
+    input_r: &[f32],
+    out_l: &mut [f32],
+    out_r: &mut [f32],
+    line: &mut PdcDelayLine,
+    delay_samples: u32,
+    gain: f32,
+) {
+    let frames = input_l
+        .len()
+        .min(input_r.len())
+        .min(out_l.len())
+        .min(out_r.len());
+    let delay = delay_samples as usize;
+    let cap = line.l.len();
+    if delay == 0 || cap <= delay || line.r.len() != cap {
+        if gain != 0.0 {
+            for i in 0..frames {
+                out_l[i] += input_l[i] * gain;
+                out_r[i] += input_r[i] * gain;
+            }
+        }
+        return;
+    }
+    for i in 0..frames {
+        let wp = line.write_pos % cap;
+        let rp = (wp + cap - delay) % cap;
+        out_l[i] += line.l[rp] * gain;
+        out_r[i] += line.r[rp] * gain;
+        line.l[wp] = input_l[i];
+        line.r[wp] = input_r[i];
+        line.write_pos = (wp + 1) % cap;
     }
 }
 
@@ -470,7 +556,107 @@ mod tests {
             pre_fader: false,
             level_lane: None,
             enabled_lane: None,
+            pdc: PdcDelayLine::default(),
         }
+    }
+
+    /// When each track's audio reaches the input of routing track `target`,
+    /// counting its own latency and the delay PDC puts on that feed.
+    fn arrival_at(latency: &RuntimeLatencyGraph, idx: usize, send: Option<usize>) -> u32 {
+        let delay = match send {
+            Some(slot) => latency.send_pdc_delay[idx][slot],
+            None => latency.track_pdc_delay[idx],
+        };
+        latency.track_output_latency[idx] + delay
+    }
+
+    /// #187: a kick (no latency) and a snare behind a 1024-sample look-ahead
+    /// limiter, both in one drum group. Aligning the group as a whole with the
+    /// other tracks left the kick 1024 samples early inside it.
+    #[test]
+    fn tracks_feeding_one_bus_arrive_aligned() {
+        let mut kick = track("kick", "audio", 0, vec![]);
+        kick.output_track_id = Some("drums".to_string());
+        let mut snare = track("snare", "audio", 1024, vec![]);
+        snare.output_track_id = Some("drums".to_string());
+        let mut tracks = vec![
+            kick,
+            snare,
+            track("drums", "bus", 0, vec![]),
+            track("master", "master", 0, vec![]),
+        ];
+        let audio_graph = plan_runtime_audio_graph(&tracks).unwrap();
+        let latency = plan_runtime_latency_graph(&mut tracks, &audio_graph, true);
+
+        assert_eq!(latency.track_output_latency[2], 1024);
+        assert_eq!(arrival_at(&latency, 0, None), arrival_at(&latency, 1, None));
+        assert_eq!(latency.track_pdc_delay[0], 1024);
+        assert_eq!(latency.track_pdc_delay[1], 0);
+        // The group itself is the longest path; nothing to add after it.
+        assert_eq!(latency.track_pdc_delay[2], 0);
+        assert_eq!(latency.max_path_latency_samples, 1024);
+    }
+
+    /// #187: the same two tracks sending to one reverb return. The send feeds
+    /// tap before the main-path delay, so they need their own alignment.
+    #[test]
+    fn sends_feeding_one_return_arrive_aligned() {
+        let mut tracks = vec![
+            track("kick", "audio", 0, vec![send("k", "verb")]),
+            track("snare", "audio", 1024, vec![send("s", "verb")]),
+            track("verb", "return", 0, vec![]),
+            track("master", "master", 0, vec![]),
+        ];
+        let audio_graph = plan_runtime_audio_graph(&tracks).unwrap();
+        let latency = plan_runtime_latency_graph(&mut tracks, &audio_graph, true);
+
+        assert_eq!(latency.send_pdc_delay[0], vec![1024]);
+        assert_eq!(latency.send_pdc_delay[1], vec![0]);
+        assert_eq!(
+            arrival_at(&latency, 0, Some(0)),
+            arrival_at(&latency, 1, Some(0))
+        );
+        // Dry paths still meet the wet path at master.
+        let max = latency.max_path_latency_samples;
+        assert_eq!(arrival_at(&latency, 0, None), max);
+        assert_eq!(arrival_at(&latency, 1, None), max);
+        assert_eq!(arrival_at(&latency, 2, None), max);
+
+        // Compensation off: nothing is delayed.
+        let off = plan_runtime_latency_graph(&mut tracks, &audio_graph, false);
+        assert_eq!(off.send_pdc_delay[0], vec![0]);
+        assert_eq!(off.track_pdc_delay[0], 0);
+    }
+
+    #[test]
+    fn delayed_send_accumulates_late_and_keeps_time_while_muted() {
+        let mut line = PdcDelayLine {
+            l: vec![0.0; 8],
+            r: vec![0.0; 8],
+            write_pos: 0,
+        };
+        let input = [1.0, 2.0, 3.0, 4.0];
+        let mut out_l = [10.0; 4];
+        let mut out_r = [0.0; 4];
+        accumulate_delayed_send(&input, &input, &mut out_l, &mut out_r, &mut line, 2, 0.5);
+        assert_eq!(out_l, [10.0, 10.0, 10.5, 11.0]);
+        // Gain 0 adds nothing but still moves the ring on.
+        let mut muted = [0.0; 4];
+        let mut muted_r = [0.0; 4];
+        accumulate_delayed_send(&input, &input, &mut muted, &mut muted_r, &mut line, 2, 0.0);
+        assert_eq!(muted, [0.0; 4]);
+        let mut next = [0.0; 2];
+        let mut next_r = [0.0; 2];
+        accumulate_delayed_send(
+            &[0.0; 2],
+            &[0.0; 2],
+            &mut next,
+            &mut next_r,
+            &mut line,
+            2,
+            1.0,
+        );
+        assert_eq!(next, [3.0, 4.0]);
     }
 
     #[test]

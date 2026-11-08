@@ -46,6 +46,16 @@ fn main() {
         "cargo:rerun-if-changed={}",
         backend_root.join("src/au_host.mm").display()
     );
+    for source in [
+        "src/au_scanner.mm",
+        "src/au_scanner_stub.cpp",
+        "src/au_host_stub.cpp",
+    ] {
+        println!(
+            "cargo:rerun-if-changed={}",
+            backend_root.join(source).display()
+        );
+    }
     println!(
         "cargo:rerun-if-changed={}",
         backend_root.join("include/sphere_au_host.h").display()

@@ -33,14 +33,20 @@
 //!   account service on loopback.
 //!
 //! The session credential is stored in the per-user app-data directory
-//! (`session.json`), which the OS already restricts to the user's account. An OS
-//! keychain would harden this further and is a documented follow-up.
+//! (`session.json`), written atomically (a temporary file renamed over the
+//! old one). On Windows the credential in it is sealed with DPAPI for the
+//! signed-in Windows user, so another account on the machine cannot use it
+//! even if it can read the file; on macOS and Linux the file is created
+//! readable by its owner only (0600). A file an older build wrote — the
+//! credential in clear, default permissions — is rewritten that way the
+//! first time it is read.
 
-use std::io::{BufRead, BufReader, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -57,6 +63,22 @@ const SESSION_FILE: &str = "session.json";
 /// Overall ceiling on a browser sign-in before the loopback gives up, so a user
 /// who closes the browser never leaks the waiting thread.
 const OAUTH_WAIT_SECS: u64 = 180;
+
+/// Loopback connections served at once. A browser opens one for the redirect
+/// and may open a speculative one or two beside it; past this, more are
+/// closed unread.
+const MAX_CALLBACK_CONNECTIONS: usize = 8;
+
+/// The longest request head the loopback reads from one connection.
+const MAX_CALLBACK_HEAD: usize = 16 * 1024;
+
+/// How long the loopback waits between looking for a new connection and
+/// looking for a connection's verdict.
+const CALLBACK_POLL: Duration = Duration::from_millis(50);
+
+/// How long writing the reply page, and then waiting for the browser to close
+/// its side, may take.
+const CALLBACK_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Network timeout for a single auth HTTP call.
 const HTTP_TIMEOUT_SECS: u64 = 20;
@@ -454,7 +476,12 @@ pub fn complete_scheme_sign_in(state: &str, session: &str, error: Option<&str>) 
 
 /// One-shot loopback capture of the `?fbsession=` (or `?error=`) redirect.
 /// Verifies the `fbstate` nonce, ignores unrelated requests (e.g. favicon), and
-/// bounds the wait so a thread never leaks.
+/// gives up at `deadline` whatever the connections are doing.
+///
+/// Each connection is read on its own short-lived thread, so one that never
+/// sends anything — a browser's speculative preconnect — cannot hold up the
+/// redirect arriving on another, nor the deadline. Connections still open
+/// when this returns are shut down, which ends their threads.
 fn wait_for_session(
     listener: TcpListener,
     expected_state: &str,
@@ -463,34 +490,139 @@ fn wait_for_session(
     listener
         .set_nonblocking(true)
         .map_err(|error| format!("local sign-in listener failed: {error}"))?;
-    let start = Instant::now();
+    let until = Instant::now() + deadline;
+    let (verdicts, verdict) = mpsc::channel::<Result<String, String>>();
+    let serving = Arc::new(AtomicUsize::new(0));
+    let mut open = OpenCallbacks(Vec::new());
     loop {
+        if let Ok(result) = verdict.try_recv() {
+            return result;
+        }
+        let Some(left) = until
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+        else {
+            return Err("timed out waiting for the browser sign-in".to_string());
+        };
         match listener.accept() {
             Ok((stream, _)) => {
-                if let Some(result) = handle_callback(stream, expected_state) {
-                    return result;
+                if serving.load(Ordering::Acquire) >= MAX_CALLBACK_CONNECTIONS {
+                    continue; // dropped unread
+                }
+                let answered = Arc::new(AtomicBool::new(false));
+                if let Ok(handle) = stream.try_clone() {
+                    open.0.push((handle, answered.clone()));
+                }
+                serving.fetch_add(1, Ordering::AcqRel);
+                let expected = expected_state.to_string();
+                let verdicts = verdicts.clone();
+                let done = serving.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("futureboard-auth-callback".into())
+                    .spawn(move || {
+                        if let Some(result) = serve_callback(stream, &expected, until, &answered) {
+                            let _ = verdicts.send(result);
+                        }
+                        done.fetch_sub(1, Ordering::AcqRel);
+                    });
+                if spawned.is_err() {
+                    serving.fetch_sub(1, Ordering::AcqRel);
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                if start.elapsed() >= deadline {
-                    return Err("timed out waiting for the browser sign-in".to_string());
+                if let Ok(result) = verdict.recv_timeout(left.min(CALLBACK_POLL)) {
+                    return result;
                 }
-                std::thread::sleep(Duration::from_millis(120));
             }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) => return Err(format!("local sign-in listener failed: {error}")),
         }
     }
 }
 
-/// Parse one loopback request. `None` means "not the callback, keep waiting";
-/// `Some` is the terminal result (session credential or error).
-fn handle_callback(mut stream: TcpStream, expected_state: &str) -> Option<Result<String, String>> {
-    let mut reader = BufReader::new(&stream);
-    let mut request_line = String::new();
-    if reader.read_line(&mut request_line).is_err() {
-        return None;
-    }
+/// The loopback connections accepted so far, each with whether it has been
+/// answered. When the wait ends, the ones never answered are shut down so a
+/// reader still blocked on one returns at once; an answered one is left to
+/// close itself, so its reply page is not cut off.
+struct OpenCallbacks(Vec<(TcpStream, Arc<AtomicBool>)>);
 
+impl Drop for OpenCallbacks {
+    fn drop(&mut self) {
+        for (stream, answered) in &self.0 {
+            if !answered.load(Ordering::Acquire) {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+        }
+    }
+}
+
+/// Serve one loopback connection: read its request head (all of it, however
+/// it arrives, until `until`), answer it, and close it so the browser keeps
+/// the page. `None` means "not the callback, keep waiting"; `Some` is the
+/// terminal result (session credential or error).
+fn serve_callback(
+    mut stream: TcpStream,
+    expected_state: &str,
+    until: Instant,
+    answered: &AtomicBool,
+) -> Option<Result<String, String>> {
+    // Accepted from a non-blocking listener, the stream is non-blocking too on
+    // Windows and macOS, so a read before the browser has sent its request
+    // failed at once and the redirect was dropped. Linux does not pass the
+    // mode on, and there a read with no timeout waited forever on a
+    // connection that never sends. Blocking reads with a deadline, here.
+    stream.set_nonblocking(false).ok()?;
+    let _ = stream.set_write_timeout(Some(CALLBACK_REPLY_TIMEOUT));
+    let head = read_request_head(&mut stream, until)?;
+    let head = String::from_utf8_lossy(&head);
+    let request_line = head.lines().next().unwrap_or_default();
+    let (result, message) = callback_verdict(request_line, expected_state);
+    answered.store(true, Ordering::Release);
+    let _ = write_browser_response(&mut stream, message);
+    // Close only after the browser has the whole reply: our write side first,
+    // then wait (briefly) for it to close its own. Dropping a socket with
+    // unread input sends a reset, which can cost the browser the page.
+    let _ = stream.shutdown(Shutdown::Write);
+    let _ = stream.set_read_timeout(Some(CALLBACK_REPLY_TIMEOUT));
+    let mut sink = [0u8; 512];
+    while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
+    result
+}
+
+/// Read until the blank line that ends a request head. `None` when the
+/// connection closes, stalls past `until`, or sends more than
+/// [`MAX_CALLBACK_HEAD`] without ending its head.
+fn read_request_head(stream: &mut TcpStream, until: Instant) -> Option<Vec<u8>> {
+    let mut head = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 2048];
+    loop {
+        let left = until
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())?;
+        stream.set_read_timeout(Some(left)).ok()?;
+        let read = match stream.read(&mut chunk) {
+            Ok(0) => return None,
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        };
+        let searched_from = head.len().saturating_sub(3);
+        head.extend_from_slice(&chunk[..read]);
+        if head[searched_from..].windows(4).any(|w| w == b"\r\n\r\n") {
+            return Some(head);
+        }
+        if head.len() > MAX_CALLBACK_HEAD {
+            return None;
+        }
+    }
+}
+
+/// What one loopback request line means for the sign-in, and the page to
+/// answer it with. `None`: not the callback (a favicon, a stray hit).
+fn callback_verdict(
+    request_line: &str,
+    expected_state: &str,
+) -> (Option<Result<String, String>>, &'static str) {
     // "GET /path?query HTTP/1.1"
     let target = request_line.split_whitespace().nth(1).unwrap_or("");
     let query = target.split_once('?').map(|(_, q)| q).unwrap_or("");
@@ -498,9 +630,7 @@ fn handle_callback(mut stream: TcpStream, expected_state: &str) -> Option<Result
 
     let has_auth = params.iter().any(|(k, _)| k == "fbsession" || k == "error");
     if !has_auth {
-        // Favicon or a stray hit — acknowledge and keep listening.
-        let _ = write_browser_response(&mut stream, "Waiting for sign-in…");
-        return None;
+        return (None, "Waiting for sign-in…");
     }
 
     let state_ok = params
@@ -509,29 +639,30 @@ fn handle_callback(mut stream: TcpStream, expected_state: &str) -> Option<Result
         .map(|(_, v)| constant_time_eq(v.as_bytes(), expected_state.as_bytes()))
         .unwrap_or(false);
     if !state_ok {
-        let _ = write_browser_response(&mut stream, "Sign-in could not be verified.");
-        return Some(Err("the sign-in response failed verification".to_string()));
+        return (
+            Some(Err("the sign-in response failed verification".to_string())),
+            "Sign-in could not be verified.",
+        );
     }
 
     if let Some((_, error)) = params.iter().find(|(k, _)| k == "error") {
-        let _ = write_browser_response(&mut stream, "Sign-in was cancelled.");
-        return Some(Err(format!("sign-in was refused: {error}")));
+        return (
+            Some(Err(format!("sign-in was refused: {error}"))),
+            "Sign-in was cancelled.",
+        );
     }
 
     match params.into_iter().find(|(k, _)| k == "fbsession") {
-        Some((_, session)) if !session.is_empty() => {
-            let _ = write_browser_response(
-                &mut stream,
-                "Signed in to Futureboard Studio. You can close this tab.",
-            );
-            Some(Ok(session))
-        }
-        _ => {
-            let _ = write_browser_response(&mut stream, "Sign-in did not complete.");
+        Some((_, session)) if !session.is_empty() => (
+            Some(Ok(session)),
+            "Signed in to Futureboard Studio. You can close this tab.",
+        ),
+        _ => (
             Some(Err(
                 "the sign-in response did not include a session".to_string()
-            ))
-        }
+            )),
+            "Sign-in did not complete.",
+        ),
     }
 }
 
@@ -651,28 +782,236 @@ fn session_path() -> PathBuf {
     app_data_dir().join(SESSION_FILE)
 }
 
+/// `session.json` as written. The credential is in exactly one of the two
+/// fields: sealed on Windows, in clear elsewhere (in a file only its owner
+/// can read). A file from an older build has it in clear on every platform.
+#[derive(Serialize, Deserialize)]
+struct StoredSession {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
+    /// DPAPI-sealed for the Windows user who signed in, base64.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sealed_token: Option<String>,
+    #[serde(default)]
+    checked_at: u64,
+    user: UserProfile,
+}
+
 fn store_persisted_session(session: &Session) -> Result<(), String> {
+    store_session_at(&session_path(), session)
+}
+
+fn load_persisted_session() -> Option<Session> {
     let path = session_path();
+    let (session, outdated) = load_session_at(&path)?;
+    if outdated {
+        // Written by an older build: the credential in clear, or a file
+        // others may read. Rewrite it the way this build stores it.
+        match store_session_at(&path, &session) {
+            Ok(()) => debug_log("stored session moved to protected storage"),
+            Err(error) => debug_log(&format!("could not protect the stored session: {error}")),
+        }
+    }
+    Some(session)
+}
+
+fn store_session_at(path: &Path, session: &Session) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("could not create the session directory: {error}"))?;
     }
-    let json = serde_json::to_vec_pretty(session)
+    let (token, sealed_token) = if cfg!(windows) {
+        let sealed = sealed::seal(session.token.as_bytes())?;
+        (None, Some(URL_SAFE_NO_PAD.encode(sealed)))
+    } else {
+        (Some(session.token.clone()), None)
+    };
+    let stored = StoredSession {
+        token,
+        sealed_token,
+        checked_at: session.checked_at,
+        user: session.user.clone(),
+    };
+    let json = serde_json::to_vec_pretty(&stored)
         .map_err(|error| format!("could not encode the session: {error}"))?;
-    std::fs::write(&path, json).map_err(|error| format!("could not save the session: {error}"))
+    write_private_atomically(path, &json)
+        .map_err(|error| format!("could not save the session: {error}"))
 }
 
-fn load_persisted_session() -> Option<Session> {
-    let bytes = std::fs::read(session_path()).ok()?;
-    match serde_json::from_slice::<Session>(&bytes) {
-        Ok(session) => Some(session),
+/// The stored session, and whether its file needs rewriting (an older
+/// build's: the credential in clear on Windows, or readable by others
+/// elsewhere).
+fn load_session_at(path: &Path) -> Option<(Session, bool)> {
+    let bytes = std::fs::read(path).ok()?;
+    let stored = match serde_json::from_slice::<StoredSession>(&bytes) {
+        Ok(stored) => stored,
         Err(error) => {
             // A session written by an older build (the Supabase shape) lands
             // here. Dropping it costs one sign-in and is the only honest read of
             // a credential this build cannot use.
             debug_log(&format!("stored session is unreadable: {error}"));
-            None
+            return None;
         }
+    };
+    let (token, outdated) = match (stored.sealed_token, stored.token) {
+        (Some(sealed), _) => {
+            // Sealed for another Windows user, or on another machine: not a
+            // credential this user can use.
+            let opened = URL_SAFE_NO_PAD
+                .decode(sealed.as_bytes())
+                .map_err(|error| error.to_string())
+                .and_then(|bytes| sealed::unseal(&bytes))
+                .and_then(|bytes| String::from_utf8(bytes).map_err(|error| error.to_string()));
+            match opened {
+                Ok(token) => (token, false),
+                Err(error) => {
+                    debug_log(&format!("stored session could not be opened: {error}"));
+                    return None;
+                }
+            }
+        }
+        (None, Some(token)) => (token, cfg!(windows) || readable_by_others(path)),
+        (None, None) => return None,
+    };
+    if token.is_empty() {
+        return None;
+    }
+    Some((
+        Session {
+            token,
+            checked_at: stored.checked_at,
+            user: stored.user,
+        },
+        outdated,
+    ))
+}
+
+/// Write `bytes` to `path` through a temporary file in the same folder that is
+/// renamed over it, so a crash mid-write leaves the old file whole. On Unix the
+/// file is created owner-read/write only (0600).
+fn write_private_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| SESSION_FILE.to_string());
+    let temp = path.with_file_name(format!("{file_name}.{}.tmp", std::process::id()));
+    let _ = std::fs::remove_file(&temp);
+    let written = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    written
+}
+
+/// Whether anyone but the owner may read the file at `path`.
+#[cfg(unix)]
+fn readable_by_others(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|meta| meta.permissions().mode() & 0o077 != 0)
+        .unwrap_or(false)
+}
+
+/// Windows keeps the credential sealed instead; the file's own access is the
+/// per-user app-data folder's.
+#[cfg(not(unix))]
+fn readable_by_others(_path: &Path) -> bool {
+    false
+}
+
+/// DPAPI: the credential sealed with a key only the signed-in Windows user
+/// (on this machine) can open.
+#[cfg(windows)]
+mod sealed {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Cryptography::{
+        CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    };
+
+    fn blob(data: &[u8]) -> Result<CRYPT_INTEGER_BLOB, String> {
+        Ok(CRYPT_INTEGER_BLOB {
+            cbData: u32::try_from(data.len()).map_err(|_| "the session is too large")?,
+            pbData: data.as_ptr().cast_mut(),
+        })
+    }
+
+    /// Copy out and free what DPAPI handed back.
+    fn take(output: CRYPT_INTEGER_BLOB) -> Vec<u8> {
+        if output.pbData.is_null() {
+            return Vec::new();
+        }
+        // SAFETY: on success DPAPI returns `cbData` bytes at `pbData`, allocated
+        // with LocalAlloc; they are copied before being freed, exactly once.
+        unsafe {
+            let bytes = std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
+            let _ = LocalFree(Some(HLOCAL(output.pbData.cast())));
+            bytes
+        }
+    }
+
+    pub(super) fn seal(data: &[u8]) -> Result<Vec<u8>, String> {
+        let input = blob(data)?;
+        let mut output = CRYPT_INTEGER_BLOB::default();
+        // SAFETY: `input` points at `data`, alive for the call; DPAPI only
+        // reads it and writes `output`.
+        unsafe {
+            CryptProtectData(
+                &input,
+                PCWSTR::null(),
+                None,
+                None,
+                None,
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut output,
+            )
+        }
+        .map_err(|error| format!("could not protect the session: {error}"))?;
+        Ok(take(output))
+    }
+
+    pub(super) fn unseal(data: &[u8]) -> Result<Vec<u8>, String> {
+        let input = blob(data)?;
+        let mut output = CRYPT_INTEGER_BLOB::default();
+        // SAFETY: as in `seal`.
+        unsafe {
+            CryptUnprotectData(
+                &input,
+                None,
+                None,
+                None,
+                None,
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut output,
+            )
+        }
+        .map_err(|error| format!("could not open the stored session: {error}"))?;
+        Ok(take(output))
+    }
+}
+
+/// Elsewhere the file's own permissions protect it; nothing is sealed.
+#[cfg(not(windows))]
+mod sealed {
+    pub(super) fn seal(data: &[u8]) -> Result<Vec<u8>, String> {
+        Ok(data.to_vec())
+    }
+
+    pub(super) fn unseal(data: &[u8]) -> Result<Vec<u8>, String> {
+        Ok(data.to_vec())
     }
 }
 
@@ -884,6 +1223,142 @@ mod tests {
             Some("access_denied")
         ));
         assert!(receiver.try_recv().expect("delivered").is_err());
+    }
+
+    fn callback_listener() -> (TcpListener, SocketAddr) {
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let address = listener.local_addr().unwrap();
+        (listener, address)
+    }
+
+    /// A connection that never sends (a browser's speculative preconnect) must
+    /// not hold up the redirect on another, and a request that arrives in
+    /// pieces is still read whole and answered with the page.
+    #[test]
+    fn the_loopback_takes_the_redirect_past_an_idle_connection_and_a_split_request() {
+        let (listener, address) = callback_listener();
+        let started = Instant::now();
+        let waiter = std::thread::spawn(move || {
+            wait_for_session(listener, "nonce-123", Duration::from_secs(20))
+        });
+
+        let _idle = TcpStream::connect(address).unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        let mut browser = TcpStream::connect(address).unwrap();
+        browser.write_all(b"GET /?fbsession=sess-1&fbst").unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        browser
+            .write_all(b"ate=nonce-123 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .unwrap();
+        browser
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reply = String::new();
+        let _ = browser.read_to_string(&mut reply);
+
+        assert_eq!(waiter.join().unwrap(), Ok("sess-1".to_string()));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(reply.starts_with("HTTP/1.1 200 OK"), "{reply}");
+        assert!(reply.contains("Signed in"), "{reply}");
+    }
+
+    /// An idle connection must not keep the sign-in waiting past its deadline.
+    #[test]
+    fn the_loopback_gives_up_at_its_deadline_with_a_connection_open() {
+        let (listener, address) = callback_listener();
+        let started = Instant::now();
+        let waiter = std::thread::spawn(move || {
+            wait_for_session(listener, "nonce", Duration::from_millis(400))
+        });
+        let _idle = TcpStream::connect(address).unwrap();
+        let result = waiter.join().unwrap();
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_stray_request_is_answered_and_the_wait_goes_on() {
+        let (verdict, _) = callback_verdict("GET /favicon.ico HTTP/1.1", "n");
+        assert!(verdict.is_none());
+        let (verdict, _) = callback_verdict("GET /?fbsession=s&fbstate=bad HTTP/1.1", "n");
+        assert!(verdict.unwrap().is_err());
+    }
+
+    fn session_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "fb-auth-test-{name}-{}-{}",
+            std::process::id(),
+            random_token(6)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn profile() -> UserProfile {
+        UserProfile {
+            id: "u1".to_string(),
+            email: None,
+            username: Some("jane".to_string()),
+            avatar_url: None,
+            email_verified: false,
+        }
+    }
+
+    /// The stored credential is sealed on Windows and in an owner-only file
+    /// elsewhere, and reads back as it was.
+    #[test]
+    fn a_stored_session_is_protected_and_reads_back() {
+        let dir = session_dir("store");
+        let path = dir.join(SESSION_FILE);
+        let session = Session {
+            token: "live-credential-value".to_string(),
+            checked_at: 42,
+            user: profile(),
+        };
+        store_session_at(&path, &session).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        if cfg!(windows) {
+            assert!(!text.contains("live-credential-value"), "{text}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let (loaded, outdated) = load_session_at(&path).unwrap();
+        assert_eq!(loaded.token, "live-credential-value");
+        assert_eq!(loaded.checked_at, 42);
+        assert!(!outdated);
+        // No temporary file is left beside it.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An older build's file (the credential in clear) still signs in, and is
+    /// flagged so it is rewritten protected.
+    #[test]
+    fn an_older_plaintext_session_file_loads_and_is_marked_for_rewrite() {
+        let dir = session_dir("legacy");
+        let path = dir.join(SESSION_FILE);
+        std::fs::write(
+            &path,
+            r#"{"token":"old-credential","checked_at":7,"user":{"id":"u1","email":null,"username":"jane","avatar_url":null}}"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let (loaded, outdated) = load_session_at(&path).unwrap();
+        assert_eq!(loaded.token, "old-credential");
+        assert!(outdated);
+        store_session_at(&path, &loaded).unwrap();
+        let (again, outdated) = load_session_at(&path).unwrap();
+        assert_eq!(again.token, "old-credential");
+        assert!(!outdated);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A plaintext account service would put a live session credential on the

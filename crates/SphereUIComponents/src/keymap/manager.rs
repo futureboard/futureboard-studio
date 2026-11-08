@@ -824,6 +824,24 @@ mod default_binding_tests {
         assert!(conflicts.is_empty(), "{conflicts:#?}");
     }
 
+    /// No shipped profile has a conflict either, once it is layered on the
+    /// default: a shared key would silently run only one of its commands.
+    #[test]
+    fn no_shipped_profile_has_conflicts() {
+        let mut failures = Vec::new();
+        for descriptor in PROFILE_DESCRIPTORS.iter().filter(|p| p.builtin) {
+            let mut manager = fresh();
+            manager.set_active_profile(descriptor.id).unwrap();
+            for row in manager.rows().iter().filter(|row| row.is_conflict) {
+                failures.push(format!(
+                    "{}: {} {:?} vs {:?}",
+                    descriptor.id, row.id, row.keystrokes, row.conflict_with
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
     /// Nothing is bound to a command no handler runs.
     #[test]
     fn no_default_key_is_bound_to_a_missing_command() {

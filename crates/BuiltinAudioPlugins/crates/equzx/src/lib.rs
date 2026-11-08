@@ -21,8 +21,7 @@ use biquad::{Biquad, Coefficients, DirectForm1, ToHertz, Type};
 use builtin_dsp_core::delay::{Smoothed, smoothing_step};
 use builtin_dsp_core::{
     ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, biquad_response_db, clamp,
-    db_to_linear, flush_denormal, linear_to_db, make_eq_coefficients, max_filter_frequency, mix,
-    time_constant,
+    db_to_linear, flush_denormal, linear_to_db, max_filter_frequency, mix, time_constant,
 };
 use serde::{Deserialize, Serialize};
 
@@ -578,7 +577,7 @@ pub fn section_count(band: &BandParams) -> usize {
 /// A first-order Butterworth cut at `freq_hz` (bilinear, prewarped), as a
 /// biquad with its second-order terms zero: −3 dB at the corner, 6 dB/oct
 /// past it.
-fn first_order_cut(high_pass: bool, freq_hz: f32, sample_rate: f32) -> Coefficients<f32> {
+fn first_order_cut(high_pass: bool, freq_hz: f32, sample_rate: f32) -> Coefficients<f64> {
     let fs = f64::from(sample_rate.max(1.0));
     let f0 = f64::from(clamp(freq_hz, 10.0, max_filter_frequency(sample_rate)));
     let k = (std::f64::consts::PI * f0 / fs).tan();
@@ -591,30 +590,34 @@ fn first_order_cut(high_pass: bool, freq_hz: f32, sample_rate: f32) -> Coefficie
         (b0, b0)
     };
     Coefficients {
-        a1: a1 as f32,
+        a1,
         a2: 0.0,
-        b0: b0 as f32,
-        b1: b1 as f32,
+        b0,
+        b1,
         b2: 0.0,
     }
 }
 
 /// Biquad coefficients for one EQ shape: the shared
-/// [`make_eq_coefficients`], with the Q ceiling raised to [`ipc::Q_MAX`].
-/// Below the shared builder's own ceiling of 12 it *is* the shared builder,
-/// so bands saved before the range widened design the same filters.
+/// [`builtin_dsp_core::make_eq_coefficients`]'s shapes and frequency clamp,
+/// with the Q ceiling raised to [`ipc::Q_MAX`], designed in `f64`.
+///
+/// Every filter here runs in `f64` too. A shelf or cut at tens of hertz at
+/// 176.4/192 kHz puts its poles within a few `f32` steps of z = 1: designed
+/// or run in `f32`, rounding alone lands them outside the unit circle and the
+/// band runs away to NaN.
 fn design(
     kind: &str,
     freq_hz: f32,
     gain_db: f32,
     q: f32,
     sample_rate: f32,
-) -> Option<Coefficients<f32>> {
-    if q <= 12.0 {
-        return make_eq_coefficients(kind, freq_hz, gain_db, q, sample_rate);
-    }
+) -> Option<Coefficients<f64>> {
     let fs = sample_rate.max(1.0);
-    let f0 = clamp(freq_hz, 10.0, max_filter_frequency(fs));
+    let f0 = f64::from(clamp(freq_hz, 10.0, max_filter_frequency(fs)));
+    // The shared builder's floor; this EQ's own ceiling.
+    let q = f64::from(clamp(q, 0.1, ipc::Q_MAX));
+    let gain_db = f64::from(gain_db);
     let filter_type = match kind {
         "bell" => Type::PeakingEQ(gain_db),
         "lowshelf" => Type::LowShelf(gain_db),
@@ -625,7 +628,16 @@ fn design(
         "bandpass" => Type::BandPass,
         _ => return None,
     };
-    Coefficients::<f32>::from_params(filter_type, fs.hz(), f0.hz(), q.min(ipc::Q_MAX)).ok()
+    Coefficients::<f64>::from_params(filter_type, f64::from(fs).hz(), f0.hz(), q).ok()
+}
+
+/// One running biquad, in `f64` (see [`design`]).
+type Filter = DirectForm1<f64>;
+
+/// `x` through `filter`, at the `f32` interface.
+#[inline]
+fn run(filter: &mut Filter, x: f32) -> f32 {
+    filter.run(f64::from(x)) as f32
 }
 
 /// The coefficients of section `section` of `band` at gain `gain_db`: for a
@@ -636,7 +648,7 @@ fn section_coefficients(
     section: usize,
     gain_db: f32,
     sample_rate: f32,
-) -> Option<Coefficients<f32>> {
+) -> Option<Coefficients<f64>> {
     if !band.band_type.is_cut() {
         return design(
             band.band_type.section_kind(),
@@ -734,11 +746,11 @@ fn auto_gain_grid(sample_rate: f32) -> AutoGainGrid {
 /// `coefficients`' power gain at one grid point (what
 /// [`biquad_response_db`] computes, with the trig done once).
 #[inline]
-fn power_at(c: &Coefficients<f32>, [cos1, sin1, cos2, sin2]: [f64; 4]) -> f64 {
-    let num_re = f64::from(c.b0) + f64::from(c.b1) * cos1 + f64::from(c.b2) * cos2;
-    let num_im = -(f64::from(c.b1) * sin1 + f64::from(c.b2) * sin2);
-    let den_re = 1.0 + f64::from(c.a1) * cos1 + f64::from(c.a2) * cos2;
-    let den_im = -(f64::from(c.a1) * sin1 + f64::from(c.a2) * sin2);
+fn power_at(c: &Coefficients<f64>, [cos1, sin1, cos2, sin2]: [f64; 4]) -> f64 {
+    let num_re = c.b0 + c.b1 * cos1 + c.b2 * cos2;
+    let num_im = -(c.b1 * sin1 + c.b2 * sin2);
+    let den_re = 1.0 + c.a1 * cos1 + c.a2 * cos2;
+    let den_im = -(c.a1 * sin1 + c.a2 * sin2);
     ((num_re * num_re + num_im * num_im) / (den_re * den_re + den_im * den_im).max(1e-30))
         .max(1e-30)
 }
@@ -884,7 +896,7 @@ impl Glide {
     }
 }
 
-type Cascade = [Option<DirectForm1<f32>>; MAX_SECTIONS];
+type Cascade = [Option<Filter>; MAX_SECTIONS];
 
 const EMPTY_CASCADE: Cascade = [None; MAX_SECTIONS];
 
@@ -897,7 +909,7 @@ pub struct Dsp {
     /// Second processing path: right, or side.
     path_b: [Cascade; BAND_COUNT],
     /// Band-local detector for dynamic EQ (bandpass around the band centre).
-    detector: [Option<DirectForm1<f32>>; BAND_COUNT],
+    detector: [Option<Filter>; BAND_COUNT],
     dyn_state: [DynamicBandState; BAND_COUNT],
     /// Sections each band actually runs, so the audio path never scans past them.
     sections: [u8; BAND_COUNT],
@@ -913,8 +925,8 @@ pub struct Dsp {
     ms_mode: bool,
     routing: Routing,
     /// Audition bandpass for the soloed band, one per path.
-    solo_a: Option<DirectForm1<f32>>,
-    solo_b: Option<DirectForm1<f32>>,
+    solo_a: Option<Filter>,
+    solo_b: Option<Filter>,
     solo_channel: BandChannel,
     /// Linear output gain, smoothed per sample.
     output_gain: Glide,
@@ -1164,8 +1176,7 @@ impl Dsp {
                 _ => SOLO_WIDE_Q,
             };
             (
-                design("bandpass", band.freq, 0.0, q, self.sample_rate)
-                    .map(DirectForm1::<f32>::new),
+                design("bandpass", band.freq, 0.0, q, self.sample_rate).map(Filter::new),
                 band.channel,
             )
         } else {
@@ -1194,7 +1205,7 @@ impl Dsp {
         for section in 0..MAX_SECTIONS {
             let filter = if section < count {
                 section_coefficients(&band, section, band.gain_db, self.sample_rate)
-                    .map(DirectForm1::<f32>::new)
+                    .map(Filter::new)
             } else {
                 None
             };
@@ -1211,7 +1222,7 @@ impl Dsp {
                 BandType::Bell => band.q,
                 _ => SOLO_WIDE_Q,
             };
-            design("bandpass", band.freq, 0.0, q, self.sample_rate).map(DirectForm1::<f32>::new)
+            design("bandpass", band.freq, 0.0, q, self.sample_rate).map(Filter::new)
         } else {
             None
         };
@@ -1252,7 +1263,7 @@ impl Dsp {
     fn dynamic_delta_db(&mut self, index: usize, detector_input: f32) -> f32 {
         let band = self.params.bands[index];
         let detected = match self.detector[index].as_mut() {
-            Some(filter) => filter.run(detector_input).abs(),
+            Some(filter) => run(filter, detector_input).abs(),
             None => detector_input.abs(),
         };
 
@@ -1285,10 +1296,10 @@ impl Dsp {
 
         for section in 0..count {
             if run_a && let Some(filter) = self.path_a[index][section].as_mut() {
-                *a = filter.run(*a);
+                *a = run(filter, *a);
             }
             if run_b && let Some(filter) = self.path_b[index][section].as_mut() {
-                *b = filter.run(*b);
+                *b = run(filter, *b);
             }
         }
     }
@@ -1374,19 +1385,19 @@ impl Dsp {
         // sides on their own rather than folded back into the image.
         if let (Some(solo_a), Some(solo_b)) = (self.solo_a.as_mut(), self.solo_b.as_mut()) {
             return match self.solo_channel {
-                BandChannel::Stereo => (solo_a.run(left) * gain, solo_b.run(right) * gain),
+                BandChannel::Stereo => (run(solo_a, left) * gain, run(solo_b, right) * gain),
                 BandChannel::Mid => {
-                    let mid = solo_a.run((left + right) * 0.5) * gain;
+                    let mid = run(solo_a, (left + right) * 0.5) * gain;
                     (mid, mid)
                 }
                 BandChannel::Side => {
-                    let side = solo_b.run((left - right) * 0.5) * gain;
+                    let side = run(solo_b, (left - right) * 0.5) * gain;
                     (side, -side)
                 }
                 // A one-sided band is auditioned on its own side, the other
                 // silent, so the audition says where the band works.
-                BandChannel::Left => (solo_a.run(left) * gain, 0.0),
-                BandChannel::Right => (0.0, solo_b.run(right) * gain),
+                BandChannel::Left => (run(solo_a, left) * gain, 0.0),
+                BandChannel::Right => (0.0, run(solo_b, right) * gain),
             };
         }
 
@@ -1955,32 +1966,37 @@ mod tests {
 
         let mut params = state.params;
         params.bands[3].dynamic = false;
-        let section = |kind: &str, freq: f32, gain: f32, q: f32| {
-            builtin_dsp_core::make_eq_biquad(kind, freq, gain, q, 48_000.0).expect("filter")
+        // The Cookbook sections the old chain ran, now designed and run in
+        // f64 as the EQ runs them (equal to f32 rounding, not bit for bit).
+        let section = |kind: Type<f64>, freq: f64, q: f32| {
+            DirectForm1::<f64>::new(
+                Coefficients::<f64>::from_params(kind, 48_000.0.hz(), freq.hz(), f64::from(q))
+                    .expect("filter"),
+            )
         };
         let q0 = butterworth_q(4, 0);
         let q1 = butterworth_q(4, 1);
         // Mid path: the cut, the mid bell, the stereo bell; side: the cut,
         // the shelf, the stereo bell — in band order, as the old chain ran.
         let mut mid = [
-            section("highpass", 60.0, 0.0, q0),
-            section("highpass", 60.0, 0.0, q1),
-            section("bell", 900.0, -4.0, 2.0),
-            section("bell", 3000.0, 2.0, 1.0),
+            section(Type::HighPass, 60.0, q0),
+            section(Type::HighPass, 60.0, q1),
+            section(Type::PeakingEQ(-4.0), 900.0, 2.0),
+            section(Type::PeakingEQ(2.0), 3000.0, 1.0),
         ];
         let mut side = [
-            section("highpass", 60.0, 0.0, q0),
-            section("highpass", 60.0, 0.0, q1),
-            section("highshelf", 6000.0, 5.0, 0.7),
-            section("bell", 3000.0, 2.0, 1.0),
+            section(Type::HighPass, 60.0, q0),
+            section(Type::HighPass, 60.0, q1),
+            section(Type::HighShelf(5.0), 6000.0, 0.7),
+            section(Type::PeakingEQ(2.0), 3000.0, 1.0),
         ];
         let mut dsp = Dsp::new(48_000.0);
         dsp.set_params(params);
-        let gain = db_to_linear(-2.0);
+        let gain = f64::from(db_to_linear(-2.0));
         for n in 0..4_000 {
             let l = ((n as f32) * 0.037).sin() * 0.5;
             let r = ((n as f32) * 0.21).sin() * 0.3;
-            let (mut a, mut b) = ((l + r) * 0.5, (l - r) * 0.5);
+            let (mut a, mut b) = (f64::from((l + r) * 0.5), f64::from((l - r) * 0.5));
             for filter in &mut mid {
                 a = filter.run(a);
             }
@@ -1988,7 +2004,69 @@ mod tests {
                 b = filter.run(b);
             }
             let expected = ((a + b) * gain, (a - b) * gain);
-            assert_eq!(dsp.process_stereo(l, r), expected, "sample {n}");
+            let (out_l, out_r) = dsp.process_stereo(l, r);
+            assert!(
+                (f64::from(out_l) - expected.0).abs() < 1.0e-6
+                    && (f64::from(out_r) - expected.1).abs() < 1.0e-6,
+                "sample {n}: {:?} vs {expected:?}",
+                (out_l, out_r)
+            );
+        }
+    }
+
+    /// A low shelf (or high shelf) cornered at tens of hertz puts its poles
+    /// within a few f32 steps of z = 1 at 176.4/192 kHz; the band must stay
+    /// stable there, at the gain it draws, as it does at 44.1–96 kHz.
+    #[test]
+    fn low_corner_shelves_stay_stable_at_every_rate() {
+        for sr in [
+            44_100.0f32,
+            48_000.0,
+            88_200.0,
+            96_000.0,
+            176_400.0,
+            192_000.0,
+        ] {
+            for (kind, freq, gain, q) in [
+                (BandType::LowShelf, 20.0f32, 13.0f32, 0.6f32),
+                (BandType::LowShelf, 10.0, 18.0, 0.1),
+                (BandType::LowShelf, 30.0, -18.0, 2.0),
+                (BandType::HighShelf, 20.0, -13.0, 0.6),
+                (BandType::LowCut, 10.0, 0.0, 0.7),
+            ] {
+                let mut params = default_params();
+                params.auto_gain = false;
+                params.bands[1] = BandParams {
+                    active: true,
+                    band_type: kind,
+                    freq,
+                    gain_db: gain,
+                    q,
+                    channel: BandChannel::Stereo,
+                    ..params.bands[1]
+                };
+                let mut dsp = Dsp::new(sr);
+                dsp.set_params(params.clone());
+                // A −12 dBFS 55 Hz sine riding a little DC, for 8 s.
+                let frames = (sr * 8.0) as usize;
+                let mut peak = 0.0f32;
+                for n in 0..frames {
+                    let x = 0.25 * (std::f32::consts::TAU * 55.0 * n as f32 / sr).sin() + 0.01;
+                    let (l, r) = dsp.process_stereo(x, x);
+                    assert!(
+                        l.is_finite() && r.is_finite(),
+                        "{kind:?} at {sr}: NaN at {n}"
+                    );
+                    peak = peak.max(l.abs());
+                }
+                // Gain at DC and at 55 Hz, as drawn, bounds the steady state.
+                let at = |hz| response_db(&params, BandChannel::Stereo, hz, sr);
+                let bound = 0.26 * db_to_linear(at(1.0).max(at(55.0))) * 1.5;
+                assert!(
+                    peak < bound,
+                    "{kind:?} {freq} Hz {gain} dB at {sr}: peak {peak} over {bound}"
+                );
+            }
         }
     }
 

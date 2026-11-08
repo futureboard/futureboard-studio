@@ -331,17 +331,13 @@ impl StudioLayout {
             .as_deref()
             .is_some_and(SpherePluginHost::builtin_audio_bridge_supported);
         // An Audio Unit has no module file to find; the host's instantiate
-        // reports whether the component is installed.
-        let has_module_file = slot
-            .plugin_format
-            .is_none_or(|format| format.has_module_file());
-        if !is_builtin && has_module_file && !slot.plugin_path.as_ref().is_some_and(|p| p.exists())
-        {
-            let reason = slot
-                .plugin_path
-                .as_ref()
-                .map(|p| format!("Plugin file not found: {}", p.display()))
-                .unwrap_or_else(|| "Plugin file not found".to_string());
+        // reports whether the component is installed. A module that is not
+        // there, or that the plug-in catalog does not know, is not loaded.
+        if let Some(reason) = crate::plugin_module_gate::module_refusal(
+            is_builtin,
+            slot.plugin_format,
+            slot.plugin_path.as_deref(),
+        ) {
             let _ = self.timeline.update(cx, |timeline, _cx| {
                 timeline.state.set_insert_runtime(
                     &target.track_id,

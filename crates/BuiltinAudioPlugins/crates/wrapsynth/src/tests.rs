@@ -388,3 +388,39 @@ fn an_lfo_on_the_cutoff_moves_the_sound() {
         .fold((f32::MAX, 0.0f32), |(lo, hi), &w| (lo.min(w), hi.max(w)));
     assert!(high > low * 1.5, "{low} .. {high}");
 }
+
+/// A key released while the synth is in Poly is gone when it goes back to
+/// Mono: releasing the next key there leaves nothing sounding.
+#[test]
+fn a_key_released_in_another_voice_mode_does_not_stick() {
+    let switch_to = |mode| {
+        move |dsp: &mut Dsp| {
+            let params = Params {
+                voice_mode: mode,
+                ..dsp.params().clone()
+            };
+            dsp.set_params(params);
+        }
+    };
+    let mut dsp = synth(Params {
+        release_ms: 20.0,
+        voice_mode: VoiceMode::Mono,
+        ..default_params()
+    });
+    dsp.note_on(60, 100);
+    render(&mut dsp, 2_000);
+    switch_to(VoiceMode::Poly)(&mut dsp);
+    dsp.note_off(60);
+    render(&mut dsp, 2_000);
+    switch_to(VoiceMode::Mono)(&mut dsp);
+    dsp.note_on(62, 100);
+    render(&mut dsp, 2_000);
+    dsp.note_off(62);
+    render(&mut dsp, 12_000);
+    assert_eq!(dsp.active_voices(), 0, "a released key kept sounding");
+    let tail = render(&mut dsp, 256);
+    assert!(
+        tail.iter()
+            .all(|(l, r)| l.abs() < 1.0e-4 && r.abs() < 1.0e-4)
+    );
+}

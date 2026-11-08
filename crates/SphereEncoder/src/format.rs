@@ -117,9 +117,15 @@ pub struct AudioEncodeSummary {
 
 #[derive(Debug, Clone, Default)]
 pub struct WavEncodeOptions {
-    /// Reserved for future WAV-specific switches (extensible header, fact
-    /// chunk, …). Kept as a unit-ish struct so the options surface is stable.
-    pub _reserved: (),
+    /// Reserve room for an RF64 header (EBU Tech 3306) so the file may grow
+    /// past the 4 GiB RIFF limit.
+    ///
+    /// The header carries a 36-byte `JUNK` chunk ahead of `fmt `, which every
+    /// RIFF reader skips. While the data fits RIFF the file stays a plain
+    /// RIFF/WAVE; once it does not, the header is rewritten in place as
+    /// `RF64` with that chunk turned into `ds64`. Off by default: a file
+    /// written without it keeps the classic 44-byte header.
+    pub rf64: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -269,6 +275,15 @@ pub trait AudioEncoder: Send {
     /// Flush, patch headers/trailers, and close the file. Calling twice is a
     /// no-op-safe error rather than a panic.
     fn finalize(&mut self) -> Result<AudioEncodeSummary, EncodeError>;
+
+    /// Make what has been written so far readable on disk, as if the stream
+    /// ended here, without ending it: a process that dies before
+    /// [`finalize`](AudioEncoder::finalize) then leaves a file that opens up
+    /// to the last checkpoint. Blocks on file I/O; never call it from a
+    /// realtime thread. Formats that cannot do this cheaply do nothing.
+    fn checkpoint(&mut self) -> Result<(), EncodeError> {
+        Ok(())
+    }
 }
 
 /// Whether MP3 encoding is compiled into this build (the `mp3` feature). The UI

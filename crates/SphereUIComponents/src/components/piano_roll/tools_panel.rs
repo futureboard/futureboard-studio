@@ -161,8 +161,14 @@ impl PianoRoll {
     /// The quantize pass the column's settings describe; `Q` and the toolbar
     /// button use it too, so every quantize in the editor agrees.
     pub(super) fn quantize_spec(&self) -> QuantizeSpec {
+        // "1 Bar" is the meter's bar at the clip, not four quarters.
+        let step = if self.quantize_res == GridRes::Bar {
+            self.bar_beats()
+        } else {
+            self.quantize_res.beats()
+        };
         QuantizeSpec {
-            step: self.quantize_res.beats().max(MIN_NOTE_BEATS),
+            step: step.max(MIN_NOTE_BEATS),
             strength: self.tools.quantize_strength as f32 / 100.0,
             swing: self.tools.quantize_swing as f32 / 100.0,
         }

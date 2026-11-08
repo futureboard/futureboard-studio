@@ -56,6 +56,11 @@ const SWAP_FADE_MS: f32 = 8.0;
 /// block. [`NamCapture::begin_block`] caps the live chunk at the host buffer.
 pub const NAM_BLOCK: usize = 64;
 
+/// Upper bound on a [`RateAdapter`]'s latency across the ratios it accepts,
+/// in engine samples — the length of the dry side's extra delay line. The
+/// worst case is the narrowest ratio, about 19 samples; a test pins it.
+pub(super) const MAX_ADAPTER_LATENCY: usize = 32;
+
 /// A `.nam` failed to parse/build, or its sample rate is too far from the
 /// engine's for the rate adapter to bridge.
 #[derive(Debug)]
@@ -495,6 +500,14 @@ pub(super) struct NamCapture {
     /// trimmed signal while `in_*` keeps the untrimmed dry.
     trim_l: Vec<f32>,
     trim_r: Vec<f32>,
+    /// The dry side's delay on top of the block ring, matching the active
+    /// capture's rate adapter: a rate-adapted wet arrives that much later
+    /// than the chunk, and a dry blended without it combs. A ring of
+    /// [`MAX_ADAPTER_LATENCY`] frames; `dry_delay` is 0 for a native capture.
+    dry_l: [f32; MAX_ADAPTER_LATENCY],
+    dry_r: [f32; MAX_ADAPTER_LATENCY],
+    dry_pos: usize,
+    dry_delay: usize,
     /// How many samples of the current block have been written.
     fill: usize,
     /// Samples per inference, and the wet delay. [`NAM_BLOCK`] until a host
@@ -538,6 +551,10 @@ impl NamCapture {
             fade_r: vec![0.0; NAM_BLOCK],
             trim_l: vec![0.0; NAM_BLOCK],
             trim_r: vec![0.0; NAM_BLOCK],
+            dry_l: [0.0; MAX_ADAPTER_LATENCY],
+            dry_r: [0.0; MAX_ADAPTER_LATENCY],
+            dry_pos: 0,
+            dry_delay: 0,
             fill: 0,
             quantum: NAM_BLOCK,
             pending_quantum: None,
@@ -584,6 +601,9 @@ impl NamCapture {
         ] {
             buffer.fill(0.0);
         }
+        self.dry_l = [0.0; MAX_ADAPTER_LATENCY];
+        self.dry_r = [0.0; MAX_ADAPTER_LATENCY];
+        self.dry_pos = 0;
         self.fill = 0;
         if let Some(rt) = self.active.as_mut() {
             rt.reset();
@@ -704,6 +724,11 @@ impl NamCapture {
                     self.fade_l.copy_from_slice(&self.out_l);
                     self.fade_r.copy_from_slice(&self.out_r);
                 }
+                self.dry_delay = self
+                    .active
+                    .as_ref()
+                    .map_or(0, |rt| rt.latency_samples)
+                    .min(MAX_ADAPTER_LATENCY - 1);
                 self.apply_slim_size();
             }
         }
@@ -721,13 +746,14 @@ impl NamCapture {
     /// live chunk ([`NAM_BLOCK`], or the host buffer when that is shorter).
     /// The inference runs once per chunk. Per sample this is only the DC
     /// blocker, the trims and the wet/dry mix — the dry side comes out of the
-    /// same ring as the wet, so the two stay phase-aligned. No allocation, no
+    /// same ring as the wet, then through the rate adapter's delay when the
+    /// capture has one, so the two stay phase-aligned. No allocation, no
     /// locks, no swap logic (see [`Self::begin_block`]).
     #[inline]
     pub(super) fn process(&mut self, left: f32, right: f32) -> (f32, f32) {
         // Read this slot's finished output and the dry sample that produced it
         // *before* the slot is overwritten with the newest input.
-        let dry = (self.in_l[self.fill], self.in_r[self.fill]);
+        let dry = self.delay_dry(self.in_l[self.fill], self.in_r[self.fill]);
         let new_out = (self.out_l[self.fill], self.out_r[self.fill]);
 
         let wet = if self.fading_out.is_some() {
@@ -755,6 +781,17 @@ impl NamCapture {
 
         let m = self.mix;
         (dry.0 * (1.0 - m) + ol * m, dry.1 * (1.0 - m) + or * m)
+    }
+
+    /// The block-delayed dry frame, delayed again by `dry_delay`.
+    #[inline]
+    fn delay_dry(&mut self, left: f32, right: f32) -> (f32, f32) {
+        const LEN: usize = MAX_ADAPTER_LATENCY;
+        self.dry_l[self.dry_pos] = left;
+        self.dry_r[self.dry_pos] = right;
+        let read = (self.dry_pos + LEN - self.dry_delay) % LEN;
+        self.dry_pos = (self.dry_pos + 1) % LEN;
+        (self.dry_l[read], self.dry_r[read])
     }
 
     /// Run the just-filled input block through the active runtime (and the
@@ -1237,5 +1274,79 @@ mod tests {
 
         assert_eq!(run(48_000.0, 32), 0, "native 32-frame process allocated");
         assert_eq!(run(44_100.0, 64), 0, "rate-adapted process allocated");
+    }
+
+    /// The impulse response of a 48 kHz capture rate-adapted into 44.1 kHz,
+    /// at `mix_pct`, and the latency the engine reports for it.
+    fn adapted_impulse(mix_pct: f32) -> (Vec<f32>, usize) {
+        // nam-rs's hand-checked tiny net (see `render_adapted`): positive in,
+        // scaled positive out.
+        const PASSING: &str = r#"{
+            "version": "0.5.4", "architecture": "WaveNet",
+            "config": { "layers": [{
+                "input_size": 1, "condition_size": 1, "channels": 1, "head_size": 1,
+                "kernel_size": 1, "dilations": [1], "activation": "ReLU",
+                "gated": false, "head_bias": false
+            }], "head": null, "head_scale": 1.0 },
+            "weights": [1.0, 2.0, 0.5, 1.0, 3.0, 0.1, 0.5, 10.0],
+            "sample_rate": 48000.0
+        }"#;
+        let prepared = prepare_nam_runtime(PASSING, "t".into(), 44_100.0, false, false)
+            .expect("48 kHz capture adapts into 44.1 kHz");
+        let mut cap = NamCapture::new(44_100.0);
+        cap.configure(0.0, 0.0, mix_pct, false, 1.0);
+        cap.submit(Box::new(prepared));
+        let mut out = Vec::new();
+        for block in 0..8 {
+            cap.begin_block(NAM_BLOCK);
+            for n in 0..NAM_BLOCK {
+                let x = if block == 0 && n == 0 { 0.5 } else { 0.0 };
+                out.push(cap.process(x, x).0);
+            }
+        }
+        (out, cap.latency_samples())
+    }
+
+    /// Issue #168: a rate-adapted capture's dry side waits for the adapter
+    /// too. Dry alone lands exactly on the reported latency, and the wet's
+    /// peak lands there as well, so a partial mix blends aligned signals
+    /// instead of combing.
+    #[test]
+    fn a_rate_adapted_capture_keeps_its_dry_on_the_reported_latency() {
+        let (dry, latency) = adapted_impulse(0.0);
+        assert!(latency > NAM_BLOCK, "the adapter adds latency");
+        for (n, &y) in dry.iter().enumerate() {
+            let expected = if n == latency { 0.5 } else { 0.0 };
+            assert_eq!(y, expected, "dry at {n}, reported latency {latency}");
+        }
+
+        let (wet, _) = adapted_impulse(100.0);
+        let peak = wet
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+            .map(|(n, _)| n)
+            .expect("output");
+        assert!(
+            peak.abs_diff(latency) <= 2,
+            "wet peaks at {peak}, the reported latency is {latency}"
+        );
+    }
+
+    /// The dry line is long enough for every ratio the adapter accepts.
+    #[test]
+    fn the_dry_line_covers_every_adapter_latency() {
+        let engine = 48_000.0;
+        let steps = 64;
+        for i in 0..=steps {
+            let ratio = MIN_RATIO + (MAX_RATIO - MIN_RATIO) * i as f64 / steps as f64;
+            let adapter =
+                RateAdapter::new(engine * ratio, engine, NAM_BLOCK).expect("ratio in range");
+            assert!(
+                adapter.latency_samples() < MAX_ADAPTER_LATENCY,
+                "ratio {ratio}: {} samples",
+                adapter.latency_samples()
+            );
+        }
     }
 }

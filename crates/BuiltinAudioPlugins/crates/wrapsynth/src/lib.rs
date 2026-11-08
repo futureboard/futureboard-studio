@@ -1076,6 +1076,10 @@ impl Dsp {
             return;
         }
         let velocity = f32::from(velocity) / 127.0;
+        // Held keys are tracked in every mode: the mode can change while a
+        // key is down, and a key released in Poly must not linger for Mono
+        // to fall back to.
+        self.held.push(note);
         self.age = self.age.wrapping_add(1);
         let start_pitch = self.start_pitch(note);
         let seed = self.next_seed();
@@ -1159,7 +1163,6 @@ impl Dsp {
         seed: u32,
         mode: VoiceMode,
     ) {
-        self.held.push(note);
         let age = self.age;
         let glide = self.params.glide_ms > 0.0;
         let voice = &mut self.voices[0];
@@ -1196,6 +1199,7 @@ impl Dsp {
     }
 
     fn handle_note_off(&mut self, note: u8) {
+        self.held.remove(note);
         if self.params.voice_mode != VoiceMode::Poly {
             self.note_off_mono(note);
             return;
@@ -1218,7 +1222,6 @@ impl Dsp {
     }
 
     fn note_off_mono(&mut self, note: u8) {
-        self.held.remove(note);
         let mode = self.params.voice_mode;
         let glide = self.params.glide_ms > 0.0;
         let top = self.held.top();

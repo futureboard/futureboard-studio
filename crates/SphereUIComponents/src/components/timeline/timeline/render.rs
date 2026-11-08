@@ -1202,8 +1202,8 @@ impl Render for Timeline {
         });
 
         let on_automation_down = cx.listener(
-            |this, payload: &(String, String, f32, f32, bool, bool, u32), _window, cx| {
-                let (track_id, lane_id, beat, value, additive, alt, click_count) = (
+            |this, payload: &(String, String, f32, f32, bool, bool, u32, f32), _window, cx| {
+                let (track_id, lane_id, beat, value, additive, alt, click_count, hit_beat) = (
                     payload.0.clone(),
                     payload.1.clone(),
                     payload.2,
@@ -1211,11 +1211,13 @@ impl Render for Timeline {
                     payload.4,
                     payload.5,
                     payload.6,
+                    payload.7,
                 );
                 this.begin_automation_interaction(
                     &track_id,
                     &lane_id,
                     beat,
+                    hit_beat,
                     value,
                     additive,
                     alt,

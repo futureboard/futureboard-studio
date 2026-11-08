@@ -506,6 +506,7 @@ mod tests {
             pre_fader: false,
             level_lane: None,
             enabled_lane: None,
+            pdc: Default::default(),
         }
     }
 

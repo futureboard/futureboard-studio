@@ -560,7 +560,11 @@ impl StudioLayout {
             let picked = picked.path().to_path_buf();
             let _ = this.update(cx, |layout, cx| {
                 if let Some(plugin_id) = row.strip_prefix(PLUGIN_ROW) {
-                    layout.relink_plugin(plugin_id, plugin_file_for(picked), cx);
+                    // Picked by hand, so loaded even when no scan has seen it
+                    // (a project alone never gets that far).
+                    let module = plugin_file_for(picked);
+                    crate::plugin_module_gate::trust_user_choice(&module);
+                    layout.relink_plugin(plugin_id, module, cx);
                 } else if let Some(asset) = row.strip_prefix(AUDIO_ROW) {
                     layout.relink_audio(asset, picked, cx);
                 }

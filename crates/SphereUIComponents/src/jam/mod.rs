@@ -486,6 +486,32 @@ pub fn install_with_ingress(
     Ok(())
 }
 
+/// What a host sends on joining when nothing says what to send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DefaultSend {
+    Master,
+    LiveInput,
+}
+
+/// What a host sends on joining, by what it takes from the room.
+///
+/// * **Studio** ([`JamIngress::Routed`]) sends its master: the project's mix,
+///   which holds a remote performer only where a track was deliberately
+///   routed to one.
+/// * **A jam client** ([`JamIngress::Everything`]) sends its live input. Its
+///   master is every remote performer it hears, at the level its faders set;
+///   two clients sending that to each other recirculate whatever enters the
+///   loop for as long as they stay joined, and a fader above unity makes it
+///   run away to full scale. What such a host adds to the room is its own
+///   input, so that is the mix-minus it sends — and the only one: its master
+///   is never published ([`JamController::publish_master`]).
+fn default_send(ingress: JamIngress) -> DefaultSend {
+    match ingress {
+        JamIngress::Routed => DefaultSend::Master,
+        JamIngress::Everything => DefaultSend::LiveInput,
+    }
+}
+
 /// How often the published state is refreshed while a jam is live. The rest of
 /// Studio meters at 30 Hz; anything faster repaints for packets nobody can see
 /// arriving.
@@ -825,10 +851,14 @@ impl JamController {
         // A default that works. Joining a room and being inaudible — with the
         // remedy being an output bus bound to a port on a device you have to
         // know exists — is why this reads as hard to use. When the project says
-        // nothing about what to send, send the mix; it is the one answer that
-        // is right for every room, and one click switches it off.
+        // nothing about what to send, send what this host plays into the room:
+        // see [`default_send`]. One click switches it off.
         if self.published_keys.is_empty() {
-            if let Err(error) = self.publish_master() {
+            let sent = match default_send(self.ingress) {
+                DefaultSend::Master => self.publish_master(),
+                DefaultSend::LiveInput => self.publish_live_input(),
+            };
+            if let Err(error) = sent {
                 self.last_error = Some(error.to_string());
             }
         }
@@ -1062,8 +1092,19 @@ impl JamController {
     /// metronome is [`JamPublishQuality::master_click`]; the engine decides
     /// where to mix the click relative to the tap, so neither answer costs the
     /// stream a resample or a second buffer.
+    ///
+    /// Refused for a host that takes the whole room ([`JamIngress::Everything`]):
+    /// its master is the room itself, so sending it back forms a loop (see
+    /// [`default_send`]).
     pub fn publish_master(&mut self) -> Result<()> {
         self.clear_error();
+        if default_send(self.ingress) != DefaultSend::Master {
+            return Err(JamError::Audio(
+                "this mix is the room itself: sending it back would loop every performer \
+                 through the room again — send your input instead"
+                    .to_string(),
+            ));
+        }
         let Some(session) = self.session.as_ref() else {
             return Err(JamError::Session("not in a jam".to_string()));
         };
@@ -2208,6 +2249,20 @@ mod tests {
         summary.channels = 1;
         summary.channel_metadata.clear();
         assert_eq!(channel_labels(&summary), vec!["Mono"]);
+    }
+}
+
+#[cfg(test)]
+mod default_send_tests {
+    use super::{default_send, DefaultSend, JamIngress};
+
+    /// A host that hears the whole room has the room as its master: sending
+    /// that back loops every performer through the room again. It sends its
+    /// own input; only a host that routes (Studio) sends its mix.
+    #[test]
+    fn a_host_that_takes_the_room_sends_its_input_never_its_mix() {
+        assert_eq!(default_send(JamIngress::Everything), DefaultSend::LiveInput);
+        assert_eq!(default_send(JamIngress::Routed), DefaultSend::Master);
     }
 }
 

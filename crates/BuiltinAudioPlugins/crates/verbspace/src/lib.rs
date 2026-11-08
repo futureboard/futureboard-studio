@@ -616,6 +616,25 @@ impl Absorption {
         high: 1.0,
     };
 
+    /// The three bands' absolute per-pass gains `[middle, low, high]`, each
+    /// at most one in every state the tuning resolves.
+    #[inline]
+    fn bands(self) -> [f32; 3] {
+        [self.gain, self.gain * self.low, self.gain * self.high]
+    }
+
+    /// Back from [`Absorption::bands`].
+    #[inline]
+    fn from_bands(bands: [f32; 3]) -> Self {
+        let gain = bands[0].max(f32::MIN_POSITIVE);
+        let inv = 1.0 / gain;
+        Self {
+            gain,
+            low: bands[1] * inv,
+            high: bands[2] * inv,
+        }
+    }
+
     /// Magnitude of the loss at `hz`.
     fn magnitude(self, low: OnePole, high: OnePole, hz: f32, sample_rate: f32) -> f64 {
         let (lr, li) = low.response(hz, sample_rate);
@@ -913,8 +932,14 @@ struct Line {
     /// Length now, gliding toward `Tuning::lines`.
     delay: f32,
     /// Loss now, gliding toward `Tuning::absorption`: a gain that jumped
-    /// inside the loop would step the running tail.
+    /// inside the loop would step the running tail. Derived from `bands`.
     loss: Absorption,
+    /// The absolute band gains that actually glide. Gliding the middle gain
+    /// and the low/high ratios separately multiplies two glides: from a short
+    /// bass-heavy room to Freeze or a long decay their product passes far
+    /// above one mid-glide and the tank runs away. Each absolute band glides
+    /// between two gains of at most one, so the loop never gains.
+    bands: [f32; 3],
     low_x: f32,
     low_y: f32,
     high_x: f32,
@@ -935,24 +960,16 @@ impl Line {
 
     #[inline]
     fn glide_loss(&mut self, target: Absorption, step: f32) {
-        self.loss.gain += (target.gain - self.loss.gain) * step;
-        self.loss.low += (target.low - self.loss.low) * step;
-        self.loss.high += (target.high - self.loss.high) * step;
-        // The three parts glide on their own, so mid-transition their
-        // product can pass unity even when both ends are stable: Freeze
-        // on/off and a large Decay jump with Bass Mult above 1 both push
-        // `gain x low` far past 1 at DC, and the tank then feeds itself
-        // until it hits Inf (#197). The loop's per-pass gain is `gain x
-        // low` at DC and `gain x high` at Nyquist, so pin the broadband
-        // gain so neither product passes the frozen loop's own ceiling.
-        // The shelves keep gliding, so the pin releases by itself as they
-        // settle, and the endpoints already satisfy it — steady-state
-        // sound is unchanged.
-        let shelf = self.loss.low.max(self.loss.high).max(1.0);
-        let ceiling = FREEZE_GAIN / shelf;
-        if self.loss.gain > ceiling {
-            self.loss.gain = ceiling;
+        let to = target.bands();
+        for (band, to) in self.bands.iter_mut().zip(to) {
+            *band += (to - *band) * step;
         }
+        self.loss = Absorption::from_bands(self.bands);
+    }
+
+    fn set_loss(&mut self, loss: Absorption) {
+        self.loss = loss;
+        self.bands = loss.bands();
     }
 
     #[inline]
@@ -1158,6 +1175,7 @@ impl Dsp {
                 allpass: Allpass::for_ms(TANK_ALLPASS_MS[i], sample_rate),
                 delay: tuning.lines[i],
                 loss: tuning.absorption[i],
+                bands: tuning.absorption[i].bands(),
                 low_x: 0.0,
                 low_y: 0.0,
                 high_x: 0.0,
@@ -1276,7 +1294,7 @@ impl Dsp {
         }
         for (i, line) in self.lines.iter_mut().enumerate() {
             line.delay = self.tuning.lines[i];
-            line.loss = self.tuning.absorption[i];
+            line.set_loss(self.tuning.absorption[i]);
         }
     }
 

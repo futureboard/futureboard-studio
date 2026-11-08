@@ -466,28 +466,36 @@ pub fn validate_saved_studio_bounds(bounds: Bounds<Pixels>, cx: &App) -> Result<
 /// Clamp `bounds` inside the work area of the monitor containing its center (else primary).
 pub fn clamp_bounds_to_work_area(window_bounds: Bounds<Pixels>, cx: &App) -> Bounds<Pixels> {
     let work = monitor_work_area(Some(window_bounds), cx);
-    let w: f32 = window_bounds.size.width.into();
-    let h: f32 = window_bounds.size.height.into();
+    fit_bounds_in_work_area(window_bounds, work)
+}
+
+/// `window` moved — and, when it is larger than `work`, shrunk — so all of it
+/// lies inside `work`.
+///
+/// A size saved on a larger monitor is shrunk to this one rather than placed
+/// with its right and bottom edges, and the resize corner with them, off
+/// screen. The usual 8 px margin is kept on any side the window leaves room
+/// for, and given up rather than pushing the window past the opposite edge.
+fn fit_bounds_in_work_area(window: Bounds<Pixels>, work: Bounds<Pixels>) -> Bounds<Pixels> {
+    const MARGIN: f32 = 8.0;
     let work_x: f32 = work.origin.x.into();
     let work_y: f32 = work.origin.y.into();
     let work_w: f32 = work.size.width.into();
     let work_h: f32 = work.size.height.into();
-    let mut x: f32 = window_bounds.origin.x.into();
-    let mut y: f32 = window_bounds.origin.y.into();
-    let margin = 8.0;
-    if x + w + margin > work_x + work_w {
-        x = work_x + work_w - w - margin;
+    if !(work_w > 0.0 && work_h > 0.0) {
+        return window;
     }
-    if y + h + margin > work_y + work_h {
-        y = work_y + work_h - h - margin;
-    }
-    if x < work_x + margin {
-        x = work_x + margin;
-    }
-    if y < work_y + margin {
-        y = work_y + margin;
-    }
-    gpui::bounds(point(px(x), px(y)), window_bounds.size)
+    let w = f32::from(window.size.width).min(work_w);
+    let h = f32::from(window.size.height).min(work_h);
+    let margin_x = MARGIN.min((work_w - w) / 2.0);
+    let margin_y = MARGIN.min((work_h - h) / 2.0);
+    let x = f32::from(window.origin.x)
+        .min(work_x + work_w - w - margin_x)
+        .max(work_x + margin_x);
+    let y = f32::from(window.origin.y)
+        .min(work_y + work_h - h - margin_y)
+        .max(work_y + margin_y);
+    gpui::bounds(point(px(x), px(y)), size(px(w), px(h)))
 }
 
 fn load_saved_studio_bounds() -> Option<Bounds<Pixels>> {
@@ -662,6 +670,57 @@ mod tests {
             size(px(STUDIO_WINDOW_WIDTH), px(STUDIO_WINDOW_HEIGHT)),
         );
         assert!(!is_unpositioned_spawn_snapshot(moved));
+    }
+
+    fn rect(x: f32, y: f32, w: f32, h: f32) -> Bounds<Pixels> {
+        bounds(point(px(x), px(y)), size(px(w), px(h)))
+    }
+
+    fn parts(b: Bounds<Pixels>) -> (f32, f32, f32, f32) {
+        (
+            b.origin.x.into(),
+            b.origin.y.into(),
+            b.size.width.into(),
+            b.size.height.into(),
+        )
+    }
+
+    /// A size saved on a 2560 px monitor restored on a 1920x1080 one fits the
+    /// work area instead of hanging off its right and bottom edges.
+    #[test]
+    fn a_window_larger_than_the_work_area_is_shrunk_to_fit() {
+        let work = rect(0.0, 0.0, 1920.0, 1040.0);
+        let fitted = fit_bounds_in_work_area(rect(0.0, 0.0, 2560.0, 1400.0), work);
+        assert_eq!(parts(fitted), (0.0, 0.0, 1920.0, 1040.0));
+
+        // Wider only: the height and its margin are kept.
+        let fitted = fit_bounds_in_work_area(rect(300.0, 100.0, 2400.0, 800.0), work);
+        assert_eq!(parts(fitted), (0.0, 100.0, 1920.0, 800.0));
+
+        // A work area that does not start at the origin (a second monitor, a
+        // taskbar on the left).
+        let work = rect(1920.0, 40.0, 1280.0, 984.0);
+        let fitted = fit_bounds_in_work_area(rect(1900.0, 0.0, 1400.0, 1000.0), work);
+        assert_eq!(parts(fitted), (1920.0, 40.0, 1280.0, 984.0));
+    }
+
+    #[test]
+    fn a_window_that_fits_keeps_its_size_and_only_moves_inside() {
+        let work = rect(0.0, 0.0, 1920.0, 1040.0);
+        let inside = rect(100.0, 80.0, 1400.0, 900.0);
+        assert_eq!(parts(fit_bounds_in_work_area(inside, work)), parts(inside));
+
+        let overhanging = rect(800.0, 500.0, 1400.0, 900.0);
+        assert_eq!(
+            parts(fit_bounds_in_work_area(overhanging, work)),
+            (512.0, 132.0, 1400.0, 900.0)
+        );
+
+        let above_left = rect(-300.0, -50.0, 1400.0, 900.0);
+        assert_eq!(
+            parts(fit_bounds_in_work_area(above_left, work)),
+            (8.0, 8.0, 1400.0, 900.0)
+        );
     }
 
     #[test]

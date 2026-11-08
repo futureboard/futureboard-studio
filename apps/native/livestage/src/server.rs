@@ -132,7 +132,9 @@ const USAGE: &str = "usage: livestage-server [--session FILE] [--host NAME] [--i
                         to the session file; with no session, memory only). No users: anyone who
                         reaches the web UI has full control
   --remote FILE         the OSC and MIDI remote settings (default: remote.json next to the session
-                        file; with no session, memory only). OSC listens on the --http address
+                        file; with no session, memory only). OSC listens on this machine only,
+                        unless remote.json sets osc.network and lists the controllers' addresses
+                        in osc.allow; then it listens on the --http address for those only
   --autosave-seconds N  save the session every N seconds when it changed (default 30, 0 = off);
                         it is also saved right after a scene is stored, and on the way out
   --no-autosave         never save the session without being asked
@@ -381,7 +383,8 @@ fn main() {
             let _ = inbound.send(Inbound::Storage(done));
         })
     });
-    // OSC listens where the web UI does (127.0.0.1: this machine only).
+    // OSC listens on loopback, or — set in remote.json — where the web UI
+    // does, for the listed controllers only (see `remote::OscSettings`).
     let remote_ip = options
         .http
         .map_or(std::net::IpAddr::from([127, 0, 0, 1]), |addr| addr.ip());
@@ -397,6 +400,7 @@ fn main() {
     let mut server = Server {
         options,
         clients: Vec::new(),
+        admissions: HashMap::new(),
         catalog: Vec::new(),
         sent_revision: None,
         sent_history: None,
@@ -521,7 +525,7 @@ fn main() {
                 server.push_session_if_changed(&engine);
                 server.push_storage_if_changed(&engine);
             }
-            Ok(Inbound::Joined(id, outbox, peer)) => {
+            Ok(Inbound::Joined(id, outbox, peer, admission)) => {
                 // Bring the others up to now first, so that what the new
                 // client is sent is what everyone has.
                 server.push_session_if_changed(&engine);
@@ -530,11 +534,13 @@ fn main() {
                 server.push_storage_if_changed(&engine);
                 // Its `auth`, then — when it needs no log-in — the rest.
                 server.clients.push((id, outbox));
+                server.admissions.insert(id, admission);
                 server.users.join(id, peer);
                 server.refresh_auth(&engine);
             }
             Ok(Inbound::Left(id)) => {
                 server.clients.retain(|(client, _)| *client != id);
+                server.admissions.remove(&id);
                 server.watches.remove(&id);
                 server.users.leave(id);
             }
@@ -748,6 +754,10 @@ enum Source {
 struct Server {
     options: Options,
     clients: Vec<(ClientId, SyncSender<String>)>,
+    /// Each web client's connection slot, told when the client is let in or
+    /// shut out: one never let in is closed after a while, and is what a
+    /// full server closes to make room (see `web::Slots`).
+    admissions: HashMap<ClientId, web::Admission>,
     /// The inserts each client has an editor open on.
     watches: HashMap<ClientId, HashSet<Id>>,
     /// The inserts the engine was last told to measure: every client's.
@@ -901,6 +911,11 @@ impl Server {
 
     fn refresh_auth_with(&mut self, welcome: impl Fn(&Self, &SyncSender<String>)) {
         for refresh in self.users.refresh() {
+            if let (Some(admitted), Some(admission)) =
+                (refresh.admitted, self.admissions.get(&refresh.client))
+            {
+                admission.set(admitted);
+            }
             let Some(outbox) = self
                 .clients
                 .iter()
@@ -1911,6 +1926,7 @@ mod tests {
         let server = Server {
             options,
             clients: vec![(1, outbox)],
+            admissions: HashMap::new(),
             catalog: Vec::new(),
             sent_revision: None,
             sent_history: None,
