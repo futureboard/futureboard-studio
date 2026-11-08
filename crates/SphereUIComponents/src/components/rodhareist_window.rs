@@ -31,28 +31,28 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    App, AppContext, Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
-    ParentElement, Render, Styled, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle,
-    WindowKind, div, px, size,
+    div, px, size, App, AppContext, Context, FocusHandle, InteractiveElement, IntoElement,
+    KeyDownEvent, ParentElement, Render, Styled, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowHandle, WindowKind,
 };
 use rodharerist::Params;
 
 use crate::components::builtin_plugin_editor::{
-    FileLoad, RODHAREIST_FILES_FOLDER, RodhareistFile, file_load,
+    file_load, FileLoad, RodhareistFile, RODHAREIST_FILES_FOLDER,
 };
 use crate::components::builtin_plugin_editor_window::{
     BuiltinEditorHostOps, BuiltinIrLoadRequest, BuiltinNamLoadRequest, PluginInstanceKey,
 };
 use crate::components::native_plugin_shell::{
-    NativeBuiltinEditor, SHELL_METER_INTERVAL, ShellIdentity, ShellMeter,
     claim_editor_transport_key, native_plugin_shell, swallow_editor_transport_key_up,
+    NativeBuiltinEditor, ShellIdentity, ShellMeter, SHELL_METER_INTERVAL,
 };
 use crate::components::plate;
 use crate::components::rodhareist_panel::{
-    ChainFocus, Page, RodFields, RodUi, chain_frame, rodhareist_panel, tapped_interval,
+    chain_frame, rodhareist_panel, tapped_interval, ChainFocus, Page, RodFields, RodUi,
 };
 use crate::components::text_input::{
-    TextInputAction, TextInputState, bind_mouse_selection, text_field_with_callbacks_and_ime,
+    bind_mouse_selection, text_field_with_callbacks_and_ime, TextInputAction, TextInputState,
 };
 
 /// The editor at its design size, and the smallest it may get.
@@ -160,7 +160,16 @@ fn user_preset_dir() -> PathBuf {
 }
 
 fn list_user_presets() -> Vec<(String, PathBuf)> {
-    let Ok(entries) = std::fs::read_dir(user_preset_dir()) else {
+    list_presets_in(&user_preset_dir())
+}
+
+/// `.pst` files in `dir` this editor can load.
+///
+/// The folder is shared with the VST3 and CLAP. A file whose state belongs
+/// to one of those — or to anything this editor cannot apply — is left out
+/// of the list, and a save will not overwrite it.
+fn list_presets_in(dir: &std::path::Path) -> Vec<(String, PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
     let mut presets = Vec::new();
@@ -169,7 +178,7 @@ fn list_user_presets() -> Vec<(String, PathBuf)> {
         let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
             continue;
         };
-        if !ext.eq_ignore_ascii_case("pst") {
+        if !ext.eq_ignore_ascii_case("pst") || !preset_file_is_ours(&path) {
             continue;
         }
         let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) else {
@@ -182,6 +191,26 @@ fn list_user_presets() -> Vec<(String, PathBuf)> {
     }
     presets.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
     presets
+}
+
+/// Whether `bytes` are a Rodhareist state this editor can apply. The VST3
+/// and CLAP share the folder but store their own plug-in state under their
+/// own id.
+fn preset_state_is_builtin(plugin_id: &str, bytes: &[u8]) -> bool {
+    if plugin_id != rodharerist::PLUGIN_ID {
+        return false;
+    }
+    let Ok(json) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    rodharerist::RodhareistState::from_json(json).is_ok()
+}
+
+fn preset_file_is_ours(path: &std::path::Path) -> bool {
+    let Ok((plugin_id, bytes)) = SpherePluginHost::preset::read_state_preset(path) else {
+        return false;
+    };
+    preset_state_is_builtin(&plugin_id, &bytes)
 }
 
 fn preset_file_stem(name: &str) -> String {
@@ -694,6 +723,13 @@ impl RodhareistEditorWindow {
         };
         let stem = preset_file_stem(&name);
         let path = user_preset_dir().join(format!("{stem}.pst"));
+        // A file this editor cannot load is another format's preset (the
+        // VST3 or the CLAP). Replacing it would destroy that file.
+        if path.exists() && !preset_file_is_ours(&path) {
+            return Err(format!(
+                "A preset named {stem} belongs to another Rodhareist and was left unchanged"
+            ));
+        }
         let loaded = self.user_preset.as_ref().map(|loaded| loaded.name.as_str());
         if save_needs_confirm(
             &stem,
@@ -1420,5 +1456,57 @@ mod tests {
         ));
         // A warning about one name does not cover another.
         assert!(save_needs_confirm("Crunch", true, None, Some("Plexi Lead")));
+    }
+
+    #[test]
+    fn another_formats_preset_is_not_listed_or_treated_as_ours() {
+        let dir = std::env::temp_dir().join(format!(
+            "rodhareist-preset-list-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = rodharerist::RodhareistState::new(rodharerist::default_params())
+            .to_json()
+            .unwrap()
+            .into_bytes();
+        let ours = dir.join("Clean.pst");
+        let foreign = dir.join("Lead.pst");
+        SpherePluginHost::preset::write_state_preset(
+            &ours,
+            &SpherePluginHost::preset::StatePreset {
+                plugin_id: rodharerist::PLUGIN_ID.to_string(),
+                plugin_name: "Rodhareist".to_string(),
+                state: json.clone(),
+            },
+        )
+        .unwrap();
+        SpherePluginHost::preset::write_state_preset(
+            &foreign,
+            &SpherePluginHost::preset::StatePreset {
+                plugin_id: "vst3:rodhareist".to_string(),
+                plugin_name: "Rodhareist".to_string(),
+                state: b"\x00\x01host-state".to_vec(),
+            },
+        )
+        .unwrap();
+
+        assert!(preset_state_is_builtin(rodharerist::PLUGIN_ID, &json));
+        assert!(!preset_state_is_builtin("vst3:rodhareist", &json));
+        assert!(!preset_state_is_builtin(
+            rodharerist::PLUGIN_ID,
+            b"not-json"
+        ));
+        assert!(preset_file_is_ours(&ours));
+        assert!(!preset_file_is_ours(&foreign));
+        let listed = list_presets_in(&dir);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].0, "Clean");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
