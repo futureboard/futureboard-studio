@@ -823,6 +823,7 @@ settings.grid-intensity.percent = { $n }%
 settings.interval.minutes = { $n } min
 settings.language.en = English
 settings.language.ja = Japanese
+settings.language.lo = Lao
 settings.language.th = Thai
 settings.language.zh = Chinese (Simplified)
 settings.latency.approx = ~{ $ms } ms

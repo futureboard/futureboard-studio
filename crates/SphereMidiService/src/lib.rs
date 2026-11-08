@@ -171,6 +171,9 @@ pub fn midi_settings_debug_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("FUTUREBOARD_MIDI_SETTINGS_DEBUG").is_some())
 }
 
+// Pure packet-list traversal, also built for tests so it is exercised off macOS.
+#[cfg(any(target_os = "macos", test))]
+mod coremidi_packets;
 #[cfg(target_os = "macos")]
 mod macos_coremidi;
 

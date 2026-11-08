@@ -12,18 +12,39 @@
 //!
 //! Two values are baked:
 //! - `FUTUREBOARD_AUTH_API_URL` — public account-service origin, not a secret.
-//! - `FUTUREBOARD_TONE3000_API_KEY` — TONE3000 partner Bearer key for Rodhareist
-//!   NAM A2 catalog fetch, **in debug (developer) builds only**. A key compiled
-//!   into a binary can be read back out of it, and release binaries — nightlies
-//!   included — are handed out, so a release build never carries it: it reads
-//!   the key from its runtime environment, or has TONE3000 browsing off.
+//! - The TONE3000 partner Bearer key for Rodhareist NAM A2 catalog fetch, **in
+//!   developer builds only**. A key compiled into a binary can be read back out
+//!   of it, and release binaries — nightlies included — are handed out, so a
+//!   release build never carries it: it reads `FUTUREBOARD_TONE3000_API_KEY`
+//!   from its runtime environment, or has TONE3000 browsing off.
+//!
+//!   "Developer build" is decided by `build_support/tone3000_key_policy.rs`
+//!   (dev profile, opt-level 0 and debug assertions, all three) and fails
+//!   closed. Only then does this script set the `futureboard_tone3000_dev_key`
+//!   cfg and hand the key over under a build-only name
+//!   (`FUTUREBOARD_TONE3000_DEV_BUILD_KEY`); `tone3000.rs` reads it only under
+//!   `cfg(all(debug_assertions, futureboard_tone3000_dev_key))`, so a release
+//!   build has no compile-time read of any key variable and nothing exported in
+//!   the build shell can reach the binary (#241).
 
 use std::path::{Path, PathBuf};
 
+#[path = "build_support/tone3000_key_policy.rs"]
+mod tone3000_key_policy;
+
 fn main() {
+    println!("cargo:rerun-if-changed=build_support/tone3000_key_policy.rs");
     println!("cargo:rerun-if-env-changed=FUTUREBOARD_AUTH_API_URL");
     println!("cargo:rerun-if-env-changed=FUTUREBOARD_TONE3000_API_KEY");
     println!("cargo:rerun-if-env-changed=TONE3000_API_KEY");
+    println!(
+        "cargo:rerun-if-env-changed={}",
+        tone3000_key_policy::DEV_KEY_RUSTC_ENV
+    );
+    println!(
+        "cargo:rustc-check-cfg=cfg({})",
+        tone3000_key_policy::DEV_KEY_CFG
+    );
 
     let manifest_dir = PathBuf::from(
         std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by Cargo"),
@@ -40,12 +61,20 @@ fn main() {
     if let Some(url) = resolve_auth_api_url(&dotenv_path) {
         println!("cargo:rustc-env=FUTUREBOARD_AUTH_API_URL={url}");
     }
-    // Cargo sets PROFILE to "debug" for the dev and test profiles and to
-    // "release" for release and every profile built on it.
-    let developer_build = std::env::var("PROFILE").is_ok_and(|profile| profile == "debug");
-    if developer_build {
+    let profile = std::env::var("PROFILE").ok();
+    let opt_level = std::env::var("OPT_LEVEL").ok();
+    let debug_assertions = std::env::var_os("CARGO_CFG_DEBUG_ASSERTIONS").is_some();
+    if tone3000_key_policy::may_embed_dev_key(
+        profile.as_deref(),
+        opt_level.as_deref(),
+        debug_assertions,
+    ) {
+        println!("cargo:rustc-cfg={}", tone3000_key_policy::DEV_KEY_CFG);
         if let Some(key) = resolve_tone3000_api_key(&dotenv_path) {
-            println!("cargo:rustc-env=FUTUREBOARD_TONE3000_API_KEY={key}");
+            println!(
+                "cargo:rustc-env={}={key}",
+                tone3000_key_policy::DEV_KEY_RUSTC_ENV
+            );
         }
     }
 }

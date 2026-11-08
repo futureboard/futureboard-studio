@@ -49,17 +49,17 @@ use std::time::Instant;
 
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use windows::Win32::Media::MediaFoundation::{
-    IMF2DBuffer, IMFDXGIBuffer, IMFMediaType, IMFSample, IMFSourceReader, MF_MT_DEFAULT_STRIDE,
-    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
-    MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_YUV_MATRIX, MF_PD_DURATION,
+    IMF2DBuffer, IMF2DBuffer2, IMFDXGIBuffer, IMFMediaType, IMFSample, IMFSourceReader,
+    MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
+    MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_YUV_MATRIX, MF_PD_DURATION,
     MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, MF_SOURCE_READER_ALL_STREAMS,
     MF_SOURCE_READER_D3D_MANAGER, MF_SOURCE_READER_DISABLE_DXVA,
     MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
     MF_SOURCE_READER_MEDIASOURCE, MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED,
-    MF_SOURCE_READERF_ENDOFSTREAM, MF_VERSION, MFCreateAttributes, MFCreateMediaType,
-    MFCreateSourceReaderFromURL, MFMediaType_Video, MFNominalRange_0_255, MFSTARTUP_NOSOCKET,
-    MFStartup, MFVideoFormat_ARGB32, MFVideoFormat_NV12, MFVideoFormat_P010, MFVideoFormat_RGB32,
-    MFVideoInterlace_Progressive, MFVideoTransferMatrix_BT709,
+    MF_SOURCE_READERF_ENDOFSTREAM, MF_VERSION, MF2DBuffer_LockFlags_Read, MFCreateAttributes,
+    MFCreateMediaType, MFCreateSourceReaderFromURL, MFMediaType_Video, MFNominalRange_0_255,
+    MFSTARTUP_NOSOCKET, MFStartup, MFVideoFormat_ARGB32, MFVideoFormat_NV12, MFVideoFormat_P010,
+    MFVideoFormat_RGB32, MFVideoInterlace_Progressive, MFVideoTransferMatrix_BT709,
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
 use windows::Win32::System::Variant::VT_I8;
@@ -975,52 +975,73 @@ fn convert_system_memory_yuv(
             .ConvertToContiguousBuffer()
             .map_err(|e| hresult_error("presentation: ConvertToContiguousBuffer", e))?;
 
-        let two_d = buffer.cast::<IMF2DBuffer>().ok();
-        let mut base: *mut u8 = std::ptr::null_mut();
-        let mut pitch = 0i32;
-        let mut locked_len = 0u32;
-
-        if let Some(two_d) = &two_d {
+        // Every read below is bounded by what the lock actually handed back.
+        // `IMF2DBuffer2::Lock2DSize` reports the buffer's real extent next to
+        // the pitch; a buffer without it is read through the plain contiguous
+        // `Lock`, whose current length is the bound. (`IMF2DBuffer::Lock2D`
+        // reports no length at all, so it is not used here.)
+        let two_d = buffer.cast::<IMF2DBuffer2>().ok();
+        let (base, pitch, available) = if let Some(two_d) = &two_d {
+            let mut scanline0: *mut u8 = std::ptr::null_mut();
+            let mut signed_pitch = 0i32;
+            let mut buffer_start: *mut u8 = std::ptr::null_mut();
+            let mut buffer_len = 0u32;
             two_d
-                .Lock2D(&mut base, &mut pitch)
-                .map_err(|e| hresult_error("presentation: IMF2DBuffer::Lock2D", e))?;
+                .Lock2DSize(
+                    MF2DBuffer_LockFlags_Read,
+                    &mut scanline0,
+                    &mut signed_pitch,
+                    &mut buffer_start,
+                    &mut buffer_len,
+                )
+                .map_err(|e| hresult_error("presentation: IMF2DBuffer2::Lock2DSize", e))?;
+            (
+                scanline0,
+                signed_pitch as isize,
+                bytes_after(buffer_start, buffer_len as usize, scanline0),
+            )
         } else {
+            let mut base: *mut u8 = std::ptr::null_mut();
+            let mut locked_len = 0u32;
             buffer
                 .Lock(&mut base, None, Some(&mut locked_len))
                 .map_err(|e| hresult_error("presentation: IMFMediaBuffer::Lock", e))?;
-            pitch = format.abs_stride().max(format.width as usize) as i32;
-        }
+            let pitch = format
+                .abs_stride()
+                .max(format.width as usize * pixel_format.bytes_per_sample());
+            (base, pitch as isize, locked_len as usize)
+        };
 
-        let height = format.height as usize;
-        let luma_pitch = pitch.unsigned_abs() as usize;
-        // NV12/P010 store the full-height luma plane followed by an
-        // interleaved chroma plane of half the height and the same pitch.
-        let total = luma_pitch * height + luma_pitch * height.div_ceil(2);
-        let result = if base.is_null() || luma_pitch == 0 {
-            Err(VideoError::Backend(format!(
-                "presentation: unexpected {} layout {}x{} pitch={pitch}",
+        let layout =
+            semi_planar_layout(pixel_format, format.width, format.height, pitch, available);
+        let result = match layout {
+            Some(layout) if !base.is_null() => {
+                // SAFETY: `semi_planar_layout` only succeeds when both planes
+                // fit in the `available` bytes the lock reported from `base`.
+                let planes = std::slice::from_raw_parts(base as *const u8, layout.total_len);
+                let (luma, chroma) = planes.split_at(layout.luma_len);
+                let (preview_width, preview_height) = format.preview_size();
+                cpu_convert_to_bgra(
+                    YuvPlanes {
+                        luma,
+                        luma_pitch: layout.pitch,
+                        chroma,
+                        chroma_pitch: layout.pitch,
+                        format: pixel_format,
+                        width: format.width,
+                        height: format.height,
+                    },
+                    preview_width,
+                    preview_height,
+                    format.color,
+                )
+            }
+            _ => Err(VideoError::Backend(format!(
+                "presentation: unexpected {} layout {}x{} pitch={pitch} bytes={available}",
                 pixel_format.name(),
                 format.width,
                 format.height
-            )))
-        } else {
-            let planes = std::slice::from_raw_parts(base as *const u8, total);
-            let (luma, chroma) = planes.split_at(luma_pitch * height);
-            let (preview_width, preview_height) = format.preview_size();
-            cpu_convert_to_bgra(
-                YuvPlanes {
-                    luma,
-                    luma_pitch,
-                    chroma,
-                    chroma_pitch: luma_pitch,
-                    format: pixel_format,
-                    width: format.width,
-                    height: format.height,
-                },
-                preview_width,
-                preview_height,
-                format.color,
-            )
+            ))),
         };
 
         if let Some(two_d) = &two_d {
@@ -1040,9 +1061,125 @@ fn convert_system_memory_yuv(
     }
 }
 
+/// Where the planes of a locked NV12/P010 frame sit, from its first scanline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SemiPlanarLayout {
+    /// Row pitch of both planes, in bytes.
+    pitch: usize,
+    /// Bytes of the full-height luma plane; the chroma plane starts here.
+    luma_len: usize,
+    /// Bytes of both planes together.
+    total_len: usize,
+}
+
+/// Lays out an NV12/P010 frame at `pitch` and checks it against the
+/// `available` bytes the lock reported from the first scanline.
+///
+/// NV12/P010 store the full-height luma plane followed by an interleaved chroma
+/// plane of half the height at the same pitch. `None` when the frame does not
+/// fit, when a row is narrower than the image, or when the pitch is not a
+/// positive top-down pitch (walking forward from a bottom-up surface's first
+/// scanline would leave the buffer).
+fn semi_planar_layout(
+    pixel_format: HwPixelFormat,
+    width: u32,
+    height: u32,
+    pitch: isize,
+    available: usize,
+) -> Option<SemiPlanarLayout> {
+    let pitch = usize::try_from(pitch).ok().filter(|pitch| *pitch > 0)?;
+    let row_bytes = (width as usize).checked_mul(pixel_format.bytes_per_sample())?;
+    if pitch < row_bytes {
+        return None;
+    }
+    let height = height as usize;
+    let luma_len = pitch.checked_mul(height)?;
+    let chroma_len = pitch.checked_mul(height.div_ceil(2))?;
+    let total_len = luma_len.checked_add(chroma_len)?;
+    (total_len <= available).then_some(SemiPlanarLayout {
+        pitch,
+        luma_len,
+        total_len,
+    })
+}
+
+/// Bytes from `from` to the end of the `len`-byte buffer at `start`, or zero
+/// when `from` is not inside it.
+fn bytes_after(start: *const u8, len: usize, from: *const u8) -> usize {
+    let (start, from) = (start as usize, from as usize);
+    match from.checked_sub(start) {
+        Some(offset) if offset <= len => len - offset,
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_semi_planar_frame_must_fit_the_locked_buffer() {
+        // 4x4 NV12 at pitch 8: 32 luma bytes, then 2 chroma rows of 8.
+        let exact = semi_planar_layout(HwPixelFormat::Nv12, 4, 4, 8, 48);
+        assert_eq!(
+            exact,
+            Some(SemiPlanarLayout {
+                pitch: 8,
+                luma_len: 32,
+                total_len: 48
+            })
+        );
+        // One byte short of the chroma plane: the regression read past it.
+        assert_eq!(semi_planar_layout(HwPixelFormat::Nv12, 4, 4, 8, 47), None);
+        assert_eq!(semi_planar_layout(HwPixelFormat::Nv12, 4, 4, 8, 0), None);
+    }
+
+    #[test]
+    fn odd_heights_round_the_chroma_plane_up() {
+        // 3 luma rows need 2 chroma rows.
+        let layout = semi_planar_layout(HwPixelFormat::Nv12, 4, 3, 4, 20).expect("fits");
+        assert_eq!((layout.luma_len, layout.total_len), (12, 20));
+        assert_eq!(semi_planar_layout(HwPixelFormat::Nv12, 4, 3, 4, 19), None);
+    }
+
+    #[test]
+    fn p010_rows_need_two_bytes_per_sample() {
+        // A pitch that is wide enough for NV12 is half a P010 row.
+        assert_eq!(
+            semi_planar_layout(HwPixelFormat::P010, 8, 2, 8, 1 << 20),
+            None
+        );
+        let layout = semi_planar_layout(HwPixelFormat::P010, 8, 2, 16, 48).expect("fits");
+        assert_eq!((layout.luma_len, layout.total_len), (32, 48));
+    }
+
+    #[test]
+    fn bottom_up_zero_and_overflowing_pitches_are_rejected() {
+        assert_eq!(
+            semi_planar_layout(HwPixelFormat::Nv12, 4, 4, -8, 1 << 20),
+            None
+        );
+        assert_eq!(
+            semi_planar_layout(HwPixelFormat::Nv12, 4, 4, 0, 1 << 20),
+            None
+        );
+        assert_eq!(
+            semi_planar_layout(HwPixelFormat::Nv12, 4, u32::MAX, isize::MAX, usize::MAX),
+            None
+        );
+    }
+
+    #[test]
+    fn bytes_after_measures_from_the_first_scanline() {
+        let buffer = [0u8; 64];
+        let start = buffer.as_ptr();
+        assert_eq!(bytes_after(start, 64, start), 64);
+        assert_eq!(bytes_after(start, 64, start.wrapping_add(16)), 48);
+        assert_eq!(bytes_after(start, 64, start.wrapping_add(64)), 0);
+        // Outside the buffer on either side: nothing is readable.
+        assert_eq!(bytes_after(start, 64, start.wrapping_add(65)), 0);
+        assert_eq!(bytes_after(start.wrapping_add(8), 56, start), 0);
+    }
 
     #[test]
     fn frame_size_packing_round_trips() {

@@ -769,8 +769,16 @@ impl BuiltinPluginInstance {
         let Some((_, kvs)) = presets.iter().find(|(n, _)| n.eq_ignore_ascii_case(preset_name)) else {
             return false;
         };
+        // One whole-state load, not a run of knob moves: C1073 crossfades
+        // to the preset instead of gliding each value in from the old one.
+        if let BuiltinDsp::C1073(d) = &mut self.dsp {
+            d.begin_state_load();
+        }
         for (k, v) in kvs {
             self.set_param(k, *v);
+        }
+        if let BuiltinDsp::C1073(d) = &mut self.dsp {
+            d.end_state_load();
         }
         self.active_preset = preset_name.to_string();
         true

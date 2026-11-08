@@ -4,6 +4,10 @@
 //! `core-foundation` version. Links Apple's CoreMIDI + CoreFoundation frameworks
 //! directly.
 
+use crate::coremidi_packets::{
+    PACKET_DATA_OFFSET, PACKET_LENGTH_OFFSET, PACKET_LIST_FIRST_PACKET, PACKETS_ARE_4_BYTE_ALIGNED,
+    for_each_packet,
+};
 use crate::{
     DetectedMidiDevice, HardwareMidiInputMessage, MidiDeviceDirection,
     coalesce_detected_midi_devices, decode_midi_bytes, stable_id, stable_id_ordinal,
@@ -49,7 +53,9 @@ const MIDI_PACKET_LIST_BUF: usize = 512;
 /// Largest message one `MIDIPacket` in [`MIDI_PACKET_LIST_BUF`] carries.
 const MAX_PACKET_BYTES: usize = 256;
 
-/// Maximum payload of a single `MIDIPacket`, from `MIDIServices.h`.
+/// The declared size of `MIDIPacket::data` in `MIDIServices.h`. Nominal only:
+/// an incoming packet's `length` can exceed it (a bulk SysEx), and the packet
+/// list is walked by that real length, never by this.
 const PACKET_DATA_CAPACITY: usize = 256;
 
 /// `MIDIPacket` is declared under `#pragma pack(4)` on every Apple target.
@@ -74,13 +80,9 @@ struct MIDIPacketList {
     packet: MIDIPacket,
 }
 
-/// Offsets used to walk a packet list without ever forming a reference to a
-/// packed field. Checked against the struct declarations below so a layout
-/// mistake fails the macOS build instead of silently decoding noise.
-const PACKET_LIST_FIRST_PACKET: usize = 4;
-const PACKET_LENGTH_OFFSET: usize = 8;
-const PACKET_DATA_OFFSET: usize = 10;
-
+// The offsets `coremidi_packets` walks a packet list with, checked against the
+// struct declarations above so a layout mistake fails the macOS build instead
+// of silently decoding noise.
 const _: () = {
     assert!(std::mem::align_of::<MIDIPacket>() == 4);
     assert!(std::mem::size_of::<MIDIPacket>() == 268);
@@ -90,24 +92,6 @@ const _: () = {
     assert!(std::mem::offset_of!(MIDIPacket, length) == PACKET_LENGTH_OFFSET);
     assert!(std::mem::offset_of!(MIDIPacket, data) == PACKET_DATA_OFFSET);
 };
-
-/// Start of the packet that follows one of `length` bytes.
-///
-/// Mirrors `MIDIPacketNext` in `MIDIServices.h`, which is architecture
-/// dependent: ARM aligns each packet up to four bytes, Intel packs them end to
-/// end. Getting this wrong only shows up on multi-message packet lists, so it
-/// has to come from the header rather than from what happens to work locally.
-#[inline]
-unsafe fn next_packet(packet: *const u8, length: usize) -> *const u8 {
-    // SAFETY: the caller walks at most `num_packets` entries of a live list, so
-    // the end of this packet is still inside it.
-    let end = unsafe { packet.add(PACKET_DATA_OFFSET + length) };
-    if cfg!(any(target_arch = "aarch64", target_arch = "arm")) {
-        ((end as usize + 3) & !3) as *const u8
-    } else {
-        end
-    }
-}
 
 /// Stack buffer for building an outgoing packet list. CoreMIDI writes a
 /// `MIDIPacketList` into it, so it has to carry that type's alignment — a bare
@@ -648,7 +632,7 @@ unsafe extern "C" fn midi_read_proc(
         let (mut messages, mut events, mut ignored, mut dropped) = (0u64, 0u64, 0u64, 0u64);
         let mut malformed = 0u64;
 
-        for_each_packet(pktlist, |data| {
+        for_each_packet(pktlist as *const u8, PACKETS_ARE_4_BYTE_ALIGNED, |data| {
             malformed += crate::split_midi_messages(data, &mut running, |message| {
                 messages += 1;
                 match decode_midi_bytes(message) {
@@ -678,35 +662,6 @@ unsafe extern "C" fn midi_read_proc(
             .running_status
             .store(running.unwrap_or(0), Ordering::Relaxed);
         crate::note_midi_input_callback(messages, events, ignored, malformed, dropped);
-    }
-}
-
-/// Hand each packet's payload in `pktlist` to `visit`, in order.
-///
-/// Reads through raw offsets rather than the packed struct so no reference to
-/// an unaligned field is ever formed, and so the traversal can be exercised by
-/// [`tests::a_packet_list_is_walked_at_the_layout_core_midi_actually_uses`]
-/// without a CoreMIDI device attached.
-///
-/// # Safety
-/// `pktlist` must point at a live `MIDIPacketList` holding at least
-/// `num_packets` well-formed packets, as CoreMIDI guarantees for a read proc.
-unsafe fn for_each_packet(pktlist: *const MIDIPacketList, mut visit: impl FnMut(&[u8])) {
-    unsafe {
-        let list = pktlist as *const u8;
-        let num_packets = (list as *const u32).read_unaligned();
-        let mut packet = list.add(PACKET_LIST_FIRST_PACKET);
-        for _ in 0..num_packets {
-            let length = (packet.add(PACKET_LENGTH_OFFSET) as *const u16).read_unaligned() as usize;
-            // A packet can never exceed its declared payload; clamping keeps the
-            // slice inside the buffer even if the length field is nonsense.
-            let length = length.min(PACKET_DATA_CAPACITY);
-            visit(std::slice::from_raw_parts(
-                packet.add(PACKET_DATA_OFFSET),
-                length,
-            ));
-            packet = next_packet(packet, length);
-        }
     }
 }
 
@@ -965,105 +920,4 @@ pub fn open_output(device_id_or_name: &str) -> Option<MacMidiOutputConnection> {
         return None;
     }
     Some(MacMidiOutputConnection { client, port, dest })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Build a `MIDIPacketList` byte-for-byte the way CoreMIDI does.
-    ///
-    /// The offsets and the stride rule are written out as literals taken from
-    /// `MIDIServices.h` rather than from this module's constants, so the test
-    /// fails if those constants drift: `numPackets` at 0, the first packet at
-    /// **4** (not 8 — `MIDIPacket` is `pack(4)`), `timeStamp` at +0, `length` at
-    /// +8, `data` at +10, and each following packet 4-byte aligned on ARM or
-    /// butted directly against the previous payload on Intel.
-    fn build_packet_list(packets: &[&[u8]]) -> Vec<u8> {
-        let mut buffer = Vec::new();
-        buffer.extend_from_slice(&(packets.len() as u32).to_ne_bytes());
-        for payload in packets {
-            assert_eq!(buffer.len() % 4, 0, "packets start 4-byte aligned");
-            buffer.extend_from_slice(&0x1234_5678_9abc_def0u64.to_ne_bytes());
-            buffer.extend_from_slice(&(payload.len() as u16).to_ne_bytes());
-            buffer.extend_from_slice(payload);
-            if cfg!(any(target_arch = "aarch64", target_arch = "arm")) {
-                while buffer.len() % 4 != 0 {
-                    buffer.push(0);
-                }
-            }
-        }
-        // Room for the reader to clamp a payload against without running off
-        // the allocation, mirroring CoreMIDI's oversized packet buffers.
-        buffer.resize(buffer.len() + PACKET_DATA_CAPACITY, 0);
-        buffer
-    }
-
-    fn collect(packets: &[&[u8]]) -> Vec<Vec<u8>> {
-        let buffer = build_packet_list(packets);
-        let mut seen = Vec::new();
-        // SAFETY: `buffer` is a well-formed packet list built above, and it
-        // outlives the walk.
-        unsafe {
-            for_each_packet(buffer.as_ptr() as *const MIDIPacketList, |data| {
-                seen.push(data.to_vec());
-            });
-        }
-        seen
-    }
-
-    #[test]
-    fn a_packet_list_is_walked_at_the_layout_core_midi_actually_uses() {
-        // The regression: reading the first packet through a naturally aligned
-        // `#[repr(C)]` struct put it at offset 8, so `length` landed on the
-        // third data byte and every payload came back as noise.
-        assert_eq!(collect(&[&[0x90, 60, 100]]), vec![vec![0x90, 60, 100]]);
-    }
-
-    #[test]
-    fn every_packet_in_a_multi_packet_list_is_read() {
-        // Wrong stride arithmetic only shows up from the second packet on, and
-        // the correct rule differs between Apple Silicon and Intel.
-        let seen = collect(&[&[0x90, 60, 100], &[0x80, 60, 0], &[0xB0, 7, 90]]);
-        assert_eq!(
-            seen,
-            vec![vec![0x90, 60, 100], vec![0x80, 60, 0], vec![0xB0, 7, 90]]
-        );
-    }
-
-    #[test]
-    fn packets_of_uneven_length_keep_the_walk_aligned() {
-        let seen = collect(&[&[0xF8], &[0x90, 60, 100], &[0xC0, 5], &[0x90, 64, 100]]);
-        assert_eq!(
-            seen,
-            vec![
-                vec![0xF8],
-                vec![0x90, 60, 100],
-                vec![0xC0, 5],
-                vec![0x90, 64, 100]
-            ]
-        );
-    }
-
-    #[test]
-    fn a_coalesced_packet_reaches_the_splitter_intact() {
-        // CoreMIDI puts messages that share a timestamp in one packet; the
-        // payload has to arrive whole for `split_midi_messages` to unpack it.
-        let payload: &[u8] = &[0x90, 60, 100, 0x90, 64, 100, 0x90, 67, 100];
-        assert_eq!(collect(&[payload]), vec![payload.to_vec()]);
-
-        let mut running = None;
-        let mut events = Vec::new();
-        crate::split_midi_messages(payload, &mut running, |message| {
-            if let Some(event) = decode_midi_bytes(message) {
-                events.push(event);
-            }
-        });
-        assert_eq!(events.len(), 3, "the whole chord must decode");
-    }
-
-    #[test]
-    fn an_empty_packet_list_is_a_no_op() {
-        assert!(collect(&[]).is_empty());
-    }
 }

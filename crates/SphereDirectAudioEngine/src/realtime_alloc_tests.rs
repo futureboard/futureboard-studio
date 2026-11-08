@@ -14,7 +14,8 @@ use crossbeam_channel::bounded;
 
 use crate::backend::render::{drain_commands, LocalAudioState};
 use crate::command::{EngineCommand, TempoMapChange};
-use crate::engine::{AudioEngineState, SharedState, SlowBlock, SlowBlockReport};
+use crate::engine::{AudioEngineState, EngineInner, SharedState, SlowBlock, SlowBlockReport};
+use crate::graveyard::test_hooks as graveyard_hooks;
 use crate::runtime::{
     build_unresolved_midi_schedule, midi_block_event_capacity, RuntimeMidiData, RuntimeMidiEvent,
     RuntimeMidiEventKind, RuntimeMidiTrack, RuntimeProject,
@@ -356,6 +357,98 @@ fn set_tempo_map_without_a_prepared_schedule_retimes_in_place_without_heap_work(
         event_samples(&reference.midi_tracks)
     );
 }
+// ── #238: the first tempo command after a device open ──────────────────────
+
+/// Heap events, graveyard drop-threads spawned and retired values leaked on
+/// the calling thread while the callback drains `cmd`.
+struct CallbackCost {
+    heap: u64,
+    spawns: u64,
+    leaks: u64,
+}
+
+/// Play the callback for one command: no warm-up pass, so anything the
+/// callback still initialises lazily — a graveyard channel and its thread, a
+/// cached debug flag — shows up here, as it would on the first real block.
+fn callback_drains(
+    cmd: EngineCommand,
+    runtime: &mut RuntimeProject,
+    shared: &Arc<SharedState>,
+    local: &mut LocalAudioState,
+) -> CallbackCost {
+    let (tx, rx) = bounded(1);
+    tx.send(cmd).unwrap();
+    let spawns = graveyard_hooks::worker_spawns_on_this_thread();
+    let leaks = graveyard_hooks::leaks_on_this_thread();
+    let (_, heap) = count_heap_events(|| drain_commands(&rx, runtime, shared, local, SR));
+    CallbackCost {
+        heap,
+        spawns: graveyard_hooks::worker_spawns_on_this_thread() - spawns,
+        leaks: graveyard_hooks::leaks_on_this_thread() - leaks,
+    }
+}
+
+fn assert_realtime_clean(cost: CallbackCost, what: &str) {
+    assert_eq!(
+        cost.spawns, 0,
+        "{what}: spawned a graveyard thread on the callback"
+    );
+    assert_eq!(cost.heap, 0, "{what}: allocated or freed on the callback");
+    assert_eq!(cost.leaks, 0, "{what}: had no graveyard to retire into");
+}
+
+/// The Jam order: the engine is created and a device opened before any
+/// project is loaded. The re-seed's `SetTempoMap` is the callback's first
+/// tempo command and its first use of the tempo graveyard; it must find the
+/// graveyard already running. A user tempo edit that follows is clean too.
+#[test]
+fn first_tempo_command_after_engine_creation_and_device_open_is_realtime_clean() {
+    let engine = EngineInner::new();
+    let (rx, mut runtime) = engine.open_test_stream(SR);
+    let shared = Arc::clone(&engine.shared);
+    let mut local = LocalAudioState::new(SR as f64);
+
+    let first = rx
+        .try_recv()
+        .expect("the device open re-seeds the callback");
+    assert!(matches!(first, EngineCommand::SetTempoMap(_)));
+    let cost = callback_drains(first, &mut runtime, &shared, &mut local);
+    assert_realtime_clean(cost, "the re-seed's SetTempoMap");
+    assert!(crate::graveyard::is_primed());
+    // The rest of the re-seed (time signature, metronome) is not under test.
+    drain_commands(&rx, &mut runtime, &shared, &mut local, SR);
+
+    engine.set_tempo_map(90.0, Vec::new()).unwrap();
+    let edit = rx.try_recv().expect("a tempo edit reaches the callback");
+    let cost = callback_drains(edit, &mut runtime, &shared, &mut local);
+    assert_realtime_clean(cost, "a tempo edit");
+    let tempo_90 = RuntimeTempoMapSnapshot::static_tempo(90.0);
+    assert_eq!(runtime.tempo_map.segments, tempo_90.segments);
+    assert_eq!(
+        local.tempo_map.segments, tempo_90.segments,
+        "metronome follows"
+    );
+}
+
+/// Close and reopen the device with nothing in between that would have
+/// initialised the graveyard on the control thread: the reopened callback's
+/// first tempo command is still clean.
+#[test]
+fn first_tempo_command_after_a_device_reopen_is_realtime_clean() {
+    let engine = EngineInner::new();
+    let (first_stream, _) = engine.open_test_stream(SR);
+    drop(first_stream);
+    engine.close_device();
+    let (rx, mut runtime) = engine.open_test_stream(SR);
+    let shared = Arc::clone(&engine.shared);
+    let mut local = LocalAudioState::new(SR as f64);
+
+    let first = rx.try_recv().expect("the reopen re-seeds the callback");
+    assert!(matches!(first, EngineCommand::SetTempoMap(_)));
+    let cost = callback_drains(first, &mut runtime, &shared, &mut local);
+    assert_realtime_clean(cost, "the reopen's SetTempoMap");
+}
+
 /// The in-place re-time keeps the schedule order the stable sort gives, even
 /// where the new tempo pulls apart events that shared a sample and were
 /// ordered by kind (a note-off just after a note-on, same sample at 120 BPM).

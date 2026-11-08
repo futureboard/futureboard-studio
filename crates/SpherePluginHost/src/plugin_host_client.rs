@@ -869,6 +869,21 @@ impl PluginHostClient {
     ) -> Result<(), PluginHostClientError> {
         self.send(&HostCommand::CloseEditor {
             plugin_instance_id: plugin_instance_id.into(),
+            editor_generation: None,
+        })
+    }
+
+    /// As [`Self::close_editor`], naming the window the view is attached to.
+    /// The host's [`crate::ipc::HostEvent::EditorClosed`] for this close
+    /// carries the same `editor_generation` back.
+    pub fn close_editor_generation(
+        &mut self,
+        plugin_instance_id: impl Into<String>,
+        editor_generation: u64,
+    ) -> Result<(), PluginHostClientError> {
+        self.send(&HostCommand::CloseEditor {
+            plugin_instance_id: plugin_instance_id.into(),
+            editor_generation: Some(editor_generation),
         })
     }
 

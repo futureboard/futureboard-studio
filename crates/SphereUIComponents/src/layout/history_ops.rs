@@ -218,9 +218,17 @@ impl StudioLayout {
             let before = crate::components::builtin_plugin_editor::builtin_state_replay(
                 &plugin_id, insert_id,
             );
-            crate::components::builtin_plugin_editor::builtin_state_seed(
+            // Replace, not seed: the insert already has live state, and a
+            // seed leaves that alone — which made a preset load, a paste and
+            // an undo of either a no-op (#234).
+            if !crate::components::builtin_plugin_editor::builtin_state_replace(
                 &plugin_id, insert_id, &state,
-            );
+            ) {
+                eprintln!(
+                    "[history] state for insert={insert_id} is not {plugin_id}'s; left as it was"
+                );
+                return;
+            }
             let baseline = (!before.is_empty()).then_some(before);
             self.replay_builtin_insert_state(insert_id, baseline, cx);
             self.refresh_builtin_editor_sidebars(cx);

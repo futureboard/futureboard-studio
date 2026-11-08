@@ -36,6 +36,14 @@ pub fn vst3_midi_debug_enabled() -> bool {
     })
 }
 
+/// Read this module's cached debug flags once, on a control thread: the first
+/// read takes the environment (and allocates), which must not happen in the
+/// callback. See `crate::engine::prime_audio_thread_resources`.
+pub(crate) fn prime_debug_flags() {
+    let _ = vst3_midi_debug_enabled();
+    let _ = vst3_context_debug_enabled();
+}
+
 fn vst3_context_debug_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| {

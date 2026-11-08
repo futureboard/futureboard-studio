@@ -663,8 +663,14 @@ impl Render for QuickSamplerEditorWindow {
             .relative()
             .size_full()
             .track_focus(&self.focus_handle)
-            .capture_key_down(|event, window, cx| {
-                claim_editor_transport_key(event, window, cx);
+            .capture_key_down({
+                // An open Presets list types Space into its filter (#227).
+                let presets = self.presets.clone();
+                move |event, window, cx| {
+                    if !presets.read(cx).owns_keyboard(window) {
+                        claim_editor_transport_key(event, window, cx);
+                    }
+                }
             })
             .on_key_up(|_event, window, cx| swallow_editor_transport_key_up(window, cx))
             // A marker drag follows the pointer anywhere in the window and

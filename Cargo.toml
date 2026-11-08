@@ -251,7 +251,7 @@ solfege-acoustic = { git = "https://github.com/futureboard/solfage-engine" }
 fbmx-runtime = { git = "https://github.com/futureboard/fbmx-runtime" }
 # Pure-Rust ONNX inference (CPU) for offline audio analysis. Dual MIT/Apache-2.0.
 # Re-exports `tract_ndarray` via its prelude.
-tract-onnx = "0.21"
+tract-onnx = "0.22.2"
 # ONNX Runtime bindings for GPU-capable MDX-NET stem inference (CUDA/DirectML/CoreML).
 # `load-dynamic` resolves the ONNX Runtime shared library at runtime (from
 # `ORT_DYLIB_PATH` or the system path) instead of downloading/linking at build

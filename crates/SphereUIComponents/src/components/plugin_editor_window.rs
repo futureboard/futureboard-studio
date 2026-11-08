@@ -92,8 +92,9 @@ struct HostEditorBackend {
     /// a shared host is a later optimization). Drop shuts it down.
     client: Option<PluginHostClient>,
     shared: Option<SharedPluginBridgeRuntime>,
-    /// Main-app-owned `WS_CHILD` content HWND the host attaches the view into.
-    content: Option<ContentChildHwnd>,
+    /// Main-app-owned `WS_CHILD` content HWND the host attaches the view into,
+    /// with the generation that names it to the host.
+    content: Option<OwnedContent>,
     plugin_path: String,
     class_id: String,
     /// Captured from `HostEvent::Ready` for diagnostics.
@@ -292,6 +293,66 @@ const MAX_PLUGIN_EDITOR_PREFERRED_SIZE: i32 = 4096;
 /// milliseconds; this only bounds a host that hung or died without saying so.
 const PARKED_CONTENT_MAX_WAIT: Duration = Duration::from_secs(5);
 
+/// Ownership token of one content child: one open of one plug-in's editor into
+/// one window.
+///
+/// A plug-in instance id does not identify a content child. Switching tabs
+/// A → B → A gives A a second child while the first still waits for the host
+/// to let go of it, and an answer naming only "A" cannot say which of the two
+/// it is about. Every child gets a generation of its own, never reused; the
+/// `CloseEditor` that asks the host to detach the view carries it, and the
+/// host's `EditorClosed` echoes it back.
+///
+/// A close sent with no child to release (nothing was attached yet) still gets
+/// a fresh generation, so its answer is recognisably a reply to this process
+/// rather than the user closing the plug-in's own window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ContentGeneration(u64);
+
+impl ContentGeneration {
+    fn next() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+/// A content child the editor window currently owns, with its generation.
+struct OwnedContent {
+    generation: ContentGeneration,
+    child: ContentChildHwnd,
+}
+
+/// What became of the request to detach a parked child's view, which decides
+/// whether the deadline may destroy it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseRequest {
+    /// The host was sent `CloseEditor` for this generation. Its
+    /// `EditorClosed` releases the child; a host that never answers is hung or
+    /// dead, and the deadline bounds the wait.
+    Sent,
+    /// The host process is gone, and the view with it. Nothing will answer;
+    /// the deadline frees the child.
+    HostGone,
+    /// The close could not be delivered to a host that may still be running.
+    /// Nothing told it to let go, so a view may still be attached: the child
+    /// is never destroyed on a timer, and stays hidden until the process ends.
+    Undelivered,
+}
+
+impl CloseRequest {
+    fn may_expire(self) -> bool {
+        !matches!(self, Self::Undelivered)
+    }
+}
+
+struct ParkedContent<T> {
+    instance_id: String,
+    generation: ContentGeneration,
+    parked_at: Instant,
+    close: CloseRequest,
+    content: T,
+}
+
 /// Content children whose plug-in view the host was asked to detach, waiting
 /// for it to say it has.
 ///
@@ -300,9 +361,14 @@ const PARKED_CONTENT_MAX_WAIT: Duration = Duration::from_secs(5);
 /// after this process has moved on — to another tab, to the crash panel, or to
 /// destroying the editor window. Destroying the child before then destroys the
 /// plug-in's window under an attached view. Each child waits here, hidden and
-/// out of the editor window, until its `EditorClosed` or the deadline.
+/// out of the editor window, until the `EditorClosed` for its own generation
+/// or the deadline.
+///
+/// Only superseded children are ever here: the one an editor window currently
+/// shows belongs to that window, and enters this ledger only once the window
+/// has moved off it and asked the host to let go. Nothing here can reach it.
 struct ParkedContents<T> {
-    entries: Vec<(String, Instant, T)>,
+    entries: Vec<ParkedContent<T>>,
 }
 
 impl<T> ParkedContents<T> {
@@ -312,35 +378,63 @@ impl<T> ParkedContents<T> {
         }
     }
 
-    fn park(&mut self, instance_id: String, content: T, now: Instant) {
-        self.entries.push((instance_id, now, content));
+    fn park(
+        &mut self,
+        instance_id: String,
+        generation: ContentGeneration,
+        content: T,
+        close: CloseRequest,
+        now: Instant,
+    ) {
+        debug_assert!(
+            !self
+                .entries
+                .iter()
+                .any(|entry| entry.generation == generation),
+            "a content generation is parked once"
+        );
+        self.entries.push(ParkedContent {
+            instance_id,
+            generation,
+            parked_at: now,
+            close,
+            content,
+        });
     }
 
-    /// Everything waiting on `instance_id`, which the host has let go of, plus
-    /// whatever has waited past `max_wait`.
-    fn take_released(&mut self, instance_id: &str, now: Instant, max_wait: Duration) -> Vec<T> {
-        self.take_where(|id, parked_at| {
-            id == instance_id || now.saturating_duration_since(parked_at) >= max_wait
-        })
+    /// The child of exactly `generation`, whose view the host has detached.
+    ///
+    /// Any other child of the same instance — an older one still waiting on
+    /// its own answer, or a newer one — stays. A generation this ledger does
+    /// not hold (already released, expired, or never parked) releases nothing.
+    fn release(&mut self, instance_id: &str, generation: ContentGeneration) -> Option<T> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.generation == generation && entry.instance_id == instance_id)?;
+        Some(self.entries.remove(index).content)
     }
 
-    /// Whatever has waited past `max_wait`.
+    /// Whatever has waited past `max_wait` for an answer that may never come.
+    /// A child whose close was never delivered is not among them.
     fn take_expired(&mut self, now: Instant, max_wait: Duration) -> Vec<T> {
-        self.take_where(|_, parked_at| now.saturating_duration_since(parked_at) >= max_wait)
-    }
-
-    fn take_where(&mut self, done: impl Fn(&str, Instant) -> bool) -> Vec<T> {
         let mut taken = Vec::new();
         let mut index = 0;
         while index < self.entries.len() {
-            let (id, parked_at, _) = &self.entries[index];
-            if done(id, *parked_at) {
-                taken.push(self.entries.remove(index).2);
+            let entry = &self.entries[index];
+            if entry.close.may_expire()
+                && now.saturating_duration_since(entry.parked_at) >= max_wait
+            {
+                taken.push(self.entries.remove(index).content);
             } else {
                 index += 1;
             }
         }
         taken
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
@@ -351,8 +445,8 @@ struct ParkedOnUiThread(ParkedContents<ContentChildHwnd>);
 
 impl Drop for ParkedOnUiThread {
     fn drop(&mut self) {
-        for (_, _, content) in self.0.entries.drain(..) {
-            std::mem::forget(content);
+        for entry in self.0.entries.drain(..) {
+            std::mem::forget(entry.content);
         }
     }
 }
@@ -363,36 +457,85 @@ thread_local! {
 }
 
 /// Hides `content`, moves it out of its editor window and keeps it until the
-/// host reports `instance_id`'s view detached.
-fn park_editor_content(instance_id: String, mut content: ContentChildHwnd) {
-    content.park();
-    let expired = PARKED_CONTENT.with(|parked| {
+/// host reports its generation's view detached.
+fn park_editor_content(instance_id: String, content: OwnedContent, close: CloseRequest) {
+    let OwnedContent {
+        generation,
+        mut child,
+    } = content;
+    if !child.is_valid() {
+        // Its window is gone already, and the child with it: there is nothing
+        // left to keep alive, only a stale handle to forget.
+        return;
+    }
+    child.park();
+    if close == CloseRequest::Undelivered {
+        eprintln!(
+            "[plugin-editor-window] close undelivered instance={instance_id} generation={} \
+             (content kept hidden; never destroyed on a timer)",
+            generation.0
+        );
+    }
+    let mut child = Some(child);
+    let expired = PARKED_CONTENT.try_with(|parked| {
         let mut parked = parked.borrow_mut();
         let now = Instant::now();
-        parked.0.park(instance_id, content, now);
+        if let Some(child) = child.take() {
+            parked.0.park(instance_id, generation, child, close, now);
+        }
         parked.0.take_expired(now, PARKED_CONTENT_MAX_WAIT)
     });
+    // The UI thread is already ending: forgotten, like everything parked.
+    if let Some(child) = child {
+        std::mem::forget(child);
+    }
     // Destroyed outside the borrow: destroying a window dispatches messages.
     drop(expired);
 }
 
-/// The host reported `instance_id`'s editor closed: its view has let go of
-/// the content child, which can now be destroyed.
-pub(crate) fn release_parked_editor_content(instance_id: &str) {
+/// The host reported the view of `instance_id`'s content child `generation`
+/// detached: that child, and only that one, can now be destroyed.
+///
+/// `None` is an `EditorClosed` that answers no close of this process's — the
+/// user closed a host-owned window — or comes from a host too old to echo the
+/// generation. It names no child, so it releases none; the deadline covers
+/// those.
+pub(crate) fn release_parked_editor_content(instance_id: &str, generation: Option<u64>) {
+    let Some(generation) = generation else {
+        return;
+    };
     let released = PARKED_CONTENT.with(|parked| {
         parked
             .borrow_mut()
             .0
-            .take_released(instance_id, Instant::now(), PARKED_CONTENT_MAX_WAIT)
+            .release(instance_id, ContentGeneration(generation))
     });
+    if plugin_view_debug() {
+        eprintln!(
+            "[plugin-editor-window] EditorClosed instance={instance_id} generation={generation} \
+             released_parked={}",
+            released.is_some()
+        );
+    }
     drop(released);
+}
+
+/// See [`PluginEditorWindow::host_closed_editor`].
+fn host_closed_editor(event: &ClientEvent) -> bool {
+    matches!(
+        event,
+        ClientEvent::Host(HostEvent::EditorClosed {
+            editor_generation: None,
+            ..
+        }) | ClientEvent::Disconnected
+    )
 }
 
 /// Destroys parked content children whose host never answered.
 pub(crate) fn sweep_parked_editor_content() {
     let expired = PARKED_CONTENT.with(|parked| {
         let mut parked = parked.borrow_mut();
-        if parked.0.entries.is_empty() {
+        if parked.0.is_empty() {
             return Vec::new();
         }
         parked
@@ -1357,15 +1500,12 @@ impl PluginEditorWindow {
     /// User-initiated retry from the failure panel: tear down any partial state
     /// and restart the lifecycle from `Opening`.
     fn retry(&mut self, cx: &mut Context<Self>) {
-        if self.embed_handle.take().is_some() {
-            // Detach the editor view only — the runtime processor keeps running.
-            // Order matters: the plug-in lets go of the child window, and only
-            // then is the child destroyed.
-            if let Some(processor) = self.processor.as_ref() {
-                processor.view_detach();
-            }
-            self.view_content = None;
-        }
+        // Detach the editor view only — the runtime processor keeps running.
+        // Order matters: the plug-in lets go of the child window, and only
+        // then is the child destroyed. On the host path a content child left
+        // from the failed attempt is parked like any other rather than being
+        // replaced — and destroyed — by the next attach's.
+        self.release_active_view();
         self.status = PluginEditorStatus::Opening;
         self.wait_ticks = 0;
         self.host_mounted_logged = false;
@@ -1674,7 +1814,10 @@ impl PluginEditorWindow {
         };
         {
             let host = self.host.as_mut().unwrap();
-            host.content = Some(content);
+            host.content = Some(OwnedContent {
+                generation: ContentGeneration::next(),
+                child: content,
+            });
             let pid = host
                 .host_pid
                 .map(|p| p.to_string())
@@ -2177,7 +2320,7 @@ impl PluginEditorWindow {
         self.close_preset_menu(cx);
         // The view died with its process; what is left here is the content
         // child it was parented to.
-        self.release_active_view();
+        self.release_view_of_lost_host();
         self.status = PluginEditorStatus::Crashed(detail);
         self.wait_ticks = 0;
         self.last_region = None;
@@ -2230,6 +2373,17 @@ impl PluginEditorWindow {
 
     /// Detaches whatever this window currently hosts, without closing it.
     fn release_active_view(&mut self) {
+        self.release_view(false);
+    }
+
+    /// As [`Self::release_active_view`], for a view whose host process has
+    /// died: nothing is attached to the content child any more, so it may go
+    /// on the deadline even if the close cannot be delivered.
+    fn release_view_of_lost_host(&mut self) {
+        self.release_view(true);
+    }
+
+    fn release_view(&mut self, host_gone: bool) {
         if self.embed_handle.take().is_some() {
             if let Some(processor) = self.processor.as_ref() {
                 processor.view_detach();
@@ -2242,17 +2396,37 @@ impl PluginEditorWindow {
             } else {
                 format!("{}::{}", self.track_id, self.insert_id)
             };
-            if let Some(shared) = host.shared.as_ref() {
-                if let Ok(mut runtime) = shared.lock() {
-                    runtime.close_editor(closing.clone());
-                }
+            let content = host.content.take();
+            // The close names the child it releases, and the answer echoes it:
+            // a late answer to an older close of the same plug-in then cannot
+            // release this child. With no child, a fresh generation still marks
+            // the answer as a reply rather than the user closing the editor.
+            let generation = content
+                .as_ref()
+                .map(|content| content.generation)
+                .unwrap_or_else(ContentGeneration::next);
+            let sent = if let Some(shared) = host.shared.as_ref() {
+                shared.lock().is_ok_and(|mut runtime| {
+                    runtime.close_editor_generation(closing.clone(), generation.0)
+                })
             } else if let Some(client) = host.client.as_mut() {
-                let _ = client.close_editor(closing.clone());
-            }
+                client
+                    .close_editor_generation(closing.clone(), generation.0)
+                    .is_ok()
+            } else {
+                false
+            };
             // The host detaches the view when it handles the close, after this
             // returns; the content child it is attached to waits for that.
-            if let Some(content) = host.content.take() {
-                park_editor_content(closing, content);
+            if let Some(content) = content {
+                let close = if host_gone {
+                    CloseRequest::HostGone
+                } else if sent {
+                    CloseRequest::Sent
+                } else {
+                    CloseRequest::Undelivered
+                };
+                park_editor_content(closing, content, close);
             }
         }
         self.view_content = None;
@@ -2308,6 +2482,19 @@ impl PluginEditorWindow {
         // Preferred-size events arrive here; auto-size the shell as soon as one
         // lands (Part 3) rather than only on the next render-driven `drive_host`.
         self.apply_host_preferred_size(window);
+    }
+
+    /// Whether `event` means the plug-in's editor went away on the host's side
+    /// — the host process is gone, or the user closed the plug-in's own
+    /// window — rather than answering a close this process sent.
+    ///
+    /// An answer to one of this window's own closes echoes the generation the
+    /// close named, and arrives whenever the host gets to it: after a tab
+    /// switch, possibly after the same plug-in is on screen again. Reading it
+    /// as "the editor was closed" would take the window down under the view
+    /// that is attached to it now.
+    pub(crate) fn host_closed_editor(event: &ClientEvent) -> bool {
+        host_closed_editor(event)
     }
 
     /// The plugin instance id an editor-targeted host event refers to, if any.
@@ -2424,10 +2611,11 @@ impl PluginEditorWindow {
                 cx.notify();
             }
             ClientEvent::Host(HostEvent::EditorClosed {
-                plugin_instance_id, ..
+                plugin_instance_id,
+                editor_generation,
             }) => {
                 eprintln!("[plugin-view][host] EditorClosed editor_id={id}");
-                release_parked_editor_content(&plugin_instance_id);
+                release_parked_editor_content(&plugin_instance_id, editor_generation);
             }
             ClientEvent::Host(HostEvent::EditorChromeAction { action, .. }) => {
                 // Straight onto the queue this window's own strip would have
@@ -2564,7 +2752,7 @@ impl PluginEditorWindow {
             .map(|previous| previous.width != rect.width || previous.height != rect.height)
             .unwrap_or(true);
         host.last_region = Some(rect);
-        if let Some(content) = host.content.as_ref() {
+        if let Some(content) = host.content.as_ref().map(|content| &content.child) {
             if !content.is_valid() {
                 return;
             }
@@ -2691,19 +2879,15 @@ impl Drop for PluginEditorWindow {
         if self.released_for_close {
             return;
         }
-        // Host-process path: ask the host to remove the view (spec Part 6), then
-        // let the backend's Drop tear down the content HWND + the host process.
-        if let Some(host) = self.host.as_mut() {
+        // Host-process path: ask the host to remove the view (spec Part 6),
+        // through the same release every other path uses, so the close names
+        // its content child's generation. A child still alive is parked until
+        // the host answers; one its window took down with it is only forgotten.
+        if self.host.is_some() {
             let id = format!("{}::{}", self.track_id, self.insert_id);
-            if let Some(shared) = host.shared.as_ref() {
-                if let Ok(mut runtime) = shared.lock() {
-                    runtime.close_editor(self.insert_id.clone());
-                }
-            } else if let Some(client) = host.client.as_mut() {
-                let _ = client.close_editor(id.clone());
-            }
+            self.release_active_view();
             eprintln!(
-                "[plugin-view][host] CloseEditor sent editor_id={id} (drop) — tearing down content HWND + host process"
+                "[plugin-view][host] CloseEditor sent editor_id={id} (drop) — releasing content HWND + host process"
             );
             return;
         }
@@ -3448,49 +3632,271 @@ mod platform_support_tests {
 
 #[cfg(test)]
 mod parked_content_tests {
-    use super::ParkedContents;
+    use super::{host_closed_editor, CloseRequest, ContentGeneration, ParkedContents};
+    use std::collections::{HashMap, VecDeque};
     use std::time::{Duration, Instant};
+    use SpherePluginHost::ipc::HostEvent;
+    use SpherePluginHost::plugin_host_client::ClientEvent;
 
     const WAIT: Duration = Duration::from_secs(5);
 
-    /// A content child released by a tab switch or a close goes when the host
-    /// reports that instance's view detached, and not before; another
-    /// instance's report leaves it waiting.
-    #[test]
-    fn parked_content_goes_when_its_own_view_is_detached() {
-        let start = Instant::now();
-        let mut parked = ParkedContents::new();
-        parked.park("a".to_string(), 1, start);
-        parked.park("b".to_string(), 2, start);
-
-        assert!(parked.take_expired(start, WAIT).is_empty());
-        assert_eq!(parked.take_released("b", start, WAIT), vec![2]);
-        assert!(parked.take_released("b", start, WAIT).is_empty());
-        assert_eq!(parked.entries.len(), 1);
-        assert_eq!(parked.take_released("a", start, WAIT), vec![1]);
-        assert!(parked.entries.is_empty());
+    fn generation(value: u64) -> ContentGeneration {
+        ContentGeneration(value)
     }
 
-    /// A host that never answers (hung, or died with the view) does not keep
-    /// the window around for good.
+    /// A plug-in host as far as editors go: it handles commands strictly in
+    /// the order they were sent, attaches an instance's view to the child an
+    /// open names, detaches it when it handles the close, and answers each
+    /// close with exactly one `EditorClosed` echoing its generation. When it
+    /// gets to the commands, and when its answers reach the studio, is up to
+    /// the test.
+    #[derive(Default)]
+    struct SimHost {
+        inbox: VecDeque<SimCommand>,
+        /// Which child each instance's view is attached to.
+        attached: HashMap<&'static str, ContentGeneration>,
+        /// Answers written but not yet delivered.
+        outbox: Vec<(&'static str, ContentGeneration)>,
+    }
+
+    enum SimCommand {
+        Open(&'static str, ContentGeneration),
+        Close(&'static str, ContentGeneration),
+    }
+
+    impl SimHost {
+        fn handle_next(&mut self) {
+            match self.inbox.pop_front().expect("a command to handle") {
+                SimCommand::Open(instance, generation) => {
+                    self.attached.insert(instance, generation);
+                }
+                SimCommand::Close(instance, generation) => {
+                    self.attached.remove(instance);
+                    self.outbox.push((instance, generation));
+                }
+            }
+        }
+
+        fn view_attached_to(&self, generation: ContentGeneration) -> bool {
+            self.attached
+                .values()
+                .any(|&attached| attached == generation)
+        }
+    }
+
+    /// One editor window switching tabs, with the same ledger the window uses.
+    struct SimWindow {
+        next_generation: u64,
+        /// The tab on screen and the child its view is (being) attached to.
+        current: Option<(&'static str, ContentGeneration)>,
+        parked: ParkedContents<ContentGeneration>,
+        /// Every child the ledger handed back for destruction.
+        destroyed: Vec<ContentGeneration>,
+    }
+
+    impl SimWindow {
+        fn new() -> Self {
+            Self {
+                next_generation: 1,
+                current: None,
+                parked: ParkedContents::new(),
+                destroyed: Vec::new(),
+            }
+        }
+
+        /// `activate_tab`: release the view on screen (close, then park its
+        /// child), then open `instance` into a child of its own.
+        fn show(&mut self, instance: &'static str, host: &mut SimHost, now: Instant) {
+            if let Some((previous, child)) = self.current.take() {
+                host.inbox.push_back(SimCommand::Close(previous, child));
+                self.parked
+                    .park(previous.to_string(), child, child, CloseRequest::Sent, now);
+            }
+            let child = generation(self.next_generation);
+            self.next_generation += 1;
+            host.inbox.push_back(SimCommand::Open(instance, child));
+            self.current = Some((instance, child));
+        }
+
+        /// The studio receiving one `EditorClosed`.
+        fn deliver(&mut self, instance: &str, child: ContentGeneration, host: &SimHost) {
+            if let Some(released) = self.parked.release(instance, child) {
+                self.destroy(released, host);
+            }
+        }
+
+        fn sweep(&mut self, now: Instant, host: &SimHost) {
+            for expired in self.parked.take_expired(now, WAIT) {
+                self.destroy(expired, host);
+            }
+        }
+
+        fn destroy(&mut self, child: ContentGeneration, host: &SimHost) {
+            assert!(
+                !host.view_attached_to(child),
+                "content child {child:?} destroyed while a view is attached to it"
+            );
+            assert_ne!(
+                self.current.map(|(_, current)| current),
+                Some(child),
+                "the child on screen was destroyed"
+            );
+            self.destroyed.push(child);
+        }
+    }
+
+    /// The bug in #236: A → B → A → B faster than the host answers. The first
+    /// close of A is answered late — after the second child of A was parked,
+    /// while the host still has A's view attached to it — and the answers
+    /// arrive out of order. Each answer releases its own child and no other.
     #[test]
-    fn parked_content_is_destroyed_after_the_deadline_without_an_answer() {
+    fn rapid_tab_switching_releases_only_the_child_each_answer_names() {
+        let start = Instant::now();
+        let mut host = SimHost::default();
+        let mut window = SimWindow::new();
+        window.show("a", &mut host, start); // a#1
+        window.show("b", &mut host, start); // closes a#1, opens b#2
+        window.show("a", &mut host, start); // closes b#2, opens a#3
+        let a3 = window.current.unwrap().1;
+        window.show("b", &mut host, start); // closes a#3, opens b#4
+        let b4 = window.current.unwrap().1;
+
+        // The host gets as far as attaching A's view to a#3, and no further:
+        // the close of a#3 is still in its queue.
+        for _ in 0..5 {
+            host.handle_next();
+        }
+        assert!(host.view_attached_to(a3));
+
+        // Its answers to a#1 and b#2 arrive late, newest first.
+        let answers: Vec<_> = host.outbox.drain(..).rev().collect();
+        assert_eq!(answers, vec![("b", generation(2)), ("a", generation(1))]);
+        for (instance, child) in answers {
+            window.deliver(instance, child, &host);
+        }
+        assert_eq!(window.destroyed, vec![generation(2), generation(1)]);
+        // a#3 still waits for its own answer: A's view is on it.
+        assert_eq!(window.parked.entries.len(), 1);
+        assert_eq!(window.parked.entries[0].generation, a3);
+
+        // A stale duplicate of the first answer still finds nothing to free.
+        window.deliver("a", generation(1), &host);
+        assert_eq!(window.parked.entries.len(), 1);
+
+        // The host catches up; a#3's own answer releases it.
+        host.handle_next(); // close a#3
+        host.handle_next(); // open b#4
+        let answers: Vec<_> = host.outbox.drain(..).collect();
+        assert_eq!(answers, vec![("a", a3)]);
+        window.deliver("a", a3, &host);
+        assert_eq!(
+            window.destroyed,
+            vec![generation(2), generation(1), a3],
+            "every parked child went exactly once"
+        );
+        assert!(window.parked.is_empty());
+        assert!(host.view_attached_to(b4), "the tab on screen is untouched");
+    }
+
+    /// The same switching while the current child of A is the one on screen:
+    /// a late answer about A's earlier child cannot reach it, and the ledger
+    /// never holds it.
+    #[test]
+    fn a_late_answer_never_releases_the_child_on_screen() {
+        let start = Instant::now();
+        let mut host = SimHost::default();
+        let mut window = SimWindow::new();
+        window.show("a", &mut host, start); // a#1
+        window.show("b", &mut host, start); // b#2
+        window.show("a", &mut host, start); // a#3, on screen
+        while !host.inbox.is_empty() {
+            host.handle_next();
+        }
+        for (instance, child) in host.outbox.drain(..).rev().collect::<Vec<_>>() {
+            window.deliver(instance, child, &host);
+        }
+        // Again, for good measure, long after.
+        window.deliver("a", generation(1), &host);
+        window.sweep(start + Duration::from_secs(60), &host);
+        assert_eq!(window.current, Some(("a", generation(3))));
+        assert!(host.view_attached_to(generation(3)));
+        assert!(!window.destroyed.contains(&generation(3)));
+    }
+
+    /// An answer naming a generation the ledger does not hold — never parked,
+    /// already released, or another instance's — releases nothing.
+    #[test]
+    fn an_answer_for_an_unknown_generation_is_ignored() {
         let start = Instant::now();
         let mut parked = ParkedContents::new();
-        parked.park("a".to_string(), 1, start);
-        parked.park("b".to_string(), 2, start + Duration::from_secs(3));
+        parked.park("a".to_string(), generation(1), 1, CloseRequest::Sent, start);
+        parked.park("b".to_string(), generation(2), 2, CloseRequest::Sent, start);
 
-        assert!(parked
-            .take_expired(start + Duration::from_secs(4), WAIT)
-            .is_empty());
+        assert_eq!(parked.release("a", generation(99)), None);
         assert_eq!(
-            parked.take_expired(start + Duration::from_secs(5), WAIT),
-            vec![1]
+            parked.release("a", generation(2)),
+            None,
+            "b's generation under a's name"
         );
-        // Any release sweeps what has waited too long, whoever it is for.
-        assert_eq!(
-            parked.take_released("x", start + Duration::from_secs(8), WAIT),
-            vec![2]
+        assert_eq!(parked.entries.len(), 2);
+        assert_eq!(parked.release("a", generation(1)), Some(1));
+        assert_eq!(parked.release("a", generation(1)), None, "released once");
+        assert_eq!(parked.release("b", generation(2)), Some(2));
+        assert!(parked.is_empty());
+    }
+
+    /// The deadline frees only superseded children it is safe to: ones the
+    /// host was asked to let go of (or whose host died) and that waited the
+    /// full time. A younger child keeps waiting; one whose close never
+    /// reached a live host is never destroyed on a timer.
+    #[test]
+    fn the_deadline_frees_only_superseded_children_whose_close_went_out() {
+        let start = Instant::now();
+        let at = |secs| start + Duration::from_secs(secs);
+        let mut parked = ParkedContents::new();
+        parked.park("a".to_string(), generation(1), 1, CloseRequest::Sent, start);
+        parked.park(
+            "b".to_string(),
+            generation(2),
+            2,
+            CloseRequest::Undelivered,
+            start,
         );
+        parked.park(
+            "c".to_string(),
+            generation(3),
+            3,
+            CloseRequest::HostGone,
+            start,
+        );
+        parked.park("a".to_string(), generation(4), 4, CloseRequest::Sent, at(3));
+
+        assert!(parked.take_expired(at(4), WAIT).is_empty());
+        assert_eq!(parked.take_expired(at(5), WAIT), vec![1, 3]);
+        assert!(parked.take_expired(at(7), WAIT).is_empty());
+        assert_eq!(parked.take_expired(at(8), WAIT), vec![4]);
+        assert!(parked.take_expired(at(3600), WAIT).is_empty());
+        assert_eq!(parked.entries.len(), 1);
+        assert_eq!(parked.entries[0].generation, generation(2));
+        // It still goes the moment the host does answer for it.
+        assert_eq!(parked.release("b", generation(2)), Some(2));
+    }
+
+    /// The studio closes an editor window when the host closes its editor.
+    /// An answer to one of this process's own closes — it carries the
+    /// generation the close named — is never that, however late it arrives.
+    #[test]
+    fn only_a_close_the_studio_did_not_ask_for_closes_the_window() {
+        let answer = ClientEvent::Host(HostEvent::EditorClosed {
+            plugin_instance_id: "a".to_string(),
+            editor_generation: Some(7),
+        });
+        let user_closed = ClientEvent::Host(HostEvent::EditorClosed {
+            plugin_instance_id: "a".to_string(),
+            editor_generation: None,
+        });
+        assert!(!host_closed_editor(&answer));
+        assert!(host_closed_editor(&user_closed));
+        assert!(host_closed_editor(&ClientEvent::Disconnected));
     }
 }

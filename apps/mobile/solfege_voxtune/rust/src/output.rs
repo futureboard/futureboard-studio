@@ -142,11 +142,12 @@ mod android {
     impl Drop for Output {
         fn drop(&mut self) {
             unsafe {
-                (self.api.request_stop)(self.stream);
-                // close() waits for any in-flight callback, so the context
-                // can be freed afterwards.
-                (self.api.close)(self.stream);
-                drop(Box::from_raw(self.ctx));
+                // The data and error callbacks both read the context: free it
+                // only once the stream has stopped and been closed. A stream
+                // that never stopped keeps it (leaked) instead.
+                if stop_and_close(self.api, self.stream) {
+                    drop(Box::from_raw(self.ctx));
+                }
             }
         }
     }

@@ -69,7 +69,14 @@ pub struct BuiltinPresetMenu {
     presets: Vec<(String, PathBuf)>,
     view: PresetPopoverView,
     focus: FocusHandle,
+    /// When a click outside last closed the list. The same click lands on
+    /// the trigger next, and must not open it again (#228).
+    dismissed_at: Option<std::time::Instant>,
 }
+
+/// How long after a click-outside close a trigger click counts as that same
+/// click.
+const REOPEN_GUARD: std::time::Duration = std::time::Duration::from_millis(250);
 
 impl BuiltinPresetMenu {
     pub fn new(key: PluginInstanceKey, identity: &ShellIdentity, cx: &mut Context<Self>) -> Self {
@@ -81,7 +88,15 @@ impl BuiltinPresetMenu {
             presets: Vec::new(),
             view: PresetPopoverView::default(),
             focus: cx.focus_handle(),
+            dismissed_at: None,
         }
+    }
+
+    /// Whether the open list has the keyboard: a window that claims keys
+    /// before they reach their target (Space for the transport) leaves them
+    /// to the filter then (#227).
+    pub fn owns_keyboard(&self, window: &Window) -> bool {
+        self.open && self.focus.is_focused(window)
     }
 
     /// The editor took another insert.
@@ -105,6 +120,13 @@ impl BuiltinPresetMenu {
     fn toggle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.open {
             self.close(cx);
+            return;
+        }
+        if self
+            .dismissed_at
+            .take()
+            .is_some_and(|at| at.elapsed() < REOPEN_GUARD)
+        {
             return;
         }
         self.presets =
@@ -320,7 +342,10 @@ impl BuiltinPresetMenu {
                         .h(size.height)
                         .shadow_lg()
                         .on_mouse_down_out(move |_, _, cx| {
-                            let _ = close.update(cx, |menu, cx| menu.close(cx));
+                            let _ = close.update(cx, |menu, cx| {
+                                menu.dismissed_at = Some(std::time::Instant::now());
+                                menu.close(cx);
+                            });
                         })
                         .child(render_preset_popover(&chrome, &self.view, emit)),
                 ),

@@ -7,10 +7,11 @@
 //! No OAuth and no per-user login. Authenticate with a TONE3000 API key
 //! (`t3k_cs_…` secret, or an equivalent Bearer credential), read from the
 //! process environment (`FUTUREBOARD_TONE3000_API_KEY` / `TONE3000_API_KEY`).
-//! Only a debug (developer) build also bakes it from the build environment or
-//! the workspace `.env` (`option_env!`, see `build.rs`): a release binary is
-//! handed out, and a key inside it can be read back out by anyone, so a
-//! release build never carries one. Direct API calls use
+//! Only a developer build also bakes it from the build environment or the
+//! workspace `.env` (`option_env!` behind a `build.rs`-set cfg and
+//! `debug_assertions`, see `build.rs`): a release binary is handed out, and a
+//! key inside it can be read back out by anyone, so a release build never
+//! carries one and has no compile-time read of it. Direct API calls use
 //! `Authorization: Bearer <key>` as TONE3000 documents for server-side
 //! fetch. The key never crosses the CEF bridge.
 
@@ -96,9 +97,24 @@ pub fn configured() -> bool {
     api_key().is_some()
 }
 
-/// Baked by `build.rs` from the build environment or workspace `.env` — in a
-/// debug build only; always `None` in a release build.
-const BAKED_API_KEY: Option<&str> = option_env!("FUTUREBOARD_TONE3000_API_KEY");
+/// Handed over by `build.rs` from the build environment or workspace `.env`,
+/// in a developer build only. The cfg below is set by `build.rs` only when
+/// `build_support/tone3000_key_policy.rs` says this is a developer build, and
+/// is additionally tied to `debug_assertions` here, so a release build does not
+/// contain the `option_env!` at all and cannot embed a key whatever rustc's
+/// environment holds (#241). The name read is build-only on purpose: the
+/// user-facing `FUTUREBOARD_TONE3000_API_KEY` is never read at compile time.
+#[cfg(all(debug_assertions, futureboard_tone3000_dev_key))]
+const BAKED_API_KEY: Option<&str> = option_env!("FUTUREBOARD_TONE3000_DEV_BUILD_KEY");
+#[cfg(not(all(debug_assertions, futureboard_tone3000_dev_key)))]
+const BAKED_API_KEY: Option<&str> = None;
+
+/// Whether a compile-time TONE3000 key is compiled into this build. Always
+/// false in a release build (no `debug_assertions`), which is what keeps the
+/// partner key out of distributed binaries.
+pub fn compile_time_key_compiled_in() -> bool {
+    cfg!(all(debug_assertions, futureboard_tone3000_dev_key)) && BAKED_API_KEY.is_some()
+}
 
 fn api_key() -> Option<String> {
     non_empty_env("FUTUREBOARD_TONE3000_API_KEY")
@@ -469,5 +485,72 @@ mod tests {
         assert!(non_empty("").is_none());
         assert!(non_empty("   ").is_none());
         assert_eq!(non_empty(" t3k_cs_x ").as_deref(), Some("t3k_cs_x"));
+    }
+
+    /// The exact decision `build.rs` makes, compiled from the same file.
+    mod key_policy {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/build_support/tone3000_key_policy.rs"
+        ));
+    }
+
+    #[test]
+    fn build_policy_embeds_only_in_plain_dev_builds() {
+        use key_policy::may_embed_dev_key;
+        assert!(may_embed_dev_key(Some("debug"), Some("0"), true));
+
+        // Release, and release-derived custom profiles.
+        assert!(!may_embed_dev_key(Some("release"), Some("3"), false));
+        assert!(!may_embed_dev_key(Some("release"), Some("0"), true));
+        assert!(!may_embed_dev_key(Some("release"), Some("3"), true));
+        // Dev-derived profiles that are optimised or drop debug assertions.
+        assert!(!may_embed_dev_key(Some("debug"), Some("3"), true));
+        assert!(!may_embed_dev_key(Some("debug"), Some("s"), true));
+        assert!(!may_embed_dev_key(Some("debug"), Some("0"), false));
+        // Missing or unexpected values fail closed.
+        assert!(!may_embed_dev_key(None, Some("0"), true));
+        assert!(!may_embed_dev_key(Some("debug"), None, true));
+        assert!(!may_embed_dev_key(Some("Debug"), Some("0"), true));
+        assert!(!may_embed_dev_key(Some(""), Some("0"), true));
+    }
+
+    #[test]
+    fn build_policy_never_reads_the_user_facing_variable_at_compile_time() {
+        // `option_env!` sees rustc's whole environment, so the compile-time
+        // name must not be one a shell exports for the runtime lookup.
+        assert_ne!(
+            key_policy::DEV_KEY_RUSTC_ENV,
+            "FUTUREBOARD_TONE3000_API_KEY"
+        );
+        assert_ne!(key_policy::DEV_KEY_RUSTC_ENV, "TONE3000_API_KEY");
+        // `option_env!` and `cfg` need literals; keep them in step with the
+        // policy file.
+        let source = include_str!("tone3000.rs");
+        assert!(source.contains(&format!(
+            "option_env!(\"{}\")",
+            key_policy::DEV_KEY_RUSTC_ENV
+        )));
+        assert!(source.contains(&format!(
+            "#[cfg(all(debug_assertions, {}))]",
+            key_policy::DEV_KEY_CFG
+        )));
+    }
+
+    #[test]
+    fn compile_time_key_requires_a_developer_build() {
+        // build.rs sets the cfg only alongside debug assertions.
+        assert!(cfg!(debug_assertions) || !cfg!(futureboard_tone3000_dev_key));
+        if !cfg!(futureboard_tone3000_dev_key) {
+            assert!(!compile_time_key_compiled_in());
+            assert!(BAKED_API_KEY.is_none());
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn release_build_has_no_compile_time_key() {
+        assert!(!compile_time_key_compiled_in());
+        assert!(BAKED_API_KEY.is_none());
     }
 }

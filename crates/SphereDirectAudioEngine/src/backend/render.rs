@@ -57,6 +57,18 @@ fn metronome_debug_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("FUTUREBOARD_METRONOME_DEBUG").is_some())
 }
 
+/// Read every cached debug flag of this module once, on a control thread: the
+/// first read takes the environment (and allocates), which must not happen in
+/// the callback. See `crate::engine::prime_audio_thread_resources`.
+pub(crate) fn prime_debug_flags() {
+    let _ = command_debug_enabled();
+    let _ = callback_debug_enabled();
+    let _ = transport_freeze_debug_enabled();
+    let _ = pdc_debug_enabled();
+    let _ = metronome_debug_enabled();
+    let _ = plugin_bridge_master_fallback_enabled();
+}
+
 /// Logs the first N audio blocks after `StartTransport` when freeze debug is on.
 static POST_PLAY_CALLBACK_LOGS: AtomicU32 = AtomicU32::new(0);
 

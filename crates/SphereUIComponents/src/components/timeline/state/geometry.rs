@@ -110,6 +110,35 @@ pub fn snap_beat_against_meter(
     super::musical_snap::snap_beat(beats as f64, snap.to_musical(), bypass) as f32
 }
 
+/// Snap a song-axis beat for an automation lane through the shared
+/// meter-aware grid ([`super::musical_snap::MeterGrid`]) — the grid the piano
+/// roll's notes and controller lanes snap to. "1 Bar" lands on the bar lines
+/// drawn, counted from each meter's start, so a meter change does not leave
+/// the automation one or two beats off the bars after it; the fixed
+/// divisions step from the song start as before.
+pub fn snap_automation_beat(
+    beats: f32,
+    snap: SnapSettings,
+    time_signature_map: &TimeSignatureMap,
+    bypass: bool,
+) -> f32 {
+    use super::musical_snap::{GridStep, MeterGrid};
+    if bypass || !snap.enabled || snap.division == SnapDivision::Off {
+        return beats.max(0.0);
+    }
+    let step = if snap.division == SnapDivision::Bar1 && snap.shape == SnapShape::Straight {
+        GridStep::Bar
+    } else {
+        let mut musical = snap.to_musical();
+        musical.beats_per_bar = time_signature_map.beats_per_bar_at_beat(beats as f64);
+        match musical.step_beats() {
+            Some(step) => GridStep::Beats(step),
+            None => return beats.max(0.0),
+        }
+    };
+    (MeterGrid::new(time_signature_map, step, 0.0).snap(beats as f64) as f32).max(0.0)
+}
+
 /// Snap a wall-clock second offset to the current grid. Shared by
 /// [`TimelineState::snap_time`] and [`TimelineGestureContext::snap_time`].
 pub fn snap_seconds(seconds: f32, seconds_per_beat: f32, snap: SnapSettings) -> f32 {
@@ -201,6 +230,11 @@ impl TimelineGestureContext {
 
     pub fn snap_time(&self, seconds: f32) -> f32 {
         snap_seconds(seconds, self.seconds_per_beat(), self.snap)
+    }
+
+    /// See [`snap_automation_beat`].
+    pub fn snap_automation_beats(&self, beats: f32) -> f32 {
+        snap_automation_beat(beats, self.snap, &self.time_signature_map, false)
     }
 
     pub fn arrangement_content_top(&self) -> f32 {
@@ -364,6 +398,16 @@ impl TimelineState {
         )
     }
 
+    /// Snap an automation lane's beat — see [`snap_automation_beat`].
+    pub fn snap_automation_beats(&self, beats: f32) -> f32 {
+        snap_automation_beat(
+            beats,
+            SnapSettings::from_timeline(self),
+            &self.time_signature_map,
+            false,
+        )
+    }
+
     /// Snap a beat value to the current grid (or return it unchanged when snap is off).
     pub fn snap_beats(&self, beats: f32) -> f32 {
         self.snap_beats_with_bypass(beats, false)
@@ -432,5 +476,74 @@ mod origin_tests {
             state.tempo_lane_origin_y(),
             72.0 + RULER_HEIGHT + state.global_lane_top(GlobalLaneKind::Tempo)
         ));
+    }
+}
+
+#[cfg(test)]
+mod automation_snap_tests {
+    use super::*;
+
+    fn one_bar() -> SnapSettings {
+        SnapSettings {
+            enabled: true,
+            division: SnapDivision::Bar1,
+            shape: SnapShape::Straight,
+            beats_per_bar: 4.0,
+            auto_step_beats: 0.25,
+        }
+    }
+
+    fn map(points: &[(f64, u16, u16)]) -> TimeSignatureMap {
+        TimeSignatureMap::with_points(
+            points
+                .iter()
+                .enumerate()
+                .map(|(i, &(beat, n, d))| TimeSignaturePoint::with_id(format!("m{i}"), beat, n, d))
+                .collect(),
+        )
+    }
+
+    /// #237: "1 Bar" automation lands on the bar lines drawn in 3/4 and 6/8.
+    #[test]
+    fn one_bar_automation_snaps_to_the_meters_bar_lines() {
+        let three_four = map(&[(0.0, 3, 4)]);
+        assert_eq!(
+            snap_automation_beat(4.4, one_bar(), &three_four, false),
+            3.0
+        );
+        assert_eq!(
+            snap_automation_beat(4.6, one_bar(), &three_four, false),
+            6.0
+        );
+        let six_eight = map(&[(0.0, 6, 8)]);
+        assert_eq!(snap_automation_beat(5.0, one_bar(), &six_eight, false), 6.0);
+        assert_eq!(snap_automation_beat(7.4, one_bar(), &six_eight, false), 6.0);
+    }
+
+    /// #237: after a meter change the bars count from the change, as the grid
+    /// draws them — 4/4 for two bars, then 3/4 lines at 8, 11, 14.
+    #[test]
+    fn one_bar_automation_follows_a_meter_change() {
+        let m = map(&[(0.0, 4, 4), (8.0, 3, 4)]);
+        let snap = |beat| snap_automation_beat(beat, one_bar(), &m, false);
+        assert_eq!(snap(5.0), 4.0);
+        assert_eq!(snap(7.0), 8.0);
+        assert_eq!(snap(9.0), 8.0);
+        assert_eq!(snap(10.0), 11.0);
+        assert_eq!(snap(12.6), 14.0);
+        assert_eq!(snap(16.0), 17.0);
+    }
+
+    /// Fixed divisions, snapping off and Shift keep their meaning.
+    #[test]
+    fn fixed_steps_off_and_bypass_are_unchanged() {
+        let m = map(&[(0.0, 4, 4), (8.0, 3, 4)]);
+        let mut quarter = one_bar();
+        quarter.division = SnapDivision::Div1_4;
+        assert_eq!(snap_automation_beat(9.3, quarter, &m, false), 9.0);
+        assert_eq!(snap_automation_beat(9.3, one_bar(), &m, true), 9.3);
+        let mut off = one_bar();
+        off.enabled = false;
+        assert_eq!(snap_automation_beat(9.3, off, &m, false), 9.3);
     }
 }

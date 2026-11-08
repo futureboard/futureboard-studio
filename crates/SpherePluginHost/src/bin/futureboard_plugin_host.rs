@@ -4430,6 +4430,8 @@ fn run_ipc_loop(mut out: IpcOut, shutdown: Arc<AtomicBool>) {
                 &mut out,
                 &HostEvent::EditorClosed {
                     plugin_instance_id: instance_id,
+                    // No close asked for this: the user closed the window.
+                    editor_generation: None,
                 },
             );
         }
@@ -5579,8 +5581,13 @@ fn dispatch(
             ]);
             chrome.commit(&title);
         }
-        HostCommand::CloseEditor { plugin_instance_id } => {
-            eprintln!("[PluginEditor] close requested plugin_id={plugin_instance_id}");
+        HostCommand::CloseEditor {
+            plugin_instance_id,
+            editor_generation,
+        } => {
+            eprintln!(
+                "[PluginEditor] close requested plugin_id={plugin_instance_id} generation={editor_generation:?}"
+            );
             registry.remove(&plugin_instance_id);
             pending_editor_attaches.remove(&plugin_instance_id);
             pending_resizes.remove(&plugin_instance_id);
@@ -5601,7 +5608,16 @@ fn dispatch(
             eprintln!("[AudioGraph] node remains active plugin_id={plugin_instance_id}");
             eprintln!("[VSTi] midi route alive plugin_id={plugin_instance_id}");
             eprintln!("[VSTi] process active after editor close plugin_id={plugin_instance_id}");
-            let _ = ipc::write_frame(out, &HostEvent::EditorClosed { plugin_instance_id });
+            // Exactly one answer per close, after the detach, echoing the
+            // window generation the close named: the client destroys that
+            // window, and only that one, on receiving it.
+            let _ = ipc::write_frame(
+                out,
+                &HostEvent::EditorClosed {
+                    plugin_instance_id,
+                    editor_generation,
+                },
+            );
         }
         HostCommand::PreviewNoteOn {
             plugin_instance_id,

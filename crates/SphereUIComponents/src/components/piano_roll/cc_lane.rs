@@ -70,17 +70,16 @@ pub(super) fn freehand_cc_samples(
     samples
 }
 /// The points one grid-snapped segment of the CC brush writes (Alt+drag with
-/// the Draw tool): one on every grid line from `first_line` to `last_line` —
-/// the lines nearest the previous and current pointer positions — valued
-/// along the straight line between those two pointer positions
+/// the Draw tool): one on every grid line in `lines` — the lines from the one
+/// nearest the previous pointer position to the one nearest the current, as
+/// the note grid draws them (see `controller_grid_lines`) — valued along the
+/// straight line between those two pointer positions
 /// (`(from_beat, from_value)` → `(to_beat, to_value)`) and quantized to the
 /// controller's resolution. Ascending by beat, like the lane.
-pub(super) fn grid_cc_samples(
+pub(super) fn grid_cc_samples_on(
     (from_beat, from_value): (f32, f32),
     (to_beat, to_value): (f32, f32),
-    first_line: f32,
-    last_line: f32,
-    step: f32,
+    lines: &[f32],
     value_steps: f32,
 ) -> Vec<(f32, f32)> {
     let quantize = |value: f32| (value.clamp(0.0, 1.0) * value_steps).round() / value_steps;
@@ -92,23 +91,39 @@ pub(super) fn grid_cc_samples(
         let t = ((beat - from_beat) / span).clamp(0.0, 1.0);
         from_value + (to_value - from_value) * t
     };
+    if let [line] = lines {
+        // Still inside one grid cell: the line under the cursor takes the
+        // cursor's value.
+        return vec![(*line, quantize(to_value))];
+    }
+    lines
+        .iter()
+        .map(|&beat| (beat, quantize(value_at(beat))))
+        .collect()
+}
+
+/// [`grid_cc_samples_on`] over a grid of even `step`s from `first_line` to
+/// `last_line` — the single-meter case its tests describe.
+#[cfg(test)]
+fn grid_cc_samples(
+    from: (f32, f32),
+    to: (f32, f32),
+    first_line: f32,
+    last_line: f32,
+    step: f32,
+    value_steps: f32,
+) -> Vec<(f32, f32)> {
     let (lo, hi) = if first_line <= last_line {
         (first_line, last_line)
     } else {
         (last_line, first_line)
     };
-    if step <= 0.0 || hi - lo < step * 0.5 {
-        // Still inside one grid cell: the line under the cursor takes the
-        // cursor's value.
-        return vec![(last_line, quantize(to_value))];
-    }
-    let lines = ((hi - lo) / step).round() as usize;
-    (0..=lines.min(65_536))
-        .map(|k| {
-            let beat = if k == lines { hi } else { lo + k as f32 * step };
-            (beat, quantize(value_at(beat)))
-        })
-        .collect()
+    let lines = if step <= 0.0 || hi - lo < step * 0.5 {
+        vec![last_line]
+    } else {
+        uniform_controller_samples(lo, hi, step)
+    };
+    grid_cc_samples_on(from, to, &lines, value_steps)
 }
 
 const CC_POINT_MERGE_EPS: f32 = 1.0e-3;
@@ -189,6 +204,12 @@ fn replace_cc_paint_segment(
 }
 
 impl PianoRoll {
+    /// Clip beat one bar of the meter after clip beat `beat` — the default
+    /// span of a generated CC curve, which used to be a fixed four quarters.
+    fn one_bar_after(&self, beat: f32) -> f32 {
+        beat + self.meter.bar_beats_at(beat + self.edit_origin())
+    }
+
     pub(super) fn cc_view_size(&self) -> (f32, f32) {
         match self.cc_bounds.get() {
             Some(b) => (
@@ -342,14 +363,19 @@ impl PianoRoll {
         // Alt asks for the grid explicitly, so it applies whatever the snap
         // toggle says; a `Free` grid has no lines and stays freehand. An
         // erase sweep always follows the pointer.
-        let on_grid = !unsnap && !erase && !self.grid_res.is_free();
-        let edits = if on_grid {
-            grid_cc_samples(
-                (from_beat, value_at(from_y)),
-                (to_beat, value_at(ly)),
+        let grid = (!unsnap && !erase).then(|| self.edit_grid()).flatten();
+        let edits = if let Some(grid) = grid {
+            // The note grid's own lines between the two snapped ends, so the
+            // points follow a meter change inside the clip (#237).
+            let lines = controller_grid_lines(
+                grid,
                 self.clamp_cc_beat(self.snap_to_grid(from_beat)),
                 self.clamp_cc_beat(self.snap_to_grid(to_beat)),
-                self.step_beats(),
+            );
+            grid_cc_samples_on(
+                (from_beat, value_at(from_y)),
+                (to_beat, value_at(ly)),
+                &lines,
                 controller_value_steps(kind),
             )
         } else {
@@ -666,7 +692,18 @@ impl PianoRoll {
             .read(cx)
             .state
             .controller_points_snapshot(&clip_id, kind);
-        let offset = self.step_beats().max(1.0e-3);
+        // One grid step on, measured on the note grid at the selection — so
+        // "1 Bar" is the bar there, not the bar at the clip start (#237).
+        let first = prev
+            .iter()
+            .filter(|point| self.cc_selection.contains(&point.id))
+            .map(|point| point.beat)
+            .fold(f32::INFINITY, f32::min);
+        let offset = match self.edit_grid() {
+            Some(grid) if first.is_finite() => duplicate_offset(Some(grid), first, first),
+            _ => self.step_beats(),
+        }
+        .max(1.0e-3);
         let mut next = prev.clone();
         let mut new_ids = HashSet::new();
         for point in prev
@@ -745,10 +782,10 @@ impl PianoRoll {
             (lo, hi.max(lo + step), from, to)
         } else if selected.len() == 1 {
             let p = selected[0];
-            (p.beat, p.beat + 4.0, p.value, 1.0 - p.value)
+            (p.beat, self.one_bar_after(p.beat), p.value, 1.0 - p.value)
         } else {
             let start = self.snap_beats(click_beat.max(0.0));
-            (start, start + 4.0, 0.0, 1.0)
+            (start, self.one_bar_after(start), 0.0, 1.0)
         };
 
         // Humanize: jitter existing points in-span rather than regenerating.
@@ -771,9 +808,12 @@ impl PianoRoll {
             }
         } else {
             let span = (hi_beat - lo_beat).max(step);
-            let count = (span / step).round().max(1.0) as i32;
-            for i in 0..=count {
-                let beat = (lo_beat + step * i as f32).min(hi_beat);
+            // One point per note-grid line across the span (#237).
+            let beats = match self.edit_grid() {
+                Some(grid) => controller_grid_lines(grid, lo_beat, hi_beat),
+                None => uniform_controller_samples(lo_beat, hi_beat, step),
+            };
+            for beat in beats {
                 let t = if span <= 1.0e-6 {
                     0.0
                 } else {
@@ -887,11 +927,14 @@ impl PianoRoll {
             .filter(|p| p.beat < lo_beat - EPS || p.beat > hi_beat + EPS)
             .collect();
 
-        let step = self.step_beats().max(1.0e-3);
         let span = (hi_beat - lo_beat).max(0.0);
-        let count = (span / step).round().max(0.0) as i32;
-        for i in 0..=count {
-            let beat = (lo_beat + step * i as f32).min(hi_beat);
+        // One point per note-grid line between the ends (#237): after a meter
+        // change inside the clip the ramp's points stay on the bar lines.
+        let beats = match self.edit_grid() {
+            Some(grid) => controller_grid_lines(grid, lo_beat, hi_beat),
+            None => uniform_controller_samples(lo_beat, hi_beat, self.step_beats()),
+        };
+        for beat in beats {
             let t = if span <= 1.0e-6 {
                 0.0
             } else {

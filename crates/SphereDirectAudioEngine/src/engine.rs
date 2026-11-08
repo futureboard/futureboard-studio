@@ -1334,9 +1334,38 @@ fn insert_load_trace(line: impl FnOnce() -> String) {
     eprintln!("[insert-load] {}", line());
 }
 
+/// Create, on the calling (control) thread, everything the audio callback
+/// reaches through a process-wide lazy static, so the callback only ever finds
+/// it ready: every graveyard channel and its drop-thread (#238), the analysis
+/// and visualizer tap rings, and the cached debug flags (a first read takes
+/// the environment, which allocates).
+///
+/// The one place they are primed. Called at engine creation (the Jam app
+/// opens a device before it loads anything), before every device open or
+/// reopen, and before commands that carry something the callback will retire.
+/// Idempotent and cheap after the first call.
+pub(crate) fn prime_audio_thread_resources() {
+    crate::graveyard::prime();
+    let _ = crate::analysis_tap::analysis_tap();
+    let _ = crate::visualizer_tap::visualizer_tap();
+    let _ = command_debug_enabled();
+    let _ = input_debug_enabled();
+    let _ = callback_debug_enabled();
+    let _ = plugin_restore_debug_enabled();
+    let _ = bridge_debug_enabled();
+    let _ = recording_debug_enabled();
+    let _ = transport_freeze_debug_enabled();
+    render::prime_debug_flags();
+    crate::backend::render::prime_debug_flags();
+    crate::runtime::prime_debug_flags();
+    crate::vst3_processor::prime_debug_flags();
+    let _ = crate::forensic_trace::forensic_trace_enabled();
+}
+
 impl EngineInner {
     pub fn new() -> Self {
         log_sphere_audio_processor_diagnostics_once();
+        prime_audio_thread_resources();
         // What a freshly opened stream's `LocalAudioState` also starts at, so
         // the first re-seed after a device open is a no-op rather than a push.
         let default_tempo_map = crate::tempo_map::RuntimeTempoMapSnapshot::static_tempo(120.0);
@@ -1519,7 +1548,7 @@ impl EngineInner {
     /// Open (or re-open) an audio output stream.
     /// Closes any existing stream first.
     pub fn open_device(&self, config: JsDeviceOpenConfig) -> Result<(), SphereAudioError> {
-        self.close_device_inner();
+        self.prepare_stream_open();
 
         let (dev, dev_name) = device::resolve_output_device(config.output_device_id.as_deref())
             .map_err(SphereAudioError::DeviceNotFound)?;
@@ -1623,6 +1652,15 @@ impl EngineInner {
         self.close_device_inner();
     }
 
+    /// Control-thread preparation for a new output stream, before any backend
+    /// builds one: close the previous stream, and make sure everything the new
+    /// callback reaches through a process-wide lazy static already exists —
+    /// some backends start calling back while the stream is still being built.
+    fn prepare_stream_open(&self) {
+        self.close_device_inner();
+        prime_audio_thread_resources();
+    }
+
     fn close_device_inner(&self) {
         // Preserve the input ring's SPSC contract across backend switches: the
         // standalone capture callback must be gone before a duplex ASIO producer
@@ -1674,6 +1712,27 @@ impl EngineInner {
         // A new stream cannot be inside a scrub, but saying so explicitly costs
         // one queued command and removes a way for a reopen to come up silent.
         let _ = self.send_command(EngineCommand::SetMetronomeSuspended(false));
+    }
+
+    /// A device open without the device: the control-thread steps
+    /// `open_device` takes around building its stream — the preparation before
+    /// it, the graph the callback starts with, the command channel it reads and
+    /// the re-seed after it. Returns the callback's end of the channel and its
+    /// graph, for a test to play the callback.
+    #[cfg(test)]
+    pub(crate) fn open_test_stream(
+        &self,
+        sample_rate: u32,
+    ) -> (crossbeam_channel::Receiver<EngineCommand>, RuntimeProject) {
+        self.prepare_stream_open();
+        self.shared
+            .sample_rate
+            .store(sample_rate, Ordering::Relaxed);
+        let initial_runtime = self.get_initial_runtime(Some(sample_rate));
+        let (tx, rx) = bounded::<EngineCommand>(512);
+        *self.cmd_tx.lock() = Some(tx);
+        self.reseed_stream_transport_state();
+        (rx, initial_runtime)
     }
 
     /// Start audio playback (calls `stream.play()`).
@@ -1978,7 +2037,7 @@ impl EngineInner {
             mirror.midi_clips = mirror_midi.midi_clips;
             mirror.midi_tracks = mirror_midi.midi_tracks;
         }
-        crate::graveyard::prime();
+        prime_audio_thread_resources();
         let result = self.send_command(EngineCommand::SetTempoMap(Box::new(
             crate::command::TempoMapChange {
                 metronome_map: snapshot.clone(),
@@ -4058,10 +4117,10 @@ impl EngineInner {
                 t.id, t.track_type, track_clips, t.volume, t.pan, t.muted, t.solo, volume_automation
             );
         }
-        // Initialise the graveyard drop-thread on this (control) thread so the
+        // Initialise the graveyard drop-threads on this (control) thread so the
         // callback's first graph swap is a cheap atomic enqueue, never a
         // channel allocation + thread spawn on the audio thread.
-        crate::graveyard::prime();
+        prime_audio_thread_resources();
 
         // Serialize the project store and callback command with incremental
         // input edits. If one committed while this graph was being built, carry
@@ -4941,7 +5000,7 @@ impl EngineInner {
     /// again with a safe fallback config.  Use `open_daux_safe` if you want the
     /// engine to handle the fallback automatically.
     pub fn open_daux(&self, config: JsDauxConfig) -> Result<(), SphereAudioError> {
-        self.close_device_inner();
+        self.prepare_stream_open();
 
         // Sanitize before open so a persisted Exclusive ASIO id cannot reach
         // the ASIO arm on Community / unentitled builds — fall back to Auto
@@ -6286,7 +6345,7 @@ impl EngineInner {
         // Retiring a previous preview is the callback's first graveyard use in
         // a session that never loaded a project; prime it from here so that
         // enqueue can't spawn the drop thread on the audio thread.
-        crate::graveyard::prime();
+        prime_audio_thread_resources();
         let token = self
             .shared
             .audition_request_token

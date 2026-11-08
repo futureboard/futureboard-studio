@@ -170,6 +170,218 @@ pub fn snap_relative_delta(delta: f64, snap: MusicalSnap, bypass: bool) -> f64 {
     (delta / step).round() * step
 }
 
+/// The bar lines of a meter map, the way every editor draws them: bars count
+/// from each meter's start, the first meter reaches back to the song start,
+/// and a meter change is a bar line of its own even when it cuts the previous
+/// meter's last bar short.
+pub trait MeterBars {
+    /// `(start, end)` of the bar containing song-axis `beat`. A beat before
+    /// the song start belongs to the first bar.
+    fn bar_span(&self, beat: f64) -> (f64, f64);
+}
+
+impl MeterBars for super::time_signature::TimeSignatureMap {
+    fn bar_span(&self, beat: f64) -> (f64, f64) {
+        let beat = beat.max(0.0);
+        let mut start = 0.0;
+        let mut bar = 4.0;
+        let mut end = f64::INFINITY;
+        let mut points: Vec<(f64, f64)> = self
+            .points
+            .iter()
+            .map(|p| {
+                let bar = super::time_signature::beats_per_bar_from_sig(
+                    p.numerator.max(1),
+                    p.denominator,
+                );
+                (p.beat.max(0.0), bar.max(0.25))
+            })
+            .collect();
+        points.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for (i, &(at, bar_beats)) in points.iter().enumerate() {
+            // The first meter reaches back to the song start.
+            let seg_start = if i == 0 { 0.0 } else { at };
+            if i > 0 && beat < seg_start {
+                end = seg_start;
+                break;
+            }
+            start = seg_start;
+            bar = bar_beats;
+        }
+        let bar_start = start + ((beat - start) / bar).floor() * bar;
+        (bar_start, (bar_start + bar).min(end))
+    }
+}
+
+/// The step of a [`MeterGrid`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GridStep {
+    /// Every bar line of the meter: the "1 Bar" grid.
+    Bar,
+    /// A fixed step, in quarter beats, counted from the local frame's zero.
+    Beats(f64),
+}
+
+/// Lines a [`MeterGrid`] walk returns at most, so a degenerate step cannot
+/// stall the UI thread.
+const MAX_GRID_LINES: usize = 1 << 16;
+
+/// Distance, in beats, under which two grid positions are the same line.
+const GRID_EPS: f64 = 1.0e-4;
+
+/// The one meter-aware edit grid: piano-roll notes, controller (CC) lanes and
+/// arrangement automation lanes all snap, walk and duplicate through it, so a
+/// controller point or automation point lands on the line the note above it
+/// lands on.
+///
+/// Positions are in a local frame that starts `origin` beats into the song —
+/// a clip's frame for notes and controller points (`origin` = the clip
+/// start), the song axis for automation (`origin` = 0).
+///
+/// * [`GridStep::Bar`] lines are the meter's bar lines, found on the song
+///   axis ([`MeterBars`]): a clip that starts off a bar line still snaps to
+///   the bar lines drawn over it, and a meter change inside the clip changes
+///   the bar length from the change on.
+/// * [`GridStep::Beats`] lines are every `step` beats from the local zero —
+///   a clip's fixed grid counts from the clip start, as it always has.
+pub struct MeterGrid<'a, M: MeterBars + ?Sized> {
+    meter: &'a M,
+    step: GridStep,
+    origin: f64,
+}
+
+impl<M: MeterBars + ?Sized> Clone for MeterGrid<'_, M> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<M: MeterBars + ?Sized> Copy for MeterGrid<'_, M> {}
+
+impl<'a, M: MeterBars + ?Sized> MeterGrid<'a, M> {
+    pub fn new(meter: &'a M, step: GridStep, origin: f64) -> Self {
+        Self {
+            meter,
+            step,
+            origin,
+        }
+    }
+
+    pub fn step(&self) -> GridStep {
+        self.step
+    }
+
+    /// The grid cell holding local `beat`: the line at or before it and the
+    /// next line.
+    pub fn cell(&self, beat: f64) -> (f64, f64) {
+        match self.step {
+            GridStep::Bar => {
+                let (start, end) = self.meter.bar_span(beat + self.origin);
+                (start - self.origin, end - self.origin)
+            }
+            GridStep::Beats(step) => {
+                let step = step.max(GRID_EPS);
+                let k = (beat / step).floor();
+                (k * step, (k + 1.0) * step)
+            }
+        }
+    }
+
+    /// The line nearest local `beat`; a beat halfway between two lines takes
+    /// the earlier one.
+    pub fn snap(&self, beat: f64) -> f64 {
+        match self.step {
+            GridStep::Beats(step) => {
+                let step = step.max(GRID_EPS);
+                (beat / step).round() * step
+            }
+            GridStep::Bar => {
+                let (below, above) = self.cell(beat);
+                if beat - below <= above - beat {
+                    below
+                } else {
+                    above
+                }
+            }
+        }
+    }
+
+    /// The line at or before local `beat`. A beat a rounding error short of
+    /// a line counts as on it.
+    pub fn line_at_or_before(&self, beat: f64) -> f64 {
+        let (below, above) = self.cell(beat);
+        if above - beat <= GRID_EPS {
+            above
+        } else {
+            below
+        }
+    }
+
+    /// The line after `line`, which is itself a line of this grid.
+    pub fn next_line(&self, line: f64) -> f64 {
+        let (_, above) = self.cell(line);
+        if above - line <= GRID_EPS {
+            // `line` sat a rounding error short of the line it stands for.
+            self.cell(above).1
+        } else {
+            above
+        }
+    }
+
+    /// `a`, every line strictly between `a` and `b`, and `b`, ascending —
+    /// the points a snapped stroke or ramp from `a` to `b` writes. With both
+    /// ends on lines that is exactly the lines from one to the other; one
+    /// entry when they are the same position.
+    pub fn lines_between(&self, a: f64, b: f64) -> Vec<f64> {
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        let mut lines = vec![lo];
+        if hi - lo <= GRID_EPS {
+            return lines;
+        }
+        let mut line = self.next_line(self.line_at_or_before(lo));
+        while line < hi - GRID_EPS && lines.len() < MAX_GRID_LINES {
+            if line > lo + GRID_EPS {
+                lines.push(line);
+            }
+            line = self.next_line(line);
+        }
+        lines.push(hi);
+        lines
+    }
+
+    /// How far Duplicate moves the copies of a selection spanning local
+    /// `[start, end)`.
+    ///
+    /// The rule: the copies keep the selection's place in its grid cell and
+    /// land on the first such place at or after the selection's end. Walk the
+    /// grid from the line at or before `start`, one line at a time — with the
+    /// "1 Bar" grid one bar at a time, each bar as long as the meter in force
+    /// there makes it — until that line plus the selection's offset into its
+    /// cell reaches `end`. Under one meter this is the selection length
+    /// rounded up to whole grid steps (never less than one step), so a
+    /// four-beat selection in 4/4 moves one bar wherever it starts; across a
+    /// meter change it is the place the note grid counts the same number of
+    /// bars on, which is not the same number of beats.
+    pub fn duplicate_offset(&self, start: f64, end: f64) -> f64 {
+        let span = (end - start).max(0.0);
+        if let GridStep::Beats(step) = self.step {
+            let step = step.max(GRID_EPS);
+            let steps = ((span - GRID_EPS) / step).ceil().max(1.0);
+            return steps * step;
+        }
+        let anchor = self.line_at_or_before(start);
+        let into_cell = start - anchor;
+        let mut line = anchor;
+        for _ in 0..MAX_GRID_LINES {
+            line = self.next_line(line);
+            if line + into_cell >= end - GRID_EPS {
+                break;
+            }
+        }
+        line + into_cell - start
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

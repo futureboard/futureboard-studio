@@ -34,10 +34,10 @@ use crate::assets;
 use crate::components::edit::{normalize_range, EditCommand};
 use crate::components::timeline::timeline::Timeline;
 use crate::components::timeline::timeline_state::{
-    midi_debug_enabled, ArticulationId, ChordInsertKind, MidiArticulationEvent, MidiChannel,
-    MidiChannelMask, MidiControllerKind, MidiControllerPoint, MidiNoteState, PitchCurve,
-    PitchTransformContext, ScaleKind, ScaleRoot, StretchAnchor, StretchSpec, TimelineState,
-    MIN_NOTE_BEATS,
+    midi_debug_enabled, ArticulationId, ChordInsertKind, GridStep, MeterBars, MeterGrid,
+    MidiArticulationEvent, MidiChannel, MidiChannelMask, MidiControllerKind, MidiControllerPoint,
+    MidiNoteState, PitchCurve, PitchTransformContext, ScaleKind, ScaleRoot, StretchAnchor,
+    StretchSpec, TimelineState, MIN_NOTE_BEATS,
 };
 use crate::theme::Colors;
 use sphere_midi_service::{NoteExpression, NoteExpressionLane};
@@ -297,18 +297,7 @@ impl EditorMeter {
     /// draws: bars count from each meter's start, and a meter change is a bar
     /// line of its own even when the previous meter's last bar is cut short.
     pub fn snap_to_bar(&self, beat: f32) -> f32 {
-        let beat = beat.max(0.0);
-        let Some(seg) = self.segment_at(beat) else {
-            return beat;
-        };
-        let bar = seg.bar_beats.max(0.25);
-        let below = seg.start + ((beat - seg.start) / bar).floor() * bar;
-        let above = (below + bar).min(seg.end);
-        if beat - below <= above - beat {
-            below
-        } else {
-            above
-        }
+        MeterGrid::new(self, GridStep::Bar, 0.0).snap(f64::from(beat.max(0.0))) as f32
     }
 
     /// Segments overlapping `[start, end]`.
@@ -316,6 +305,21 @@ impl EditorMeter {
         self.segments
             .iter()
             .filter(move |seg| seg.end > start && seg.start <= end)
+    }
+}
+
+/// The editor's bars for the shared meter-aware grid ([`MeterGrid`]) — the
+/// bars [`PianoRollViewport::grid_lines_in`] draws.
+impl MeterBars for EditorMeter {
+    fn bar_span(&self, beat: f64) -> (f64, f64) {
+        let beat = beat.max(0.0) as f32;
+        let Some(seg) = self.segment_at(beat) else {
+            return (0.0, 4.0);
+        };
+        let bar = seg.bar_beats.max(0.25);
+        let start = seg.start + ((beat - seg.start) / bar).floor() * bar;
+        let end = (start + bar).min(seg.end);
+        (f64::from(start), f64::from(end))
     }
 }
 
@@ -578,6 +582,77 @@ impl DragGrab {
     }
 }
 
+/// How far the *pointer* has travelled since a note press, measured in window
+/// pixels from the press point — the click-vs-drag test (#242).
+///
+/// Content space ([`DragGrab`]) is the wrong ruler for this: follow-playhead
+/// and the wheel move the content under a pointer that is held still, so a
+/// still click measured there turned into a move or a resize. Pointer travel
+/// only changes when the mouse moves. Once it passes [`NOTE_CLICK_SLOP_PX`]
+/// the press is a drag for good, and from then on the drag is measured in
+/// content space so the note follows the content under the cursor (#184).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PointerTravel {
+    /// Window position of the press.
+    press: (f32, f32),
+    /// The pointer has moved past the slop since the press.
+    dragging: bool,
+}
+
+impl PointerTravel {
+    fn new(press: (f32, f32)) -> Self {
+        Self {
+            press,
+            dragging: false,
+        }
+    }
+
+    /// Record a pointer position (window pixels). Returns whether the press
+    /// is now a drag; that latches.
+    fn track(&mut self, pointer: (f32, f32)) -> bool {
+        let (dx, dy) = (pointer.0 - self.press.0, pointer.1 - self.press.1);
+        self.dragging = self.dragging || dx.hypot(dy) >= NOTE_CLICK_SLOP_PX;
+        self.dragging
+    }
+}
+
+/// The live `(beats, rows)` of a Move/Resize drag: nothing until the pointer
+/// itself has moved, however far the view scrolled under it; after that the
+/// content-space delta from the grab to the content now under the pointer.
+fn note_drag_delta(travel: PointerTravel, grab: DragGrab, now: DragGrab) -> (f32, i32) {
+    if travel.dragging {
+        grab.delta_to(now)
+    } else {
+        (0.0, 0)
+    }
+}
+
+/// The live length of a Resize drag: the grabbed note's original length until
+/// the pointer has moved — a press is not a request to re-snap an off-grid
+/// end — then the snapped edge under the pointer.
+fn resize_drag_duration(
+    travel: PointerTravel,
+    grab: DragGrab,
+    now: DragGrab,
+    anchor_start: f32,
+    prev_dur: f32,
+    snap: impl Fn(f32) -> f32,
+) -> f32 {
+    if !travel.dragging {
+        return prev_dur;
+    }
+    let (d_beats, _) = note_drag_delta(travel, grab, now);
+    let edge = snap(anchor_start + prev_dur + d_beats);
+    (edge - anchor_start).max(MIN_NOTE_BEATS)
+}
+
+/// Whether releasing a note Move is a click — judged on pointer travel only.
+/// A click commits nothing and records no undo step; it only applies a
+/// deselect-on-click.
+fn move_release_is_click(travel: PointerTravel) -> bool {
+    !travel.dragging
+}
+
 fn snap_beat_to_step(beat: f32, step: f32) -> f32 {
     if step <= 0.0 {
         beat.max(0.0)
@@ -634,6 +709,74 @@ fn viewport_snap_step(snap_on: bool, grid_res: GridRes, ppb: f32, bar_beats: f32
         return 0.0;
     }
     grid_step_beats(grid_res, ppb, bar_beats).max(MIN_NOTE_BEATS)
+}
+
+/// The note grid for `grid_res` at Zoom X `ppb` as the shared meter-aware
+/// grid ([`MeterGrid`]), in the frame of a clip that starts `origin` beats
+/// into the song. `None` for `Free`, which has no lines.
+///
+/// The one grid of the MIDI editor: notes snap through it, the controller
+/// lanes snap and walk through it, and Duplicate measures through it — and
+/// the arrangement's automation lanes use the same [`MeterGrid`] on the song
+/// axis — so none of them can drift from the bar lines drawn after a meter
+/// change.
+fn note_grid(
+    meter: &EditorMeter,
+    grid_res: GridRes,
+    ppb: f32,
+    origin: f32,
+) -> Option<MeterGrid<'_, EditorMeter>> {
+    let step = match grid_res {
+        GridRes::Free => return None,
+        GridRes::Bar => GridStep::Bar,
+        other => GridStep::Beats(f64::from(
+            grid_step_beats(other, ppb, meter.bar_beats_at(origin)).max(MIN_NOTE_BEATS),
+        )),
+    };
+    Some(MeterGrid::new(meter, step, f64::from(origin)))
+}
+
+/// How far Duplicate moves the copies of a selection spanning clip beats
+/// `[start, end)`: [`MeterGrid::duplicate_offset`] on the note grid, or the
+/// exact span when there is no grid (snapping off, `Free`, or Shift).
+fn duplicate_offset(grid: Option<MeterGrid<'_, EditorMeter>>, start: f32, end: f32) -> f32 {
+    let span = (end - start).max(MIN_NOTE_BEATS);
+    match grid {
+        None => span,
+        // A length, not a position: snapping the span as if it were a clip
+        // beat put "1 Bar" copies of a clip that starts off a bar line onto
+        // the nearest bar line instead of one bar on (#237).
+        Some(grid) => (grid.duplicate_offset(f64::from(start), f64::from(start + span)) as f32)
+            .max(MIN_NOTE_BEATS),
+    }
+}
+
+/// The clip beats a snapped controller stroke or ramp from `a` to `b` writes
+/// a point on: `a`, every grid line between them, and `b`, ascending — the
+/// note grid's lines, so after a meter change inside the clip the points
+/// stay on the bar lines drawn instead of stepping on by the first bar's
+/// length.
+fn controller_grid_lines(grid: MeterGrid<'_, EditorMeter>, a: f32, b: f32) -> Vec<f32> {
+    grid.lines_between(f64::from(a), f64::from(b))
+        .into_iter()
+        .map(|beat| beat as f32)
+        .collect()
+}
+
+/// `lo`, then every `step` after it, ending on `hi`: the evenly spaced
+/// samples a controller ramp writes when there is no grid (`Free`).
+fn uniform_controller_samples(lo: f32, hi: f32, step: f32) -> Vec<f32> {
+    let step = step.max(1.0e-3);
+    let count = (((hi - lo).max(0.0) / step).round() as i32).clamp(0, 65_536);
+    (0..=count)
+        .map(|i| {
+            if i > 0 && i == count {
+                hi
+            } else {
+                (lo + step * i as f32).min(hi)
+            }
+        })
+        .collect()
 }
 
 /// What Select All selects: every note on a channel the channel-view filter
@@ -1067,10 +1210,12 @@ enum PianoDrag {
     /// `grab` is the press in content space and `pointer` the last pointer
     /// position: the deltas are re-derived from both whenever the view scrolls
     /// or zooms (see [`PianoRoll::refresh_drag_from_pointer`]), so the note
-    /// stays under a still cursor while the content moves.
+    /// stays under a still cursor while the content moves. `travel` decides
+    /// click vs drag on pointer movement alone (see [`PointerTravel`]).
     Move {
         grab: DragGrab,
         pointer: (f32, f32),
+        travel: PointerTravel,
         prev: Vec<(u64, f32, u8)>,
         ids: HashSet<u64>,
         dx_beats: f32,
@@ -1100,6 +1245,7 @@ enum PianoDrag {
         ids: Vec<u64>,
         grab: DragGrab,
         pointer: (f32, f32),
+        travel: PointerTravel,
         prev_dur: f32,
         prev_durs: HashMap<u64, f32>,
         /// Original start of the grabbed note; right-edge snapping is performed
@@ -2374,20 +2520,22 @@ impl PianoRoll {
     /// for a gesture that asks for the grid explicitly (Alt on the CC lane's
     /// freehand brush). `Free` has no grid and returns the beat as it is.
     fn snap_to_grid(&self, beats: f32) -> f32 {
-        if self.grid_res == GridRes::Bar {
-            // Bars follow the meter, measured on the song's axis: snap there,
-            // so a note lands on the bar line drawn under it in 3/4, 6/8 or
-            // across a meter change.
-            let origin = self.edit_origin();
-            return (self.meter.snap_to_bar(beats + origin) - origin).max(0.0);
+        // Bars follow the meter, measured on the song's axis, so a note lands
+        // on the bar line drawn under it in 3/4, 6/8 or across a meter
+        // change; fixed steps count from the clip start. Both round (not
+        // floor) so drag jitter near a grid line settles stably instead of
+        // snapping one step early under the cursor.
+        match self.edit_grid() {
+            Some(grid) => (grid.snap(f64::from(beats)) as f32).max(0.0),
+            None => beats.max(0.0),
         }
-        let step = self.step_beats();
-        if step <= 0.0 {
-            return beats.max(0.0);
-        }
-        // Round (not floor) so drag jitter near a grid line settles stably
-        // instead of snapping one step early under the cursor.
-        snap_beat_to_step(beats, step)
+    }
+
+    /// The note grid of the edited clip, whatever the snap toggle says (see
+    /// [`note_grid`]): notes, controller lanes and Duplicate all go through
+    /// it. `None` for `Free`.
+    fn edit_grid(&self) -> Option<MeterGrid<'_, EditorMeter>> {
+        note_grid(&self.meter, self.grid_res, self.ppb, self.edit_origin())
     }
 
     /// Same as [`Self::snap_beats`], but `unsnap` (live Shift state of the
@@ -2896,24 +3044,39 @@ impl PianoRoll {
     /// cursor (follow-playhead, the wheel) moves the dragged notes with the
     /// cursor rather than with the content. O(1): no per-note work.
     fn refresh_drag_from_pointer(&mut self) {
-        let (grab, pointer) = match &self.drag {
-            PianoDrag::Move { grab, pointer, .. } | PianoDrag::Resize { grab, pointer, .. } => {
-                (*grab, *pointer)
+        let (grab, pointer, travel) = match &self.drag {
+            PianoDrag::Move {
+                grab,
+                pointer,
+                travel,
+                ..
             }
+            | PianoDrag::Resize {
+                grab,
+                pointer,
+                travel,
+                ..
+            } => (*grab, *pointer, *travel),
             _ => return,
         };
-        let (d_beats, d_rows) = grab.delta_to(self.drag_grab_at(pointer));
+        // Zero until the pointer itself has moved (#242): a scroll under a
+        // still pointer is not a drag.
+        let now = self.drag_grab_at(pointer);
+        let (d_beats, d_rows) = note_drag_delta(travel, grab, now);
         let resized = match &self.drag {
             PianoDrag::Resize {
                 prev_dur,
                 anchor_start,
                 unsnap,
                 ..
-            } => {
-                let raw_edge = *anchor_start + *prev_dur + d_beats;
-                let edge = self.snap_beats_live(raw_edge, *unsnap);
-                Some((edge - *anchor_start).max(MIN_NOTE_BEATS))
-            }
+            } => Some(resize_drag_duration(
+                travel,
+                grab,
+                now,
+                *anchor_start,
+                *prev_dur,
+                |edge| self.snap_beats_live(edge, *unsnap),
+            )),
             _ => None,
         };
         match &mut self.drag {
@@ -3861,6 +4024,7 @@ impl PianoRoll {
         self.drag = PianoDrag::Move {
             grab: self.drag_grab_at(pointer),
             pointer,
+            travel: PointerTravel::new(pointer),
             prev,
             ids,
             dx_beats: 0.0,
@@ -3928,6 +4092,7 @@ impl PianoRoll {
             ids,
             grab: self.drag_grab_at(pointer),
             pointer,
+            travel: PointerTravel::new(pointer),
             prev_dur,
             prev_durs,
             anchor_start,
@@ -4709,10 +4874,14 @@ impl PianoRoll {
         }
         if matches!(self.drag, PianoDrag::Move { .. }) {
             if let PianoDrag::Move {
-                pointer, unsnap, ..
+                pointer,
+                travel,
+                unsnap,
+                ..
             } = &mut self.drag
             {
                 *pointer = (event.position.x.into(), event.position.y.into());
+                travel.track(*pointer);
                 *unsnap = event.modifiers.shift;
             }
             self.refresh_drag_from_pointer();
@@ -4741,10 +4910,14 @@ impl PianoRoll {
         }
         if matches!(self.drag, PianoDrag::Resize { .. }) {
             if let PianoDrag::Resize {
-                pointer, unsnap, ..
+                pointer,
+                travel,
+                unsnap,
+                ..
             } = &mut self.drag
             {
                 *pointer = (event.position.x.into(), event.position.y.into());
+                travel.track(*pointer);
                 *unsnap = event.modifiers.shift;
             }
             self.refresh_drag_from_pointer();
@@ -4966,6 +5139,7 @@ impl PianoRoll {
             PianoDrag::None => return,
             PianoDrag::Move {
                 prev,
+                travel,
                 dx_beats,
                 dpitch,
                 anchor_start,
@@ -4974,11 +5148,12 @@ impl PianoRoll {
                 deselect_on_click,
                 ..
             } => {
-                // A press that moved less than a few pixels is a click: with
-                // Shift held the drag is unsnapped, and a hand's jitter would
-                // otherwise nudge the notes off the grid.
-                let moved_px = dx_beats.abs() * self.ppb.max(0.0001);
-                if moved_px < NOTE_CLICK_SLOP_PX && dpitch == 0 {
+                // A press whose pointer moved less than a few pixels is a
+                // click, however far follow-playhead or the wheel scrolled
+                // the view meanwhile (#242): it commits nothing and records
+                // no undo step. With Shift held the drag is unsnapped, and a
+                // hand's jitter would otherwise nudge the notes off the grid.
+                if move_release_is_click(travel) {
                     if let Some(id) = deselect_on_click {
                         self.selection.remove(&id);
                         cx.notify();
@@ -5051,13 +5226,15 @@ impl PianoRoll {
             PianoDrag::Resize {
                 id,
                 ids,
+                travel,
                 new_dur,
                 prev_dur,
                 prev_durs,
                 delta_dur,
                 ..
             } => {
-                if (new_dur - prev_dur).abs() < 0.0001 {
+                // As for Move: only a real pointer drag resizes (#242).
+                if !travel.dragging || (new_dur - prev_dur).abs() < 0.0001 {
                     return;
                 }
                 let target_ids = if ids.is_empty() { vec![id] } else { ids };
@@ -5946,8 +6123,12 @@ impl PianoRoll {
     }
 
     /// Duplicate the selection in place, offset forward by the selection's beat
-    /// span so the copies sit immediately after the originals. Selects the new
-    /// notes. Does not use the clipboard.
+    /// span so the copies sit after the originals. With snapping on, the span
+    /// is measured on the note grid — whole grid steps, whole bars of the
+    /// meter for "1 Bar", following meter changes (see
+    /// [`MeterGrid::duplicate_offset`] for the rule); Shift, `Free` or snap
+    /// off keep the exact span. Selects the new notes. Does not use the
+    /// clipboard.
     fn duplicate_selection(&mut self, bypass_snap: bool, cx: &mut Context<Self>) {
         let Some(clip_id) = self.editing_clip_id(cx) else {
             return;
@@ -5973,12 +6154,14 @@ impl PianoRoll {
             .iter()
             .map(|n| n.start + n.duration)
             .fold(0.0_f32, f32::max);
-        // Shift bypass keeps the exact source span; otherwise duplicates remain
-        // grid-aligned through the same piano-roll snap helper used by movement.
-        let raw_offset = (max_end - min_start).max(MIN_NOTE_BEATS);
-        let offset = self
-            .snap_beats_live(raw_offset, bypass_snap)
-            .max(MIN_NOTE_BEATS);
+        // Shift bypass keeps the exact source span; otherwise the copies stay
+        // on the note grid that movement snaps to.
+        let grid = if bypass_snap || !self.snap_on {
+            None
+        } else {
+            self.edit_grid()
+        };
+        let offset = duplicate_offset(grid, min_start, max_end);
         let notes: Vec<MidiNoteState> = src
             .iter()
             .map(|n| {
@@ -7706,5 +7889,323 @@ mod drag_and_selection_tests {
         );
         assert_eq!(visible_note_ids(&notes, MidiChannelMask::ALL).len(), 3);
         assert!(visible_note_ids(&notes, MidiChannelMask::NONE).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod meter_grid_tests {
+    use super::*;
+    use crate::components::timeline::timeline_state::{
+        snap_automation_beat, SnapDivision, SnapSettings, SnapShape, TimeSignatureMap,
+        TimeSignaturePoint,
+    };
+
+    fn map(points: &[(f64, u16, u16)]) -> TimeSignatureMap {
+        TimeSignatureMap::with_points(
+            points
+                .iter()
+                .enumerate()
+                .map(|(i, &(beat, n, d))| TimeSignaturePoint::with_id(format!("m{i}"), beat, n, d))
+                .collect(),
+        )
+    }
+
+    fn meter(points: &[(f64, u16, u16)]) -> EditorMeter {
+        EditorMeter::from_map(&map(points))
+    }
+
+    /// 4/4 for two bars, then 3/4 from beat 8: bar lines 0, 4, 8, 11, 14, 17…
+    fn four_then_three() -> EditorMeter {
+        meter(&[(0.0, 4, 4), (8.0, 3, 4)])
+    }
+
+    /// Duplicate's offset for a selection over clip beats `[start, end)` in a
+    /// clip starting at `origin`, on the "1 Bar" grid.
+    fn dup_bar(m: &EditorMeter, origin: f32, start: f32, end: f32) -> f32 {
+        let offset = duplicate_offset(note_grid(m, GridRes::Bar, 96.0, origin), start, end);
+        assert!(
+            start + offset >= end - 1.0e-4,
+            "copies of [{start}, {end}) at +{offset} overlap the originals"
+        );
+        offset
+    }
+
+    fn lines(m: &EditorMeter, origin: f32, a: f32, b: f32) -> Vec<f32> {
+        let grid = note_grid(m, GridRes::Bar, 96.0, origin).expect("bar grid");
+        controller_grid_lines(grid, a, b)
+    }
+
+    /// #237: Duplicate moves a bar's worth of notes by the meter's bar in
+    /// 4/4, 3/4 and 6/8, rounding the selection length up to whole bars so
+    /// the copies never land on top of the originals.
+    #[test]
+    fn duplicate_moves_by_whole_bars_of_the_meter() {
+        let four = meter(&[(0.0, 4, 4)]);
+        assert_eq!(dup_bar(&four, 0.0, 0.0, 4.0), 4.0);
+        assert_eq!(dup_bar(&four, 0.0, 0.0, 3.0), 4.0);
+        assert_eq!(dup_bar(&four, 0.0, 0.0, 5.0), 8.0);
+
+        let three = meter(&[(0.0, 3, 4)]);
+        assert_eq!(dup_bar(&three, 0.0, 0.0, 3.0), 3.0);
+        assert_eq!(dup_bar(&three, 0.0, 0.0, 4.0), 6.0);
+
+        let six_eight = meter(&[(0.0, 6, 8)]);
+        assert_eq!(dup_bar(&six_eight, 0.0, 0.0, 3.0), 3.0);
+        assert_eq!(dup_bar(&six_eight, 0.0, 0.0, 4.5), 6.0);
+    }
+
+    /// #237, the reported case: a clip starting on beat 2 (or 3) of a 4/4
+    /// bar duplicates four beats of notes one bar on, not by a snapped
+    /// position.
+    #[test]
+    fn duplicate_in_a_clip_off_a_bar_line_moves_one_bar() {
+        let four = meter(&[(0.0, 4, 4)]);
+        assert_eq!(dup_bar(&four, 1.0, 0.0, 4.0), 4.0);
+        assert_eq!(dup_bar(&four, 2.0, 0.0, 4.0), 4.0);
+        // A selection that starts between bar lines keeps its place in the bar.
+        assert_eq!(dup_bar(&four, 1.0, 1.0, 3.0), 4.0);
+
+        let three = meter(&[(0.0, 3, 4)]);
+        assert_eq!(dup_bar(&three, 1.0, 0.0, 3.0), 3.0);
+
+        let six_eight = meter(&[(0.0, 6, 8)]);
+        assert_eq!(dup_bar(&six_eight, 1.5, 0.0, 3.0), 3.0);
+    }
+
+    /// #237: across a meter change the copies land where the note grid counts
+    /// the next bars — a 3/4 bar moves three beats, not the four of the bar
+    /// the clip starts in.
+    #[test]
+    fn duplicate_across_a_meter_change_lands_on_the_bars_the_grid_counts() {
+        let m = four_then_three();
+        // Clip at the song start.
+        assert_eq!(dup_bar(&m, 0.0, 8.0, 11.0), 3.0);
+        assert_eq!(dup_bar(&m, 0.0, 8.0, 14.0), 6.0);
+        assert_eq!(dup_bar(&m, 0.0, 4.0, 8.0), 4.0);
+        // Four beats from the middle of bar 2 reach into the 3/4: one bar on
+        // keeps the selection's place in its bar (beat 10 = 8 + 2).
+        assert_eq!(dup_bar(&m, 0.0, 6.0, 10.0), 4.0);
+        // Four 4/4 beats copied into the 3/4 section need two of its bars.
+        assert_eq!(dup_bar(&m, 0.0, 8.0, 12.0), 6.0);
+
+        // The same bars in a clip that starts mid-bar (song beat 2): the
+        // change sits at clip beat 6.
+        assert_eq!(dup_bar(&m, 2.0, 2.0, 6.0), 4.0);
+        assert_eq!(dup_bar(&m, 2.0, 6.0, 9.0), 3.0);
+    }
+
+    /// Fixed grids round the length up to whole steps; no grid (snap off,
+    /// Free, Shift) keeps the exact span.
+    #[test]
+    fn duplicate_on_a_fixed_grid_or_without_one() {
+        let four = meter(&[(0.0, 4, 4)]);
+        let quarter = || note_grid(&four, GridRes::Quarter, 96.0, 0.5);
+        assert_eq!(duplicate_offset(quarter(), 0.0, 1.0), 1.0);
+        assert_eq!(duplicate_offset(quarter(), 0.0, 1.2), 2.0);
+        assert_eq!(duplicate_offset(quarter(), 0.25, 0.5), 1.0);
+        assert!((duplicate_offset(None, 0.0, 1.2) - 1.2).abs() < 1.0e-6);
+    }
+
+    /// #237: a snapped controller stroke or ramp writes one point per bar line
+    /// of the meter — after a change inside the clip too.
+    #[test]
+    fn controller_lines_follow_a_meter_change_inside_the_clip() {
+        let m = four_then_three();
+        assert_eq!(lines(&m, 0.0, 0.0, 14.0), vec![0.0, 4.0, 8.0, 11.0, 14.0]);
+        // Right-to-left gives the same ascending lines.
+        assert_eq!(lines(&m, 0.0, 14.0, 0.0), vec![0.0, 4.0, 8.0, 11.0, 14.0]);
+        // Clip off a bar line (song beat 2): song 4, 8, 11, 14.
+        assert_eq!(lines(&m, 2.0, 2.0, 12.0), vec![2.0, 6.0, 9.0, 12.0]);
+    }
+
+    #[test]
+    fn controller_lines_in_three_four_six_eight_and_off_a_bar_line() {
+        assert_eq!(
+            lines(&meter(&[(0.0, 3, 4)]), 0.0, 0.0, 9.0),
+            vec![0.0, 3.0, 6.0, 9.0]
+        );
+        // 6/8 clip starting half a bar in: song 3, 6, 9.
+        assert_eq!(
+            lines(&meter(&[(0.0, 6, 8)]), 1.5, 1.5, 7.5),
+            vec![1.5, 4.5, 7.5]
+        );
+        assert_eq!(
+            lines(&meter(&[(0.0, 4, 4)]), 1.0, 3.0, 11.0),
+            vec![3.0, 7.0, 11.0]
+        );
+        // Same line twice: one point, the line under the cursor.
+        assert_eq!(lines(&meter(&[(0.0, 4, 4)]), 0.0, 4.0, 4.0), vec![4.0]);
+    }
+
+    /// The controller lane's bar lines are the ones the note grid draws.
+    #[test]
+    fn controller_lines_are_the_drawn_bar_lines() {
+        let m = four_then_three();
+        let v = PianoRollViewport {
+            ppb: 20.0,
+            scroll_x: 0.0,
+            row_h: 12.0,
+            scroll_y: 0.0,
+            key_lane_width: 0.0,
+            snap_step_beats: 1.0,
+            sub_step_beats: 1.0,
+            grid_width: 2000.0,
+            grid_height: 400.0,
+        };
+        let drawn: Vec<f32> = v
+            .grid_lines_in(0.0, 20.0, &m)
+            .iter()
+            .filter(|(_, kind)| *kind == GridLineKind::Bar)
+            .map(|(x, _)| x / 20.0)
+            .filter(|beat| *beat <= 20.0)
+            .collect();
+        assert_eq!(lines(&m, 0.0, 0.0, 20.0), drawn);
+    }
+
+    /// #237: the arrangement's automation lanes and the piano roll's notes
+    /// and controller lanes snap through the same grid: the same bars, the
+    /// same lines, across meter changes.
+    #[test]
+    fn automation_and_controller_lanes_snap_where_the_notes_do() {
+        let points = [(0.0, 4, 4), (8.0, 3, 4), (17.0, 6, 8)];
+        let song = map(&points);
+        let editor = EditorMeter::from_map(&song);
+        for (grid_res, division) in [
+            (GridRes::Bar, SnapDivision::Bar1),
+            (GridRes::Quarter, SnapDivision::Div1_4),
+            (GridRes::Sixteenth, SnapDivision::Div1_16),
+        ] {
+            let snap = SnapSettings {
+                enabled: true,
+                division,
+                shape: SnapShape::Straight,
+                beats_per_bar: 4.0,
+                auto_step_beats: 0.25,
+            };
+            let notes = note_grid(&editor, grid_res, 96.0, 0.0).expect("grid");
+            for i in 0..=96 {
+                let beat = i as f32 * 0.27;
+                let note = (notes.snap(f64::from(beat)) as f32).max(0.0);
+                let automation = snap_automation_beat(beat, snap, &song, false);
+                assert!(
+                    (note - automation).abs() < 1.0e-4,
+                    "{grid_res:?} at {beat}: notes {note}, automation {automation}"
+                );
+            }
+        }
+        // And the bars themselves agree beat for beat.
+        for i in 0..=120 {
+            let beat = f64::from(i) * 0.25;
+            assert_eq!(song.bar_span(beat), editor.bar_span(beat), "beat {beat}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod click_vs_drag_tests {
+    use super::*;
+
+    const PPB: f32 = 96.0;
+    const ROW: f32 = 14.0;
+    /// Window position of the note grid's top-left corner.
+    const GRID_ORIGIN: (f32, f32) = (80.0, 60.0);
+    const PRESS: (f32, f32) = (300.0, 200.0);
+
+    /// The content point under window `pointer` with the view scrolled to
+    /// `scroll` — what `PianoRoll::drag_grab_at` computes.
+    fn content(pointer: (f32, f32), scroll: (f32, f32)) -> DragGrab {
+        DragGrab::at(
+            pointer.0 - GRID_ORIGIN.0,
+            pointer.1 - GRID_ORIGIN.1,
+            scroll.0,
+            scroll.1,
+            PPB,
+            ROW,
+        )
+    }
+
+    /// #242: follow playback scrolls the view under a pointer held still on a
+    /// note. Every frame the drag is re-derived (as on render); the note must
+    /// not move, and the release is a click — `on_up` returns before any
+    /// edit command, so no undo step is recorded.
+    #[test]
+    fn a_still_click_during_follow_playback_does_not_move_the_note() {
+        let grab = content(PRESS, (0.0, 0.0));
+        let mut travel = PointerTravel::new(PRESS);
+        let mut scroll = (0.0, 0.0);
+        for _frame in 0..12 {
+            scroll.0 += 6.0; // ~150 ms of follow-playhead at 60 fps
+            assert!(!travel.track(PRESS));
+            let now = content(PRESS, scroll);
+            assert_eq!(note_drag_delta(travel, grab, now), (0.0, 0));
+        }
+        assert!(move_release_is_click(travel));
+    }
+
+    /// #242: the same on a note's resize handle — the length stays, even for
+    /// a note whose end is off the grid (a re-snap would change it).
+    #[test]
+    fn a_still_press_on_a_resize_handle_during_scroll_does_not_resize() {
+        let grab = content(PRESS, (0.0, 0.0));
+        let mut travel = PointerTravel::new(PRESS);
+        let snap = |beat: f32| snap_beat_to_step(beat, 0.25);
+        let (anchor_start, prev_dur) = (2.0, 0.9);
+        let mut scroll = (0.0, 0.0);
+        for _frame in 0..12 {
+            scroll.0 += 6.0;
+            travel.track(PRESS);
+            let now = content(PRESS, scroll);
+            assert_eq!(
+                resize_drag_duration(travel, grab, now, anchor_start, prev_dur, snap),
+                prev_dur
+            );
+        }
+    }
+
+    /// #242: a modifier click that deselects on release (Shift on a selected
+    /// note) still deselects while the wheel scrolls the view under it, in
+    /// either axis. (Ctrl/Cmd-click toggles the note on press and never
+    /// starts a drag, so scrolling cannot touch it.)
+    #[test]
+    fn a_click_to_deselect_survives_wheel_scrolling() {
+        let grab = content(PRESS, (0.0, 0.0));
+        let mut travel = PointerTravel::new(PRESS);
+        travel.track(PRESS);
+        for scroll in [(0.0, 42.0), (120.0, 0.0), (240.0, 70.0)] {
+            // Nothing moves while the view scrolls, and the release is a click.
+            assert_eq!(
+                note_drag_delta(travel, grab, content(PRESS, scroll)),
+                (0.0, 0)
+            );
+            assert!(move_release_is_click(travel));
+        }
+    }
+
+    /// Hand jitter inside the slop stays a click; past it the press is a drag
+    /// for good, even if the pointer comes back.
+    #[test]
+    fn the_threshold_is_pointer_travel_and_latches() {
+        let mut travel = PointerTravel::new(PRESS);
+        assert!(!travel.track((PRESS.0 + 2.0, PRESS.1)));
+        assert!(!travel.track((PRESS.0 + 1.5, PRESS.1 + 1.5)));
+        assert!(travel.track((PRESS.0, PRESS.1 + 3.0)));
+        assert!(travel.track(PRESS));
+    }
+
+    /// #184 kept: once the pointer has really moved, the dragged note
+    /// follows the content under the cursor through a scroll.
+    #[test]
+    fn a_real_drag_during_scroll_still_follows_the_content() {
+        let grab = content(PRESS, (0.0, 0.0));
+        let mut travel = PointerTravel::new(PRESS);
+        let moved = (PRESS.0 + 24.0, PRESS.1);
+        assert!(travel.track(moved));
+        // Pointer held still at `moved`, view scrolled one beat and a row.
+        let now = content(moved, (PPB, ROW));
+        let (beats, rows) = note_drag_delta(travel, grab, now);
+        assert!((beats - (24.0 + PPB) / PPB).abs() < 1.0e-5, "{beats}");
+        assert_eq!(rows, -1);
+        assert_eq!((beats, rows), grab.delta_to(now));
+        assert!(!move_release_is_click(travel));
     }
 }

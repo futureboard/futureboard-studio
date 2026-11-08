@@ -567,8 +567,9 @@ pub fn automation_lane(
                     let wy: f32 = event.position.y.into();
                     let lane_x = state_for.lane_x_from_window_x(wx);
                     let raw_beat = state_for.x_to_beats(lane_x);
-                    let snapped_sec = state_for.snap_time(raw_beat * state_for.seconds_per_beat());
-                    let beat = (snapped_sec / state_for.seconds_per_beat()).max(0.0);
+                    // The shared meter-aware grid, the one the drag snaps
+                    // through — not the playhead's meter applied from beat 0.
+                    let beat = state_for.snap_automation_beats(raw_beat).max(0.0);
                     let content_y = state_for.content_y_from_window_y(wy);
                     let local_y = content_y - lane_y_abs;
                     let value = automation_y_to_value(local_y, lane_height);

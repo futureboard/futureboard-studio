@@ -359,7 +359,9 @@ fn translate(event: HostEvent) -> Option<ExternalEvent> {
             width,
             height,
         },
-        HostEvent::EditorClosed { plugin_instance_id } => ExternalEvent::EditorClosed {
+        HostEvent::EditorClosed {
+            plugin_instance_id, ..
+        } => ExternalEvent::EditorClosed {
             insert: insert_of(&plugin_instance_id)?,
         },
         HostEvent::PluginState {

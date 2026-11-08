@@ -1249,10 +1249,16 @@ impl StudioLayout {
 
         // The host has let go of this view. A content child an editor window
         // released it from -- switching tabs, or closing, so possibly with no
-        // window left to hand this to -- waited for exactly this to go.
-        if matches!(event, ClientEvent::Host(HostEvent::EditorClosed { .. })) {
+        // window left to hand this to -- waited for exactly this to go. Only
+        // the child the answered close named: the same plug-in may have a
+        // newer one parked, still holding its view.
+        if let ClientEvent::Host(HostEvent::EditorClosed {
+            editor_generation, ..
+        }) = &event
+        {
             crate::components::plugin_editor_window::release_parked_editor_content(
                 plugin_instance_id,
+                *editor_generation,
             );
         }
 
@@ -1276,14 +1282,14 @@ impl StudioLayout {
         if let Some((key, handle)) = gpui_target {
             // An `EditorClosed` only means *this* window when this window has an
             // editor to lose. One arriving while it is still opening belongs to
-            // whatever was torn down to make room for it.
+            // whatever was torn down to make room for it. Nor does an answer to
+            // one of the window's own closes, however late it comes.
             let attached = handle
                 .update(cx, |editor, _window, _cx| editor.is_attached())
                 .unwrap_or(false);
             let closed = attached
-                && matches!(
-                    event,
-                    ClientEvent::Host(HostEvent::EditorClosed { .. }) | ClientEvent::Disconnected
+                && crate::components::plugin_editor_window::PluginEditorWindow::host_closed_editor(
+                    &event,
                 );
             let delivered = handle
                 .update(cx, |editor, window, cx| {

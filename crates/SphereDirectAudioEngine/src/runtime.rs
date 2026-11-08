@@ -75,6 +75,17 @@ pub fn midi_verbose_enabled() -> bool {
     })
 }
 
+/// Read every cached flag of this module once, on a control thread: the first
+/// read takes the environment (and allocates), which must not happen in the
+/// callback. See `crate::engine::prime_audio_thread_resources`.
+pub(crate) fn prime_debug_flags() {
+    let _ = midi_engine_debug_enabled();
+    let _ = pdc_debug_enabled();
+    let _ = midi_verbose_enabled();
+    let _ = clip_dsp_debug_enabled();
+    let _ = signalsmith_enabled();
+}
+
 pub struct RuntimeSoundfontPlayer {
     pub path: PathBuf,
     pub preset: Option<(i32, i32)>,

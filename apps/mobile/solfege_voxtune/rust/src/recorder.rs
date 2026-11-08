@@ -373,9 +373,11 @@ mod android {
     impl Drop for Input {
         fn drop(&mut self) {
             unsafe {
-                (self.api.request_stop)(self.stream);
-                (self.api.close)(self.stream);
-                drop(Box::from_raw(self.ctx));
+                // Free the context only once the stream has stopped and been
+                // closed; a stream that never stopped keeps it (leaked).
+                if stop_and_close(self.api, self.stream) {
+                    drop(Box::from_raw(self.ctx));
+                }
             }
         }
     }

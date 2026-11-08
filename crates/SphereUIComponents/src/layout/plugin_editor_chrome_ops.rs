@@ -693,8 +693,12 @@ impl StudioLayout {
         // same path an undo of it takes.
         let builtin = self
             .insert_plugin_id(track_id, insert_id, cx)
-            .is_some_and(|plugin_id| SpherePluginHost::builtin_audio_bridge_supported(&plugin_id));
-        if builtin {
+            .filter(|plugin_id| SpherePluginHost::builtin_audio_bridge_supported(plugin_id));
+        if let Some(plugin_id) = builtin {
+            if !crate::components::builtin_plugin_editor::builtin_state_parses(&plugin_id, &state) {
+                eprintln!("[plugin-state] state for insert={insert_id} is not {plugin_id}'s");
+                return false;
+            }
             self.timeline.update(cx, |timeline, cx| {
                 if let Some(slot) = timeline
                     .state

@@ -28,9 +28,13 @@ impl Instrument {
             return Err(SoundFontError::InvalidInstrument(instrument_id));
         }
 
+        // Futureboard: the zone range comes from the file; one that runs past
+        // the bag list rejects the font instead of panicking.
         let span_start = info.zone_start_index as usize;
         let span_end = span_start + zone_count as usize;
-        let zone_span = &zones[span_start..span_end];
+        let zone_span = zones
+            .get(span_start..span_end)
+            .ok_or(SoundFontError::InvalidInstrumentList)?;
         let regions = InstrumentRegion::create(instrument_id, zone_span, samples)?;
 
         Ok(Self { name, regions })

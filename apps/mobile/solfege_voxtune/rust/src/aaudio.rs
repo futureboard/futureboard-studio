@@ -45,6 +45,8 @@ pub struct Api {
     pub request_pause: unsafe extern "C" fn(*mut Stream) -> i32,
     pub request_stop: unsafe extern "C" fn(*mut Stream) -> i32,
     pub close: unsafe extern "C" fn(*mut Stream) -> i32,
+    pub get_state: unsafe extern "C" fn(*mut Stream) -> i32,
+    pub wait_for_state_change: unsafe extern "C" fn(*mut Stream, i32, *mut i32, i64) -> i32,
     pub get_sample_rate: unsafe extern "C" fn(*mut Stream) -> i32,
     pub get_channel_count: unsafe extern "C" fn(*mut Stream) -> i32,
     pub get_format: unsafe extern "C" fn(*mut Stream) -> i32,
@@ -93,6 +95,8 @@ impl Api {
             request_pause: sym!(c"AAudioStream_requestPause"),
             request_stop: sym!(c"AAudioStream_requestStop"),
             close: sym!(c"AAudioStream_close"),
+            get_state: sym!(c"AAudioStream_getState"),
+            wait_for_state_change: sym!(c"AAudioStream_waitForStateChange"),
             get_sample_rate: sym!(c"AAudioStream_getSampleRate"),
             get_channel_count: sym!(c"AAudioStream_getChannelCount"),
             get_format: sym!(c"AAudioStream_getFormat"),
@@ -110,5 +114,44 @@ impl Api {
                 })
             },
         })
+    }
+}
+
+/// Longest single wait for the stream to change state while stopping.
+const STOP_WAIT_NANOS: i64 = 100_000_000;
+/// Waits before giving up on the stream stopping (about two seconds).
+const STOP_MAX_WAITS: u32 = 20;
+
+/// Stops and closes `stream`, returning whether its callbacks are known to be
+/// finished so the context they were registered with may be freed.
+///
+/// `requestStop` is asynchronous: a data callback can still be running when it
+/// returns. This waits for the stream to leave its running states before
+/// `close` instead of closing a stream that may be mid-callback. If it never
+/// settles, `false` tells the caller to keep the context alive (a bounded leak)
+/// rather than free memory a late callback could still read.
+///
+/// # Safety
+/// `stream` must be an open stream from `api` that nothing else closes.
+pub unsafe fn stop_and_close(api: &Api, stream: *mut Stream) -> bool {
+    unsafe {
+        (api.request_stop)(stream);
+        let settled = crate::aaudio_state::wait_until_settled(
+            (api.get_state)(stream),
+            STOP_MAX_WAITS,
+            |state| {
+                let mut next = state;
+                if (api.wait_for_state_change)(stream, state, &mut next, STOP_WAIT_NANOS)
+                    == AAUDIO_OK
+                {
+                    next
+                } else {
+                    // Timed out, or the stream errored: re-read where it is.
+                    (api.get_state)(stream)
+                }
+            },
+        );
+        (api.close)(stream);
+        settled
     }
 }

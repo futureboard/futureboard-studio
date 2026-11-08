@@ -145,6 +145,14 @@ pub enum HostCommand {
     /// Detach the editor view (`IPlugView::removed`) but keep the plugin loaded.
     CloseEditor {
         plugin_instance_id: String,
+        /// The client's ownership token for the window the view is attached
+        /// to. The host echoes it in the [`HostEvent::EditorClosed`] that
+        /// answers this close, so the client can tell which of several windows
+        /// it parked for the same instance may now be destroyed. Optional and
+        /// omitted when absent, so either side may be older than the other: an
+        /// older host ignores it, an older client never sends it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        editor_generation: Option<u64>,
     },
     /// Detach (if attached) and release the plugin instance entirely.
     UnloadPlugin {
@@ -487,7 +495,18 @@ pub enum HostEvent {
         dpi: u32,
     },
     /// Editor view detached (`IPlugView::removed` called).
-    EditorClosed { plugin_instance_id: String },
+    ///
+    /// Sent exactly once for every [`HostCommand::CloseEditor`], after the
+    /// detach and in command order, and also on its own when the user closes a
+    /// host-owned editor window.
+    EditorClosed {
+        plugin_instance_id: String,
+        /// The `editor_generation` of the [`HostCommand::CloseEditor`] this
+        /// answers. `None` when the close carried none, and when no close was
+        /// asked for (the user closed a host-owned window).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        editor_generation: Option<u64>,
+    },
     /// Freeze watchdog: the host UI thread's message pump stalled for
     /// `gap_ms` while this editor was open. The main app may surface a
     /// "plugin editor not responding" hint; the editor close path stays
@@ -878,6 +897,60 @@ mod tests {
         let mut reader = Cursor::new(buf);
         let decoded: HostCommand = read_frame(&mut reader).unwrap().unwrap();
         assert_eq!(decoded, cmd);
+    }
+
+    /// The editor generation travels on the close and comes back on its
+    /// answer; frames from either side's older build, without it, still parse,
+    /// and a frame without one is written exactly as an older build wrote it.
+    #[test]
+    fn editor_close_generation_round_trips_and_stays_optional() {
+        let close = HostCommand::CloseEditor {
+            plugin_instance_id: "track1:insert2".into(),
+            editor_generation: Some(41),
+        };
+        let closed = HostEvent::EditorClosed {
+            plugin_instance_id: "track1:insert2".into(),
+            editor_generation: Some(41),
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &close).unwrap();
+        write_frame(&mut buf, &closed).unwrap();
+        let mut reader = Cursor::new(buf);
+        assert_eq!(
+            read_frame::<HostCommand, _>(&mut reader).unwrap(),
+            Some(close)
+        );
+        assert_eq!(
+            read_frame::<HostEvent, _>(&mut reader).unwrap(),
+            Some(closed)
+        );
+
+        let legacy_close = r#"{"cmd":"CloseEditor","plugin_instance_id":"a"}"#;
+        let legacy_closed = r#"{"event":"EditorClosed","plugin_instance_id":"a"}"#;
+        assert_eq!(
+            serde_json::from_str::<HostCommand>(legacy_close).unwrap(),
+            HostCommand::CloseEditor {
+                plugin_instance_id: "a".into(),
+                editor_generation: None,
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<HostEvent>(legacy_closed).unwrap(),
+            HostEvent::EditorClosed {
+                plugin_instance_id: "a".into(),
+                editor_generation: None,
+            }
+        );
+        let mut buf = Vec::new();
+        write_frame(
+            &mut buf,
+            &HostEvent::EditorClosed {
+                plugin_instance_id: "a".into(),
+                editor_generation: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(buf).unwrap().trim_end(), legacy_closed);
     }
 
     #[test]

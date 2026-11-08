@@ -7,154 +7,174 @@
 //! thread (see `tasks/native/audio-system-spec.md` §1, §3 and the Phase A
 //! audit finding A.2.1).
 //!
-//! Instead the callback hands the retired graph to a background "graveyard"
+//! Instead the callback hands the retired value to a background "graveyard"
 //! thread through a bounded, lock-free channel. Once the channel exists a
 //! `try_send` performs no allocation, so the realtime thread only does an
 //! atomic enqueue; the actual destructor runs on the background thread.
+//!
+//! Every kind of graveyard (graphs, audition sources, MIDI schedules, tempo
+//! changes, ARA renderer lists) is created together, by [`prime`], on a control
+//! thread: at engine creation, before every device open and with every command
+//! that carries something the callback will retire. The `retire_*` functions
+//! never create a channel or a thread — they run on the audio thread. Should
+//! one ever run before [`prime`] (or after its worker failed to start), the
+//! retired value is leaked on purpose and counted, rather than allocating a
+//! channel, spawning a thread or running a destructor on the callback.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use crossbeam_channel::{bounded, Sender};
 
 use crate::audio_file::AudioFileBuffer;
-use crate::runtime::RuntimeProject;
+use crate::command::TempoMapChange;
+use crate::runtime::{RuntimeAraRenderer, RuntimeMidiData, RuntimeProject};
 
 /// Bounded so a pathological load storm cannot grow memory without limit. This
-/// is far more than the handful of retired graphs ever expected to be in
-/// flight; if it somehow fills, [`retire`] falls back to dropping in place.
+/// is far more than the handful of retired values ever expected to be in
+/// flight; if it somehow fills, the value is leaked and counted (see [`leak`]).
 const GRAVEYARD_CAPACITY: usize = 64;
 
-fn sender() -> &'static Sender<Box<RuntimeProject>> {
-    static GY: OnceLock<Sender<Box<RuntimeProject>>> = OnceLock::new();
-    GY.get_or_init(|| {
-        let (tx, rx) = bounded::<Box<RuntimeProject>>(GRAVEYARD_CAPACITY);
-        // Dedicated thread: blocks on recv (non-realtime) and drops each
-        // retired graph here, well away from the audio callback. Exits when
-        // the last sender is gone — but the sender is a process-lifetime
-        // static, so in practice it lives for the whole run.
-        let _ = std::thread::Builder::new()
-            .name("daux-graveyard".to_string())
-            .spawn(move || {
-                while let Ok(old) = rx.recv() {
-                    drop(old);
-                }
-            });
-        tx
-    })
+/// One channel (and one dropper thread) per kind, so a slow VST3 teardown in a
+/// retired graph never holds up the disposal of a tempo change.
+struct Graveyards {
+    project: Sender<Box<RuntimeProject>>,
+    audio_file: Sender<Box<AudioFileBuffer>>,
+    midi: Sender<Box<RuntimeMidiData>>,
+    tempo: Sender<Box<TempoMapChange>>,
+    ara: Sender<Vec<RuntimeAraRenderer>>,
 }
 
-fn audio_file_sender() -> &'static Sender<Box<AudioFileBuffer>> {
-    static GY: OnceLock<Sender<Box<AudioFileBuffer>>> = OnceLock::new();
-    GY.get_or_init(|| {
-        let (tx, rx) = bounded::<Box<AudioFileBuffer>>(GRAVEYARD_CAPACITY);
-        let _ = std::thread::Builder::new()
-            .name("daux-audition-graveyard".to_string())
-            .spawn(move || {
-                while let Ok(old) = rx.recv() {
-                    drop(old);
-                }
-            });
-        tx
-    })
+static GRAVEYARDS: OnceLock<Graveyards> = OnceLock::new();
+
+/// Retired values the audio thread had to leak because no graveyard could take
+/// them. Zero in a healthy process.
+static LEAKED: AtomicU64 = AtomicU64::new(0);
+/// The part of [`LEAKED`] already reported by [`prime`].
+static LEAKS_REPORTED: AtomicU64 = AtomicU64::new(0);
+
+/// A bounded channel whose receiving end drops every value it gets on a
+/// dedicated, non-realtime thread. Control thread only.
+fn spawn_worker<T: Send + 'static>(name: &str) -> Sender<T> {
+    let (tx, rx) = bounded::<T>(GRAVEYARD_CAPACITY);
+    #[cfg(test)]
+    test_hooks::note_worker_spawn();
+    // Exits when the last sender is gone — but the sender is a
+    // process-lifetime static, so in practice it lives for the whole run.
+    let spawned = std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            while let Ok(old) = rx.recv() {
+                drop(old);
+            }
+        });
+    if let Err(error) = spawned {
+        // The receiver went down with the closure, so every send on this
+        // channel now fails and the callback leaks (and counts) instead.
+        eprintln!("[graveyard] could not start {name}: {error}; retired values will be leaked");
+    }
+    tx
 }
 
-/// Initialise the graveyard channel and drop-thread from a non-realtime
-/// thread.
+/// Create every graveyard channel and its drop-thread, on the calling
+/// (non-realtime) thread. Idempotent: after the first call it is one atomic
+/// load.
 ///
-/// Call this from the control thread (e.g. project load) *before* a
-/// `LoadProject` command can reach the callback, so the callback's first
-/// [`retire`] is a cheap atomic enqueue rather than a channel allocation plus
-/// thread spawn.
+/// Call it before anything the callback could retire can reach the callback —
+/// see the module docs for where the engine does. Also reports, off the audio
+/// thread, any value the callback had to leak since the last call.
 pub fn prime() {
-    let _ = sender();
-    let _ = audio_file_sender();
-    let _ = ara_sender();
-    let _ = midi_sender();
-    let _ = tempo_sender();
+    GRAVEYARDS.get_or_init(|| Graveyards {
+        project: spawn_worker("daux-graveyard"),
+        audio_file: spawn_worker("daux-audition-graveyard"),
+        midi: spawn_worker("daux-midi-graveyard"),
+        tempo: spawn_worker("daux-tempo-graveyard"),
+        ara: spawn_worker("daux-ara-graveyard"),
+    });
+    let leaked = LEAKED.load(Ordering::Relaxed);
+    let reported = LEAKS_REPORTED.swap(leaked, Ordering::Relaxed);
+    if leaked > reported {
+        eprintln!(
+            "[graveyard] the audio thread leaked {} retired value(s) it had nowhere to send ({leaked} in total)",
+            leaked - reported
+        );
+    }
+}
+
+/// Whether [`prime`] has run.
+#[allow(dead_code)] // read by tests and diagnostics
+pub fn is_primed() -> bool {
+    GRAVEYARDS.get().is_some()
+}
+
+/// Retired values the audio thread leaked since the process started.
+#[allow(dead_code)] // read by tests and diagnostics
+pub fn leaked_count() -> u64 {
+    LEAKED.load(Ordering::Relaxed)
+}
+
+/// The graveyards as the audio thread sees them: one atomic load, never an
+/// initialisation.
+#[inline]
+fn graveyards() -> Option<&'static Graveyards> {
+    GRAVEYARDS.get()
+}
+
+/// Enqueue `old` on `sender`, or leak it if there is no channel or the channel
+/// cannot take it. Realtime-safe either way.
+#[inline]
+fn send_or_leak<T>(sender: Option<&Sender<T>>, old: T) {
+    match sender {
+        Some(sender) => {
+            if let Err(err) = sender.try_send(old) {
+                leak(err.into_inner());
+            }
+        }
+        None => leak(old),
+    }
+}
+
+/// Last resort on the audio thread: no graveyard (not primed, or its worker
+/// failed to start) or a full one (the worker is wedged). Dropping here would
+/// run the destructor — frees, munmaps, VST3 teardown — on the callback, and
+/// creating a channel would allocate and spawn a thread, so the value is
+/// forgotten instead and counted for [`prime`] to report.
+#[cold]
+#[inline(never)]
+fn leak<T>(old: T) {
+    std::mem::forget(old);
+    LEAKED.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    test_hooks::note_leak();
 }
 
 /// Hand a retired runtime graph to the background dropper, still in the box
 /// it arrived in (moving it out would free the box on the audio thread).
 ///
-/// Realtime-safe: a bounded-channel `try_send` performs no allocation. If the
-/// channel is full (pathological — implies the background thread is wedged),
-/// the value is dropped in place as a last resort rather than leaked.
+/// Realtime-safe: a bounded-channel `try_send` performs no allocation.
 #[inline]
 pub fn retire(old: Box<RuntimeProject>) {
-    if let Err(err) = sender().try_send(old) {
-        drop(err.into_inner());
-    }
+    send_or_leak(graveyards().map(|g| &g.project), old);
 }
 
 /// Dispose a decoded audition source away from the realtime callback.
 #[inline]
 pub fn retire_audio_file(old: Box<AudioFileBuffer>) {
-    if let Err(err) = audio_file_sender().try_send(old) {
-        drop(err.into_inner());
-    }
-}
-
-fn midi_sender() -> &'static Sender<Box<crate::runtime::RuntimeMidiData>> {
-    static GY: OnceLock<Sender<Box<crate::runtime::RuntimeMidiData>>> = OnceLock::new();
-    GY.get_or_init(|| {
-        let (tx, rx) = bounded::<Box<crate::runtime::RuntimeMidiData>>(GRAVEYARD_CAPACITY);
-        let _ = std::thread::Builder::new()
-            .name("daux-midi-graveyard".to_string())
-            .spawn(move || {
-                while let Ok(old) = rx.recv() {
-                    drop(old);
-                }
-            });
-        tx
-    })
+    send_or_leak(graveyards().map(|g| &g.audio_file), old);
 }
 
 /// Dispose a replaced MIDI schedule away from the realtime callback: its event
 /// lists are heap memory the callback must not free.
 #[inline]
-pub fn retire_midi(old: Box<crate::runtime::RuntimeMidiData>) {
-    if let Err(err) = midi_sender().try_send(old) {
-        drop(err.into_inner());
-    }
-}
-
-fn tempo_sender() -> &'static Sender<Box<crate::command::TempoMapChange>> {
-    static GY: OnceLock<Sender<Box<crate::command::TempoMapChange>>> = OnceLock::new();
-    GY.get_or_init(|| {
-        let (tx, rx) = bounded::<Box<crate::command::TempoMapChange>>(GRAVEYARD_CAPACITY);
-        let _ = std::thread::Builder::new()
-            .name("daux-tempo-graveyard".to_string())
-            .spawn(move || {
-                while let Ok(old) = rx.recv() {
-                    drop(old);
-                }
-            });
-        tx
-    })
+pub fn retire_midi(old: Box<RuntimeMidiData>) {
+    send_or_leak(graveyards().map(|g| &g.midi), old);
 }
 
 /// Dispose an applied tempo change — it now holds the replaced tempo maps and
 /// MIDI schedule — away from the realtime callback.
 #[inline]
-pub fn retire_tempo_change(old: Box<crate::command::TempoMapChange>) {
-    if let Err(err) = tempo_sender().try_send(old) {
-        drop(err.into_inner());
-    }
-}
-
-fn ara_sender() -> &'static Sender<Vec<crate::runtime::RuntimeAraRenderer>> {
-    static GY: OnceLock<Sender<Vec<crate::runtime::RuntimeAraRenderer>>> = OnceLock::new();
-    GY.get_or_init(|| {
-        let (tx, rx) = bounded::<Vec<crate::runtime::RuntimeAraRenderer>>(GRAVEYARD_CAPACITY);
-        let _ = std::thread::Builder::new()
-            .name("daux-ara-graveyard".to_string())
-            .spawn(move || {
-                while let Ok(old) = rx.recv() {
-                    drop(old);
-                }
-            });
-        tx
-    })
+pub fn retire_tempo_change(old: Box<TempoMapChange>) {
+    send_or_leak(graveyards().map(|g| &g.tempo), old);
 }
 
 /// Dispose a retired ARA renderer list away from the realtime callback.
@@ -163,11 +183,86 @@ fn ara_sender() -> &'static Sender<Vec<crate::runtime::RuntimeAraRenderer>> {
 /// processor, which is exactly the OS work `retire` exists to keep off the audio
 /// thread.
 #[inline]
-pub fn retire_ara_renderers(old: Vec<crate::runtime::RuntimeAraRenderer>) {
+pub fn retire_ara_renderers(old: Vec<RuntimeAraRenderer>) {
     if old.is_empty() {
         return;
     }
-    if let Err(err) = ara_sender().try_send(old) {
-        drop(err.into_inner());
+    send_or_leak(graveyards().map(|g| &g.ara), old);
+}
+
+/// Per-thread counters, so a test can tell what *its* thread did while other
+/// tests run in parallel against the same process-wide graveyards.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        // `const` initialisers with no destructor: touching them never
+        // allocates, so the counted realtime paths stay allocation-free.
+        static WORKER_SPAWNS: Cell<u64> = const { Cell::new(0) };
+        static LEAKS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) fn note_worker_spawn() {
+        let _ = WORKER_SPAWNS.try_with(|n| n.set(n.get() + 1));
+    }
+
+    pub(super) fn note_leak() {
+        let _ = LEAKS.try_with(|n| n.set(n.get() + 1));
+    }
+
+    /// Graveyard drop-threads this thread has spawned.
+    pub(crate) fn worker_spawns_on_this_thread() -> u64 {
+        WORKER_SPAWNS.with(Cell::get)
+    }
+
+    /// Retired values this thread had to leak.
+    pub(crate) fn leaks_on_this_thread() -> u64 {
+        LEAKS.with(Cell::get)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A primed graveyard takes a retired value with an atomic enqueue: no
+    /// allocation, no free, no thread, no leak.
+    #[test]
+    fn retiring_into_a_primed_graveyard_is_an_enqueue() {
+        prime();
+        assert!(is_primed());
+        let change = Box::new(TempoMapChange {
+            metronome_map: crate::tempo_map::RuntimeTempoMapSnapshot::static_tempo(90.0),
+            map: crate::tempo_map::RuntimeTempoMapSnapshot::static_tempo(90.0),
+            midi: None,
+            sample_rate: 0,
+        });
+        let spawns = test_hooks::worker_spawns_on_this_thread();
+        let leaks = test_hooks::leaks_on_this_thread();
+        let (_, heap) = crate::test_alloc::count_heap_events(|| retire_tempo_change(change));
+        assert_eq!(heap, 0, "retiring allocated or freed");
+        assert_eq!(test_hooks::worker_spawns_on_this_thread(), spawns);
+        assert_eq!(test_hooks::leaks_on_this_thread(), leaks);
+    }
+
+    /// With nowhere to send it, a retired value is leaked and counted — never
+    /// dropped (freed) on the calling thread.
+    #[test]
+    fn a_value_with_nowhere_to_go_is_leaked_and_counted() {
+        let (tx, rx) = bounded::<Box<u64>>(1);
+        tx.try_send(Box::new(1)).unwrap();
+        let total = leaked_count();
+        let leaks = test_hooks::leaks_on_this_thread();
+        let (full, missing) = (Box::new(2u64), Box::new(3u64));
+        let (_, heap) = crate::test_alloc::count_heap_events(|| {
+            // A full channel, then no channel at all.
+            send_or_leak(Some(&tx), full);
+            send_or_leak(None, missing);
+        });
+        assert_eq!(heap, 0, "a leaked value was freed");
+        assert_eq!(test_hooks::leaks_on_this_thread(), leaks + 2);
+        assert!(leaked_count() >= total + 2);
+        drop(rx);
     }
 }

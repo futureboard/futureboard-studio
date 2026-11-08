@@ -86,7 +86,8 @@ pub use mixer::*;
 pub use mixer_tree_state::*;
 pub use musical_snap::{
     beats_to_ticks, multi_select_move_delta, snap_beat_with_grab_offset, snap_relative_delta,
-    snap_resize_edge, ticks_to_beats, MusicalSnap, SnapShape, TICKS_PER_QUARTER,
+    snap_resize_edge, ticks_to_beats, GridStep, MeterBars, MeterGrid, MusicalSnap, SnapShape,
+    TICKS_PER_QUARTER,
 };
 pub use pitch_curve::*;
 pub use pitch_trajectory::*;

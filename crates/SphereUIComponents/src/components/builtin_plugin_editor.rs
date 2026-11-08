@@ -372,12 +372,45 @@ mod state_mirror {
     /// Seed the mirror from `plugin_id`'s persisted state blob — only when this
     /// plugin has no entry yet, so live edits always win over stale disk state.
     pub fn builtin_state_seed(plugin_id: &str, insert_id: &str, state_bytes: &[u8]) {
-        let Some(origin) = origin_for_plugin_id(plugin_id) else {
+        let Some((origin, parsed)) = parse_state(plugin_id, state_bytes) else {
             return;
         };
-        let Ok(text) = std::str::from_utf8(state_bytes) else {
-            return;
+        if let Ok(mut states) = map().lock() {
+            match states.get(insert_id) {
+                // This plugin's live state is authoritative — leave it alone.
+                Some(existing) if existing.origin() == origin => {}
+                // Absent, or another plugin's leftovers in the same slot.
+                _ => {
+                    states.insert(insert_id.to_string(), parsed);
+                }
+            }
+        }
+    }
+
+    /// Replace the insert's mirrored state with `state_bytes`, whatever it held:
+    /// a preset load, a paste, or an undo/redo step that sets the plug-in's
+    /// whole state. `false` when the bytes are not this plug-in's state, in
+    /// which case the mirror is left as it was.
+    pub fn builtin_state_replace(plugin_id: &str, insert_id: &str, state_bytes: &[u8]) -> bool {
+        let Some((_, parsed)) = parse_state(plugin_id, state_bytes) else {
+            return false;
         };
+        let Ok(mut states) = map().lock() else {
+            return false;
+        };
+        states.insert(insert_id.to_string(), parsed);
+        true
+    }
+
+    /// Whether `state_bytes` is `plugin_id`'s state, as a load would read it.
+    pub fn builtin_state_parses(plugin_id: &str, state_bytes: &[u8]) -> bool {
+        parse_state(plugin_id, state_bytes).is_some()
+    }
+
+    /// `state_bytes` parsed as `plugin_id`'s state, with that plug-in's origin.
+    fn parse_state(plugin_id: &str, state_bytes: &[u8]) -> Option<(&'static str, BuiltinParams)> {
+        let origin = origin_for_plugin_id(plugin_id)?;
+        let text = std::str::from_utf8(state_bytes).ok()?;
         let parsed = match origin {
             rodharerist::ui::UI_ORIGIN => rodharerist::RodhareistState::from_json(text)
                 .ok()
@@ -446,20 +479,8 @@ mod state_mirror {
                 .ok()
                 .map(|state| BuiltinParams::Compresser(Box::new(state.params))),
             _ => None,
-        };
-        let Some(parsed) = parsed else {
-            return;
-        };
-        if let Ok(mut states) = map().lock() {
-            match states.get(insert_id) {
-                // This plugin's live state is authoritative — leave it alone.
-                Some(existing) if existing.origin() == origin => {}
-                // Absent, or another plugin's leftovers in the same slot.
-                _ => {
-                    states.insert(insert_id.to_string(), parsed);
-                }
-            }
-        }
+        }?;
+        Some((origin, parsed))
     }
 
     /// Serialized state blob for persistence / `selectInstance`. `None` when the
@@ -1159,11 +1180,11 @@ pub use state_mirror::{
     builtin_equz8_params, builtin_equzx_params, builtin_imager_params, builtin_mixstation_params,
     builtin_quick_sampler_params, builtin_replay_changes, builtin_rodhareist_files,
     builtin_rodhareist_params, builtin_sample_names, builtin_slicer_params, builtin_state_apply,
-    builtin_state_bytes, builtin_state_clear, builtin_state_remove, builtin_state_replay,
-    builtin_state_seed, builtin_state_set_rodhareist_file, builtin_state_set_sample,
-    builtin_transient_params, builtin_used_output_buses, builtin_verbspace_params,
-    builtin_waygate_params, builtin_whitesharp_params, builtin_wrapsynth_params,
-    builtin_zapp_params, builtin_zcomp_params,
+    builtin_state_bytes, builtin_state_clear, builtin_state_parses, builtin_state_remove,
+    builtin_state_replace, builtin_state_replay, builtin_state_seed,
+    builtin_state_set_rodhareist_file, builtin_state_set_sample, builtin_transient_params,
+    builtin_used_output_buses, builtin_verbspace_params, builtin_waygate_params,
+    builtin_whitesharp_params, builtin_wrapsynth_params, builtin_zapp_params, builtin_zcomp_params,
 };
 
 /// Featureless no-ops: without the editor there is no param wire, so there is
@@ -1172,6 +1193,12 @@ pub use state_mirror::{
 mod state_mirror_stubs {
     pub fn builtin_state_apply(_plugin_id: &str, _insert_id: &str, _wire_index: u32, _value: f32) {}
     pub fn builtin_state_seed(_plugin_id: &str, _insert_id: &str, _state_bytes: &[u8]) {}
+    pub fn builtin_state_replace(_plugin_id: &str, _insert_id: &str, _state_bytes: &[u8]) -> bool {
+        false
+    }
+    pub fn builtin_state_parses(_plugin_id: &str, _state_bytes: &[u8]) -> bool {
+        false
+    }
     pub fn builtin_state_bytes(_plugin_id: &str, _insert_id: &str) -> Option<Vec<u8>> {
         None
     }
@@ -1221,9 +1248,9 @@ mod state_mirror_stubs {
 #[cfg(not(feature = "builtin-plugin-editor"))]
 pub use state_mirror_stubs::{
     builtin_default_replay, builtin_replay_changes, builtin_rodhareist_files, builtin_sample_names,
-    builtin_state_apply, builtin_state_bytes, builtin_state_clear, builtin_state_remove,
-    builtin_state_replay, builtin_state_seed, builtin_state_set_rodhareist_file,
-    builtin_state_set_sample,
+    builtin_state_apply, builtin_state_bytes, builtin_state_clear, builtin_state_parses,
+    builtin_state_remove, builtin_state_replace, builtin_state_replay, builtin_state_seed,
+    builtin_state_set_rodhareist_file, builtin_state_set_sample,
 };
 
 /// The two files a Rodhareist insert loads into its DSP: the amp's NAM
@@ -3680,6 +3707,41 @@ mod tests {
     /// mirror: an edit folds in, the blob it saves restores them, and a
     /// restarted host is replayed every param and reloaded the sample.
     #[cfg(feature = "builtin-plugin-editor")]
+    /// A preset load, paste or undo hands an insert that already has live
+    /// state a whole new state: seeding leaves the live state alone (that is
+    /// for restoring from disk), replacing takes the new one (#234).
+    #[test]
+    fn replacing_a_live_state_takes_the_new_one_where_seeding_keeps_the_old() {
+        let insert = "test-insert-replace-live-state";
+        let cutoff = builtin_param_index("quicksampler", "cutoff").expect("cutoff");
+        builtin_state_apply("quicksampler", insert, cutoff, 750.0);
+        let preset = builtin_state_bytes("quicksampler", insert).expect("preset");
+        builtin_state_apply("quicksampler", insert, cutoff, 2_000.0);
+
+        builtin_state_seed("quicksampler", insert, &preset);
+        let kept = builtin_quick_sampler_params(insert).expect("live");
+        assert_eq!(kept.sampler.cutoff_hz, 2_000.0, "a seed keeps live state");
+
+        assert!(builtin_state_parses("quicksampler", &preset));
+        assert!(builtin_state_replace("quicksampler", insert, &preset));
+        let loaded = builtin_quick_sampler_params(insert).expect("loaded");
+        assert_eq!(
+            loaded.sampler.cutoff_hz, 750.0,
+            "a replace loads the preset"
+        );
+
+        // Another plug-in's state, or junk, is refused and changes nothing.
+        assert!(!builtin_state_parses("quicksampler", b"not a state"));
+        assert!(!builtin_state_replace(
+            "quicksampler",
+            insert,
+            b"not a state"
+        ));
+        let unchanged = builtin_quick_sampler_params(insert).expect("unchanged");
+        assert_eq!(unchanged.sampler.cutoff_hz, 750.0);
+        builtin_state_remove(insert);
+    }
+
     #[test]
     fn quick_sampler_state_round_trips_through_the_mirror() {
         let insert = "test-insert-quick-sampler";

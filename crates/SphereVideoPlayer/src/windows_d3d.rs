@@ -76,7 +76,7 @@ impl HwPixelFormat {
     }
 
     /// Bytes per luma sample in system memory.
-    fn bytes_per_sample(self) -> usize {
+    pub(crate) fn bytes_per_sample(self) -> usize {
         match self {
             Self::Nv12 => 1,
             Self::P010 => 2,

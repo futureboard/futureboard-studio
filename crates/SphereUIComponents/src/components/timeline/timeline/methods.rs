@@ -3385,7 +3385,10 @@ impl Timeline {
             return true;
         }
         if let Some(drag) = self.automation_drag.clone() {
-            let beat = self.snap_beat(self.beat_from_window_x(window_x)).max(0.0);
+            let beat = self
+                .state
+                .snap_automation_beats(self.beat_from_window_x(window_x))
+                .max(0.0);
             let value =
                 self.automation_value_from_window_y(&drag.track_id, &drag.lane_id, window_y);
             // The pressed point follows the snapped cursor in time; the rest of

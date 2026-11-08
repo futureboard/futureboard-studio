@@ -14,6 +14,9 @@ pub use sphere_voxtune::*;
 
 #[cfg(target_os = "android")]
 pub(crate) mod aaudio;
+// Stream-state teardown logic, also built for host tests.
+#[cfg(any(target_os = "android", test))]
+pub(crate) mod aaudio_state;
 pub mod ffi;
 pub mod output;
 pub mod recorder;

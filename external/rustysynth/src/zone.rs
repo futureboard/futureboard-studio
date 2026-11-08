@@ -14,16 +14,24 @@ impl Zone {
         }
     }
 
-    fn new(info: &ZoneInfo, generators: &[Generator]) -> Self {
-        let mut segment: Vec<Generator> = Vec::new();
-
-        for i in 0..info.generator_count {
-            segment.push(generators[(info.generator_index + i) as usize]);
+    fn new(info: &ZoneInfo, generators: &[Generator]) -> Result<Self, SoundFontError> {
+        // Futureboard: the bag's generator indices come from the file. A run
+        // that reaches past the generator list rejects the font instead of
+        // panicking (a release build aborts on panic). A run whose next index
+        // goes backwards stays an empty zone, as before.
+        let count = info.generator_count.max(0) as usize;
+        if count == 0 {
+            return Ok(Self::empty());
         }
+        let start = info.generator_index as usize;
+        let segment = start
+            .checked_add(count)
+            .and_then(|end| generators.get(start..end))
+            .ok_or(SoundFontError::InvalidZoneList)?;
 
-        Self {
-            generators: segment,
-        }
+        Ok(Self {
+            generators: segment.to_vec(),
+        })
     }
 
     pub(crate) fn create(
@@ -39,7 +47,7 @@ impl Zone {
 
         let mut zones: Vec<Zone> = Vec::new();
         for info in infos.iter().take(count) {
-            zones.push(Zone::new(info, generators));
+            zones.push(Zone::new(info, generators)?);
         }
 
         Ok(zones)

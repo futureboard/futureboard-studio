@@ -124,11 +124,37 @@ plain HTTP + WebSocket server:
   then binds to the web console's address and drops packets from any other
   address. A source address is not a credential: on a network where UDP
   sources can be forged, anyone there can still drive it.
-- **Connection slots:** a connection must send its request within 10 seconds,
-  and a web-console connection that has not logged in (or entered the setup
-  code) within 2 minutes is closed. When every slot is taken, the server
-  closes a connection that never logged in to make room, so logged-in
-  operators can always connect.
+- **Connection slots:** the console serves at most 64 connections, at most
+  16 from one address (the server's own machine, including a reverse proxy
+  on it, is exempt from this and from the rate limit below).
+  - *Deadlines:* a connection must send its request within 10 seconds, and a
+    web-console connection that has not logged in (or entered the setup code)
+    within 2 minutes is closed.
+  - *Rate limit:* each address may open 20 connections in a burst, then one
+    every 2 seconds; faster attempts get `429 Too Many Requests`, and a
+    refused attempt still counts. At most 1,024 addresses are tracked;
+    addresses that have stayed away long enough to be back at a full burst
+    are forgotten first.
+  - *Grace window:* every new connection, and one that has just logged out,
+    has 30 seconds to log in during which it is never closed to make room.
+  - *When every slot is taken:* the server closes one connection that never
+    logged in and is past its grace window. If the new connection's address
+    already holds such a connection, that one is replaced; otherwise the
+    longest-waiting connection of the address holding the most is closed.
+    A logged-in connection is never closed to make room. If every slot is
+    logged in or still inside its grace window, the new connection gets
+    `503 Service Unavailable` and the page retries every second.
+
+  Limits: these rules keep a connection that reached the server long enough to
+  log in, and keep logged-in operators connected, but they cannot guarantee
+  that a *new* connection gets a slot. A host on the network that can use many
+  source addresses (for example a handful of IPv4 addresses, or any number of
+  IPv6 addresses on the local prefix) can keep all 64 slots filled with fresh
+  connections, so new browser tabs and reconnecting pages are refused while
+  it keeps this up. Operators who are logged in keep their connection, but a
+  page that loses its connection (a Wi-Fi drop) is a new connection and may
+  be refused until the flood stops. Keep the console on a trusted network,
+  or restrict it with a firewall.
 
 Treat a LiveStage console that is reachable from a network as having control of
 the show: mixer, recording, plug-in loading from the scanned catalog, and on

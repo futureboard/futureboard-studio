@@ -883,6 +883,17 @@ impl BridgeHost {
         let _ = self.client.close_editor(plugin_instance_id);
     }
 
+    /// `CloseEditor` naming the window generation the view is attached to;
+    /// the host's `EditorClosed` echoes it. Whether the close was sent.
+    pub fn close_editor_generation(&mut self, plugin_instance_id: String, generation: u64) -> bool {
+        eprintln!(
+            "[plugin-bridge] CloseEditor instance={plugin_instance_id} generation={generation}"
+        );
+        self.client
+            .close_editor_generation(plugin_instance_id, generation)
+            .is_ok()
+    }
+
     pub fn unload_plugin(&mut self, plugin_instance_id: String) {
         eprintln!("[plugin-bridge] UnloadPlugin instance={plugin_instance_id}");
         let _ = self.client.unload_plugin(plugin_instance_id.clone());
@@ -1581,6 +1592,13 @@ impl PluginBridgeRuntime {
         if let Some(host) = self.host_for_mut(&plugin_instance_id) {
             host.close_editor(plugin_instance_id);
         }
+    }
+
+    /// See the per-host `close_editor_generation`. `false` when no host holds
+    /// the instance, or the close could not be written to it.
+    pub fn close_editor_generation(&mut self, plugin_instance_id: String, generation: u64) -> bool {
+        self.host_for_mut(&plugin_instance_id)
+            .is_some_and(|host| host.close_editor_generation(plugin_instance_id, generation))
     }
 
     pub fn unload_plugin(&mut self, plugin_instance_id: String) {

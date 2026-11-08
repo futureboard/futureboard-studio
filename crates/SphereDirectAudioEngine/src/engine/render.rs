@@ -23,6 +23,12 @@ use SphereAudioProcessor::StretchBackend;
 /// measured pre/post ratio on the block that reaches the device. "The fader
 /// moves and nothing gets quieter" is one of those five links, and reading the
 /// code cannot tell you which.
+/// Read this module's cached debug flag once, on a control thread (see
+/// [`super::prime_audio_thread_resources`]).
+pub(super) fn prime_debug_flags() {
+    let _ = fader_debug_enabled();
+}
+
 fn fader_debug_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("FUTUREBOARD_FADER_DEBUG").is_some())
