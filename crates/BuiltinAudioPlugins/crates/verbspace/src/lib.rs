@@ -938,6 +938,21 @@ impl Line {
         self.loss.gain += (target.gain - self.loss.gain) * step;
         self.loss.low += (target.low - self.loss.low) * step;
         self.loss.high += (target.high - self.loss.high) * step;
+        // The three parts glide on their own, so mid-transition their
+        // product can pass unity even when both ends are stable: Freeze
+        // on/off and a large Decay jump with Bass Mult above 1 both push
+        // `gain x low` far past 1 at DC, and the tank then feeds itself
+        // until it hits Inf (#197). The loop's per-pass gain is `gain x
+        // low` at DC and `gain x high` at Nyquist, so pin the broadband
+        // gain so neither product passes the frozen loop's own ceiling.
+        // The shelves keep gliding, so the pin releases by itself as they
+        // settle, and the endpoints already satisfy it — steady-state
+        // sound is unchanged.
+        let shelf = self.loss.low.max(self.loss.high).max(1.0);
+        let ceiling = FREEZE_GAIN / shelf;
+        if self.loss.gain > ceiling {
+            self.loss.gain = ceiling;
+        }
     }
 
     #[inline]
