@@ -75,15 +75,55 @@ install -m644 "$ICON_SRC" "$APPDIR/usr/share/icons/hicolor/512x512/apps/${DESKTO
 
 install -m644 "$MIME_SRC" "$APPDIR/usr/share/mime/packages/${DESKTOP_SLUG}.xml"
 
-# appimagetool (fetched on demand, cached under target/ so CI can cache it
-# across runs same as the Rust build cache).
-APPIMAGETOOL="$ROOT/target/appimagetool-x86_64.AppImage"
-if [[ ! -x "$APPIMAGETOOL" ]]; then
-  echo "Fetching appimagetool..."
-  curl -fsSL -o "$APPIMAGETOOL" \
-    https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
-  chmod +x "$APPIMAGETOOL"
-fi
+# appimagetool and the AppImage runtime it embeds as the image's ELF header.
+# Both are pinned to a versioned release (never the moving `continuous` tag)
+# and checked against a SHA-256 before use, cached copies included: `target/`
+# is restored from the CI cache, so a cached file is trusted no more than a
+# fresh download. Without `--runtime-file` appimagetool would fetch the
+# runtime from `continuous` itself at build time and ship it unverified.
+# The hashes are the digests GitHub records for these release assets; bump a
+# version and its hash together.
+APPIMAGETOOL_VERSION="1.9.1"
+APPIMAGETOOL_SHA256="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
+APPIMAGETOOL_URL="https://github.com/AppImage/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-x86_64.AppImage"
+APPIMAGE_RUNTIME_VERSION="20251108"
+APPIMAGE_RUNTIME_SHA256="2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d"
+APPIMAGE_RUNTIME_URL="https://github.com/AppImage/type2-runtime/releases/download/${APPIMAGE_RUNTIME_VERSION}/runtime-x86_64"
+
+sha256_of() {
+  sha256sum "$1" | cut -d' ' -f1
+}
+
+# fetch_verified URL SHA256 DEST: leave DEST holding exactly the pinned bytes,
+# or fail without leaving anything at DEST.
+fetch_verified() {
+  local url="$1" expected="$2" dest="$3"
+  if [[ -f "$dest" && "$(sha256_of "$dest")" == "$expected" ]]; then
+    return 0
+  fi
+  rm -f "$dest"
+  echo "Fetching $url"
+  local tmp="$dest.download.$$"
+  rm -f "$tmp"
+  curl -fsSL --retry 3 -o "$tmp" "$url"
+  local actual
+  actual="$(sha256_of "$tmp")"
+  if [[ "$actual" != "$expected" ]]; then
+    rm -f "$tmp"
+    echo "error: SHA-256 mismatch for $url" >&2
+    echo "  expected $expected" >&2
+    echo "  actual   $actual" >&2
+    exit 1
+  fi
+  mv -f "$tmp" "$dest"
+}
+
+mkdir -p "$ROOT/target"
+APPIMAGETOOL="$ROOT/target/appimagetool-${APPIMAGETOOL_VERSION}-x86_64.AppImage"
+APPIMAGE_RUNTIME="$ROOT/target/appimage-runtime-${APPIMAGE_RUNTIME_VERSION}-x86_64"
+fetch_verified "$APPIMAGETOOL_URL" "$APPIMAGETOOL_SHA256" "$APPIMAGETOOL"
+fetch_verified "$APPIMAGE_RUNTIME_URL" "$APPIMAGE_RUNTIME_SHA256" "$APPIMAGE_RUNTIME"
+chmod +x "$APPIMAGETOOL"
 
 mkdir -p "$OUT_DIR"
 OUTPUT="$OUT_DIR/Futureboard.Studio-${APP_VERSION}-x86_64.AppImage"
@@ -91,7 +131,8 @@ rm -f "$OUTPUT"
 
 # `--appimage-extract-and-run` makes appimagetool run itself without FUSE,
 # which most CI containers don't have `/dev/fuse` for.
-ARCH=x86_64 "$APPIMAGETOOL" --appimage-extract-and-run "$APPDIR" "$OUTPUT"
+ARCH=x86_64 "$APPIMAGETOOL" --appimage-extract-and-run \
+  --runtime-file "$APPIMAGE_RUNTIME" "$APPDIR" "$OUTPUT"
 
 echo "Built AppImage: $OUTPUT"
 echo

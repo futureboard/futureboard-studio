@@ -19,13 +19,17 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Checks only: nothing here writes to the repository or its releases.
+permissions:
+  contents: read
+
 jobs:
   version-format:
     name: Version scheme
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 1
 
@@ -63,7 +67,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 1
 
@@ -96,6 +100,53 @@ jobs:
             }
           done
 
+  # Enforces deny.toml: RustSec advisories (vulnerable, unsound, unmaintained),
+  # banned crates, licenses and allowed sources. Lockfile-only, so one Linux
+  # runner covers every target (`targets = []` checks all of them).
+  cargo-deny:
+    name: cargo deny
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_DENY_VERSION: "0.20.2"
+      # SHA-256 of cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz, the
+      # digest GitHub records for that release asset.
+      CARGO_DENY_SHA256: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+          submodules: false
+
+      # `[patch.crates-io] cpal` points at this submodule; without it Cargo
+      # cannot resolve the workspace at all. Nothing else is needed.
+      - name: Initialize cpal submodule
+        run: git submodule update --init --depth=1 --checkout -- external/cpal
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-16
+
+      - name: Install cargo-deny (pinned, checksum-verified)
+        run: |
+          set -euo pipefail
+          name="cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl"
+          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/${name}.tar.gz" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/${name}.tar.gz"
+          echo "${CARGO_DENY_SHA256}  ${RUNNER_TEMP}/${name}.tar.gz" | sha256sum -c -
+          tar -xzf "${RUNNER_TEMP}/${name}.tar.gz" -C "${RUNNER_TEMP}"
+          install -m755 "${RUNNER_TEMP}/${name}/cargo-deny" "${HOME}/.cargo/bin/cargo-deny"
+          cargo deny --version
+
+      - name: cargo deny check (advisories, bans, sources)
+        run: cargo deny --locked check advisories bans sources
+
+      # Licenses are reported but not yet enforced: LGPL LAME (mp3lame-*,
+      # #284) and CDLA-Permissive-2.0 webpki-roots still fail the policy and
+      # need a product decision. Drop continue-on-error once #284 is settled.
+      - name: cargo deny check licenses (report only, #284)
+        continue-on-error: true
+        run: cargo deny --locked check licenses
+
   rust-fmt:
     name: Rust format (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -105,14 +156,14 @@ jobs:
         os: [ubuntu-24.04, windows-latest, macos-latest]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # Format does not need submodule contents, but keep .gitmodules
           # available for path-aware tooling.
           fetch-depth: 1
 
       - name: Setup Rust (rustfmt)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-16
         with:
           components: rustfmt
 
@@ -137,7 +188,7 @@ jobs:
         os: [ubuntu-24.04, windows-latest, macos-latest]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 1
           # Submodules are pulled explicitly below (shallow + selective) so we
@@ -179,16 +230,16 @@ jobs:
           echo "libclang: $LIBCLANG_PATH"
 
       - name: Setup Rust (clippy)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-16
         with:
           components: clippy
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
 
       - name: Cache Rust dependencies and CEF
         id: ci-cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -224,7 +275,7 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 1
           submodules: false
@@ -248,15 +299,15 @@ jobs:
           echo "libclang: $LIBCLANG_PATH"
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-16
         with:
           targets: x86_64-apple-darwin
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
 
       - name: Cache Rust dependencies and CEF
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
