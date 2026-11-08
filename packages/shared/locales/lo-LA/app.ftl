@@ -823,6 +823,7 @@ settings.grid-intensity.percent = { $n }%
 settings.interval.minutes = { $n } ນາທີ
 settings.language.en = ພາສາອັງກິດ (English)
 settings.language.ja = ພາສາຍີ່ປຸ່ນ (Japanese)
+settings.language.lo = Lao
 settings.language.th = ພາສາໄທ (Thai)
 settings.language.zh = ພາສາຈີນ (Simplified)
 settings.latency.approx = ~{ $ms } ms
