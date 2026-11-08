@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
+use ed25519_dalek::{Signature, VerifyingKey};
 use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -23,6 +24,29 @@ use sphere_ui_components::update_service::{
 /// old name is claimed by anything else. Ask for the real repository.
 const RELEASES_API: &str = "https://api.github.com/repos/futureboard/futureboard-studio/releases";
 const USER_AGENT: &str = "Futureboard-Studio-Updater";
+
+/// The project's Ed25519 update-signing public key, as 64 hex characters,
+/// baked in at build time from `FUTUREBOARD_UPDATE_PUBLIC_KEY`.
+///
+/// A matching SHA-256 from GitHub only proves the bytes arrived intact: anyone
+/// able to publish a release asset can publish its hash too. Authenticity comes
+/// from this key, whose private half never touches a build. A build without it
+/// cannot verify anything, so it refuses every download rather than trusting
+/// the release host.
+const UPDATE_PUBLIC_KEY: Option<&str> = option_env!("FUTUREBOARD_UPDATE_PUBLIC_KEY");
+
+/// Each installer `<asset>` is published with a detached signature asset named
+/// `<asset>.sig`.
+const SIGNATURE_SUFFIX: &str = ".sig";
+
+/// Domain separation for the signed message, so an update signature can never
+/// be replayed as any other Ed25519 signature made with the same key (and vice
+/// versa). Bump the version only together with the release signer.
+const SIGNATURE_CONTEXT: &[u8] = b"futureboard-studio-update-v1\n";
+
+/// A signature asset is 64 raw bytes or 128 hex characters; anything this large
+/// is not one, so it is rejected without reading further.
+const MAX_SIGNATURE_BYTES: u64 = 4096;
 
 #[derive(Debug, Clone, Deserialize)]
 struct GithubAsset {
@@ -46,6 +70,9 @@ pub struct AvailableUpdate {
     pub version: Version,
     pub channel: UpdateChannel,
     asset: GithubAsset,
+    /// The `<asset>.sig` published beside the installer. A release without one
+    /// is never offered.
+    signature: GithubAsset,
 }
 
 /// `Ok(None)` when GitHub answered 404.
@@ -225,6 +252,128 @@ fn platform_asset(release: &GithubRelease) -> Option<GithubAsset> {
         .map(|(_, asset)| asset.clone())
 }
 
+/// The detached signature published for `asset`: exactly `<asset name>.sig`.
+fn signature_asset(release: &GithubRelease, asset: &GithubAsset) -> Option<GithubAsset> {
+    let expected = format!("{}{SIGNATURE_SUFFIX}", asset.name);
+    release
+        .assets
+        .iter()
+        .find(|candidate| candidate.name == expected)
+        .cloned()
+}
+
+/// The exact bytes the release signer signs for one installer:
+/// `"futureboard-studio-update-v1\n" || <asset name> || "\n" || SHA-256(installer)`
+/// with the digest as 32 raw bytes.
+///
+/// Binding the asset name (which carries the version and platform) means a
+/// genuine signature for one installer cannot vouch for a different one — an
+/// older build or another platform's — published under this name.
+fn signed_message(asset_name: &str, sha256: &[u8; 32]) -> Vec<u8> {
+    let mut message = Vec::with_capacity(SIGNATURE_CONTEXT.len() + asset_name.len() + 1 + 32);
+    message.extend_from_slice(SIGNATURE_CONTEXT);
+    message.extend_from_slice(asset_name.as_bytes());
+    message.push(b'\n');
+    message.extend_from_slice(sha256);
+    message
+}
+
+fn decode_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
+    let text = text.as_bytes();
+    if text.len() != N * 2 {
+        return None;
+    }
+    let nibble = |byte: u8| (byte as char).to_digit(16).map(|value| value as u8);
+    let mut out = [0_u8; N];
+    for (slot, pair) in out.iter_mut().zip(text.chunks_exact(2)) {
+        *slot = (nibble(pair[0])? << 4) | nibble(pair[1])?;
+    }
+    Some(out)
+}
+
+fn parse_public_key(hex: &str) -> Result<VerifyingKey, String> {
+    let bytes = decode_hex::<32>(hex.trim())
+        .ok_or_else(|| "the update signing key baked into this build is malformed".to_string())?;
+    VerifyingKey::from_bytes(&bytes)
+        .map_err(|_| "the update signing key baked into this build is invalid".to_string())
+}
+
+/// Accepts the signature as 64 raw bytes (what `openssl pkeyutl -sign` writes)
+/// or as 128 hex characters with optional surrounding whitespace.
+fn parse_signature(raw: &[u8]) -> Result<Signature, String> {
+    let bytes = if raw.len() == Signature::BYTE_SIZE {
+        let mut bytes = [0_u8; Signature::BYTE_SIZE];
+        bytes.copy_from_slice(raw);
+        Some(bytes)
+    } else {
+        std::str::from_utf8(raw)
+            .ok()
+            .and_then(|text| decode_hex::<{ Signature::BYTE_SIZE }>(text.trim()))
+    };
+    bytes
+        .map(|bytes| Signature::from_bytes(&bytes))
+        .ok_or_else(|| "the update signature is malformed".to_string())
+}
+
+const NO_KEY_ERROR: &str = "updates are unavailable in this build: it was built without an update \
+     signing key (FUTUREBOARD_UPDATE_PUBLIC_KEY), so no installer could be verified";
+
+/// The baked-in key, or why this build cannot verify (and so cannot offer or
+/// download) any update.
+fn update_verifying_key(public_key: Option<&str>) -> Result<VerifyingKey, String> {
+    let public_key = public_key
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .ok_or_else(|| NO_KEY_ERROR.to_string())?;
+    parse_public_key(public_key)
+}
+
+/// Fail closed: no key, a malformed key, a malformed signature or a signature
+/// that does not verify all reject the update.
+fn verify_update_signature(
+    public_key: Option<&str>,
+    asset_name: &str,
+    sha256: &[u8; 32],
+    signature: &[u8],
+) -> Result<(), String> {
+    let key = update_verifying_key(public_key)?;
+    let signature = parse_signature(signature)?;
+    key.verify_strict(&signed_message(asset_name, sha256), &signature)
+        .map_err(|_| "the update signature is not valid for this installer".to_string())
+}
+
+/// The signature binds the asset name, and the name carries the version. The
+/// version offered may come from the release tag instead, so the two must
+/// agree: otherwise a genuinely signed older installer could be re-published
+/// under a newer tag and install as a silent downgrade.
+fn asset_carries_offered_version(update: &AvailableUpdate) -> bool {
+    version_from_asset_name(&update.asset.name).as_ref() == Some(&update.version)
+}
+
+/// Fetch the small detached signature asset, bounded so a hostile response
+/// cannot make the updater buffer an arbitrary amount.
+fn download_signature(asset: &GithubAsset) -> Result<Vec<u8>, String> {
+    if asset.size > MAX_SIGNATURE_BYTES {
+        return Err("the update signature asset is too large".to_string());
+    }
+    let response = ureq::get(&asset.browser_download_url)
+        .header("Accept", "application/octet-stream")
+        .header("User-Agent", USER_AGENT)
+        .call()
+        .map_err(|error| format!("update signature download failed: {error}"))?;
+    let mut signature = Vec::new();
+    response
+        .into_body()
+        .into_reader()
+        .take(MAX_SIGNATURE_BYTES + 1)
+        .read_to_end(&mut signature)
+        .map_err(|error| format!("failed to download the update signature: {error}"))?;
+    if signature.len() as u64 > MAX_SIGNATURE_BYTES {
+        return Err("the update signature asset is too large".to_string());
+    }
+    Ok(signature)
+}
+
 fn choose_release(
     releases: Vec<GithubRelease>,
     channel: UpdateChannel,
@@ -236,6 +385,13 @@ fn choose_release(
         .filter_map(|release| {
             let version = release_version(&release)?;
             let asset = platform_asset(&release)?;
+            // Never offer what `download_update` would refuse: an installer
+            // with no published signature, or one whose (signed) name does
+            // not carry the version being offered.
+            let signature = signature_asset(&release, &asset)?;
+            if version_from_asset_name(&asset.name).as_ref() != Some(&version) {
+                return None;
+            }
             let available = match channel {
                 // A user explicitly opting into nightly may move from the same
                 // stable base to its prerelease build.
@@ -246,6 +402,7 @@ fn choose_release(
                 version,
                 channel,
                 asset,
+                signature,
             })
         })
         .max_by(|left, right| left.version.cmp(&right.version))
@@ -255,6 +412,17 @@ pub fn check_for_update(
     channel: UpdateChannel,
     current_version: &str,
 ) -> Result<Option<AvailableUpdate>, String> {
+    check_for_update_with_key(UPDATE_PUBLIC_KEY, channel, current_version)
+}
+
+fn check_for_update_with_key(
+    public_key: Option<&str>,
+    channel: UpdateChannel,
+    current_version: &str,
+) -> Result<Option<AvailableUpdate>, String> {
+    // A build that cannot verify an installer must not offer one. This is an
+    // error, not "up to date": the user is told why no update can be offered.
+    update_verifying_key(public_key)?;
     let current = Version::parse(current_version)
         .map_err(|error| format!("invalid installed version {current_version:?}: {error}"))?;
     let url = match channel {
@@ -289,6 +457,17 @@ pub fn download_update(
         .map_err(|error| format!("failed to create update cache: {error}"))?;
     let destination = update_dir.join(file_name);
     let partial = destination.with_extension("part");
+
+    // Settle everything that would make the installer unverifiable before
+    // spending the bandwidth on it.
+    update_verifying_key(UPDATE_PUBLIC_KEY)?;
+    if !asset_carries_offered_version(update) {
+        return Err(format!(
+            "the installer name {} does not carry the offered version {}",
+            update.asset.name, update.version
+        ));
+    }
+    let signature = download_signature(&update.signature)?;
 
     let response = ureq::get(&update.asset.browser_download_url)
         .header("Accept", "application/octet-stream")
@@ -334,7 +513,9 @@ pub fn download_update(
             update.asset.size
         ));
     }
-    let actual_digest = format!("sha256:{:x}", hasher.finalize());
+    let digest = hasher.finalize();
+    let actual_digest = format!("sha256:{digest:x}");
+    let digest: [u8; 32] = digest.into();
     if update
         .asset
         .digest
@@ -343,6 +524,15 @@ pub fn download_update(
     {
         let _ = fs::remove_file(&partial);
         return Err("GitHub did not provide a matching SHA-256 digest for the update".to_string());
+    }
+    // The digest above is integrity only. Authenticity is the project's
+    // signature over that digest; an installer that fails it never reaches the
+    // final path that `install_update` runs.
+    if let Err(error) =
+        verify_update_signature(UPDATE_PUBLIC_KEY, &update.asset.name, &digest, &signature)
+    {
+        let _ = fs::remove_file(&partial);
+        return Err(error);
     }
     if destination.exists() {
         fs::remove_file(&destination)
@@ -435,6 +625,13 @@ fn is_machine_wide(install_dir: &Path) -> bool {
 
 /// macOS: the asset is a DMG. Mount it, copy the bundle out, unmount, then let
 /// a detached shell script swap the running bundle once this process exits.
+///
+/// The swap no longer clears `com.apple.quarantine`. That does not by itself
+/// bring in a Gatekeeper assessment: a DMG fetched by `ureq` never receives a
+/// quarantine attribute, so the bundle copied out of it has none either. It only
+/// means the updater never actively strips one. Authenticity is established
+/// earlier, by the project signature `download_update` verifies before the DMG
+/// reaches this function.
 #[cfg(target_os = "macos")]
 fn install_macos(staged: &Path, cache_root: &Path) -> Result<InstallOutcome, String> {
     let Some(target) = current_macos_bundle() else {
@@ -511,7 +708,6 @@ fn install_macos(staged: &Path, cache_root: &Path) -> Result<InstallOutcome, Str
          while kill -0 {pid} 2>/dev/null; do sleep 0.2; done\n\
          /bin/rm -rf \"{target}\"\n\
          /usr/bin/ditto \"{staged}\" \"{target}\" || exit 1\n\
-         /usr/bin/xattr -dr com.apple.quarantine \"{target}\" 2>/dev/null\n\
          /bin/rm -rf \"{staged}\"\n\
          /usr/bin/open \"{target}\"\n",
         pid = std::process::id(),
@@ -687,24 +883,19 @@ mod tests {
     use super::*;
 
     fn release(tag: &str, name: &str, prerelease: bool) -> GithubRelease {
-        GithubRelease {
-            tag_name: tag.to_string(),
-            name: Some(name.to_string()),
-            draft: false,
-            prerelease,
-            assets: vec![GithubAsset {
-                name: if cfg!(target_os = "windows") {
-                    "FutureboardStudioSetup.exe"
-                } else if cfg!(target_os = "macos") {
-                    "Futureboard.Studio-2026.8.3-macos.dmg"
-                } else {
-                    "Futureboard.Studio-2026.8.3-x86_64.AppImage"
-                }
-                .to_string(),
-                browser_download_url: "https://example.test/download".to_string(),
-                size: 1,
-                digest: Some("sha256:test".to_string()),
-            }],
+        let mut release = versioned_release(tag, name, tag.trim_start_matches('v'));
+        release.prerelease = prerelease;
+        release
+    }
+
+    /// The detached signature asset the release workflow publishes beside
+    /// `installer`.
+    fn signature_for(installer: &str) -> GithubAsset {
+        GithubAsset {
+            name: format!("{installer}.sig"),
+            browser_download_url: "https://example.test/download.sig".to_string(),
+            size: 64,
+            digest: None,
         }
     }
 
@@ -773,12 +964,15 @@ mod tests {
             name: Some(name.to_string()),
             draft: false,
             prerelease: true,
-            assets: vec![GithubAsset {
-                name: asset,
-                browser_download_url: "https://example.test/download".to_string(),
-                size: 1,
-                digest: Some("sha256:test".to_string()),
-            }],
+            assets: vec![
+                GithubAsset {
+                    name: asset.clone(),
+                    browser_download_url: "https://example.test/download".to_string(),
+                    size: 1,
+                    digest: Some("sha256:test".to_string()),
+                },
+                signature_for(&asset),
+            ],
         }
     }
 
@@ -863,6 +1057,184 @@ mod tests {
             RELEASES_API,
             "https://api.github.com/repos/futureboard/futureboard-studio/releases"
         );
+    }
+
+    /// Test-only signing key. It signs nothing outside these tests and is
+    /// unrelated to the release key baked in through
+    /// `FUTUREBOARD_UPDATE_PUBLIC_KEY`.
+    fn test_signing_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[7_u8; 32])
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn test_public_key_hex() -> String {
+        hex(test_signing_key().verifying_key().as_bytes())
+    }
+
+    fn sign(asset_name: &str, digest: &[u8; 32]) -> [u8; 64] {
+        use ed25519_dalek::Signer;
+        test_signing_key()
+            .sign(&signed_message(asset_name, digest))
+            .to_bytes()
+    }
+
+    const ASSET: &str = "Futureboard.Studio-2026.11.2-windows-x86_64-Setup.exe";
+
+    #[test]
+    fn a_genuine_signature_verifies_raw_or_hex() {
+        let key = test_public_key_hex();
+        let digest = [0x5a_u8; 32];
+        let signature = sign(ASSET, &digest);
+        assert!(verify_update_signature(Some(&key), ASSET, &digest, &signature).is_ok());
+        let hex_signature = format!("{}\n", hex(&signature));
+        assert!(
+            verify_update_signature(Some(&key), ASSET, &digest, hex_signature.as_bytes()).is_ok()
+        );
+    }
+
+    /// No key baked in means nothing can be verified, so every update is
+    /// refused rather than trusted on the release host's word.
+    #[test]
+    fn a_build_without_a_key_rejects_every_update() {
+        let digest = [1_u8; 32];
+        let signature = sign(ASSET, &digest);
+        assert!(verify_update_signature(None, ASSET, &digest, &signature).is_err());
+        assert!(verify_update_signature(Some("  "), ASSET, &digest, &signature).is_err());
+        assert!(verify_update_signature(Some("not-hex"), ASSET, &digest, &signature).is_err());
+    }
+
+    #[test]
+    fn a_tampered_or_foreign_signature_is_rejected() {
+        let key = test_public_key_hex();
+        let digest = [2_u8; 32];
+        let signature = sign(ASSET, &digest);
+
+        // Different installer bytes.
+        let mut other_digest = digest;
+        other_digest[0] ^= 1;
+        assert!(verify_update_signature(Some(&key), ASSET, &other_digest, &signature).is_err());
+
+        // A genuine signature for another asset (older version, other
+        // platform) cannot vouch for this one.
+        let older = "Futureboard.Studio-2026.11.1-windows-x86_64-Setup.exe";
+        assert!(verify_update_signature(Some(&key), older, &digest, &signature).is_err());
+
+        // Signed by someone else's key.
+        let attacker = ed25519_dalek::SigningKey::from_bytes(&[9_u8; 32]);
+        let attacker_signature = {
+            use ed25519_dalek::Signer;
+            attacker.sign(&signed_message(ASSET, &digest)).to_bytes()
+        };
+        assert!(verify_update_signature(Some(&key), ASSET, &digest, &attacker_signature).is_err());
+
+        // Missing, truncated or garbage signature bytes.
+        assert!(verify_update_signature(Some(&key), ASSET, &digest, b"").is_err());
+        assert!(verify_update_signature(Some(&key), ASSET, &digest, &signature[..63]).is_err());
+        assert!(verify_update_signature(Some(&key), ASSET, &digest, &[0_u8; 64]).is_err());
+    }
+
+    /// A tag cannot lift a signed installer to a version its name does not
+    /// carry: such a release is not offered, and download refuses it too.
+    #[test]
+    fn the_offered_version_must_match_the_signed_asset_name() {
+        let current = Version::parse("2026.8.1").unwrap();
+        let honest = versioned_release("v2026.8.9", "Release", "2026.8.9");
+        let update = choose_release(vec![honest], UpdateChannel::Beta, &current).unwrap();
+        assert!(asset_carries_offered_version(&update));
+
+        let mut relabelled = versioned_release("v2026.9.0", "Release", "2026.8.2");
+        relabelled.prerelease = false;
+        assert!(choose_release(vec![relabelled.clone()], UpdateChannel::Beta, &current).is_none());
+
+        // Download is still fail-closed for an update built by hand.
+        let forged = AvailableUpdate {
+            version: Version::parse("2026.9.0").unwrap(),
+            channel: UpdateChannel::Beta,
+            asset: relabelled.assets[0].clone(),
+            signature: relabelled.assets[1].clone(),
+        };
+        assert!(!asset_carries_offered_version(&forged));
+    }
+
+    /// The signature travels as `<installer>.sig` in the same release, matched
+    /// exactly. A release without one is skipped, so an older signed release
+    /// is offered instead of a newer unverifiable one.
+    #[test]
+    fn a_release_without_its_signature_is_not_offered() {
+        let current = Version::parse("2026.8.1").unwrap();
+        let signed = versioned_release("v2026.8.9", "Release", "2026.8.9");
+        let installer = signed.assets[0].name.clone();
+        let update = choose_release(vec![signed], UpdateChannel::Beta, &current).unwrap();
+        assert_eq!(update.signature.name, format!("{installer}.sig"));
+
+        let mut unsigned = versioned_release("v2026.8.9", "Release", "2026.8.9");
+        unsigned.assets.truncate(1);
+        assert!(choose_release(vec![unsigned.clone()], UpdateChannel::Beta, &current).is_none());
+
+        // Near-miss names are not the signature.
+        let mut misnamed = unsigned.clone();
+        misnamed
+            .assets
+            .push(signature_for(&installer.to_ascii_lowercase()));
+        let mut suffixed = signature_for(&installer);
+        suffixed.name.push_str(".txt");
+        misnamed.assets.push(suffixed);
+        assert!(choose_release(vec![misnamed], UpdateChannel::Beta, &current).is_none());
+
+        let mut newer_unsigned = versioned_release("v2026.8.10", "Release", "2026.8.10");
+        newer_unsigned.assets.truncate(1);
+        let older_signed = versioned_release("v2026.8.9", "Release", "2026.8.9");
+        let update = choose_release(
+            vec![newer_unsigned, older_signed],
+            UpdateChannel::Beta,
+            &current,
+        )
+        .unwrap();
+        assert_eq!(update.version, Version::parse("2026.8.9").unwrap());
+    }
+
+    /// Without a usable key the check reports updates as unavailable (an
+    /// error the dialog shows), never "up to date" and never an offer, and it
+    /// does so before any network request.
+    #[test]
+    fn a_build_without_a_key_offers_no_update() {
+        for key in [None, Some(""), Some("not-a-key")] {
+            let result = check_for_update_with_key(key, UpdateChannel::Stable, "2026.8.1");
+            assert!(result.is_err(), "{key:?} must not report a check result");
+        }
+        assert_eq!(
+            check_for_update_with_key(None, UpdateChannel::Stable, "2026.8.1").unwrap_err(),
+            NO_KEY_ERROR
+        );
+        assert!(update_verifying_key(Some(&test_public_key_hex())).is_ok());
+    }
+
+    /// Download is fail-closed on its own too: an update refused before any
+    /// network request (the URL is unreachable anyway) leaves no installer
+    /// behind.
+    #[test]
+    fn download_without_a_key_stages_nothing() {
+        if UPDATE_PUBLIC_KEY.is_some() {
+            // A key baked into this test build would let the request proceed.
+            return;
+        }
+        let current = Version::parse("2026.8.1").unwrap();
+        let signed = versioned_release("v2026.8.9", "Release", "2026.8.9");
+        let update = choose_release(vec![signed], UpdateChannel::Beta, &current).unwrap();
+        let cache =
+            std::env::temp_dir().join(format!("futureboard-updater-test-{}", std::process::id()));
+        let result = download_update(&update, &cache, &|_, _| {});
+        assert_eq!(result.unwrap_err(), NO_KEY_ERROR);
+        let staged = cache
+            .join("Updates")
+            .join(update.version.to_string())
+            .join(&update.asset.name);
+        assert!(!staged.exists());
+        assert!(!staged.with_extension("part").exists());
+        let _ = fs::remove_dir_all(&cache);
     }
 
     #[test]

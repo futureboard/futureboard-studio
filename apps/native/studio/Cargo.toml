@@ -59,7 +59,10 @@ sphere-webview = { workspace = true, optional = true, features = ["cef-runtime"]
 # the private source tree; serde/sha2 are shared with the updater above.
 reqwest = { workspace = true, optional = true, features = ["blocking", "json"] }
 base64 = { workspace = true, optional = true }
-ed25519-dalek = { workspace = true, optional = true }
+# Ed25519 verification: the updater checks every downloaded installer against
+# the project's update signing key, and the Professional license client verifies
+# its offline tokens. Verification only — no signing key ships in a build.
+ed25519-dalek.workspace = true
 # CSPRNG for the OAuth PKCE verifier / state nonce (Professional Edition auth).
 rand = { workspace = true, optional = true }
 
@@ -144,7 +147,6 @@ professional = [
     "dep:cpal",
     "dep:reqwest",
     "dep:base64",
-    "dep:ed25519-dalek",
     "dep:rand",
     "dep:windows-registry",
     # The engine's full-duplex ASIO session rides the same toolchain switch.
