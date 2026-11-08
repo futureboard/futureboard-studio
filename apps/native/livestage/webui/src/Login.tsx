@@ -3,7 +3,8 @@
 //
 // The server says who may log in (`auth.users`); the PIN goes to it and its
 // answer, wrong PIN or the wait after too many tries, is shown as it said
-// it. A kept token logs a reload straight back in (store.ts `resume`).
+// it. A kept token logs a reconnect straight back in (store.ts `resume`); a
+// reload asks for the PIN again, as a login token is never stored on the device.
 
 import { useEffect, useRef, useState } from 'react'
 import { AudioLines, ChevronLeft, CircleAlert, Delete, KeyRound, LoaderCircle, LogIn, UserRound, WifiOff } from 'lucide-react'
