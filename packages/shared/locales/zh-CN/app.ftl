@@ -942,6 +942,7 @@ settings.tab.audio = 音频
 settings.tab.audio.description = 驱动、设备、采样率、缓冲区大小和延迟。
 settings.tab.editing = 编辑
 settings.tab.editing.description = 鼠标、网格吸附和撤销历史。
+settings.tab.experimental = 实验功能
 settings.tab.files-media = 文件与媒体
 settings.tab.files-media.description = 项目、采样、录音和缓存位置。
 settings.tab.general = 常规
