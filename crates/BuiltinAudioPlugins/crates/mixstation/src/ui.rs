@@ -1,6 +1,6 @@
 //! MixStation's editor origin.
 //!
-//! The editor is native GPUI now (`sphere_ui_components::components::mix_station_window`);
+//! The editor is native GPUI now (`sphere_ui_components::components::mixstation_plate`);
 //! the CEF `editor/` bundle was removed. What stays is the stem Studio routes
 //! this plug-in's inserts, state mirror and native editor by.
 

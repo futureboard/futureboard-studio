@@ -67,6 +67,8 @@ pub struct ClipEditorPanel {
     /// Brings the popped-out MIDI editor back into the dock.
     on_dock_midi_editor: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
     _timeline_observer: Subscription,
+    /// Repaints when Settings → Experimental turns the Voxtune tab on or off.
+    _settings_observer: Option<Subscription>,
 }
 
 impl ClipEditorPanel {
@@ -80,6 +82,10 @@ impl ClipEditorPanel {
         cx: &mut Context<Self>,
     ) -> Self {
         let _timeline_observer = cx.observe(&timeline, |_, _, cx| cx.notify());
+        let _settings_observer = cx
+            .try_global::<crate::settings::GlobalSettingsModel>()
+            .map(|settings| settings.0.clone())
+            .map(|settings| cx.observe(&settings, |_, _, cx| cx.notify()));
         Self {
             timeline,
             piano_roll,
@@ -93,6 +99,7 @@ impl ClipEditorPanel {
             midi_popped_out: false,
             on_dock_midi_editor: None,
             _timeline_observer,
+            _settings_observer,
         }
     }
 
@@ -201,6 +208,7 @@ impl ClipEditorPanel {
         let default_tab = default_surface_tab(
             audio_clip_selected,
             ara_track_selected,
+            crate::settings::voxtune_enabled(cx),
             self.active_surface_tab,
         );
         if self.active_surface_tab != default_tab {
@@ -244,12 +252,14 @@ impl ClipEditorPanel {
             .bg(Colors::surface_titlebar());
 
         // The tuner works on an audio clip's take; an ARA track without one
-        // has nothing for it.
+        // has nothing for it. It is offered only while Settings → Experimental
+        // has it on.
         let audio_clip_selected =
             editor_kind_for_clip(clip_type_hint_for_selection(&self.timeline.read(cx).state))
                 == ClipEditorKind::Audio;
+        let voxtune_on = crate::settings::voxtune_enabled(cx);
         for (index, tab) in EditorSurfaceTab::ALL.into_iter().enumerate() {
-            if tab == EditorSurfaceTab::Voxtune && !audio_clip_selected {
+            if tab == EditorSurfaceTab::Voxtune && !(audio_clip_selected && voxtune_on) {
                 continue;
             }
             let active = self.active_surface_tab == tab;
@@ -288,6 +298,13 @@ impl ClipEditorPanel {
 impl Render for ClipEditorPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_surface_tab_to_selection(cx);
+        // Turned off in Settings while it was in front: the clip goes back to
+        // the Audio Editor, and the tuner stops following the selection.
+        if self.active_surface_tab == EditorSurfaceTab::Voxtune
+            && !crate::settings::voxtune_enabled(cx)
+        {
+            self.active_surface_tab = EditorSurfaceTab::AudioEditor;
+        }
 
         if self.editor_surface_tabs_visible(cx) {
             let body = match self.active_surface_tab {
@@ -350,15 +367,17 @@ impl Render for ClipEditorPanel {
 /// A clip on an ARA track is the plug-in's to edit — its document holds the
 /// clip's edits — so it opens on the ARA page, and so does every other clip
 /// picked or dragged on that track afterwards. Off ARA, audio opens the Audio
-/// Editor, unless the user is tuning take after take on the Voxtune tab.
+/// Editor, unless the user is tuning take after take on the Voxtune tab —
+/// which exists only while Settings → Experimental has it on.
 fn default_surface_tab(
     audio_clip_selected: bool,
     ara_track_selected: bool,
+    voxtune_on: bool,
     current: EditorSurfaceTab,
 ) -> EditorSurfaceTab {
     if ara_track_selected {
         EditorSurfaceTab::Ara
-    } else if audio_clip_selected && current == EditorSurfaceTab::Voxtune {
+    } else if audio_clip_selected && voxtune_on && current == EditorSurfaceTab::Voxtune {
         EditorSurfaceTab::Voxtune
     } else {
         EditorSurfaceTab::AudioEditor
@@ -373,13 +392,13 @@ mod tests {
     fn a_clip_on_an_ara_track_opens_the_ara_page() {
         for current in EditorSurfaceTab::ALL {
             assert_eq!(
-                default_surface_tab(true, true, current),
+                default_surface_tab(true, true, true, current),
                 EditorSurfaceTab::Ara,
                 "from {current:?}"
             );
         }
         assert_eq!(
-            default_surface_tab(false, true, EditorSurfaceTab::AudioEditor),
+            default_surface_tab(false, true, true, EditorSurfaceTab::AudioEditor),
             EditorSurfaceTab::Ara,
             "a selected ARA track with no clip"
         );
@@ -388,12 +407,20 @@ mod tests {
     #[test]
     fn plain_audio_opens_the_audio_editor_unless_tuning() {
         assert_eq!(
-            default_surface_tab(true, false, EditorSurfaceTab::Ara),
+            default_surface_tab(true, false, true, EditorSurfaceTab::Ara),
             EditorSurfaceTab::AudioEditor
         );
         assert_eq!(
-            default_surface_tab(true, false, EditorSurfaceTab::Voxtune),
+            default_surface_tab(true, false, true, EditorSurfaceTab::Voxtune),
             EditorSurfaceTab::Voxtune
+        );
+    }
+
+    #[test]
+    fn with_voxtune_off_the_next_clip_opens_the_audio_editor() {
+        assert_eq!(
+            default_surface_tab(true, false, false, EditorSurfaceTab::Voxtune),
+            EditorSurfaceTab::AudioEditor
         );
     }
 }

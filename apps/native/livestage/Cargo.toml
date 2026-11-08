@@ -47,7 +47,7 @@ external-plugins = ["livestage-engine/external-plugins"]
 appliance = ["dep:ratatui", "dep:sha1"]
 # Developer tool: `LiveStage --preview DIR` renders each view of a demo
 # session to PNG off-screen and quits. Never in a release.
-ui-preview = ["gui", "sphere_ui_components/ui-preview", "gpui/test-support", "dep:fa76"]
+ui-preview = ["gui", "sphere_ui_components/ui-preview", "gpui/test-support", "dep:zcomp"]
 
 [dependencies]
 livestage-engine.workspace = true
@@ -71,8 +71,8 @@ rand.workspace = true
 # The server's MIDI remote: control surfaces in and feedback out (WinMM on
 # Windows, the ALSA sequencer on Linux).
 midir.workspace = true
-# The preview demo addresses FA-76 parameters by name.
-fa76 = { workspace = true, optional = true }
+# The preview demo addresses Z-Comp parameters by name.
+zcomp = { workspace = true, optional = true }
 
 gpui = { workspace = true, optional = true }
 raw-window-handle = { workspace = true, optional = true }

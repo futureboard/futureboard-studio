@@ -112,7 +112,7 @@ impl WhiteSharp {
 
 impl Plugin for WhiteSharp {
     const NAME: &'static str = "WhiteSharp";
-    const VENDOR: &'static str = "Futureboard";
+    const VENDOR: &'static str = "Futureboard Digital Technologies";
     const URL: &'static str = "";
     const EMAIL: &'static str = "";
     const VERSION: &'static str = env!("CARGO_PKG_VERSION");

@@ -271,6 +271,7 @@ const components = [
   ["settings.tab.files-media", "Files & Media"],
   ["settings.tab.shortcuts", "Key Commands"],
   ["settings.tab.performance", "Performance"],
+  ["settings.tab.experimental", "Experimental"],
   ["settings.tab.advanced", "Advanced"],
   ["settings.tab.about", "About"],
   ["settings.tab.general.description", "Application behavior, project defaults, and autosave."],

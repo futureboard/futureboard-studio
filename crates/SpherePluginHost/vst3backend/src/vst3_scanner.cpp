@@ -419,7 +419,7 @@ intptr_t SPHERE_VST2_CC vst2_scan_audio_master(AEffect*, int32_t opcode, int32_t
       return kVstProcessLevelUser;
     case audioMasterGetVendorString:
       if (ptr) {
-        std::snprintf(static_cast<char*>(ptr), 64, "%s", "Futureboard");
+        std::snprintf(static_cast<char*>(ptr), 64, "%s", "Futureboard Digital Technologies");
         return 1;
       }
       return 0;

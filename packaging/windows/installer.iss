@@ -25,7 +25,7 @@
 ;   All-users: %ProgramFiles%\Futureboard Studio\Studio
 
 #define MyAppName "Futureboard Studio"
-#define MyAppPublisher "Futureboard"
+#define MyAppPublisher "Futureboard Digital Technologies"
 #define MyAppExeName "FutureboardNative.exe"
 #define MyAppIcon "..\..\packages\shared\app\icons\icon.ico"
 

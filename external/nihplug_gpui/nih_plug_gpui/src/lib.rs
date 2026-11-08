@@ -126,6 +126,18 @@ pub fn set_asset_source(source: impl gpui::AssetSource) -> bool {
     host::set_asset_source(Arc::new(source))
 }
 
+/// Ask for the keyboard while the editor has a text field to type into, and give it back with
+/// `false` once it doesn't.
+///
+/// On Windows an embedded editor is a child window, and Windows never moves keyboard focus to a
+/// child window on a click: without this, keys and IME text keep going to the host while GPUI shows
+/// a focused field. Holding the keyboard only while typing leaves the host's shortcuts working the
+/// rest of the time. Call it from the GPUI thread, outside of rendering (`Window::defer`). Elsewhere
+/// this does nothing.
+pub fn set_keyboard_focus(window: &Window, focused: bool) {
+    embed::set_keyboard_focus(window, focused)
+}
+
 /// Everything the GUI needs to interact with the plugin. This is handed to the `build` closure
 /// passed to [`create_gpui_editor()`], and it's cheap to clone into your views.
 #[derive(Clone)]

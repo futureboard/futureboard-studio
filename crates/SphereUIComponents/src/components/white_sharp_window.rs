@@ -33,9 +33,10 @@ use gpui::{
 use whitesharp::Params;
 
 use crate::components::builtin_plugin_editor_window::{BuiltinEditorHostOps, PluginInstanceKey};
+use crate::components::builtin_preset_menu::BuiltinPresetMenu;
 use crate::components::fx_model::KnobSpec;
 use crate::components::native_plugin_shell::{
-    claim_editor_transport_key, native_plugin_shell, swallow_editor_transport_key_up,
+    claim_editor_transport_key, native_plugin_shell_with, swallow_editor_transport_key_up,
     NativeBuiltinEditor, ShellIdentity, ShellMeter,
 };
 use crate::components::white_sharp_meter::{LiveBounds, LiveDisplay, LiveInputs};
@@ -424,6 +425,8 @@ pub struct WhiteSharpWindow {
     editor: Entity<WhiteSharpEditor>,
     live: Rc<RefCell<LiveDisplay>>,
     meter: ShellMeter,
+    /// The `.pst` preset menu in the identity strip.
+    presets: gpui::Entity<BuiltinPresetMenu>,
 }
 
 impl WhiteSharpWindow {
@@ -434,6 +437,7 @@ impl WhiteSharpWindow {
         on_close: Arc<dyn Fn(&mut Window, &mut App)>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let presets = cx.new(|cx| BuiltinPresetMenu::new(key.clone(), &identity, cx));
         ensure_fonts(cx);
         let editor = cx.new(|cx| WhiteSharpEditor::new(key.clone(), host_ops.clone(), cx));
         let live = Rc::new(RefCell::new(LiveDisplay::default()));
@@ -447,6 +451,7 @@ impl WhiteSharpWindow {
             editor,
             live,
             meter: ShellMeter::default(),
+            presets,
         };
         window.bind_live();
         window
@@ -502,6 +507,9 @@ impl NativeBuiltinEditor for WhiteSharpWindow {
         cx: &mut Context<Self>,
     ) {
         self.key = key.clone();
+        let presets_key = self.key.clone();
+        self.presets
+            .update(cx, |menu, cx| menu.rebind(presets_key, &identity, cx));
         self.identity = identity;
         self.host_ops = host_ops.clone();
         self.editor
@@ -580,7 +588,7 @@ impl Render for WhiteSharpWindow {
                 this.on_key_down(event, cx);
             }))
             .on_key_up(|_event, window, cx| swallow_editor_transport_key_up(window, cx))
-            .child(native_plugin_shell(
+            .child(native_plugin_shell_with(
                 "whitesharp-window-close",
                 &self.identity,
                 self.meter,
@@ -588,6 +596,7 @@ impl Render for WhiteSharpWindow {
                     on_close(window, cx);
                     window.remove_window();
                 },
+                Some(self.presets.clone().into_any_element()),
                 content,
             ))
     }

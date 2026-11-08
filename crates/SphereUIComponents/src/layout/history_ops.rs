@@ -198,7 +198,7 @@ impl StudioLayout {
     /// Hand an insert's stored state (`vst3_state`) to its live plug-in, after
     /// a step changed it. The preset strip then names no preset: what is
     /// loaded is whatever the step restored.
-    fn push_insert_state_to_plugin(
+    pub(super) fn push_insert_state_to_plugin(
         &mut self,
         track_id: &str,
         insert_id: &str,

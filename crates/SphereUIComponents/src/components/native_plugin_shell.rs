@@ -42,6 +42,11 @@ pub struct ShellIdentity {
     pub track_name: String,
     /// 1-based slot on the track's insert chain.
     pub insert_number: usize,
+    /// The plug-in's registry id, which its `.pst` presets carry. Empty where
+    /// nothing handles presets (LiveStage): the strip then shows no menu.
+    pub plugin_id: String,
+    /// The name its preset folder has under `Presets/Plug-ins`.
+    pub preset_plugin_name: String,
 }
 
 /// The output meter in the strip: peak and RMS, linear.
@@ -134,8 +139,13 @@ fn meter(meter: ShellMeter) -> AnyElement {
         .into_any_element()
 }
 
-/// The identity strip under the title bar.
-fn identity_strip(identity: &ShellIdentity, level: ShellMeter) -> AnyElement {
+/// The identity strip under the title bar, with the editor's preset menu
+/// (when it has one) before the meter.
+fn identity_strip(
+    identity: &ShellIdentity,
+    level: ShellMeter,
+    presets: Option<AnyElement>,
+) -> AnyElement {
     div()
         .flex()
         .flex_row()
@@ -170,6 +180,7 @@ fn identity_strip(identity: &ShellIdentity, level: ShellMeter) -> AnyElement {
                     identity.track_name, identity.insert_number
                 )),
         )
+        .children(presets)
         .child(meter(level))
         .into_any_element()
 }
@@ -226,6 +237,19 @@ pub fn native_plugin_shell(
     on_close: impl Fn(&mut Window, &mut App) + Clone + 'static,
     content: AnyElement,
 ) -> AnyElement {
+    native_plugin_shell_with(close_id, identity, level, on_close, None, content)
+}
+
+/// [`native_plugin_shell`] with the editor's preset menu in the identity
+/// strip ([`crate::components::builtin_preset_menu`]).
+pub fn native_plugin_shell_with(
+    close_id: &'static str,
+    identity: &ShellIdentity,
+    level: ShellMeter,
+    on_close: impl Fn(&mut Window, &mut App) + Clone + 'static,
+    presets: Option<AnyElement>,
+    content: AnyElement,
+) -> AnyElement {
     div()
         .flex()
         .flex_col()
@@ -238,7 +262,7 @@ pub fn native_plugin_shell(
             close_id,
             on_close,
         ))
-        .child(identity_strip(identity, level))
+        .child(identity_strip(identity, level, presets))
         .child(div().flex_1().min_h(px(0.0)).relative().child(content))
         .into_any_element()
 }

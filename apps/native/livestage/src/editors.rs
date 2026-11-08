@@ -109,6 +109,9 @@ pub fn open_editor(
         plugin_name: slot.plugin.display_name(),
         track_name: strip_name,
         insert_number: position + 1,
+        // LiveStage keeps no plug-in presets: no preset menu in the strip.
+        plugin_id: String::new(),
+        preset_plugin_name: String::new(),
     };
     match slot.plugin.clone() {
         InsertPlugin::Builtin { stem, params } => {
@@ -144,8 +147,9 @@ fn open_builtin(
     cx: &mut Context<LiveStageApp>,
 ) {
     use sphere_ui_components::components::{
-        band_panel, burn_limit_plate, dyn_panel, equz8_plate, equzx_plate, fx_window, gate_panel,
-        imager_plate, mix_station_panel, rodhareist_window, white_sharp_window,
+        burn_limit_plate, compressor_plate, dyn_plate, echospace_plate, equz8_plate, equzx_plate,
+        imager_plate, mixstation_plate, rodhareist_window, verbspace_plate, waygate_plate,
+        white_sharp_window,
     };
 
     let key = PluginInstanceKey {
@@ -208,18 +212,16 @@ fn open_builtin(
     let opened = match stem {
         "equz8" => open(equz8_plate::open_equz8_editor, b, k, i, h, c, cx),
         "equzx" => open(equzx_plate::open_equzx_editor, b, k, i, h, c, cx),
-        "verbspace" => open(fx_window::open_verbspace_editor, b, k, i, h, c, cx),
-        "echospace" => open(fx_window::open_echospace_editor, b, k, i, h, c, cx),
-        "fa2a" => open(dyn_panel::open_fa2a_editor, b, k, i, h, c, cx),
-        "fa76" => open(dyn_panel::open_fa76_editor, b, k, i, h, c, cx),
-        "zcomp" => open(dyn_panel::open_zcomp_editor, b, k, i, h, c, cx),
+        "verbspace" => open(verbspace_plate::open_verbspace_editor, b, k, i, h, c, cx),
+        "echospace" => open(echospace_plate::open_echospace_editor, b, k, i, h, c, cx),
+        "zcomp" => open(dyn_plate::open_zcomp_editor, b, k, i, h, c, cx),
         "burnlimit" => open(burn_limit_plate::open_burnlimit_editor, b, k, i, h, c, cx),
-        "clipper67" => open(dyn_panel::open_clipper67_editor, b, k, i, h, c, cx),
-        "transient" => open(dyn_panel::open_transient_editor, b, k, i, h, c, cx),
-        "waygate" => open(gate_panel::open_waygate_editor, b, k, i, h, c, cx),
-        "compresser" => open(band_panel::open_compresser_editor, b, k, i, h, c, cx),
+        "clipper67" => open(dyn_plate::open_clipper67_editor, b, k, i, h, c, cx),
+        "transient" => open(dyn_plate::open_transient_editor, b, k, i, h, c, cx),
+        "waygate" => open(waygate_plate::open_waygate_editor, b, k, i, h, c, cx),
+        "compresser" => open(compressor_plate::open_compresser_editor, b, k, i, h, c, cx),
         "imager" => open(imager_plate::open_imager_editor, b, k, i, h, c, cx),
-        "mixstation" => open(mix_station_panel::open_mixstation_editor, b, k, i, h, c, cx),
+        "mixstation" => open(mixstation_plate::open_mixstation_editor, b, k, i, h, c, cx),
         "whitesharp" => open(
             white_sharp_window::open_whitesharp_editor,
             b,

@@ -72,8 +72,6 @@ pub enum BuiltinDsp {
     Equz8(Box<equz8::Dsp>),
     Equzx(Box<equzx::Dsp>),
     Compresser(Box<compresser::Dsp>),
-    Fa2a(Box<fa2a::Dsp>),
-    Fa76(Box<fa76::Dsp>),
     Zcomp(Box<zcomp::Dsp>),
     Echospace(Box<echospace::Dsp>),
     Verbspace(Box<verbspace::Dsp>),
@@ -151,16 +149,6 @@ impl BuiltinPluginInstance {
                 "Compresser Studio Bus",
                 PluginKind::Effect,
                 BuiltinDsp::Compresser(Box::new(compresser::Dsp::new(sr))),
-            ),
-            "fa2a" => (
-                "FA-2A Optical Leveler",
-                PluginKind::Effect,
-                BuiltinDsp::Fa2a(Box::new(fa2a::Dsp::new(sr))),
-            ),
-            "fa76" => (
-                "FA-76 FET Limiter",
-                PluginKind::Effect,
-                BuiltinDsp::Fa76(Box::new(fa76::Dsp::new(sr))),
             ),
             "zcomp" => (
                 "Z-Comp VCA Dynamics",
@@ -392,8 +380,6 @@ impl BuiltinPluginInstance {
             BuiltinDsp::Equz8(d) => d.set_sample_rate(sr),
             BuiltinDsp::Equzx(d) => d.set_sample_rate(sr),
             BuiltinDsp::Compresser(d) => d.set_sample_rate(sr),
-            BuiltinDsp::Fa2a(d) => d.set_sample_rate(sr),
-            BuiltinDsp::Fa76(d) => d.set_sample_rate(sr),
             BuiltinDsp::Zcomp(d) => d.set_sample_rate(sr),
             BuiltinDsp::Echospace(d) => d.set_sample_rate(sr),
             BuiltinDsp::Verbspace(d) => d.set_sample_rate(sr),
@@ -432,8 +418,6 @@ impl BuiltinPluginInstance {
             BuiltinDsp::Equz8(d) => d.reset(),
             BuiltinDsp::Equzx(d) => d.reset(),
             BuiltinDsp::Compresser(d) => d.reset(),
-            BuiltinDsp::Fa2a(d) => d.reset(),
-            BuiltinDsp::Fa76(d) => d.reset(),
             BuiltinDsp::Zcomp(d) => d.reset(),
             BuiltinDsp::Echospace(d) => d.reset(),
             BuiltinDsp::Verbspace(d) => d.reset(),
@@ -546,18 +530,6 @@ impl BuiltinPluginInstance {
             }
             BuiltinDsp::Compresser(d) => {
                 if let Some(idx) = compresser::ipc::ui_param_index(param_id) {
-                    d.apply_wire_param(idx, value);
-                    return true;
-                }
-            }
-            BuiltinDsp::Fa2a(d) => {
-                if let Some(idx) = fa2a::ipc::ui_param_index(param_id) {
-                    d.apply_wire_param(idx, value);
-                    return true;
-                }
-            }
-            BuiltinDsp::Fa76(d) => {
-                if let Some(idx) = fa76::ipc::ui_param_index(param_id) {
                     d.apply_wire_param(idx, value);
                     return true;
                 }
@@ -825,8 +797,6 @@ impl BuiltinPluginInstance {
             BuiltinDsp::Equz8(d) => process_effect_loop(d.as_mut(), left, right, frames),
             BuiltinDsp::Equzx(d) => process_effect_loop(d.as_mut(), left, right, frames),
             BuiltinDsp::Compresser(d) => process_effect_loop(d.as_mut(), left, right, frames),
-            BuiltinDsp::Fa2a(d) => process_effect_loop(d.as_mut(), left, right, frames),
-            BuiltinDsp::Fa76(d) => process_effect_loop(d.as_mut(), left, right, frames),
             BuiltinDsp::Zcomp(d) => process_effect_loop(d.as_mut(), left, right, frames),
             BuiltinDsp::Echospace(d) => process_effect_loop(d.as_mut(), left, right, frames),
             BuiltinDsp::Verbspace(d) => process_effect_loop(d.as_mut(), left, right, frames),
@@ -1100,8 +1070,6 @@ pub fn canonicalize_id(raw: &str) -> String {
         "eq" | "eq-z8" | "equz8" => "equz8".to_string(),
         "eq-zx" | "equzx" => "equzx".to_string(),
         "comp" | "compressor" | "compresser" => "compresser".to_string(),
-        "la2a" | "fa-2a" | "fa2a" => "fa2a".to_string(),
-        "1176" | "fa-76" | "fa76" => "fa76".to_string(),
         "z-comp" | "zcomp" => "zcomp".to_string(),
         "delay" | "echospace" => "echospace".to_string(),
         "reverb" | "verbspace" => "verbspace".to_string(),
@@ -1206,20 +1174,6 @@ pub fn plugin_catalog() -> Vec<PluginCatalogEntry> {
             "Dynamics",
             PluginKind::Effect,
             "Precision studio bus & track compressor with sidechain HPF, knee control and parallel mix",
-        ),
-        (
-            "fa2a",
-            "FA-2A Optical",
-            "Dynamics",
-            PluginKind::Effect,
-            "Warm program-dependent electro-optical tube leveling amplifier",
-        ),
-        (
-            "fa76",
-            "FA-76 FET",
-            "Dynamics",
-            PluginKind::Effect,
-            "Ultra-fast FET limiting amplifier with all-buttons-in ratio mode",
         ),
         (
             "zcomp",
@@ -1440,23 +1394,6 @@ pub fn build_param_specs_for(plugin_id: &str) -> Vec<PluginParamSpec> {
             spec("makeup_db", "Makeup Gain", 2.0, -12.0, 24.0, "dB", "Output"),
             spec("sc_hpf_hz", "SC HPF", 80.0, 20.0, 500.0, "Hz", "Sidechain"),
             spec("mix_pct", "Mix", 100.0, 0.0, 100.0, "%", "Output"),
-        ],
-        "fa2a" => vec![
-            spec("power", "Power", 1.0, 0.0, 1.0, "bool", "Global"),
-            spec("peak_reduction", "Peak Reduction", 42.0, 0.0, 100.0, "%", "Optical"),
-            spec("gain", "Make-Up Gain", 36.0, 0.0, 100.0, "%", "Optical"),
-            spec("limit_mode", "Compress / Limit", 0.0, 0.0, 1.0, "mode", "Optical"),
-            spec("emphasis", "HF Emphasis", 25.0, 0.0, 100.0, "%", "Sidechain"),
-            spec("mix", "Dry/Wet Mix", 100.0, 0.0, 100.0, "%", "Output"),
-        ],
-        "fa76" => vec![
-            spec("power", "Power", 1.0, 0.0, 1.0, "bool", "Global"),
-            spec("input_db", "Input Drive", 0.0, -24.0, 24.0, "dB", "FET"),
-            spec("output_db", "Output Level", 0.0, -24.0, 24.0, "dB", "FET"),
-            spec("attack", "Attack (Fast 7)", 5.0, 1.0, 7.0, "step", "Envelope"),
-            spec("release", "Release (Fast 7)", 4.0, 1.0, 7.0, "step", "Envelope"),
-            spec("ratio_mode", "Ratio (4/8/12/20/All)", 1.0, 0.0, 4.0, "mode", "FET"),
-            spec("mix_pct", "Parallel Mix", 100.0, 0.0, 100.0, "%", "Output"),
         ],
         "zcomp" => vec![
             spec("power", "Power", 1.0, 0.0, 1.0, "bool", "Global"),

@@ -24,7 +24,7 @@
 ; page is disabled so it cannot be pointed at a plug-in folder either.
 
 #define MyAppName "WhiteSharp"
-#define MyAppPublisher "Futureboard"
+#define MyAppPublisher "Futureboard Digital Technologies"
 #define MyAppURL "https://futureboard.studio/plugins/whitesharp"
 #define MyAppIcon "..\..\packages\shared\app\icons\icon.ico"
 

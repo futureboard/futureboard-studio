@@ -47,10 +47,10 @@ fn demo_session() -> Session {
         strip.core.pan = pan;
         session.channels.push(strip);
     }
-    let fa76 = builtin(&mut session, "fa76");
+    let vox_comp = builtin(&mut session, "zcomp");
     let eq = builtin(&mut session, "equz8");
     let vox = &mut session.channels[4];
-    vox.core.inserts = vec![eq, fa76];
+    vox.core.inserts = vec![eq, vox_comp];
     vox.record_arm = true;
     vox.sends = vec![
         SendSlot {
@@ -143,23 +143,23 @@ pub fn run(out: PathBuf, cx: &mut App) {
             }
         }
         // A built-in editor, opened from the mixer the way a click opens it:
-        // the vocal's FA-76, with a changed value in the session.
+        // the vocal's Z-Comp, with a changed value in the session.
         let opened = handle.update(cx, |app: &mut LiveStageApp, _, cx| {
             let vox = app.engine.session().channels[4].clone();
-            let fa76 = vox.core.inserts[1].id;
+            let vox_comp = vox.core.inserts[1].id;
             app.run(livestage_engine::Command::SetInsertParam {
-                insert: fa76,
-                index: fa76::ipc::INPUT_INDEX,
-                value: 6.0,
+                insert: vox_comp,
+                index: zcomp::ipc::THRESHOLD_INDEX,
+                value: -24.0,
             });
             crate::editors::open_editor(
                 app,
                 livestage_engine::StripRef::Channel(vox.id),
-                fa76,
+                vox_comp,
                 None,
                 cx,
             );
-            app.editors.window(fa76)
+            app.editors.window(vox_comp)
         });
         if let Ok(Some(editor)) = opened {
             let _ = editor.update(cx, |_, window, _| {
@@ -168,7 +168,7 @@ pub fn run(out: PathBuf, cx: &mut App) {
             cx.background_executor()
                 .timer(Duration::from_millis(1200))
                 .await;
-            let file = out.join("editor-fa76.png");
+            let file = out.join("editor-zcomp.png");
             match cx
                 .update_window(editor, |_, window, _| window.render_to_image())
                 .and_then(|frame| frame)

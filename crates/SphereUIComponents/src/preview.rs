@@ -22,10 +22,6 @@ use crate::components::band_model::BandKind;
 use crate::components::builtin_plugin_editor::builtin_state_seed;
 use crate::components::builtin_plugin_editor_window::{BuiltinEditorHostOps, PluginInstanceKey};
 use crate::components::dyn_model::DynKind;
-use crate::components::fx_model::{presets, FxKind, FxParams};
-use crate::components::fx_window::{fx_window_size, FxEditorWindow};
-use crate::components::gate_panel::WayGateModel;
-use crate::components::mix_station_panel::MixStationModel;
 use crate::components::native_plugin_shell::ShellIdentity;
 use crate::components::plate;
 use crate::components::plugin_kit::{KitModel, KitWindow};
@@ -241,32 +237,32 @@ pub fn scenes() -> Vec<Scene> {
         },
         Scene {
             name: "verbspace-hall",
-            width: fx_window_size(FxKind::Verb).0,
-            height: fx_window_size(FxKind::Verb).1,
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
             open: verbspace_hall,
         },
         Scene {
             name: "verbspace-plate",
-            width: fx_window_size(FxKind::Verb).0,
-            height: fx_window_size(FxKind::Verb).1,
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
             open: verbspace_plate,
         },
         Scene {
             name: "echospace-default",
-            width: fx_window_size(FxKind::Echo).0,
-            height: fx_window_size(FxKind::Echo).1,
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
             open: echospace_default,
         },
         Scene {
             name: "echospace-synced",
-            width: fx_window_size(FxKind::Echo).0,
-            height: fx_window_size(FxKind::Echo).1,
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
             open: echospace_synced,
         },
         Scene {
             name: "echospace-ambient",
-            width: fx_window_size(FxKind::Echo).0,
-            height: fx_window_size(FxKind::Echo).1,
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
             open: echospace_ambient,
         },
         Scene {
@@ -300,22 +296,16 @@ pub fn scenes() -> Vec<Scene> {
             open: whitesharp_vibrato_scene,
         },
         Scene {
-            name: "fa2a",
-            width: DynKind::Fa2a.window_size().0,
-            height: DynKind::Fa2a.window_size().1,
-            open: fa2a_scene,
-        },
-        Scene {
-            name: "fa76",
-            width: DynKind::Fa76.window_size().0,
-            height: DynKind::Fa76.window_size().1,
-            open: fa76_scene,
-        },
-        Scene {
             name: "zcomp",
-            width: DynKind::Zcomp.window_size().0,
-            height: DynKind::Zcomp.window_size().1,
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
             open: zcomp_scene,
+        },
+        Scene {
+            name: "zcomp-bus",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: zcomp_bus_scene,
         },
         Scene {
             name: "burnlimit",
@@ -325,38 +315,50 @@ pub fn scenes() -> Vec<Scene> {
         },
         Scene {
             name: "clipper67",
-            width: DynKind::Clipper.window_size().0,
-            height: DynKind::Clipper.window_size().1,
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
             open: clipper67_scene,
         },
         Scene {
+            name: "clipper67-limit",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: clipper67_limit_scene,
+        },
+        Scene {
             name: "transient",
-            width: DynKind::Transient.window_size().0,
-            height: DynKind::Transient.window_size().1,
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
             open: transient_scene,
         },
         Scene {
+            name: "transient-snap",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: transient_snap_scene,
+        },
+        Scene {
             name: "waygate",
-            width: WayGateModel.window_size().0,
-            height: WayGateModel.window_size().1,
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
             open: waygate_scene,
         },
         Scene {
             name: "waygate-duck",
-            width: WayGateModel.window_size().0,
-            height: WayGateModel.window_size().1,
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
             open: waygate_duck_scene,
         },
         Scene {
             name: "compressor-single",
-            width: BandKind::Comp.window_size().0,
-            height: BandKind::Comp.window_size().1,
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
             open: compressor_single,
         },
         Scene {
             name: "compressor-multi",
-            width: BandKind::Comp.window_size().0,
-            height: BandKind::Comp.window_size().1,
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
             open: compressor_multi,
         },
         Scene {
@@ -373,8 +375,8 @@ pub fn scenes() -> Vec<Scene> {
         },
         Scene {
             name: "mixstation",
-            width: MixStationModel.window_size().0,
-            height: MixStationModel.window_size().1,
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
             open: mixstation_scene,
         },
         Scene {
@@ -385,8 +387,8 @@ pub fn scenes() -> Vec<Scene> {
         },
         Scene {
             name: "mixstation-empty",
-            width: MixStationModel.window_size().0,
-            height: MixStationModel.window_size().1,
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
             open: mixstation_empty,
         },
         Scene {
@@ -394,6 +396,18 @@ pub fn scenes() -> Vec<Scene> {
             width: plate::WINDOW_SIZE.0,
             height: plate::WINDOW_SIZE.1,
             open: rodhareist,
+        },
+        Scene {
+            name: "rodhareist-users",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: rodhareist_users,
+        },
+        Scene {
+            name: "rodhareist-lanes",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: rodhareist_lanes,
         },
         Scene {
             name: "rodhareist-explore",
@@ -426,40 +440,76 @@ pub fn scenes() -> Vec<Scene> {
             open: rodhareist_settings,
         },
         Scene {
+            name: "settings-experimental",
+            width: crate::components::settings_layout::SETTINGS_WINDOW_WIDTH,
+            height: crate::components::settings_layout::SETTINGS_WINDOW_HEIGHT,
+            open: settings_experimental,
+        },
+        Scene {
             name: "wrapsynth",
-            width: 1_280.0,
-            height: 900.0,
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
             open: wrap_synth,
         },
         Scene {
             name: "wrapsynth-modulation",
-            width: 1_280.0,
-            height: 1_040.0,
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
             open: wrap_synth_modulation,
         },
         Scene {
             name: "wrapsynth-voice-fx",
-            width: 1_280.0,
-            height: 900.0,
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
             open: wrap_synth_voice_fx,
         },
         Scene {
             name: "drum-sampler",
-            width: 1_200.0,
-            height: 820.0,
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
             open: drum_sampler,
         },
         Scene {
+            name: "drum-sampler-kit",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: drum_sampler_kit,
+        },
+        Scene {
+            name: "drum-sampler-mixer",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: drum_sampler_mixer,
+        },
+        Scene {
             name: "quick-sampler",
-            width: 1_100.0,
-            height: 760.0,
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
             open: quick_sampler,
         },
         Scene {
+            name: "quick-sampler-loop",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: quick_sampler_loop,
+        },
+        Scene {
             name: "slicer",
-            width: 1_100.0,
-            height: 760.0,
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
             open: slicer,
+        },
+        Scene {
+            name: "slicer-loop",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: |o, cx| slicer_loop_by(o, cx, slicer::SliceMode::Transient),
+        },
+        Scene {
+            name: "slicer-beat",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: |o, cx| slicer_loop_by(o, cx, slicer::SliceMode::Beat),
         },
         Scene {
             name: "mixer",
@@ -704,6 +754,9 @@ fn identity(plugin: &str) -> ShellIdentity {
         plugin_name: plugin.to_string(),
         track_name: "Lead Vocal".to_string(),
         insert_number: 2,
+        // So the strip shows the preset menu, as it does in Studio.
+        plugin_id: format!("builtin:{}", plugin.to_lowercase()),
+        preset_plugin_name: plugin.to_string(),
     }
 }
 
@@ -1068,52 +1121,149 @@ fn dyn_json(
 ) -> std::result::Result<String, serde_json::Error> {
     use crate::components::dyn_model::DynParams;
     match params.clone() {
-        DynParams::Fa2a(p) => fa2a::ipc::Fa2aState::new(p).to_json(),
-        DynParams::Fa76(p) => fa76::ipc::Fa76State::new(p).to_json(),
         DynParams::Zcomp(p) => zcomp::ipc::ZcompState::new(p).to_json(),
         DynParams::Clipper(p) => clipper67::ipc::Clipper67State::new(p).to_json(),
         DynParams::Transient(p) => transient::ipc::TransientState::new(p).to_json(),
     }
 }
 
+/// Ten seconds of meter frames from the real DSP at `params`, run over
+/// [`preview_signal`] as the host would meter it.
+fn dyn_frames(
+    params: &crate::components::dyn_model::DynParams,
+) -> Vec<SpherePluginHost::audio_bridge::BuiltinMeterFrame> {
+    use crate::components::dyn_model::DynParams;
+    use waygate::StereoEffect;
+    macro_rules! frames {
+        ($dsp:path, $params:expr) => {{
+            let dsp = std::cell::RefCell::new(<$dsp>::new(48_000.0));
+            dsp.borrow_mut().set_params($params.clone());
+            run_preview(
+                |l, r| dsp.borrow_mut().process_stereo(l, r),
+                || {
+                    let f = dsp.borrow().meter_frame();
+                    SpherePluginHost::audio_bridge::BuiltinMeterFrame {
+                        in_peak: f.in_peak,
+                        in_rms: f.in_rms,
+                        out_peak: f.out_peak,
+                        out_rms: f.out_rms,
+                        gain_reduction_db: f.gain_reduction_db,
+                        in_clip: f.in_clip,
+                        out_clip: f.out_clip,
+                        ..Default::default()
+                    }
+                },
+            )
+        }};
+    }
+    match params {
+        DynParams::Zcomp(p) => frames!(zcomp::Dsp, p),
+        DynParams::Clipper(p) => frames!(clipper67::Dsp, p),
+        DynParams::Transient(p) => frames!(transient::Dsp, p),
+    }
+}
+
+/// Opens `kind`'s plate on factory preset `preset` with `edits` made, its
+/// history and meters filled from a run of the real DSP.
 fn open_dyn(
     options: WindowOptions,
     cx: &mut App,
     kind: DynKind,
+    insert: &'static str,
     preset: &str,
-    reduction_db: f32,
+    edits: &[(&str, f32)],
+    then: impl FnOnce(&mut crate::components::plugin_kit::KitEditor<DynKind>) + 'static,
 ) -> Result<AnyWindowHandle> {
-    let params = dyn_preset(kind, preset);
-    open_kit(
+    let params = edits
+        .iter()
+        .fold(dyn_preset(kind, preset), |params, (id, value)| {
+            params.with(id, *value)
+        });
+    let frames = dyn_frames(&params);
+    open_plate(
         options,
         cx,
         kind,
         kind.key(),
-        kind.key(),
+        insert,
         dyn_json(&params),
-        reduction_db,
+        frames,
+        [0.0; SpherePluginHost::audio_bridge::BUILTIN_PAD_SLOTS],
+        then,
+    )
+}
+
+fn zcomp_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_dyn(
+        options,
+        cx,
+        DynKind::Zcomp,
+        "zcomp",
+        "Bass Glue",
+        &[],
         |_| {},
     )
 }
 
-fn fa2a_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
-    open_dyn(options, cx, DynKind::Fa2a, "Vocal Level", 6.0)
-}
-
-fn fa76_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
-    open_dyn(options, cx, DynKind::Fa76, "Vocal Catch", 9.0)
-}
-
-fn zcomp_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
-    open_dyn(options, cx, DynKind::Zcomp, "Vocal Catch", 5.0)
+fn zcomp_bus_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_dyn(
+        options,
+        cx,
+        DynKind::Zcomp,
+        "zcomp-bus",
+        "Bus Soft",
+        &[],
+        |editor| editor.ui.vu_output = true,
+    )
 }
 
 fn clipper67_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
-    open_dyn(options, cx, DynKind::Clipper, "Hybrid Glue", 3.0)
+    open_dyn(
+        options,
+        cx,
+        DynKind::Clipper,
+        "clipper67",
+        "Aggressive",
+        &[],
+        |_| {},
+    )
+}
+
+fn clipper67_limit_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_dyn(
+        options,
+        cx,
+        DynKind::Clipper,
+        "clipper67-limit",
+        "Brick Limit",
+        // Pushed, so the limiter has peaks to hold.
+        &[("inputDb", 6.0)],
+        |_| {},
+    )
 }
 
 fn transient_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
-    open_dyn(options, cx, DynKind::Transient, "Punch Up", 4.0)
+    open_dyn(
+        options,
+        cx,
+        DynKind::Transient,
+        "transient",
+        "Punch Up",
+        &[],
+        |_| {},
+    )
+}
+
+fn transient_snap_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_dyn(
+        options,
+        cx,
+        DynKind::Transient,
+        "transient-snap",
+        "Snap Cut",
+        &[],
+        |_| {},
+    )
 }
 
 /// Ten seconds of WayGate telemetry, measured by running the real DSP at
@@ -1173,39 +1323,20 @@ fn open_waygate(
     insert: &'static str,
     params: waygate::Params,
 ) -> Result<AnyWindowHandle> {
-    if let Ok(json) = waygate::ipc::WayGateState::new(params.clone()).to_json() {
-        seed("waygate", insert, json);
-    }
-    let frames = waygate_frames(&params);
-    let source = frames.clone();
-    let tick = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let host_ops = BuiltinEditorHostOps {
-        meter_source: Some(Arc::new(move |_| {
-            let at = tick.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            source.get(at % source.len()).copied()
-        })),
-        ..preview_host_ops()
-    };
-    let handle = cx.open_window(options, move |_, cx| {
-        cx.new(|cx| {
-            let window = KitWindow::new(
-                WayGateModel,
-                key(insert),
-                identity("WayGate"),
-                host_ops,
-                no_close(),
-                cx,
-            );
-            {
-                let mut live = window.live().borrow_mut();
-                for frame in frames.iter() {
-                    live.show(*frame);
-                }
-            }
-            window
-        })
-    })?;
-    Ok(handle.into())
+    use crate::components::waygate_plate::WayGatePlate;
+    let frames = waygate_frames(&params).as_ref().clone();
+    let json = waygate::ipc::WayGateState::new(params).to_json();
+    open_plate(
+        options,
+        cx,
+        WayGatePlate,
+        "waygate",
+        insert,
+        json,
+        frames,
+        [0.0; SpherePluginHost::audio_bridge::BUILTIN_PAD_SLOTS],
+        |_| {},
+    )
 }
 
 fn waygate_preset(name: &str) -> waygate::Params {
@@ -1236,6 +1367,37 @@ fn band_preset(kind: BandKind, name: &str) -> crate::components::band_model::Ban
         .unwrap_or_else(|| crate::components::band_model::BandParams::defaults(kind))
 }
 
+/// The Compressor over [`preview_signal`], read as the host would: its meter
+/// frames, and each band's reduction where the run ends.
+fn compressor_telemetry(
+    params: &compresser::Params,
+) -> (
+    Vec<SpherePluginHost::audio_bridge::BuiltinMeterFrame>,
+    [f32; SpherePluginHost::audio_bridge::REDUCTION_BANDS],
+) {
+    use waygate::StereoEffect;
+    let dsp = std::cell::RefCell::new(compresser::Dsp::new(48_000.0));
+    dsp.borrow_mut().set_params(params.clone());
+    let frames = run_preview(
+        |l, r| dsp.borrow_mut().process_stereo(l, r),
+        || {
+            let f = dsp.borrow().meter_frame();
+            SpherePluginHost::audio_bridge::BuiltinMeterFrame {
+                in_peak: f.in_peak,
+                in_rms: f.in_rms,
+                out_peak: f.out_peak,
+                out_rms: f.out_rms,
+                gain_reduction_db: f.gain_reduction_db,
+                in_clip: f.in_clip,
+                out_clip: f.out_clip,
+                ..Default::default()
+            }
+        },
+    );
+    let reduction = dsp.borrow().band_reduction_db();
+    (frames, reduction)
+}
+
 fn open_band(
     options: WindowOptions,
     cx: &mut App,
@@ -1244,13 +1406,29 @@ fn open_band(
     preset: &str,
 ) -> Result<AnyWindowHandle> {
     use crate::components::band_model::BandParams;
-    let (plugin, json) = match band_preset(kind, preset) {
-        BandParams::Comp(p) => (
-            "compresser",
-            compresser::ipc::CompresserState::new(p).to_json(),
-        ),
-    };
-    open_kit(options, cx, kind, plugin, insert, json, 5.0, |_| {})
+    let BandParams::Comp(params) = band_preset(kind, preset);
+    let (frames, reduction) = compressor_telemetry(&params);
+    let json = compresser::ipc::CompresserState::new(params).to_json();
+    let handle = open_plate(
+        options,
+        cx,
+        kind,
+        "compresser",
+        insert,
+        json,
+        frames,
+        [0.0; SpherePluginHost::audio_bridge::BUILTIN_PAD_SLOTS],
+        |_| {},
+    )?;
+    if let Some(window) = handle.downcast::<KitWindow<BandKind>>() {
+        let _ = window.update(cx, |window, _, _| {
+            window
+                .live()
+                .borrow_mut()
+                .show_bands(Some(preview_spectrum()), Some(reduction))
+        });
+    }
+    Ok(handle)
 }
 
 fn compressor_single(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
@@ -1354,16 +1532,45 @@ fn open_mix(
         .find(|p| p.name == preset)
         .map(|p| p.params.clone())
         .unwrap_or_else(mixstation::default_params);
+    let frames = mixstation_telemetry(&params);
     let json = mixstation::ipc::MixStationState::new(params).to_json();
-    open_kit(
+    open_plate(
         options,
         cx,
-        MixStationModel,
+        crate::components::mixstation_plate::MixStationPlate,
         "mixstation",
         insert,
         json,
-        3.0,
+        frames,
+        [0.0; SpherePluginHost::audio_bridge::BUILTIN_PAD_SLOTS],
         move |editor| editor.ui.selected = select,
+    )
+}
+
+/// MixStation over [`preview_signal`], read as the host would: its meter
+/// frames, each rack position's levels in the rack blocks.
+fn mixstation_telemetry(
+    params: &mixstation::Params,
+) -> Vec<SpherePluginHost::audio_bridge::BuiltinMeterFrame> {
+    use waygate::StereoEffect;
+    let dsp = std::cell::RefCell::new(mixstation::Dsp::new(48_000.0));
+    dsp.borrow_mut().set_params(params.clone());
+    run_preview(
+        |l, r| dsp.borrow_mut().process_stereo(l, r),
+        || {
+            let f = dsp.borrow().meter_frame();
+            SpherePluginHost::audio_bridge::BuiltinMeterFrame {
+                in_peak: f.in_peak,
+                in_rms: f.in_rms,
+                out_peak: f.out_peak,
+                out_rms: f.out_rms,
+                gain_reduction_db: f.gain_reduction_db,
+                in_clip: f.in_clip,
+                out_clip: f.out_clip,
+                slot_in_peak: f.slot_in_peak,
+                slot_out_peak: f.slot_out_peak,
+            }
+        },
     )
 }
 
@@ -2461,93 +2668,111 @@ fn midi_input_tree(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHand
 
 // ── VerbSpace and EchoSpace scenes ─────────────────────────────────────────
 
-/// Seeds params and opens the editor on them.
-fn open_fx(
+/// A steady meter reading for the time-effect plates' In / Out rows.
+fn time_plate_frames(
+    in_peak: f32,
+    out_peak: f32,
+) -> Vec<SpherePluginHost::audio_bridge::BuiltinMeterFrame> {
+    vec![SpherePluginHost::audio_bridge::BuiltinMeterFrame {
+        in_peak,
+        out_peak,
+        ..Default::default()
+    }]
+}
+
+fn verbspace_with(
     options: WindowOptions,
     cx: &mut App,
     insert: &'static str,
-    params: FxParams,
+    params: verbspace::Params,
 ) -> Result<AnyWindowHandle> {
-    let kind = params.kind();
-    let (plugin, json) = match &params {
-        FxParams::Verb(p) => (
-            "verbspace",
-            verbspace::ipc::VerbspaceState::new(p.clone()).to_json(),
-        ),
-        FxParams::Echo(p) => (
-            "echospace",
-            echospace::ipc::EchospaceState::new(p.clone()).to_json(),
-        ),
-    };
-    if let Ok(json) = json {
-        seed(plugin, insert, json);
-    }
-    let handle = cx.open_window(options, move |_, cx| {
-        cx.new(|cx| {
-            FxEditorWindow::new(
-                kind,
-                key(insert),
-                identity(kind.title()),
-                preview_host_ops(),
-                no_close(),
-                cx,
-            )
-        })
-    })?;
-    Ok(handle.into())
+    use crate::components::verbspace_plate::VerbSpacePlate;
+    let json = verbspace::ipc::VerbspaceState::new(params).to_json();
+    open_plate(
+        options,
+        cx,
+        VerbSpacePlate,
+        "verbspace",
+        insert,
+        json,
+        time_plate_frames(0.42, 0.5),
+        [0.0; SpherePluginHost::audio_bridge::BUILTIN_PAD_SLOTS],
+        |_| {},
+    )
 }
 
-/// Factory preset `name` of `kind`.
-fn fx_preset(kind: FxKind, name: &str) -> FxParams {
-    presets(kind)
-        .iter()
+fn verbspace_preset(name: &str) -> verbspace::Params {
+    verbspace::factory_presets()
+        .into_iter()
         .find(|preset| preset.name == name)
-        .map(|preset| preset.params.clone())
-        .unwrap_or_else(|| FxParams::defaults(kind))
+        .map_or_else(verbspace::default_params, |preset| preset.params)
 }
 
 fn verbspace_hall(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
-    open_fx(
-        options,
-        cx,
-        "verbspace-hall",
-        FxParams::defaults(FxKind::Verb),
-    )
+    verbspace_with(options, cx, "verbspace-hall", verbspace::default_params())
 }
 
 fn verbspace_plate(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
-    open_fx(
+    verbspace_with(
         options,
         cx,
         "verbspace-plate",
-        fx_preset(FxKind::Verb, "Bright Plate"),
+        verbspace_preset("Bright Plate"),
     )
 }
 
+fn echospace_with(
+    options: WindowOptions,
+    cx: &mut App,
+    insert: &'static str,
+    params: echospace::Params,
+) -> Result<AnyWindowHandle> {
+    use crate::components::echospace_plate::EchoSpacePlate;
+    let json = echospace::ipc::EchospaceState::new(params).to_json();
+    open_plate(
+        options,
+        cx,
+        EchoSpacePlate,
+        "echospace",
+        insert,
+        json,
+        time_plate_frames(0.38, 0.44),
+        [0.0; SpherePluginHost::audio_bridge::BUILTIN_PAD_SLOTS],
+        |_| {},
+    )
+}
+
+fn echospace_preset(name: &str) -> echospace::Params {
+    echospace::factory_presets()
+        .into_iter()
+        .find(|preset| preset.name == name)
+        .map_or_else(echospace::default_params, |preset| preset.params)
+}
+
 fn echospace_default(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
-    open_fx(
+    echospace_with(
         options,
         cx,
         "echospace-default",
-        FxParams::defaults(FxKind::Echo),
+        echospace::default_params(),
     )
 }
 
 fn echospace_synced(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
-    open_fx(
+    echospace_with(
         options,
         cx,
         "echospace-synced",
-        fx_preset(FxKind::Echo, "Dotted Eighth"),
+        echospace_preset("Dotted Eighth"),
     )
 }
 
 fn echospace_ambient(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
-    open_fx(
+    echospace_with(
         options,
         cx,
         "echospace-ambient",
-        fx_preset(FxKind::Echo, "Ambient Wash"),
+        echospace_preset("Ambient Wash"),
     )
 }
 
@@ -3295,6 +3520,18 @@ fn rodhareist_focused(
     options: WindowOptions,
     cx: &mut App,
 ) -> Result<AnyWindowHandle> {
+    rodhareist_with(page, edit, focus, |_| {}, options, cx)
+}
+
+/// [`rodhareist_focused`], with the editor's view state set by `view`.
+fn rodhareist_with(
+    page: crate::components::rodhareist_panel::Page,
+    edit: fn(&mut rodharerist::Params),
+    focus: rodharerist::StageKind,
+    view: fn(&mut crate::components::rodhareist_window::RodhareistEditorWindow),
+    options: WindowOptions,
+    cx: &mut App,
+) -> Result<AnyWindowHandle> {
     use waygate::StereoEffect;
     let dsp = std::cell::RefCell::new(rodharerist::Dsp::new(48_000.0));
     let _ = run_preview(
@@ -3322,6 +3559,7 @@ fn rodhareist_focused(
                     focus,
                 ));
             }
+            view(&mut window);
             window
         })
     })?;
@@ -3335,6 +3573,35 @@ fn rodhareist(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
             p.input_trim_db = 4.5;
             p.output_trim_db = -3.0;
         },
+        options,
+        cx,
+    )
+}
+
+/// Home on the Users tab: the save row and the saved `.pst` list.
+fn rodhareist_users(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    rodhareist_with(
+        crate::components::rodhareist_panel::Page::Home,
+        |_| {},
+        rodharerist::StageKind::Amp,
+        |window| window.ui.preset_tab = crate::components::rodhareist_panel::PresetTab::Users,
+        options,
+        cx,
+    )
+}
+
+/// Delay and Reverb moved down to lane 2, which opens Parallel; the
+/// Pedalboard shows the Delay.
+fn rodhareist_lanes(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    use rodharerist::StageKind;
+    rodhareist_focused(
+        crate::components::rodhareist_panel::Page::Pedalboard,
+        |p| {
+            p.stage_row[StageKind::Delay as usize] = 1;
+            p.stage_row[StageKind::Reverb as usize] = 1;
+            p.row_send[0] = rodharerist::RowSend::Parallel;
+        },
+        StageKind::Delay,
         options,
         cx,
     )
@@ -3401,6 +3668,41 @@ fn rodhareist_stereo(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHa
     )
 }
 
+/// Settings → Experimental at its defaults: every feature off. The model
+/// points at a scratch path, so nothing here can write the real settings file.
+fn settings_experimental(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    use crate::components::settings_dialog::{SettingsTab, SettingsWindow};
+    use crate::settings::{SettingsAudioLatencySnapshot, SettingsModel, SettingsSchema};
+    let settings = cx.new(|_| SettingsModel {
+        current: SettingsSchema::default(),
+        path: std::env::temp_dir().join("futureboard-preview-settings.json"),
+    });
+    let handle = cx.open_window(options, move |_, cx| {
+        cx.new(|cx| {
+            let mut window = SettingsWindow::new(
+                settings,
+                Vec::new(),
+                Vec::new(),
+                vec!["WASAPI Shared".to_string()],
+                Vec::new(),
+                Vec::new(),
+                None,
+                Arc::new(SettingsAudioLatencySnapshot::default),
+                None,
+                None,
+                None,
+                Arc::new(|_, _| {}),
+                None,
+                None,
+                cx,
+            );
+            window.show_tab(SettingsTab::Experimental);
+            window
+        })
+    })?;
+    Ok(handle.into())
+}
+
 fn rodhareist_settings(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
     rodhareist_on(
         crate::components::rodhareist_panel::Page::Settings,
@@ -3417,7 +3719,7 @@ default_editor!(
 );
 /// WrapSynth on one of its pages, with a patch that shows the page off.
 fn wrap_synth_on(
-    page: crate::components::wrap_synth_panel::SynthPage,
+    page: crate::components::wrap_synth_plate::SynthPage,
     preset: usize,
     options: WindowOptions,
     cx: &mut App,
@@ -3441,7 +3743,7 @@ fn wrap_synth_on(
 fn wrap_synth_modulation(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
     // Wobble Bass: a synced LFO on the cutoff and the wavetable.
     wrap_synth_on(
-        crate::components::wrap_synth_panel::SynthPage::Modulation,
+        crate::components::wrap_synth_plate::SynthPage::Modulation,
         6,
         options,
         cx,
@@ -3451,7 +3753,7 @@ fn wrap_synth_modulation(options: WindowOptions, cx: &mut App) -> Result<AnyWind
 fn wrap_synth_voice_fx(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
     // Supersaw Lead: legato with glide, delay and reverb.
     wrap_synth_on(
-        crate::components::wrap_synth_panel::SynthPage::VoiceFx,
+        crate::components::wrap_synth_plate::SynthPage::VoiceFx,
         1,
         options,
         cx,
@@ -3464,6 +3766,118 @@ default_editor!(
     "drumsampler",
     "Drum Sampler"
 );
+
+/// A one-shot's overview as the host sends it: 256 peaks of a hit that
+/// rises in `attack` points and falls away over `decay`, roughened by a
+/// fixed noise `grain` (0 for a clean tone).
+fn drum_preview_peaks(attack: usize, decay: f32, grain: f32, seed: u32) -> Vec<u8> {
+    let mut state = seed.max(1);
+    (0..drumsampler::WAVEFORM_POINTS)
+        .map(|i| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let noise = (state % 1_000) as f32 / 1_000.0;
+            let rise = ((i + 1) as f32 / attack.max(1) as f32).min(1.0);
+            let fall = (-(i.saturating_sub(attack) as f32) / decay).exp();
+            let level = rise * fall * (1.0 - grain + grain * noise);
+            (level.clamp(0.0, 1.0) * 255.0) as u8
+        })
+        .collect()
+}
+
+/// Bank A of a kit — kick, snare, hats, toms, a clap and a crash — with
+/// the selected snare trimmed, enveloped and filtered, a hi-hat choke
+/// group and two pads on outputs of their own.
+fn drum_preview_kit() -> (
+    drumsampler::Params,
+    Vec<Option<crate::components::builtin_plugin_editor::DrumPadWaveform>>,
+) {
+    use crate::components::builtin_plugin_editor::DrumPadWaveform;
+    let mut params = drumsampler::default_params();
+    let mut waveforms = vec![None; drumsampler::PADS];
+    let kit: [(usize, &str, usize, f32, f32, f32); 10] = [
+        (0, "Kick Deep 01.wav", 2, 60.0, 0.05, 0.42),
+        (1, "Snare Crack.wav", 2, 34.0, 0.55, 0.38),
+        (2, "Hat Closed.wav", 1, 9.0, 0.8, 0.09),
+        (3, "Hat Open.wav", 2, 50.0, 0.8, 0.55),
+        (4, "Clap Wide.wav", 3, 26.0, 0.7, 0.33),
+        (5, "Tom Low.wav", 2, 70.0, 0.1, 0.62),
+        (6, "Tom Mid.wav", 2, 55.0, 0.1, 0.5),
+        (7, "Rim Shot.wav", 1, 8.0, 0.4, 0.1),
+        (8, "Crash Bright 18in.wav", 3, 160.0, 0.75, 2.4),
+        (12, "Perc Shaker Loop Long Name.wav", 4, 30.0, 0.85, 0.7),
+    ];
+    for (seed, (pad, name, attack, decay, grain, seconds)) in kit.into_iter().enumerate() {
+        params.pads[pad].sample_name = Some(name.to_string());
+        waveforms[pad] = Some(DrumPadWaveform {
+            name: name.to_string(),
+            frames: (seconds * 48_000.0) as u64,
+            channels: if pad == 8 { 2 } else { 1 },
+            sample_rate: 48_000,
+            peaks: drum_preview_peaks(attack, decay, grain, 7 + seed as u32 * 31),
+        });
+    }
+    let snare = &mut params.pads[1];
+    snare.start = 0.04;
+    snare.end = 0.78;
+    snare.attack_ms = 2.0;
+    snare.hold_ms = 30.0;
+    snare.decay_ms = 260.0;
+    snare.filter_mode = drumsampler::FilterMode::HighPass;
+    snare.cutoff_hz = 180.0;
+    snare.resonance = 35.0;
+    snare.tune_semitones = 2.0;
+    snare.gain_db = -3.0;
+    snare.pan = -0.15;
+    snare.output = 2;
+    params.pads[0].output = 1;
+    params.pads[2].choke_group = 1;
+    params.pads[3].choke_group = 1;
+    params.pads[5].muted = true;
+    params.pads[7].solo = true;
+    params.pads[8].gain_db = -9.5;
+    params.master_gain_db = -1.5;
+    (params, waveforms)
+}
+
+fn drum_sampler_on(
+    view: crate::components::drum_sampler_panel::DrumView,
+    options: WindowOptions,
+    cx: &mut App,
+) -> Result<AnyWindowHandle> {
+    let handle = cx.open_window(options, move |_, cx| {
+        cx.new(|cx| {
+            let mut window = crate::components::drum_sampler_window::DrumSamplerEditorWindow::new(
+                key("drumsampler"),
+                identity("Drum Sampler"),
+                preview_host_ops(),
+                no_close(),
+                cx,
+            );
+            let (params, waveforms) = drum_preview_kit();
+            window.show_for_preview(params, waveforms, 1, view);
+            window
+        })
+    })?;
+    Ok(handle.into())
+}
+
+fn drum_sampler_kit(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    drum_sampler_on(
+        crate::components::drum_sampler_panel::DrumView::Pads,
+        options,
+        cx,
+    )
+}
+
+fn drum_sampler_mixer(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    drum_sampler_on(
+        crate::components::drum_sampler_panel::DrumView::Mixer,
+        options,
+        cx,
+    )
+}
 default_editor!(
     quick_sampler,
     crate::components::quick_sampler_window::QuickSamplerEditorWindow,
@@ -3476,6 +3890,124 @@ default_editor!(
     "slicer",
     "Slicer"
 );
+
+/// A synthetic sample's overview, for previews only: `(min, max)` per
+/// column from `level`, a 0–1 envelope over the sample's length, with a
+/// little grain so it reads as audio.
+fn preview_sample(
+    name: &str,
+    seconds: f64,
+    level: impl Fn(f32) -> f32,
+) -> crate::components::quick_sampler_panel::SampleSummary {
+    const BUCKETS: usize = 1_600;
+    let peaks = (0..BUCKETS)
+        .map(|i| {
+            let t = i as f32 / BUCKETS as f32;
+            let grain = 0.8 + 0.2 * (i as f32 * 1.91).sin().abs();
+            let high = (level(t) * grain).clamp(0.0, 1.0);
+            let low = -high * (0.88 + 0.12 * (i as f32 * 0.73).cos());
+            (low, high)
+        })
+        .collect();
+    crate::components::quick_sampler_panel::SampleSummary {
+        file_name: name.to_string(),
+        sample_rate: 44_100,
+        channels: 2,
+        seconds,
+        peaks: Arc::new(peaks),
+    }
+}
+
+/// Quick Sampler with a held note loaded — a swell, a sustain with some
+/// vibrato, a tail — looping forward over its steady part, through a
+/// resonant low-pass and a slow envelope.
+fn quick_sampler_loop(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    let sample = preview_sample("Choir Ah C4.wav", 3.69, |t| {
+        let swell = (t / 0.08).min(1.0);
+        let body = 0.62 + 0.08 * (t * 70.0).sin() + 0.25 * (-(t - 0.08).max(0.0) * 9.0).exp();
+        let tail = ((1.0 - t) / 0.18).clamp(0.0, 1.0);
+        swell * body * tail
+    });
+    let params = quicksampler::QuickSamplerParams {
+        start: 0.03,
+        end: 0.93,
+        loop_mode: quicksampler::LoopMode::Forward,
+        loop_start: 0.42,
+        loop_end: 0.76,
+        filter: quicksampler::FilterMode::LowPass,
+        cutoff_hz: 2_400.0,
+        resonance: 0.45,
+        attack_ms: 12.0,
+        decay_ms: 380.0,
+        sustain: 0.6,
+        release_ms: 900.0,
+        ..Default::default()
+    };
+    let handle = cx.open_window(options, move |_, cx| {
+        cx.new(|cx| {
+            let mut window = crate::components::quick_sampler_window::QuickSamplerEditorWindow::new(
+                key("quicksampler"),
+                identity("Quick Sampler"),
+                preview_host_ops(),
+                no_close(),
+                cx,
+            );
+            window.show_for_preview(sample, params);
+            window
+        })
+    })?;
+    Ok(handle.into())
+}
+
+/// The Slicer with a drum loop cut at its eight hits, the third slice
+/// picked; `mode` is how it says it was cut (Beat shows the strip at its
+/// widest).
+fn slicer_loop_by(
+    options: WindowOptions,
+    cx: &mut App,
+    mode: slicer::SliceMode,
+) -> Result<AnyWindowHandle> {
+    const HITS: [(f32, f32); 8] = [
+        (0.0, 1.0),
+        (0.124, 0.55),
+        (0.25, 0.9),
+        (0.376, 0.5),
+        (0.5, 1.0),
+        (0.61, 0.45),
+        (0.75, 0.85),
+        (0.874, 0.6),
+    ];
+    let sample = preview_sample("Break 136.wav", 1.76, |t| {
+        let mut level = 0.03;
+        for (at, gain) in HITS {
+            if t >= at {
+                level += gain * (-(t - at) * 1.76 * 14.0).exp();
+            }
+        }
+        level
+    });
+    let points: Vec<f32> = HITS.iter().map(|(at, _)| (at - 0.002).max(0.0)).collect();
+    let cut = slicer::SlicerParams {
+        slice_mode: mode,
+        sample_bpm: 136.0,
+        ..Default::default()
+    };
+    let params = slicer::slicing::with_points(cut, &points, 0.0);
+    let handle = cx.open_window(options, move |_, cx| {
+        cx.new(|cx| {
+            let mut window = crate::components::slicer_window::SlicerEditorWindow::new(
+                key("slicer"),
+                identity("Slicer"),
+                preview_host_ops(),
+                no_close(),
+                cx,
+            );
+            window.show_for_preview(sample, params, Some(2));
+            window
+        })
+    })?;
+    Ok(handle.into())
+}
 
 #[cfg(test)]
 mod tests {

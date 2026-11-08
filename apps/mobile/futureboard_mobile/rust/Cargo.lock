@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "SphereSoundfontPlayer"
-version = "2026.10.16-beta1.4.4"
+version = "2026.11.1-beta2.0.0"
 dependencies = [
  "rustysynth",
  "serde",
@@ -63,7 +63,7 @@ checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
 name = "builtin_dsp_core"
-version = "2026.10.16-beta1.4.4"
+version = "2026.11.1-beta2.0.0"
 dependencies = [
  "biquad",
  "rustfft",
@@ -71,7 +71,7 @@ dependencies = [
 
 [[package]]
 name = "burnlimit"
-version = "2026.10.16-beta1.4.4"
+version = "2026.11.1-beta2.0.0"
 dependencies = [
  "builtin_dsp_core",
  "serde",
@@ -86,7 +86,7 @@ checksum = "95832e849adfb21180ccb6826a99da14e5d266ae5c2e668e1602cf234f153797"
 
 [[package]]
 name = "c1073"
-version = "2026.10.16-beta1.4.4"
+version = "2026.11.1-beta2.0.0"
 dependencies = [
  "biquad",
  "builtin_dsp_core",
@@ -100,7 +100,7 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "clipper67"
-version = "2026.10.16-beta1.4.4"
+version = "2026.11.1-beta2.0.0"
 dependencies = [
  "builtin_dsp_core",
  "serde",
@@ -109,7 +109,7 @@ dependencies = [
 
 [[package]]
 name = "compresser"
-version = "2026.10.16-beta1.4.4"
+version = "2026.11.1-beta2.0.0"
 dependencies = [
  "biquad",
  "builtin_dsp_core",
@@ -140,7 +140,7 @@ checksum = "0c87e182de0887fd5361989c677c4e8f5000cd9491d6d563161a8f3a5519fc7f"
 
 [[package]]
 name = "drumsampler"
-version = "2026.10.16-beta1.4.4"
+version = "2026.11.1-beta2.0.0"
 dependencies = [
  "builtin_dsp_core",
  "serde",
@@ -149,7 +149,7 @@ dependencies = [
 
 [[package]]
 name = "drumsilencer"
-version = "2026.10.16-beta1.4.4"
+version = "2026.11.1-beta2.0.0"
 dependencies = [
  "builtin_dsp_core",
  "rustfft",
@@ -177,7 +177,7 @@ dependencies = [
 
 [[package]]
 name = "echospace"
-version = "2026.10.16-beta1.4.4"
+version = "2026.11.1-beta2.0.0"
 dependencies = [
  "biquad",
  "builtin_dsp_core",
@@ -207,7 +207,7 @@ checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
 
 [[package]]
 name = "equz8"
-version = "2026.10.16-beta1.4.4"
+version = "2026.11.1-beta2.0.0"
 dependencies = [
  "biquad",
  "builtin_dsp_core",
@@ -217,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "equzx"
-version = "2026.10.16-beta1.4.4"
+version = "2026.11.1-beta2.0.0"
 dependencies = [
  "biquad",
  "builtin_dsp_core",
@@ -232,26 +232,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af9673d8203fcb076b19dfd17e38b3d4ae9f44959416ea532ce72415a6020365"
 
 [[package]]
-name = "fa2a"
-version = "2026.10.16-beta1.4.4"
-dependencies = [
- "builtin_dsp_core",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "fa76"
-version = "2026.10.16-beta1.4.4"
-dependencies = [
- "builtin_dsp_core",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "fb_studio_mobile_engine"
-version = "0.1.0"
+version = "2026.11.1-beta2.0.0"
 dependencies = [
  "SphereSoundfontPlayer",
  "biquad",
@@ -266,8 +248,6 @@ dependencies = [
  "echospace",
  "equz8",
  "equzx",
- "fa2a",
- "fa76",
  "imager",
  "meowsyn",
  "mixstation",
@@ -370,7 +350,7 @@ dependencies = [
 
 [[package]]
 name = "imager"
-version = "2026.10.16-beta1.4.4"
+version = "2026.11.1-beta2.0.0"
 dependencies = [
  "builtin_dsp_core",
  "serde",
@@ -424,7 +404,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "meowsyn"
-version = "2026.10.16-beta1.4.4"
+version = "2026.11.1-beta2.0.0"
 dependencies = [
  "builtin_dsp_core",
  "fundsp",
@@ -443,7 +423,7 @@ dependencies = [
 
 [[package]]
 name = "mixstation"
-version = "2026.10.16-beta1.4.4"
+version = "2026.11.1-beta2.0.0"
 dependencies = [
  "builtin_dsp_core",
  "serde",
@@ -574,7 +554,7 @@ dependencies = [
 
 [[package]]
 name = "quicksampler"
-version = "2026.10.16-beta1.4.4"
+version = "2026.11.1-beta2.0.0"
 dependencies = [
  "builtin_dsp_core",
  "serde",
@@ -610,7 +590,7 @@ dependencies = [
 
 [[package]]
 name = "rodharerist"
-version = "2026.10.16-beta1.4.4"
+version = "2026.11.1-beta2.0.0"
 dependencies = [
  "biquad",
  "builtin_dsp_core",
@@ -710,7 +690,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "slicer"
-version = "2026.10.16-beta1.4.4"
+version = "2026.11.1-beta2.0.0"
 dependencies = [
  "quicksampler",
  "serde",
@@ -725,7 +705,7 @@ checksum = "d0d5d4b1981b8bbbb7aed204cae5726d683d5d6ac7e74ec54122ea28f315e7c8"
 
 [[package]]
 name = "solfege_spatialaudio"
-version = "2026.10.16-beta1.4.4"
+version = "2026.11.1-beta2.0.0"
 dependencies = [
  "rustfft",
  "serde",
@@ -733,7 +713,7 @@ dependencies = [
 
 [[package]]
 name = "sphere-audio-plugins"
-version = "2026.10.16-beta1.4.4"
+version = "2026.11.1-beta2.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -968,7 +948,7 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "transient"
-version = "2026.10.16-beta1.4.4"
+version = "2026.11.1-beta2.0.0"
 dependencies = [
  "builtin_dsp_core",
  "serde",
@@ -999,7 +979,7 @@ checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 
 [[package]]
 name = "verbspace"
-version = "2026.10.16-beta1.4.4"
+version = "2026.11.1-beta2.0.0"
 dependencies = [
  "biquad",
  "builtin_dsp_core",
@@ -1015,7 +995,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "waygate"
-version = "2026.10.16-beta1.4.4"
+version = "2026.11.1-beta2.0.0"
 dependencies = [
  "biquad",
  "builtin_dsp_core",
@@ -1025,7 +1005,7 @@ dependencies = [
 
 [[package]]
 name = "whitesharp"
-version = "2026.10.16-beta1.4.4"
+version = "2026.11.1-beta2.0.0"
 dependencies = [
  "biquad",
  "builtin_dsp_core",
@@ -1051,7 +1031,7 @@ checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
 
 [[package]]
 name = "wrapsynth"
-version = "2026.10.16-beta1.4.4"
+version = "2026.11.1-beta2.0.0"
 dependencies = [
  "builtin_dsp_core",
  "echospace",
@@ -1063,7 +1043,7 @@ dependencies = [
 
 [[package]]
 name = "zcomp"
-version = "2026.10.16-beta1.4.4"
+version = "2026.11.1-beta2.0.0"
 dependencies = [
  "builtin_dsp_core",
  "serde",

@@ -938,6 +938,7 @@ settings.tab.audio = ສຽງ
 settings.tab.audio.description = ໄດຣເວີ, ອຸປະກອນ, ອັດຕາການສຸ່ມຕົວຢ່າງ, ຂະໜາດບັບເຟີ ແລະ ຄວາມໜ່ວງ.
 settings.tab.editing = ການແກ້ໄຂ
 settings.tab.editing.description = ເມົາສ໌, ການສະແນັບຕາຕະລາງ ແລະ ປະຫວັດການຍົກເລີກ.
+settings.tab.experimental = ຄຸນສົມບັດທົດລອງ
 settings.tab.files-media = ໄຟລ໌ & ສື່
 settings.tab.files-media.description = ໂປຣເຈັກ, ແຊມເປິລ, ການບັນທຶກ ແລະ ບ່ອນເກັບແຄຊ໌.
 settings.tab.general = ທົ່ວໄປ

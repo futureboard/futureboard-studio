@@ -17,8 +17,6 @@ builtin_dsp_core = { path = "../../../../crates/BuiltinAudioPlugins/crates/built
 equz8 = { path = "../../../../crates/BuiltinAudioPlugins/crates/equz8" }
 equzx = { path = "../../../../crates/BuiltinAudioPlugins/crates/equzx" }
 compresser = { path = "../../../../crates/BuiltinAudioPlugins/crates/compresser" }
-fa2a = { path = "../../../../crates/BuiltinAudioPlugins/crates/fa2a" }
-fa76 = { path = "../../../../crates/BuiltinAudioPlugins/crates/fa76" }
 zcomp = { path = "../../../../crates/BuiltinAudioPlugins/crates/zcomp" }
 echospace = { path = "../../../../crates/BuiltinAudioPlugins/crates/echospace" }
 verbspace = { path = "../../../../crates/BuiltinAudioPlugins/crates/verbspace" }

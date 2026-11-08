@@ -31,6 +31,7 @@ use gpui::{
 };
 
 use crate::components::builtin_plugin_editor_window::{BuiltinEditorHostOps, PluginInstanceKey};
+use crate::components::builtin_preset_menu::BuiltinPresetMenu;
 use crate::components::context_menu::{context_menu_overlay, ContextMenuEntry};
 use crate::components::controls::{
     fb_button, fb_checkbox, fb_segment, fb_segmented_track, FbButtonKind, FbSegment,
@@ -38,7 +39,7 @@ use crate::components::controls::{
 use crate::components::fx_model::KnobSpec;
 use crate::components::knob::{knob_bipolar, knob_with_default};
 use crate::components::native_plugin_shell::{
-    claim_editor_transport_key, native_plugin_shell, swallow_editor_transport_key_up,
+    claim_editor_transport_key, native_plugin_shell_with, swallow_editor_transport_key_up,
     NativeBuiltinEditor, ShellIdentity, ShellMeter, SHELL_METER_INTERVAL,
 };
 use crate::components::plugin_live::Live;
@@ -218,6 +219,8 @@ pub struct KitEditor<M: KitModel> {
     pub live_bounds: LiveBounds,
     /// The host's sample rate, for displays drawn from the DSP's filters.
     pub sample_rate: f32,
+    /// The host's tempo, for displays of tempo-synced times.
+    pub tempo_bpm: f32,
     /// The window's size at the last render, for panels laid out at a design
     /// size and scaled to fit.
     pub viewport: (f32, f32),
@@ -254,6 +257,7 @@ impl<M: KitModel> KitEditor<M> {
             ui: M::Ui::default(),
             live_bounds: LiveBounds::default(),
             sample_rate: 48_000.0,
+            tempo_bpm: 120.0,
             viewport: model.window_size(),
             undo: Vec::new(),
             redo: Vec::new(),
@@ -662,6 +666,8 @@ pub struct KitWindow<M: KitModel> {
     editor: Entity<KitEditor<M>>,
     live: Rc<RefCell<Live>>,
     meter: ShellMeter,
+    /// The `.pst` preset menu in the identity strip.
+    presets: Entity<BuiltinPresetMenu>,
     /// Cleared when the window closes, ending the telemetry timer.
     alive: Rc<Cell<bool>>,
 }
@@ -676,6 +682,7 @@ impl<M: KitModel> KitWindow<M> {
         cx: &mut Context<Self>,
     ) -> Self {
         let editor = cx.new(|cx| KitEditor::new(model, key.clone(), host_ops.clone(), cx));
+        let presets = cx.new(|cx| BuiltinPresetMenu::new(key.clone(), &identity, cx));
         let window = Self {
             live: Rc::new(RefCell::new(Live::new(key.clone(), &host_ops))),
             key,
@@ -686,6 +693,7 @@ impl<M: KitModel> KitWindow<M> {
             focused_once: false,
             editor,
             meter: ShellMeter::default(),
+            presets,
             alive: Rc::new(Cell::new(true)),
         };
         window.start_telemetry(cx);
@@ -742,6 +750,16 @@ impl<M: KitModel> KitWindow<M> {
                 });
             }
         }
+        // So does a tempo-synced display.
+        if let Some(tempo) = self.live.borrow().tempo_bpm() {
+            let editor = self.editor.read(cx);
+            if (editor.tempo_bpm - tempo).abs() > 1.0e-3 {
+                self.editor.update(cx, |editor, cx| {
+                    editor.tempo_bpm = tempo;
+                    cx.notify();
+                });
+            }
+        }
         if moved {
             cx.notify();
         }
@@ -770,6 +788,8 @@ impl<M: KitModel> NativeBuiltinEditor for KitWindow<M> {
         cx: &mut Context<Self>,
     ) {
         self.key = key.clone();
+        self.presets
+            .update(cx, |menu, cx| menu.rebind(key.clone(), &identity, cx));
         self.identity = identity;
         self.host_ops = host_ops.clone();
         self.editor.update(cx, |editor, cx| {
@@ -863,7 +883,7 @@ impl<M: KitModel> Render for KitWindow<M> {
             .on_mouse_up_out(MouseButton::Left, move |_: &MouseUpEvent, _window, cx| {
                 let _ = up_out_target.update(cx, |editor, cx| M::mouse_up(editor, cx));
             })
-            .child(native_plugin_shell(
+            .child(native_plugin_shell_with(
                 "kit-window-close",
                 &self.identity,
                 self.meter,
@@ -873,6 +893,7 @@ impl<M: KitModel> Render for KitWindow<M> {
                     on_close(window, cx);
                     window.remove_window();
                 },
+                Some(self.presets.clone().into_any_element()),
                 content,
             ))
             .child(overlay)

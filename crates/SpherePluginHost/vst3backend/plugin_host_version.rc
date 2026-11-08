@@ -13,7 +13,7 @@ BEGIN
     BEGIN
         BLOCK "040904B0"
         BEGIN
-            VALUE "CompanyName",      "Futureboard"
+            VALUE "CompanyName",      "Futureboard Digital Technologies"
             VALUE "FileDescription",  "Futureboard Plugin Host"
             VALUE "FileVersion",      "2026.6.5.0"
             VALUE "InternalName",     "FutureboardPluginHost"

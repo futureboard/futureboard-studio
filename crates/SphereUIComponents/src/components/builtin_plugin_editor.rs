@@ -82,8 +82,6 @@ pub fn builtin_param_index(plugin_id: &str, param_id: &str) -> Option<u32> {
         duckstep::ui::UI_ORIGIN => duckstep::ui_param_index(param_id),
         echospace::ui::UI_ORIGIN => echospace::ui_param_index(param_id),
         imager::ui::UI_ORIGIN => imager::ui_param_index(param_id),
-        fa2a::ui::UI_ORIGIN => fa2a::ui_param_index(param_id),
-        fa76::ui::UI_ORIGIN => fa76::ui_param_index(param_id),
         burnlimit::ui::UI_ORIGIN => burnlimit::ui_param_index(param_id),
         clipper67::ui::UI_ORIGIN => clipper67::ui_param_index(param_id),
         transient::ui::UI_ORIGIN => transient::ui_param_index(param_id),
@@ -140,8 +138,6 @@ mod state_mirror {
         Duckstep(Box<duckstep::Params>),
         Echospace(Box<echospace::Params>),
         Imager(Box<imager::Params>),
-        Fa2a(Box<fa2a::Params>),
-        Fa76(Box<fa76::Params>),
         BurnLimit(Box<burnlimit::Params>),
         Clipper67(Box<clipper67::Params>),
         Transient(Box<transient::Params>),
@@ -169,8 +165,6 @@ mod state_mirror {
                 Self::Duckstep(_) => duckstep::ui::UI_ORIGIN,
                 Self::Echospace(_) => echospace::ui::UI_ORIGIN,
                 Self::Imager(_) => imager::ui::UI_ORIGIN,
-                Self::Fa2a(_) => fa2a::ui::UI_ORIGIN,
-                Self::Fa76(_) => fa76::ui::UI_ORIGIN,
                 Self::BurnLimit(_) => burnlimit::ui::UI_ORIGIN,
                 Self::Clipper67(_) => clipper67::ui::UI_ORIGIN,
                 Self::Transient(_) => transient::ui::UI_ORIGIN,
@@ -211,8 +205,6 @@ mod state_mirror {
                     Some(Self::Echospace(Box::new(echospace::default_params())))
                 }
                 imager::ui::UI_ORIGIN => Some(Self::Imager(Box::new(imager::default_params()))),
-                fa2a::ui::UI_ORIGIN => Some(Self::Fa2a(Box::new(fa2a::default_params()))),
-                fa76::ui::UI_ORIGIN => Some(Self::Fa76(Box::new(fa76::default_params()))),
                 burnlimit::ui::UI_ORIGIN => {
                     Some(Self::BurnLimit(Box::new(burnlimit::default_params())))
                 }
@@ -285,8 +277,6 @@ mod state_mirror {
             duckstep::ui::UI_ORIGIN => duckstep::ui_param_id(wire_index).is_some(),
             echospace::ui::UI_ORIGIN => echospace::ui_param_id(wire_index).is_some(),
             imager::ui::UI_ORIGIN => imager::ui_param_id(wire_index).is_some(),
-            fa2a::ui::UI_ORIGIN => fa2a::ui_param_id(wire_index).is_some(),
-            fa76::ui::UI_ORIGIN => fa76::ui_param_id(wire_index).is_some(),
             burnlimit::ui::UI_ORIGIN => burnlimit::ui_param_id(wire_index).is_some(),
             clipper67::ui::UI_ORIGIN => clipper67::ui_param_id(wire_index).is_some(),
             transient::ui::UI_ORIGIN => transient::ui_param_id(wire_index).is_some(),
@@ -341,12 +331,6 @@ mod state_mirror {
             }
             Some(BuiltinParams::Imager(params)) => {
                 let _ = imager::ipc::apply_wire_param(params, wire_index, value);
-            }
-            Some(BuiltinParams::Fa2a(params)) => {
-                let _ = fa2a::ipc::apply_wire_param(params, wire_index, value);
-            }
-            Some(BuiltinParams::Fa76(params)) => {
-                let _ = fa76::ipc::apply_wire_param(params, wire_index, value);
             }
             Some(BuiltinParams::BurnLimit(params)) => {
                 let _ = burnlimit::ipc::apply_wire_param(params, wire_index, value);
@@ -428,12 +412,6 @@ mod state_mirror {
             imager::ui::UI_ORIGIN => imager::ipc::ImagerState::from_json(text)
                 .ok()
                 .map(|state| BuiltinParams::Imager(Box::new(state.params))),
-            fa2a::ui::UI_ORIGIN => fa2a::ipc::Fa2aState::from_json(text)
-                .ok()
-                .map(|state| BuiltinParams::Fa2a(Box::new(state.params))),
-            fa76::ui::UI_ORIGIN => fa76::ipc::Fa76State::from_json(text)
-                .ok()
-                .map(|state| BuiltinParams::Fa76(Box::new(state.params))),
             burnlimit::ui::UI_ORIGIN => burnlimit::ipc::BurnLimitState::from_json(text)
                 .ok()
                 .map(|state| BuiltinParams::BurnLimit(Box::new(state.params))),
@@ -543,16 +521,6 @@ mod state_mirror {
             }
             BuiltinParams::Imager(params) if origin == imager::ui::UI_ORIGIN => {
                 imager::ipc::ImagerState::new((**params).clone())
-                    .to_json()
-                    .ok()?
-            }
-            BuiltinParams::Fa2a(params) if origin == fa2a::ui::UI_ORIGIN => {
-                fa2a::ipc::Fa2aState::new((**params).clone())
-                    .to_json()
-                    .ok()?
-            }
-            BuiltinParams::Fa76(params) if origin == fa76::ui::UI_ORIGIN => {
-                fa76::ipc::Fa76State::new((**params).clone())
                     .to_json()
                     .ok()?
             }
@@ -721,18 +689,6 @@ mod state_mirror {
                 imager::ipc::ui_values(params)
                     .into_iter()
                     .filter_map(|(id, value)| imager::ui_param_index(id).map(|i| (i, value)))
-                    .collect()
-            }
-            Some(BuiltinParams::Fa2a(params)) if origin == fa2a::ui::UI_ORIGIN => {
-                fa2a::ipc::ui_values(params)
-                    .into_iter()
-                    .filter_map(|(id, value)| fa2a::ui_param_index(id).map(|i| (i, value)))
-                    .collect()
-            }
-            Some(BuiltinParams::Fa76(params)) if origin == fa76::ui::UI_ORIGIN => {
-                fa76::ipc::ui_values(params)
-                    .into_iter()
-                    .filter_map(|(id, value)| fa76::ui_param_index(id).map(|i| (i, value)))
                     .collect()
             }
             Some(BuiltinParams::BurnLimit(params)) if origin == burnlimit::ui::UI_ORIGIN => {
@@ -988,26 +944,6 @@ mod state_mirror {
         }
     }
 
-    /// An FA-2A insert's mirrored params, like
-    /// [`builtin_verbspace_params`].
-    pub fn builtin_fa2a_params(insert_id: &str) -> Option<fa2a::Params> {
-        let states = map().lock().ok()?;
-        match states.get(insert_id)? {
-            BuiltinParams::Fa2a(params) => Some((**params).clone()),
-            _ => None,
-        }
-    }
-
-    /// An FA-76 insert's mirrored params, like
-    /// [`builtin_verbspace_params`].
-    pub fn builtin_fa76_params(insert_id: &str) -> Option<fa76::Params> {
-        let states = map().lock().ok()?;
-        match states.get(insert_id)? {
-            BuiltinParams::Fa76(params) => Some((**params).clone()),
-            _ => None,
-        }
-    }
-
     /// A Z-Comp insert's mirrored params, like
     /// [`builtin_verbspace_params`].
     pub fn builtin_zcomp_params(insert_id: &str) -> Option<zcomp::Params> {
@@ -1220,14 +1156,14 @@ pub use state_mirror::{
     builtin_airboost_params, builtin_burnlimit_params, builtin_clipper67_params,
     builtin_compresser_params, builtin_deesser_params, builtin_default_replay,
     builtin_drum_sampler_params, builtin_duckstep_params, builtin_echospace_params,
-    builtin_equz8_params, builtin_equzx_params, builtin_fa2a_params, builtin_fa76_params,
-    builtin_imager_params, builtin_mixstation_params, builtin_quick_sampler_params,
-    builtin_replay_changes, builtin_rodhareist_files, builtin_rodhareist_params,
-    builtin_sample_names, builtin_slicer_params, builtin_state_apply, builtin_state_bytes,
-    builtin_state_clear, builtin_state_remove, builtin_state_replay, builtin_state_seed,
-    builtin_state_set_rodhareist_file, builtin_state_set_sample, builtin_transient_params,
-    builtin_used_output_buses, builtin_verbspace_params, builtin_waygate_params,
-    builtin_whitesharp_params, builtin_wrapsynth_params, builtin_zapp_params, builtin_zcomp_params,
+    builtin_equz8_params, builtin_equzx_params, builtin_imager_params, builtin_mixstation_params,
+    builtin_quick_sampler_params, builtin_replay_changes, builtin_rodhareist_files,
+    builtin_rodhareist_params, builtin_sample_names, builtin_slicer_params, builtin_state_apply,
+    builtin_state_bytes, builtin_state_clear, builtin_state_remove, builtin_state_replay,
+    builtin_state_seed, builtin_state_set_rodhareist_file, builtin_state_set_sample,
+    builtin_transient_params, builtin_used_output_buses, builtin_verbspace_params,
+    builtin_waygate_params, builtin_whitesharp_params, builtin_wrapsynth_params,
+    builtin_zapp_params, builtin_zcomp_params,
 };
 
 /// Featureless no-ops: without the editor there is no param wire, so there is
@@ -3444,8 +3380,6 @@ mod tests {
         assert_eq!(origin_for_plugin_id("builtin:verbspace"), Some("verbspace"));
         assert_eq!(origin_for_plugin_id("builtin:echospace"), Some("echospace"));
         assert_eq!(origin_for_plugin_id("builtin:imager"), Some("imager"));
-        assert_eq!(origin_for_plugin_id("builtin:fa2a"), Some("fa2a"));
-        assert_eq!(origin_for_plugin_id("builtin:fa76"), Some("fa76"));
         assert_eq!(origin_for_plugin_id("builtin:burnlimit"), Some("burnlimit"));
         assert_eq!(origin_for_plugin_id("builtin:clipper67"), Some("clipper67"));
         assert_eq!(origin_for_plugin_id("builtin:transient"), Some("transient"));
@@ -3466,8 +3400,6 @@ mod tests {
         assert_eq!(origin_for_plugin_id("verbspace"), Some("verbspace"));
         assert_eq!(origin_for_plugin_id("echospace"), Some("echospace"));
         assert_eq!(origin_for_plugin_id("imager"), Some("imager"));
-        assert_eq!(origin_for_plugin_id("fa2a"), Some("fa2a"));
-        assert_eq!(origin_for_plugin_id("fa76"), Some("fa76"));
         assert_eq!(origin_for_plugin_id("burnlimit"), Some("burnlimit"));
         assert_eq!(origin_for_plugin_id("clipper67"), Some("clipper67"));
         assert_eq!(origin_for_plugin_id("transient"), Some("transient"));

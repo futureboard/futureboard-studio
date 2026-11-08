@@ -73,13 +73,6 @@ const CATALOG: &[BuiltinEntry] = &[
         editor: BuiltinEditorKind::Native,
     },
     BuiltinEntry {
-        stem: "fa2a",
-        name: "FA-2A",
-        category: "Dynamics",
-        kind: PluginKind::Effect,
-        editor: BuiltinEditorKind::Native,
-    },
-    BuiltinEntry {
         stem: "zcomp",
         name: "Z-Comp",
         category: "Dynamics",
@@ -118,13 +111,6 @@ const CATALOG: &[BuiltinEntry] = &[
         stem: "imager",
         name: "Imager",
         category: "Utility",
-        kind: PluginKind::Effect,
-        editor: BuiltinEditorKind::Native,
-    },
-    BuiltinEntry {
-        stem: "fa76",
-        name: "FA-76",
-        category: "Dynamics",
         kind: PluginKind::Effect,
         editor: BuiltinEditorKind::Native,
     },
@@ -182,7 +168,7 @@ const CATALOG: &[BuiltinEntry] = &[
         name: "WayGate",
         category: "Dynamics",
         kind: PluginKind::Effect,
-        // Native GPUI editor (`sphere_ui_components::components::gate_panel`).
+        // Native GPUI editor (`sphere_ui_components::components::waygate_plate`).
         editor: BuiltinEditorKind::Native,
     },
     BuiltinEntry {
@@ -229,7 +215,7 @@ const CATALOG: &[BuiltinEntry] = &[
     },
 ];
 
-const VENDOR: &str = "Futureboard";
+const VENDOR: &str = "Futureboard Digital Technologies";
 
 /// The registry id for a built-in stem, e.g. `builtin:rodharerist`.
 pub fn builtin_id(stem: &str) -> String {
@@ -290,8 +276,6 @@ pub const AUDIO_BRIDGE_STEMS: &[&str] = &[
     "echospace",
     "whitesharp",
     "imager",
-    "fa2a",
-    "fa76",
     "burnlimit",
     "clipper67",
     "transient",
@@ -433,8 +417,6 @@ mod tests {
             "verbspace",
             "echospace",
             "whitesharp",
-            "fa2a",
-            "fa76",
             "zcomp",
             "burnlimit",
             "clipper67",
@@ -477,14 +459,10 @@ mod tests {
         assert!(builtin_audio_bridge_supported("builtin:echospace"));
         assert!(builtin_audio_bridge_supported("imager"));
         assert!(builtin_audio_bridge_supported("builtin:imager"));
-        assert!(builtin_audio_bridge_supported("fa2a"));
-        assert!(builtin_audio_bridge_supported("builtin:fa2a"));
         assert!(builtin_audio_bridge_supported("zcomp"));
         assert!(builtin_audio_bridge_supported("builtin:zcomp"));
         assert!(builtin_audio_bridge_supported("mixstation"));
         assert!(builtin_audio_bridge_supported("builtin:mixstation"));
-        assert!(builtin_audio_bridge_supported("fa76"));
-        assert!(builtin_audio_bridge_supported("builtin:fa76"));
         assert!(builtin_audio_bridge_supported("burnlimit"));
         assert!(builtin_audio_bridge_supported("builtin:burnlimit"));
         assert!(builtin_audio_bridge_supported("clipper67"));
@@ -525,13 +503,11 @@ mod tests {
         assert_eq!(builtin_display_name("builtin:verbspace"), Some("VerbSpace"));
         assert_eq!(builtin_display_name("echospace"), Some("EchoSpace"));
         assert_eq!(builtin_display_name("builtin:imager"), Some("Imager"));
-        assert_eq!(builtin_display_name("builtin:fa2a"), Some("FA-2A"));
         assert_eq!(builtin_display_name("builtin:zcomp"), Some("Z-Comp"));
         assert_eq!(
             builtin_display_name("builtin:mixstation"),
             Some("MixStation")
         );
-        assert_eq!(builtin_display_name("builtin:fa76"), Some("FA-76"));
         assert_eq!(builtin_display_name("builtin:burnlimit"), Some("BurnLimit"));
         assert_eq!(builtin_display_name("builtin:clipper67"), Some("67Clipper"));
         assert_eq!(builtin_display_name("builtin:transient"), Some("Transient"));

@@ -282,6 +282,9 @@ pub enum DialUnit {
     Seconds,
     /// A bare number to one decimal: a 0–10 knob.
     Plain,
+    /// Milliseconds, in hundredths under 1 ms and read in seconds from 1 s:
+    /// a compressor's attack or release.
+    Time,
 }
 
 impl DialUnit {
@@ -297,6 +300,9 @@ impl DialUnit {
             Self::Bias => format!("{}%", signed(v * 100.0).replace(".0", "")),
             Self::Seconds => format!("{v:.1} s"),
             Self::Plain => format!("{v:.1}"),
+            Self::Time if v >= 1_000.0 => format!("{:.2} s", v / 1_000.0),
+            Self::Time if v < 1.0 => format!("{v:.2} ms"),
+            Self::Time => fmt_ms(v),
         }
     }
 
@@ -315,6 +321,10 @@ impl DialUnit {
             Self::Ratio | Self::Plain => 0.1,
             Self::Seconds => 0.01,
             Self::Q | Self::Bias => 0.01,
+            Self::Time if v < 1.0 => 0.01,
+            Self::Time if v < 10.0 => 0.1,
+            Self::Time if v < 1_000.0 => 1.0,
+            Self::Time => 10.0,
         };
         (v / step).round() * step
     }
@@ -892,6 +902,31 @@ pub fn knob_reading<T: 'static>(
     s: f32,
     set: impl Fn(&mut T, f32, &mut Context<T>) + 'static,
 ) -> AnyElement {
+    let entity = cx.entity().clone();
+    let set: KnobSet = Rc::new(move |value, app: &mut App| {
+        let _ = entity.update(app, |this, cx| set(this, value, cx));
+    });
+    knob_with(key, dial, value, readout, look, cell, ink, enabled, s, set)
+}
+
+/// What a knob calls with each new value.
+pub type KnobSet = Rc<dyn Fn(f32, &mut App)>;
+
+/// [`knob_reading`] for a view that hands its edits to a callback rather
+/// than to an entity's method: the instruments' panels.
+#[allow(clippy::too_many_arguments)]
+pub fn knob_with(
+    key: impl Into<SharedString>,
+    dial: Dial,
+    value: f32,
+    readout: Option<String>,
+    look: KnobLook,
+    cell: KnobCell,
+    ink: Rgba,
+    enabled: bool,
+    s: f32,
+    set: KnobSet,
+) -> AnyElement {
     let key: SharedString = key.into();
     let n = dial.norm(value);
     let face = canvas(
@@ -905,10 +940,6 @@ pub fn knob_reading<T: 'static>(
         .flex_shrink_0()
         .child(face);
     if enabled {
-        let set = Rc::new(set);
-        let entity = cx.entity().clone();
-        let on_drag = entity.clone();
-        let on_wheel = entity.clone();
         let drag_set = set.clone();
         let wheel_set = set.clone();
         let drag_id = key.to_string();
@@ -931,23 +962,18 @@ pub fn knob_reading<T: 'static>(
                     KNOB_DRAG_SPAN * s,
                     |dy| -dy,
                 );
-                let set = drag_set.clone();
-                let _ = on_drag.update(app, |this, cx| set(this, dial.at(next), cx));
+                drag_set(dial.at(next), app);
             })
             .on_scroll_wheel(move |event: &ScrollWheelEvent, _window, app| {
                 let dy = f32::from(event.delta.pixel_delta(px(20.0)).y);
                 if dy == 0.0 {
                     return;
                 }
-                let set = wheel_set.clone();
-                let _ = on_wheel.update(app, |this, cx| {
-                    set(this, wheel_turn(dial, value, dy, event.modifiers.shift), cx)
-                });
+                wheel_set(wheel_turn(dial, value, dy, event.modifiers.shift), app);
             })
             .on_click(move |event, _window, app| {
                 if is_reset_click(event) {
-                    let set = set.clone();
-                    let _ = entity.update(app, |this, cx| set(this, dial.default, cx));
+                    set(dial.default, app);
                 }
             });
     }

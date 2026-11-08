@@ -164,12 +164,18 @@ fn main() -> ExitCode {
     }
 }
 
-/// Run the WhiteSharp plug-in's own xtask. That package is a separate
-/// workspace under `vstplugins/`, so this does not compile it into the DAW
-/// target directory.
+/// Run a plug-in's own xtask: the one under `vstplugins/<package>` for the
+/// package named first (`rodhareist_vst3`, `whitesharp_vst3`), else
+/// WhiteSharp's. Each is a separate workspace, so this does not compile it
+/// into the DAW target directory.
 fn run_plugin_bundle(args: &[String]) -> ExitCode {
     let root = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
-    let manifest = root.join("vstplugins/whitesharp_vst3/Cargo.toml");
+    let manifest = args
+        .iter()
+        .find(|arg| !arg.starts_with('-'))
+        .map(|package| root.join("vstplugins").join(package).join("Cargo.toml"))
+        .filter(|manifest| manifest.is_file())
+        .unwrap_or_else(|| root.join("vstplugins/whitesharp_vst3/Cargo.toml"));
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     eprintln!(
         "[xtask] cargo run --manifest-path {} --package xtask --release -- bundle {}",

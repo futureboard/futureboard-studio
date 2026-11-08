@@ -1,0 +1,8 @@
+[package]
+name = "xtask"
+version = "2026.11.1-beta2.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+nih_plug_xtask = { git = "https://github.com/arizkami/nihplug_gpui" }

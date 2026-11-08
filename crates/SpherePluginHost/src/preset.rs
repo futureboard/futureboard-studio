@@ -339,6 +339,104 @@ pub fn clear_plugin_cache() -> Result<u32, String> {
     clear_all_presets()
 }
 
+// ── Where user presets live ─────────────────────────────────────────────────
+
+/// A folder name the OS will take for a plug-in called `plugin_name`: the
+/// characters Windows refuses become `_`, and trailing dots and spaces go.
+/// `None` when nothing is left.
+pub fn preset_folder_name(plugin_name: &str) -> Option<String> {
+    let name: String = plugin_name
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    let name = name.trim().trim_end_matches(['.', ' ']).to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+/// One plug-in's user presets:
+/// `Documents/Futureboard Studio/Presets/Plug-ins/{plugin name}/`.
+///
+/// Named for the plug-in rather than its id, so the folder is the one the
+/// user would look for. The formats of one plug-in (its VST3 and its CLAP)
+/// share it; each file names the plug-in id it belongs to, and
+/// [`state_preset_owner`] tells them apart.
+pub fn user_preset_dir(plugin_name: &str) -> Option<PathBuf> {
+    Some(crate::registry::user_preset_root().join(preset_folder_name(plugin_name)?))
+}
+
+/// One plug-in's user presets, sorted by name: `(name, file)`.
+///
+/// The folder is shared by the plug-in's formats, so only the `.pst` files
+/// that say they belong to `plugin_id` are listed: another's (the VST3's,
+/// seen from the CLAP) would be refused on load, and so would a file that
+/// names no plug-in at all.
+pub fn list_user_presets(plugin_id: &str, plugin_name: &str) -> Vec<(String, PathBuf)> {
+    let Some(dir) = user_preset_dir(plugin_name) else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut presets: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("pst"))
+                && state_preset_owner(path).as_deref() == Some(plugin_id)
+        })
+        .filter_map(|path| {
+            let name = path.file_stem()?.to_str()?.to_string();
+            Some((name, path))
+        })
+        .collect();
+    presets.sort_by_key(|(name, _)| name.to_lowercase());
+    presets
+}
+
+/// The plug-in id a user preset file says it belongs to, read from its
+/// header and metadata only. `None` for anything that is not a one-plug-in
+/// FBPST preset. Remembered per file and modification time, so listing a
+/// folder again does not reopen every file.
+pub fn state_preset_owner(path: &Path) -> Option<String> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::SystemTime;
+    static SEEN: OnceLock<Mutex<HashMap<PathBuf, (SystemTime, Option<String>)>>> = OnceLock::new();
+    let modified = fs::metadata(path).and_then(|meta| meta.modified()).ok()?;
+    let seen = SEEN.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some((when, owner)) = seen.lock().ok()?.get(path) {
+        if *when == modified {
+            return owner.clone();
+        }
+    }
+    let owner = read_state_preset_owner(path);
+    if let Ok(mut seen) = seen.lock() {
+        seen.insert(path.to_path_buf(), (modified, owner.clone()));
+    }
+    owner
+}
+
+fn read_state_preset_owner(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut file = fs::File::open(path).ok()?;
+    let mut header = [0u8; 24];
+    file.read_exact(&mut header).ok()?;
+    if &header[..5] != PRESET_MAGIC || header_version(&header) >= VERSION_BUNDLE {
+        return None;
+    }
+    let meta_len = u32::from_le_bytes([header[8], header[9], header[10], header[11]]) as usize;
+    let mut meta = vec![0u8; meta_len.min(1024 * 1024)];
+    file.read_exact(&mut meta).ok()?;
+    let parsed: PresetMetadataOwned = serde_json::from_slice(&meta).ok()?;
+    Some(parsed.plugin_metadata.id)
+}
+
 /// One user preset: a plug-in's own opaque state under a name.
 ///
 /// Written in the same FBPST container as the scan cache — one format for every
@@ -967,6 +1065,52 @@ mod tests {
         assert!(user.exists(), "the user's preset survives Clear Database");
         assert!(!cache.exists());
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A plug-in's name becomes a folder Windows will take.
+    #[test]
+    fn plug_in_names_become_safe_folder_names() {
+        assert_eq!(preset_folder_name("Serum").as_deref(), Some("Serum"));
+        assert_eq!(
+            preset_folder_name("FabFilter Pro-Q 3").as_deref(),
+            Some("FabFilter Pro-Q 3")
+        );
+        assert_eq!(
+            preset_folder_name("A/B: Test?").as_deref(),
+            Some("A_B_ Test_")
+        );
+        assert_eq!(preset_folder_name("Trail. ").as_deref(), Some("Trail"));
+        assert_eq!(preset_folder_name("  "), None);
+    }
+
+    /// Each preset in a plug-in's folder names the plug-in it belongs to, so
+    /// the formats sharing the folder each find only their own; a file that
+    /// is not a one-plug-in preset names none.
+    #[test]
+    fn a_preset_names_the_plug_in_it_belongs_to() {
+        let dir = std::env::temp_dir().join("fb-preset-owner");
+        let _ = fs::remove_dir_all(&dir);
+        let preset = |name: &str, id: &str| {
+            let path = dir.join(name);
+            write_state_preset(
+                &path,
+                &StatePreset {
+                    plugin_id: id.to_string(),
+                    plugin_name: "X".to_string(),
+                    state: vec![7],
+                },
+            )
+            .unwrap();
+            path
+        };
+        let vst3 = preset("Warm.pst", "vst3:x");
+        let clap = preset("Bright.pst", "clap:x");
+        assert_eq!(state_preset_owner(&vst3).as_deref(), Some("vst3:x"));
+        assert_eq!(state_preset_owner(&clap).as_deref(), Some("clap:x"));
+        let chain = dir.join("Chain.pst");
+        write_bundle_preset(&chain, &bundle(BundleKind::Chain)).unwrap();
+        assert_eq!(state_preset_owner(&chain), None);
         let _ = fs::remove_dir_all(&dir);
     }
 

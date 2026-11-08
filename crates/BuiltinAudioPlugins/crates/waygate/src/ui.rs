@@ -1,6 +1,6 @@
 //! WayGate's editor origin.
 //!
-//! The editor is native GPUI (`sphere_ui_components::components::gate_panel`)
+//! The editor is native GPUI (`sphere_ui_components::components::waygate_plate`)
 //! in Studio, and a web port of it in LiveStage. What lives here is the stem
 //! Studio routes this plug-in's inserts, state mirror and native editor by.
 

@@ -4596,7 +4596,7 @@ mod tests {
         rig.apply(Command::AddInsert {
             strip: a,
             plugin: InsertPlugin::Builtin {
-                stem: "fa76".to_string(),
+                stem: "zcomp".to_string(),
                 params: Default::default(),
             },
             index: None,
@@ -5107,7 +5107,7 @@ mod tests {
             r#"{"cmd":"scene_delete","id":7}"#,
             r#"{"cmd":"scene_move","id":7,"index":0}"#,
             r#"{"cmd":"set_recall_safe","strip":{"kind":"channel","id":3},"safe":true}"#,
-            r#"{"cmd":"paste_strip","targets":[{"kind":"channel","id":3},{"kind":"master"}],"settings":{"fader_db":-3,"color":null,"inserts":[{"bypass":false,"plugin":{"type":"builtin","stem":"fa76","params":[[1,0.5]]}}]},"sections":["fader_pan","name_color","inserts","processing","hpf","gate","eq","comp","delay","sends","input"]}"#,
+            r#"{"cmd":"paste_strip","targets":[{"kind":"channel","id":3},{"kind":"master"}],"settings":{"fader_db":-3,"color":null,"inserts":[{"bypass":false,"plugin":{"type":"builtin","stem":"zcomp","params":[[1,0.5]]}}]},"sections":["fader_pan","name_color","inserts","processing","hpf","gate","eq","comp","delay","sends","input"]}"#,
         ];
         for line in lines {
             let command: Command =

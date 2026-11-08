@@ -1,9 +1,9 @@
-// Editors for FA-2A, FA-76, Z-Comp, BurnLimit, 67Clipper and Transient: a
-// port of the native dynamics family (components/dyn_model.rs, dyn_panel.rs).
+// Editors for Z-Comp, BurnLimit, 67Clipper and Transient: a port of the
+// native dynamics family (components/dyn_model.rs, dyn_panel.rs).
 //
 // Each has a row of displays over a row of control cards:
-// * the hardware emulations get a moving-coil VU, reading gain reduction or
-//   output (a switch in the editor, not a param);
+// * Z-Comp gets a moving-coil VU, reading gain reduction or output (a switch
+//   in the editor, not a param);
 // * Z-Comp, the limiter and the clipper draw their static curve from the DSP
 //   crates' own `transfer_db` (ported below), with the live operating point;
 // * Transient sketches a hit before and after its shaping;
@@ -33,16 +33,13 @@ import {
   rect,
   transferPlot,
   VU_BLUE,
-  VU_CREAM,
   vuTinted,
 } from './paint.ts'
 import './dynamics.css'
 
-type Kind = 'fa2a' | 'fa76' | 'zcomp' | 'burnlimit' | 'clipper67' | 'transient'
+type Kind = 'zcomp' | 'burnlimit' | 'clipper67' | 'transient'
 
 const TITLE: Record<Kind, string> = {
-  fa2a: 'FA-2A',
-  fa76: 'FA-76',
   zcomp: 'Z-Comp',
   burnlimit: 'BurnLimit',
   clipper67: '67Clipper',
@@ -60,10 +57,6 @@ function wireEnum(value: number, count: number): number {
 
 function subtitle(kind: Kind, e: Editor): string {
   switch (kind) {
-    case 'fa2a':
-      return 'Optical leveling amplifier'
-    case 'fa76':
-      return 'FET limiting amplifier'
     case 'zcomp':
       return `Multi-circuit dynamics · ${ZCOMP_MODELS[wireEnum(e.value('model'), 4)]}`
     case 'burnlimit':
@@ -87,21 +80,6 @@ function reductionLabel(kind: Kind): [string, string] {
 type KnobRow = [label: string, taper: Taper, unit: Unit]
 
 const KNOBS: Record<Kind, Record<string, KnobRow>> = {
-  fa2a: {
-    peakReduction: ['Peak Reduction', 'linear', 'plain'],
-    gainDb: ['Gain', 'linear', 'db'],
-    emphasis: ['Emphasis', 'linear', 'percent'],
-    color: ['Color', 'linear', 'percent'],
-    sidechainLowCutHz: ['Sidechain', 'log', 'hz'],
-    outputTrimDb: ['Trim', 'linear', 'db'],
-  },
-  fa76: {
-    inputDb: ['Input', 'linear', 'db'],
-    outputDb: ['Output', 'linear', 'db'],
-    attackUs: ['Attack', 'log', 'us'],
-    releaseMs: ['Release', 'log', 'ms'],
-    sidechainHpfHz: ['SC HPF', 'square', 'cutHz'],
-  },
   zcomp: {
     thresholdDb: ['Thresh', 'linear', 'db'],
     ratio: ['Ratio', 'log', 'ratio'],
@@ -134,16 +112,11 @@ const KNOBS: Record<Kind, Record<string, KnobRow>> = {
 
 /** Drawn from where they rest: a trim at unity, a shaper at no change. */
 const BIPOLAR: Record<Kind, string[]> = {
-  fa2a: ['gainDb', 'outputTrimDb'],
-  fa76: [],
   zcomp: ['makeupDb'],
   burnlimit: ['gainDb'],
   clipper67: ['inputDb'],
   transient: ['attack', 'sustain'],
 }
-
-/** FA-76's sidechain filter is off at or below this. */
-const FA76_HPF_OFF_HZ = 9.5
 
 /** The knob for `id`, its range from the effect's descriptor (so a range
  *  change in the DSP reaches the editor); null for an id the effect lacks. */
@@ -152,7 +125,6 @@ function knobSpec(e: Editor, kind: Kind, id: string): KnobSpec | null {
   const row: KnobRow | undefined = id === 'mix' ? ['Mix', 'linear', 'percent'] : KNOBS[kind][id]
   if (!range || !row) return null
   let s = spec(id, row[0], range.min, range.max, row[1], row[2])
-  if (kind === 'fa76' && id === 'sidechainHpfHz') s = { ...s, cutOff: FA76_HPF_OFF_HZ }
   if (BIPOLAR[kind].includes(id)) s = bipolar(s, 0)
   return s
 }
@@ -166,8 +138,6 @@ const minWidth = (px: number): CSSProperties => ({ minWidth: `min(${px}px, 100%)
 // ── Choices (dyn_model::choice_labels, choice_hint) ─────────────────────
 
 const CHOICES: Partial<Record<Kind, [id: string, labels: string[]]>> = {
-  fa2a: ['mode', ['Compress', 'Limit']],
-  fa76: ['ratio', ['4', '8', '12', '20', 'All']],
   zcomp: ['model', ZCOMP_MODELS],
   burnlimit: ['style', ['Clean', 'Punch', 'Modern', 'Clip']],
   clipper67: ['mode', ['Clip', 'Hybrid', 'Limit']],
@@ -175,12 +145,6 @@ const CHOICES: Partial<Record<Kind, [id: string, labels: string[]]>> = {
 
 function choiceHint(kind: Kind, e: Editor): string {
   switch (kind) {
-    case 'fa2a':
-      return wireEnum(e.value('mode'), 2) === 1 ? 'Higher ratio for peak control' : 'Gentle ratio, slow optical release'
-    case 'fa76':
-      return wireEnum(e.value('ratio'), 5) === 4
-        ? 'All buttons in: hard-knee, aggressive, faster'
-        : 'Fixed −24 dB threshold: drive the input into it'
     case 'zcomp':
       return [
         'VCA · feed-forward · thrust sidechain',
@@ -466,7 +430,6 @@ function paintEnvelope(ctx: Ctx, w: number, h: number, attack: number, sustain: 
 
 /** The VU face a kind wears; Z-Comp's follows its circuit. */
 function vuFace(kind: Kind, e: Editor): VuFace {
-  if (kind === 'fa2a') return VU_CREAM
   if (kind !== 'zcomp') return VU_BLUE
   switch (wireEnum(e.value('model'), 4)) {
     case 1:
@@ -614,10 +577,6 @@ function Displays(props: { editor: Editor; kind: Kind; vuOutput: boolean }) {
 
   let displays: ReactNode[]
   switch (kind) {
-    case 'fa2a':
-    case 'fa76':
-      displays = [vu(), history()]
-      break
     case 'zcomp':
       displays = [vu(), transfer()]
       break
@@ -715,44 +674,6 @@ function Controls(props: { editor: Editor; kind: Kind; vuOutput: boolean; setVuO
   )
 
   switch (kind) {
-    case 'fa2a':
-      return (
-        <Row>
-          {card(
-            'LEVELING',
-            3,
-            360,
-            <div className="dyn-cluster">
-              {hero('gainDb')}
-              {hero('peakReduction')}
-              <div className="dyn-stack">
-                <Caption>MODE</Caption>
-                <ParamChoice
-                  editor={e}
-                  id="mode"
-                  options={[
-                    [0, 'Compress'],
-                    [1, 'Limit'],
-                  ]}
-                />
-                {vuSwitch(true)}
-              </div>
-            </div>,
-          )}
-          {knobCard('CHARACTER', [knob('emphasis'), knob('sidechainLowCutHz'), knob('color')])}
-          {knobCard('OUTPUT', [knob('mix'), knob('outputTrimDb')])}
-        </Row>
-      )
-    case 'fa76':
-      return (
-        <Row>
-          {modeCard('RATIO')}
-          {card('METER', 0, 110, vuSwitch(false))}
-          {knobCard('GAIN', [hero('inputDb'), hero('outputDb')])}
-          {knobCard('TIMING', [knob('attackUs'), knob('releaseMs')])}
-          {knobCard('SIDECHAIN · MIX', [knob('sidechainHpfHz'), knob('mix')])}
-        </Row>
-      )
     case 'zcomp': {
       // SSL's auto release is a fixed dual time-constant network: the
       // Release knob has nothing to do.
@@ -889,8 +810,6 @@ function editorFor(kind: Kind): EditorComponent {
 }
 
 export const editors: Record<string, EditorComponent> = {
-  fa2a: editorFor('fa2a'),
-  fa76: editorFor('fa76'),
   zcomp: editorFor('zcomp'),
   burnlimit: editorFor('burnlimit'),
   clipper67: editorFor('clipper67'),

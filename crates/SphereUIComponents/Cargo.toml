@@ -53,8 +53,6 @@ builtin-plugin-editor = [
     "dep:deesser",
     "dep:duckstep",
     "dep:imager",
-    "dep:fa2a",
-    "dep:fa76",
     "dep:burnlimit",
     "dep:clipper67",
     "dep:transient",
@@ -116,8 +114,6 @@ airboost = { workspace = true, optional = true }
 deesser = { workspace = true, optional = true }
 duckstep = { workspace = true, optional = true }
 imager = { workspace = true, optional = true }
-fa2a = { workspace = true, optional = true }
-fa76 = { workspace = true, optional = true }
 burnlimit = { workspace = true, optional = true }
 clipper67 = { workspace = true, optional = true }
 transient = { workspace = true, optional = true }

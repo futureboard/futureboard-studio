@@ -54,7 +54,7 @@ pub fn descriptor() -> PluginDescriptor {
     PluginDescriptor {
         id: PLUGIN_ID,
         name: "MeowSyn",
-        vendor: "Futureboard",
+        vendor: "Futureboard Digital Technologies",
         category: PluginCategory::Instrument,
         version: env!("CARGO_PKG_VERSION"),
         params: &[

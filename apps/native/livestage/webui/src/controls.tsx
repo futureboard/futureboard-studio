@@ -194,7 +194,7 @@ export function Knob(props: {
     return `M ${x0} ${y0} A ${r} ${r} 0 ${large} 1 ${x1} ${y1}`
   }
   // A bipolar arc starts at zero, which is the middle only of a symmetric
-  // range (FA-2A's gain runs −12…+24 dB).
+  // range (BurnLimit's gain runs −12…+24 dB).
   const origin = props.bipolar ? Math.min(1, Math.max(0, -props.min / span)) : 0
   const [px0, py0] = point(fraction, r * 0.28)
   const [px1, py1] = point(fraction, r * 0.62)

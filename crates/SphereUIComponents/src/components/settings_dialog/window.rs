@@ -79,6 +79,11 @@ impl SettingsWindow {
         this
     }
 
+    /// Shows `tab` (the preview tool's way in).
+    pub fn show_tab(&mut self, tab: SettingsTab) {
+        self.active_tab = tab;
+    }
+
     /// Make sure the GPU adapter list exists before the Performance page wants
     /// it. Enumeration can take seconds, so it runs on a background thread and
     /// the page shows "Detecting…" until this one notify lands. A no-op wait

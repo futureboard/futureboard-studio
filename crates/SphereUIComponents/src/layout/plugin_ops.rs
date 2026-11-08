@@ -162,12 +162,19 @@ pub(crate) struct PluginEditorWindows {
         String,
         gpui::WindowHandle<crate::components::duckstep_plate::DuckstepWindow>,
     >,
-    /// Open native VerbSpace and EchoSpace editors (one window type for
-    /// both), keyed by insert id, like `quick_sampler`.
+    /// Open native VerbSpace editors, keyed by insert id, like
+    /// `quick_sampler`.
     #[cfg(feature = "builtin-plugin-editor")]
-    pub fx: std::collections::HashMap<
+    pub verbspace: std::collections::HashMap<
         String,
-        gpui::WindowHandle<crate::components::fx_window::FxEditorWindow>,
+        gpui::WindowHandle<crate::components::verbspace_plate::VerbSpaceWindow>,
+    >,
+    /// Open native EchoSpace editors, keyed by insert id, like
+    /// `quick_sampler`.
+    #[cfg(feature = "builtin-plugin-editor")]
+    pub echospace: std::collections::HashMap<
+        String,
+        gpui::WindowHandle<crate::components::echospace_plate::EchoSpaceWindow>,
     >,
     /// Open native WhiteSharp editors, keyed by insert id, like
     /// `quick_sampler`.
@@ -176,34 +183,34 @@ pub(crate) struct PluginEditorWindows {
         String,
         gpui::WindowHandle<crate::components::white_sharp_window::WhiteSharpWindow>,
     >,
-    /// Open native dynamics editors — FA-2A, FA-76, Z-Comp, 67Clipper and
-    /// Transient share one window type — keyed by insert id,
+    /// Open native dynamics editors — Z-Comp, 67Clipper and Transient
+    /// share one window type — keyed by insert id,
     /// like `quick_sampler`.
     #[cfg(feature = "builtin-plugin-editor")]
     pub dynamics: std::collections::HashMap<
         String,
-        gpui::WindowHandle<crate::components::dyn_panel::DynEditorWindow>,
+        gpui::WindowHandle<crate::components::dyn_plate::DynPlateWindow>,
     >,
     /// Open native WayGate editors, keyed by insert id, like
     /// `quick_sampler`.
     #[cfg(feature = "builtin-plugin-editor")]
     pub waygate: std::collections::HashMap<
         String,
-        gpui::WindowHandle<crate::components::gate_panel::WayGateEditorWindow>,
+        gpui::WindowHandle<crate::components::waygate_plate::WayGateWindow>,
     >,
     /// Open native Compressor editors,
     /// keyed by insert id, like `quick_sampler`.
     #[cfg(feature = "builtin-plugin-editor")]
     pub bands: std::collections::HashMap<
         String,
-        gpui::WindowHandle<crate::components::band_panel::BandEditorWindow>,
+        gpui::WindowHandle<crate::components::compressor_plate::CompressorWindow>,
     >,
     /// Open native MixStation editors, keyed by insert id, like
     /// `quick_sampler`.
     #[cfg(feature = "builtin-plugin-editor")]
     pub mix_station: std::collections::HashMap<
         String,
-        gpui::WindowHandle<crate::components::mix_station_panel::MixStationWindow>,
+        gpui::WindowHandle<crate::components::mixstation_plate::MixStationWindow>,
     >,
     /// Native main-owned external-bridge editor shells, keyed by
     /// `(track_id, plugin_instance_id)`.
@@ -3243,6 +3250,7 @@ impl StudioLayout {
         cx: &mut Context<Self>,
     ) {
         use crate::components::native_plugin_shell::ShellIdentity;
+        let preset_plugin_name = self.preset_owner(plugin_id, &display_name).plugin_name;
         let identity = instances
             .iter()
             .find(|instance| instance.instance_key == target)
@@ -3250,11 +3258,15 @@ impl StudioLayout {
                 plugin_name: display_name.clone(),
                 track_name: instance.track_name.clone(),
                 insert_number: instance.insert_number,
+                plugin_id: plugin_id.to_string(),
+                preset_plugin_name: preset_plugin_name.clone(),
             })
             .unwrap_or(ShellIdentity {
                 plugin_name: display_name,
                 track_name: String::new(),
                 insert_number: 1,
+                plugin_id: plugin_id.to_string(),
+                preset_plugin_name,
             });
 
         let opened = match SpherePluginHost::resolve_builtin_stem(plugin_id) {
@@ -3301,15 +3313,15 @@ impl StudioLayout {
                 cx,
             ),
             Some(verbspace::ui::UI_ORIGIN) => self.open_native_editor(
-                |windows| &mut windows.fx,
-                crate::components::fx_window::open_verbspace_editor,
+                |windows| &mut windows.verbspace,
+                crate::components::verbspace_plate::open_verbspace_editor,
                 (target, identity, host_ops),
                 window,
                 cx,
             ),
             Some(echospace::ui::UI_ORIGIN) => self.open_native_editor(
-                |windows| &mut windows.fx,
-                crate::components::fx_window::open_echospace_editor,
+                |windows| &mut windows.echospace,
+                crate::components::echospace_plate::open_echospace_editor,
                 (target, identity, host_ops),
                 window,
                 cx,
@@ -3321,23 +3333,9 @@ impl StudioLayout {
                 window,
                 cx,
             ),
-            Some(fa2a::ui::UI_ORIGIN) => self.open_native_editor(
-                |windows| &mut windows.dynamics,
-                crate::components::dyn_panel::open_fa2a_editor,
-                (target, identity, host_ops),
-                window,
-                cx,
-            ),
-            Some(fa76::ui::UI_ORIGIN) => self.open_native_editor(
-                |windows| &mut windows.dynamics,
-                crate::components::dyn_panel::open_fa76_editor,
-                (target, identity, host_ops),
-                window,
-                cx,
-            ),
             Some(zcomp::ui::UI_ORIGIN) => self.open_native_editor(
                 |windows| &mut windows.dynamics,
-                crate::components::dyn_panel::open_zcomp_editor,
+                crate::components::dyn_plate::open_zcomp_editor,
                 (target, identity, host_ops),
                 window,
                 cx,
@@ -3379,28 +3377,28 @@ impl StudioLayout {
             ),
             Some(clipper67::ui::UI_ORIGIN) => self.open_native_editor(
                 |windows| &mut windows.dynamics,
-                crate::components::dyn_panel::open_clipper67_editor,
+                crate::components::dyn_plate::open_clipper67_editor,
                 (target, identity, host_ops),
                 window,
                 cx,
             ),
             Some(transient::ui::UI_ORIGIN) => self.open_native_editor(
                 |windows| &mut windows.dynamics,
-                crate::components::dyn_panel::open_transient_editor,
+                crate::components::dyn_plate::open_transient_editor,
                 (target, identity, host_ops),
                 window,
                 cx,
             ),
             Some(waygate::ui::UI_ORIGIN) => self.open_native_editor(
                 |windows| &mut windows.waygate,
-                crate::components::gate_panel::open_waygate_editor,
+                crate::components::waygate_plate::open_waygate_editor,
                 (target, identity, host_ops),
                 window,
                 cx,
             ),
             Some(compresser::ui::UI_ORIGIN) => self.open_native_editor(
                 |windows| &mut windows.bands,
-                crate::components::band_panel::open_compresser_editor,
+                crate::components::compressor_plate::open_compresser_editor,
                 (target, identity, host_ops),
                 window,
                 cx,
@@ -3414,7 +3412,7 @@ impl StudioLayout {
             ),
             Some(mixstation::ui::UI_ORIGIN) => self.open_native_editor(
                 |windows| &mut windows.mix_station,
-                crate::components::mix_station_panel::open_mixstation_editor,
+                crate::components::mixstation_plate::open_mixstation_editor,
                 (target, identity, host_ops),
                 window,
                 cx,
@@ -3604,8 +3602,12 @@ impl StudioLayout {
             for handle in duckers {
                 let _ = handle.update(cx, |editor, _window, cx| editor.sync_from_mirror(cx));
             }
-            let fxs: Vec<_> = self.plugin_editors.fx.values().copied().collect();
-            for handle in fxs {
+            let reverbs: Vec<_> = self.plugin_editors.verbspace.values().copied().collect();
+            for handle in reverbs {
+                let _ = handle.update(cx, |editor, _window, cx| editor.sync_from_mirror(cx));
+            }
+            let delays: Vec<_> = self.plugin_editors.echospace.values().copied().collect();
+            for handle in delays {
                 let _ = handle.update(cx, |editor, _window, cx| editor.sync_from_mirror(cx));
             }
             let tuners: Vec<_> = self.plugin_editors.white_sharp.values().copied().collect();

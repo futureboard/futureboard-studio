@@ -37,16 +37,6 @@ pub const BUILTIN_EFFECTS: &[BuiltinEffectInfo] = &[
         category: "Dynamics",
     },
     BuiltinEffectInfo {
-        stem: "fa2a",
-        name: "FA-2A",
-        category: "Dynamics",
-    },
-    BuiltinEffectInfo {
-        stem: "fa76",
-        name: "FA-76",
-        category: "Dynamics",
-    },
-    BuiltinEffectInfo {
         stem: "zcomp",
         name: "Z-Comp",
         category: "Dynamics",
@@ -177,8 +167,6 @@ pub fn builtin_params(stem: &str) -> Vec<BuiltinParam> {
         "equz8" => params_of!(equz8::descriptor, equz8::ipc::ui_param_index),
         "equzx" => params_of!(equzx::descriptor, equzx::ipc::ui_param_index),
         "compresser" => params_of!(compresser::descriptor, compresser::ipc::ui_param_index),
-        "fa2a" => params_of!(fa2a::descriptor, fa2a::ipc::ui_param_index),
-        "fa76" => params_of!(fa76::descriptor, fa76::ipc::ui_param_index),
         "zcomp" => params_of!(zcomp::descriptor, zcomp::ipc::ui_param_index),
         "transient" => params_of!(transient::descriptor, transient::ipc::ui_param_index),
         "waygate" => params_of!(waygate::descriptor, waygate::ipc::ui_param_index),
@@ -257,8 +245,6 @@ pub fn builtin_spec(stem: &str) -> Option<BuiltinSpec> {
             compresser::ipc::UI_PARAM_IDS,
             compresser::ipc::ui_values
         ),
-        "fa2a" => spec_of!(fa2a, fa2a::ipc::UI_PARAM_IDS, fa2a::ipc::ui_values),
-        "fa76" => spec_of!(fa76, fa76::ipc::UI_PARAM_IDS, fa76::ipc::ui_values),
         "zcomp" => spec_of!(zcomp, zcomp::ipc::UI_PARAM_IDS, zcomp::ipc::ui_values),
         "transient" => spec_of!(
             transient,
@@ -326,8 +312,6 @@ pub enum BuiltinFx {
     Equz8(equz8::Dsp),
     Equzx(equzx::Dsp),
     Compresser(compresser::Dsp),
-    Fa2a(fa2a::Dsp),
-    Fa76(fa76::Dsp),
     Zcomp(zcomp::Dsp),
     Transient(transient::Dsp),
     WayGate(waygate::Dsp),
@@ -348,8 +332,6 @@ macro_rules! with_dsp {
             BuiltinFx::Equz8($dsp) => $body,
             BuiltinFx::Equzx($dsp) => $body,
             BuiltinFx::Compresser($dsp) => $body,
-            BuiltinFx::Fa2a($dsp) => $body,
-            BuiltinFx::Fa76($dsp) => $body,
             BuiltinFx::Zcomp($dsp) => $body,
             BuiltinFx::Transient($dsp) => $body,
             BuiltinFx::WayGate($dsp) => $body,
@@ -374,8 +356,6 @@ impl BuiltinFx {
             "equz8" => Self::Equz8(equz8::Dsp::new(sr)),
             "equzx" => Self::Equzx(equzx::Dsp::new(sr)),
             "compresser" => Self::Compresser(compresser::Dsp::new(sr)),
-            "fa2a" => Self::Fa2a(fa2a::Dsp::new(sr)),
-            "fa76" => Self::Fa76(fa76::Dsp::new(sr)),
             "zcomp" => Self::Zcomp(zcomp::Dsp::new(sr)),
             "transient" => Self::Transient(transient::Dsp::new(sr)),
             "waygate" => Self::WayGate(waygate::Dsp::new(sr)),
@@ -409,12 +389,6 @@ impl BuiltinFx {
                 let _ = dsp.apply_wire_param(index, value);
             }
             Self::Compresser(dsp) => {
-                let _ = dsp.apply_wire_param(index, value);
-            }
-            Self::Fa2a(dsp) => {
-                let _ = dsp.apply_wire_param(index, value);
-            }
-            Self::Fa76(dsp) => {
                 let _ = dsp.apply_wire_param(index, value);
             }
             Self::Zcomp(dsp) => {
@@ -491,8 +465,6 @@ impl BuiltinFx {
             }};
         }
         Some(match self {
-            Self::Fa2a(dsp) => frame!(dsp.meter_frame(), f => f.gain_reduction_db),
-            Self::Fa76(dsp) => frame!(dsp.meter_frame(), f => f.gain_reduction_db),
             Self::Zcomp(dsp) => frame!(dsp.meter_frame(), f => f.gain_reduction_db),
             // Shaping goes either way; the frame carries its size.
             Self::Transient(dsp) => frame!(dsp.meter_frame(), f => f.gain_reduction_db),
@@ -606,7 +578,7 @@ mod tests {
             assert!(dsp.apply_wire_param(index, value));
         }
         assert_eq!(dsp.latency_samples(), whitesharp::splice::LATENCY);
-        assert!(stage_defaults("fa76").is_empty());
+        assert!(stage_defaults("zcomp").is_empty());
     }
 
     /// Every catalog entry builds, processes a block to finite samples, and

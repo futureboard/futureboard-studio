@@ -110,15 +110,22 @@ impl SettingsSection {
     ];
 }
 
+/// Which preset list the Home sidebar shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) enum PresetTab {
+    #[default]
+    Factory,
+    Users,
+}
+
 /// What the editor shows and how — never saved, never sent to the plug-in.
 #[derive(Clone, Debug)]
 pub(crate) struct RodUi {
     pub page: Page,
+    /// The Home sidebar's preset list.
+    pub preset_tab: PresetTab,
     /// The Explore page's family, `None` for every block.
     pub family: Option<Family>,
-    pub query: String,
-    /// Typing goes to the search field.
-    pub search_focus: bool,
     pub settings: SettingsSection,
     /// The slot each footswitch toggles; `None` follows the chain.
     pub footswitches: [Option<usize>; 4],
@@ -126,26 +133,34 @@ pub(crate) struct RodUi {
     /// Meters read RMS rather than peak.
     pub meter_rms: bool,
     pub last_tap: Option<Instant>,
-    /// The Home name field. Saved as the `.pst` stem; never a wire parameter.
-    pub preset_name: String,
-    /// Typing goes to the preset name field.
-    pub preset_name_focus: bool,
+    /// The block being dragged along the chain, while the drag lasts.
+    pub drag_block: Option<StageKind>,
+    /// The chain layout last asked for, and the move toward it on screen.
+    pub chain_look: Option<ChainLook>,
+    pub chain_motion: Option<ChainMotion>,
+}
+
+/// The editor's two text fields, built by the window (they need its entity
+/// for the OS input handler) and placed by the pages.
+pub(crate) struct RodFields {
+    pub search: AnyElement,
+    pub preset_name: AnyElement,
 }
 
 impl Default for RodUi {
     fn default() -> Self {
         Self {
             page: Page::Home,
+            preset_tab: PresetTab::Factory,
             family: None,
-            query: String::new(),
-            search_focus: false,
             settings: SettingsSection::Audio,
             footswitches: [None; 4],
             show_names: true,
             meter_rms: false,
             last_tap: None,
-            preset_name: String::new(),
-            preset_name_focus: false,
+            drag_block: None,
+            chain_look: None,
+            chain_motion: None,
         }
     }
 }
@@ -473,8 +488,9 @@ struct LaneGeom {
     lane_h: f32,
 }
 
-/// How many lanes to draw. The main path is always there. One more lane
-/// is offered past the last row in use, and the well stops at four.
+/// How many lanes are in use: the main path, and every lane down to the
+/// last one holding a block or sending. The rest stay closed until a drag
+/// opens the next one ([`target_look`]); the well stops at four.
 fn lane_count(p: &Params) -> usize {
     let mut highest = 0u8;
     for stage in p.stage_order.iter().flatten() {
@@ -485,7 +501,225 @@ fn lane_count(p: &Params) -> usize {
             highest = highest.max(index as u8 + 1);
         }
     }
-    (highest as usize + 2).clamp(2, 4)
+    (highest as usize + 1).clamp(1, 4)
+}
+
+/// Whether any block on the path sits on lane `row` (0-based).
+fn lane_holds_blocks(p: &Params, row: usize) -> bool {
+    p.stage_order
+        .iter()
+        .flatten()
+        .any(|kind| p.stage_row[*kind as usize] as usize == row)
+}
+
+/// Keeps each send lane's mode in step with its blocks after a move: a
+/// lane that just got its first block starts Parallel (an Off lane does not
+/// run, so the block would go silent), and a lane its last block left goes
+/// back to Off, which closes it.
+fn settle_lane_sends(before: &Params, next: &mut Params) {
+    for index in 0..next.row_send.len() {
+        let row = index + 1;
+        let had = lane_holds_blocks(before, row);
+        let has = lane_holds_blocks(next, row);
+        if has && !had && next.row_send[index] == RowSend::Off {
+            next.row_send[index] = RowSend::Parallel;
+        } else if had && !has {
+            next.row_send[index] = RowSend::Off;
+        }
+    }
+}
+
+/// Moves `kind` to lane `row` in place, settling the lane sends.
+fn move_to_lane(p: &mut Params, kind: StageKind, row: u8) {
+    let before = p.clone();
+    rodharerist::apply_to_params(p, kind.row_id(), row as f32);
+    settle_lane_sends(&before, p);
+}
+
+/// How long a chain change takes to settle on screen.
+const CHAIN_MOTION: Duration = Duration::from_millis(300);
+
+/// The chain as laid out, at the design size: the lanes drawn, the
+/// positions shown, block size and pitch, lane height, and where each block
+/// on the path sits (`kind`, lane, left, top).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ChainLook {
+    lanes: usize,
+    shown: usize,
+    size: f32,
+    pitch: f32,
+    lane_h: f32,
+    blocks: Vec<(StageKind, u8, f32, f32)>,
+}
+
+impl ChainLook {
+    fn geom(&self) -> LaneGeom {
+        LaneGeom {
+            size: self.size,
+            pitch: self.pitch,
+            lane_h: self.lane_h,
+        }
+    }
+
+    /// The look `t` of the way from `self` to `to`. Blocks that are only in
+    /// `to` sit at their place; the lane count is the larger of the two so a
+    /// closing lane can fade.
+    fn toward(&self, to: &ChainLook, t: f32) -> ChainLook {
+        let mix = |a: f32, b: f32| a + (b - a) * t;
+        ChainLook {
+            lanes: self.lanes.max(to.lanes),
+            shown: to.shown,
+            size: mix(self.size, to.size),
+            pitch: mix(self.pitch, to.pitch),
+            lane_h: mix(self.lane_h, to.lane_h),
+            blocks: to
+                .blocks
+                .iter()
+                .map(|&(kind, row, left, top)| {
+                    match self.blocks.iter().find(|entry| entry.0 == kind) {
+                        Some(&(_, _, from_left, from_top)) => {
+                            (kind, row, mix(from_left, left), mix(from_top, top))
+                        }
+                        None => (kind, row, left, top),
+                    }
+                })
+                .collect(),
+        }
+    }
+}
+
+/// A chain change in flight on screen. View state only.
+#[derive(Clone, Debug)]
+pub(crate) struct ChainMotion {
+    from: ChainLook,
+    to: ChainLook,
+    start: Instant,
+}
+
+impl ChainMotion {
+    fn progress(&self, now: Instant) -> f32 {
+        (now.duration_since(self.start).as_secs_f32() / CHAIN_MOTION.as_secs_f32()).clamp(0.0, 1.0)
+    }
+
+    fn frame(&self, raw: f32) -> ChainFrame {
+        let t = 1.0 - (1.0 - raw).powi(3);
+        ChainFrame {
+            look: self.from.toward(&self.to, t),
+            t,
+            from_lanes: self.from.lanes,
+            to_lanes: self.to.lanes,
+            changed_lane: self
+                .to
+                .blocks
+                .iter()
+                .filter(|(kind, row, _, _)| {
+                    self.from
+                        .blocks
+                        .iter()
+                        .any(|entry| entry.0 == *kind && entry.1 != *row)
+                })
+                .map(|entry| entry.0)
+                .collect(),
+        }
+    }
+}
+
+/// What the well draws this frame.
+pub(crate) struct ChainFrame {
+    look: ChainLook,
+    /// How far the current move has got, eased; 1 at rest.
+    t: f32,
+    from_lanes: usize,
+    to_lanes: usize,
+    /// Blocks that are changing lane in this move.
+    changed_lane: Vec<StageKind>,
+}
+
+impl ChainFrame {
+    fn at_rest(look: ChainLook) -> Self {
+        let lanes = look.lanes;
+        Self {
+            look,
+            t: 1.0,
+            from_lanes: lanes,
+            to_lanes: lanes,
+            changed_lane: Vec::new(),
+        }
+    }
+
+    /// A lane that is opening fades in, one that is closing fades out.
+    fn lane_alpha(&self, row: usize) -> f32 {
+        if row >= self.to_lanes {
+            1.0 - self.t
+        } else if row >= self.from_lanes {
+            self.t
+        } else {
+            1.0
+        }
+    }
+}
+
+/// The chain's layout for `p`. While a block is being dragged the next
+/// closed lane opens as a drop target.
+fn target_look(p: &Params, dragging: bool) -> ChainLook {
+    let used = lane_count(p);
+    let lanes = if dragging { (used + 1).min(4) } else { used };
+    let shown = shown_slots(&p.stage_order);
+    let geom = lane_geom(lanes, shown);
+    let blocks = p
+        .stage_order
+        .iter()
+        .enumerate()
+        .take(shown)
+        .filter_map(|(slot, entry)| {
+            let kind = (*entry)?;
+            let row = p.stage_row[kind as usize].min(3);
+            let (left, top) = slot_origin(&geom, slot, row as usize);
+            Some((kind, row, left, top))
+        })
+        .collect();
+    ChainLook {
+        lanes,
+        shown,
+        size: geom.size,
+        pitch: geom.pitch,
+        lane_h: geom.lane_h,
+        blocks,
+    }
+}
+
+/// The well's layout for this frame. Any change of lanes or places — a
+/// drop, a Move or Lane button, a preset, an undo, a drag opening a lane —
+/// starts a move from wherever the blocks are drawn now. Returns the frame
+/// and whether it is still moving (the caller asks for another frame).
+pub(crate) fn chain_frame(ui: &mut RodUi, p: &Params, now: Instant) -> (ChainFrame, bool) {
+    let target = target_look(p, ui.drag_block.is_some());
+    if ui.chain_look.as_ref() != Some(&target) {
+        if let Some(previous) = ui.chain_look.take() {
+            let from = match &ui.chain_motion {
+                Some(motion) => motion.frame(motion.progress(now)).look,
+                None => previous,
+            };
+            ui.chain_motion = Some(ChainMotion {
+                from,
+                to: target.clone(),
+                start: now,
+            });
+        }
+        ui.chain_look = Some(target.clone());
+    }
+    match &ui.chain_motion {
+        Some(motion) => {
+            let raw = motion.progress(now);
+            if raw >= 1.0 {
+                ui.chain_motion = None;
+                (ChainFrame::at_rest(target), false)
+            } else {
+                (motion.frame(raw), true)
+            }
+        }
+        None => (ChainFrame::at_rest(target), false),
+    }
 }
 
 fn lane_geom(lanes: usize, shown: usize) -> LaneGeom {
@@ -542,13 +776,16 @@ fn drop_chain(
     move |drag, _window, app| {
         let kind = drag.kind;
         let _ = entity.update(app, |this, cx| {
-            let mut next = this.params_snapshot();
+            let before = this.params_snapshot();
+            let mut next = before.clone();
             let from = next
                 .stage_order
                 .iter()
                 .position(|entry| *entry == Some(kind))
                 .unwrap_or(drag.slot);
             rodharerist::reorder_chain(&mut next.stage_order, &mut next.stage_row, from, slot, row);
+            settle_lane_sends(&before, &mut next);
+            this.ui.drag_block = None;
             this.chain_focus = Some(ChainFocus::Block(kind));
             this.set_params(next, cx);
         });
@@ -632,6 +869,17 @@ fn act(
     let entity = cx.entity().clone();
     move |_event, _window, app: &mut App| {
         let _ = entity.update(app, |this, cx| f(this, cx));
+    }
+}
+
+/// [`act`] for a handler that also needs the window (focus moves).
+fn act_in(
+    cx: &Cx,
+    f: impl Fn(&mut RodhareistEditorWindow, &mut Window, &mut Cx) + 'static,
+) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static {
+    let entity = cx.entity().clone();
+    move |_event, window, app: &mut App| {
+        let _ = entity.update(app, |this, cx| f(this, window, cx));
     }
 }
 
@@ -764,10 +1012,10 @@ fn header(w: &RodhareistEditorWindow, p: &Params, cx: &mut Cx, s: f32) -> AnyEle
                 .cursor(gpui::CursorStyle::PointingHand)
                 .hover(|style| style.text_color(color(WHITE)))
                 .child(label)
-                .on_click(act(cx, move |this, cx| {
+                .on_click(act_in(cx, move |this, window, cx| {
                     this.ui.page = item;
-                    this.ui.search_focus = false;
-                    this.ui.preset_name_focus = false;
+                    // The field on the page being left stops taking keys.
+                    this.release_text_focus(window, cx);
                     if item == Page::Home {
                         this.refresh_user_presets();
                     }
@@ -915,11 +1163,11 @@ fn chain_block(
     slot: usize,
     row: u8,
     selected: bool,
-    geom: &LaneGeom,
+    (left, top): (f32, f32),
+    size: f32,
     cx: &mut Cx,
     s: f32,
 ) -> AnyElement {
-    let size = geom.size;
     // Narrower blocks keep their type legible and shrink the rest.
     let k = (size / BLOCK_REF).clamp(0.55, 1.0);
     let type_k = k.max(0.72);
@@ -1024,7 +1272,14 @@ fn chain_block(
         block = block.border_dashed();
     }
     if let Some(kind) = entry {
-        block = block.on_drag(ChainDrag { slot, kind }, |drag, _, _, cx| {
+        let entity = cx.entity().clone();
+        block = block.on_drag(ChainDrag { slot, kind }, move |drag, _, _, cx| {
+            // The drag opens the next lane as a drop target. The render
+            // that follows sees it; the flag clears once the drag ends.
+            let _ = entity.update(cx, |this, cx| {
+                this.ui.drag_block = Some(drag.kind);
+                cx.notify();
+            });
             cx.new(|_| ChainGhost {
                 name: blocks::block_name(drag.kind),
             })
@@ -1063,7 +1318,6 @@ fn chain_block(
                 });
             }
         });
-    let (left, top) = slot_origin(geom, slot, row as usize);
     let ring = if size < 64.0 { 3.0 } else { 4.0 };
     if selected {
         // The design's ring: a dark gap, then the accent.
@@ -1211,9 +1465,12 @@ fn lane_controls(p: &Params, row: usize) -> LaneControls {
 /// The lane's split, at its end. Lane 1 is the main path. Lanes 2–4 are
 /// sends. Wet/dry/wet names the lane and says the blocks on it are the wet
 /// path; the send knob is the amount, live only while that mode uses it.
-fn lane_send(p: &Params, row: usize, geom: &LaneGeom, cx: &mut Cx, s: f32) -> AnyElement {
+fn lane_send(p: &Params, row: usize, lane_h: f32, cx: &mut Cx, s: f32) -> AnyElement {
     let info = lane_controls(p, row);
-    let top = LANE_TOP + row as f32 * geom.lane_h;
+    let top = LANE_TOP + row as f32 * lane_h;
+    // With only the main lane open, say how to get another.
+    let hint = (row == 0 && lane_count(p) == 1)
+        .then(|| words("Drag a block down for a new lane", 11.0, FAINT, s).mt(px(4.0 * s)));
     let mode_id = info.mode_id;
     let send_id = info.send_id;
     let pills = div()
@@ -1270,7 +1527,7 @@ fn lane_send(p: &Params, row: usize, geom: &LaneGeom, cx: &mut Cx, s: f32) -> An
         .left(px(SEND_LEFT * s))
         .top(px(top * s))
         .w(px(190.0 * s))
-        .h(px(geom.lane_h * s))
+        .h(px(lane_h * s))
         .flex()
         .flex_col()
         .justify_center()
@@ -1298,75 +1555,167 @@ fn lane_send(p: &Params, row: usize, geom: &LaneGeom, cx: &mut Cx, s: f32) -> An
                 )
                 .child(send),
         )
+        .children(hint)
+        .into_any_element()
+}
+
+/// The end of a lane a drag has opened: what dropping there does.
+fn opening_lane(row: usize, lane_h: f32, s: f32) -> AnyElement {
+    div()
+        .absolute()
+        .left(px(SEND_LEFT * s))
+        .top(px((LANE_TOP + row as f32 * lane_h) * s))
+        .w(px(190.0 * s))
+        .h(px(lane_h * s))
+        .flex()
+        .flex_col()
+        .justify_center()
+        .gap(px(2.0 * s))
+        .child(numbers(
+            format!("{} \u{00B7} NEW LANE", row + 1),
+            11.0,
+            ACCENT,
+            s,
+        ))
+        .child(words("Drop a block here", 12.0, WHITE, s))
+        .child(words("It runs in parallel with lane 1", 11.0, SOFT, s))
         .into_any_element()
 }
 
 /// An empty column on a lane that is not showing the slot's block. A drop
-/// here moves the block onto this lane without packing the path.
-fn drop_cell(slot: usize, row: u8, geom: &LaneGeom, cx: &Cx, s: f32) -> AnyElement {
-    let (left, top) = slot_origin(geom, slot, row as usize);
-    div()
+/// here moves the block onto this lane without packing the path. While a
+/// block is in the air the cells show, and the one under it lights.
+fn drop_cell(
+    slot: usize,
+    row: u8,
+    (left, top): (f32, f32),
+    size: f32,
+    dragging: bool,
+    cx: &Cx,
+    s: f32,
+) -> AnyElement {
+    let mut cell = div()
         .id(("rodhareist-drop", row as usize * 16 + slot))
         .absolute()
         .left(px(left * s))
         .top(px(top * s))
-        .size(px(geom.size * s))
+        .size(px(size * s))
         .rounded(px(2.0 * s))
         .border(px(1.0))
         .border_color(color_a(0, 0.0))
-        .hover(|style| style.border_color(color(0x5a5a5a)))
-        .on_drop(drop_chain(cx, slot, row))
-        .into_any_element()
+        .hover(|style| style.border_color(color(0x5a5a5a)));
+    if dragging {
+        cell = cell
+            .border_dashed()
+            .border_color(color(0x3c3c3c))
+            .drag_over::<ChainDrag>(|style, _, _, _| {
+                style.border_color(accent()).bg(color_a(ACCENT, 0.14))
+            });
+    }
+    cell.on_drop(drop_chain(cx, slot, row)).into_any_element()
 }
 
 fn display(
     w: &RodhareistEditorWindow,
     p: &Params,
     focus: ChainFocus,
+    frame: &ChainFrame,
     cx: &mut Cx,
     s: f32,
 ) -> AnyElement {
-    let shown = shown_slots(&p.stage_order);
-    let lanes = lane_count(p);
+    let look = &frame.look;
+    let geom = look.geom();
+    let shown = look.shown;
+    let lanes = look.lanes;
+    let used = lane_count(p);
+    let dragging = w.ui.drag_block.is_some();
     let selected_slot = focus_slot(&p.stage_order, focus);
-    let geom = lane_geom(lanes, shown);
     let mut wires = Vec::with_capacity(lanes);
     let mut sends = Vec::with_capacity(lanes);
     let mut cells: Vec<AnyElement> = Vec::new();
     for row in 0..lanes {
+        let alpha = frame.lane_alpha(row);
         let mid = LANE_TOP + row as f32 * geom.lane_h + geom.lane_h * 0.5;
-        let wet_lane = lane_controls(p, row).wet;
+        // A lane past the ones in use is the one a drag opened.
+        let opening = row >= used;
+        let wet_lane = !opening && lane_controls(p, row).wet;
         wires.push(
             div()
                 .absolute()
                 .left(px(CHAIN_LEFT * s))
                 .top(px((mid - 1.0) * s))
-                .w(px(BLOCK_RUN * s))
+                .w(px(BLOCK_RUN * s * if opening { alpha } else { 1.0 }))
                 .h(px(2.0 * s))
-                .bg(if wet_lane { accent() } else { color(0xb5b5b5) })
+                .opacity(alpha)
+                .bg(if wet_lane {
+                    accent()
+                } else if opening {
+                    color(0x4a4a4a)
+                } else {
+                    color(0xb5b5b5)
+                })
                 .into_any_element(),
         );
-        sends.push(lane_send(p, row, &geom, cx, s));
+        let send = if opening {
+            opening_lane(row, geom.lane_h, s)
+        } else {
+            lane_send(p, row, geom.lane_h, cx, s)
+        };
+        sends.push(div().opacity(alpha).child(send).into_any_element());
         for slot in 0..shown {
             let here = match p.stage_order[slot] {
                 Some(kind) => p.stage_row[kind as usize] as usize == row,
                 None => row == 0,
             };
-            if here {
+            if here && p.stage_order[slot].is_none() {
                 cells.push(chain_block(
                     w,
                     p,
                     slot,
-                    row as u8,
+                    0,
                     slot == selected_slot,
-                    &geom,
+                    slot_origin(&geom, slot, 0),
+                    geom.size,
                     cx,
                     s,
                 ));
-            } else {
-                cells.push(drop_cell(slot, row as u8, &geom, cx, s));
+            } else if !here {
+                cells.push(drop_cell(
+                    slot,
+                    row as u8,
+                    slot_origin(&geom, slot, row),
+                    geom.size,
+                    dragging,
+                    cx,
+                    s,
+                ));
             }
         }
+    }
+    // Blocks are drawn where the frame has them, so a move between lanes
+    // or places glides; a block changing lane swells a little on the way.
+    for &(kind, row, left, top) in &look.blocks {
+        let Some(slot) = p.stage_order.iter().position(|e| *e == Some(kind)) else {
+            continue;
+        };
+        let swell = if frame.changed_lane.contains(&kind) {
+            1.0 + 0.12 * (frame.t * std::f32::consts::PI).sin()
+        } else {
+            1.0
+        };
+        let size = geom.size * swell;
+        let grow = (size - geom.size) * 0.5;
+        cells.push(chain_block(
+            w,
+            p,
+            slot,
+            row,
+            slot == selected_slot,
+            (left - grow, top - grow),
+            size,
+            cx,
+            s,
+        ));
     }
     let input = level_knob("input_trim", "IN", p.input_trim_db, 31.0, cx, s);
     let output = level_knob("output_trim", "OUT", p.output_trim_db, 964.0, cx, s);
@@ -1376,6 +1725,7 @@ fn display(
         .top(px(7.0 * s))
         .w(px(1011.0 * s))
         .h(px(327.0 * s))
+        .overflow_hidden()
         .bg(color(plate::WELL))
         .border(px(1.0))
         .border_color(color(plate::WELL_EDGE))
@@ -1429,45 +1779,17 @@ fn bank_row(
         .into_any_element()
 }
 
-fn preset_name_field(w: &RodhareistEditorWindow, cx: &mut Cx, s: f32) -> AnyElement {
-    let focused = w.ui.preset_name_focus;
-    let text = if w.ui.preset_name.is_empty() && !focused {
-        words("Preset name", 13.0, FAINT, s).into_any_element()
-    } else {
-        words(
-            format!("{}{}", w.ui.preset_name, if focused { "|" } else { "" }),
-            13.0,
-            WHITE,
-            s,
-        )
-        .truncate()
-        .into_any_element()
-    };
+/// The window's preset name field, in its row cell. Enter saves a `.pst`.
+fn preset_name_field(field: AnyElement, s: f32) -> AnyElement {
     div()
-        .id("rodhareist-preset-name")
+        .id("rodhareist-preset-name-cell")
         .flex()
-        .flex_row()
         .items_center()
         .flex_1()
         .min_w(px(0.0))
         .h(px(32.0 * s))
-        .px(px(8.0 * s))
-        .rounded(px(3.0 * s))
-        .border(px(1.0))
-        .border_color(if focused { accent() } else { color(0x4a4a4a) })
-        .bg(color(0x1f1f1f))
-        .overflow_hidden()
-        .cursor(gpui::CursorStyle::IBeam)
-        .child(text)
         .tooltip(fb_tooltip("Name for the user preset. Enter saves a .pst."))
-        .on_click(act(cx, |this, cx| {
-            this.ui.search_focus = false;
-            if this.ui.preset_name.is_empty() {
-                this.ui.preset_name = this.suggested_preset_name();
-            }
-            this.ui.preset_name_focus = true;
-            cx.notify();
-        }))
+        .child(field)
         .into_any_element()
 }
 
@@ -1534,7 +1856,74 @@ fn ir_block(w: &RodhareistEditorWindow, p: &Params, cx: &mut Cx, s: f32) -> AnyE
     block.into_any_element()
 }
 
-fn home(w: &RodhareistEditorWindow, p: &Params, cx: &mut Cx, s: f32) -> Vec<AnyElement> {
+/// The sidebar's two preset lists, as one segmented switch: the factory
+/// bank and the `.pst` files the player saved, each with its count.
+fn preset_tabs(
+    current: PresetTab,
+    factory: usize,
+    users: usize,
+    cx: &mut Cx,
+    s: f32,
+) -> AnyElement {
+    let tab = |id: usize, item: PresetTab, label: &'static str, count: usize, cx: &mut Cx| {
+        let on = item == current;
+        div()
+            .id(("rodhareist-preset-tab", id))
+            .flex_1()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_center()
+            .gap(px(6.0 * s))
+            .h_full()
+            .rounded(px(2.0 * s))
+            .bg(if on { color(0x343434) } else { color_a(0, 0.0) })
+            .border_b(px(2.0 * s))
+            .border_color(if on { accent() } else { color_a(0, 0.0) })
+            .cursor(gpui::CursorStyle::PointingHand)
+            .hover(|style| style.bg(color(0x2e2e2e)))
+            .child(
+                words(label, 13.0, if on { WHITE } else { SOFT }, s)
+                    .font_weight(FontWeight::MEDIUM),
+            )
+            .child(numbers(
+                count.to_string(),
+                11.0,
+                if on { ACCENT } else { FAINT },
+                s,
+            ))
+            .on_click(act_in(cx, move |this, window, cx| {
+                this.ui.preset_tab = item;
+                this.release_text_focus(window, cx);
+                if item == PresetTab::Users {
+                    this.refresh_user_presets();
+                }
+                cx.notify();
+            }))
+    };
+    div()
+        .flex()
+        .flex_row()
+        .flex_shrink_0()
+        .h(px(32.0 * s))
+        .p(px(2.0 * s))
+        .gap(px(2.0 * s))
+        .rounded(px(3.0 * s))
+        .border(px(1.0))
+        .border_color(color(0x454545))
+        .bg(color(0x1f1f1f))
+        .child(tab(0, PresetTab::Factory, "Factory", factory, cx))
+        .child(tab(1, PresetTab::Users, "Users", users, cx))
+        .into_any_element()
+}
+
+fn home(
+    w: &RodhareistEditorWindow,
+    p: &Params,
+    name_field: AnyElement,
+    cx: &mut Cx,
+    s: f32,
+) -> Vec<AnyElement> {
     let current = w.preset_status();
     let presets = rodharerist::factory_presets();
     let rows: Vec<AnyElement> = presets
@@ -1569,45 +1958,17 @@ fn home(w: &RodhareistEditorWindow, p: &Params, cx: &mut Cx, s: f32) -> Vec<AnyE
             )
         })
         .collect();
-    let user_list = if user_rows.is_empty() {
-        vec![words("No saved presets", 12.0, SOFT, s).into_any_element()]
-    } else {
-        user_rows
-    };
+    let user_count = user_rows.len();
+    let tab = w.ui.preset_tab;
     let note = w.preset_note().unwrap_or("").to_string();
     let has_note = !note.is_empty();
     let mut list = section(s, 6.0, 262.0)
         .p(px(12.0 * s))
-        .gap(px(4.0 * s))
+        .gap(px(6.0 * s))
         .child(heading("Presets", s))
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(6.0 * s))
-                .child(preset_name_field(w, cx, s))
-                .child(
-                    div()
-                        .id("rodhareist-save-preset")
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .h(px(32.0 * s))
-                        .px(px(10.0 * s))
-                        .rounded(px(3.0 * s))
-                        .border(px(1.0))
-                        .border_color(color(0x454545))
-                        .bg(color(0x2a2a2a))
-                        .cursor(gpui::CursorStyle::PointingHand)
-                        .hover(|style| style.bg(color(0x2e2e2e)))
-                        .child(words("Save", 13.0, WHITE, s))
-                        .tooltip(fb_tooltip("Writes a .pst under the name in the field"))
-                        .on_click(w.save_user_preset_cb(cx)),
-                ),
-        )
-        .child(heading("Factory", s).mt(px(4.0 * s)))
-        .child(
+        .child(preset_tabs(tab, presets.len(), user_count, cx, s));
+    list = match tab {
+        PresetTab::Factory => list.child(
             div()
                 .id("rodhareist-factory-presets")
                 .flex_1()
@@ -1617,19 +1978,55 @@ fn home(w: &RodhareistEditorWindow, p: &Params, cx: &mut Cx, s: f32) -> Vec<AnyE
                 .gap(px(4.0 * s))
                 .overflow_y_scroll()
                 .children(rows),
-        )
-        .child(heading("User", s).mt(px(4.0 * s)))
-        .child(
-            div()
-                .id("rodhareist-user-presets")
-                .flex_1()
-                .min_h(px(0.0))
-                .flex()
-                .flex_col()
-                .gap(px(4.0 * s))
-                .overflow_y_scroll()
-                .children(user_list),
-        );
+        ),
+        PresetTab::Users => {
+            let user_list = if user_rows.is_empty() {
+                vec![
+                    words("No saved presets yet.", 12.5, SOFT, s).into_any_element(),
+                    words("Name the rig above and press Save.", 12.0, FAINT, s).into_any_element(),
+                ]
+            } else {
+                user_rows
+            };
+            list.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0 * s))
+                    .child(preset_name_field(name_field, s))
+                    .child(
+                        div()
+                            .id("rodhareist-save-preset")
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .h(px(32.0 * s))
+                            .px(px(10.0 * s))
+                            .rounded(px(3.0 * s))
+                            .border(px(1.0))
+                            .border_color(color(0x454545))
+                            .bg(color(0x2a2a2a))
+                            .cursor(gpui::CursorStyle::PointingHand)
+                            .hover(|style| style.bg(color(0x2e2e2e)))
+                            .child(words("Save", 13.0, WHITE, s))
+                            .tooltip(fb_tooltip("Writes a .pst under the name in the field"))
+                            .on_click(w.save_user_preset_cb(cx)),
+                    ),
+            )
+            .child(
+                div()
+                    .id("rodhareist-user-presets")
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0 * s))
+                    .overflow_y_scroll()
+                    .children(user_list),
+            )
+        }
+    };
     if has_note {
         list = list.child(words(note, 12.0, ACCENT, s));
     }
@@ -2041,6 +2438,7 @@ fn explore(
     w: &RodhareistEditorWindow,
     p: &Params,
     focus: ChainFocus,
+    search_field: AnyElement,
     cx: &mut Cx,
     s: f32,
 ) -> Vec<AnyElement> {
@@ -2090,7 +2488,7 @@ fn explore(
         );
 
     let target = focus_slot(&p.stage_order, focus);
-    let query = w.ui.query.trim().to_lowercase();
+    let query = w.search.value.trim().to_lowercase();
     let matches: Vec<Entry> = all
         .into_iter()
         .filter(|e| current.is_none_or(|family| Family::of(e.category) == family))
@@ -2127,36 +2525,13 @@ fn explore(
         grid = grid.child(words("No block matches the search.", 13.0, SOFT, s));
     }
 
-    let focused = w.ui.search_focus;
     let search = div()
-        .id("rodhareist-search")
         .flex()
-        .flex_row()
         .items_center()
         .flex_1()
+        .min_w(px(0.0))
         .h(px(30.0 * s))
-        .px(px(10.0 * s))
-        .rounded(px(3.0 * s))
-        .border(px(1.0))
-        .border_color(if focused { accent() } else { color(0x4a4a4a) })
-        .bg(color(0x1f1f1f))
-        .cursor(gpui::CursorStyle::IBeam)
-        .child(if w.ui.query.is_empty() && !focused {
-            words("Search blocks", 13.0, FAINT, s).into_any_element()
-        } else {
-            words(
-                format!("{}{}", w.ui.query, if focused { "|" } else { "" }),
-                13.0,
-                WHITE,
-                s,
-            )
-            .into_any_element()
-        })
-        .on_click(act(cx, |this, cx| {
-            this.ui.preset_name_focus = false;
-            this.ui.search_focus = true;
-            cx.notify();
-        }));
+        .child(search_field);
     let library = section(s, 274.0, 743.0)
         .px(px(16.0 * s))
         .py(px(14.0 * s))
@@ -2451,6 +2826,10 @@ fn block_card(
     cx: &mut Cx,
     s: f32,
 ) -> AnyElement {
+    // A capture is a file, a tone stack and four trims: its own layout.
+    if kind == StageKind::Amp && p.tone_engine == ToneEngineKind::NamCapture {
+        return nam_card(w, p, cx, s);
+    }
     let family = Family::of(Category::of(kind));
     let ink = color(family.color());
     let on = blocks::is_on(p, kind);
@@ -2474,30 +2853,9 @@ fn block_card(
         .collect();
 
     // Which send row the block sits on, the side of the path it runs on,
-    // the cabinet's microphone and IR, and the amp's NAM capture.
+    // and the cabinet's microphone and IR.
     let mut extras: Vec<AnyElement> = Vec::new();
-    let row_now = (p.stage_row[kind as usize] as usize).min(3);
-    extras.push(
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(6.0 * s))
-            .child(caption("Row", 10.5, 0.1, SOFT, s).mr(px(4.0 * s)))
-            .children((0..4).map(|row| {
-                plate::pill(
-                    ("rodhareist-block-row", row),
-                    ["1", "2", "3", "4"][row],
-                    row_now == row,
-                    accent(),
-                    plate::PillLook::words(28.0, 12.0, 12.5),
-                    true,
-                    s,
-                    w.set_cb(cx, kind.row_id(), row as f32),
-                )
-            }))
-            .into_any_element(),
-    );
+    extras.push(lane_pills(w, p, kind, cx, s));
     if let (Some(current), Some(id)) = (blocks::channel(p, kind), kind.channel_id()) {
         extras.push(
             div()
@@ -2565,70 +2923,7 @@ fn block_card(
             }
         }
     }
-    if kind == StageKind::Amp && p.tone_engine == ToneEngineKind::NamCapture {
-        // The capture and its loudness share one row, under the knobs.
-        extras.push(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(6.0 * s))
-                .child(load_row(
-                    "rodhareist-load-nam",
-                    "Load capture\u{2026}",
-                    w.nam_loaded_info(),
-                    w.nam_loading(),
-                    w.nam_error(),
-                    w.load_nam_cb(cx),
-                    220.0,
-                    s,
-                ))
-                .child(
-                    div()
-                        .w(px(1.0))
-                        .h(px(20.0 * s))
-                        .mx(px(12.0 * s))
-                        .bg(color(0x454545)),
-                )
-                .child(caption("Loudness", 10.5, 0.1, SOFT, s).mr(px(4.0 * s)))
-                .child(plate::pill(
-                    "rodhareist-nam-raw",
-                    "Raw",
-                    !p.nam_loudness_norm,
-                    accent(),
-                    plate::PillLook::words(28.0, 10.0, 12.5),
-                    true,
-                    s,
-                    w.set_cb(cx, "nam_loudness_norm", 0.0),
-                ))
-                .child(plate::pill(
-                    "rodhareist-nam-norm",
-                    "Normalized",
-                    p.nam_loudness_norm,
-                    accent(),
-                    plate::PillLook::words(28.0, 10.0, 12.5),
-                    true,
-                    s,
-                    w.set_cb(cx, "nam_loudness_norm", 1.0),
-                ))
-                .into_any_element(),
-        );
-    }
-
-    let mut led =
-        div()
-            .size(px(12.0 * s))
-            .rounded_full()
-            .bg(if on { ink } else { color(0x3a3a3a) });
-    if on {
-        led = led.shadow(vec![gpui::BoxShadow {
-            color: ink.into(),
-            offset: gpui::point(px(0.0), px(0.0)),
-            blur_radius: px(12.0 * s),
-            spread_radius: px(0.0),
-            inset: false,
-        }]);
-    }
+    let led = card_led(on, ink, s);
     let name = blocks::model_name(p, kind).unwrap_or("No amp");
     // A smaller footswitch when the card is full, so it stays inside it.
     let switch = if dense || extras.len() > 1 {
@@ -2711,6 +3006,301 @@ fn block_card(
                         s,
                     )
                     .font_weight(FontWeight::SEMIBOLD),
+                ),
+        )
+        .into_any_element()
+}
+
+/// A card's on/off lamp, glowing in the family colour while on.
+fn card_led(on: bool, ink: Rgba, s: f32) -> gpui::Div {
+    let led = div()
+        .size(px(12.0 * s))
+        .rounded_full()
+        .bg(if on { ink } else { color(0x3a3a3a) });
+    if !on {
+        return led;
+    }
+    led.shadow(vec![gpui::BoxShadow {
+        color: ink.into(),
+        offset: gpui::point(px(0.0), px(0.0)),
+        blur_radius: px(12.0 * s),
+        spread_radius: px(0.0),
+        inset: false,
+    }])
+}
+
+/// The lane a block runs on. Moving it settles the lane sends the same way
+/// a drag does, so a block never lands on a lane that is switched off.
+fn lane_pills(
+    w: &RodhareistEditorWindow,
+    p: &Params,
+    kind: StageKind,
+    cx: &mut Cx,
+    s: f32,
+) -> AnyElement {
+    let row_now = (p.stage_row[kind as usize] as usize).min(3);
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.0 * s))
+        .child(caption("Lane", 10.5, 0.1, SOFT, s).mr(px(4.0 * s)))
+        .children((0..4).map(|row| {
+            plate::pill(
+                ("rodhareist-block-row", row),
+                ["1", "2", "3", "4"][row],
+                row_now == row,
+                accent(),
+                plate::PillLook::words(28.0, 12.0, 12.5),
+                true,
+                s,
+                w.chain_edit_cb(
+                    cx,
+                    move |p| move_to_lane(p, kind, row as u8),
+                    ChainFocus::Block(kind),
+                ),
+            )
+        }))
+        .into_any_element()
+}
+
+/// The amp running a NAM capture. Three plain bands, top to bottom: the
+/// capture file with its loudness, the knobs in two labelled groups (the
+/// tone stack and the capture's own levels), then lane and bypass.
+fn nam_card(w: &RodhareistEditorWindow, p: &Params, cx: &mut Cx, s: f32) -> AnyElement {
+    let kind = StageKind::Amp;
+    let family = Family::Amp;
+    let ink = color(family.color());
+    let on = blocks::is_on(p, kind);
+    let values: std::collections::HashMap<&'static str, f32> =
+        rodharerist::ui_values(p).into_iter().collect();
+    let (levels, tone): (Vec<ParamSpec>, Vec<ParamSpec>) = blocks::params(p, kind)
+        .into_iter()
+        .partition(|spec| spec.id.starts_with("nam_"));
+    const KNOB: f32 = 44.0;
+    const CELL: f32 = 62.0;
+    let knobs = |specs: Vec<ParamSpec>, cx: &mut Cx| -> Vec<AnyElement> {
+        specs
+            .into_iter()
+            .map(|mut spec| {
+                // Under the "Capture" heading the prefix only repeats it.
+                spec.label = match spec.id {
+                    "nam_input_trim" => "In",
+                    "nam_output_trim" => "Out",
+                    "nam_mix" => "Mix",
+                    "nam_slim_size" => "Slim",
+                    _ => spec.label,
+                };
+                let value = values.get(spec.id).copied().unwrap_or(spec.min);
+                block_knob(cx, spec, value, ink, KNOB, CELL, s)
+            })
+            .collect()
+    };
+    let tone_knobs = knobs(tone, cx);
+    let level_knobs = knobs(levels, cx);
+    let group = |title: &str, cells: Vec<AnyElement>| {
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(8.0 * s))
+            .child(caption(title, 10.5, 0.12, SOFT, s))
+            .child(div().flex().flex_row().gap(px(2.0 * s)).children(cells))
+    };
+
+    // The file band: what is loaded, how loud it plays, and the button.
+    let loaded = w.nam_loaded_info();
+    let has_capture = loaded.is_some();
+    let (status, status_ink) = if w.nam_loading() {
+        ("Loading\u{2026}".to_string(), SOFT)
+    } else if let Some(error) = w.nam_error() {
+        (error, ACCENT)
+    } else if has_capture {
+        ("Capture loaded".to_string(), SOFT)
+    } else {
+        ("Load a .nam file from Neural Amp Modeler".to_string(), SOFT)
+    };
+    let mut load = div()
+        .id("rodhareist-load-nam")
+        .flex()
+        .items_center()
+        .flex_shrink_0()
+        .h(px(32.0 * s))
+        .px(px(14.0 * s))
+        .rounded(px(3.0 * s))
+        .border(px(1.0))
+        .border_color(accent())
+        .bg(color(0x1f1f1f))
+        .text_size(type_px(13.0, s))
+        .text_color(color(WHITE))
+        .child(if has_capture {
+            "Replace\u{2026}"
+        } else {
+            "Load capture\u{2026}"
+        });
+    if !w.nam_loading() {
+        load = load
+            .cursor(gpui::CursorStyle::PointingHand)
+            .hover(|style| style.bg(color(0x2e2e2e)))
+            .on_click(w.load_nam_cb(cx));
+    }
+    let loudness = div()
+        .id("rodhareist-nam-loudness")
+        .flex()
+        .flex_row()
+        .items_center()
+        .flex_shrink_0()
+        .gap(px(4.0 * s))
+        .child(plate::pill(
+            "rodhareist-nam-raw",
+            "Raw",
+            !p.nam_loudness_norm,
+            accent(),
+            plate::PillLook::words(28.0, 10.0, 12.5),
+            true,
+            s,
+            w.set_cb(cx, "nam_loudness_norm", 0.0),
+        ))
+        .child(plate::pill(
+            "rodhareist-nam-norm",
+            "Normalized",
+            p.nam_loudness_norm,
+            accent(),
+            plate::PillLook::words(28.0, 10.0, 12.5),
+            true,
+            s,
+            w.set_cb(cx, "nam_loudness_norm", 1.0),
+        ))
+        .tooltip(fb_tooltip(
+            "Normalized evens out captures recorded at different levels",
+        ));
+    let file = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(14.0 * s))
+        .h(px(60.0 * s))
+        .px(px(14.0 * s))
+        .rounded(px(6.0 * s))
+        .bg(color(0x222222))
+        .border(px(1.0))
+        .border_color(color(if has_capture { 0x4a4a4a } else { 0x3a3a3a }))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .flex_shrink_0()
+                .size(px(36.0 * s))
+                .rounded(px(4.0 * s))
+                .bg(color(0x1a1a1a))
+                .child(icon(
+                    family.icon(),
+                    (24.0, 24.0),
+                    (20.0, 20.0),
+                    1.6,
+                    if has_capture { ink } else { color(FAINT) },
+                    s,
+                )),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w(px(0.0))
+                .gap(px(2.0 * s))
+                .child(
+                    words(
+                        loaded.unwrap_or_else(|| "No capture".to_string()),
+                        16.0,
+                        if has_capture { WHITE } else { PALE },
+                        s,
+                    )
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .truncate(),
+                )
+                .child(words(status, 12.0, status_ink, s).truncate()),
+        )
+        .child(loudness)
+        .child(load);
+
+    let name = blocks::model_name(p, kind).unwrap_or("NAM Capture");
+    tile(s)
+        .relative()
+        .size_full()
+        .rounded(px(8.0 * s))
+        .overflow_hidden()
+        .child(top_strip(family.color(), 4.0, 8.0, s))
+        .px(px(22.0 * s))
+        .py(px(18.0 * s))
+        .flex()
+        .flex_col()
+        .justify_between()
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_start()
+                .justify_between()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.0 * s))
+                        .opacity(if on { 1.0 } else { 0.6 })
+                        .child(words(name, 26.0, WHITE, s).font_weight(FontWeight::SEMIBOLD))
+                        .child(words(model_desc(name), 13.0, PALE, s)),
+                )
+                .child(card_led(on, ink, s)),
+        )
+        .child(file)
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_start()
+                .justify_center()
+                .gap(px(18.0 * s))
+                .opacity(if on { 1.0 } else { 0.6 })
+                .child(group("Tone", tone_knobs))
+                .child(div().w(px(1.0)).h(px(96.0 * s)).bg(color(0x3a3a3a)))
+                .child(group("Capture", level_knobs)),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .child(lane_pills(w, p, kind, cx, s))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(10.0 * s))
+                        .child(
+                            words(
+                                plate::tracked(if on { "On" } else { "Bypassed" }, 0.1),
+                                12.0,
+                                if on { WHITE } else { SOFT },
+                                s,
+                            )
+                            .font_weight(FontWeight::SEMIBOLD),
+                        )
+                        .child(
+                            div()
+                                .id("rodhareist-block-bypass")
+                                .size(px(40.0 * s))
+                                .rounded_full()
+                                .bg(color(0x1a1a1a))
+                                .border(px(3.0 * s))
+                                .border_color(color(if on { 0x6a6a6a } else { 0x4a4a4a }))
+                                .cursor(gpui::CursorStyle::PointingHand)
+                                .hover(|style| style.border_color(color(0x8a8a8a)))
+                                .on_click(w.toggle_cb(cx, blocks::enable_id(kind))),
+                        ),
                 ),
         )
         .into_any_element()
@@ -3116,6 +3706,8 @@ fn settings_row(index: usize, row: Row, cx: &mut Cx, s: f32) -> AnyElement {
 
 pub(crate) fn rodhareist_panel(
     w: &RodhareistEditorWindow,
+    frame: &ChainFrame,
+    fields: RodFields,
     window: &Window,
     cx: &mut Cx,
 ) -> AnyElement {
@@ -3123,10 +3715,10 @@ pub(crate) fn rodhareist_panel(
     let s = plate_scale((f32::from(viewport.width), f32::from(viewport.height)));
     let p = w.params_snapshot();
     let focus = resolve_focus(&p.stage_order, w.chain_focus);
-    let mut children = vec![display(w, &p, focus, cx, s)];
+    let mut children = vec![display(w, &p, focus, frame, cx, s)];
     children.extend(match w.ui.page {
-        Page::Home => home(w, &p, cx, s),
-        Page::Explore => explore(w, &p, focus, cx, s),
+        Page::Home => home(w, &p, fields.preset_name, cx, s),
+        Page::Explore => explore(w, &p, focus, fields.search, cx, s),
         Page::Pedalboard => pedalboard(w, &p, focus, cx, s),
         Page::Settings => settings(w, &p, cx, s),
     });
@@ -3214,18 +3806,83 @@ mod tests {
     }
 
     #[test]
-    fn an_unused_rig_offers_two_lanes_and_four_still_fit() {
+    fn an_unused_rig_shows_one_lane_and_four_still_fit() {
         let p = rodharerist::default_params();
-        assert_eq!(lane_count(&p), 2);
+        assert_eq!(lane_count(&p), 1);
+        assert_eq!(target_look(&p, false).lanes, 1);
+        // A drag opens the next lane as a drop target.
+        assert_eq!(target_look(&p, true).lanes, 2);
         let two = lane_geom(2, 7);
         assert!(two.size >= 48.0);
         assert!(LANE_TOP + 2.0 * two.lane_h <= LANE_BOTTOM + 0.01);
         let mut parked = p.clone();
         parked.stage_row[StageKind::Delay as usize] = 3;
         assert_eq!(lane_count(&parked), 4);
+        assert_eq!(target_look(&parked, true).lanes, 4);
         let four = lane_geom(4, 7);
         assert!(four.size + 6.0 <= four.lane_h);
         assert!(LANE_TOP + 4.0 * four.lane_h <= LANE_BOTTOM + 0.01);
+    }
+
+    #[test]
+    fn a_block_dropped_on_a_closed_lane_opens_it_and_the_last_one_out_closes_it() {
+        let mut p = rodharerist::default_params();
+        assert_eq!(p.row_send[0], RowSend::Off);
+        move_to_lane(&mut p, StageKind::Delay, 1);
+        assert_eq!(p.stage_row[StageKind::Delay as usize], 1);
+        assert_eq!(
+            p.row_send[0],
+            RowSend::Parallel,
+            "an Off lane would mute it"
+        );
+        assert_eq!(lane_count(&p), 2);
+
+        // A mode the player chose stays while the lane has blocks.
+        p.row_send[0] = RowSend::WetDryWet;
+        move_to_lane(&mut p, StageKind::Reverb, 1);
+        assert_eq!(p.row_send[0], RowSend::WetDryWet);
+        move_to_lane(&mut p, StageKind::Reverb, 0);
+        assert_eq!(p.row_send[0], RowSend::WetDryWet);
+
+        move_to_lane(&mut p, StageKind::Delay, 0);
+        assert_eq!(p.row_send[0], RowSend::Off);
+        assert_eq!(lane_count(&p), 1);
+    }
+
+    #[test]
+    fn a_chain_change_glides_from_where_the_blocks_were_drawn() {
+        let mut ui = RodUi::default();
+        let mut p = rodharerist::default_params();
+        let t0 = Instant::now();
+        // The first frame has nothing to move from.
+        let (rest, moving) = chain_frame(&mut ui, &p, t0);
+        assert!(!moving);
+        let at = |look: &ChainLook, kind| {
+            look.blocks
+                .iter()
+                .find(|entry| entry.0 == kind)
+                .map(|entry| (entry.2, entry.3))
+                .unwrap()
+        };
+        let start = at(&rest.look, StageKind::Delay);
+
+        move_to_lane(&mut p, StageKind::Delay, 1);
+        let (first, moving) = chain_frame(&mut ui, &p, t0);
+        assert!(moving);
+        assert_eq!(at(&first.look, StageKind::Delay), start);
+        assert!(first.changed_lane.contains(&StageKind::Delay));
+        assert_eq!(first.lane_alpha(1), 0.0, "the new lane fades in");
+
+        let (mid, moving) = chain_frame(&mut ui, &p, t0 + CHAIN_MOTION / 2);
+        assert!(moving);
+        let end = at(&target_look(&p, false), StageKind::Delay);
+        let (_, mid_top) = at(&mid.look, StageKind::Delay);
+        assert!(mid_top > start.1 && mid_top < end.1 || mid_top < start.1 && mid_top > end.1);
+
+        let (done, moving) = chain_frame(&mut ui, &p, t0 + CHAIN_MOTION);
+        assert!(!moving);
+        assert_eq!(at(&done.look, StageKind::Delay), end);
+        assert!(ui.chain_motion.is_none());
     }
 
     #[test]

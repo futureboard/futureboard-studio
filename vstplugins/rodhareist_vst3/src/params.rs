@@ -1,0 +1,599 @@
+//! Host parameters: one per Rodhareist wire id.
+//!
+//! Generated from the core's own tables rather than written out field by
+//! field: `rodharerist::UI_PARAM_IDS` names every parameter (and the order the
+//! DSP needs them replayed in), `descriptor()` and the editor's block model
+//! give ranges, units and labels, and `ui_values(&default_params())` gives
+//! defaults. The host-facing id of each parameter is its wire id, so
+//! automation and saved sessions use the names Studio's projects use.
+
+use std::sync::{Arc, RwLock};
+
+use nih_plug::prelude::*;
+use nih_plug_gpui::EditorContext;
+use rodharerist::{
+    AmpModel, CabModel, DelayModel, DriveModel, EqModel, MicModel, ModModel, ReverbModel,
+    StageChannel, StageKind, ToneEngineKind, WahModel, PATH_SLOTS, UI_PARAM_IDS,
+};
+
+use crate::components::rodhareist_blocks::{self as blocks, ParamSpec};
+
+/// The wire id that is an action rather than state; never a host parameter.
+pub const CLEAR_CLIP: &str = "clear_clip";
+
+#[derive(Params)]
+pub struct RodhareistParams {
+    /// The `.nam` capture the amp's NAM engine runs: a file name in
+    /// `Documents/Futureboard Studio/Rodhareist/NAMs`, as Studio saves it.
+    #[persist = "nam-file"]
+    pub nam_file: Arc<RwLock<Option<String>>>,
+
+    /// The `.wav` impulse response the cabinet convolves with: a file name in
+    /// `Documents/Futureboard Studio/Rodhareist/IRs`.
+    #[persist = "ir-file"]
+    pub ir_file: Arc<RwLock<Option<String>>>,
+
+    #[nested]
+    pub wire: WireParams,
+}
+
+impl Default for RodhareistParams {
+    fn default() -> Self {
+        Self {
+            nam_file: Arc::new(RwLock::new(None)),
+            ir_file: Arc::new(RwLock::new(None)),
+            wire: WireParams::new(),
+        }
+    }
+}
+
+impl RodhareistParams {
+    pub fn nam_file(&self) -> Option<String> {
+        self.nam_file
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn ir_file(&self) -> Option<String> {
+        self.ir_file
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn set_nam_file(&self, name: Option<String>) {
+        *self.nam_file.write().unwrap_or_else(|e| e.into_inner()) = name;
+    }
+
+    pub fn set_ir_file(&self, name: Option<String>) {
+        *self.ir_file.write().unwrap_or_else(|e| e.into_inner()) = name;
+    }
+
+    /// The core params the host values describe, with the files they name:
+    /// what the editor shows. Not for the audio thread (it clones strings).
+    pub fn to_core_params_with_files(&self) -> rodharerist::Params {
+        let mut params = self.wire.to_core_params();
+        params.nam_file = self.nam_file();
+        params.ir_file = self.ir_file();
+        params
+    }
+
+    /// An editor edit by wire index: one complete gesture, so the host
+    /// records it. `clear_clip` is an action and has no parameter; the caller
+    /// handles it.
+    pub fn set_from_editor(&self, context: &EditorContext, index: u32, value: f32) {
+        let Some(id) = rodharerist::ui_param_id(index) else {
+            return;
+        };
+        let Some(entry) = self.wire.get(id) else {
+            return;
+        };
+        let setter = context.setter();
+        entry.param.begin(&setter);
+        entry.param.set_plain(&setter, value);
+        entry.param.end(&setter);
+    }
+}
+
+/// What a wire parameter is, as far as the processor cares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntryKind {
+    /// Routed to the DSP with `Dsp::apply_ui_param`.
+    Value,
+    /// One slot of the signal path; applied as a whole order with
+    /// `Dsp::set_path_order`.
+    PathSlot(usize),
+}
+
+pub enum WireParam {
+    Float(FloatParam),
+    Int(IntParam),
+    Bool(BoolParam),
+}
+
+pub struct WireEntry {
+    /// Wire id, shared with the DSP and Studio's project format.
+    pub id: &'static str,
+    pub kind: EntryKind,
+    pub param: WireParam,
+}
+
+/// Every wire parameter, in `UI_PARAM_IDS` order (minus `clear_clip`).
+///
+/// Built once and never resized: the host holds raw pointers into it (see
+/// [`Params::param_map`]), so the entries must not move.
+pub struct WireParams {
+    entries: Box<[WireEntry]>,
+}
+
+impl WireParams {
+    fn new() -> Self {
+        let defaults = rodharerist::ui_values(&rodharerist::default_params());
+        let specs = block_specs();
+        let entries = UI_PARAM_IDS
+            .iter()
+            .filter(|id| **id != CLEAR_CLIP)
+            .map(|&id| {
+                let default = defaults
+                    .iter()
+                    .find(|(d, _)| *d == id)
+                    .map(|(_, v)| *v)
+                    .unwrap_or_else(|| panic!("no default for wire id `{id}`"));
+                build_entry(id, default, &specs)
+            })
+            .collect();
+        Self { entries }
+    }
+
+    pub fn entries(&self) -> &[WireEntry] {
+        &self.entries
+    }
+
+    /// Position of `id` in [`Self::entries`]. Linear scan: setup and GUI only.
+    pub fn index_of(&self, id: &str) -> Option<usize> {
+        self.entries.iter().position(|e| e.id == id)
+    }
+
+    pub fn get(&self, id: &str) -> Option<&WireEntry> {
+        self.entries.iter().find(|e| e.id == id)
+    }
+
+    /// Every value in entry order, for the editor to see what moved.
+    pub fn values(&self) -> Vec<f32> {
+        self.entries.iter().map(|e| e.param.plain()).collect()
+    }
+
+    /// The core parameter set these host values describe: the defaults with
+    /// every wire value replayed over them in table order, the property
+    /// `rodharerist`'s own state restore relies on.
+    pub fn to_core_params(&self) -> rodharerist::Params {
+        let mut p = rodharerist::default_params();
+        for e in self.entries.iter() {
+            rodharerist::apply_to_params(&mut p, e.id, e.param.plain());
+        }
+        p
+    }
+}
+
+unsafe impl Params for WireParams {
+    fn param_map(&self) -> Vec<(String, ParamPtr, String)> {
+        self.entries
+            .iter()
+            .map(|e| (e.id.to_string(), e.param.ptr(), describe(e.id).0))
+            .collect()
+    }
+}
+
+impl WireParam {
+    /// The current plain value in the core's units (bools as 0/1, choices as
+    /// their index). Lock- and allocation-free.
+    #[inline]
+    pub fn plain(&self) -> f32 {
+        match self {
+            WireParam::Float(p) => p.value(),
+            WireParam::Int(p) => p.value() as f32,
+            WireParam::Bool(p) => f32::from(u8::from(p.value())),
+        }
+    }
+
+    pub fn ptr(&self) -> ParamPtr {
+        match self {
+            WireParam::Float(p) => p.as_ptr(),
+            WireParam::Int(p) => p.as_ptr(),
+            WireParam::Bool(p) => p.as_ptr(),
+        }
+    }
+
+    fn begin(&self, setter: &ParamSetter) {
+        match self {
+            WireParam::Float(p) => setter.begin_set_parameter(p),
+            WireParam::Int(p) => setter.begin_set_parameter(p),
+            WireParam::Bool(p) => setter.begin_set_parameter(p),
+        }
+    }
+
+    fn set_plain(&self, setter: &ParamSetter, value: f32) {
+        match self {
+            WireParam::Float(p) => setter.set_parameter(p, value),
+            WireParam::Int(p) => setter.set_parameter(p, value.round() as i32),
+            WireParam::Bool(p) => setter.set_parameter(p, value >= 0.5),
+        }
+    }
+
+    fn end(&self, setter: &ParamSetter) {
+        match self {
+            WireParam::Float(p) => setter.end_set_parameter(p),
+            WireParam::Int(p) => setter.end_set_parameter(p),
+            WireParam::Bool(p) => setter.end_set_parameter(p),
+        }
+    }
+}
+
+fn is_toggle(id: &str) -> bool {
+    id == "power" || id == "nam_loudness_norm" || id.ends_with("_on")
+}
+
+fn path_slot(id: &str) -> Option<usize> {
+    id.strip_prefix("path_slot_")?
+        .parse()
+        .ok()
+        .filter(|slot| *slot < PATH_SLOTS)
+}
+
+fn labels<T: Copy>(all: &[T], label: fn(T) -> &'static str) -> Vec<&'static str> {
+    all.iter().map(|m| label(*m)).collect()
+}
+
+/// `ToneEngineKind` in wire order (the core has no `ALL` for it).
+const TONE_ENGINES: &[ToneEngineKind] = &[
+    ToneEngineKind::Classic,
+    ToneEngineKind::NamCapture,
+    ToneEngineKind::Bypass,
+];
+
+fn tone_engine_label(engine: ToneEngineKind) -> &'static str {
+    match engine {
+        ToneEngineKind::Classic => "Amp model",
+        ToneEngineKind::NamCapture => "NAM capture",
+        ToneEngineKind::Bypass => "Off",
+    }
+}
+
+/// The display names of a select's indices, if `id` is one.
+pub fn choice_labels(id: &str) -> Option<Vec<&'static str>> {
+    if id.ends_with("_row") {
+        return Some(vec!["Lane 1", "Lane 2", "Lane 3", "Lane 4"]);
+    }
+    if id.ends_with("_channel") {
+        return Some(labels(StageChannel::ALL, blocks::channel_label));
+    }
+    if id.starts_with("row_send_") {
+        return Some(vec!["Off", "Serial", "Parallel", "Wet/Dry/Wet"]);
+    }
+    Some(match id {
+        "drive_model" | "drive2_model" => labels(DriveModel::ALL, blocks::drive_model_label),
+        "amp_model" => labels(AmpModel::ALL, blocks::amp_model_label),
+        "cab_model" => labels(CabModel::ALL, blocks::cab_model_label),
+        "cab_mic_type" => labels(MicModel::ALL, blocks::mic_model_label),
+        "mod_model" | "mod2_model" => labels(ModModel::ALL, blocks::mod_model_label),
+        "wah_model" => labels(WahModel::ALL, blocks::wah_model_label),
+        "eq_model" | "eq2_model" => labels(EqModel::ALL, blocks::eq_model_label),
+        "reverb_model" => labels(ReverbModel::ALL, blocks::reverb_model_label),
+        "delay_model" | "delay2_model" => labels(DelayModel::ALL, blocks::delay_model_label),
+        "tone_engine" => labels(TONE_ENGINES, tone_engine_label),
+        "line2_mode" => vec!["Wet", "Dry", "Wet/Dry/Wet"],
+        _ => return None,
+    })
+}
+
+/// Every block knob the editor can show, from the block model over the
+/// variants that add rows (the NAM capture's trims, the Stereo delays'
+/// right side), keyed by `(block, spec)`.
+fn block_specs() -> Vec<(StageKind, ParamSpec)> {
+    let base = rodharerist::default_params();
+    let mut nam = base.clone();
+    nam.tone_engine = ToneEngineKind::NamCapture;
+    let mut stereo = base.clone();
+    stereo.delay_model = DelayModel::Stereo;
+    stereo.stage_b.delay_model = DelayModel::Stereo;
+    let mut specs: Vec<(StageKind, ParamSpec)> = Vec::new();
+    for p in [&base, &nam, &stereo] {
+        for &kind in StageKind::ALL {
+            for spec in blocks::params(p, kind) {
+                if !specs.iter().any(|(_, known)| known.id == spec.id) {
+                    specs.push((kind, spec));
+                }
+            }
+        }
+    }
+    specs
+}
+
+/// The spec of a continuous parameter: the block model's, else a global trim,
+/// else the descriptor's (a second instance falls back to its first's).
+fn spec_of(id: &'static str, specs: &[(StageKind, ParamSpec)]) -> Option<ParamSpec> {
+    if let Some((_, spec)) = specs.iter().find(|(_, spec)| spec.id == id) {
+        return Some(*spec);
+    }
+    if let Some(spec) = blocks::trim_spec(id, "") {
+        return Some(spec);
+    }
+    let descriptor = rodharerist::descriptor();
+    let find = |key: &str| {
+        descriptor
+            .params
+            .iter()
+            .find(|d| d.id == key)
+            .map(|d| (d.min, d.max, d.unit))
+    };
+    let (min, max, unit) = find(id).or_else(|| find(&id.replacen("2_", "_", 1)))?;
+    Some(ParamSpec {
+        id,
+        label: "",
+        min,
+        max,
+        unit,
+        inactive: false,
+    })
+}
+
+/// `(group, label)` a host shows for a wire id. The group is the block name,
+/// so a host's parameter list reads like the editor.
+pub fn describe(id: &str) -> (String, String) {
+    let global = |label: &str| ("Global".to_string(), label.to_string());
+    match id {
+        "power" => return global("Power"),
+        "input_trim" => return global("Input"),
+        "output_trim" => return global("Output"),
+        "tuner_on" => return global("Tuner"),
+        "tone_engine" => return ("Amp".into(), "Engine".into()),
+        "cab_mic_type" => return ("Cab".into(), "Microphone".into()),
+        "nam_loudness_norm" => return ("Amp".into(), "Capture Normalized".into()),
+        "line2_mode" => return ("Lanes".into(), "Lane 1 Mode".into()),
+        "line2_mix" => return ("Lanes".into(), "Lane 1 Send".into()),
+        _ => {}
+    }
+    if let Some(n) = id.strip_prefix("row_send_") {
+        let lane = n.parse::<usize>().map_or(0, |n| n + 1);
+        return ("Lanes".into(), format!("Lane {lane} Mode"));
+    }
+    if let Some(n) = id.strip_prefix("row_level_") {
+        let lane = n.parse::<usize>().map_or(0, |n| n + 1);
+        return ("Lanes".into(), format!("Lane {lane} Send"));
+    }
+    if let Some(slot) = path_slot(id) {
+        return ("Signal Path".into(), format!("Slot {}", slot + 1));
+    }
+    let defaults = rodharerist::default_params();
+    let specs = block_specs();
+    for &kind in StageKind::ALL {
+        let block = blocks::block_name(kind).to_string();
+        if blocks::enable_id(kind) == id {
+            return (block, "On".into());
+        }
+        if kind.row_id() == id {
+            return (block, "Lane".into());
+        }
+        if kind.channel_id() == Some(id) {
+            return (block, "Channel".into());
+        }
+        if let Some((_, spec)) = specs.iter().find(|(k, spec)| *k == kind && spec.id == id) {
+            return (block, spec.label.into());
+        }
+        if blocks::models(&defaults, kind)
+            .0
+            .iter()
+            .any(|m| m.wire_id == id)
+        {
+            return (block, "Model".into());
+        }
+    }
+    ("Other".into(), id.into())
+}
+
+fn host_name(id: &str) -> String {
+    let (group, label) = describe(id);
+    if group == "Global" {
+        label
+    } else {
+        format!("{group} {label}")
+    }
+}
+
+/// Leading number of a typed value, honouring a `k` multiplier ("2.4 kHz").
+fn parse_number(text: &str) -> Option<f32> {
+    let text = text.trim();
+    let end = text
+        .char_indices()
+        .find(|(i, c)| !(c.is_ascii_digit() || *c == '.' || (*i == 0 && (*c == '-' || *c == '+'))))
+        .map(|(i, _)| i)
+        .unwrap_or(text.len());
+    let value: f32 = text[..end].parse().ok()?;
+    let rest = text[end..].trim_start();
+    Some(if rest.starts_with('k') || rest.starts_with('K') {
+        value * 1000.0
+    } else {
+        value
+    })
+}
+
+fn build_entry(id: &'static str, default: f32, specs: &[(StageKind, ParamSpec)]) -> WireEntry {
+    let name = host_name(id);
+
+    if let Some(slot) = path_slot(id) {
+        let param = IntParam::new(
+            name,
+            default.round() as i32,
+            IntRange::Linear {
+                min: -1,
+                max: StageKind::COUNT as i32 - 1,
+            },
+        )
+        .with_value_to_string(Arc::new(|v| match StageKind::from_index(v) {
+            Some(kind) => blocks::block_name(kind).to_string(),
+            None => "Empty".to_string(),
+        }))
+        .with_string_to_value(Arc::new(|s| {
+            let s = s.trim();
+            if s.eq_ignore_ascii_case("empty") {
+                return Some(-1);
+            }
+            StageKind::ALL
+                .iter()
+                .find(|k| blocks::block_name(**k).eq_ignore_ascii_case(s))
+                .map(|k| k.index() as i32)
+        }))
+        // The rack order is edited in the editor, not automated.
+        .non_automatable()
+        .hide_in_generic_ui();
+        return WireEntry {
+            id,
+            kind: EntryKind::PathSlot(slot),
+            param: WireParam::Int(param),
+        };
+    }
+
+    let param = if is_toggle(id) {
+        let param = BoolParam::new(name, default >= 0.5);
+        // The tuner is something the player looks at, not part of the sound.
+        WireParam::Bool(if id == "tuner_on" {
+            param.non_automatable()
+        } else {
+            param
+        })
+    } else if let Some(names) = choice_labels(id) {
+        let parse_names = names.clone();
+        let param = IntParam::new(
+            name,
+            default.round() as i32,
+            IntRange::Linear {
+                min: 0,
+                max: names.len() as i32 - 1,
+            },
+        )
+        .with_value_to_string(Arc::new(move |v| {
+            names.get(v as usize).copied().unwrap_or("?").to_string()
+        }))
+        .with_string_to_value(Arc::new(move |s| {
+            let s = s.trim();
+            parse_names
+                .iter()
+                .position(|n| n.eq_ignore_ascii_case(s))
+                .map(|i| i as i32)
+                .or_else(|| s.parse().ok())
+        }));
+        // Moving a block between lanes rebuilds the routing: edited in the
+        // editor, not automated, like the path order.
+        WireParam::Int(if id.ends_with("_row") {
+            param.non_automatable()
+        } else {
+            param
+        })
+    } else {
+        let spec = spec_of(id, specs).unwrap_or_else(|| panic!("no range for wire id `{id}`"));
+        let range = match spec.unit {
+            // Frequency, time and ratio read better skewed toward their low end.
+            "Hz" | "ms" | "s" | ":1" if spec.min > 0.0 => FloatRange::Skewed {
+                min: spec.min,
+                max: spec.max,
+                factor: FloatRange::skew_factor(-1.0),
+            },
+            _ => FloatRange::Linear {
+                min: spec.min,
+                max: spec.max,
+            },
+        };
+        WireParam::Float(
+            FloatParam::new(name, default, range)
+                .with_value_to_string(Arc::new(move |v| blocks::format_value(v, &spec)))
+                .with_string_to_value(Arc::new(parse_number)),
+        )
+    };
+    WireEntry {
+        id,
+        kind: EntryKind::Value,
+        param,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_wire_id_but_clear_clip_is_a_host_parameter_in_order() {
+        let wire = WireParams::new();
+        let ids: Vec<&str> = wire.entries().iter().map(|e| e.id).collect();
+        let expected: Vec<&str> = UI_PARAM_IDS
+            .iter()
+            .copied()
+            .filter(|id| *id != CLEAR_CLIP)
+            .collect();
+        assert_eq!(ids, expected);
+    }
+
+    #[test]
+    fn host_defaults_reproduce_the_core_defaults() {
+        assert_eq!(
+            WireParams::new().to_core_params(),
+            rodharerist::default_params()
+        );
+    }
+
+    #[test]
+    fn every_continuous_parameter_has_a_range_containing_its_default() {
+        let specs = block_specs();
+        for (id, value) in rodharerist::ui_values(&rodharerist::default_params()) {
+            if is_toggle(id) || path_slot(id).is_some() || choice_labels(id).is_some() {
+                continue;
+            }
+            let spec = spec_of(id, &specs).unwrap_or_else(|| panic!("`{id}` has no range"));
+            assert!(
+                spec.min < spec.max && (spec.min..=spec.max).contains(&value),
+                "`{id}`"
+            );
+        }
+    }
+
+    #[test]
+    fn choices_cover_every_index_the_core_takes() {
+        assert_eq!(
+            choice_labels("drive_model").unwrap().len(),
+            DriveModel::ALL.len()
+        );
+        assert_eq!(
+            choice_labels("cab_model").unwrap().len(),
+            CabModel::ALL.len()
+        );
+        assert_eq!(
+            choice_labels("gate_channel").unwrap().len(),
+            StageChannel::ALL.len()
+        );
+        for (i, engine) in TONE_ENGINES.iter().enumerate() {
+            assert_eq!(engine.index() as usize, i);
+        }
+        for (i, label) in choice_labels("row_send_1").unwrap().iter().enumerate() {
+            assert_eq!(
+                rodharerist::RowSend::from_index(i as u32).index(),
+                i as u32,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_parameter_has_a_block_group() {
+        for id in UI_PARAM_IDS.iter().filter(|id| **id != CLEAR_CLIP) {
+            assert_ne!(describe(id).0, "Other", "`{id}` has no group");
+        }
+    }
+
+    #[test]
+    fn typed_values_parse() {
+        assert_eq!(parse_number("2.40 kHz"), Some(2400.0));
+        assert_eq!(parse_number("-12.5 dB"), Some(-12.5));
+        assert_eq!(parse_number("+3"), Some(3.0));
+        assert_eq!(parse_number("4.0:1"), Some(4.0));
+    }
+}

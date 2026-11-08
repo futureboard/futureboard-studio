@@ -125,14 +125,14 @@ impl PluginEditorChrome {
 /// Popover state the list renders from: the highlighted row (an index into
 /// `chrome.presets`) and the type-to-filter text.
 #[derive(Clone, Debug, Default)]
-struct PresetPopoverView {
-    highlighted: Option<usize>,
-    filter: String,
+pub(crate) struct PresetPopoverView {
+    pub(crate) highlighted: Option<usize>,
+    pub(crate) filter: String,
 }
 
 /// Presets matching `filter`, as indices into `presets`. Case-insensitive
 /// substring match: preset names are short and the user types part of one.
-fn filtered_presets(presets: &[String], filter: &str) -> Vec<usize> {
+pub(crate) fn filtered_presets(presets: &[String], filter: &str) -> Vec<usize> {
     let needle = filter.trim().to_lowercase();
     presets
         .iter()
@@ -163,7 +163,7 @@ fn filtered_presets(presets: &[String], filter: &str) -> Vec<usize> {
 /// hairline border, square corners. The floating lift an in-window popover
 /// would get is carried here by the OS instead, because the list really is a
 /// separate surface above the editor.
-fn render_preset_popover(
+pub(crate) fn render_preset_popover(
     chrome: &PluginEditorChrome,
     view: &PresetPopoverView,
     emit: impl Fn(PluginEditorAction, &mut Window, &mut App) + Clone + 'static,

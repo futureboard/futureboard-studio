@@ -2,7 +2,8 @@
 //!
 //! The editor of one WrapSynth insert — a built-in instrument that runs in
 //! the plug-in host like every other — drawn natively with GPUI inside the
-//! shared [`native_plugin_shell`] rather than as a web page in CEF.
+//! shared [`native_plugin_shell`] rather than as a web page in CEF, as a
+//! plate ([`wrap_synth_plate`]) scaled to the window.
 //!
 //! It talks to the plug-in through the host ops `plugin_ops.rs` injects:
 //!
@@ -22,22 +23,23 @@ use gpui::{
 };
 
 use crate::components::builtin_plugin_editor_window::{BuiltinEditorHostOps, PluginInstanceKey};
+use crate::components::builtin_preset_menu::BuiltinPresetMenu;
 use crate::components::native_plugin_shell::{
-    claim_editor_transport_key, native_plugin_shell, swallow_editor_transport_key_up,
+    claim_editor_transport_key, native_plugin_shell_with, swallow_editor_transport_key_up,
     NativeBuiltinEditor, ShellIdentity, ShellMeter, SHELL_METER_INTERVAL,
 };
-use crate::components::wrap_synth_panel::{
-    wrap_synth_panel, SynthPage, WrapSynthCallbacks, WrapSynthPanelState,
+use crate::components::plate;
+use crate::components::wrap_synth_plate::{
+    wrap_synth_plate, SynthPage, WrapSynthCallbacks, WrapSynthPanelState,
 };
 use wrapsynth::Params;
 
-/// Opens on the Synth page with both oscillators on one row and the filter,
-/// envelope and output on the next, keyboard below. Narrower, the cards wrap
-/// and the body scrolls; the header and keyboard stay put.
-pub const WRAP_SYNTH_WINDOW_WIDTH: f32 = 1_080.0;
-pub const WRAP_SYNTH_WINDOW_HEIGHT: f32 = 720.0;
-pub const WRAP_SYNTH_WINDOW_MIN_WIDTH: f32 = 660.0;
-pub const WRAP_SYNTH_WINDOW_MIN_HEIGHT: f32 = 520.0;
+/// The plate at its design size, and the smallest the window may get; the
+/// plate scales to whatever size it is between.
+pub const WRAP_SYNTH_WINDOW_WIDTH: f32 = plate::WINDOW_SIZE.0;
+pub const WRAP_SYNTH_WINDOW_HEIGHT: f32 = plate::WINDOW_SIZE.1;
+pub const WRAP_SYNTH_WINDOW_MIN_WIDTH: f32 = plate::MIN_WINDOW_SIZE.0;
+pub const WRAP_SYNTH_WINDOW_MIN_HEIGHT: f32 = plate::MIN_WINDOW_SIZE.1;
 
 const PREVIEW_VELOCITY: u8 = 100;
 
@@ -50,6 +52,8 @@ pub struct WrapSynthEditorWindow {
     focused_once: bool,
     panel: WrapSynthPanelState,
     meter: ShellMeter,
+    /// The `.pst` preset menu in the identity strip.
+    presets: gpui::Entity<BuiltinPresetMenu>,
     /// Cleared when the window closes, ending the meter timer.
     alive: Rc<Cell<bool>>,
 }
@@ -62,6 +66,7 @@ impl WrapSynthEditorWindow {
         on_close: Arc<dyn Fn(&mut Window, &mut App)>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let presets = cx.new(|cx| BuiltinPresetMenu::new(key.clone(), &identity, cx));
         let mut window = Self {
             key,
             identity,
@@ -71,8 +76,10 @@ impl WrapSynthEditorWindow {
             focused_once: false,
             panel: WrapSynthPanelState::default(),
             meter: ShellMeter::default(),
+            presets,
             alive: Rc::new(Cell::new(true)),
         };
+        plate::ensure_fonts(cx);
         window.sync_from_mirror(cx);
         window.start_meter(cx);
         window
@@ -104,6 +111,9 @@ impl WrapSynthEditorWindow {
             self.release_all(cx);
             self.key = key;
         }
+        let presets_key = self.key.clone();
+        self.presets
+            .update(cx, |menu, cx| menu.rebind(presets_key, &identity, cx));
         self.identity = identity;
         self.host_ops = host_ops;
         self.sync_from_mirror(cx);
@@ -130,11 +140,7 @@ impl WrapSynthEditorWindow {
     }
 
     /// The UI preview's scenes: one page, one patch, without a host.
-    pub fn show_for_preview(
-        &mut self,
-        page: crate::components::wrap_synth_panel::SynthPage,
-        params: Params,
-    ) {
+    pub fn show_for_preview(&mut self, page: SynthPage, params: Params) {
         self.panel.page = page;
         self.panel.params = params;
     }
@@ -192,16 +198,23 @@ impl WrapSynthEditorWindow {
 
     fn callbacks(&self, cx: &mut Context<Self>) -> WrapSynthCallbacks {
         let entity = cx.entity().clone();
-        fn with<T: Clone + 'static>(
+        /// `f` on this window with the value an element hands over.
+        fn with<T: 'static>(
             entity: &gpui::Entity<WrapSynthEditorWindow>,
             f: impl Fn(&mut WrapSynthEditorWindow, T, &mut Context<WrapSynthEditorWindow>) + 'static,
-        ) -> Arc<dyn Fn(&T, &mut Window, &mut App) + 'static> {
+        ) -> Rc<dyn Fn(T, &mut App)> {
             let entity = entity.clone();
-            Arc::new(move |value: &T, _window, app: &mut App| {
-                let value = value.clone();
+            Rc::new(move |value: T, app: &mut App| {
                 let _ = entity.update(app, |this, cx| f(this, value, cx));
             })
         }
+        let note_on = with(&entity, |this, pitch: u8, cx| this.note_on(pitch, cx));
+        let note_off = with(&entity, |this, pitch: u8, cx| this.note_off(pitch, cx));
+        let shift = with(&entity, |this, delta: i32, cx| {
+            this.release_all(cx);
+            this.panel.shift_keyboard_octave(delta);
+            cx.notify();
+        });
         WrapSynthCallbacks {
             on_set_params: with(&entity, |this, params: Params, cx| {
                 this.set_params(params, cx)
@@ -210,12 +223,14 @@ impl WrapSynthEditorWindow {
                 this.panel.page = page;
                 cx.notify();
             }),
-            on_note_on: with(&entity, |this, pitch: u8, cx| this.note_on(pitch, cx)),
-            on_note_off: with(&entity, |this, pitch: u8, cx| this.note_off(pitch, cx)),
-            on_shift_octave: with(&entity, |this, delta: i32, cx| {
-                this.release_all(cx);
-                this.panel.shift_keyboard_octave(delta);
-                cx.notify();
+            on_note_on: Rc::new(move |pitch: u8, _window: &mut Window, app: &mut App| {
+                note_on(pitch, app)
+            }),
+            on_note_off: Rc::new(move |pitch: u8, _window: &mut Window, app: &mut App| {
+                note_off(pitch, app)
+            }),
+            on_shift_octave: Rc::new(move |delta: i32, _window: &mut Window, app: &mut App| {
+                shift(delta, app)
             }),
         }
     }
@@ -242,7 +257,9 @@ impl Render for WrapSynthEditorWindow {
         let entity = cx.entity().clone();
         let on_close = self.on_close.clone();
         let alive = self.alive.clone();
-        let content = wrap_synth_panel(&self.panel, self.callbacks(cx));
+        let viewport = window.viewport_size();
+        let s = plate::plate_scale((f32::from(viewport.width), f32::from(viewport.height)));
+        let content = wrap_synth_plate(&self.panel, self.callbacks(cx), s);
 
         div()
             .size_full()
@@ -276,7 +293,7 @@ impl Render for WrapSynthEditorWindow {
                     });
                 }
             })
-            .child(native_plugin_shell(
+            .child(native_plugin_shell_with(
                 "wrap-synth-window-close",
                 &self.identity,
                 self.meter,
@@ -288,6 +305,7 @@ impl Render for WrapSynthEditorWindow {
                     on_close(window, cx);
                     window.remove_window();
                 },
+                Some(self.presets.clone().into_any_element()),
                 content,
             ))
     }

@@ -1,24 +1,28 @@
-//! The built-in Drum Sampler's panel, drawn natively.
+//! The built-in Drum Sampler's panel, drawn natively on the plate.
 //!
-//! Laid out the way a pad sampler is played and read:
+//! The standard 1024 × 768 plate (see [`crate::components::plate`]), scaled
+//! to the window, laid out the way a pad sampler is played and read:
 //!
-//! * a **top bar** — how many pads hold a sample, and the kit's master gain
-//!   and tune;
-//! * on the left, the **pads** — sixteen in a 4×4 grid, pad 1 bottom-left as
-//!   on a hardware controller. Each shows its number, note, tags (choke
-//!   group, filter, mute, solo), a silhouette of its sample with the played
-//!   region bright, the file name and a level bar that lights the pad while
-//!   it sounds — from whatever played it — and flashes on every hit. Press
-//!   a pad to select and hear it, as fast as you like; drag up or down to
-//!   set its gain (Shift: its tune). A file dropped on a pad loads there;
-//!   several fill the pads after it;
+//! * the **well** along the top — the header (the name, how many pads hold
+//!   a sample, the Pads / Mixer pages and banks A–D, the kit's master gain
+//!   and tune) over the **selected pad's sample**: its waveform with the
+//!   region it plays (drag either edge, double-click one to reset it) and the
+//!   envelope laid over it in time;
+//! * on the deck's left, the **pads** — sixteen in a 4 × 4 grid, pad 1
+//!   bottom-left as on a hardware controller. Each shows its number, note,
+//!   tags (choke group, filter, output, mute, solo), a silhouette of its
+//!   sample with the played region bright, the file name and a level bar that
+//!   lights the pad while it sounds — from whatever played it — and flashes on
+//!   every hit. Press a pad to select and hear it, as fast as you like; drag
+//!   up or down to set its gain (Shift: its tune). A file dropped on a pad
+//!   loads there; several fill the pads after it;
 //! * under them, the **Samples folder** — search it, click a file to load it
 //!   onto the selected pad, Browse… to bring one in from anywhere; a file
 //!   dropped here is only added to the folder;
-//! * on the right, the **selected pad**: its waveform with the region it
-//!   plays (drag either edge, double-click to reset it) and the envelope laid
-//!   over it in time, then the voice, envelope, filter (with its response
-//!   curve) and trigger modules.
+//! * on the deck's right, the selected pad's **Voice**, **Envelope**,
+//!   **Filter**, **Trigger** (note and choke group) and **Output** cards —
+//!   or, on the Mixer page, a strip per pad of the bank
+//!   ([`crate::components::drum_sampler_deck`]).
 //!
 //! This file only renders; the state lives in
 //! [`crate::components::drum_sampler_window::DrumSamplerEditorWindow`].
@@ -29,61 +33,85 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use drumsampler::{
-    FilterMode, Pad, BANK_PADS, MAX_CUTOFF_HZ, MAX_DECAY_MS, MAX_HOLD_MS, MIN_REGION, OUTPUTS, PADS,
-};
+use drumsampler::{FilterMode, Pad, BANK_PADS, MIN_REGION, OUTPUTS, PADS};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    canvas, div, fill, point, px, relative, Animation, AnimationExt, AnyElement, App, Bounds,
-    ExternalPaths, InteractiveElement, IntoElement, ParentElement, PathBuilder, Pixels,
-    StatefulInteractiveElement, Styled, Window,
+    canvas, div, px, relative, Animation, AnimationExt, AnyElement, App, Bounds, ExternalPaths,
+    FontWeight, InteractiveElement, IntoElement, ParentElement, Pixels, Rgba, SharedString,
+    StatefulInteractiveElement, Styled,
 };
 
 use crate::components::builtin_plugin_editor::DrumPadWaveform;
 use crate::components::builtin_plugin_files::BuiltinFileEntry;
-use crate::components::controls::{
-    fb_button, fb_checkbox, fb_segment, fb_segmented_track, fb_stepper_button, FbButtonKind,
-    FbSegment,
-};
+use crate::components::drum_sampler_deck::{mixer_deck, pad_cards};
 use crate::components::drum_sampler_menu::DrumMenuTarget;
-use crate::components::knob::{format_pan_label, knob_bipolar, knob_with_default};
+use crate::components::instrument_plate::{self, display_colors, WELL_TOP};
+use crate::components::plate::{
+    self, caption, color, color_a, numbers, paint_polygon, paint_rect, plate_frame, type_px, words,
+    Dial, DialUnit, KnobSet, CARD, CARD_EDGE, FAINT, GHOST, INK, PALE, PLATE_H, PLATE_W, SOFT,
+    WELL, WHITE,
+};
 use crate::components::quick_sampler_panel::{
-    controls_row, cutoff_from_position, cutoff_position, empty_sample_drop_zone, format_hz,
-    format_ms, format_seconds, knob_cell, module, paint_curve, paint_display_frame,
-    paint_graph_frame, paint_waveform, rect, ruler_labels, status_banner, DisplayColors,
-    GraphColors, VoidCb, FLAG_H, FLAG_W, GRAPH_H, KNOB_SIZE, SAMPLE_DROP_GROUP,
+    format_seconds, paint_display_frame, paint_waveform, ruler_labels, FLAG_H, FLAG_W,
 };
 use crate::components::soundfont_player_mdi::note_label;
-use crate::theme::{radius, space, typography, Colors};
+use crate::components::time_plate::{fmt_time, BOX_EDGE, BOX_GROUND};
 
 /// Pad 1 bottom-left, as on a hardware pad controller: the grid's rows, top
 /// to bottom.
 const BANK_GRID: [usize; BANK_PADS] = [12, 13, 14, 15, 8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3];
 /// Banks of [`BANK_PADS`] pads, named A–D.
 pub const BANKS: usize = PADS / BANK_PADS;
-/// The mixer's faders: how tall, and the gain they span.
-const FADER_H: f32 = 176.0;
-const FADER_THUMB_H: f32 = 10.0;
+/// Drum Sampler's accent on the plate.
+pub const ACCENT: u32 = 0xff9f43;
+/// A failed load, a muted pad; a soloed pad.
+pub const ERROR: u32 = 0xff6b6b;
+pub const SOLO: u32 = 0xf5c542;
+
+// ── Plate layout, in design units ──────────────────────────────────────────
+
+/// The well: the header over the selected pad's sample.
+pub const WELL_H: f32 = 206.0;
+/// The deck under it, to the plate's foot (the pads are the playing surface,
+/// so the plate has no keyboard strip).
+pub const DECK_TOP: f32 = WELL_TOP + WELL_H + 4.0;
+pub const DECK_H: f32 = PLATE_H - DECK_TOP - 7.0;
+/// The deck's inset, and the gap between its blocks.
+pub const DECK_PAD: f32 = 14.0;
+pub const DECK_GAP: f32 = 12.0;
+/// The pads' column: the grid and the Samples folder under it.
+pub const PADS_W: f32 = 380.0;
+const PAD_GAP: f32 = 6.0;
+const PAD_H: f32 = 74.0;
+const MINI_WAVE_H: f32 = 20.0;
+/// The display's caption row over the waveform.
+const DISPLAY_HEAD_H: f32 = 28.0;
+
+/// The mixer's faders: how tall (design units), and the gain they span.
+pub const FADER_H: f32 = 240.0;
 pub const FADER_MIN_DB: f32 = -60.0;
 pub const FADER_MAX_DB: f32 = 12.0;
-const LEFT_W: f32 = 384.0;
-const PAD_H: f32 = 86.0;
-const MINI_WAVE_H: f32 = 24.0;
-const WAVE_H: f32 = 172.0;
 /// How near a press must land to a region edge to grab it, in pixels.
 pub const EDGE_GRAB_PX: f32 = 10.0;
-/// A pad drag's travel: dB and semitones per pixel.
+/// A pad drag's travel: dB and semitones per design unit.
 const GAIN_PER_PX: f32 = 0.25;
 const TUNE_PER_PX: f32 = 0.1;
 /// Pixels a press must move before it is a drag rather than a hit.
 pub const DRAG_SLOP_PX: f32 = 4.0;
-const ATTACK_MAX_MS: f32 = 250.0;
+pub(crate) const ATTACK_MAX_MS: f32 = 250.0;
 /// `drumsampler`'s envelope floor: the decay reaches −60 dB at its time.
 const DECAY_FLOOR: f32 = 0.001;
 const MIN_Q: f32 = std::f32::consts::FRAC_1_SQRT_2;
 const MAX_Q: f32 = 12.0;
 /// How long a pad's flash lasts after a hit.
 const HIT_FLASH: Duration = Duration::from_millis(260);
+/// The drag-over group: the hint along the foot shows while a file from
+/// outside is over the window.
+const DROP_GROUP: &str = "drum-sampler-drop";
+
+pub(crate) fn accent() -> Rgba {
+    color(ACCENT)
+}
 
 /// What the body shows: the pads with the selected one's editor, or a
 /// mixer strip per pad.
@@ -138,6 +166,9 @@ pub struct DrumSamplerPanelState {
     /// The bank of sixteen pads on screen (0 = A).
     pub bank: usize,
     pub view: DrumView,
+    /// The plate's scale at the last render: window pixels per design unit,
+    /// which the window's drags measure in.
+    pub scale: f32,
 }
 
 impl Default for DrumSamplerPanelState {
@@ -158,6 +189,7 @@ impl Default for DrumSamplerPanelState {
             pressed: None,
             bank: 0,
             view: DrumView::Pads,
+            scale: 1.0,
         }
     }
 }
@@ -177,17 +209,6 @@ pub struct PadPress {
     pub shift: bool,
 }
 
-pub type PadPressCb = Arc<dyn Fn(&PadPress, &mut Window, &mut App) + 'static>;
-/// A whole new pad value for one pad.
-pub type PadEditCb = Arc<dyn Fn(&(usize, Pad), &mut Window, &mut App) + 'static>;
-/// Dropped files: onto a pad (and the ones after it), or `None` for the
-/// Samples folder only.
-pub type DropCb = Arc<dyn Fn(&(Option<usize>, Vec<PathBuf>), &mut Window, &mut App) + 'static>;
-/// Master gain (dB) and tune (semitones).
-pub type MasterCb = Arc<dyn Fn(&(f32, f32), &mut Window, &mut App) + 'static>;
-/// A press on the waveform: window-space x, and the click count.
-pub type WavePressCb = Arc<dyn Fn(&(f32, usize), &mut Window, &mut App) + 'static>;
-pub type FileCb = Arc<dyn Fn(&String, &mut Window, &mut App) + 'static>;
 /// A press on a mixer fader.
 #[derive(Clone, Copy, Debug)]
 pub struct FaderPress {
@@ -197,31 +218,58 @@ pub struct FaderPress {
     pub clicks: usize,
 }
 
-pub type FaderCb = Arc<dyn Fn(&FaderPress, &mut Window, &mut App) + 'static>;
-/// A right-click: on what, and where (window space).
-pub type ContextCb = Arc<dyn Fn(&(DrumMenuTarget, f32, f32), &mut Window, &mut App) + 'static>;
-pub type ViewCb = Arc<dyn Fn(&DrumView, &mut Window, &mut App) + 'static>;
-/// A bank, or a pad, by index.
-pub type IndexCb = Arc<dyn Fn(&usize, &mut Window, &mut App) + 'static>;
-/// Every pad's output at once (index = pad).
-pub type OutputsCb = Arc<dyn Fn(&[u8; PADS], &mut Window, &mut App) + 'static>;
+/// A handler the panel calls with what was done.
+pub type Cb<T> = Rc<dyn Fn(T, &mut App)>;
 
 #[derive(Clone)]
 pub struct DrumSamplerCallbacks {
-    pub on_pad_press: PadPressCb,
-    pub on_set_pad: PadEditCb,
-    pub on_set_master: MasterCb,
-    pub on_drop: DropCb,
-    pub on_waveform_press: WavePressCb,
-    pub on_load_file: FileCb,
-    pub on_browse: VoidCb,
-    pub on_refresh: VoidCb,
-    pub on_set_outputs: OutputsCb,
-    pub on_view: ViewCb,
-    pub on_bank: IndexCb,
-    pub on_select: IndexCb,
-    pub on_fader_press: FaderCb,
-    pub on_context: ContextCb,
+    pub on_pad_press: Cb<PadPress>,
+    /// A whole new value for one pad.
+    pub on_set_pad: Cb<(usize, Pad)>,
+    /// Master gain (dB) and tune (semitones).
+    pub on_set_master: Cb<(f32, f32)>,
+    /// Dropped files: onto a pad (and the ones after it), or `None` for the
+    /// Samples folder only.
+    pub on_drop: Cb<(Option<usize>, Vec<PathBuf>)>,
+    /// A press on the waveform: window-space x, and the click count.
+    pub on_waveform_press: Cb<(f32, usize)>,
+    pub on_load_file: Cb<String>,
+    pub on_browse: Cb<()>,
+    pub on_refresh: Cb<()>,
+    /// Every pad's output at once (index = pad).
+    pub on_set_outputs: Cb<[u8; PADS]>,
+    pub on_view: Cb<DrumView>,
+    /// A bank, or a pad, by index.
+    pub on_bank: Cb<usize>,
+    pub on_select: Cb<usize>,
+    pub on_fader_press: Cb<FaderPress>,
+    /// A right-click: on what, and where (window space).
+    pub on_context: Cb<(DrumMenuTarget, f32, f32)>,
+}
+
+impl DrumSamplerCallbacks {
+    /// A knob's setter for the selected pad: `apply` writes the knob's value
+    /// into a copy of the pad as it is now.
+    pub(crate) fn pad_knob(
+        &self,
+        panel: &DrumSamplerPanelState,
+        index: usize,
+        apply: impl Fn(&mut Pad, f32) + 'static,
+    ) -> KnobSet {
+        let pad = panel.params.pads[index].clone();
+        let set = self.on_set_pad.clone();
+        Rc::new(move |value, cx| {
+            let mut next = pad.clone();
+            apply(&mut next, value);
+            set((index, next), cx)
+        })
+    }
+
+    /// A click that sends pad `index` as `next`.
+    pub(crate) fn send_pad(&self, index: usize, next: Pad) -> instrument_plate::Click {
+        let set = self.on_set_pad.clone();
+        Rc::new(move |_window, cx| set((index, next.clone()), cx))
+    }
 }
 
 // ── Pure helpers ───────────────────────────────────────────────────────────
@@ -267,13 +315,14 @@ pub fn fader_position(db: f32) -> f32 {
     ((db - FADER_MIN_DB) / (FADER_MAX_DB - FADER_MIN_DB)).clamp(0.0, 1.0)
 }
 
-/// The gain a fader dragged `rise` pixels up from `start` sets, to 0.1 dB.
+/// The gain a fader dragged `rise` design units up from `start` sets, to
+/// 0.1 dB.
 pub fn fader_dragged(start: f32, rise: f32) -> f32 {
     let db = start + rise / FADER_H * (FADER_MAX_DB - FADER_MIN_DB);
     ((db * 10.0).round() / 10.0).clamp(FADER_MIN_DB, FADER_MAX_DB)
 }
 
-/// "01" … "16".
+/// "01" … "64".
 pub fn pad_number(index: usize) -> String {
     format!("{:02}", index + 1)
 }
@@ -373,7 +422,7 @@ pub fn level_unit(linear: f32) -> f32 {
     }
 }
 
-/// The value a pad drag sets: `start` moved by `rise` pixels upward.
+/// The value a pad drag sets: `start` moved by `rise` design units upward.
 pub fn adjusted(field: PadAdjust, start: f32, rise: f32) -> f32 {
     match field {
         PadAdjust::Gain => {
@@ -387,11 +436,11 @@ pub fn adjusted(field: PadAdjust, start: f32, rise: f32) -> f32 {
 }
 
 /// Square-root knob travel for a time: short times get most of the sweep.
-fn time_position(ms: f32, max: f32) -> f32 {
+pub(crate) fn time_position(ms: f32, max: f32) -> f32 {
     (ms.max(0.0) / max).sqrt().clamp(0.0, 1.0)
 }
 
-fn time_from_position(position: f32, max: f32) -> f32 {
+pub(crate) fn time_from_position(position: f32, max: f32) -> f32 {
     let ms = position.clamp(0.0, 1.0).powi(2) * max;
     if ms < 10.0 {
         (ms * 10.0).round() / 10.0
@@ -400,380 +449,676 @@ fn time_from_position(position: f32, max: f32) -> f32 {
     }
 }
 
-fn format_db(db: f32) -> String {
-    format!("{db:+.1} dB")
+pub(crate) fn format_db(db: f32) -> String {
+    plate::fmt_db(db)
 }
 
-fn format_semis(semis: f32) -> String {
-    format!("{:+} st", semis.round() as i32)
+pub(crate) fn format_semis(semis: f32) -> String {
+    let semis = semis.round() as i32;
+    if semis < 0 {
+        format!("\u{2212}{} st", -semis)
+    } else if semis > 0 {
+        format!("+{semis} st")
+    } else {
+        "0 st".to_string()
+    }
+}
+
+/// The pads in choke group `group` (1–8): a hit on one cuts the others.
+pub fn choke_members(params: &drumsampler::Params, group: u8) -> Vec<usize> {
+    if group == 0 {
+        return Vec::new();
+    }
+    (0..PADS)
+        .filter(|index| params.pads[*index].choke_group == group)
+        .collect()
 }
 
 // ── Panel ──────────────────────────────────────────────────────────────────
 
-/// The whole panel. `search_field` is the library's search box (the window
-/// owns its text state), `query` what it holds; `wave_bounds` is filled in
-/// by the waveform's paint, so the window can turn a pointer x into a
-/// position in the sample.
+/// The whole panel at plate scale `s`. `search_field` is the library's
+/// search box (the window owns its text state), `query` what it holds;
+/// `wave_bounds` is filled in by the waveform's paint, so the window can
+/// turn a pointer x into a position in the sample.
 pub fn drum_sampler_panel(
     panel: &DrumSamplerPanelState,
     cb: DrumSamplerCallbacks,
     search_field: AnyElement,
     query: &str,
     wave_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    s: f32,
 ) -> AnyElement {
     let anywhere = cb.on_drop.clone();
     let selected = panel.selected;
+    let mut children = vec![
+        well_view(panel, &cb, wave_bounds, s),
+        match panel.view {
+            DrumView::Pads => pads_deck(panel, &cb, search_field, query, s),
+            DrumView::Mixer => mixer_deck(panel, &cb, s),
+        },
+    ];
+    if let Some(note) = panel.note.clone() {
+        children.push(note_banner(note, s));
+    }
     div()
         .relative()
-        .group(SAMPLE_DROP_GROUP)
-        .flex()
-        .flex_col()
         .size_full()
-        .bg(Colors::surface_window())
+        .group(DROP_GROUP)
         // A drop that lands on neither a pad nor the library loads the
         // selected pad.
-        .on_drop::<ExternalPaths>(move |paths, w, cx| {
-            anywhere(&(Some(selected), paths.paths().to_vec()), w, cx)
+        .on_drop::<ExternalPaths>(move |paths, _, cx| {
+            anywhere((Some(selected), paths.paths().to_vec()), cx)
         })
-        .child(top_bar(panel, &cb))
-        .when_some(panel.note.clone(), |root, note| {
-            root.child(status_banner(note))
-        })
-        .when(panel.view == DrumView::Mixer, |root| {
-            root.child(mixer_view(panel, &cb))
-        })
-        .when(panel.view == DrumView::Pads, |root| {
-            root.child(pads_view(panel, &cb, search_field, query, wave_bounds))
-        })
-        .child(drop_hint())
+        .child(plate_frame(s, children))
+        .child(drop_hint(s))
         .into_any_element()
 }
 
-/// The pads of the bank, the Samples folder, and the selected pad's editor.
-fn pads_view(
+/// A short-lived note over the top of the deck.
+fn note_banner(note: String, s: f32) -> AnyElement {
+    div()
+        .absolute()
+        .left_0()
+        .w(px(PLATE_W * s))
+        .top(px((DECK_TOP - 13.0) * s))
+        .flex()
+        .justify_center()
+        .child(
+            div()
+                .px(px(14.0 * s))
+                .py(px(5.0 * s))
+                .rounded(px(4.0 * s))
+                .border(px(1.0))
+                .border_color(accent())
+                .bg(color(0x1d1d1d))
+                .child(words(note, 12.0, WHITE, s)),
+        )
+        .into_any_element()
+}
+
+/// Shown along the foot while a file is dragged over the window.
+fn drop_hint(s: f32) -> AnyElement {
+    div()
+        .absolute()
+        .left_0()
+        .right_0()
+        .bottom_0()
+        .flex()
+        .justify_center()
+        .py(px(7.0 * s))
+        .opacity(0.0)
+        .group_drag_over::<ExternalPaths>(DROP_GROUP, |style| style.opacity(1.0))
+        .bg(color_a(ACCENT, 0.18))
+        .border_t(px(1.0))
+        .border_color(accent())
+        .child(words(
+            "Drop on a pad to load it there \u{2014} several files fill the pads after it \
+             \u{00B7} on Samples to add them to the folder \u{00B7} anywhere else loads the \
+             selected pad",
+            12.0,
+            WHITE,
+            s,
+        ))
+        .into_any_element()
+}
+
+// ── The well ───────────────────────────────────────────────────────────────
+
+fn loaded_count(pads: &[Pad]) -> usize {
+    pads.iter().filter(|pad| pad.sample_name.is_some()).count()
+}
+
+fn well_view(
+    panel: &DrumSamplerPanelState,
+    cb: &DrumSamplerCallbacks,
+    wave_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    s: f32,
+) -> AnyElement {
+    let loaded = loaded_count(&panel.params.pads);
+    let on_view = cb.on_view.clone();
+    let view_tabs = instrument_plate::tabs(
+        "drum-view",
+        &["Pads", "Mixer"],
+        match panel.view {
+            DrumView::Pads => 0,
+            DrumView::Mixer => 1,
+        },
+        accent(),
+        s,
+        Rc::new(move |index, _window, cx| {
+            on_view(
+                if index == 0 {
+                    DrumView::Pads
+                } else {
+                    DrumView::Mixer
+                },
+                cx,
+            )
+        }),
+    );
+    let middle = vec![view_tabs, bank_tabs(panel, cb, s)];
+    let right = master_knobs(panel, cb, s);
+    plate::well(s, WELL_TOP, WELL_H)
+        .child(instrument_plate::header(
+            "drum-header",
+            s,
+            "Drum Sampler",
+            &format!("64-pad kit \u{00B7} {loaded} loaded"),
+            accent(),
+            middle,
+            right,
+            None,
+        ))
+        .child(
+            div()
+                .flex_1()
+                .min_h(px(0.0))
+                .flex()
+                .px(px(8.0 * s))
+                .pb(px(8.0 * s))
+                .child(sample_display(panel, cb, wave_bounds, s)),
+        )
+        .into_any_element()
+}
+
+/// The four banks, each with how many of its pads hold a sample.
+fn bank_tabs(panel: &DrumSamplerPanelState, cb: &DrumSamplerCallbacks, s: f32) -> AnyElement {
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(3.0 * s))
+        .child(
+            div()
+                .mr(px(4.0 * s))
+                .child(caption("Bank", 10.0, 0.12, FAINT, s)),
+        );
+    for bank in 0..BANKS {
+        let loaded = loaded_count(&panel.params.pads[bank * BANK_PADS..(bank + 1) * BANK_PADS]);
+        let on_bank = cb.on_bank.clone();
+        let label = if loaded > 0 {
+            format!("{} \u{00B7} {loaded}", bank_letter(bank))
+        } else {
+            bank_letter(bank).to_string()
+        };
+        row = row.child(
+            plate::pill(
+                ("drum-bank", bank),
+                label,
+                panel.bank == bank,
+                accent(),
+                plate::PillLook::words(28.0, 0.0, 12.0),
+                true,
+                s,
+                move |_, _, cx| on_bank(bank, cx),
+            )
+            .min_w(px(36.0 * s))
+            .px(px(8.0 * s)),
+        );
+    }
+    row.into_any_element()
+}
+
+/// The kit's master gain and tune, as compact knobs that fit the header.
+fn master_knobs(
+    panel: &DrumSamplerPanelState,
+    cb: &DrumSamplerCallbacks,
+    s: f32,
+) -> Vec<AnyElement> {
+    let p = &panel.params;
+    let (gain, tune) = (p.master_gain_db, p.master_tune);
+    let on_gain = cb.on_set_master.clone();
+    let on_tune = cb.on_set_master.clone();
+    vec![
+        header_knob(
+            "drum-master-gain",
+            Dial::new("masterGain", "Gain", -60.0, 12.0, 0.0, DialUnit::Db),
+            gain,
+            format_db(gain),
+            s,
+            Rc::new(move |value, cx| on_gain(((value * 10.0).round() / 10.0, tune), cx)),
+        ),
+        header_knob(
+            "drum-master-tune",
+            Dial::new("masterTune", "Tune", -24.0, 24.0, 0.0, DialUnit::Plain).bipolar(),
+            tune,
+            format_semis(tune),
+            s,
+            Rc::new(move |value, cx| on_tune((gain, value.round()), cx)),
+        ),
+    ]
+}
+
+/// A knob with its caption and value beside it, short enough for the
+/// header row: drag it, wheel it, double-click it to reset — as every plate
+/// knob.
+fn header_knob(
+    key: &'static str,
+    dial: Dial,
+    value: f32,
+    readout: String,
+    s: f32,
+    set: KnobSet,
+) -> AnyElement {
+    let look = plate::KnobLook::small(30.0);
+    // A plate knob cell with its label and value hidden: the knob alone,
+    // with its drag, wheel and reset.
+    let cell = plate::KnobCell::new(30.0, 0.1, 0.1).gap(0.0);
+    let knob = div()
+        .h(px(30.0 * s))
+        .overflow_hidden()
+        .child(plate::knob_with(
+            key,
+            Dial { label: "", ..dial },
+            value,
+            Some(String::new()),
+            look,
+            cell,
+            accent(),
+            true,
+            s,
+            set,
+        ));
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.0 * s))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .items_end()
+                .child(caption(dial.label, 9.5, 0.12, SOFT, s))
+                .child(
+                    div()
+                        .min_w(px(58.0 * s))
+                        .flex()
+                        .justify_end()
+                        .child(numbers(readout, 12.0, WHITE, s)),
+                ),
+        )
+        .child(knob)
+        .into_any_element()
+}
+
+/// The selected pad's sample: the region it plays, flagged S and E, and the
+/// envelope over it in time.
+fn sample_display(
+    panel: &DrumSamplerPanelState,
+    cb: &DrumSamplerCallbacks,
+    bounds_out: Rc<Cell<Option<Bounds<Pixels>>>>,
+    s: f32,
+) -> AnyElement {
+    let index = panel.selected;
+    let pad = panel.pad().clone();
+    let waveform = panel.waveforms[index].clone();
+    let colors = display_colors(accent());
+    let (lo, hi) = effective_region(&pad);
+    let seconds = waveform
+        .as_ref()
+        .filter(|w| w.sample_rate > 0)
+        .map_or(0.0, |w| w.frames as f64 / w.sample_rate as f64);
+    let plays = waveform
+        .as_ref()
+        .map_or(0.0, |w| region_seconds(&pad, w, panel.params.master_tune));
+    let pairs: Option<Arc<Vec<(f32, f32)>>> = waveform.as_ref().map(|w| {
+        Arc::new(
+            w.peaks
+                .iter()
+                .map(|peak| {
+                    let v = *peak as f32 / 255.0;
+                    (-v, v)
+                })
+                .collect(),
+        )
+    });
+    let has_sample = pairs.is_some();
+    let press = cb.on_waveform_press.clone();
+    let context = cb.on_context.clone();
+    let envelope_pad = pad.clone();
+
+    let name = if panel.loading[index] {
+        "Loading\u{2026}".to_string()
+    } else {
+        pad.sample_name
+            .clone()
+            .unwrap_or_else(|| "No sample".into())
+    };
+    let meta = waveform
+        .as_ref()
+        .map(|w| {
+            format!(
+                "{} \u{00B7} {} \u{00B7} {:.1} kHz",
+                format_seconds(seconds),
+                if w.channels == 1 { "mono" } else { "stereo" },
+                w.sample_rate as f32 / 1_000.0
+            )
+        })
+        .unwrap_or_default();
+    let reading = |label: &str, value: String| {
+        div()
+            .flex()
+            .flex_row()
+            .items_baseline()
+            .gap(px(5.0 * s))
+            .child(caption(label, 9.5, 0.12, FAINT, s))
+            .child(numbers(value, 11.5, INK, s))
+    };
+    let mut head = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .flex_shrink_0()
+        .h(px(DISPLAY_HEAD_H * s))
+        .px(px(10.0 * s))
+        .gap(px(10.0 * s))
+        .border_b(px(1.0))
+        .border_color(color(BOX_EDGE))
+        .child(caption(
+            &format!(
+                "Pad {} \u{00B7} {}",
+                pad_number(index),
+                note_label(pad.note)
+            ),
+            10.5,
+            0.12,
+            ACCENT,
+            s,
+        ))
+        .child(
+            div()
+                .flex_shrink(1.0)
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .child(
+                    words(name, 13.0, if has_sample { WHITE } else { FAINT }, s)
+                        .font_weight(FontWeight::MEDIUM),
+                ),
+        );
+    if let Some(error) = panel.errors[index].clone() {
+        head = head.child(
+            div()
+                .flex_shrink(1.0)
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .child(words(error, 11.0, ERROR, s)),
+        );
+    }
+    head = head
+        .child(div().flex_1())
+        .child(numbers(meta, 10.5, GHOST, s))
+        .child(reading("Start", format!("{:.1}%", lo * 100.0)))
+        .child(reading("End", format!("{:.1}%", hi * 100.0)))
+        .child(reading(
+            "Plays",
+            if plays > 0.0 {
+                fmt_time(plays * 1_000.0)
+            } else {
+                "\u{2014}".into()
+            },
+        ));
+
+    let mut wave = div()
+        .id("drum-wave")
+        .relative()
+        .flex_1()
+        .min_h(px(0.0))
+        .w_full()
+        .overflow_hidden()
+        .when(has_sample, |display| {
+            display
+                .cursor(gpui::CursorStyle::ResizeLeftRight)
+                .on_mouse_down(gpui::MouseButton::Left, move |event, _, cx| {
+                    press((f32::from(event.position.x), event.click_count), cx)
+                })
+                .on_mouse_down(gpui::MouseButton::Right, move |event, _, cx| {
+                    context(
+                        (
+                            DrumMenuTarget::Waveform,
+                            f32::from(event.position.x),
+                            f32::from(event.position.y),
+                        ),
+                        cx,
+                    )
+                })
+        })
+        .child(
+            canvas(
+                move |bounds, _, _| bounds_out.set(Some(bounds)),
+                move |bounds, _, window, _| {
+                    let frame = paint_display_frame(window, bounds, seconds, &colors);
+                    if !paint_waveform(window, &frame, pairs.as_deref(), &colors) {
+                        return;
+                    }
+                    let (x0, y0, w, wave_h) = (frame.x0, frame.y0, frame.w, frame.wave_h);
+                    let (start, end) = (frame.at(lo), frame.at(hi));
+                    paint_rect(window, (x0, y0, start - x0, wave_h), colors.skipped);
+                    paint_rect(window, (end, y0, x0 + w - end, wave_h), colors.skipped);
+                    // The envelope, in time across the region, from the edge
+                    // playback starts at, shaded under.
+                    if plays > 0.0 {
+                        let steps = ((end - start).max(2.0) as usize).min(512);
+                        let mut line = Vec::with_capacity(steps + 1);
+                        for i in 0..=steps {
+                            let along = i as f32 / steps as f32;
+                            let level = envelope_at(&envelope_pad, along * plays);
+                            let fraction = if envelope_pad.reverse {
+                                hi - along * (hi - lo)
+                            } else {
+                                lo + along * (hi - lo)
+                            };
+                            line.push((frame.at(fraction), frame.mid - level * frame.half));
+                        }
+                        let floor = frame.mid;
+                        let mut area = line.clone();
+                        area.push((line[line.len() - 1].0, floor));
+                        area.push((line[0].0, floor));
+                        paint_polygon(window, &area, color_a(0xffffff, 0.05));
+                        plate::paint_polyline(window, &line, 1.5, color_a(0xffffff, 0.8), None);
+                    }
+                    for x in [start, end - 1.5] {
+                        let x = x.clamp(x0, x0 + w - 1.5);
+                        paint_rect(window, (x, y0, 1.5, wave_h), colors.marker);
+                    }
+                    window.paint_quad(
+                        gpui::fill(plate::rect(start, y0, FLAG_W, FLAG_H), colors.marker)
+                            .corner_radii(px(2.0)),
+                    );
+                    window.paint_quad(
+                        gpui::fill(plate::rect(end - FLAG_W, y0, FLAG_W, FLAG_H), colors.marker)
+                            .corner_radii(px(2.0)),
+                    );
+                },
+            )
+            .absolute()
+            .inset_0(),
+        );
+    if has_sample {
+        for (fraction, letter, inside) in [(lo, "S", false), (hi, "E", true)] {
+            let flag = div()
+                .absolute()
+                .top(px(0.0))
+                .left(relative(fraction))
+                .w(px(FLAG_W))
+                .h(px(FLAG_H))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(9.0))
+                .font_weight(FontWeight::BOLD)
+                .text_color(color(WELL))
+                .child(letter);
+            wave = wave.child(if inside { flag.ml(px(-FLAG_W)) } else { flag });
+        }
+        for (fraction, label) in ruler_labels(seconds) {
+            wave = wave.child(
+                div()
+                    .absolute()
+                    .bottom(px(1.0))
+                    .left(relative(fraction))
+                    .pl(px(3.0))
+                    .child(numbers(label, 9.5, GHOST, s)),
+            );
+        }
+    } else {
+        wave = wave.child(empty_display(panel.loading[index], s));
+    }
+
+    div()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_w(px(0.0))
+        .bg(color(BOX_GROUND))
+        .border(px(1.0))
+        .border_color(color(BOX_EDGE))
+        .overflow_hidden()
+        .child(head)
+        .child(wave)
+        .into_any_element()
+}
+
+/// What an empty pad's display says, over its blank frame.
+fn empty_display(loading: bool, s: f32) -> AnyElement {
+    let (title, hint) = if loading {
+        ("Loading\u{2026}", "")
+    } else {
+        (
+            "Drop an audio file here",
+            "or click a file in Samples to load it onto this pad",
+        )
+    };
+    div()
+        .absolute()
+        .inset_0()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(px(4.0 * s))
+        .child(words(title, 14.0, PALE, s).font_weight(FontWeight::MEDIUM))
+        .when(!hint.is_empty(), |empty| {
+            empty.child(words(hint, 11.5, FAINT, s))
+        })
+        .into_any_element()
+}
+
+// ── The deck: pads and the Samples folder ──────────────────────────────────
+
+fn pads_deck(
     panel: &DrumSamplerPanelState,
     cb: &DrumSamplerCallbacks,
     search_field: AnyElement,
     query: &str,
-    wave_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    s: f32,
 ) -> AnyElement {
-    let cb = cb.clone();
-    div()
-        .flex()
-        .flex_row()
-        .flex_1()
-        .min_h(px(0.0))
-        .gap(px(space::SECTION))
-        .px(px(space::SECTION))
-        .pt(px(space::LOOSE))
-        .pb(px(space::SECTION))
+    plate::deck(s, DECK_TOP, DECK_H)
+        .p(px(DECK_PAD * s))
+        .gap(px(DECK_GAP * s))
         .child(
             div()
                 .flex()
                 .flex_col()
                 .flex_shrink_0()
-                .w(px(LEFT_W))
-                .min_h(px(0.0))
-                .gap(px(space::BASE))
-                .child(pad_grid(panel, &cb))
-                .child(library(panel, &cb, search_field, query)),
+                .w(px(PADS_W * s))
+                .gap(px(DECK_GAP * s))
+                .child(pad_grid(panel, cb, s))
+                .child(library(panel, cb, search_field, query, s)),
         )
-        .child(
-            div()
-                .id("drum-sampler-inspector")
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_w(px(0.0))
-                .min_h(px(0.0))
-                .overflow_y_scroll()
-                .gap(px(space::BASE))
-                .child(inspector_head(panel))
-                .child(waveform_editor(panel, &cb, wave_bounds))
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .flex_wrap()
-                        .gap(px(space::BASE))
-                        .mt(px(space::TIGHT))
-                        .child(voice_module(panel, &cb))
-                        .child(envelope_module(panel, &cb))
-                        .child(filter_module(panel, &cb))
-                        .child(trigger_module(panel, &cb))
-                        .child(output_module(panel, &cb)),
-                ),
-        )
+        .child(pad_cards(panel, cb, s))
         .into_any_element()
 }
 
-fn caption(text: &'static str) -> AnyElement {
-    div()
-        .text_size(px(typography::DENSE_CAPTION))
-        .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_color(Colors::text_faint())
-        .child(text)
-        .into_any_element()
-}
-
-fn top_bar(panel: &DrumSamplerPanelState, cb: &DrumSamplerCallbacks) -> AnyElement {
-    let p = &panel.params;
-    let loaded = p
-        .pads
-        .iter()
-        .filter(|pad| pad.sample_name.is_some())
-        .count();
-    let (gain, tune) = (p.master_gain_db, p.master_tune);
-    let on_gain = cb.on_set_master.clone();
-    let on_tune = cb.on_set_master.clone();
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .flex_shrink_0()
-        .gap(px(space::LOOSE))
-        .px(px(space::SECTION))
-        .py(px(space::SNUG))
-        .border_b(px(1.0))
-        .border_color(Colors::border_subtle())
-        .bg(Colors::surface_base())
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(space::HAIR))
-                .child(
-                    div()
-                        .text_size(px(typography::UI_MD))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(Colors::text_primary())
-                        .child("64-pad one-shot kit"),
-                )
-                .child(
-                    div()
-                        .text_size(px(typography::UI_XS))
-                        .text_color(Colors::text_muted())
-                        .child(format!("{loaded} / {PADS} pads loaded")),
-                ),
-        )
-        .child(view_tabs(panel, cb))
-        .child(bank_tabs(panel, cb))
-        .child(div().flex_1())
-        .child(caption("MASTER"))
-        .child(knob_cell(
-            "Gain",
-            format_db(gain),
-            knob_with_default(
-                "drum-master-gain",
-                gain,
-                -60.0,
-                12.0,
-                KNOB_SIZE,
-                Colors::accent_primary(),
-                0.0,
-                move |value, w, cx| on_gain(&(((*value) * 10.0).round() / 10.0, tune), w, cx),
-            ),
-        ))
-        .child(knob_cell(
-            "Tune",
-            format_semis(tune),
-            knob_bipolar(
-                "drum-master-tune",
-                tune,
-                -24.0,
-                24.0,
-                KNOB_SIZE,
-                Colors::accent_primary(),
-                None,
-                0.0,
-                move |value, w, cx| on_tune(&(gain, value.round()), w, cx),
-            ),
-        ))
-        .into_any_element()
-}
-
-fn view_tabs(panel: &DrumSamplerPanelState, cb: &DrumSamplerCallbacks) -> AnyElement {
-    let mut track = fb_segmented_track();
-    for (index, (view, label)) in [(DrumView::Pads, "Pads"), (DrumView::Mixer, "Mixer")]
-        .into_iter()
-        .enumerate()
-    {
-        let on_view = cb.on_view.clone();
-        track = track.child(fb_segment(
-            ("drum-view", index),
-            label,
-            panel.view == view,
-            if index == 0 {
-                FbSegment::First
-            } else {
-                FbSegment::Last
-            },
-            move |_, w, cx| on_view(&view, w, cx),
-        ));
-    }
-    track.w(px(150.0)).into_any_element()
-}
-
-/// The four banks, each with how many of its pads hold a sample.
-fn bank_tabs(panel: &DrumSamplerPanelState, cb: &DrumSamplerCallbacks) -> AnyElement {
-    let mut track = fb_segmented_track();
-    for bank in 0..BANKS {
-        let loaded = panel.params.pads[bank * BANK_PADS..(bank + 1) * BANK_PADS]
-            .iter()
-            .filter(|pad| pad.sample_name.is_some())
-            .count();
-        let on_bank = cb.on_bank.clone();
-        let label = if loaded > 0 {
-            format!("{} · {loaded}", bank_letter(bank))
-        } else {
-            bank_letter(bank).to_string()
-        };
-        track = track.child(fb_segment(
-            ("drum-bank", bank),
-            label,
-            panel.bank == bank,
-            match bank {
-                0 => FbSegment::First,
-                b if b + 1 == BANKS => FbSegment::Last,
-                _ => FbSegment::Middle,
-            },
-            move |_, w, cx| on_bank(&bank, w, cx),
-        ));
-    }
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(space::SNUG))
-        .child(caption("BANK"))
-        .child(track.w(px(220.0)))
-        .child(
-            div()
-                .text_size(px(typography::DENSE_CAPTION))
-                .text_color(Colors::text_muted())
-                .child(format!(
-                    "Pads {}–{}",
-                    pad_number(panel.bank * BANK_PADS),
-                    pad_number((panel.bank + 1) * BANK_PADS - 1)
-                )),
-        )
-        .into_any_element()
-}
-
-/// Shown along the bottom while a file is dragged over the window.
-fn drop_hint() -> AnyElement {
-    div()
-        .absolute()
-        .left(px(0.0))
-        .right(px(0.0))
-        .bottom(px(0.0))
-        .px(px(space::SECTION))
-        .py(px(space::SNUG))
-        .opacity(0.0)
-        .group_drag_over::<ExternalPaths>(SAMPLE_DROP_GROUP, |style| style.opacity(1.0))
-        .bg(Colors::with_alpha(Colors::accent_primary(), 0.16))
-        .border_t(px(1.0))
-        .border_color(Colors::accent_primary())
-        .text_size(px(typography::DENSE_LABEL))
-        .text_color(Colors::text_primary())
-        .child(
-            "Drop on a pad to load it there — several files fill the pads after it · on Samples \
-             to add them to the folder · anywhere else loads the selected pad",
-        )
-        .into_any_element()
-}
-
-// ── Pads ───────────────────────────────────────────────────────────────────
-
-fn pad_grid(panel: &DrumSamplerPanelState, cb: &DrumSamplerCallbacks) -> AnyElement {
-    let mut grid = div().flex().flex_col().gap(px(space::SNUG));
+fn pad_grid(panel: &DrumSamplerPanelState, cb: &DrumSamplerCallbacks, s: f32) -> AnyElement {
+    let mut grid = div().flex().flex_col().flex_shrink_0().gap(px(PAD_GAP * s));
     let first = panel.bank * BANK_PADS;
     for row in BANK_GRID.chunks(4) {
-        let mut line = div().flex().flex_row().w_full().gap(px(space::SNUG));
+        let mut line = div().flex().flex_row().w_full().gap(px(PAD_GAP * s));
         for &offset in row {
-            line = line.child(pad_cell(panel, first + offset, cb));
+            line = line.child(pad_cell(panel, first + offset, cb, s));
         }
         grid = grid.child(line);
     }
     grid.into_any_element()
 }
 
-fn tag(text: String, color: gpui::Rgba) -> AnyElement {
+/// A pad's small tag: its choke group, filter, output, mute or solo.
+fn tag(text: String, ink: u32, s: f32) -> AnyElement {
     div()
-        .px(px(3.0))
-        .rounded(px(2.0))
-        .bg(Colors::with_alpha(color, 0.18))
-        .text_size(px(8.0))
-        .font_weight(gpui::FontWeight::BOLD)
-        .text_color(color)
-        .child(text)
+        .flex_shrink_0()
+        .px(px(3.0 * s))
+        .rounded(px(2.0 * s))
+        .bg(color_a(ink, 0.16))
+        .child(
+            numbers(text, 8.5, ink, s)
+                .font_weight(FontWeight::SEMIBOLD)
+                .line_height(px(12.0 * s)),
+        )
         .into_any_element()
 }
 
-fn pad_cell(panel: &DrumSamplerPanelState, index: usize, cb: &DrumSamplerCallbacks) -> AnyElement {
+fn pad_cell(
+    panel: &DrumSamplerPanelState,
+    index: usize,
+    cb: &DrumSamplerCallbacks,
+    s: f32,
+) -> AnyElement {
     let pad = &panel.params.pads[index];
     let empty = pad.sample_name.is_none();
     let selected = panel.selected == index;
     let loading = panel.loading[index];
     let failed = panel.errors[index].is_some();
     let meter = level_unit(panel.levels[index]);
-    let accent = Colors::accent_primary();
     let pressed = panel.pressed == Some(index);
     let rest = if pressed {
-        Colors::surface_pressed()
+        0x181818
     } else if selected {
-        Colors::surface_card_selected()
+        0x2a2a2a
     } else {
-        Colors::surface_card()
+        0x232323
     };
     // The pad lights while it sounds, with how loud.
-    let bg = if meter > 0.02 {
-        Colors::composite(rest, Colors::with_alpha(accent, 0.12 + 0.3 * meter))
-    } else {
-        rest
+    let lit = Rgba {
+        a: 0.10 + 0.28 * meter,
+        ..accent()
     };
     let border = if failed {
-        Colors::status_error()
+        color(ERROR)
     } else if selected {
-        accent
+        accent()
     } else {
-        Colors::border_subtle()
+        color(0x3c3c3c)
     };
     let press = cb.on_pad_press.clone();
     let drop = cb.on_drop.clone();
     let context = cb.on_context.clone();
 
-    let mut tags = div().flex().flex_row().gap(px(2.0));
+    let mut tags = div().flex().flex_row().gap(px(2.0 * s)).min_w(px(0.0));
     if pad.choke_group > 0 {
         // Pads in the selected pad's group are marked in the accent: the
         // ones it cuts, and that cut it.
         let linked = panel.pad().choke_group == pad.choke_group;
         tags = tags.child(tag(
             format!("C{}", pad.choke_group),
-            if linked {
-                accent
-            } else {
-                Colors::text_secondary()
-            },
+            if linked { ACCENT } else { PALE },
+            s,
         ));
     }
     if pad.filter_mode != FilterMode::Off {
-        tags = tags.child(tag("F".into(), Colors::text_secondary()));
+        tags = tags.child(tag("F".into(), PALE, s));
     }
     if pad.output > 0 {
-        tags = tags.child(tag(
-            format!("→{}", pad.output + 1),
-            Colors::text_secondary(),
-        ));
+        tags = tags.child(tag(format!("\u{2192}{}", pad.output + 1), PALE, s));
     }
     if pad.muted {
-        tags = tags.child(tag("M".into(), Colors::status_error()));
+        tags = tags.child(tag("M".into(), ERROR, s));
     }
     if pad.solo {
-        tags = tags.child(tag("S".into(), Colors::status_warning()));
+        tags = tags.child(tag("S".into(), SOLO, s));
     }
     let name = if loading {
-        "Loading…".to_string()
+        "Loading\u{2026}".to_string()
     } else {
         pad.sample_name.clone().unwrap_or_else(|| "Empty".into())
     };
@@ -799,44 +1144,42 @@ fn pad_cell(panel: &DrumSamplerPanelState, index: usize, cb: &DrumSamplerCallbac
         .flex_1()
         .min_w(px(0.0))
         .overflow_hidden()
-        .h(px(PAD_H))
-        .p(px(space::SNUG))
-        .gap(px(3.0))
-        .rounded(px(radius::CONTROL))
+        .h(px(PAD_H * s))
+        .px(px(7.0 * s))
+        .py(px(6.0 * s))
+        .gap(px(3.0 * s))
+        .rounded(px(4.0 * s))
         .border(px(1.0))
         .border_color(border)
-        .bg(bg)
+        .bg(color(rest))
+        .when(meter > 0.02, |cell| cell.bg(lit))
         .cursor(gpui::CursorStyle::PointingHand)
         .when(!selected && meter <= 0.02, |cell| {
-            cell.hover(|style| style.bg(Colors::surface_card_hover()))
+            cell.hover(|style| style.bg(color(0x2c2c2c)))
         })
         .drag_over::<ExternalPaths>(move |style, _, _, _| {
-            style
-                .border_color(accent)
-                .bg(Colors::with_alpha(accent, 0.2))
+            style.border_color(accent()).bg(color_a(ACCENT, 0.2))
         })
-        .on_drop::<ExternalPaths>(move |paths, w, cx| {
-            drop(&(Some(index), paths.paths().to_vec()), w, cx)
+        .on_drop::<ExternalPaths>(move |paths, _, cx| {
+            drop((Some(index), paths.paths().to_vec()), cx)
         })
-        .on_mouse_down(gpui::MouseButton::Right, move |event, w, cx| {
+        .on_mouse_down(gpui::MouseButton::Right, move |event, _, cx| {
             context(
-                &(
+                (
                     DrumMenuTarget::Pad(index),
                     f32::from(event.position.x),
                     f32::from(event.position.y),
                 ),
-                w,
                 cx,
             )
         })
-        .on_mouse_down(gpui::MouseButton::Left, move |event, w, cx| {
+        .on_mouse_down(gpui::MouseButton::Left, move |event, _, cx| {
             press(
-                &PadPress {
+                PadPress {
                     pad: index,
                     y: f32::from(event.position.y),
                     shift: event.modifiers.shift,
                 },
-                w,
                 cx,
             )
         })
@@ -845,65 +1188,45 @@ fn pad_cell(panel: &DrumSamplerPanelState, index: usize, cb: &DrumSamplerCallbac
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(space::TIGHT))
+                .gap(px(4.0 * s))
+                .h(px(14.0 * s))
                 .child(
-                    div()
-                        .text_size(px(typography::UI_XS))
-                        .font_weight(gpui::FontWeight::BOLD)
-                        .text_color(if selected {
-                            accent
-                        } else {
-                            Colors::text_primary()
-                        })
-                        .child(pad_number(index)),
+                    numbers(
+                        pad_number(index),
+                        11.0,
+                        if selected { ACCENT } else { WHITE },
+                        s,
+                    )
+                    .font_weight(FontWeight::SEMIBOLD),
                 )
                 .child(tags)
                 .child(div().flex_1())
-                .child(
-                    div()
-                        .text_size(px(typography::DENSE_CAPTION))
-                        .text_color(Colors::text_muted())
-                        .child(note_label(pad.note)),
-                ),
+                .child(numbers(note_label(pad.note), 9.5, FAINT, s)),
         )
-        .child(mini_wave(peaks, region, empty))
+        .child(mini_wave(peaks, region, empty, s))
         .child(
-            div()
-                .truncate()
-                .text_size(px(typography::DENSE_CAPTION))
-                .text_color(if empty {
-                    Colors::text_faint()
-                } else {
-                    Colors::text_secondary()
-                })
-                .child(name),
+            div().w_full().overflow_hidden().child(
+                words(name, 10.5, if empty { GHOST } else { PALE }, s)
+                    .w_full()
+                    .truncate(),
+            ),
         )
         .child(
             div()
                 .w_full()
-                .h(px(3.0))
-                .rounded(px(1.5))
-                .bg(Colors::surface_muted())
+                .h(px(3.0 * s))
+                .rounded(px(1.5 * s))
+                .bg(color(0x161616))
                 .child(
                     div()
                         .h_full()
                         .w(relative(meter))
-                        .rounded(px(1.5))
-                        .bg(accent),
+                        .rounded(px(1.5 * s))
+                        .bg(accent()),
                 ),
         )
-        .when(selected && !failed, |cell| {
-            cell.child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .rounded(px(radius::CONTROL))
-                    .border(px(1.0))
-                    .border_color(accent),
-            )
-        })
         .when(panel.hits[index] > 0, |cell| {
-            cell.child(hit_flash(index, panel.hits[index]))
+            cell.child(hit_flash(index, panel.hits[index], s))
         })
         .when_some(adjust, |cell, (label, value)| {
             cell.child(
@@ -914,30 +1237,24 @@ fn pad_cell(panel: &DrumSamplerPanelState, index: usize, cb: &DrumSamplerCallbac
                     .flex_col()
                     .items_center()
                     .justify_center()
-                    .rounded(px(radius::CONTROL))
-                    .bg(Colors::with_alpha(Colors::surface_window(), 0.86))
-                    .child(caption(label))
-                    .child(
-                        div()
-                            .text_size(px(typography::UI_MD))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(Colors::text_primary())
-                            .child(value),
-                    ),
+                    .rounded(px(4.0 * s))
+                    .bg(color_a(0x141414, 0.9))
+                    .child(caption(label, 9.5, 0.12, SOFT, s))
+                    .child(numbers(value, 14.0, WHITE, s)),
             )
         })
         .into_any_element()
 }
 
-/// A hit's flash over its pad: bright at once, fading out. Each hit has its
-/// own id, so a retrigger starts it over; GPUI's animation element drives
-/// the frames, and only while it runs.
-fn hit_flash(index: usize, hit: u64) -> AnyElement {
-    let accent = Colors::accent_primary();
+/// A hit's flash over its pad or strip: bright at once, fading out. Each hit
+/// has its own id, so a retrigger starts it over; GPUI's animation element
+/// drives the frames, and only while it runs.
+pub(crate) fn hit_flash(index: usize, hit: u64, s: f32) -> AnyElement {
+    let base = accent();
     div()
         .absolute()
         .inset_0()
-        .rounded(px(radius::CONTROL))
+        .rounded(px(4.0 * s))
         .border(px(2.0))
         .with_animation(
             ("drum-hit", index * 1_000_000 + (hit % 1_000_000) as usize),
@@ -945,8 +1262,11 @@ fn hit_flash(index: usize, hit: u64) -> AnyElement {
             move |flash, delta| {
                 let left = 1.0 - delta;
                 flash
-                    .bg(Colors::with_alpha(accent, 0.38 * left))
-                    .border_color(Colors::with_alpha(accent, left))
+                    .bg(Rgba {
+                        a: 0.38 * left,
+                        ..base
+                    })
+                    .border_color(Rgba { a: left, ..base })
             },
         )
         .into_any_element()
@@ -954,46 +1274,41 @@ fn hit_flash(index: usize, hit: u64) -> AnyElement {
 
 /// A pad's sample as a small mirrored silhouette, the played region bright
 /// and the trimmed ends dim.
-fn mini_wave(peaks: Option<Arc<Vec<u8>>>, (lo, hi): (f32, f32), empty: bool) -> AnyElement {
+fn mini_wave(peaks: Option<Arc<Vec<u8>>>, (lo, hi): (f32, f32), empty: bool, s: f32) -> AnyElement {
     let shape = if empty {
-        Colors::text_faint()
+        color(0x4a4a4a)
     } else {
-        Colors::accent_primary()
+        color_a(ACCENT, 0.75)
     };
-    let shape = Colors::with_alpha(shape, 0.7);
-    let trim = Colors::with_alpha(Colors::surface_card(), 0.7);
+    let trim = color_a(0x1d1d1d, 0.72);
     canvas(
         |_, _, _| {},
         move |bounds, _, window, _| {
-            let x0 = f32::from(bounds.origin.x);
-            let y0 = f32::from(bounds.origin.y);
+            let (x0, y0) = plate::xy(bounds.origin);
             let w = f32::from(bounds.size.width).max(1.0);
             let h = f32::from(bounds.size.height).max(1.0);
             let mid = y0 + h * 0.5;
             let Some(peaks) = peaks.as_ref().filter(|peaks| peaks.len() >= 2) else {
-                window.paint_quad(fill(rect(x0, mid, w, 1.0), shape));
+                paint_rect(window, (x0, mid, w, 1.0), shape);
                 return;
             };
             let last = (peaks.len() - 1) as f32;
             let at = |i: usize| x0 + i as f32 / last * w;
-            let mut path = PathBuilder::fill();
-            path.move_to(point(px(x0), px(mid)));
+            let mut outline: Vec<(f32, f32)> = Vec::with_capacity(peaks.len() * 2);
             for (i, peak) in peaks.iter().enumerate() {
-                path.line_to(point(px(at(i)), px(mid - *peak as f32 / 255.0 * h * 0.5)));
+                outline.push((at(i), mid - *peak as f32 / 255.0 * h * 0.5));
             }
             for (i, peak) in peaks.iter().enumerate().rev() {
-                path.line_to(point(px(at(i)), px(mid + *peak as f32 / 255.0 * h * 0.5)));
+                outline.push((at(i), mid + *peak as f32 / 255.0 * h * 0.5));
             }
-            path.close();
-            if let Ok(path) = path.build() {
-                window.paint_path(path, shape);
-            }
-            window.paint_quad(fill(rect(x0, y0, lo * w, h), trim));
-            window.paint_quad(fill(rect(x0 + hi * w, y0, (1.0 - hi) * w, h), trim));
+            paint_polygon(window, &outline, shape);
+            paint_rect(window, (x0, y0, lo * w, h), trim);
+            paint_rect(window, (x0 + hi * w, y0, (1.0 - hi) * w, h), trim);
         },
     )
     .w_full()
-    .h(px(MINI_WAVE_H))
+    .h(px(MINI_WAVE_H * s))
+    .flex_shrink_0()
     .into_any_element()
 }
 
@@ -1004,8 +1319,8 @@ fn library(
     cb: &DrumSamplerCallbacks,
     search_field: AnyElement,
     query: &str,
+    s: f32,
 ) -> AnyElement {
-    let accent = Colors::accent_primary();
     let drop = cb.on_drop.clone();
     let refresh = cb.on_refresh.clone();
     let browse = cb.on_browse.clone();
@@ -1017,20 +1332,26 @@ fn library(
         .flex_col()
         .flex_1()
         .min_h(px(0.0))
-        .overflow_y_scroll();
+        .overflow_y_scroll()
+        .gap(px(1.0 * s));
     match &panel.files {
-        None => list = list.child(library_note("Reading the Samples folder…".into())),
+        None => list = list.child(library_note("Reading the Samples folder\u{2026}".into(), s)),
         Some(files) => {
             let shown: Vec<&BuiltinFileEntry> = files
                 .iter()
                 .filter(|file| needle.is_empty() || file.file_name.to_lowercase().contains(&needle))
                 .collect();
             if shown.is_empty() {
-                list = list.child(library_note(if files.is_empty() {
-                    "The Samples folder is empty — drop audio files here, or use Browse…".into()
-                } else {
-                    format!("No sample matches “{}”.", query.trim())
-                }));
+                list = list.child(library_note(
+                    if files.is_empty() {
+                        "The Samples folder is empty \u{2014} drop audio files here, or use \
+                         Browse\u{2026}"
+                            .into()
+                    } else {
+                        format!("No sample matches \u{201C}{}\u{201D}.", query.trim())
+                    },
+                    s,
+                ));
             }
             for (row, file) in shown.into_iter().enumerate() {
                 let is_current = current.as_deref() == Some(file.file_name.as_str());
@@ -1043,1322 +1364,113 @@ fn library(
                         .id(("drum-library-file", row))
                         .flex()
                         .flex_row()
+                        .flex_shrink_0()
                         .items_center()
-                        .gap(px(space::SNUG))
-                        .px(px(space::SNUG))
-                        .py(px(3.0))
-                        .rounded(px(radius::CONTROL_SM))
-                        .when(is_current, |row| row.bg(Colors::with_alpha(accent, 0.14)))
-                        .on_mouse_down(gpui::MouseButton::Right, move |event, w, cx| {
+                        .gap(px(8.0 * s))
+                        .h(px(20.0 * s))
+                        .px(px(8.0 * s))
+                        .rounded(px(3.0 * s))
+                        .when(is_current, |row| row.bg(color_a(ACCENT, 0.12)))
+                        .on_mouse_down(gpui::MouseButton::Right, move |event, _, cx| {
                             context(
-                                &(
+                                (
                                     DrumMenuTarget::File(menu_name.clone()),
                                     f32::from(event.position.x),
                                     f32::from(event.position.y),
                                 ),
-                                w,
                                 cx,
                             )
                         })
                         .when(panel.connected, |row| {
                             row.cursor(gpui::CursorStyle::PointingHand)
-                                .hover(|style| style.bg(Colors::surface_hover()))
-                                .on_click(move |_, w, cx| load(&name, w, cx))
+                                .hover(|style| style.bg(color(0x262626)))
+                                .on_click(move |_, _, cx| load(name.clone(), cx))
                         })
                         .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .truncate()
-                                .text_size(px(typography::UI_XS))
-                                .text_color(if is_current {
-                                    accent
-                                } else {
-                                    Colors::text_secondary()
-                                })
-                                .child(file.file_name.clone()),
+                            div().flex_1().min_w(px(0.0)).overflow_hidden().child(
+                                words(
+                                    file.file_name.clone(),
+                                    11.5,
+                                    if is_current { ACCENT } else { PALE },
+                                    s,
+                                )
+                                .w_full()
+                                .truncate(),
+                            ),
                         )
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .text_size(px(typography::DENSE_CAPTION))
-                                .text_color(Colors::text_faint())
-                                .child(format!("{} KB", (file.size_bytes / 1_024).max(1))),
-                        ),
+                        .child(numbers(
+                            format!("{} KB", (file.size_bytes / 1_024).max(1)),
+                            10.0,
+                            GHOST,
+                            s,
+                        )),
                 );
             }
         }
     }
+    let target: SharedString = format!("\u{2192} Pad {}", pad_number(panel.selected)).into();
     div()
         .id("drum-library")
         .flex()
         .flex_col()
         .flex_1()
-        .min_h(px(140.0))
-        .gap(px(space::SNUG))
-        .p(px(space::BASE))
-        .rounded(px(radius::SURFACE))
+        .min_h(px(0.0))
+        .gap(px(6.0 * s))
+        .px(px(10.0 * s))
+        .py(px(9.0 * s))
+        .rounded(px(4.0 * s))
         .border(px(1.0))
-        .border_color(Colors::border_subtle())
-        .bg(Colors::surface_panel())
+        .border_color(color(CARD_EDGE))
+        .bg(color(CARD))
         .drag_over::<ExternalPaths>(move |style, _, _, _| {
-            style
-                .border_color(accent)
-                .bg(Colors::with_alpha(accent, 0.12))
+            style.border_color(accent()).bg(color_a(ACCENT, 0.1))
         })
-        .on_drop::<ExternalPaths>(move |paths, w, cx| drop(&(None, paths.paths().to_vec()), w, cx))
+        .on_drop::<ExternalPaths>(move |paths, _, cx| drop((None, paths.paths().to_vec()), cx))
         .child(
             div()
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(space::SNUG))
-                .child(caption("SAMPLES"))
-                .child(
-                    div()
-                        .flex_1()
-                        .text_size(px(typography::DENSE_CAPTION))
-                        .text_color(Colors::text_muted())
-                        .child(format!("→ Pad {}", pad_number(panel.selected))),
-                )
-                .child(fb_button(
+                .flex_shrink_0()
+                .gap(px(8.0 * s))
+                .child(plate::card_title("Samples", s))
+                .child(numbers(target, 10.5, FAINT, s))
+                .child(div().flex_1())
+                .child(plate::pill(
                     "drum-library-refresh",
                     "Refresh",
-                    FbButtonKind::Ghost,
+                    false,
+                    accent(),
+                    plate::PillLook::words(24.0, 10.0, 11.5),
                     true,
-                    move |_, w, cx| refresh(w, cx),
+                    s,
+                    move |_, _, cx| refresh((), cx),
                 ))
-                .child(fb_button(
+                .child(plate::pill(
                     "drum-library-browse",
-                    "Browse…",
-                    FbButtonKind::Primary,
+                    "Browse\u{2026}",
+                    true,
+                    accent(),
+                    plate::PillLook::words(24.0, 10.0, 11.5),
                     panel.connected,
-                    move |_, w, cx| browse(w, cx),
+                    s,
+                    move |_, _, cx| browse((), cx),
                 )),
         )
-        .child(search_field)
+        .child(div().flex_shrink_0().child(search_field))
         .child(list)
         .into_any_element()
 }
 
-fn library_note(text: String) -> AnyElement {
+fn library_note(text: String, s: f32) -> AnyElement {
     div()
-        .py(px(space::BASE))
-        .text_size(px(typography::DENSE_LABEL))
-        .text_color(Colors::text_faint())
+        .py(px(8.0 * s))
+        .px(px(8.0 * s))
+        .text_size(type_px(11.0, s))
+        .line_height(px(14.0 * s))
+        .text_color(color(FAINT))
         .child(text)
         .into_any_element()
-}
-
-// ── Selected pad ───────────────────────────────────────────────────────────
-
-fn inspector_head(panel: &DrumSamplerPanelState) -> AnyElement {
-    let index = panel.selected;
-    let pad = panel.pad();
-    let name = if panel.loading[index] {
-        "Loading…".to_string()
-    } else {
-        pad.sample_name
-            .clone()
-            .unwrap_or_else(|| "No sample".into())
-    };
-    div()
-        .flex()
-        .flex_row()
-        .items_baseline()
-        .gap(px(space::BASE))
-        .child(
-            div()
-                .flex_shrink_0()
-                .text_size(px(typography::UI_XS))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(Colors::accent_primary())
-                .child(format!(
-                    "PAD {} · {}",
-                    pad_number(index),
-                    note_label(pad.note)
-                )),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.0))
-                .truncate()
-                .text_size(px(typography::UI_MD))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(Colors::text_primary())
-                .child(name),
-        )
-        .when_some(panel.errors[index].clone(), |head, error| {
-            head.child(
-                div()
-                    .flex_shrink_0()
-                    .text_size(px(typography::DENSE_LABEL))
-                    .text_color(Colors::status_error())
-                    .child(error),
-            )
-        })
-        .into_any_element()
-}
-
-/// The selected pad's sample, the region it plays, and the envelope over it.
-fn waveform_editor(
-    panel: &DrumSamplerPanelState,
-    cb: &DrumSamplerCallbacks,
-    bounds_out: Rc<Cell<Option<Bounds<Pixels>>>>,
-) -> AnyElement {
-    let pad = panel.pad().clone();
-    let waveform = panel.waveforms[panel.selected].clone();
-    let colors = DisplayColors::resolve();
-    let (lo, hi) = effective_region(&pad);
-    let seconds = waveform
-        .as_ref()
-        .filter(|w| w.sample_rate > 0)
-        .map_or(0.0, |w| w.frames as f64 / w.sample_rate as f64);
-    let plays = waveform
-        .as_ref()
-        .map_or(0.0, |w| region_seconds(&pad, w, panel.params.master_tune));
-    let pairs: Option<Arc<Vec<(f32, f32)>>> = waveform.as_ref().map(|w| {
-        Arc::new(
-            w.peaks
-                .iter()
-                .map(|peak| {
-                    let v = *peak as f32 / 255.0;
-                    (-v, v)
-                })
-                .collect(),
-        )
-    });
-    let has_sample = pairs.is_some();
-    let press = cb.on_waveform_press.clone();
-    let context = cb.on_context.clone();
-    let envelope_pad = pad.clone();
-
-    let mut display = div()
-        .id("drum-wave")
-        .relative()
-        .flex_shrink_0()
-        .h(px(WAVE_H))
-        .w_full()
-        .rounded(px(radius::SURFACE))
-        .overflow_hidden()
-        .border(px(1.0))
-        .border_color(Colors::border_subtle())
-        .when(has_sample, |display| {
-            display
-                .cursor(gpui::CursorStyle::ResizeLeftRight)
-                .on_mouse_down(gpui::MouseButton::Left, move |event, w, cx| {
-                    press(&(f32::from(event.position.x), event.click_count), w, cx)
-                })
-                .on_mouse_down(gpui::MouseButton::Right, move |event, w, cx| {
-                    context(
-                        &(
-                            DrumMenuTarget::Waveform,
-                            f32::from(event.position.x),
-                            f32::from(event.position.y),
-                        ),
-                        w,
-                        cx,
-                    )
-                })
-        })
-        .child(
-            canvas(
-                move |bounds, _, _| bounds_out.set(Some(bounds)),
-                move |bounds, _, window, _| {
-                    let frame = paint_display_frame(window, bounds, seconds, &colors);
-                    if !paint_waveform(window, &frame, pairs.as_deref(), &colors) {
-                        return;
-                    }
-                    let (x0, y0, w, wave_h) = (frame.x0, frame.y0, frame.w, frame.wave_h);
-                    let (start, end) = (frame.at(lo), frame.at(hi));
-                    window.paint_quad(fill(rect(x0, y0, start - x0, wave_h), colors.skipped));
-                    window.paint_quad(fill(rect(end, y0, x0 + w - end, wave_h), colors.skipped));
-                    // The envelope, in time across the region, from the edge
-                    // playback starts at.
-                    if plays > 0.0 {
-                        let steps = ((end - start).max(2.0) as usize).min(512);
-                        let mut line = PathBuilder::stroke(px(1.5));
-                        for i in 0..=steps {
-                            let along = i as f32 / steps as f32;
-                            let level = envelope_at(&envelope_pad, along * plays);
-                            let fraction = if envelope_pad.reverse {
-                                hi - along * (hi - lo)
-                            } else {
-                                lo + along * (hi - lo)
-                            };
-                            let at =
-                                point(px(frame.at(fraction)), px(frame.mid - level * frame.half));
-                            if i == 0 {
-                                line.move_to(at);
-                            } else {
-                                line.line_to(at);
-                            }
-                        }
-                        if let Ok(path) = line.build() {
-                            window.paint_path(path, colors.loop_marker);
-                        }
-                    }
-                    for x in [start, end - 1.5] {
-                        let x = x.clamp(x0, x0 + w - 1.5);
-                        window.paint_quad(fill(rect(x, y0, 1.5, wave_h), colors.marker));
-                    }
-                    window.paint_quad(
-                        fill(rect(start, y0, FLAG_W, FLAG_H), colors.marker).corner_radii(px(2.0)),
-                    );
-                    window.paint_quad(
-                        fill(rect(end - FLAG_W, y0, FLAG_W, FLAG_H), colors.marker)
-                            .corner_radii(px(2.0)),
-                    );
-                },
-            )
-            .absolute()
-            .inset_0(),
-        );
-    if has_sample {
-        for (fraction, letter, inside) in [(lo, "S", false), (hi, "E", true)] {
-            let flag = div()
-                .absolute()
-                .top(px(0.0))
-                .left(relative(fraction))
-                .w(px(FLAG_W))
-                .h(px(FLAG_H))
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_size(px(9.0))
-                .font_weight(gpui::FontWeight::BOLD)
-                .text_color(Colors::text_inverse())
-                .child(letter);
-            display = display.child(if inside { flag.ml(px(-FLAG_W)) } else { flag });
-        }
-        for (fraction, label) in ruler_labels(seconds) {
-            display = display.child(
-                div()
-                    .absolute()
-                    .bottom(px(2.0))
-                    .left(relative(fraction))
-                    .pl(px(3.0))
-                    .text_size(px(typography::DENSE_CAPTION))
-                    .text_color(Colors::text_faint())
-                    .child(label),
-            );
-        }
-    } else {
-        display = display.child(empty_sample_drop_zone(
-            pad.sample_name.is_some(),
-            "or click a file in Samples to load it onto this pad",
-        ));
-    }
-
-    let readout = |label: &'static str, value: String| {
-        div()
-            .flex()
-            .flex_row()
-            .items_baseline()
-            .gap(px(space::TIGHT))
-            .child(caption(label))
-            .child(
-                div()
-                    .text_size(px(typography::UI_XS))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(Colors::text_secondary())
-                    .child(value),
-            )
-    };
-    let meta = waveform
-        .as_ref()
-        .map(|w| {
-            format!(
-                "{} · {} · {:.1} kHz",
-                format_seconds(seconds),
-                if w.channels == 1 { "mono" } else { "stereo" },
-                w.sample_rate as f32 / 1_000.0
-            )
-        })
-        .unwrap_or_default();
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(space::SNUG))
-        .child(display)
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .flex_wrap()
-                .items_center()
-                .gap(px(space::LOOSE))
-                .child(readout("START", format!("{:.1}%", lo * 100.0)))
-                .child(readout("END", format!("{:.1}%", hi * 100.0)))
-                .child(readout(
-                    "PLAYS",
-                    if plays > 0.0 {
-                        format_ms(plays * 1_000.0)
-                    } else {
-                        "—".into()
-                    },
-                ))
-                .child(div().flex_1())
-                .child(
-                    div()
-                        .text_size(px(typography::DENSE_CAPTION))
-                        .text_color(Colors::text_faint())
-                        .child(meta),
-                ),
-        )
-        .into_any_element()
-}
-
-// ── Modules ────────────────────────────────────────────────────────────────
-
-/// Sends the selected pad edited by `apply`.
-fn edit(
-    panel: &DrumSamplerPanelState,
-    cb: &DrumSamplerCallbacks,
-    apply: impl Fn(&mut Pad, f32) + 'static,
-) -> impl Fn(&f32, &mut Window, &mut App) + 'static {
-    let index = panel.selected;
-    let pad = panel.pad().clone();
-    let set = cb.on_set_pad.clone();
-    move |value, w, cx| {
-        let mut next = pad.clone();
-        apply(&mut next, *value);
-        set(&(index, next), w, cx)
-    }
-}
-
-fn knob_id(name: &'static str, pad: usize) -> String {
-    format!("drum-{name}-{pad}")
-}
-
-fn voice_module(panel: &DrumSamplerPanelState, cb: &DrumSamplerCallbacks) -> AnyElement {
-    let pad = panel.pad();
-    let i = panel.selected;
-    let accent = Colors::accent_primary();
-    module(
-        "VOICE",
-        None,
-        controls_row()
-            .child(knob_cell(
-                "Tune",
-                format_semis(pad.tune_semitones),
-                knob_bipolar(
-                    knob_id("tune", i),
-                    pad.tune_semitones,
-                    -24.0,
-                    24.0,
-                    KNOB_SIZE,
-                    accent,
-                    None,
-                    0.0,
-                    edit(panel, cb, |pad, v| pad.tune_semitones = v.round()),
-                ),
-            ))
-            .child(knob_cell(
-                "Gain",
-                format_db(pad.gain_db),
-                knob_with_default(
-                    knob_id("gain", i),
-                    pad.gain_db,
-                    -60.0,
-                    12.0,
-                    KNOB_SIZE,
-                    accent,
-                    0.0,
-                    edit(panel, cb, |pad, v| pad.gain_db = (v * 10.0).round() / 10.0),
-                ),
-            ))
-            .child(knob_cell(
-                "Pan",
-                format_pan_label(pad.pan),
-                knob_bipolar(
-                    knob_id("pan", i),
-                    pad.pan,
-                    -1.0,
-                    1.0,
-                    KNOB_SIZE,
-                    accent,
-                    None,
-                    0.0,
-                    edit(panel, cb, |pad, v| pad.pan = v),
-                ),
-            ))
-            .child(knob_cell(
-                "Velocity",
-                format!("{:.0}%", pad.velocity_sensitivity),
-                knob_with_default(
-                    knob_id("velocity", i),
-                    pad.velocity_sensitivity,
-                    0.0,
-                    100.0,
-                    KNOB_SIZE,
-                    accent,
-                    100.0,
-                    edit(panel, cb, |pad, v| pad.velocity_sensitivity = v.round()),
-                ),
-            )),
-    )
-}
-
-fn envelope_module(panel: &DrumSamplerPanelState, cb: &DrumSamplerCallbacks) -> AnyElement {
-    let pad = panel.pad();
-    let i = panel.selected;
-    let accent = Colors::accent_primary();
-    let decays = pad.decay_ms > 0.0;
-    module(
-        if decays {
-            "ENVELOPE · ATTACK HOLD DECAY"
-        } else {
-            "ENVELOPE · PLAYS TO THE END"
-        },
-        None,
-        controls_row()
-            .child(knob_cell(
-                "Attack",
-                format_ms(pad.attack_ms),
-                knob_with_default(
-                    knob_id("attack", i),
-                    time_position(pad.attack_ms, ATTACK_MAX_MS),
-                    0.0,
-                    1.0,
-                    KNOB_SIZE,
-                    accent,
-                    time_position(1.0, ATTACK_MAX_MS),
-                    edit(panel, cb, |pad, v| {
-                        pad.attack_ms = time_from_position(v, ATTACK_MAX_MS)
-                    }),
-                ),
-            ))
-            .child(
-                div()
-                    .opacity(if decays { 1.0 } else { 0.48 })
-                    .child(knob_cell(
-                        "Hold",
-                        format_ms(pad.hold_ms),
-                        knob_with_default(
-                            knob_id("hold", i),
-                            time_position(pad.hold_ms, MAX_HOLD_MS),
-                            0.0,
-                            1.0,
-                            KNOB_SIZE,
-                            accent,
-                            0.0,
-                            edit(panel, cb, |pad, v| {
-                                pad.hold_ms = time_from_position(v, MAX_HOLD_MS)
-                            }),
-                        ),
-                    )),
-            )
-            .child(knob_cell(
-                "Decay",
-                if decays {
-                    format_ms(pad.decay_ms)
-                } else {
-                    "Off".into()
-                },
-                knob_with_default(
-                    knob_id("decay", i),
-                    time_position(pad.decay_ms, MAX_DECAY_MS),
-                    0.0,
-                    1.0,
-                    KNOB_SIZE,
-                    accent,
-                    0.0,
-                    edit(panel, cb, |pad, v| {
-                        pad.decay_ms = time_from_position(v, MAX_DECAY_MS)
-                    }),
-                ),
-            )),
-    )
-}
-
-fn filter_graph(pad: Pad) -> AnyElement {
-    let active = pad.filter_mode != FilterMode::Off;
-    let colors = GraphColors::resolve(active);
-    canvas(
-        |_, _, _| {},
-        move |bounds, _, window, _| {
-            paint_graph_frame(window, bounds, &colors);
-            let x0 = f32::from(bounds.origin.x);
-            let y0 = f32::from(bounds.origin.y);
-            let w = f32::from(bounds.size.width).max(1.0);
-            let h = f32::from(bounds.size.height).max(1.0);
-            let y_for = |db: f32| y0 + ((18.0 - db.clamp(-36.0, 18.0)) / 54.0) * h;
-            let columns = (w as usize).max(2);
-            let curve: Vec<(f32, f32)> = (0..columns)
-                .map(|i| {
-                    let t = i as f32 / (columns - 1) as f32;
-                    let hz = 20.0 * 1_000.0_f32.powf(t);
-                    (x0 + t * w, y_for(filter_db(&pad, hz)))
-                })
-                .collect();
-            paint_curve(window, &curve, y0 + h, &colors);
-            if active {
-                let x = x0 + cutoff_position(pad.cutoff_hz) * w;
-                window.paint_quad(fill(rect(x, y0, 1.0, h), colors.guide));
-            }
-        },
-    )
-    .w_full()
-    .h(px(GRAPH_H))
-    .into_any_element()
-}
-
-fn filter_module(panel: &DrumSamplerPanelState, cb: &DrumSamplerCallbacks) -> AnyElement {
-    let pad = panel.pad();
-    let i = panel.selected;
-    let accent = Colors::accent_primary();
-    let mut modes = fb_segmented_track();
-    let last = FilterMode::ALL.len() - 1;
-    for (index, mode) in FilterMode::ALL.into_iter().enumerate() {
-        let set = cb.on_set_pad.clone();
-        let mut next = pad.clone();
-        next.filter_mode = mode;
-        modes = modes.child(fb_segment(
-            ("drum-filter", index),
-            match mode {
-                FilterMode::Off => "Off",
-                FilterMode::LowPass => "LP",
-                FilterMode::HighPass => "HP",
-                FilterMode::BandPass => "BP",
-            },
-            pad.filter_mode == mode,
-            match index {
-                0 => FbSegment::First,
-                i if i == last => FbSegment::Last,
-                _ => FbSegment::Middle,
-            },
-            move |_, w, cx| set(&(i, next.clone()), w, cx),
-        ));
-    }
-    let active = pad.filter_mode != FilterMode::Off;
-    module(
-        "FILTER",
-        Some(filter_graph(pad.clone())),
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(space::BASE))
-            .child(modes.w_full())
-            .child(
-                controls_row()
-                    .justify_around()
-                    .opacity(if active { 1.0 } else { 0.48 })
-                    .child(knob_cell(
-                        "Cutoff",
-                        format_hz(pad.cutoff_hz),
-                        knob_with_default(
-                            knob_id("cutoff", i),
-                            cutoff_position(pad.cutoff_hz),
-                            0.0,
-                            1.0,
-                            KNOB_SIZE,
-                            accent,
-                            cutoff_position(MAX_CUTOFF_HZ),
-                            edit(panel, cb, |pad, v| {
-                                pad.cutoff_hz = cutoff_from_position(v).round()
-                            }),
-                        ),
-                    ))
-                    .child(knob_cell(
-                        "Resonance",
-                        format!("{:.0}%", pad.resonance),
-                        knob_with_default(
-                            knob_id("resonance", i),
-                            pad.resonance,
-                            0.0,
-                            100.0,
-                            KNOB_SIZE,
-                            accent,
-                            0.0,
-                            edit(panel, cb, |pad, v| pad.resonance = v.round()),
-                        ),
-                    )),
-            ),
-    )
-}
-
-/// A `− value +` stepper over one pad field.
-fn pad_stepper(
-    id: (&'static str, usize),
-    caption_text: &'static str,
-    readout: String,
-    (index, dec, inc): (usize, Pad, Pad),
-    cb: &DrumSamplerCallbacks,
-) -> AnyElement {
-    let on_dec = cb.on_set_pad.clone();
-    let on_inc = cb.on_set_pad.clone();
-    div()
-        .flex()
-        .flex_col()
-        .items_center()
-        .gap(px(space::HAIR))
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(space::HAIR))
-                .child(fb_stepper_button(
-                    (id.0, id.1 * 2),
-                    "−",
-                    move |_, w, cx| on_dec(&(index, dec.clone()), w, cx),
-                ))
-                .child(
-                    div()
-                        .w(px(58.0))
-                        .flex()
-                        .justify_center()
-                        .text_size(px(typography::UI_SM))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(Colors::text_primary())
-                        .child(readout),
-                )
-                .child(fb_stepper_button(
-                    (id.0, id.1 * 2 + 1),
-                    "+",
-                    move |_, w, cx| on_inc(&(index, inc.clone()), w, cx),
-                )),
-        )
-        .child(
-            div()
-                .text_size(px(typography::DENSE_CAPTION))
-                .text_color(Colors::text_muted())
-                .child(caption_text),
-        )
-        .into_any_element()
-}
-
-/// Where the selected pad plays: Main, on the instrument's own channel, or
-/// one of fifteen more outputs, each heard on a mixer channel of its own that
-/// Studio adds as soon as a pad uses it (and drops when none does) — nothing
-/// to set up first. Two shortcuts send the whole kit at once.
-fn output_module(panel: &DrumSamplerPanelState, cb: &DrumSamplerCallbacks) -> AnyElement {
-    let i = panel.selected;
-    let pad = panel.pad().clone();
-    let accent = Colors::accent_primary();
-    let mut chips = div().flex().flex_row().flex_wrap().gap(px(3.0));
-    for output in 0..OUTPUTS as u8 {
-        let on = pad.output == output;
-        let used = panel.params.pads.iter().any(|p| p.output == output);
-        let set = cb.on_set_pad.clone();
-        let mut next = pad.clone();
-        next.output = output;
-        chips = chips.child(
-            div()
-                .id(("drum-output", output as usize))
-                .flex()
-                .items_center()
-                .justify_center()
-                .min_w(px(26.0))
-                .h(px(24.0))
-                .px(px(4.0))
-                .rounded(px(radius::CONTROL_SM))
-                .border(px(1.0))
-                .border_color(if on { accent } else { Colors::border_subtle() })
-                .bg(if on {
-                    Colors::with_alpha(accent, 0.22)
-                } else if used {
-                    Colors::surface_card()
-                } else {
-                    Colors::surface_input()
-                })
-                .cursor(gpui::CursorStyle::PointingHand)
-                .hover(|style| style.bg(Colors::surface_hover()))
-                .on_click(move |_, w, cx| set(&(i, next.clone()), w, cx))
-                .child(
-                    div()
-                        .text_size(px(typography::DENSE_LABEL))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(if on {
-                            accent
-                        } else if used {
-                            Colors::text_primary()
-                        } else {
-                            Colors::text_muted()
-                        })
-                        .child((output + 1).to_string()),
-                ),
-        );
-    }
-    let mut extra: Vec<u8> = panel
-        .params
-        .pads
-        .iter()
-        .map(|p| p.output)
-        .filter(|output| *output > 0)
-        .collect();
-    extra.sort_unstable();
-    extra.dedup();
-    let summary = if pad.output == 0 {
-        "Out 1 — plays on this instrument's own channel".to_string()
-    } else {
-        format!(
-            "{} — plays on its own mixer channel, “Out Ch {}”, added for you",
-            output_label(pad.output),
-            pad.output + 1
-        )
-    };
-    let channels = if extra.is_empty() {
-        "Every pad is on Out 1".to_string()
-    } else {
-        let names: Vec<String> = extra.iter().map(|o| output_label(*o)).collect();
-        format!("Own channels: {}", names.join(", "))
-    };
-    let spread = cb.on_set_outputs.clone();
-    let gather = cb.on_set_outputs.clone();
-    let outputs = pad_outputs(&panel.params);
-    let bank = panel.bank;
-    module(
-        "OUTPUT",
-        None,
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(space::SNUG))
-            .child(chips)
-            .child(
-                div()
-                    .text_size(px(typography::DENSE_CAPTION))
-                    .text_color(Colors::text_muted())
-                    .child(summary),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .flex_wrap()
-                    .items_center()
-                    .gap(px(space::SNUG))
-                    .child(fb_button(
-                        "drum-outputs-spread",
-                        "One per pad (this bank)",
-                        FbButtonKind::Default,
-                        true,
-                        move |_, w, cx| spread(&one_output_per_pad(outputs, bank), w, cx),
-                    ))
-                    .child(fb_button(
-                        "drum-outputs-gather",
-                        "All to Out 1",
-                        FbButtonKind::Ghost,
-                        !extra.is_empty(),
-                        move |_, w, cx| gather(&[0; PADS], w, cx),
-                    ))
-                    .child(
-                        div()
-                            .text_size(px(typography::DENSE_CAPTION))
-                            .text_color(Colors::text_faint())
-                            .child(channels),
-                    ),
-            ),
-    )
-}
-
-// ── Mixer ──────────────────────────────────────────────────────────────────
-
-/// A strip per pad of the bank: what each pad plays, where it goes, and how
-/// loud — the kit's own mixer, before the outputs reach Studio's.
-fn mixer_view(panel: &DrumSamplerPanelState, cb: &DrumSamplerCallbacks) -> AnyElement {
-    let first = panel.bank * BANK_PADS;
-    let mut strips = div().flex().flex_row().w_full().gap(px(space::TIGHT));
-    for index in first..first + BANK_PADS {
-        strips = strips.child(mixer_strip(panel, index, cb));
-    }
-    div()
-        .id("drum-mixer")
-        .flex()
-        .flex_col()
-        .flex_1()
-        .min_h(px(0.0))
-        .overflow_y_scroll()
-        .gap(px(space::BASE))
-        .px(px(space::SECTION))
-        .pt(px(space::LOOSE))
-        .pb(px(space::SECTION))
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_baseline()
-                .gap(px(space::BASE))
-                .child(caption("MIXER"))
-                .child(
-                    div()
-                        .text_size(px(typography::DENSE_CAPTION))
-                        .text_color(Colors::text_muted())
-                        .child(
-                            "Drag a fader for the pad's level — double-click it for 0 dB · Out \
-                             picks the mixer channel the pad plays on",
-                        ),
-                ),
-        )
-        .child(strips)
-        .into_any_element()
-}
-
-fn strip_toggle(
-    id: (&'static str, usize),
-    label: &'static str,
-    on: bool,
-    tone: gpui::Rgba,
-    set: impl Fn(&mut Window, &mut App) + 'static,
-) -> AnyElement {
-    div()
-        .id(id)
-        .flex()
-        .items_center()
-        .justify_center()
-        .flex_1()
-        .h(px(20.0))
-        .rounded(px(radius::CONTROL_SM))
-        .border(px(1.0))
-        .border_color(if on { tone } else { Colors::border_subtle() })
-        .bg(if on {
-            Colors::with_alpha(tone, 0.28)
-        } else {
-            Colors::surface_input()
-        })
-        .cursor(gpui::CursorStyle::PointingHand)
-        .hover(|style| style.bg(Colors::surface_hover()))
-        .on_click(move |_, w, cx| set(w, cx))
-        .text_size(px(typography::DENSE_LABEL))
-        .font_weight(gpui::FontWeight::BOLD)
-        .text_color(if on { tone } else { Colors::text_muted() })
-        .child(label)
-        .into_any_element()
-}
-
-fn mixer_strip(
-    panel: &DrumSamplerPanelState,
-    index: usize,
-    cb: &DrumSamplerCallbacks,
-) -> AnyElement {
-    let pad = panel.params.pads[index].clone();
-    let selected = panel.selected == index;
-    let empty = pad.sample_name.is_none();
-    let meter = level_unit(panel.levels[index]);
-    let accent = Colors::accent_primary();
-    let position = fader_position(pad.gain_db);
-    let select = cb.on_select.clone();
-    let press = cb.on_fader_press.clone();
-    let context = cb.on_context.clone();
-    let set = |apply: fn(&mut Pad)| {
-        let set = cb.on_set_pad.clone();
-        let mut next = pad.clone();
-        apply(&mut next);
-        move |w: &mut Window, cx: &mut App| set(&(index, next.clone()), w, cx)
-    };
-    let pan_set = cb.on_set_pad.clone();
-    let pan_pad = pad.clone();
-    let out_dec = {
-        let set = cb.on_set_pad.clone();
-        let mut next = pad.clone();
-        next.output = pad.output.saturating_sub(1);
-        move |_: &gpui::ClickEvent, w: &mut Window, cx: &mut App| set(&(index, next.clone()), w, cx)
-    };
-    let out_inc = {
-        let set = cb.on_set_pad.clone();
-        let mut next = pad.clone();
-        next.output = (pad.output + 1).min(OUTPUTS as u8 - 1);
-        move |_: &gpui::ClickEvent, w: &mut Window, cx: &mut App| set(&(index, next.clone()), w, cx)
-    };
-
-    let fader = div()
-        .id(("drum-fader", index))
-        .relative()
-        .w(px(20.0))
-        .h(px(FADER_H))
-        .cursor(gpui::CursorStyle::ResizeUpDown)
-        .on_mouse_down(gpui::MouseButton::Left, move |event, w, cx| {
-            press(
-                &FaderPress {
-                    pad: index,
-                    y: f32::from(event.position.y),
-                    clicks: event.click_count,
-                },
-                w,
-                cx,
-            )
-        })
-        .child(
-            div()
-                .absolute()
-                .left(px(8.0))
-                .w(px(4.0))
-                .top(px(0.0))
-                .bottom(px(0.0))
-                .rounded(px(2.0))
-                .bg(Colors::surface_input()),
-        )
-        .child(
-            div()
-                .absolute()
-                .left(px(8.0))
-                .w(px(4.0))
-                .bottom(px(0.0))
-                .h(px(FADER_H * position))
-                .rounded(px(2.0))
-                .bg(Colors::with_alpha(accent, 0.55)),
-        )
-        // 0 dB, marked.
-        .child(
-            div()
-                .absolute()
-                .left(px(2.0))
-                .w(px(16.0))
-                .h(px(1.0))
-                .bottom(px(FADER_H * fader_position(0.0)))
-                .bg(Colors::text_faint()),
-        )
-        .child(
-            div()
-                .absolute()
-                .left(px(0.0))
-                .w(px(20.0))
-                .h(px(FADER_THUMB_H))
-                .bottom(px((FADER_H - FADER_THUMB_H) * position))
-                .rounded(px(2.0))
-                .border(px(1.0))
-                .border_color(Colors::border_strong())
-                .bg(if selected {
-                    accent
-                } else {
-                    Colors::text_secondary()
-                }),
-        );
-    let level = div()
-        .relative()
-        .w(px(6.0))
-        .h(px(FADER_H))
-        .rounded(px(2.0))
-        .bg(Colors::surface_muted())
-        .child(
-            div()
-                .absolute()
-                .left(px(0.0))
-                .right(px(0.0))
-                .bottom(px(0.0))
-                .h(px(FADER_H * meter))
-                .rounded(px(2.0))
-                .bg(accent),
-        );
-
-    div()
-        .id(("drum-strip", index))
-        .relative()
-        .flex()
-        .flex_col()
-        .items_center()
-        .flex_1()
-        .min_w(px(0.0))
-        .overflow_hidden()
-        .gap(px(space::SNUG))
-        .p(px(space::TIGHT))
-        .rounded(px(radius::CONTROL))
-        .border(px(1.0))
-        .border_color(if selected {
-            accent
-        } else {
-            Colors::border_subtle()
-        })
-        .bg(if meter > 0.02 {
-            Colors::composite(
-                Colors::surface_panel(),
-                Colors::with_alpha(accent, 0.08 + 0.2 * meter),
-            )
-        } else {
-            Colors::surface_panel()
-        })
-        .opacity(if empty { 0.6 } else { 1.0 })
-        .on_mouse_down(gpui::MouseButton::Right, move |event, w, cx| {
-            context(
-                &(
-                    DrumMenuTarget::Pad(index),
-                    f32::from(event.position.x),
-                    f32::from(event.position.y),
-                ),
-                w,
-                cx,
-            )
-        })
-        .child(
-            div()
-                .id(("drum-strip-head", index))
-                .flex()
-                .flex_col()
-                .items_center()
-                .w_full()
-                .cursor(gpui::CursorStyle::PointingHand)
-                .on_click(move |_, w, cx| select(&index, w, cx))
-                .child(
-                    div()
-                        .text_size(px(typography::UI_XS))
-                        .font_weight(gpui::FontWeight::BOLD)
-                        .text_color(if selected {
-                            accent
-                        } else {
-                            Colors::text_primary()
-                        })
-                        .child(pad_number(index)),
-                )
-                .child(
-                    div()
-                        .w_full()
-                        .truncate()
-                        .text_center()
-                        .text_size(px(typography::DENSE_CAPTION))
-                        .text_color(Colors::text_muted())
-                        .child(pad.sample_name.clone().unwrap_or_else(|| "Empty".into())),
-                ),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap(px(2.0))
-                .child(caption("OUT"))
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .child(fb_stepper_button(
-                            ("drum-strip-out", index * 2),
-                            "−",
-                            out_dec,
-                        ))
-                        .child(
-                            div()
-                                .w(px(18.0))
-                                .flex()
-                                .justify_center()
-                                .text_size(px(typography::UI_XS))
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(if pad.output > 0 {
-                                    accent
-                                } else {
-                                    Colors::text_primary()
-                                })
-                                .child((pad.output + 1).to_string()),
-                        )
-                        .child(fb_stepper_button(
-                            ("drum-strip-out", index * 2 + 1),
-                            "+",
-                            out_inc,
-                        )),
-                ),
-        )
-        .child(knob_cell(
-            "Pan",
-            format_pan_label(pad.pan),
-            knob_bipolar(
-                knob_id("strip-pan", index),
-                pad.pan,
-                -1.0,
-                1.0,
-                24.0,
-                accent,
-                None,
-                0.0,
-                move |value, w, cx| {
-                    let mut next = pan_pad.clone();
-                    next.pan = *value;
-                    pan_set(&(index, next), w, cx)
-                },
-            ),
-        ))
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_end()
-                .gap(px(space::TIGHT))
-                .child(fader)
-                .child(level),
-        )
-        .child(
-            div()
-                .text_size(px(typography::DENSE_LABEL))
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(Colors::text_secondary())
-                .child(format!("{:+.1}", pad.gain_db)),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .w_full()
-                .gap(px(2.0))
-                .child(strip_toggle(
-                    ("drum-strip-mute", index),
-                    "M",
-                    pad.muted,
-                    Colors::status_error(),
-                    set(|p| p.muted = !p.muted),
-                ))
-                .child(strip_toggle(
-                    ("drum-strip-solo", index),
-                    "S",
-                    pad.solo,
-                    Colors::status_warning(),
-                    set(|p| p.solo = !p.solo),
-                )),
-        )
-        .when(panel.hits[index] > 0, |strip| {
-            strip.child(hit_flash(index, panel.hits[index]))
-        })
-        .into_any_element()
-}
-
-/// The pads in choke group `group` (1–8): a hit on one cuts the others.
-pub fn choke_members(params: &drumsampler::Params, group: u8) -> Vec<usize> {
-    if group == 0 {
-        return Vec::new();
-    }
-    (0..PADS)
-        .filter(|index| params.pads[*index].choke_group == group)
-        .collect()
-}
-
-/// The selected pad's choke group, as one row of chips — Off, then 1–8 —
-/// each group showing how many pads are in it, and which pads share the
-/// selected one's.
-fn choke_chips(panel: &DrumSamplerPanelState, cb: &DrumSamplerCallbacks) -> AnyElement {
-    let i = panel.selected;
-    let pad = panel.pad().clone();
-    let accent = Colors::accent_primary();
-    let mut chips = div().flex().flex_row().flex_wrap().gap(px(3.0));
-    for group in 0..=8_u8 {
-        let on = pad.choke_group == group;
-        let count = choke_members(&panel.params, group).len();
-        let set = cb.on_set_pad.clone();
-        let mut next = pad.clone();
-        next.choke_group = group;
-        chips = chips.child(
-            div()
-                .id(("drum-choke-group", group as usize))
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .min_w(px(if group == 0 { 34.0 } else { 24.0 }))
-                .h(px(28.0))
-                .px(px(4.0))
-                .rounded(px(radius::CONTROL_SM))
-                .border(px(1.0))
-                .border_color(if on { accent } else { Colors::border_subtle() })
-                .bg(if on {
-                    Colors::with_alpha(accent, 0.22)
-                } else {
-                    Colors::surface_input()
-                })
-                .cursor(gpui::CursorStyle::PointingHand)
-                .hover(|style| style.bg(Colors::surface_hover()))
-                .on_click(move |_, w, cx| set(&(i, next.clone()), w, cx))
-                .child(
-                    div()
-                        .text_size(px(typography::DENSE_LABEL))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(if on { accent } else { Colors::text_secondary() })
-                        .child(if group == 0 {
-                            "Off".to_string()
-                        } else {
-                            group.to_string()
-                        }),
-                )
-                .when(group > 0 && count > 0, |chip| {
-                    chip.child(
-                        div()
-                            .text_size(px(8.0))
-                            .text_color(Colors::text_faint())
-                            .child(format!("{count} pad{}", if count == 1 { "" } else { "s" })),
-                    )
-                }),
-        );
-    }
-    let members = choke_members(&panel.params, pad.choke_group);
-    let summary = if pad.choke_group == 0 {
-        "Off — this pad never cuts another, and is never cut".to_string()
-    } else if members.len() <= 1 {
-        format!(
-            "Group {} — put another pad in it to cut each other (open and closed hi-hat)",
-            pad.choke_group
-        )
-    } else {
-        let names: Vec<String> = members.iter().map(|m| pad_number(*m)).collect();
-        format!(
-            "Group {} — pads {} cut each other",
-            pad.choke_group,
-            names.join(", ")
-        )
-    };
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(space::TIGHT))
-        .child(caption("CHOKE GROUP"))
-        .child(chips)
-        .child(
-            div()
-                .text_size(px(typography::DENSE_CAPTION))
-                .text_color(Colors::text_muted())
-                .child(summary),
-        )
-        .into_any_element()
-}
-
-fn trigger_module(panel: &DrumSamplerPanelState, cb: &DrumSamplerCallbacks) -> AnyElement {
-    let pad = panel.pad().clone();
-    let i = panel.selected;
-    let with = |apply: &dyn Fn(&mut Pad)| {
-        let mut next = pad.clone();
-        apply(&mut next);
-        next
-    };
-    let toggle = |id: &'static str, label: &'static str, on: bool, apply: fn(&mut Pad)| {
-        let set = cb.on_set_pad.clone();
-        let mut next = pad.clone();
-        apply(&mut next);
-        fb_checkbox((id, i), label, on, true, move |_, w, cx| {
-            set(&(i, next.clone()), w, cx)
-        })
-    };
-    module(
-        "TRIGGER",
-        None,
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(space::BASE))
-            .child(controls_row().child(pad_stepper(
-                ("drum-note", i),
-                "Note",
-                note_label(pad.note),
-                (
-                    i,
-                    with(&|p| p.note = p.note.saturating_sub(1)),
-                    with(&|p| p.note = p.note.saturating_add(1).min(127)),
-                ),
-                cb,
-            )))
-            .child(choke_chips(panel, cb))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .flex_wrap()
-                    .gap(px(space::BASE))
-                    .child(toggle("drum-reverse", "Reverse", pad.reverse, |p| {
-                        p.reverse = !p.reverse
-                    }))
-                    .child(toggle("drum-mute", "Mute", pad.muted, |p| {
-                        p.muted = !p.muted
-                    }))
-                    .child(toggle("drum-solo", "Solo", pad.solo, |p| p.solo = !p.solo)),
-            ),
-    )
 }
 
 #[cfg(test)]
@@ -2379,6 +1491,21 @@ mod tests {
         assert_eq!(BANKS, 4);
         assert_eq!((bank_of(15), bank_of(16), bank_of(63)), (0, 1, 3));
         assert_eq!(bank_letter(2), 'C');
+    }
+
+    #[test]
+    fn the_plate_regions_fit_the_artboard() {
+        assert!(WELL_TOP + WELL_H < DECK_TOP);
+        assert!(DECK_TOP + DECK_H <= PLATE_H);
+        // The pads' column: four rows of pads and the Samples folder under
+        // them, inside the deck.
+        let grid = 4.0 * PAD_H + 3.0 * PAD_GAP;
+        let inner = DECK_H - 2.0 * DECK_PAD;
+        assert!(
+            grid + DECK_GAP + 150.0 <= inner,
+            "room for the Samples list"
+        );
+        assert!(FADER_H < inner);
     }
 
     #[test]
@@ -2462,7 +1589,7 @@ mod tests {
         assert!((fader_position(0.0) - 60.0 / 72.0).abs() < 1.0e-6);
         // The full height is the full span; a drag rounds to 0.1 dB.
         assert_eq!(fader_dragged(0.0, FADER_H), FADER_MAX_DB);
-        assert_eq!(fader_dragged(0.0, -10.0), -4.1);
+        assert_eq!(fader_dragged(0.0, -10.0), -3.0);
         assert_eq!(fader_dragged(-59.0, -500.0), FADER_MIN_DB);
     }
 
@@ -2491,10 +1618,21 @@ mod tests {
     #[test]
     fn envelope_knobs_travel_square_root_and_round_back() {
         assert_eq!(
-            time_from_position(time_position(400.0, MAX_DECAY_MS), MAX_DECAY_MS),
+            time_from_position(
+                time_position(400.0, drumsampler::MAX_DECAY_MS),
+                drumsampler::MAX_DECAY_MS
+            ),
             400.0
         );
         assert_eq!(time_from_position(1.0, ATTACK_MAX_MS), ATTACK_MAX_MS);
-        assert_eq!(time_position(0.0, MAX_HOLD_MS), 0.0);
+        assert_eq!(time_position(0.0, drumsampler::MAX_HOLD_MS), 0.0);
+    }
+
+    #[test]
+    fn semitones_and_decibels_read_as_the_plates_print_them() {
+        assert_eq!(format_semis(3.0), "+3 st");
+        assert_eq!(format_semis(-12.0), "\u{2212}12 st");
+        assert_eq!(format_semis(0.0), "0 st");
+        assert_eq!(format_db(-6.0), "\u{2212}6.0 dB");
     }
 }

@@ -358,7 +358,7 @@ log "The installer ISO"
 # appended after the volume is not within.
 xorriso -as mkisofs -quiet \
 	-iso-level 3 -full-iso9660-filenames -joliet -joliet-long -rational-rock \
-	-volid "$ISO_LABEL" -appid "LiveStage installer" -publisher "Futureboard" \
+	-volid "$ISO_LABEL" -appid "LiveStage installer" -publisher "Futureboard Digital Technologies" \
 	-e boot/efiboot.img -no-emul-boot -efi-boot-part --efi-boot-image \
 	-output "/out/$INSTALLER_NAME.iso" "$WORK/iso"
 (cd /out && sha256sum "$IMAGE_NAME.img" "$IMAGE_NAME.efi" "$INSTALLER_NAME.iso" >"$IMAGE_NAME.sha256")

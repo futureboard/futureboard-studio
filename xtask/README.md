@@ -53,8 +53,6 @@ out/
 │     │  ├─ compresser.dll             # (no CEF, no PluginUI/ — CEF is shared at the app root)
 │     │  ├─ echospace.dll
 │     │  ├─ equz8.dll
-│     │  ├─ fa2a.dll
-│     │  ├─ fa76.dll
 │     │  ├─ meowsyn.dll
 │     │  └─ rodharerist.dll
 │     ├─ Resources/
@@ -118,7 +116,7 @@ Optional flags:
 - `--plugin <spec>` — build the Built-in Plugin dynamic libraries and stage them
   into `Plugins/`. `spec` is one of:
   - `all` — every built-in crate (`c1073`, `compresser`, `echospace`, `equz8`,
-    `fa2a`, `fa76`, `meowsyn`, `rodharerist`); fails if any expected library is
+    `meowsyn`, `rodharerist`, …); fails if any expected library is
     missing from the staged package.
   - `none` — build no plugins (the default).
   - a comma-separated list of crate names, e.g. `rodharerist,equz8`.

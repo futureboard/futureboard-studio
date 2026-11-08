@@ -16,8 +16,6 @@ dependencies = [
  "echospace",
  "equz8",
  "equzx",
- "fa2a",
- "fa76",
  "meowsyn",
  "mixstation",
  "transient",
@@ -2944,24 +2942,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af9673d8203fcb076b19dfd17e38b3d4ae9f44959416ea532ce72415a6020365"
 
 [[package]]
-name = "fa2a"
-version = "2026.11.1-beta2.0.0"
-dependencies = [
- "builtin_dsp_core",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "fa76"
-version = "2026.11.1-beta2.0.0"
-dependencies = [
- "builtin_dsp_core",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "fallible-iterator"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4925,7 +4905,6 @@ name = "livestage"
 version = "2026.11.1-beta2.0.0"
 dependencies = [
  "builtin_ui_embed",
- "fa76",
  "gpui",
  "gpui_linux",
  "gpui_windows",
@@ -4943,6 +4922,7 @@ dependencies = [
  "sphere_ui_components",
  "tungstenite",
  "windows-sys 0.61.2",
+ "zcomp",
 ]
 
 [[package]]
@@ -4958,8 +4938,6 @@ dependencies = [
  "echospace",
  "equz8",
  "equzx",
- "fa2a",
- "fa76",
  "imager",
  "libc",
  "mixstation",
@@ -8360,8 +8338,6 @@ dependencies = [
  "embed-resource",
  "equz8",
  "equzx",
- "fa2a",
- "fa76",
  "imager",
  "libc",
  "mixstation",
@@ -8454,8 +8430,6 @@ dependencies = [
  "echospace",
  "equz8",
  "equzx",
- "fa2a",
- "fa76",
  "fbmx-runtime",
  "gpui",
  "gpui_windows",

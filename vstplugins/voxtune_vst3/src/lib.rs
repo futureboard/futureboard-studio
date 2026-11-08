@@ -91,7 +91,7 @@ impl Default for Voxtune {
 
 impl Plugin for Voxtune {
     const NAME: &'static str = "Solfege Voxtune";
-    const VENDOR: &'static str = "Futureboard";
+    const VENDOR: &'static str = "Futureboard Digital Technologies";
     const URL: &'static str = "https://futureboard.studio";
     const EMAIL: &'static str = "";
     const VERSION: &'static str = env!("CARGO_PKG_VERSION");

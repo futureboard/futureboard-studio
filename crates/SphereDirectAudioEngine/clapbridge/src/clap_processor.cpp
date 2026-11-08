@@ -1054,7 +1054,7 @@ SphereDauxClapProcessor *sphere_daux_clap_create(const char *plugin_path,
   p->host.clap_version = CLAP_VERSION;
   p->host.host_data = p;
   p->host.name = "Futureboard Studio";
-  p->host.vendor = "Futureboard";
+  p->host.vendor = "Futureboard Digital Technologies";
   p->host.url = "";
   p->host.version = "1.0";
   p->host.get_extension = host_get_extension;

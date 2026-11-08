@@ -1513,7 +1513,7 @@ mod tests {
             id: insert,
             bypass: false,
             plugin: InsertPlugin::Builtin {
-                stem: "fa76".to_string(),
+                stem: "zcomp".to_string(),
                 params: BTreeMap::from([(2, 0.5)]),
             },
         });

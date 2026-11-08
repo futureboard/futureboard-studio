@@ -662,7 +662,7 @@ impl StudioMobileEngine {
         }
         t1.sync_snapshot_from_plugins();
 
-        // ── Track 2: Sub & Pluck Bass (WrapSynth + C-1073 + FA-76) ───────────
+        // ── Track 2: Sub & Pluck Bass (WrapSynth + C-1073 + Z-Comp) ──────────
         let bass_pattern: &[(u8, f64, f64, u8)] = &[
             // Bar 1: A1 (45)
             (45, 0.0, 0.75, 115),
@@ -767,8 +767,8 @@ impl StudioMobileEngine {
         if let Some(c1073) = BuiltinPluginInstance::new("c1073", sr as f32) {
             t2.insert_instances.push(c1073);
         }
-        if let Some(fa76) = BuiltinPluginInstance::new("fa76", sr as f32) {
-            t2.insert_instances.push(fa76);
+        if let Some(zcomp) = BuiltinPluginInstance::new("zcomp", sr as f32) {
+            t2.insert_instances.push(zcomp);
         }
         t2.sync_snapshot_from_plugins();
 
@@ -847,7 +847,7 @@ impl StudioMobileEngine {
         }
         t3.sync_snapshot_from_plugins();
 
-        // ── Track 4: Studio Vocal / Harmonic Audio Stem (Audio + EQ-Z8 + FA-2A)
+        // ── Track 4: Studio Vocal / Harmonic Audio Stem (Audio + EQ-Z8 + Compresser)
         let mut t4 = TrackRuntime::new(
             TrackSnapshot {
                 id: "track-4".to_string(),
@@ -898,8 +898,8 @@ impl StudioMobileEngine {
             eq.apply_preset("Vocal Presence & Air");
             t4.insert_instances.push(eq);
         }
-        if let Some(fa2a) = BuiltinPluginInstance::new("fa2a", sr as f32) {
-            t4.insert_instances.push(fa2a);
+        if let Some(comp) = BuiltinPluginInstance::new("compresser", sr as f32) {
+            t4.insert_instances.push(comp);
         }
         t4.sync_snapshot_from_plugins();
 

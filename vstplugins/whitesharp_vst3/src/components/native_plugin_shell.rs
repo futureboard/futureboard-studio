@@ -40,6 +40,19 @@ impl ShellMeter {
     }
 }
 
+/// Studio's shell with a preset menu in its strip. The plug-in has no strip,
+/// and its host keeps the presets, so the menu is not shown.
+pub fn native_plugin_shell_with(
+    close_id: &'static str,
+    identity: &ShellIdentity,
+    level: ShellMeter,
+    on_close: impl Fn(&mut Window, &mut App) + Clone + 'static,
+    _presets: Option<AnyElement>,
+    content: AnyElement,
+) -> AnyElement {
+    native_plugin_shell(close_id, identity, level, on_close, content)
+}
+
 pub fn native_plugin_shell(
     _close_id: &'static str,
     _identity: &ShellIdentity,

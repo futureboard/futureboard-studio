@@ -443,11 +443,11 @@ mod tests {
     #[test]
     fn plugin_selection_list_is_trimmed() {
         assert_eq!(
-            PluginSelection::parse(Some("rodharerist, equz8 ,,fa76"), false),
+            PluginSelection::parse(Some("rodharerist, equz8 ,,zapp"), false),
             PluginSelection::Only(vec![
                 "rodharerist".to_string(),
                 "equz8".to_string(),
-                "fa76".to_string(),
+                "zapp".to_string(),
             ])
         );
     }

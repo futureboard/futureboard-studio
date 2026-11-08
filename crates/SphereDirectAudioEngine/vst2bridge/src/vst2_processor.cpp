@@ -309,7 +309,7 @@ intptr_t vst2_audio_master(AEffect *effect, int32_t opcode, int32_t index,
 
   case audioMasterGetVendorString:
     if (ptr) {
-      std::snprintf(static_cast<char *>(ptr), 64, "%s", "Futureboard");
+      std::snprintf(static_cast<char *>(ptr), 64, "%s", "Futureboard Digital Technologies");
       return 1;
     }
     return 0;

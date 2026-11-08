@@ -98,6 +98,7 @@ pub struct Live {
     /// held and falling back.
     polar: [f32; POLAR_BINS],
     sample_rate: Option<f32>,
+    tempo_bpm: Option<f32>,
 }
 
 impl Live {
@@ -125,6 +126,7 @@ impl Live {
             scope_gain: 1.0,
             polar: [0.0; POLAR_BINS],
             sample_rate: None,
+            tempo_bpm: None,
         }
     }
 
@@ -156,6 +158,11 @@ impl Live {
 
     pub fn sample_rate(&self) -> Option<f32> {
         self.sample_rate
+    }
+
+    /// The host's tempo, once it has reported one.
+    pub fn tempo_bpm(&self) -> Option<f32> {
+        self.tempo_bpm
     }
 
     /// Reads every source. True when anything worth a redraw moved, so an
@@ -208,9 +215,13 @@ impl Live {
                 moved = true;
             }
         }
-        if let Some((rate, ..)) = self.status_source.as_ref().and_then(|s| s(&self.key)) {
+        if let Some((rate, _, _, tempo)) = self.status_source.as_ref().and_then(|s| s(&self.key)) {
             if rate > 0 {
                 self.sample_rate = Some(rate as f32);
+            }
+            let tempo = tempo as f32;
+            if tempo.is_finite() && tempo > 0.0 {
+                self.tempo_bpm = Some(tempo);
             }
         }
         moved
@@ -284,6 +295,16 @@ impl Live {
         (0..self.count.min(HOLD_FRAMES))
             .map(|age| read(&self.point(age)))
             .fold(f32::NEG_INFINITY, f32::max)
+    }
+
+    /// Where a VU needle stands: on the output scale in VU when `output`,
+    /// else on the reduction scale in dB — with the meter's ballistics.
+    pub(crate) fn needle(&self, output: bool) -> f32 {
+        if output {
+            self.needle_output
+        } else {
+            self.needle_reduction
+        }
     }
 
     pub fn spectrum_bins(&self) -> Option<&[f32; SPECTRUM_BINS]> {

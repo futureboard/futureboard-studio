@@ -65,6 +65,8 @@ pub enum SettingsTab {
     Editing,
     Appearance,
     Performance,
+    /// Features still being built, each off until turned on.
+    Experimental,
     About,
 }
 
@@ -79,6 +81,7 @@ impl SettingsTab {
             Self::Editing => "settings.tab.editing",
             Self::Appearance => "settings.tab.appearance",
             Self::Performance => "settings.tab.performance",
+            Self::Experimental => "settings.tab.experimental",
             Self::About => "settings.tab.about",
         }
     }
@@ -93,6 +96,7 @@ impl SettingsTab {
             Self::Editing => assets::ICON_PENCIL_PATH,
             Self::Appearance => assets::ICON_PALETTE_PATH,
             Self::Performance => assets::ICON_GAUGE_PATH,
+            Self::Experimental => assets::ICON_SPARKLES_PATH,
             Self::About => assets::ICON_STAR_PATH,
         }
     }
@@ -103,7 +107,7 @@ impl SettingsTab {
             &[Self::General],
             &[Self::Audio, Self::Midi, Self::Recording, Self::Playback],
             &[Self::Editing, Self::Appearance],
-            &[Self::Performance, Self::About],
+            &[Self::Performance, Self::Experimental, Self::About],
         ]
     }
 
@@ -117,6 +121,7 @@ impl SettingsTab {
             Self::Editing,
             Self::Appearance,
             Self::Performance,
+            Self::Experimental,
             Self::About,
         ]
     }

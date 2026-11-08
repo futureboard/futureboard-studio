@@ -49,7 +49,10 @@ use crate::components::native_plugin_shell::{
 };
 use crate::components::plate;
 use crate::components::rodhareist_panel::{
-    ChainFocus, Page, RodUi, rodhareist_panel, tapped_interval,
+    ChainFocus, Page, RodFields, RodUi, chain_frame, rodhareist_panel, tapped_interval,
+};
+use crate::components::text_input::{
+    TextInputAction, TextInputState, bind_mouse_selection, text_field_with_callbacks_and_ime,
 };
 
 /// The editor at its design size, and the smallest it may get.
@@ -145,14 +148,15 @@ pub(crate) struct LoadStatus {
     pub error: Option<String>,
 }
 
-/// A stored file's name as the editor shows it: without its extension.
-/// `User/futureboard.rodharerist` under the app preset root. The plug-in
-/// id is already a safe directory name, the same folder the editor chrome
-/// uses for this plug-in's `.pst` files.
+/// The name Rodhareist's presets are filed under, as the registry lists it.
+const PRESET_PLUGIN_NAME: &str = "Rodhareist";
+
+/// `Documents/Futureboard Studio/Presets/Plug-ins/Rodhareist`: every
+/// plug-in's user presets sit in a folder named for it there, Studio's
+/// built-in and the external builds alike.
 fn user_preset_dir() -> PathBuf {
-    SpherePluginHost::registry::default_preset_root()
-        .join("User")
-        .join(rodharerist::PLUGIN_ID)
+    SpherePluginHost::preset::user_preset_dir(PRESET_PLUGIN_NAME)
+        .unwrap_or_else(|| SpherePluginHost::registry::user_preset_root().join(PRESET_PLUGIN_NAME))
 }
 
 fn list_user_presets() -> Vec<(String, PathBuf)> {
@@ -262,6 +266,11 @@ pub struct RodhareistEditorWindow {
     pub(crate) chain_focus: Option<ChainFocus>,
     /// The page, footswitch map and display options — view state too.
     pub(crate) ui: RodUi,
+    /// Explore's block search. Studio's text field: the OS IME (Thai, CJK,
+    /// dead keys), caret, selection and clipboard all work in it.
+    pub(crate) search: TextInputState,
+    /// Home's preset name, saved as the `.pst` stem; never a wire parameter.
+    pub(crate) preset_name: TextInputState,
     /// The insert's telemetry block (`rodharerist::telemetry`): per-channel
     /// levels and the tuner.
     pads: Option<[f32; SpherePluginHost::audio_bridge::BUILTIN_PAD_SLOTS]>,
@@ -295,6 +304,12 @@ impl RodhareistEditorWindow {
             preset_note: None,
             chain_focus: None,
             ui: RodUi::default(),
+            search: TextInputState::new("rodhareist-search", cx.focus_handle())
+                .with_placeholder("Search blocks")
+                .with_accessible_label("Search blocks"),
+            preset_name: TextInputState::new("rodhareist-preset-name", cx.focus_handle())
+                .with_placeholder("Preset name")
+                .with_accessible_label("Preset name"),
             pads: None,
             alive: Rc::new(Cell::new(true)),
         };
@@ -302,7 +317,8 @@ impl RodhareistEditorWindow {
         window.sync_from_mirror(cx);
         window.preset = matching_preset(&window.params);
         window.refresh_user_presets();
-        window.ui.preset_name = window.user_preset_save_name();
+        let name = window.user_preset_save_name();
+        window.preset_name.set_value(name);
         window.start_meter(cx);
         window
     }
@@ -339,6 +355,7 @@ impl RodhareistEditorWindow {
             self.preset_note = None;
             self.pads = None;
             self.ui = RodUi::default();
+            self.search.set_value("");
         }
         self.identity = identity;
         self.host_ops = host_ops;
@@ -347,7 +364,8 @@ impl RodhareistEditorWindow {
             self.preset = matching_preset(&self.params);
         }
         self.refresh_user_presets();
-        self.ui.preset_name = self.user_preset_save_name();
+        let name = self.user_preset_save_name();
+        self.preset_name.set_value(name);
     }
 
     /// Sends what changed between the window's params and `next` as wire
@@ -469,74 +487,62 @@ impl RodhareistEditorWindow {
             .filter(|(rate, _)| *rate > 0)
     }
 
-    /// Typing into the Explore page's search field.
-    fn on_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        if self.ui.preset_name_focus && self.ui.page == Page::Home {
-            self.on_preset_name_key(event, cx);
+    /// Whether one of the editor's text fields has the keyboard.
+    pub(crate) fn typing(&self, window: &Window) -> bool {
+        self.search.is_focused(window) || self.preset_name.is_focused(window)
+    }
+
+    /// Hands the keyboard back to the editor from a text field — on a page
+    /// change, a preset load or Enter — so it stops taking keys it no longer
+    /// shows.
+    pub(crate) fn release_text_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.typing(window) {
+            self.focus_handle.focus(window, cx);
+        }
+    }
+
+    /// Keys for the focused text field. Printable text and IME composition
+    /// arrive through the OS input handler (`EntityInputHandler` below), so
+    /// this only steers: caret, selection, deletion, clipboard, Enter and
+    /// Escape.
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.preset_name.is_focused(window) {
+            // Enter writes the `.pst`; Escape leaves the text as it is.
+            match self.preset_name.handle_key_ime(event, Some(cx)) {
+                TextInputAction::Submit => {
+                    self.preset_note = self.save_user_preset().err();
+                    self.release_text_focus(window, cx);
+                }
+                TextInputAction::Cancel => self.release_text_focus(window, cx),
+                TextInputAction::Consumed | TextInputAction::Pass => {}
+            }
+            cx.notify();
             return;
         }
-        if !self.ui.search_focus || self.ui.page != Page::Explore {
+        if !self.search.is_focused(window) {
             return;
         }
-        let keystroke = &event.keystroke;
-        match keystroke.key.as_str() {
-            "escape" => {
-                if self.ui.query.is_empty() {
-                    self.ui.search_focus = false;
+        // Escape clears a search, then leaves the field.
+        if event.keystroke.key == "escape" && !self.search.value.is_empty() {
+            self.search.set_value("");
+        } else {
+            match self.search.handle_key_ime(event, Some(cx)) {
+                TextInputAction::Submit | TextInputAction::Cancel => {
+                    self.release_text_focus(window, cx)
                 }
-                self.ui.query.clear();
-            }
-            "backspace" => {
-                self.ui.query.pop();
-            }
-            "enter" => self.ui.search_focus = false,
-            _ => {
-                if keystroke.modifiers.control || keystroke.modifiers.platform {
-                    return;
-                }
-                match keystroke.key_char.as_deref() {
-                    Some(text) if !text.chars().any(char::is_control) => {
-                        if self.ui.query.chars().count() < 40 {
-                            self.ui.query.push_str(text);
-                        }
-                    }
-                    _ => return,
-                }
+                TextInputAction::Consumed | TextInputAction::Pass => {}
             }
         }
         cx.notify();
     }
 
-    /// Home's preset name field. Enter writes the `.pst`; Escape leaves the text.
-    fn on_preset_name_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        let keystroke = &event.keystroke;
-        match keystroke.key.as_str() {
-            "escape" => self.ui.preset_name_focus = false,
-            "backspace" => {
-                self.ui.preset_name.pop();
-            }
-            "enter" => {
-                self.ui.preset_name_focus = false;
-                match self.save_user_preset() {
-                    Ok(()) => self.preset_note = None,
-                    Err(error) => self.preset_note = Some(error),
-                }
-            }
-            _ => {
-                if keystroke.modifiers.control || keystroke.modifiers.platform {
-                    return;
-                }
-                match keystroke.key_char.as_deref() {
-                    Some(text) if !text.chars().any(char::is_control) => {
-                        if self.ui.preset_name.chars().count() < 48 {
-                            self.ui.preset_name.push_str(text);
-                        }
-                    }
-                    _ => return,
-                }
-            }
+    /// The text field the OS input handler is talking to.
+    fn ime_field(&mut self, window: &Window) -> &mut TextInputState {
+        if self.preset_name.is_focused(window) {
+            &mut self.preset_name
+        } else {
+            &mut self.search
         }
-        cx.notify();
     }
 
     fn set_wire(&mut self, id: &str, value: f32, cx: &mut Context<Self>) {
@@ -555,7 +561,7 @@ impl RodhareistEditorWindow {
         index: usize,
     ) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static {
         let entity = cx.entity().clone();
-        move |_event, _window, app: &mut App| {
+        move |_event, window, app: &mut App| {
             let _ = entity.update(app, |this, cx| {
                 let Some(preset) = rodharerist::factory_presets().get(index) else {
                     return;
@@ -564,8 +570,8 @@ impl RodhareistEditorWindow {
                 this.preset = Some(index);
                 this.user_preset = None;
                 this.preset_note = None;
-                this.ui.preset_name = preset.name.to_string();
-                this.ui.preset_name_focus = false;
+                this.preset_name.set_value(preset.name);
+                this.release_text_focus(window, cx);
                 this.chain_focus = None;
                 this.set_params(next, cx);
             });
@@ -615,13 +621,10 @@ impl RodhareistEditorWindow {
         cx: &Context<Self>,
     ) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static {
         let entity = cx.entity().clone();
-        move |_event, _window, app: &mut App| {
+        move |_event, window, app: &mut App| {
             let _ = entity.update(app, |this, cx| {
-                this.ui.preset_name_focus = false;
-                match this.save_user_preset() {
-                    Ok(()) => this.preset_note = None,
-                    Err(error) => this.preset_note = Some(error),
-                }
+                this.release_text_focus(window, cx);
+                this.preset_note = this.save_user_preset().err();
                 cx.notify();
             });
         }
@@ -634,8 +637,9 @@ impl RodhareistEditorWindow {
         index: usize,
     ) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static {
         let entity = cx.entity().clone();
-        move |_event, _window, app: &mut App| {
+        move |_event, window, app: &mut App| {
             let _ = entity.update(app, |this, cx| {
+                this.release_text_focus(window, cx);
                 let Some((name, path)) = this.user_presets.get(index).cloned() else {
                     return;
                 };
@@ -647,8 +651,7 @@ impl RodhareistEditorWindow {
                             name: name.clone(),
                             params: next.clone(),
                         });
-                        this.ui.preset_name = name;
-                        this.ui.preset_name_focus = false;
+                        this.preset_name.set_value(name);
                         this.preset_note = None;
                         this.chain_focus = None;
                         this.set_params(next, cx);
@@ -663,7 +666,7 @@ impl RodhareistEditorWindow {
     }
 
     fn save_user_preset(&mut self) -> Result<(), String> {
-        let typed = self.ui.preset_name.trim();
+        let typed = self.preset_name.value.trim();
         let name = if typed.is_empty() {
             self.user_preset_save_name()
         } else {
@@ -685,7 +688,7 @@ impl RodhareistEditorWindow {
             &path,
             &SpherePluginHost::preset::StatePreset {
                 plugin_id: rodharerist::PLUGIN_ID.to_string(),
-                plugin_name: "Rodhareist".to_string(),
+                plugin_name: PRESET_PLUGIN_NAME.to_string(),
                 state: json.into_bytes(),
             },
         )?;
@@ -694,7 +697,7 @@ impl RodhareistEditorWindow {
             name: stem.clone(),
             params: self.params.clone(),
         });
-        self.ui.preset_name = stem.clone();
+        self.preset_name.set_value(stem.clone());
         if let Some(old) = previous {
             if old != stem {
                 let old_path = dir.join(format!("{old}.pst"));
@@ -722,10 +725,6 @@ impl RodhareistEditorWindow {
 
     /// The name the field starts from: the loaded user preset, else the
     /// factory name, else "My Rig".
-    pub(crate) fn suggested_preset_name(&self) -> String {
-        self.user_preset_save_name()
-    }
-
     fn user_preset_save_name(&self) -> String {
         if let Some(loaded) = &self.user_preset {
             return loaded.name.clone();
@@ -1130,21 +1129,45 @@ impl Render for RodhareistEditorWindow {
         }
         let on_close = self.on_close.clone();
         let alive = self.alive.clone();
-        let content = rodhareist_panel(self, window, cx);
+        // A chain drag that ended anywhere but a drop target closes the
+        // lane it opened.
+        if !cx.has_active_drag() {
+            self.ui.drag_block = None;
+        }
+        let (frame, moving) = chain_frame(&mut self.ui, &self.params, std::time::Instant::now());
+        if moving {
+            window.request_animation_frame();
+        }
+        let entity = cx.entity();
+        let fields = RodFields {
+            search: text_field_with_callbacks_and_ime(
+                &self.search,
+                self.search.is_focused(window),
+                bind_mouse_selection(entity.clone(), |this| &mut this.search),
+                entity.clone(),
+            )
+            .into_any_element(),
+            preset_name: text_field_with_callbacks_and_ime(
+                &self.preset_name,
+                self.preset_name.is_focused(window),
+                bind_mouse_selection(entity.clone(), |this| &mut this.preset_name),
+                entity,
+            )
+            .into_any_element(),
+        };
+        let content = rodhareist_panel(self, &frame, fields, window, cx);
 
         div()
             .relative()
             .size_full()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                // Explore search owns Space while its caret is up. Everywhere
+                // A text field owns Space while its caret is up. Everywhere
                 // else in this window Space is play/pause.
-                let typing = (this.ui.search_focus && this.ui.page == Page::Explore)
-                    || (this.ui.preset_name_focus && this.ui.page == Page::Home);
-                if !typing && claim_editor_transport_key(event, window, cx) {
+                if !this.typing(window) && claim_editor_transport_key(event, window, cx) {
                     return;
                 }
-                this.on_key_down(event, cx);
+                this.on_key_down(event, window, cx);
             }))
             .on_key_up(|_event, window, cx| swallow_editor_transport_key_up(window, cx))
             .child(native_plugin_shell(
@@ -1161,6 +1184,98 @@ impl Render for RodhareistEditorWindow {
                 },
                 content,
             ))
+    }
+}
+
+/// The OS input handler, for whichever of the two fields has focus: text and
+/// IME composition (Thai, CJK, dead keys) reach the field here, not through
+/// key-down. `impl_single_input_window_ime!` serves one field; this window has
+/// two, so it routes by focus.
+impl gpui::EntityInputHandler for RodhareistEditorWindow {
+    fn text_for_range(
+        &mut self,
+        range: std::ops::Range<usize>,
+        actual_range: &mut Option<std::ops::Range<usize>>,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        self.ime_field(window)
+            .text_for_utf16_range(range, actual_range)
+    }
+
+    fn selected_text_range(
+        &mut self,
+        ignore_disabled_input: bool,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<gpui::UTF16Selection> {
+        self.ime_field(window)
+            .selected_text_range_utf16(ignore_disabled_input)
+    }
+
+    fn marked_text_range(
+        &self,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        if self.preset_name.is_focused(window) {
+            self.preset_name.marked_text_range_utf16()
+        } else {
+            self.search.marked_text_range_utf16()
+        }
+    }
+
+    fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ime_field(window).unmark_text();
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range: Option<std::ops::Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ime_field(window)
+            .replace_text_in_utf16_range(range, text);
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range: Option<std::ops::Range<usize>>,
+        new_text: &str,
+        new_selected_range: Option<std::ops::Range<usize>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ime_field(window).replace_and_mark_text_in_utf16_range(
+            range,
+            new_text,
+            new_selected_range,
+        );
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: std::ops::Range<usize>,
+        bounds: gpui::Bounds<gpui::Pixels>,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<gpui::Bounds<gpui::Pixels>> {
+        self.ime_field(window)
+            .bounds_for_utf16_range(range_utf16, bounds)
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: gpui::Point<gpui::Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
     }
 }
 

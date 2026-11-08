@@ -977,6 +977,22 @@ pub struct PerformanceSettings {
     pub audio_processing: AudioProcessingSettings,
 }
 
+/// Features still being built (Settings → Experimental). Each is off until the
+/// user turns it on, and an off feature has no way into Studio at all.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ExperimentalSettings {
+    /// The Voxtune vocal tuner as a tab of the bottom Editor panel.
+    #[serde(default)]
+    pub voxtune: bool,
+}
+
+/// Whether the Voxtune tab is turned on in Settings → Experimental. Off when
+/// no settings model exists yet.
+pub fn voxtune_enabled(cx: &gpui::App) -> bool {
+    cx.try_global::<GlobalSettingsModel>()
+        .is_some_and(|settings| settings.0.read(cx).current.experimental.voxtune)
+}
+
 /// Audio engine CPU use (Settings → Performance → Audio Processing). Both
 /// parts are process-wide and take effect on the next audio block.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1224,6 +1240,8 @@ pub struct SettingsSchema {
     pub plugins: PluginsSettings,
     #[serde(default)]
     pub performance: PerformanceSettings,
+    #[serde(default)]
+    pub experimental: ExperimentalSettings,
 }
 
 impl SettingsSchema {
@@ -1531,6 +1549,20 @@ impl gpui::Global for GlobalSettingsModel {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn experimental_features_are_off_by_default_and_in_older_files() {
+        assert!(!SettingsSchema::default().experimental.voxtune);
+        // A settings file from before the Experimental page has no section.
+        let older: SettingsSchema = serde_json::from_str(r#"{"general":{"language":"en"}}"#)
+            .expect("an older settings file loads");
+        assert!(!older.experimental.voxtune);
+        let mut on = SettingsSchema::default();
+        on.experimental.voxtune = true;
+        let json = serde_json::to_string(&on).unwrap();
+        let back: SettingsSchema = serde_json::from_str(&json).unwrap();
+        assert!(back.experimental.voxtune, "the choice is saved");
+    }
 
     #[test]
     fn test_default_settings() {

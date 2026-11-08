@@ -21,16 +21,8 @@ use crate::layout::StudioLayout;
 /// opaque state. Nothing here parses or edits the state — a preset a plug-in
 /// cannot read back is worse than no preset at all — but the container around
 /// it must be unwrapped before the state is handed over.
-///
-/// `.pst` is safe under the preset root: the scan cache also walks that root for
-/// `.pst`, but a user preset carries state and a cache row never does, so the
-/// cache reader skips it and Clear Database keeps it
-/// (`SpherePluginHost::preset::is_state_preset_file`).
 const PRESET_EXTENSION: &str = "pst";
 
-/// Extension user presets were saved with before they became `.pst`. Still
-/// listed and loaded, so nothing saved earlier disappears.
-const LEGACY_PRESET_EXTENSION: &str = "fbstate";
 /// How an ARA editor's window is filed among the insert editors.
 ///
 /// It has no insert slot of its own — it is bound to a clip — so the studio
@@ -59,69 +51,52 @@ pub(super) fn legacy_native_editor_shell() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("FUTUREBOARD_PLUGIN_EDITOR_LEGACY_SHELL").is_some())
 }
 
-/// Where one plug-in's user presets live.
-///
-/// Under the registry's preset root so presets sit beside everything else the
-/// plug-in system writes, in a folder named for the plug-in rather than the
-/// insert: a preset saved on one track is meant to be reachable from another.
-fn preset_dir(plugin_id: &str) -> Option<PathBuf> {
-    let safe: String = plugin_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if safe.is_empty() {
-        return None;
-    }
-    Some(
-        SpherePluginHost::registry::default_preset_root()
-            .join("User")
-            .join(safe),
-    )
+/// The plug-in a preset list is for: its id, which a preset's state must
+/// match, and its name, which the folder is named for.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct PresetOwner {
+    pub(super) plugin_id: String,
+    pub(super) plugin_name: String,
 }
 
-/// One plug-in's user presets, sorted by name: `(name, file)`.
+/// Where one plug-in's user presets live:
+/// `Documents/Futureboard Studio/Presets/Plug-ins/{plug-in name}/`.
 ///
-/// `.pst` and the older `.fbstate` both count; where one name exists as both,
-/// the `.pst` wins so the list never shows a preset twice.
-fn list_preset_files(plugin_id: &str) -> Vec<(String, PathBuf)> {
-    let Some(dir) = preset_dir(plugin_id) else {
-        return Vec::new();
-    };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    let mut presets: Vec<(String, PathBuf)> = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
-            continue;
-        };
-        let modern = ext.eq_ignore_ascii_case(PRESET_EXTENSION);
-        if !modern && !ext.eq_ignore_ascii_case(LEGACY_PRESET_EXTENSION) {
-            continue;
-        }
-        let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) else {
-            continue;
-        };
-        match presets.iter_mut().find(|(existing, _)| existing == name) {
-            Some(slot) if modern => slot.1 = path,
-            Some(_) => {}
-            None => presets.push((name.to_string(), path)),
-        }
-    }
-    presets.sort_by_key(|(name, _)| name.to_lowercase());
-    presets
+/// Named for the plug-in rather than the insert: a preset saved on one track
+/// is meant to be reachable from another.
+fn preset_dir(owner: &PresetOwner) -> Option<PathBuf> {
+    SpherePluginHost::preset::user_preset_dir(&owner.plugin_name)
+}
+
+/// One plug-in's user presets, sorted by name: `(name, file)`. Only the
+/// ones saved by this exact plug-in id
+/// (`SpherePluginHost::preset::list_user_presets`).
+fn list_preset_files(owner: &PresetOwner) -> Vec<(String, PathBuf)> {
+    SpherePluginHost::preset::list_user_presets(&owner.plugin_id, &owner.plugin_name)
+}
+
+/// Tells the user a preset action they asked for did not happen. A save or a
+/// load that silently does nothing is worse than an extra dialog.
+#[cfg(feature = "builtin-plugin-editor")]
+fn report_preset_problem(title: &'static str, message: String, cx: &mut Context<StudioLayout>) {
+    eprintln!("[plugin-preset] {title}: {message}");
+    #[cfg(feature = "native-dialogs")]
+    cx.spawn(async move |_, _| {
+        rfd::AsyncMessageDialog::new()
+            .set_level(rfd::MessageLevel::Warning)
+            .set_title(title)
+            .set_description(message)
+            .show()
+            .await;
+    })
+    .detach();
+    #[cfg(not(feature = "native-dialogs"))]
+    let _ = cx;
 }
 
 /// Preset names for one plug-in, in list order.
-fn list_presets(plugin_id: &str) -> Vec<String> {
-    list_preset_files(plugin_id)
+fn list_presets(owner: &PresetOwner) -> Vec<String> {
+    list_preset_files(owner)
         .into_iter()
         .map(|(name, _)| name)
         .collect()
@@ -278,7 +253,7 @@ impl StudioLayout {
         let presets = slot
             .plugin_id
             .as_deref()
-            .map(list_presets)
+            .map(|plugin_id| list_presets(&self.preset_owner(plugin_id, &slot.display_name)))
             .unwrap_or_default();
         // A bridged plug-in reports through its shared region, which the host
         // writes and the bridge runtime holds; the engine's control-side graph
@@ -471,6 +446,11 @@ impl StudioLayout {
 
     /// Applies whatever the chrome's controls asked for since the last poll.
     pub(super) fn drain_plugin_editor_chrome_actions(&mut self, cx: &mut Context<Self>) {
+        // The built-in editors' preset menus.
+        #[cfg(feature = "builtin-plugin-editor")]
+        for (key, request) in crate::components::builtin_preset_menu::take_requests() {
+            self.apply_builtin_preset_request(&key.track_id, &key.insert_id, request, cx);
+        }
         // Built-in editors queue per instance, and only for what applies to a
         // built-in (power). A changed insert changes its tab, so the tabs are
         // rebuilt after.
@@ -567,8 +547,8 @@ impl StudioLayout {
             }
             PluginEditorAction::RevealPresetFolder => {
                 if let Some(dir) = self
-                    .insert_plugin_id(track_id, insert_id, cx)
-                    .and_then(|plugin_id| preset_dir(&plugin_id))
+                    .insert_preset_owner(track_id, insert_id, cx)
+                    .and_then(|owner| preset_dir(&owner))
                 {
                     let _ = std::fs::create_dir_all(&dir);
                     super::helpers::reveal_path(&dir);
@@ -605,10 +585,10 @@ impl StudioLayout {
         delta: i32,
         cx: &mut Context<Self>,
     ) {
-        let Some(plugin_id) = self.insert_plugin_id(track_id, insert_id, cx) else {
+        let Some(owner) = self.insert_preset_owner(track_id, insert_id, cx) else {
             return;
         };
-        let count = list_presets(&plugin_id).len() as i64;
+        let count = list_presets(&owner).len() as i64;
         if count == 0 {
             return;
         }
@@ -631,24 +611,46 @@ impl StudioLayout {
         index: usize,
         cx: &mut Context<Self>,
     ) {
-        let Some(plugin_id) = self.insert_plugin_id(track_id, insert_id, cx) else {
+        let Some(owner) = self.insert_preset_owner(track_id, insert_id, cx) else {
             return;
         };
-        let presets = list_preset_files(&plugin_id);
-        let Some((name, path)) = presets.get(index).cloned() else {
+        let presets = list_preset_files(&owner);
+        let Some((_, path)) = presets.get(index).cloned() else {
             return;
         };
-        let key = (track_id.to_string(), insert_id.to_string());
+        if self.load_preset_path(track_id, insert_id, &owner, &path, cx) {
+            let key = (track_id.to_string(), insert_id.to_string());
+            self.plugin_editors.preset_selection.insert(key, index);
+        }
+    }
+
+    /// Loads the preset file at `path` into the insert, as one undoable step.
+    /// `false` when the file is not this plug-in's preset or the plug-in
+    /// refused it; nothing changes then.
+    fn load_preset_path(
+        &mut self,
+        track_id: &str,
+        insert_id: &str,
+        owner: &PresetOwner,
+        path: &std::path::Path,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let plugin_id = owner.plugin_id.as_str();
+        let name = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or_default()
+            .to_string();
         // Through the container reader, never `fs::read`. The file is an FBPST
         // container and its state starts past the magic, the 24-byte header and
         // the JSON metadata; handing the whole file to `send_plugin_state` gave
         // the plug-in a payload it cannot parse, which is a preset that silently
         // does nothing or worse.
-        let (preset_plugin_id, state) = match SpherePluginHost::preset::read_state_preset(&path) {
+        let (preset_plugin_id, state) = match SpherePluginHost::preset::read_state_preset(path) {
             Ok(preset) => preset,
             Err(error) => {
                 eprintln!("[plugin-preset] could not read {}: {error}", path.display());
-                return;
+                return false;
             }
         };
         // The container says which plug-in produced the state, and state handed
@@ -661,7 +663,7 @@ impl StudioLayout {
                  '{plugin_id}'",
                 path.display()
             );
-            return;
+            return false;
         }
         let state_len = state.len();
         // Undo goes back to what the plug-in had before, not to the last
@@ -669,12 +671,12 @@ impl StudioLayout {
         // folds consecutive loads on one insert).
         let before = self.capture_insert_state(track_id, insert_id, cx);
         if !self.apply_plugin_state_to_insert(track_id, insert_id, std::sync::Arc::new(state), cx) {
-            return;
+            return false;
         }
         self.record_insert_state("Load Preset", track_id, insert_id, before, cx);
-        self.plugin_editors.preset_selection.insert(key, index);
         eprintln!("[plugin-preset] loaded '{name}' for insert={insert_id} bytes={state_len}");
         cx.notify();
+        true
     }
 
     /// Hands `state` to the plug-in as opaque state, and into the project so a
@@ -687,6 +689,27 @@ impl StudioLayout {
         state: std::sync::Arc<Vec<u8>>,
         cx: &mut Context<Self>,
     ) -> bool {
+        // A built-in's state is its mirror's JSON: stored on the slot, then
+        // seeded and replayed into the host DSP and every open editor — the
+        // same path an undo of it takes.
+        let builtin = self
+            .insert_plugin_id(track_id, insert_id, cx)
+            .is_some_and(|plugin_id| SpherePluginHost::builtin_audio_bridge_supported(&plugin_id));
+        if builtin {
+            self.timeline.update(cx, |timeline, cx| {
+                if let Some(slot) = timeline
+                    .state
+                    .insert_slots_mut(track_id)
+                    .and_then(|slots| slots.iter_mut().find(|slot| slot.id == insert_id))
+                {
+                    slot.vst3_state = Some(state);
+                }
+                cx.notify();
+            });
+            self.push_insert_state_to_plugin(track_id, insert_id, cx);
+            self.mark_dirty_view_only();
+            return true;
+        }
         if let Some(runtime) = self.plugin_editors.bridge_runtime.as_ref().cloned() {
             if let Ok(mut runtime) = runtime.lock() {
                 if let Err(error) = runtime.send_plugin_state(insert_id, &state) {
@@ -797,10 +820,10 @@ impl StudioLayout {
         insert_id: &str,
         cx: &mut Context<Self>,
     ) {
-        let Some(plugin_id) = self.insert_plugin_id(track_id, insert_id, cx) else {
+        let Some(owner) = self.insert_preset_owner(track_id, insert_id, cx) else {
             return;
         };
-        let Some(dir) = preset_dir(&plugin_id) else {
+        let Some(dir) = preset_dir(&owner) else {
             return;
         };
         let Some(state) = self
@@ -813,16 +836,9 @@ impl StudioLayout {
             );
             return;
         };
-        let plugin_name = self
-            .timeline
-            .read(cx)
-            .state
-            .find_insert_slot(track_id, insert_id)
-            .map(|slot| slot.display_name.clone())
-            .unwrap_or_else(|| plugin_id.clone());
         // Suggest the loaded preset's name — saving over it is the common case
         // — or the next free "Preset n".
-        let existing = list_presets(&plugin_id);
+        let existing = list_presets(&owner);
         let suggested = self
             .plugin_editors
             .preset_selection
@@ -836,8 +852,8 @@ impl StudioLayout {
             });
         let _ = std::fs::create_dir_all(&dir);
         let preset = SpherePluginHost::preset::StatePreset {
-            plugin_id,
-            plugin_name,
+            plugin_id: owner.plugin_id,
+            plugin_name: owner.plugin_name,
             state: state.as_ref().clone(),
         };
         self.save_preset_through_dialog(track_id, insert_id, dir, suggested, preset, cx);
@@ -888,7 +904,11 @@ impl StudioLayout {
                 preset.state.len()
             );
             let _ = this.update(cx, |layout, cx| {
-                layout.select_saved_preset(key, &preset.plugin_id, &path, cx);
+                let owner = PresetOwner {
+                    plugin_id: preset.plugin_id.clone(),
+                    plugin_name: preset.plugin_name.clone(),
+                };
+                layout.select_saved_preset(key, &owner, &path, cx);
             });
         })
         .detach();
@@ -918,7 +938,11 @@ impl StudioLayout {
             return;
         }
         let key = (track_id.to_string(), insert_id.to_string());
-        self.select_saved_preset(key, &preset.plugin_id, &path, cx);
+        let owner = PresetOwner {
+            plugin_id: preset.plugin_id.clone(),
+            plugin_name: preset.plugin_name.clone(),
+        };
+        self.select_saved_preset(key, &owner, &path, cx);
     }
 
     /// Marks a just-written preset as the loaded one, when it landed in the
@@ -926,11 +950,11 @@ impl StudioLayout {
     fn select_saved_preset(
         &mut self,
         key: (String, String),
-        plugin_id: &str,
+        owner: &PresetOwner,
         path: &std::path::Path,
         cx: &mut Context<Self>,
     ) {
-        let position = list_preset_files(plugin_id)
+        let position = list_preset_files(owner)
             .iter()
             .position(|(_, listed)| listed == path);
         match position {
@@ -954,20 +978,18 @@ impl StudioLayout {
         insert_id: &str,
         cx: &mut Context<Self>,
     ) {
-        let Some(plugin_id) = self.insert_plugin_id(track_id, insert_id, cx) else {
+        let Some(owner) = self.insert_preset_owner(track_id, insert_id, cx) else {
             return;
         };
-        let Some(dir) = preset_dir(&plugin_id) else {
+        let Some(dir) = preset_dir(&owner) else {
             return;
         };
+        let plugin_id = owner.plugin_id.clone();
         let _ = std::fs::create_dir_all(&dir);
         let base = rfd::AsyncFileDialog::new()
             .set_title("Import Preset")
             .set_directory(&dir)
-            .add_filter(
-                "Futureboard Preset",
-                &[PRESET_EXTENSION, LEGACY_PRESET_EXTENSION],
-            );
+            .add_filter("Futureboard Preset", &[PRESET_EXTENSION]);
         let dialog = self.parent_dialog_to_editor(track_id, base, cx);
         let (track_id, insert_id) = (track_id.to_string(), insert_id.to_string());
         cx.spawn(async move |this, cx| {
@@ -997,7 +1019,7 @@ impl StudioLayout {
                 return;
             }
             let _ = this.update(cx, |layout, cx| {
-                layout.import_preset_file(&track_id, &insert_id, &plugin_id, &dir, &source, cx);
+                layout.import_preset_file(&track_id, &insert_id, &owner, &dir, &source, cx);
             });
         })
         .detach();
@@ -1015,12 +1037,11 @@ impl StudioLayout {
 
     /// Loads an already-validated preset file into the insert, and keeps a copy
     /// in the plug-in's folder unless it already lives there.
-    #[cfg(feature = "native-dialogs")]
     fn import_preset_file(
         &mut self,
         track_id: &str,
         insert_id: &str,
-        plugin_id: &str,
+        owner: &PresetOwner,
         dir: &std::path::Path,
         source: &std::path::Path,
         cx: &mut Context<Self>,
@@ -1047,18 +1068,11 @@ impl StudioLayout {
                 })
                 .find(|candidate| !candidate.exists())
                 .unwrap_or_else(|| dir.join(format!("{stem}.{PRESET_EXTENSION}")));
-            let plugin_name = self
-                .timeline
-                .read(cx)
-                .state
-                .find_insert_slot(track_id, insert_id)
-                .map(|slot| slot.display_name.clone())
-                .unwrap_or_else(|| plugin_id.to_string());
             match SpherePluginHost::preset::write_state_preset(
                 &target,
                 &SpherePluginHost::preset::StatePreset {
-                    plugin_id: plugin_id.to_string(),
-                    plugin_name,
+                    plugin_id: owner.plugin_id.clone(),
+                    plugin_name: owner.plugin_name.clone(),
                     state: state.clone(),
                 },
             ) {
@@ -1082,7 +1096,7 @@ impl StudioLayout {
         self.record_insert_state("Import Preset", track_id, insert_id, before, cx);
         self.select_saved_preset(
             (track_id.to_string(), insert_id.to_string()),
-            plugin_id,
+            owner,
             &filed,
             cx,
         );
@@ -1115,6 +1129,129 @@ impl StudioLayout {
             .or(dialog)
             .unwrap_or_else(rfd::AsyncFileDialog::new)
     }
+    /// Carries out what a built-in editor's preset menu asked for: the same
+    /// loading, saving and filing the external editors' strip does, against
+    /// the same `Presets/Plug-ins/{name}` folder.
+    #[cfg(feature = "builtin-plugin-editor")]
+    fn apply_builtin_preset_request(
+        &mut self,
+        track_id: &str,
+        insert_id: &str,
+        request: crate::components::builtin_preset_menu::BuiltinPresetRequest,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::components::builtin_preset_menu::BuiltinPresetRequest;
+        let Some(owner) = self.insert_preset_owner(track_id, insert_id, cx) else {
+            return;
+        };
+        match request {
+            BuiltinPresetRequest::Load(path) => {
+                if !self.load_preset_path(track_id, insert_id, &owner, &path, cx) {
+                    report_preset_problem(
+                        "Load Preset",
+                        format!(
+                            "{} could not be loaded into {}.",
+                            path.display(),
+                            owner.plugin_name
+                        ),
+                        cx,
+                    );
+                }
+            }
+            BuiltinPresetRequest::SaveTo(path) => {
+                let Some(state) = self
+                    .capture_insert_state(track_id, insert_id, cx)
+                    .filter(|state| !state.is_empty())
+                else {
+                    eprintln!("[plugin-preset] nothing to save for insert={insert_id}");
+                    return;
+                };
+                let preset = SpherePluginHost::preset::StatePreset {
+                    plugin_id: owner.plugin_id.clone(),
+                    plugin_name: owner.plugin_name.clone(),
+                    state: state.as_ref().clone(),
+                };
+                match SpherePluginHost::preset::write_state_preset(&path, &preset) {
+                    Ok(()) => eprintln!(
+                        "[plugin-preset] saved {} bytes={}",
+                        path.display(),
+                        preset.state.len()
+                    ),
+                    Err(error) => report_preset_problem(
+                        "Save Preset",
+                        format!("Could not save {}:\n{error}", path.display()),
+                        cx,
+                    ),
+                }
+            }
+            BuiltinPresetRequest::Import(source) => {
+                let refusal = match SpherePluginHost::preset::read_state_preset(&source) {
+                    Err(error) => Some(format!(
+                        "{} is not a plug-in preset:\n{error}",
+                        source.display()
+                    )),
+                    Ok((theirs, _)) if theirs != owner.plugin_id => Some(format!(
+                        "{} was saved from a different plug-in ({theirs}). Presets only load \
+                         into the plug-in that made them.",
+                        source.display()
+                    )),
+                    Ok(_) => None,
+                };
+                if let Some(message) = refusal {
+                    report_preset_problem("Import Preset", message, cx);
+                    return;
+                }
+                let Some(dir) = preset_dir(&owner) else {
+                    return;
+                };
+                let _ = std::fs::create_dir_all(&dir);
+                self.import_preset_file(track_id, insert_id, &owner, &dir, &source, cx);
+            }
+            BuiltinPresetRequest::RevealFolder => {
+                if let Some(dir) = preset_dir(&owner) {
+                    let _ = std::fs::create_dir_all(&dir);
+                    super::helpers::reveal_path(&dir);
+                }
+            }
+        }
+    }
+
+    /// The plug-in a slot's presets are filed under: its id, and the
+    /// registry's own name for that id — the name the slot was inserted with
+    /// until the catalog has loaded.
+    pub(super) fn preset_owner(&self, plugin_id: &str, display_name: &str) -> PresetOwner {
+        // A built-in insert holds the registry's class id (`rodharerist`),
+        // not its catalog id (`builtin:rodharerist`).
+        let plugin_name = self
+            .plugin_catalog
+            .available
+            .as_ref()
+            .and_then(|plugins| {
+                plugins.iter().find(|plugin| {
+                    plugin.id == plugin_id || plugin.class_id.as_deref() == Some(plugin_id)
+                })
+            })
+            .map(|plugin| plugin.name.clone())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| display_name.to_string());
+        PresetOwner {
+            plugin_id: plugin_id.to_string(),
+            plugin_name,
+        }
+    }
+
+    fn insert_preset_owner(
+        &self,
+        track_id: &str,
+        insert_id: &str,
+        cx: &Context<Self>,
+    ) -> Option<PresetOwner> {
+        let state = &self.timeline.read(cx).state;
+        let slot = state.find_insert_slot(track_id, insert_id)?;
+        let plugin_id = slot.plugin_id.as_deref()?;
+        Some(self.preset_owner(plugin_id, &slot.display_name))
+    }
+
     fn insert_plugin_id(
         &self,
         track_id: &str,

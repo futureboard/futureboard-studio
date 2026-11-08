@@ -278,9 +278,7 @@ export interface VuFace {
   needle: string
 }
 
-/** Warm cream paper, brown ink: the optical leveller. */
-export const VU_CREAM: VuFace = { top: '#fff7e5', bottom: '#e7d2aa', ink: '#403629', hot: '#a92f1c', needle: '#160f08' }
-/** Deep blue, white ink: the FET limiter. */
+/** Deep blue, white ink: the default face. */
 export const VU_BLUE: VuFace = { top: '#3a72ad', bottom: '#1a4574', ink: '#f2f6fa', hot: '#d8492f', needle: '#f5f2ec' }
 
 export function vuTinted(top: string, bottom: string, ink: string, hot: string): VuFace {

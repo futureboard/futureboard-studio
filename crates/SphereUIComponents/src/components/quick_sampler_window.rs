@@ -32,23 +32,25 @@ use crate::components::builtin_plugin_editor_window::{
     read_dropped_sample, BuiltinDrumSampleLoadRequest, BuiltinEditorHostOps, PluginInstanceKey,
 };
 use crate::components::builtin_plugin_files::{self as files, BuiltinFileKind};
+use crate::components::builtin_preset_menu::BuiltinPresetMenu;
 use crate::components::context_menu::{context_menu_overlay, ContextMenuEntry};
 use crate::components::native_plugin_shell::{
-    claim_editor_transport_key, native_plugin_shell, swallow_editor_transport_key_up,
+    claim_editor_transport_key, native_plugin_shell_with, swallow_editor_transport_key_up,
     NativeBuiltinEditor, ShellIdentity, ShellMeter, SHELL_METER_INTERVAL,
 };
+use crate::components::plate;
 use crate::components::quick_sampler_panel::{
-    quick_sampler_panel, QuickSamplerCallbacks, QuickSamplerPanelState, SampleMarker, SampleSummary,
+    QuickSamplerCallbacks, QuickSamplerPanelState, SampleMarker, SampleSummary,
 };
+use crate::components::quick_sampler_plate::{quick_sampler_plate, SetParams};
 use quicksampler::{LoopMode, QuickSamplerParams};
 
-/// Opens with the display, the four modules side by side and the keyboard
-/// all in view. Narrower, the modules wrap and the body scrolls; the header
-/// and keyboard stay put.
-pub const QUICK_SAMPLER_WINDOW_WIDTH: f32 = 1_040.0;
-pub const QUICK_SAMPLER_WINDOW_HEIGHT: f32 = 800.0;
-pub const QUICK_SAMPLER_WINDOW_MIN_WIDTH: f32 = 680.0;
-pub const QUICK_SAMPLER_WINDOW_MIN_HEIGHT: f32 = 540.0;
+/// The plate's standard window: the whole design at its own size. Resized,
+/// the plate scales to fit; nothing scrolls.
+pub const QUICK_SAMPLER_WINDOW_WIDTH: f32 = plate::WINDOW_SIZE.0;
+pub const QUICK_SAMPLER_WINDOW_HEIGHT: f32 = plate::WINDOW_SIZE.1;
+pub const QUICK_SAMPLER_WINDOW_MIN_WIDTH: f32 = plate::MIN_WINDOW_SIZE.0;
+pub const QUICK_SAMPLER_WINDOW_MIN_HEIGHT: f32 = plate::MIN_WINDOW_SIZE.1;
 
 const PREVIEW_VELOCITY: u8 = 100;
 /// Columns of waveform overview read from a decoded sample.
@@ -165,6 +167,8 @@ pub struct QuickSamplerEditorWindow {
     /// The waveform's open right-click menu, at this window-space point.
     menu: Option<(f32, f32)>,
     meter: ShellMeter,
+    /// The `.pst` preset menu in the identity strip.
+    presets: gpui::Entity<BuiltinPresetMenu>,
     /// Bumped when the window closes, ending the meter timer.
     alive: Rc<Cell<bool>>,
 }
@@ -177,6 +181,7 @@ impl QuickSamplerEditorWindow {
         on_close: Arc<dyn Fn(&mut Window, &mut App)>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let presets = cx.new(|cx| BuiltinPresetMenu::new(key.clone(), &identity, cx));
         let mut window = Self {
             key,
             identity,
@@ -190,8 +195,10 @@ impl QuickSamplerEditorWindow {
             waveform_bounds: Rc::new(Cell::new(None)),
             menu: None,
             meter: ShellMeter::default(),
+            presets,
             alive: Rc::new(Cell::new(true)),
         };
+        plate::ensure_fonts(cx);
         window.sync_from_mirror(cx);
         window.start_meter(cx);
         window
@@ -199,6 +206,14 @@ impl QuickSamplerEditorWindow {
 
     pub fn key(&self) -> &PluginInstanceKey {
         &self.key
+    }
+
+    /// The UI preview's scenes: a sample and its params, without a host.
+    #[cfg(feature = "ui-preview")]
+    pub fn show_for_preview(&mut self, sample: SampleSummary, params: QuickSamplerParams) {
+        self.panel.sample = Some(sample);
+        self.panel.loading = false;
+        self.panel.params = params.sanitized();
     }
 
     /// Re-reads the insert's params from Studio's state mirror — after an
@@ -232,6 +247,9 @@ impl QuickSamplerEditorWindow {
             self.shown_sample = None;
             self.panel.dragging = None;
         }
+        let presets_key = self.key.clone();
+        self.presets
+            .update(cx, |menu, cx| menu.rebind(presets_key, &identity, cx));
         self.identity = identity;
         self.host_ops = host_ops;
         self.sync_from_mirror(cx);
@@ -530,6 +548,15 @@ impl QuickSamplerEditorWindow {
         .detach();
     }
 
+    /// Every edit on the plate: one whole params value, through the wire
+    /// path.
+    fn param_setter(&self, cx: &mut Context<Self>) -> SetParams {
+        let entity = cx.entity().clone();
+        Rc::new(move |params: QuickSamplerParams, app: &mut App| {
+            let _ = entity.update(app, |this, cx| this.set_params(params, cx));
+        })
+    }
+
     fn callbacks(&self, cx: &mut Context<Self>) -> QuickSamplerCallbacks {
         let entity = cx.entity().clone();
         fn with<T: Clone + 'static>(
@@ -598,10 +625,14 @@ impl Render for QuickSamplerEditorWindow {
         let entity = cx.entity().clone();
         let on_close = self.on_close.clone();
         let alive = self.alive.clone();
-        let content = quick_sampler_panel(
+        let viewport = window.viewport_size();
+        let s = plate::plate_scale((f32::from(viewport.width), f32::from(viewport.height)));
+        let content = quick_sampler_plate(
             &self.panel,
             self.callbacks(cx),
+            self.param_setter(cx),
             self.waveform_bounds.clone(),
+            s,
         );
 
         let menu = self.menu.map(|(x, y)| {
@@ -668,7 +699,7 @@ impl Render for QuickSamplerEditorWindow {
                     }
                 }
             })
-            .child(native_plugin_shell(
+            .child(native_plugin_shell_with(
                 "quick-sampler-window-close",
                 &self.identity,
                 self.meter,
@@ -680,6 +711,7 @@ impl Render for QuickSamplerEditorWindow {
                     on_close(window, cx);
                     window.remove_window();
                 },
+                Some(self.presets.clone().into_any_element()),
                 content,
             ))
             // The right-click menu, over everything.

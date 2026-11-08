@@ -289,7 +289,7 @@ pub fn builtin_descriptors() -> Vec<PluginDescriptor> {
         PluginDescriptor {
             id: "sphere.eq8".to_string(),
             name: "Sphere EQ8".to_string(),
-            vendor: "Futureboard".to_string(),
+            vendor: "Futureboard Digital Technologies".to_string(),
             category: PluginCategory::Effect,
             version: env!("CARGO_PKG_VERSION").to_string(),
             params: vec![
@@ -301,7 +301,7 @@ pub fn builtin_descriptors() -> Vec<PluginDescriptor> {
         PluginDescriptor {
             id: "sphere.drive".to_string(),
             name: "Sphere Drive".to_string(),
-            vendor: "Futureboard".to_string(),
+            vendor: "Futureboard Digital Technologies".to_string(),
             category: PluginCategory::Effect,
             version: env!("CARGO_PKG_VERSION").to_string(),
             params: vec![
@@ -314,7 +314,7 @@ pub fn builtin_descriptors() -> Vec<PluginDescriptor> {
         PluginDescriptor {
             id: "sphere.comp".to_string(),
             name: "Sphere Compressor".to_string(),
-            vendor: "Futureboard".to_string(),
+            vendor: "Futureboard Digital Technologies".to_string(),
             category: PluginCategory::Effect,
             version: env!("CARGO_PKG_VERSION").to_string(),
             params: vec![

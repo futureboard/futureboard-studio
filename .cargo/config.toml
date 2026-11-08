@@ -70,6 +70,18 @@ whitesharp-vst3 = [
     "--",
 ]
 
+# Rodhareist VST2/VST3/CLAP, the same way:
+#   cargo rodhareist-vst3 bundle rodhareist_vst3 --release
+rodhareist-vst3 = [
+    "run",
+    "--manifest-path",
+    "vstplugins/rodhareist_vst3/Cargo.toml",
+    "--package",
+    "xtask",
+    "--release",
+    "--",
+]
+
 # Binary packaging / staging into `out/` (see xtask/README.md). These build the
 # app and stage a clean runnable tree separate from the Cargo `target/` cache.
 #   cargo package-dev         → out/dev/<platform>

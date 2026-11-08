@@ -100,6 +100,7 @@ pub(crate) fn page_groups(tab: SettingsTab, cx: &PageCtx) -> Vec<PrefGroup> {
         SettingsTab::Editing => editing(cx),
         SettingsTab::Appearance => appearance(cx),
         SettingsTab::Performance => performance(cx),
+        SettingsTab::Experimental => experimental(cx),
         SettingsTab::About => about(cx),
     }
 }
@@ -1075,6 +1076,27 @@ fn audio_processing_group(cx: &PageCtx) -> PrefGroup {
         ));
     }
     group
+}
+
+// ── Experimental ────────────────────────────────────────────────────────────
+
+/// Features still being built. Each is off by default; while off it has no
+/// way into Studio.
+fn experimental(cx: &PageCtx) -> Vec<PrefGroup> {
+    let s = cx.schema;
+    let up = cx.up();
+    vec![PrefGroup::new("Features")
+        .row(PrefRow::described(
+            "Voxtune",
+            "Vocal pitch editing on an audio clip, as a tab of the Editor panel.",
+            &["voxtune", "vocal", "pitch", "tune", "tuner", "experimental"],
+            pref_switch(
+                "experimental-voxtune",
+                s.experimental.voxtune,
+                apply(&up, |s| s.experimental.voxtune = !s.experimental.voxtune),
+            ),
+        ))
+        .note("Experimental features can change or be removed between versions.")]
 }
 
 // ── About ───────────────────────────────────────────────────────────────────

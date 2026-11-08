@@ -26,6 +26,7 @@ pub mod white_sharp_window;
 
 pub mod builtin_plugin_editor;
 pub mod builtin_plugin_editor_window;
+pub mod builtin_preset_menu;
 pub mod native_plugin_shell;
 pub mod quick_sampler_panel;
 pub mod timeline;

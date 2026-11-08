@@ -503,7 +503,7 @@ pub fn descriptor() -> PluginDescriptor {
     PluginDescriptor {
         id: PLUGIN_ID,
         name: "Equz8",
-        vendor: "Futureboard",
+        vendor: "Futureboard Digital Technologies",
         category: PluginCategory::Effect,
         version: env!("CARGO_PKG_VERSION"),
         params: &[

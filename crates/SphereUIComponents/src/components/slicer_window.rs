@@ -35,23 +35,28 @@ use crate::components::builtin_plugin_editor_window::{
     read_dropped_sample, BuiltinDrumSampleLoadRequest, BuiltinEditorHostOps, PluginInstanceKey,
 };
 use crate::components::builtin_plugin_files::{self as files, BuiltinFileKind};
+use crate::components::builtin_preset_menu::BuiltinPresetMenu;
 use crate::components::context_menu::{context_menu_overlay, ContextMenuEntry};
 use crate::components::native_plugin_shell::{
-    claim_editor_transport_key, native_plugin_shell, swallow_editor_transport_key_up,
+    claim_editor_transport_key, native_plugin_shell_with, swallow_editor_transport_key_up,
     NativeBuiltinEditor, ShellIdentity, ShellMeter, SHELL_METER_INTERVAL,
 };
+use crate::components::plate;
 use crate::components::quick_sampler_panel::SampleSummary;
 use crate::components::quick_sampler_window::SAMPLE_EXTENSIONS;
 use crate::components::slicer_panel::{
-    point_under, slicer_panel, SlicerCallbacks, SlicerPanelState, SoundingSlice,
+    point_under, SlicerCallbacks, SlicerPanelState, SoundingSlice,
 };
+use crate::components::slicer_plate::{slicer_plate, SetSlicer};
 use crate::components::timeline::timeline_state::detect_tempo_from_mono;
 use slicer::{slicing, SliceMode, SlicerParams};
 
-pub const SLICER_WINDOW_WIDTH: f32 = 1_040.0;
-pub const SLICER_WINDOW_HEIGHT: f32 = 860.0;
-pub const SLICER_WINDOW_MIN_WIDTH: f32 = 720.0;
-pub const SLICER_WINDOW_MIN_HEIGHT: f32 = 580.0;
+/// The plate's standard window: the whole design at its own size. Resized,
+/// the plate scales to fit; nothing scrolls.
+pub const SLICER_WINDOW_WIDTH: f32 = plate::WINDOW_SIZE.0;
+pub const SLICER_WINDOW_HEIGHT: f32 = plate::WINDOW_SIZE.1;
+pub const SLICER_WINDOW_MIN_WIDTH: f32 = plate::MIN_WINDOW_SIZE.0;
+pub const SLICER_WINDOW_MIN_HEIGHT: f32 = plate::MIN_WINDOW_SIZE.1;
 
 const PREVIEW_VELOCITY: u8 = 100;
 const WAVEFORM_BUCKETS: usize = 1_600;
@@ -304,6 +309,8 @@ pub struct SlicerEditorWindow {
     /// The open right-click menu.
     menu: Option<SlicerMenu>,
     meter: ShellMeter,
+    /// The `.pst` preset menu in the identity strip.
+    presets: gpui::Entity<BuiltinPresetMenu>,
     /// Cleared when the window closes, ending the meter timer.
     alive: Rc<Cell<bool>>,
 }
@@ -316,6 +323,7 @@ impl SlicerEditorWindow {
         on_close: Arc<dyn Fn(&mut Window, &mut App)>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let presets = cx.new(|cx| BuiltinPresetMenu::new(key.clone(), &identity, cx));
         let mut window = Self {
             key,
             identity,
@@ -334,8 +342,10 @@ impl SlicerEditorWindow {
             display_bounds: Rc::new(Cell::new(None)),
             menu: None,
             meter: ShellMeter::default(),
+            presets,
             alive: Rc::new(Cell::new(true)),
         };
+        plate::ensure_fonts(cx);
         window.sync_from_mirror(cx);
         window.start_meter(cx);
         window
@@ -343,6 +353,22 @@ impl SlicerEditorWindow {
 
     pub fn key(&self) -> &PluginInstanceKey {
         &self.key
+    }
+
+    /// The UI preview's scenes: a sliced sample and the slice picked, without
+    /// a host. (What is sounding comes from the host's telemetry, which the
+    /// meter poll reads, so a preview shows nothing sounding.)
+    #[cfg(feature = "ui-preview")]
+    pub fn show_for_preview(
+        &mut self,
+        sample: SampleSummary,
+        params: SlicerParams,
+        selected: Option<usize>,
+    ) {
+        self.panel.sample = Some(sample);
+        self.panel.loading = false;
+        self.panel.params = params.sanitized();
+        self.panel.selected = selected;
     }
 
     /// Re-reads the insert's params from Studio's state mirror — after an
@@ -383,6 +409,9 @@ impl SlicerEditorWindow {
             self.sound_since.clear();
             self.telemetry_seq = None;
         }
+        let presets_key = self.key.clone();
+        self.presets
+            .update(cx, |menu, cx| menu.rebind(presets_key, &identity, cx));
         self.identity = identity;
         self.host_ops = host_ops;
         self.sync_from_mirror(cx);
@@ -864,6 +893,21 @@ impl SlicerEditorWindow {
         true
     }
 
+    /// Params from the plate, sent as they are (`set`) or cut again with
+    /// (`reslice`), through the wire path.
+    fn param_setters(&self, cx: &mut Context<Self>) -> (SetSlicer, SetSlicer) {
+        let set = cx.entity().clone();
+        let reslice = cx.entity().clone();
+        (
+            Rc::new(move |params: SlicerParams, app: &mut App| {
+                let _ = set.update(app, |this, cx| this.set_params(params, cx));
+            }),
+            Rc::new(move |params: SlicerParams, app: &mut App| {
+                let _ = reslice.update(app, |this, cx| this.reslice(params, cx));
+            }),
+        )
+    }
+
     fn callbacks(&self, cx: &mut Context<Self>) -> SlicerCallbacks {
         let entity = cx.entity().clone();
         fn with<T: Clone + 'static>(
@@ -925,7 +969,17 @@ impl Render for SlicerEditorWindow {
         let entity = cx.entity().clone();
         let on_close = self.on_close.clone();
         let alive = self.alive.clone();
-        let content = slicer_panel(&self.panel, self.callbacks(cx), self.display_bounds.clone());
+        let viewport = window.viewport_size();
+        let s = plate::plate_scale((f32::from(viewport.width), f32::from(viewport.height)));
+        let (set, reslice) = self.param_setters(cx);
+        let content = slicer_plate(
+            &self.panel,
+            self.callbacks(cx),
+            set,
+            reslice,
+            self.display_bounds.clone(),
+            s,
+        );
 
         let menu = self.menu.map(|menu| {
             let viewport = window.viewport_size();
@@ -997,7 +1051,7 @@ impl Render for SlicerEditorWindow {
                     }
                 }
             })
-            .child(native_plugin_shell(
+            .child(native_plugin_shell_with(
                 "slicer-window-close",
                 &self.identity,
                 self.meter,
@@ -1008,6 +1062,7 @@ impl Render for SlicerEditorWindow {
                     on_close(window, cx);
                     window.remove_window();
                 },
+                Some(self.presets.clone().into_any_element()),
                 content,
             ))
             // The right-click menu, over everything.

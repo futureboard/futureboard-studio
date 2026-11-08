@@ -264,8 +264,9 @@ mod tests {
     /// with nothing new reports nothing.
     #[test]
     fn a_dynamics_insert_publishes_levels_once() {
-        let mut fx = BuiltinFx::new("fa76", 48_000).unwrap();
-        fx.apply_wire_param(fa76::ipc::INPUT_INDEX, 30.0);
+        let mut fx = BuiltinFx::new("zcomp", 48_000).unwrap();
+        fx.apply_wire_param(zcomp::ipc::THRESHOLD_INDEX, -30.0);
+        fx.apply_wire_param(zcomp::ipc::RATIO_INDEX, 8.0);
         let telemetry = InsertTelemetry::default();
         let mut left = tone(256, 0.8);
         let mut right = left.clone();
@@ -274,7 +275,7 @@ mod tests {
             telemetry.publish(&mut fx, None);
         }
         let frame = telemetry.take();
-        let levels = frame.levels.expect("FA-76 meters itself");
+        let levels = frame.levels.expect("Z-Comp meters itself");
         assert!(levels.in_peak > 0.1, "input level {}", levels.in_peak);
         assert!(levels.gain_reduction_db > 0.0, "driven hard, it reduces");
         assert_eq!(telemetry.take(), TelemetryFrame::default());

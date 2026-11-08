@@ -174,7 +174,7 @@ uses web technology.
 
 | Kind           | Plug-ins                                                               |
 | -------------- | ---------------------------------------------------------------------- |
-| Dynamics       | Compressor (single and multiband) · FA-2A · FA-76 · Z-Comp · Transient |
+| Dynamics       | Compressor (single and multiband) · Z-Comp · Transient                 |
 | EQ &amp; color | EQ-Z8 · C1073 · 67Clipper · BurnLimit                                  |
 | Space          | EchoSpace · VerbSpace · Imager                                         |
 | Utility        | MixStation                                                             |

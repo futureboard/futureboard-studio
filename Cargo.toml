@@ -42,10 +42,8 @@ members = [
     "crates/BuiltinAudioPlugins/crates/equz8",
     "crates/BuiltinAudioPlugins/crates/equzx",
     "crates/BuiltinAudioPlugins/crates/compresser",
-    "crates/BuiltinAudioPlugins/crates/fa2a",
     "crates/BuiltinAudioPlugins/crates/echospace",
     "crates/BuiltinAudioPlugins/crates/imager",
-    "crates/BuiltinAudioPlugins/crates/fa76",
     "crates/BuiltinAudioPlugins/crates/burnLimit",
     "crates/BuiltinAudioPlugins/crates/67Clipper",
     "crates/BuiltinAudioPlugins/crates/Transient",
@@ -80,6 +78,7 @@ exclude = [
     # the repo root: `cargo xtask bundle whitesharp_vst3 --release`.
     "vstplugins/whitesharp_vst3",
     "vstplugins/voxtune_vst3",
+    "vstplugins/rodhareist_vst3",
 
     # Vendored NIH-plug fork used by those plug-ins. Not part of the DAW build.
     "external/nihplug_gpui",
@@ -150,10 +149,8 @@ builtin-ui-embed = { path = "crates/BuiltinAudioPlugins/crates/builtin_ui_embed"
 equz8 = { path = "crates/BuiltinAudioPlugins/crates/equz8" }
 equzx = { path = "crates/BuiltinAudioPlugins/crates/equzx" }
 compresser = { path = "crates/BuiltinAudioPlugins/crates/compresser" }
-fa2a = { path = "crates/BuiltinAudioPlugins/crates/fa2a" }
 echospace = { path = "crates/BuiltinAudioPlugins/crates/echospace" }
 imager = { path = "crates/BuiltinAudioPlugins/crates/imager" }
-fa76 = { path = "crates/BuiltinAudioPlugins/crates/fa76" }
 burnlimit = { path = "crates/BuiltinAudioPlugins/crates/burnLimit" }
 clipper67 = { path = "crates/BuiltinAudioPlugins/crates/67Clipper" }
 transient = { path = "crates/BuiltinAudioPlugins/crates/Transient" }

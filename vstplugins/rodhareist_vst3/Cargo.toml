@@ -1,0 +1,108 @@
+[workspace]
+resolver = "2"
+members = [".", "xtask"]
+
+[package]
+name = "rodhareist_vst3"
+version = "2026.11.1-beta2.0.0"
+# The editor is Studio's own Rodhareist editor, compiled from its source tree
+# (`src/components`); those files are written against edition 2021.
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Rodhareist guitar multi-effect as a VST2, VST3, and CLAP plug-in"
+
+[lib]
+# `lib` too, so tests can link the plug-in.
+crate-type = ["cdylib", "lib"]
+# The doc examples in the mounted Studio files are written for Studio's crate
+# root, not this one.
+doctest = false
+
+[features]
+default = ["native-dialogs"]
+# Same name as the DAW's feature: the shared editor window gates its NAM and
+# IR file pickers on it.
+native-dialogs = ["dep:rfd"]
+# Named only so the shared editor files' `cfg`s are known; nothing enables
+# them here.
+ui-preview = []
+builtin-plugin-editor = []
+gpu-renderer = []
+
+[dependencies]
+nih_plug = { git = "https://github.com/arizkami/nihplug_gpui", features = ["assert_process_allocs", "vst2"] }
+nih_plug_gpui = { git = "https://github.com/arizkami/nihplug_gpui" }
+# The DSP core, unchanged from the DAW, and the effect trait it implements.
+rodharerist = { path = "../../crates/BuiltinAudioPlugins/crates/rodharerist" }
+builtin_dsp_core = { path = "../../crates/BuiltinAudioPlugins/crates/builtin_dsp_core" }
+
+# The shared editor files name `gpui` directly. Patched below to the DAW's
+# GPUI, so these and `nih_plug_gpui` are the same crate.
+gpui = { git = "https://github.com/futureboard/gpui-se.git", default-features = false }
+
+# What the shared editor files use.
+dirs = "5"
+image = "0.25.1"
+rfd = { version = "0.15", optional = true }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+smallvec = { version = "1.6", features = ["union", "const_new"] }
+unicode-segmentation = "1.10"
+
+[dev-dependencies]
+# `src/entry_point_tests.rs` drives the CLAP entry the way a host does; the same
+# bindings, at the same revision, nih-plug builds the plug-in side with.
+clap-sys = { git = "https://github.com/micahrj/clap-sys.git", rev = "25d7f53fdb6363ad63fbd80049cb7a42a97ac156" }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[patch."https://github.com/futureboard/gpui-se.git"]
+gpui = { path = "../../crates/gpui" }
+gpui_linux = { path = "../../crates/gpui/crates/gpui_linux" }
+gpui_macos = { path = "../../crates/gpui/crates/gpui_macos" }
+gpui_windows = { path = "../../crates/gpui/crates/gpui_windows" }
+
+[patch."https://github.com/arizkami/nihplug_gpui"]
+# Vendored into this repo so a build does not depend on a checkout outside it.
+nih_plug = { path = "../../external/nihplug_gpui" }
+nih_plug_gpui = { path = "../../external/nihplug_gpui/nih_plug_gpui" }
+nih_plug_xtask = { path = "../../external/nihplug_gpui/nih_plug_xtask" }
+
+[patch.crates-io]
+# As in the DAW: GPUI is built against these.
+async-task = { git = "https://github.com/smol-rs/async-task.git", rev = "b4486cd71e4e94fbda54ce6302444de14f4d190e" }
+calloop = { git = "https://github.com/zed-industries/calloop" }
+
+# Realtime DSP must run optimized even in dev builds: NAM inference and the
+# oversampled amp core cannot keep up at opt-level 0. Mirrors the DAW's
+# workspace overrides, which do not apply outside it.
+[profile.dev.package.rodharerist]
+opt-level = 3
+
+[profile.dev.package.builtin_dsp_core]
+opt-level = 3
+
+[profile.dev.package.nam-rs]
+opt-level = 3
+
+[profile.dev.package.biquad]
+opt-level = 3
+
+[profile.dev.package.rustfft]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

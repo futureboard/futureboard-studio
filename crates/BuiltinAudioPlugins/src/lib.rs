@@ -5,8 +5,8 @@
 //! façade (`SphereAudioPlugins` or a dedicated bridge).
 //!
 //! ## Phase map
-//! - Phase 1 (easy): `equz8`, `compresser`, `fa2a`
-//! - Phase 2 (medium): `echospace`, `fa76`
+//! - Phase 1 (easy): `equz8`, `compresser`
+//! - Phase 2 (medium): `echospace`
 //! - Phase 3 (hard): `c1073`, `meowsyn`
 
 /// BuildInHelper: embedded UI asset infrastructure shared by every Built-in
@@ -27,8 +27,6 @@ pub use drumsampler;
 pub use echospace;
 pub use equz8;
 pub use equzx;
-pub use fa2a;
-pub use fa76;
 pub use meowsyn;
 pub use mixstation;
 pub use transient;
@@ -44,9 +42,7 @@ pub fn focus_descriptors() -> Vec<PluginDescriptor> {
         equz8::descriptor(),
         equzx::descriptor(),
         compresser::descriptor(),
-        fa2a::descriptor(),
         echospace::descriptor(),
-        fa76::descriptor(),
         burnlimit::descriptor(),
         clipper67::descriptor(),
         transient::descriptor(),
@@ -71,9 +67,7 @@ mod tests {
         assert!(ids.contains(&equz8::PLUGIN_ID));
         assert!(ids.contains(&equzx::PLUGIN_ID));
         assert!(ids.contains(&compresser::PLUGIN_ID));
-        assert!(ids.contains(&fa2a::PLUGIN_ID));
         assert!(ids.contains(&echospace::PLUGIN_ID));
-        assert!(ids.contains(&fa76::PLUGIN_ID));
         assert!(ids.contains(&burnlimit::PLUGIN_ID));
         assert!(ids.contains(&clipper67::PLUGIN_ID));
         assert!(ids.contains(&transient::PLUGIN_ID));
@@ -90,9 +84,7 @@ mod tests {
     fn effects_process_finite() {
         let mut eq = equz8::Dsp::new(48_000.0);
         let mut comp = compresser::Dsp::new(48_000.0);
-        let mut optical = fa2a::Dsp::new(48_000.0);
         let mut delay = echospace::Dsp::new(48_000.0);
-        let mut fet = fa76::Dsp::new(48_000.0);
         let mut channel = c1073::Dsp::new(48_000.0);
         let mut ultimate = zcomp::Dsp::new(48_000.0);
         let mut strip = mixstation::Dsp::new(48_000.0);
@@ -101,9 +93,7 @@ mod tests {
         for dsp in [
             &mut eq as &mut dyn StereoEffect,
             &mut comp,
-            &mut optical,
             &mut delay,
-            &mut fet,
             &mut channel,
             &mut ultimate,
             &mut strip,

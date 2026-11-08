@@ -938,6 +938,7 @@ settings.tab.audio = Audio
 settings.tab.audio.description = Driver, devices, sample rate, buffer size, and latency.
 settings.tab.editing = Editing
 settings.tab.editing.description = Mouse, grid snap, and undo history.
+settings.tab.experimental = 実験的機能
 settings.tab.files-media = Files & Media
 settings.tab.files-media.description = Projects, samples, recordings, and cache locations.
 settings.tab.general = General

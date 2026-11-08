@@ -35,29 +35,32 @@ use crate::components::builtin_plugin_editor_window::{
     read_dropped_sample, BuiltinDrumSampleLoadRequest, BuiltinEditorHostOps, PluginInstanceKey,
 };
 use crate::components::builtin_plugin_files::{self as files, BuiltinFileKind};
+use crate::components::builtin_preset_menu::BuiltinPresetMenu;
 use crate::components::context_menu::context_menu_overlay;
 use crate::components::drum_sampler_menu::{
     cleared_pad, command, free_output, menu_entries, next_empty_pad, paste_settings, reset_pad,
     DrumMenuTarget,
 };
 use crate::components::drum_sampler_panel::{
-    adjusted, bank_of, drum_sampler_panel, edge_near, fader_dragged, with_edge,
+    adjusted, bank_of, drum_sampler_panel, edge_near, fader_dragged, with_edge, Cb,
     DrumSamplerCallbacks, DrumSamplerPanelState, DrumView, FaderPress, PadAdjust, PadPress,
     RegionEdge, DRAG_SLOP_PX, EDGE_GRAB_PX,
 };
 use crate::components::native_plugin_shell::{
-    claim_editor_transport_key, native_plugin_shell, swallow_editor_transport_key_up,
+    claim_editor_transport_key, native_plugin_shell_with, swallow_editor_transport_key_up,
     NativeBuiltinEditor, ShellIdentity, ShellMeter, SHELL_METER_INTERVAL,
 };
+use crate::components::plate;
 use crate::components::quick_sampler_window::SAMPLE_EXTENSIONS;
 use crate::components::text_input::{
     bind_mouse_selection, text_field_with_callbacks_and_ime, TextInputState,
 };
 
-pub const DRUM_SAMPLER_WINDOW_WIDTH: f32 = 1_180.0;
-pub const DRUM_SAMPLER_WINDOW_HEIGHT: f32 = 840.0;
-pub const DRUM_SAMPLER_WINDOW_MIN_WIDTH: f32 = 920.0;
-pub const DRUM_SAMPLER_WINDOW_MIN_HEIGHT: f32 = 620.0;
+/// The window at the plate's design size, and the smallest it may get.
+pub const DRUM_SAMPLER_WINDOW_WIDTH: f32 = plate::WINDOW_SIZE.0;
+pub const DRUM_SAMPLER_WINDOW_HEIGHT: f32 = plate::WINDOW_SIZE.1;
+pub const DRUM_SAMPLER_WINDOW_MIN_WIDTH: f32 = plate::MIN_WINDOW_SIZE.0;
+pub const DRUM_SAMPLER_WINDOW_MIN_HEIGHT: f32 = plate::MIN_WINDOW_SIZE.1;
 
 const PREVIEW_VELOCITY: u8 = 110;
 /// Pad levels not republished for this long are stale: nothing is playing.
@@ -140,6 +143,8 @@ pub struct DrumSamplerEditorWindow {
     /// Bumped per note, so an old note's timer cannot clear a newer one.
     note_generation: u64,
     meter: ShellMeter,
+    /// The `.pst` preset menu in the identity strip.
+    presets: gpui::Entity<BuiltinPresetMenu>,
     /// Cleared when the window closes, ending the meter timer.
     alive: Rc<Cell<bool>>,
 }
@@ -152,6 +157,8 @@ impl DrumSamplerEditorWindow {
         on_close: Arc<dyn Fn(&mut Window, &mut App)>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let presets = cx.new(|cx| BuiltinPresetMenu::new(key.clone(), &identity, cx));
+        plate::ensure_fonts(cx);
         let mut window = Self {
             key,
             identity,
@@ -162,7 +169,8 @@ impl DrumSamplerEditorWindow {
             panel: DrumSamplerPanelState::default(),
             search: TextInputState::new("drum-library-search", cx.focus_handle())
                 .with_placeholder("Search samples")
-                .with_accessible_label("Search samples"),
+                .with_accessible_label("Search samples")
+                .with_field_height(24.0),
             wave_bounds: Rc::new(Cell::new(None)),
             pad_drag: None,
             fader_drag: None,
@@ -173,6 +181,7 @@ impl DrumSamplerEditorWindow {
             levels_seq: None,
             note_generation: 0,
             meter: ShellMeter::default(),
+            presets,
             alive: Rc::new(Cell::new(true)),
         };
         window.sync_from_mirror(cx);
@@ -183,6 +192,24 @@ impl DrumSamplerEditorWindow {
 
     pub fn key(&self) -> &PluginInstanceKey {
         &self.key
+    }
+
+    /// The UI preview's scenes: a kit, its pads' waveforms and a page,
+    /// without a host. Nothing is sent anywhere.
+    #[cfg(feature = "ui-preview")]
+    pub fn show_for_preview(
+        &mut self,
+        params: Params,
+        waveforms: Vec<Option<DrumPadWaveform>>,
+        selected: usize,
+        view: DrumView,
+    ) {
+        self.panel.params = params;
+        self.panel.waveforms = waveforms;
+        self.panel.selected = selected.min(PADS - 1);
+        self.panel.bank = bank_of(self.panel.selected);
+        self.panel.view = view;
+        self.panel.connected = true;
     }
 
     /// Re-reads the insert's kit from Studio's state mirror — after an undo,
@@ -234,6 +261,9 @@ impl DrumSamplerEditorWindow {
             self.panel.levels = [0.0; PADS];
             self.levels_seq = None;
         }
+        let presets_key = self.key.clone();
+        self.presets
+            .update(cx, |menu, cx| menu.rebind(presets_key, &identity, cx));
         self.identity = identity;
         self.host_ops = host_ops;
         self.sync_from_mirror(cx);
@@ -697,9 +727,12 @@ impl DrumSamplerEditorWindow {
     }
 
     fn drag_to(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
+        // The plate's travel is in design units: a drag feels the same at any
+        // window size.
+        let scale = self.panel.scale.max(0.1);
         if let Some(drag) = self.fader_drag {
             let mut next = self.panel.params.pads[drag.pad].clone();
-            next.gain_db = fader_dragged(drag.start_db, drag.start_y - y);
+            next.gain_db = fader_dragged(drag.start_db, (drag.start_y - y) / scale);
             if next.gain_db != self.panel.params.pads[drag.pad].gain_db {
                 self.set_pad(drag.pad, next, cx);
             }
@@ -725,7 +758,7 @@ impl DrumSamplerEditorWindow {
             self.pad_drag = Some(drag);
             self.panel.adjusting = Some((drag.pad, drag.field));
         }
-        let value = adjusted(drag.field, drag.start_value, rise);
+        let value = adjusted(drag.field, drag.start_value, rise / scale);
         let mut next = self.panel.params.pads[drag.pad].clone();
         match drag.field {
             PadAdjust::Gain => next.gain_db = value,
@@ -849,24 +882,20 @@ impl DrumSamplerEditorWindow {
 
     fn callbacks(&self, cx: &mut Context<Self>) -> DrumSamplerCallbacks {
         let entity = cx.entity().clone();
-        fn with<T: Clone + 'static>(
+        fn with<T: 'static>(
             entity: &gpui::Entity<DrumSamplerEditorWindow>,
             f: impl Fn(&mut DrumSamplerEditorWindow, T, &mut Context<DrumSamplerEditorWindow>) + 'static,
-        ) -> Arc<dyn Fn(&T, &mut Window, &mut App) + 'static> {
+        ) -> Cb<T> {
             let entity = entity.clone();
-            Arc::new(move |value: &T, _window, app: &mut App| {
-                let value = value.clone();
+            Rc::new(move |value: T, app: &mut App| {
                 let _ = entity.update(app, |this, cx| f(this, value, cx));
             })
         }
         fn void(
             entity: &gpui::Entity<DrumSamplerEditorWindow>,
             f: impl Fn(&mut DrumSamplerEditorWindow, &mut Context<DrumSamplerEditorWindow>) + 'static,
-        ) -> Arc<dyn Fn(&mut Window, &mut App) + 'static> {
-            let entity = entity.clone();
-            Arc::new(move |_window, app: &mut App| {
-                let _ = entity.update(app, |this, cx| f(this, cx));
-            })
+        ) -> Cb<()> {
+            with(entity, move |this, (), cx| f(this, cx))
         }
         DrumSamplerCallbacks {
             on_pad_press: with(&entity, |this, press: PadPress, cx| {
@@ -938,6 +967,9 @@ impl Render for DrumSamplerEditorWindow {
         let entity = cx.entity().clone();
         let on_close = self.on_close.clone();
         let alive = self.alive.clone();
+        let viewport = window.viewport_size();
+        let s = plate::plate_scale((f32::from(viewport.width), f32::from(viewport.height)));
+        self.panel.scale = s;
         let search_field = text_field_with_callbacks_and_ime(
             &self.search,
             self.search.is_focused(window),
@@ -951,6 +983,7 @@ impl Render for DrumSamplerEditorWindow {
             search_field,
             &self.search.value,
             self.wave_bounds.clone(),
+            s,
         );
 
         let menu = self.menu.clone().map(|(target, x, y)| {
@@ -1013,7 +1046,7 @@ impl Render for DrumSamplerEditorWindow {
                     let _ = entity.update(cx, |this, cx| this.end_drag(cx));
                 }
             })
-            .child(native_plugin_shell(
+            .child(native_plugin_shell_with(
                 "drum-sampler-window-close",
                 &self.identity,
                 self.meter,
@@ -1024,6 +1057,7 @@ impl Render for DrumSamplerEditorWindow {
                     on_close(window, cx);
                     window.remove_window();
                 },
+                Some(self.presets.clone().into_any_element()),
                 content,
             ))
             // The right-click menu, over everything.

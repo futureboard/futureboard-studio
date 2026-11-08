@@ -283,6 +283,48 @@ fn resize_raw(child: RawWindowHandle, size: (u32, u32)) -> Result<(), String> {
     Ok(())
 }
 
+/// Give `window` the keyboard, or hand it back to the window it is embedded in.
+///
+/// Windows sends key and IME messages to the one window that has keyboard focus. A top level window
+/// gets it by being activated, which is how GPUI's backend expects to receive it, but an embedded
+/// window is a child window and child windows are never activated: clicking one leaves the focus
+/// with the host. GPUI then shows a focused text field the keyboard never reaches. The editor asks
+/// for the keyboard while it has a text field to type into, and gives it back afterwards so the
+/// host's own shortcuts work again.
+#[cfg(target_os = "windows")]
+pub(crate) fn set_keyboard_focus(window: &Window, focused: bool) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+    use windows::Win32::UI::WindowsAndMessaging::GetParent;
+
+    let Ok(handle) = HasWindowHandle::window_handle(window) else {
+        return;
+    };
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+        return;
+    };
+    let child = HWND(handle.hwnd.get() as *mut std::ffi::c_void);
+
+    unsafe {
+        if focused {
+            if GetFocus() != child {
+                let _ = SetFocus(Some(child));
+            }
+        } else if GetFocus() == child {
+            // A standalone editor is a top level window with no parent to hand the keyboard to
+            if let Ok(parent) = GetParent(child) {
+                if !parent.is_invalid() {
+                    let _ = SetFocus(Some(parent));
+                }
+            }
+        }
+    }
+}
+
+/// On X11 and macOS the host's window system already routes keys to the embedded editor.
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn set_keyboard_focus(_window: &Window, _focused: bool) {}
+
 /// GPUI's Windows backend keeps track of the scaling factor for its window itself, and it only ever
 /// changes it in response to a `WM_DPICHANGED` message. Windows sends that message to top level
 /// windows only, so this synthesizes one. Aside from the scaling factor the message also carries the
