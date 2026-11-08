@@ -52,17 +52,22 @@ pub(crate) unsafe fn for_each_packet(
 ) {
     unsafe {
         let num_packets = (list as *const u32).read_unaligned();
+        if num_packets == 0 {
+            return;
+        }
         let mut packet = list.add(PACKET_LIST_FIRST_PACKET);
-        for _ in 0..num_packets {
+        for index in 0..num_packets {
             let length = (packet.add(PACKET_LENGTH_OFFSET) as *const u16).read_unaligned() as usize;
             visit(std::slice::from_raw_parts(
                 packet.add(PACKET_DATA_OFFSET),
                 length,
             ));
-            // Advance by the same distance `next_packet_address` computes, but
-            // through the pointer so it keeps the list's provenance.
-            let next = next_packet_address(packet as usize, length, align_to_4);
-            packet = packet.add(next - packet as usize);
+            if index + 1 < num_packets {
+                // Advance by the same distance `next_packet_address` computes, but
+                // through the pointer so it keeps the list's provenance.
+                let next = next_packet_address(packet as usize, length, align_to_4);
+                packet = packet.add(next - packet as usize);
+            }
         }
     }
 }
@@ -70,6 +75,51 @@ pub(crate) unsafe fn for_each_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 4-byte-aligned allocation of the exact byte length of a
+    /// `MIDIPacketList`, without trailing padding to a 4-byte boundary.
+    struct PacketListBuf {
+        ptr: *mut u8,
+        len: usize,
+        layout: std::alloc::Layout,
+    }
+
+    impl PacketListBuf {
+        fn new(bytes: &[u8]) -> Self {
+            let layout = std::alloc::Layout::from_size_align(bytes.len().max(1), 4).unwrap();
+            // SAFETY: `layout` has non-zero size and 4-byte power-of-two alignment.
+            let ptr = unsafe { std::alloc::alloc(layout) };
+            if ptr.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            // SAFETY: `ptr` is valid for `bytes.len()` bytes and does not overlap `bytes`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+            }
+            Self {
+                ptr,
+                len: bytes.len(),
+                layout,
+            }
+        }
+
+        fn as_ptr(&self) -> *const u8 {
+            self.ptr
+        }
+
+        fn len(&self) -> usize {
+            self.len
+        }
+    }
+
+    impl Drop for PacketListBuf {
+        fn drop(&mut self) {
+            // SAFETY: `self.ptr` was allocated with `self.layout` in `Self::new`.
+            unsafe {
+                std::alloc::dealloc(self.ptr, self.layout);
+            }
+        }
+    }
 
     /// Build a `MIDIPacketList` byte-for-byte the way CoreMIDI does.
     ///
@@ -81,7 +131,7 @@ mod tests {
     /// previous payload on Intel. The buffer ends exactly where the last
     /// payload does, so a walk that strays past it reads outside the
     /// allocation.
-    fn build_packet_list(packets: &[&[u8]], align_to_4: bool) -> Vec<u32> {
+    fn build_packet_list(packets: &[&[u8]], align_to_4: bool) -> PacketListBuf {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&(packets.len() as u32).to_ne_bytes());
         for (index, payload) in packets.iter().enumerate() {
@@ -98,18 +148,7 @@ mod tests {
                 }
             }
         }
-        // Store as u32 words so the list itself is 4-byte aligned, as a
-        // `MIDIPacketList` is; the walk reads `bytes.len()` bytes of it.
-        let mut words = vec![0u32; bytes.len().div_ceil(4)];
-        // SAFETY: `words` holds at least `bytes.len()` bytes.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                words.as_mut_ptr() as *mut u8,
-                bytes.len(),
-            );
-        }
-        words
+        PacketListBuf::new(&bytes)
     }
 
     fn collect(packets: &[&[u8]], align_to_4: bool) -> Vec<Vec<u8>> {
@@ -118,7 +157,7 @@ mod tests {
         // SAFETY: `list` is a well-formed packet list built above with the
         // same alignment rule, and it outlives the walk.
         unsafe {
-            for_each_packet(list.as_ptr() as *const u8, align_to_4, |data| {
+            for_each_packet(list.as_ptr(), align_to_4, |data| {
                 seen.push(data.to_vec());
             });
         }
@@ -226,5 +265,45 @@ mod tests {
         for align in LAYOUTS {
             assert!(collect(&[], align).is_empty());
         }
+    }
+
+    #[test]
+    fn arm_walk_does_not_step_past_an_unaligned_final_packet() {
+        // Issue #258: on ARM (`align_to_4 = true`), advancing `packet` after
+        // the last packet rounds up to the next 4-byte boundary, which is 1-3
+        // bytes past the end of the `MIDIPacketList` allocation whenever the
+        // final packet's end (`4 + 10 + len` from the start of the packet) is
+        // not a multiple of 4.
+        for tail in [
+            &[0xF8][..],
+            &[0xC0, 5][..],
+            &[0x90, 60, 100][..],
+            &[0xF0, 0x7D, 0x01, 0xF7][..],
+        ] {
+            for prefix in [&[][..], &[&[0x90, 60, 100][..]][..]] {
+                let mut packets = prefix.to_vec();
+                packets.push(tail);
+                let list = build_packet_list(&packets, true);
+                let base = list.as_ptr() as usize;
+                let end = base + list.len();
+                let mut seen = Vec::new();
+                // SAFETY: `list` is an exact-length allocation of `list.len()`
+                // bytes built with the ARM layout (`align_to_4 = true`).
+                unsafe {
+                    for_each_packet(list.as_ptr(), true, |data| {
+                        let slice_end = data.as_ptr() as usize + data.len();
+                        assert!(slice_end <= end, "packet slice exceeded allocation");
+                        seen.push(data.to_vec());
+                    });
+                }
+                assert_eq!(seen, owned(&packets));
+            }
+        }
+        // Specifically verify that a 3-byte Note On as the final packet leaves
+        // an exact list length not divisible by 4 (4 + 10 + 3 = 17), where
+        // `next_packet_address` rounds to 20 (3 bytes past `list.len()`).
+        let single_note = build_packet_list(&[&[0x90, 60, 100]], true);
+        assert_eq!(single_note.len(), 17);
+        assert_eq!(next_packet_address(PACKET_LIST_FIRST_PACKET, 3, true), 20);
     }
 }
