@@ -498,11 +498,28 @@ fn fit_bounds_in_work_area(window: Bounds<Pixels>, work: Bounds<Pixels>) -> Boun
     gpui::bounds(point(px(x), px(y)), size(px(w), px(h)))
 }
 
+/// Read saved studio bounds from `path`; `None` if missing or unparsable.
+fn read_saved_bounds_file(path: &std::path::Path) -> Option<Bounds<Pixels>> {
+    let content = fs::read_to_string(path).ok()?;
+    let saved: SavedStudioWindowBounds = serde_json::from_str(&content).ok()?;
+    Some(saved.to_bounds())
+}
+
+/// Write `bounds` to `path` atomically (temp file in the same folder, synced,
+/// then renamed over it): an interrupted save keeps the previous bounds
+/// instead of leaving a torn file the next launch has to ignore.
+fn write_saved_bounds_file(path: &std::path::Path, bounds: Bounds<Pixels>) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(&SavedStudioWindowBounds::from(bounds))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    crate::keymap::storage::write_file_atomically(path, json.as_bytes())
+}
+
 fn load_saved_studio_bounds() -> Option<Bounds<Pixels>> {
     let path = studio_window_file();
-    let content = fs::read_to_string(&path).ok()?;
-    let saved: SavedStudioWindowBounds = serde_json::from_str(&content).ok()?;
-    let bounds = saved.to_bounds();
+    let bounds = read_saved_bounds_file(&path)?;
     log_position(&format!(
         "main_window: loaded saved bounds={} from {}",
         format_bounds(bounds),
@@ -590,23 +607,13 @@ pub fn save_studio_window_bounds(bounds: Bounds<Pixels>, cx: &App) {
     }
 
     let path = studio_window_file();
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let saved = SavedStudioWindowBounds::from(bounds);
-    match serde_json::to_string_pretty(&saved) {
-        Ok(json) => {
-            if let Err(err) = fs::write(&path, json) {
-                log_position(&format!("main_window: save failed: {err}"));
-            } else {
-                log_position(&format!(
-                    "main_window: saved bounds={} path={}",
-                    format_bounds(bounds),
-                    path.display()
-                ));
-            }
-        }
-        Err(err) => log_position(&format!("main_window: serialize failed: {err}")),
+    match write_saved_bounds_file(&path, bounds) {
+        Ok(()) => log_position(&format!(
+            "main_window: saved bounds={} path={}",
+            format_bounds(bounds),
+            path.display()
+        )),
+        Err(err) => log_position(&format!("main_window: save failed: {err}")),
     }
 }
 
@@ -633,6 +640,29 @@ pub fn confirm_studio_window_placement() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_bounds_round_trip_and_replace_atomically() {
+        let dir = std::env::temp_dir().join(format!(
+            "fb-studio-window-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("studio_window.json");
+        let first = gpui::bounds(point(px(10.0), px(20.0)), size(px(1200.0), px(800.0)));
+        let second = gpui::bounds(point(px(-5.0), px(40.0)), size(px(900.0), px(600.0)));
+        write_saved_bounds_file(&path, first).unwrap();
+        assert_eq!(read_saved_bounds_file(&path), Some(first));
+        write_saved_bounds_file(&path, second).unwrap();
+        assert_eq!(read_saved_bounds_file(&path), Some(second));
+        let names: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("studio_window.json")]);
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn centered_over_parent_math() {
