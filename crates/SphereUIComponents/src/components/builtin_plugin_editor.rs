@@ -1387,6 +1387,14 @@ mod drum_waveform_cache {
         }
     }
 
+    pub fn remove_pad(insert_id: &str, pad_index: u32) {
+        if let Ok(mut cache) = cache().lock() {
+            if let Some(pads) = cache.get_mut(insert_id) {
+                pads.remove(&pad_index);
+            }
+        }
+    }
+
     pub fn clear() {
         if let Ok(mut cache) = cache().lock() {
             cache.clear();
@@ -1404,6 +1412,36 @@ pub fn drum_waveforms(insert_id: &str) -> Vec<(u32, DrumPadWaveform)> {
 
 pub fn drum_waveforms_remove(insert_id: &str) {
     drum_waveform_cache::remove(insert_id);
+}
+
+/// Forgets one pad's overview: its sample is being replaced or cleared, so
+/// the picture belongs to audio the DSP no longer plays.
+pub fn drum_waveform_remove_pad(insert_id: &str, pad_index: u32) {
+    drum_waveform_cache::remove_pad(insert_id, pad_index);
+}
+
+/// The sample slots that differ between `before` and `after`, both as
+/// [`builtin_sample_names`] lists them: `(slot, Some(file))` for a slot whose
+/// file was added or changed, `(slot, None)` for one that is now empty. In
+/// slot order. What a DSP still holding `before`'s audio needs sent to play
+/// `after` — a preset load, a paste or an undo replaces names in the mirror,
+/// but the audio only changes when each file is sent again (#265).
+pub fn builtin_sample_changes(
+    after: &[(u32, String)],
+    before: &[(u32, String)],
+) -> Vec<(u32, Option<String>)> {
+    use std::collections::BTreeMap;
+    let before: BTreeMap<u32, &str> = before.iter().map(|(s, n)| (*s, n.as_str())).collect();
+    let after: BTreeMap<u32, &str> = after.iter().map(|(s, n)| (*s, n.as_str())).collect();
+    let mut changes: BTreeMap<u32, Option<String>> = after
+        .iter()
+        .filter(|(slot, name)| before.get(slot) != Some(*name))
+        .map(|(slot, name)| (*slot, Some((*name).to_string())))
+        .collect();
+    for slot in before.keys().filter(|slot| !after.contains_key(slot)) {
+        changes.insert(*slot, None);
+    }
+    changes.into_iter().collect()
 }
 
 pub fn drum_waveforms_clear() {
@@ -3854,6 +3892,59 @@ mod tests {
         assert!(drum_waveforms("another-insert").is_empty());
         builtin_state_remove(insert);
         assert!(drum_waveforms(insert).is_empty());
+    }
+
+    #[test]
+    fn drum_waveform_remove_pad_drops_only_that_pad() {
+        let insert = "test-insert-drum-waveform-remove-pad";
+        let waveform = DrumPadWaveform {
+            name: "kick.wav".into(),
+            frames: 10,
+            channels: 1,
+            sample_rate: 48_000,
+            peaks: vec![1],
+        };
+        drum_waveform_store(insert, 0, waveform.clone());
+        drum_waveform_store(insert, 5, waveform.clone());
+        drum_waveform_remove_pad(insert, 0);
+        drum_waveform_remove_pad(insert, 9);
+        drum_waveform_remove_pad("no-such-insert", 5);
+        assert_eq!(drum_waveforms(insert), vec![(5, waveform)]);
+        drum_waveforms_remove(insert);
+    }
+
+    /// #265: what a sampler DSP still playing `before` must be sent to play
+    /// `after` — added and changed files, and cleared slots, nothing else.
+    #[test]
+    fn builtin_sample_changes_lists_added_changed_and_cleared_slots() {
+        let names = |list: &[(u32, &str)]| -> Vec<(u32, String)> {
+            list.iter().map(|(s, n)| (*s, n.to_string())).collect()
+        };
+        // Drum Sampler kit B -> kit A: pad 0 same, 1 changed, 2 cleared, 3 new.
+        let before = names(&[(0, "kick.wav"), (1, "snare_b.wav"), (2, "hat_b.wav")]);
+        let after = names(&[(0, "kick.wav"), (1, "snare_a.wav"), (3, "clap_a.wav")]);
+        assert_eq!(
+            builtin_sample_changes(&after, &before),
+            vec![
+                (1, Some("snare_a.wav".to_string())),
+                (2, None),
+                (3, Some("clap_a.wav".to_string())),
+            ]
+        );
+        // Quick Sampler / Slicer: one slot.
+        let one_b = names(&[(0, "loop_b.wav")]);
+        let one_a = names(&[(0, "loop_a.wav")]);
+        assert_eq!(
+            builtin_sample_changes(&one_a, &one_b),
+            vec![(0, Some("loop_a.wav".to_string()))]
+        );
+        assert_eq!(builtin_sample_changes(&[], &one_b), vec![(0, None)]);
+        assert_eq!(
+            builtin_sample_changes(&one_a, &[]),
+            vec![(0, Some("loop_a.wav".to_string()))]
+        );
+        // A parameter-only undo leaves the samples alone: nothing to send.
+        assert!(builtin_sample_changes(&before, &before).is_empty());
     }
 
     /// The mirror is keyed by insert slot id, which is not unique across

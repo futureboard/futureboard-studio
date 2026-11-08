@@ -5230,9 +5230,20 @@ fn dispatch(
                 .and_then(|e| e.to_str())
                 .unwrap_or("")
                 .to_string();
-            // No audio at all: the editor is clearing the slot.
+            // No audio at all: the editor is clearing the slot. A name with no
+            // audio is a file the studio could not find: the slot is
+            // silenced all the same — never left playing the sample it held
+            // — and the load reported as failed.
             let result = if audio_b64.is_empty() {
-                clear_builtin_sample(processor.as_deref(), pad_index, &plugin_instance_id)
+                clear_builtin_sample(processor.as_deref(), pad_index, &plugin_instance_id).and_then(
+                    |cleared| {
+                        if name.is_empty() {
+                            Ok(cleared)
+                        } else {
+                            Err("sample file is missing".to_string())
+                        }
+                    },
+                )
             } else {
                 base64::engine::general_purpose::STANDARD
                     .decode(audio_b64.as_bytes())

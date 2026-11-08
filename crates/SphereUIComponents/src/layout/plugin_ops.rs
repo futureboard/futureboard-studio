@@ -868,6 +868,11 @@ impl StudioLayout {
                             pad_index,
                             waveform.clone(),
                         );
+                    } else if ok && cleared {
+                        crate::components::builtin_plugin_editor::drum_waveform_remove_pad(
+                            &plugin_instance_id,
+                            pad_index,
+                        );
                     }
                     #[cfg(feature = "builtin-plugin-editor")]
                     if let Some(handle) = self
@@ -6395,8 +6400,8 @@ impl StudioLayout {
         // crash/respawn.
         self.replay_builtin_insert_state(plugin_instance_id, None, cx);
         // A pad's audio is not a parameter: the restarted DSP needs each
-        // sample sent again. Only here, where the DSP is new — an undo step
-        // replays parameters into a DSP whose samples are still loaded.
+        // sample sent again. An undo, a paste or a preset load sends only the
+        // samples it changed (`reload_changed_builtin_samples`).
         self.reload_builtin_samples(plugin_instance_id, cx);
         if slot_changed {
             self.audio_bridge.project_dirty = true;
@@ -6607,8 +6612,6 @@ impl StudioLayout {
     }
 
     fn reload_builtin_samples(&self, insert_id: &str, cx: &Context<Self>) {
-        use crate::components::builtin_plugin_files as files;
-        use base64::Engine as _;
         let state = &self.timeline.read(cx).state;
         let Some(slot) = std::iter::once(&state.master.inserts)
             .chain(state.tracks.iter().map(|track| &track.inserts))
@@ -6622,34 +6625,93 @@ impl StudioLayout {
         };
         // A guitar rig's capture and cabinet IR come back the same way.
         self.reload_builtin_files(insert_id, plugin_id);
-        let display_name = slot.display_name.as_str();
         let names =
             crate::components::builtin_plugin_editor::builtin_sample_names(plugin_id, insert_id);
         if names.is_empty() {
             return;
         }
+        // The overviews being replaced belong to the DSP that is gone.
+        crate::components::builtin_plugin_editor::drum_waveforms_remove(insert_id);
+        let changes = names
+            .into_iter()
+            .map(|(slot, name)| (slot, Some(name)))
+            .collect();
+        self.send_builtin_samples(insert_id, &slot.display_name, changes);
+    }
+
+    /// After a preset load, a paste or an undo replaced a sampler's state
+    /// (#265): sends the live DSP — still playing `before`'s audio — each
+    /// sample slot whose file changed, and clears each slot that is now
+    /// empty. Parameters travel separately through
+    /// `replay_builtin_insert_state`. No-op for any other plugin, or when no
+    /// file changed.
+    pub(super) fn reload_changed_builtin_samples(
+        &self,
+        insert_id: &str,
+        plugin_id: &str,
+        before: &[(u32, String)],
+        cx: &Context<Self>,
+    ) {
+        use crate::components::builtin_plugin_editor as host;
+        let after = host::builtin_sample_names(plugin_id, insert_id);
+        let changes = host::builtin_sample_changes(&after, before);
+        if changes.is_empty() {
+            return;
+        }
+        let state = &self.timeline.read(cx).state;
+        let Some(slot) = std::iter::once(&state.master.inserts)
+            .chain(state.tracks.iter().map(|track| &track.inserts))
+            .flatten()
+            .find(|slot| slot.id == insert_id)
+        else {
+            return;
+        };
+        for (pad_index, _) in &changes {
+            host::drum_waveform_remove_pad(insert_id, *pad_index);
+        }
+        self.send_builtin_samples(insert_id, &slot.display_name, changes);
+    }
+
+    /// Sends each `(slot, file)` to a sampler's host DSP: the file read from
+    /// the plugin's Samples folder, or — for `None` — an empty load that
+    /// clears the slot. A file that is gone is sent with its name and no
+    /// audio: the host silences the slot rather than keep playing what was
+    /// there, and answers with a failed load the editor shows on that pad.
+    fn send_builtin_samples(
+        &self,
+        insert_id: &str,
+        display_name: &str,
+        changes: Vec<(u32, Option<String>)>,
+    ) {
+        use crate::components::builtin_plugin_files as files;
+        use base64::Engine as _;
         let Some(runtime) = self.plugin_editors.bridge_runtime.as_ref() else {
             return;
         };
-        // The overviews being replaced belong to the DSP that is gone.
-        crate::components::builtin_plugin_editor::drum_waveforms_remove(insert_id);
         let root = files::plugin_files_root(display_name);
-        for (pad_index, name) in names {
-            let bytes = match files::read_file_bytes(&root, files::BuiltinFileKind::Samples, &name)
-            {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    eprintln!(
-                        "[PluginRestore] drum sample missing instance={insert_id} pad={pad_index} file={name} error={error}"
-                    );
-                    continue;
+        for (pad_index, name) in changes {
+            let (name, audio_b64) = match name {
+                None => (String::new(), String::new()),
+                Some(name) => {
+                    match files::read_file_bytes(&root, files::BuiltinFileKind::Samples, &name) {
+                        Ok(bytes) => {
+                            let audio = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                            (name, audio)
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "[PluginRestore] drum sample missing instance={insert_id} pad={pad_index} file={name} error={error}"
+                            );
+                            (name, String::new())
+                        }
+                    }
                 }
             };
             let command = SpherePluginHost::ipc::HostCommand::LoadBuiltinDrumSample {
                 plugin_instance_id: insert_id.to_string(),
                 pad_index,
-                name: name.clone(),
-                audio_b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                name,
+                audio_b64,
             };
             match runtime.lock() {
                 Ok(mut bridge) => {

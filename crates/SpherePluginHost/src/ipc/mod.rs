@@ -281,7 +281,9 @@ pub enum HostCommand {
     /// replies [`HostEvent::BuiltinDrumSampleResult`] either way.
     ///
     /// An empty `name` and `audio_b64` clears the slot instead; the reply
-    /// echoes the empty name.
+    /// echoes the empty name. A `name` with an empty `audio_b64` — a file the
+    /// studio could not read — also clears the slot, but replies as a failed
+    /// load of that name.
     LoadBuiltinDrumSample {
         plugin_instance_id: String,
         pad_index: u32,
