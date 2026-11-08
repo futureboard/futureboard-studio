@@ -372,36 +372,28 @@ impl Render for PluginEditor {
 /// The icons the Voxtune editor and its controls draw.
 struct Assets;
 
+/// Lucide glyphs still drawn by Studio's virtual path. Transport and tool
+/// icons are served from the Futureboard set (`assets::FUTUREBOARD_ICONS`).
 const ICONS: &[(&str, &str)] = &[
-    (assets::ICON_PLAY_PATH, assets::icons::PLAY),
-    (assets::ICON_PAUSE_PATH, assets::icons::PAUSE),
-    (assets::ICON_SKIP_BACK_PATH, assets::icons::SKIP_BACK),
-    (assets::ICON_REPEAT_PATH, assets::icons::REPEAT),
     (assets::ICON_UNDO_PATH, assets::icons::UNDO),
     (assets::ICON_REDO_PATH, assets::icons::REDO),
     (assets::ICON_HISTORY_PATH, assets::icons::HISTORY),
-    (assets::ICON_ZOOM_IN_PATH, assets::icons::ZOOM_IN),
-    (assets::ICON_ZOOM_OUT_PATH, assets::icons::ZOOM_OUT),
     (assets::ICON_SCAN_PATH, assets::icons::SCAN),
     (assets::ICON_CHEVRON_DOWN_PATH, assets::icons::CHEVRON_DOWN),
     (assets::ICON_CHECK_PATH, assets::icons::CHECK),
-    (
-        assets::ICON_MOUSE_POINTER_PATH,
-        assets::icons::MOUSE_POINTER,
-    ),
-    (assets::ICON_AUDIO_LINES_PATH, assets::icons::AUDIO_LINES),
     (
         assets::ICON_MOVE_HORIZONTAL_PATH,
         assets::icons::MOVE_HORIZONTAL,
     ),
     (assets::ICON_SPARKLES_PATH, assets::icons::SPARKLES),
-    (assets::ICON_VOLUME_2_PATH, assets::icons::VOLUME_2),
-    (assets::ICON_SCISSORS_PATH, assets::icons::SCISSORS),
 ];
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
         if let Some(svg) = crate::components::voxtune::icons::svg(path) {
+            return Ok(Some(Cow::Borrowed(svg.as_bytes())));
+        }
+        if let Some(svg) = assets::futureboard_icon(path) {
             return Ok(Some(Cow::Borrowed(svg.as_bytes())));
         }
         Ok(ICONS
@@ -414,6 +406,7 @@ impl AssetSource for Assets {
         Ok(ICONS
             .iter()
             .map(|(p, _)| *p)
+            .chain(assets::FUTUREBOARD_ICONS.iter().map(|(p, _)| *p))
             .chain(crate::components::voxtune::icons::ALL.iter().copied())
             .filter(|p| p.starts_with(path))
             .map(SharedString::from)

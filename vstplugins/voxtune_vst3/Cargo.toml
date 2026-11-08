@@ -48,6 +48,7 @@ windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_DirectWrite",
     "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [patch."https://github.com/futureboard/gpui-se.git"]

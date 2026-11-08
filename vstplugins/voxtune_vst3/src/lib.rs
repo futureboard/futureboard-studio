@@ -47,6 +47,7 @@ mod theme;
 mod keymap;
 mod native_win32_menu;
 mod paths;
+mod perf;
 
 #[derive(Params)]
 pub struct VoxParams {
