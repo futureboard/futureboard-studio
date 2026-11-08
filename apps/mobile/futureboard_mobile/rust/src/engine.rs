@@ -2,7 +2,8 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 use builtin_dsp_core::spectrum::{SpectrumAnalyzer, SPECTRUM_BINS};
 use ebur128::{EbuR128, Mode as EbuMode};
@@ -13,6 +14,247 @@ use crate::audio_io::{self, StereoAudioBuffer};
 use crate::plugin_host::{
     plugin_catalog, BuiltinPluginInstance, PluginCatalogEntry, PluginMeterSnapshot, PluginParamSpec,
 };
+
+pub const MAX_RENDER_BLOCK_FRAMES: usize = 4096;
+pub const MIC_RING_SECONDS: usize = 8;
+pub const INITIAL_TAKE_RESERVE_SECONDS: usize = 60;
+pub const MAX_RECORDING_SECONDS: usize = 600;
+const MIC_DRAIN_INTERVAL_MS: u64 = 5;
+const LIVE_MIDI_QUEUE_CAPACITY: usize = 256;
+
+/// Lock-free bounded single-producer / single-consumer stereo sample ring for microphone input.
+///
+/// The realtime input callback pushes frames using only atomic loads/stores with no heap
+/// allocation or locking. A non-realtime worker thread drains frames into preallocated
+/// take storage off the audio thread.
+pub struct MicInputRing {
+    left: Box<[AtomicU32]>,
+    right: Box<[AtomicU32]>,
+    write: AtomicUsize,
+    read: AtomicUsize,
+    active: AtomicBool,
+    dropped_frames: AtomicU64,
+}
+
+impl MicInputRing {
+    pub fn new(capacity_frames: usize) -> Self {
+        let cap = capacity_frames.max(1);
+        Self {
+            left: (0..cap).map(|_| AtomicU32::new(0)).collect(),
+            right: (0..cap).map(|_| AtomicU32::new(0)).collect(),
+            write: AtomicUsize::new(0),
+            read: AtomicUsize::new(0),
+            active: AtomicBool::new(false),
+            dropped_frames: AtomicU64::new(0),
+        }
+    }
+
+    #[inline]
+    pub fn capacity_frames(&self) -> usize {
+        self.left.len()
+    }
+
+    #[inline]
+    pub fn set_active(&self, active: bool) {
+        self.active.store(active, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    pub fn clear(&self) {
+        let w = self.write.load(Ordering::Acquire);
+        self.read.store(w, Ordering::Release);
+        self.dropped_frames.store(0, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn dropped_frames(&self) -> u64 {
+        self.dropped_frames.load(Ordering::Relaxed)
+    }
+
+    /// Realtime producer entry point. Never allocates and never blocks.
+    pub fn push_interleaved(&self, interleaved_stereo_or_mono: &[f32], channels: usize) -> usize {
+        if !self.active.load(Ordering::Acquire) || interleaved_stereo_or_mono.is_empty() {
+            return 0;
+        }
+        let ch = channels.max(1);
+        let frames = interleaved_stereo_or_mono.len() / ch;
+        if frames == 0 {
+            return 0;
+        }
+        let cap = self.left.len();
+        let w = self.write.load(Ordering::Relaxed);
+        let r = self.read.load(Ordering::Acquire);
+        let used = w.wrapping_sub(r).min(cap);
+        let avail = cap - used;
+        let n = frames.min(avail);
+        for f in 0..n {
+            let base = f * ch;
+            let l = interleaved_stereo_or_mono[base];
+            let r_val = if ch > 1 {
+                interleaved_stereo_or_mono[base + 1]
+            } else {
+                l
+            };
+            let slot = w.wrapping_add(f) % cap;
+            self.left[slot].store(l.to_bits(), Ordering::Relaxed);
+            self.right[slot].store(r_val.to_bits(), Ordering::Relaxed);
+        }
+        self.write.store(w.wrapping_add(n), Ordering::Release);
+        if n < frames {
+            self.dropped_frames
+                .fetch_add((frames - n) as u64, Ordering::Relaxed);
+        }
+        n
+    }
+
+    /// Non-realtime consumer: drains available stereo frames into `out_l` and `out_r`,
+    /// capped at `max_total_frames`.
+    pub fn drain_into(
+        &self,
+        out_l: &mut Vec<f32>,
+        out_r: &mut Vec<f32>,
+        max_total_frames: usize,
+    ) -> usize {
+        let cap = self.left.len();
+        let r = self.read.load(Ordering::Relaxed);
+        let w = self.write.load(Ordering::Acquire);
+        let available = w.wrapping_sub(r).min(cap);
+        if available == 0 {
+            return 0;
+        }
+        let current = out_l.len().min(out_r.len());
+        let room = max_total_frames.saturating_sub(current);
+        let keep = available.min(room);
+        for i in 0..keep {
+            let slot = r.wrapping_add(i) % cap;
+            out_l.push(f32::from_bits(self.left[slot].load(Ordering::Relaxed)));
+            out_r.push(f32::from_bits(self.right[slot].load(Ordering::Relaxed)));
+        }
+        self.read
+            .store(r.wrapping_add(available), Ordering::Release);
+        if keep < available {
+            self.dropped_frames
+                .fetch_add((available - keep) as u64, Ordering::Relaxed);
+        }
+        keep
+    }
+}
+
+struct TakeStorage {
+    left: Vec<f32>,
+    right: Vec<f32>,
+    max_frames: usize,
+    shutdown: bool,
+}
+
+/// Non-realtime writer that drains the microphone ring into the current take.
+///
+/// The take vectors are preallocated by the control thread in `begin_take`; the worker
+/// only appends within that bound (`max_frames`), so the realtime input callback never
+/// touches the take storage.
+struct RecordingWorker {
+    state: Arc<(Mutex<TakeStorage>, Condvar)>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+fn lock_take(lock: &Mutex<TakeStorage>) -> std::sync::MutexGuard<'_, TakeStorage> {
+    lock.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+impl RecordingWorker {
+    fn new(mic_ring: Arc<MicInputRing>) -> Self {
+        let state = Arc::new((
+            Mutex::new(TakeStorage {
+                left: Vec::new(),
+                right: Vec::new(),
+                max_frames: 0,
+                shutdown: false,
+            }),
+            Condvar::new(),
+        ));
+        let worker_state = Arc::clone(&state);
+        let thread = std::thread::Builder::new()
+            .name("fb-mobile-mic-writer".to_string())
+            .spawn(move || {
+                let (lock, cvar) = &*worker_state;
+                let mut guard = lock_take(lock);
+                loop {
+                    if guard.shutdown {
+                        break;
+                    }
+                    if !mic_ring.is_active() {
+                        guard = cvar.wait(guard).unwrap_or_else(|p| p.into_inner());
+                        continue;
+                    }
+                    let max_frames = guard.max_frames;
+                    let TakeStorage { left, right, .. } = &mut *guard;
+                    mic_ring.drain_into(left, right, max_frames);
+                    // Sleep off the realtime thread; the ring holds MIC_RING_SECONDS of audio,
+                    // so a short poll interval cannot overflow it.
+                    guard = cvar
+                        .wait_timeout(
+                            guard,
+                            std::time::Duration::from_millis(MIC_DRAIN_INTERVAL_MS),
+                        )
+                        .map(|(g, _)| g)
+                        .unwrap_or_else(|p| p.into_inner().0);
+                }
+            })
+            .ok();
+        Self { state, thread }
+    }
+
+    /// Installs preallocated take storage, resets the ring and starts accepting input.
+    fn begin_take(
+        &self,
+        mic_ring: &MicInputRing,
+        left: Vec<f32>,
+        right: Vec<f32>,
+        max_frames: usize,
+    ) {
+        let (lock, cvar) = &*self.state;
+        let mut guard = lock_take(lock);
+        mic_ring.set_active(false);
+        mic_ring.clear();
+        guard.left = left;
+        guard.right = right;
+        guard.max_frames = max_frames;
+        mic_ring.set_active(true);
+        cvar.notify_one();
+    }
+
+    /// Stops accepting input, drains what is left in the ring and returns the take.
+    fn finish_take(&self, mic_ring: &MicInputRing) -> (Vec<f32>, Vec<f32>) {
+        let (lock, _) = &*self.state;
+        let mut guard = lock_take(lock);
+        mic_ring.set_active(false);
+        let max_frames = guard.max_frames;
+        let TakeStorage { left, right, .. } = &mut *guard;
+        mic_ring.drain_into(left, right, max_frames);
+        (
+            std::mem::take(&mut guard.left),
+            std::mem::take(&mut guard.right),
+        )
+    }
+}
+
+impl Drop for RecordingWorker {
+    fn drop(&mut self) {
+        {
+            let (lock, cvar) = &*self.state;
+            let mut guard = lock_take(lock);
+            guard.shutdown = true;
+            cvar.notify_all();
+        }
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -200,6 +442,8 @@ pub struct TrackRuntime {
     pub active_midi_notes: [bool; 128],
     pub buf_l: Vec<f32>,
     pub buf_r: Vec<f32>,
+    pub spatial_scratch_l: Vec<f32>,
+    pub spatial_scratch_r: Vec<f32>,
     pub peak_l: f32,
     pub peak_r: f32,
     pub rms_l: f32,
@@ -213,10 +457,12 @@ impl TrackRuntime {
             snapshot,
             instrument_instance: None,
             insert_instances: Vec::new(),
-            binaural_source: BinauralSource::new(sample_rate, 4096),
+            binaural_source: BinauralSource::new(sample_rate, MAX_RENDER_BLOCK_FRAMES),
             active_midi_notes: [false; 128],
-            buf_l: vec![0.0; 4096],
-            buf_r: vec![0.0; 4096],
+            buf_l: vec![0.0; MAX_RENDER_BLOCK_FRAMES],
+            buf_r: vec![0.0; MAX_RENDER_BLOCK_FRAMES],
+            spatial_scratch_l: vec![0.0; MAX_RENDER_BLOCK_FRAMES],
+            spatial_scratch_r: vec![0.0; MAX_RENDER_BLOCK_FRAMES],
             peak_l: 0.0,
             peak_r: 0.0,
             rms_l: 0.0,
@@ -253,14 +499,17 @@ impl TrackRuntime {
     }
 
     pub fn sync_snapshot_from_plugins(&mut self) {
-        self.snapshot.instrument = self.instrument_instance.as_ref().map(|inst| InsertSlotSnapshot {
-            slot_index: 0,
-            plugin_id: inst.plugin_id.clone(),
-            name: inst.name.clone(),
-            enabled: inst.enabled,
-            active_preset: inst.active_preset.clone(),
-            params: inst.param_specs.clone(),
-        });
+        self.snapshot.instrument =
+            self.instrument_instance
+                .as_ref()
+                .map(|inst| InsertSlotSnapshot {
+                    slot_index: 0,
+                    plugin_id: inst.plugin_id.clone(),
+                    name: inst.name.clone(),
+                    enabled: inst.enabled,
+                    active_preset: inst.active_preset.clone(),
+                    params: inst.param_specs.clone(),
+                });
 
         self.snapshot.inserts = self
             .insert_instances
@@ -285,9 +534,9 @@ impl TrackRuntime {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct LiveMidiEvent {
-    track_id: String,
+    track_idx: usize,
     note: u8,
     velocity: u8,
     is_note_on: bool,
@@ -318,8 +567,8 @@ pub struct StudioMobileEngine {
     pub audio_pool: HashMap<String, Arc<StereoAudioBuffer>>,
 
     live_midi_queue: Vec<LiveMidiEvent>,
-    recording_buffer_l: Vec<f32>,
-    recording_buffer_r: Vec<f32>,
+    mic_ring: Arc<MicInputRing>,
+    recording_worker: RecordingWorker,
     recording_start_beat: f64,
     metronome_phase: f32,
     metronome_env: f32,
@@ -366,9 +615,12 @@ impl StudioMobileEngine {
         let ebur = EbuR128::new(
             2,
             sr,
-            EbuMode::M | EbuMode::S | EbuMode::I | EbuMode::TRUE_PEAK,
+            EbuMode::M | EbuMode::S | EbuMode::I | EbuMode::TRUE_PEAK | EbuMode::HISTOGRAM,
         )
         .ok();
+
+        let mic_ring = Arc::new(MicInputRing::new((sr as usize) * MIC_RING_SECONDS));
+        let recording_worker = RecordingWorker::new(Arc::clone(&mic_ring));
 
         let mut engine = Self {
             title: "Futureboard Mobile Session".to_string(),
@@ -392,9 +644,9 @@ impl StudioMobileEngine {
             tracks: Vec::new(),
             master_track: TrackRuntime::new(master_snap, sr),
             audio_pool: HashMap::new(),
-            live_midi_queue: Vec::new(),
-            recording_buffer_l: Vec::new(),
-            recording_buffer_r: Vec::new(),
+            live_midi_queue: Vec::with_capacity(LIVE_MIDI_QUEUE_CAPACITY),
+            mic_ring,
+            recording_worker,
             recording_start_beat: 0.0,
             metronome_phase: 0.0,
             metronome_env: 0.0,
@@ -402,7 +654,7 @@ impl StudioMobileEngine {
             spectrum: SpectrumAnalyzer::new(sr as f32),
             spectrum_bins_cache: [-96.0; SPECTRUM_BINS],
             ebur128: ebur,
-            interleaved_meter_scratch: vec![0.0; 8192],
+            interleaved_meter_scratch: vec![0.0; MAX_RENDER_BLOCK_FRAMES * 2],
             last_cpu_load_pct: 4.2,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -410,6 +662,11 @@ impl StudioMobileEngine {
         };
         engine.load_demo_project();
         engine
+    }
+
+    #[inline]
+    pub fn mic_ring(&self) -> Arc<MicInputRing> {
+        Arc::clone(&self.mic_ring)
     }
 
     fn alloc_id(&mut self, prefix: &str) -> String {
@@ -479,6 +736,7 @@ impl StudioMobileEngine {
 
     pub fn restore_from_snapshot(&mut self, snap: ProjectSnapshot) {
         self.stop_all_notes();
+        self.live_midi_queue.clear();
         self.title = snap.title;
         self.bpm = snap.bpm.clamp(20.0, 300.0);
         self.time_sig_num = snap.time_sig_num.clamp(1, 16);
@@ -523,6 +781,7 @@ impl StudioMobileEngine {
     /// Populates a complete, musically rich 6-track + Master studio session using real Rust DSP crates.
     pub fn load_demo_project(&mut self) {
         self.stop_all_notes();
+        self.live_midi_queue.clear();
         self.tracks.clear();
         self.audio_pool.clear();
         self.undo_stack.clear();
@@ -540,13 +799,8 @@ impl StudioMobileEngine {
         let sr = self.sample_rate;
 
         // Synthesize a studio vocal/harmonic audio stem for Track 4
-        let vocal_stem = Arc::new(audio_io::synthesize_demo_vocal_stem(
-            sr,
-            self.bpm,
-            16.0,
-        ));
-        let vocal_peaks =
-            audio_io::compute_stereo_peaks(&vocal_stem.left, &vocal_stem.right, 128);
+        let vocal_stem = Arc::new(audio_io::synthesize_demo_vocal_stem(sr, self.bpm, 16.0));
+        let vocal_peaks = audio_io::compute_stereo_peaks(&vocal_stem.left, &vocal_stem.right, 128);
         self.audio_pool
             .insert("stem-vocal-1".to_string(), vocal_stem);
 
@@ -1059,10 +1313,19 @@ impl StudioMobileEngine {
             return;
         }
         if recording {
-            self.recording_buffer_l.clear();
-            self.recording_buffer_r.clear();
+            // Preallocate the take on the control thread; the writer thread only appends
+            // within this capacity (up to MAX_RECORDING_SECONDS).
+            let max_frames = (self.sample_rate as usize) * MAX_RECORDING_SECONDS;
+            let prealloc_frames =
+                ((self.sample_rate as usize) * INITIAL_TAKE_RESERVE_SECONDS).min(max_frames);
             self.recording_start_beat = self.playhead_beats;
             self.is_recording = true;
+            self.recording_worker.begin_take(
+                &self.mic_ring,
+                Vec::with_capacity(prealloc_frames),
+                Vec::with_capacity(prealloc_frames),
+                max_frames,
+            );
             if !self.is_playing {
                 self.is_playing = true;
             }
@@ -1073,14 +1336,15 @@ impl StudioMobileEngine {
 
     fn finish_recording_clip(&mut self) {
         self.is_recording = false;
-        if self.recording_buffer_l.len() < 512 {
-            self.recording_buffer_l.clear();
-            self.recording_buffer_r.clear();
+        let (mut left, mut right) = self.recording_worker.finish_take(&self.mic_ring);
+        let frames = left.len().min(right.len());
+        if frames < 512 {
             return;
         }
-        let left = std::mem::take(&mut self.recording_buffer_l);
-        let right = std::mem::take(&mut self.recording_buffer_r);
-        let frames = left.len().min(right.len());
+        left.truncate(frames);
+        right.truncate(frames);
+        left.shrink_to_fit();
+        right.shrink_to_fit();
         let duration_secs = frames as f64 / self.sample_rate as f64;
         let length_beats = (duration_secs * (self.bpm / 60.0)).max(0.5);
 
@@ -1128,22 +1392,13 @@ impl StudioMobileEngine {
         }
     }
 
-    pub fn push_mic_input_interleaved(&mut self, interleaved_stereo_or_mono: &[f32], channels: usize) {
-        if !self.is_recording || interleaved_stereo_or_mono.is_empty() {
-            return;
-        }
-        let ch = channels.max(1);
-        let frames = interleaved_stereo_or_mono.len() / ch;
-        for f in 0..frames {
-            let l = interleaved_stereo_or_mono[f * ch];
-            let r = if ch > 1 {
-                interleaved_stereo_or_mono[f * ch + 1]
-            } else {
-                l
-            };
-            self.recording_buffer_l.push(l);
-            self.recording_buffer_r.push(r);
-        }
+    pub fn push_mic_input_interleaved(
+        &mut self,
+        interleaved_stereo_or_mono: &[f32],
+        channels: usize,
+    ) {
+        self.mic_ring
+            .push_interleaved(interleaved_stereo_or_mono, channels);
     }
 
     pub fn seek_beats(&mut self, beats: f64) {
@@ -1175,7 +1430,12 @@ impl StudioMobileEngine {
 
     // ── Track Management ─────────────────────────────────────────────────────
 
-    pub fn add_track(&mut self, name: &str, kind: TrackKind, instrument_id: Option<&str>) -> String {
+    pub fn add_track(
+        &mut self,
+        name: &str,
+        kind: TrackKind,
+        instrument_id: Option<&str>,
+    ) -> String {
         self.push_undo();
         let id = self.alloc_id("track");
         let palette = [
@@ -1250,6 +1510,7 @@ impl StudioMobileEngine {
             return false;
         };
         self.push_undo();
+        self.live_midi_queue.clear();
         self.tracks.remove(pos);
         if self.selected_track_id == track_id {
             self.selected_track_id = self.tracks[0].snapshot.id.clone();
@@ -1478,7 +1739,12 @@ impl StudioMobileEngine {
 
     // ── Clips, Piano Roll & Audio File Import ────────────────────────────────
 
-    pub fn add_midi_clip(&mut self, track_id: &str, start_beat: f64, length_beats: f64) -> Option<String> {
+    pub fn add_midi_clip(
+        &mut self,
+        track_id: &str,
+        start_beat: f64,
+        length_beats: f64,
+    ) -> Option<String> {
         self.push_undo();
         let clip_id = self.alloc_id("clip-midi");
         let note_id = self.alloc_id("note");
@@ -1725,39 +1991,49 @@ impl StudioMobileEngine {
         true
     }
 
-    pub fn trigger_live_midi(
-        &mut self,
-        track_id: &str,
-        note: u8,
-        velocity: u8,
-        is_note_on: bool,
-    ) {
+    pub fn trigger_live_midi(&mut self, track_id: &str, note: u8, velocity: u8, is_note_on: bool) {
         let target = if track_id.is_empty() {
-            self.selected_track_id.clone()
+            self.selected_track_id.as_str()
         } else {
-            track_id.to_string()
+            track_id
         };
-        self.live_midi_queue.push(LiveMidiEvent {
-            track_id: target,
-            note: note.min(127),
-            velocity: velocity.min(127),
-            is_note_on,
-        });
+        let Some(track_idx) = self.tracks.iter().position(|t| t.snapshot.id == target) else {
+            return;
+        };
+        if self.live_midi_queue.len() < LIVE_MIDI_QUEUE_CAPACITY {
+            self.live_midi_queue.push(LiveMidiEvent {
+                track_idx,
+                note: note.min(127),
+                velocity: velocity.min(127),
+                is_note_on,
+            });
+        }
     }
 
     // ── Real-Time Stereo Audio Graph Render ──────────────────────────────────
 
     pub fn render_interleaved_stereo(&mut self, out_interleaved: &mut [f32], frames: usize) {
-        let n = frames.min(out_interleaved.len() / 2);
-        if n == 0 {
+        let total_frames = frames.min(out_interleaved.len() / 2);
+        if total_frames == 0 {
             return;
         }
+        let mut offset = 0;
+        while offset < total_frames {
+            let chunk = (total_frames - offset).min(MAX_RENDER_BLOCK_FRAMES);
+            self.render_block_internal(
+                &mut out_interleaved[offset * 2..(offset + chunk) * 2],
+                chunk,
+            );
+            offset += chunk;
+        }
+    }
+
+    fn render_block_internal(&mut self, out_interleaved: &mut [f32], n: usize) {
         let t0 = std::time::Instant::now();
 
-        // 1. Dispatch queued live MIDI events
-        let events: Vec<LiveMidiEvent> = self.live_midi_queue.drain(..).collect();
-        for ev in events {
-            if let Some(tr) = self.tracks.iter_mut().find(|t| t.snapshot.id == ev.track_id) {
+        // 1. Dispatch queued live MIDI events without allocating
+        for ev in self.live_midi_queue.drain(..) {
+            if let Some(tr) = self.tracks.get_mut(ev.track_idx) {
                 if let Some(inst) = &mut tr.instrument_instance {
                     if ev.is_note_on && ev.velocity > 0 {
                         inst.note_on(ev.note, ev.velocity as f32 / 127.0);
@@ -1783,220 +2059,227 @@ impl StudioMobileEngine {
 
         let any_solo = self.tracks.iter().any(|t| t.snapshot.soloed);
 
-        // Prepare bus accumulation buffers
+        // Zero preallocated track and bus buffers for this block
         for tr in &mut self.tracks {
-            if tr.buf_l.len() < n {
-                tr.buf_l.resize(n, 0.0);
-                tr.buf_r.resize(n, 0.0);
-            }
             tr.buf_l[..n].fill(0.0);
             tr.buf_r[..n].fill(0.0);
         }
 
-        // 2. Render non-bus tracks (Audio, Instrument, DrumKit)
-        let mut bus_accum: HashMap<String, (Vec<f32>, Vec<f32>)> = HashMap::new();
-        for tr in &self.tracks {
-            if tr.snapshot.kind == TrackKind::Bus {
-                bus_accum.insert(tr.snapshot.id.clone(), (vec![0.0; n], vec![0.0; n]));
-            }
-        }
-
-        for tr in &mut self.tracks {
-            if tr.snapshot.kind == TrackKind::Bus {
+        // 2. Render non-bus tracks (Audio, Instrument, DrumKit) and accumulate sends into Bus tracks
+        let track_count = self.tracks.len();
+        for track_idx in 0..track_count {
+            if self.tracks[track_idx].snapshot.kind == TrackKind::Bus {
                 continue;
             }
-            let audible = !tr.snapshot.muted && (!any_solo || tr.snapshot.soloed);
+            {
+                let tr = &mut self.tracks[track_idx];
+                let audible = !tr.snapshot.muted && (!any_solo || tr.snapshot.soloed);
 
-            // Evaluate automation lanes at block_start_beat
-            if tr.snapshot.automation_read {
-                for lane in &tr.snapshot.automation_lanes {
-                    if !lane.enabled || lane.points.is_empty() {
-                        continue;
-                    }
-                    let val = eval_automation_points(&lane.points, block_start_beat);
-                    if lane.target_param == "volume_db" {
-                        tr.snapshot.volume_db = val.clamp(-60.0, 12.0);
-                    } else if lane.target_param == "pan" {
-                        tr.snapshot.pan = val.clamp(-1.0, 1.0);
+                // Evaluate automation lanes at block_start_beat
+                if tr.snapshot.automation_read {
+                    for lane in &tr.snapshot.automation_lanes {
+                        if !lane.enabled || lane.points.is_empty() {
+                            continue;
+                        }
+                        let val = eval_automation_points(&lane.points, block_start_beat);
+                        if lane.target_param == "volume_db" {
+                            tr.snapshot.volume_db = val.clamp(-60.0, 12.0);
+                        } else if lane.target_param == "pan" {
+                            tr.snapshot.pan = val.clamp(-1.0, 1.0);
+                        }
                     }
                 }
-            }
 
-            // 2a. Schedule MIDI clip notes if playing
-            if self.is_playing {
-                let mut desired_notes = [0u8; 128];
-                for clip in &tr.snapshot.midi_clips {
-                    if clip.muted {
-                        continue;
-                    }
-                    if block_start_beat >= clip.start_beat
-                        && block_start_beat < clip.start_beat + clip.length_beats
-                    {
-                        let mut rel_beat = block_start_beat - clip.start_beat;
-                        if clip.loop_enabled && clip.loop_length_beats > 0.0625 {
-                            rel_beat %= clip.loop_length_beats;
+                // 2a. Schedule MIDI clip notes if playing
+                if self.is_playing {
+                    let mut desired_notes = [0u8; 128];
+                    for clip in &tr.snapshot.midi_clips {
+                        if clip.muted {
+                            continue;
                         }
-                        for note in &clip.notes {
-                            if note.muted {
+                        if block_start_beat >= clip.start_beat
+                            && block_start_beat < clip.start_beat + clip.length_beats
+                        {
+                            let mut rel_beat = block_start_beat - clip.start_beat;
+                            if clip.loop_enabled && clip.loop_length_beats > 0.0625 {
+                                rel_beat %= clip.loop_length_beats;
+                            }
+                            for note in &clip.notes {
+                                if note.muted {
+                                    continue;
+                                }
+                                if rel_beat >= note.start_beat
+                                    && rel_beat < note.start_beat + note.duration_beats
+                                {
+                                    let p = (note.pitch as usize).min(127);
+                                    desired_notes[p] = desired_notes[p].max(note.velocity.max(1));
+                                }
+                            }
+                        }
+                    }
+                    if let Some(inst) = &mut tr.instrument_instance {
+                        for pitch in 0..128 {
+                            let want_vel = desired_notes[pitch];
+                            let is_on = tr.active_midi_notes[pitch];
+                            if want_vel > 0 && !is_on {
+                                inst.note_on(pitch as u8, want_vel as f32 / 127.0);
+                                tr.active_midi_notes[pitch] = true;
+                            } else if want_vel == 0 && is_on {
+                                inst.note_off(pitch as u8);
+                                tr.active_midi_notes[pitch] = false;
+                            }
+                        }
+                    }
+                }
+
+                // 2b. Synthesize instrument
+                if let Some(inst) = &mut tr.instrument_instance {
+                    inst.process_stereo_block(&mut tr.buf_l[..n], &mut tr.buf_r[..n]);
+                }
+
+                // 2c. Render Audio Clips
+                if self.is_playing && !tr.snapshot.audio_clips.is_empty() {
+                    for clip in &tr.snapshot.audio_clips {
+                        if clip.muted {
+                            continue;
+                        }
+                        let Some(source) = self.audio_pool.get(&clip.source_id) else {
+                            continue;
+                        };
+                        let clip_gain = 10.0f32.powf(clip.gain_db / 20.0);
+                        let pitch_ratio = 2.0f64.powf(clip.pitch_semitones as f64 / 12.0);
+                        for i in 0..n {
+                            let beat = block_start_beat + beats_per_frame * (i as f64);
+                            if beat < clip.start_beat || beat >= clip.start_beat + clip.length_beats
+                            {
                                 continue;
                             }
-                            if rel_beat >= note.start_beat
-                                && rel_beat < note.start_beat + note.duration_beats
-                            {
-                                let p = (note.pitch as usize).min(127);
-                                desired_notes[p] = desired_notes[p].max(note.velocity.max(1));
+                            let rel_beat = beat - clip.start_beat + clip.offset_beats;
+                            let sec = rel_beat * (60.0 / self.bpm) * pitch_ratio;
+                            let src_frame = sec * (source.sample_rate as f64);
+                            let idx0 = src_frame.floor() as usize;
+                            if idx0 + 1 >= source.frames {
+                                continue;
                             }
+                            let frac = (src_frame - idx0 as f64) as f32;
+                            let sl =
+                                source.left[idx0] * (1.0 - frac) + source.left[idx0 + 1] * frac;
+                            let sr_val =
+                                source.right[idx0] * (1.0 - frac) + source.right[idx0 + 1] * frac;
+
+                            // Fade envelope
+                            let pos_in_clip = beat - clip.start_beat;
+                            let rem_in_clip = (clip.start_beat + clip.length_beats) - beat;
+                            let mut env = 1.0f32;
+                            if clip.fade_in_beats > 0.001 && pos_in_clip < clip.fade_in_beats {
+                                env *= (pos_in_clip / clip.fade_in_beats) as f32;
+                            }
+                            if clip.fade_out_beats > 0.001 && rem_in_clip < clip.fade_out_beats {
+                                env *= (rem_in_clip / clip.fade_out_beats) as f32;
+                            }
+
+                            tr.buf_l[i] += sl * clip_gain * env;
+                            tr.buf_r[i] += sr_val * clip_gain * env;
                         }
                     }
                 }
-                if let Some(inst) = &mut tr.instrument_instance {
-                    for pitch in 0..128 {
-                        let want_vel = desired_notes[pitch];
-                        let is_on = tr.active_midi_notes[pitch];
-                        if want_vel > 0 && !is_on {
-                            inst.note_on(pitch as u8, want_vel as f32 / 127.0);
-                            tr.active_midi_notes[pitch] = true;
-                        } else if want_vel == 0 && is_on {
-                            inst.note_off(pitch as u8);
-                            tr.active_midi_notes[pitch] = false;
-                        }
-                    }
+
+                // 2d. Process track insert chain
+                let mut max_gr = 0.0f32;
+                for insert in &mut tr.insert_instances {
+                    insert.process_stereo_block(&mut tr.buf_l[..n], &mut tr.buf_r[..n]);
+                    max_gr = max_gr.max(insert.last_gr_db);
                 }
-            }
+                tr.gr_db = max_gr;
 
-            // 2b. Synthesize instrument
-            if let Some(inst) = &mut tr.instrument_instance {
-                inst.process_stereo_block(&mut tr.buf_l[..n], &mut tr.buf_r[..n]);
-            }
-
-            // 2c. Render Audio Clips
-            if self.is_playing && !tr.snapshot.audio_clips.is_empty() {
-                for clip in &tr.snapshot.audio_clips {
-                    if clip.muted {
-                        continue;
-                    }
-                    let Some(source) = self.audio_pool.get(&clip.source_id) else {
-                        continue;
-                    };
-                    let clip_gain = 10.0f32.powf(clip.gain_db / 20.0);
-                    let pitch_ratio = 2.0f64.powf(clip.pitch_semitones as f64 / 12.0);
-                    for i in 0..n {
-                        let beat = block_start_beat + beats_per_frame * (i as f64);
-                        if beat < clip.start_beat || beat >= clip.start_beat + clip.length_beats {
-                            continue;
-                        }
-                        let rel_beat = beat - clip.start_beat + clip.offset_beats;
-                        let sec = rel_beat * (60.0 / self.bpm) * pitch_ratio;
-                        let src_frame = sec * (source.sample_rate as f64);
-                        let idx0 = src_frame.floor() as usize;
-                        if idx0 + 1 >= source.frames {
-                            continue;
-                        }
-                        let frac = (src_frame - idx0 as f64) as f32;
-                        let sl = source.left[idx0] * (1.0 - frac) + source.left[idx0 + 1] * frac;
-                        let sr_val =
-                            source.right[idx0] * (1.0 - frac) + source.right[idx0 + 1] * frac;
-
-                        // Fade envelope
-                        let pos_in_clip = beat - clip.start_beat;
-                        let rem_in_clip = (clip.start_beat + clip.length_beats) - beat;
-                        let mut env = 1.0f32;
-                        if clip.fade_in_beats > 0.001 && pos_in_clip < clip.fade_in_beats {
-                            env *= (pos_in_clip / clip.fade_in_beats) as f32;
-                        }
-                        if clip.fade_out_beats > 0.001 && rem_in_clip < clip.fade_out_beats {
-                            env *= (rem_in_clip / clip.fade_out_beats) as f32;
-                        }
-
-                        tr.buf_l[i] += sl * clip_gain * env;
-                        tr.buf_r[i] += sr_val * clip_gain * env;
-                    }
-                }
-            }
-
-            // 2d. Process track insert chain
-            let mut max_gr = 0.0f32;
-            for insert in &mut tr.insert_instances {
-                insert.process_stereo_block(&mut tr.buf_l[..n], &mut tr.buf_r[..n]);
-                max_gr = max_gr.max(insert.last_gr_db);
-            }
-            tr.gr_db = max_gr;
-
-            // 2e. Apply track volume, pan / binaural spatializer
-            if !audible {
-                tr.buf_l[..n].fill(0.0);
-                tr.buf_r[..n].fill(0.0);
-                tr.peak_l *= 0.7;
-                tr.peak_r *= 0.7;
-                tr.rms_l *= 0.7;
-                tr.rms_r *= 0.7;
-                continue;
-            }
-
-            let gain = 10.0f32.powf(tr.snapshot.volume_db / 20.0);
-            if tr.snapshot.spatial_binaural || self.master_binaural_enabled {
-                let mut sp_l = vec![0.0f32; n];
-                let mut sp_r = vec![0.0f32; n];
-                let params = SourceParams {
-                    position: RoomPosition::new(
-                        tr.snapshot.spatial_x,
-                        tr.snapshot.spatial_y,
-                        tr.snapshot.spatial_z,
-                    ),
-                    spread: 0.15,
-                    width: 0.85,
-                    lfe: 0.0,
-                };
-                tr.binaural_source.process(
-                    &tr.buf_l[..n],
-                    &tr.buf_r[..n],
-                    &params,
-                    &self.room_settings,
-                    &mut sp_l,
-                    &mut sp_r,
-                );
-                for i in 0..n {
-                    tr.buf_l[i] = sp_l[i] * gain;
-                    tr.buf_r[i] = sp_r[i] * gain;
-                }
-            } else {
-                let angle = (tr.snapshot.pan.clamp(-1.0, 1.0) + 1.0) * std::f32::consts::FRAC_PI_4;
-                let gl = angle.cos() * gain;
-                let gr = angle.sin() * gain;
-                for i in 0..n {
-                    tr.buf_l[i] *= gl;
-                    tr.buf_r[i] *= gr;
-                }
-            }
-
-            // Compute track meters
-            update_track_meters(tr, n);
-
-            // 2f. Route sends to buses
-            for send in &tr.snapshot.sends {
-                if !send.enabled {
+                // 2e. Apply track volume, pan / binaural spatializer
+                if !audible {
+                    tr.buf_l[..n].fill(0.0);
+                    tr.buf_r[..n].fill(0.0);
+                    tr.peak_l *= 0.7;
+                    tr.peak_r *= 0.7;
+                    tr.rms_l *= 0.7;
+                    tr.rms_r *= 0.7;
                     continue;
                 }
-                if let Some((bl, br)) = bus_accum.get_mut(&send.target_bus_id) {
-                    let sg = 10.0f32.powf(send.level_db / 20.0);
+
+                let gain = 10.0f32.powf(tr.snapshot.volume_db / 20.0);
+                if tr.snapshot.spatial_binaural || self.master_binaural_enabled {
+                    tr.spatial_scratch_l[..n].fill(0.0);
+                    tr.spatial_scratch_r[..n].fill(0.0);
+                    let params = SourceParams {
+                        position: RoomPosition::new(
+                            tr.snapshot.spatial_x,
+                            tr.snapshot.spatial_y,
+                            tr.snapshot.spatial_z,
+                        ),
+                        spread: 0.15,
+                        width: 0.85,
+                        lfe: 0.0,
+                    };
+                    tr.binaural_source.process(
+                        &tr.buf_l[..n],
+                        &tr.buf_r[..n],
+                        &params,
+                        &self.room_settings,
+                        &mut tr.spatial_scratch_l[..n],
+                        &mut tr.spatial_scratch_r[..n],
+                    );
                     for i in 0..n {
-                        bl[i] += tr.buf_l[i] * sg;
-                        br[i] += tr.buf_r[i] * sg;
+                        tr.buf_l[i] = tr.spatial_scratch_l[i] * gain;
+                        tr.buf_r[i] = tr.spatial_scratch_r[i] * gain;
+                    }
+                } else {
+                    let angle =
+                        (tr.snapshot.pan.clamp(-1.0, 1.0) + 1.0) * std::f32::consts::FRAC_PI_4;
+                    let gl = angle.cos() * gain;
+                    let gr = angle.sin() * gain;
+                    for i in 0..n {
+                        tr.buf_l[i] *= gl;
+                        tr.buf_r[i] *= gr;
+                    }
+                }
+
+                // Compute track meters
+                update_track_meters(tr, n);
+            }
+
+            // 2f. Route sends directly into target Bus track buffers without heap allocation
+            let send_count = self.tracks[track_idx].snapshot.sends.len();
+            for send_idx in 0..send_count {
+                let (enabled, level_db) = {
+                    let send = &self.tracks[track_idx].snapshot.sends[send_idx];
+                    (send.enabled, send.level_db)
+                };
+                if !enabled {
+                    continue;
+                }
+                let target_bus_idx = {
+                    let target_id = &self.tracks[track_idx].snapshot.sends[send_idx].target_bus_id;
+                    self.tracks.iter().position(|t| {
+                        t.snapshot.kind == TrackKind::Bus && &t.snapshot.id == target_id
+                    })
+                };
+                if let Some(bus_idx) = target_bus_idx {
+                    if let Some((src_tr, bus_tr)) =
+                        get_two_mut(&mut self.tracks, track_idx, bus_idx)
+                    {
+                        let sg = 10.0f32.powf(level_db / 20.0);
+                        for i in 0..n {
+                            bus_tr.buf_l[i] += src_tr.buf_l[i] * sg;
+                            bus_tr.buf_r[i] += src_tr.buf_r[i] * sg;
+                        }
                     }
                 }
             }
         }
 
-        // 3. Render Bus tracks
+        // 3. Render Bus tracks (their buf_l / buf_r already hold accumulated sends)
         for tr in &mut self.tracks {
             if tr.snapshot.kind != TrackKind::Bus {
                 continue;
             }
             let audible = !tr.snapshot.muted && (!any_solo || tr.snapshot.soloed);
-            if let Some((bl, br)) = bus_accum.get(&tr.snapshot.id) {
-                tr.buf_l[..n].copy_from_slice(&bl[..n]);
-                tr.buf_r[..n].copy_from_slice(&br[..n]);
-            }
             let mut max_gr = 0.0f32;
             for insert in &mut tr.insert_instances {
                 insert.process_stereo_block(&mut tr.buf_l[..n], &mut tr.buf_r[..n]);
@@ -2020,10 +2303,6 @@ impl StudioMobileEngine {
         }
 
         // 4. Sum all audible tracks into Master Bus
-        if self.master_track.buf_l.len() < n {
-            self.master_track.buf_l.resize(n, 0.0);
-            self.master_track.buf_r.resize(n, 0.0);
-        }
         self.master_track.buf_l[..n].fill(0.0);
         self.master_track.buf_r[..n].fill(0.0);
 
@@ -2085,9 +2364,6 @@ impl StudioMobileEngine {
         update_track_meters(&mut self.master_track, n);
 
         // 7. Feed Spectrum Analyzer + EBU R128 + write output
-        if self.interleaved_meter_scratch.len() < n * 2 {
-            self.interleaved_meter_scratch.resize(n * 2, 0.0);
-        }
         for i in 0..n {
             let l = self.master_track.buf_l[i];
             let r = self.master_track.buf_r[i];
@@ -2096,10 +2372,8 @@ impl StudioMobileEngine {
             self.interleaved_meter_scratch[i * 2] = l;
             self.interleaved_meter_scratch[i * 2 + 1] = r;
         }
-        self.spectrum.push_block(
-            &self.master_track.buf_l[..n],
-            &self.master_track.buf_r[..n],
-        );
+        self.spectrum
+            .push_block(&self.master_track.buf_l[..n], &self.master_track.buf_r[..n]);
         let _ = self.spectrum.analyze();
         self.spectrum_bins_cache = *self.spectrum.levels();
         if let Some(ebu) = &mut self.ebur128 {
@@ -2170,10 +2444,7 @@ impl StudioMobileEngine {
                     }?;
                     match slot {
                         None => tr.instrument_instance.as_ref().map(|i| i.meter_snapshot()),
-                        Some(idx) => tr
-                            .insert_instances
-                            .get(*idx)
-                            .map(|i| i.meter_snapshot()),
+                        Some(idx) => tr.insert_instances.get(*idx).map(|i| i.meter_snapshot()),
                     }
                 });
 
@@ -2232,6 +2503,20 @@ impl StudioMobileEngine {
         let wav_bytes = audio_io::encode_stereo_wav_i16(&left, &right, self.sample_rate);
         std::fs::write(Path::new(output_path), wav_bytes)
             .map_err(|e| format!("Failed to write WAV '{}': {e}", output_path))
+    }
+}
+
+#[inline]
+fn get_two_mut<T>(slice: &mut [T], a: usize, b: usize) -> Option<(&mut T, &mut T)> {
+    if a == b || a >= slice.len() || b >= slice.len() {
+        return None;
+    }
+    if a < b {
+        let (left, right) = slice.split_at_mut(b);
+        Some((&mut left[a], &mut right[0]))
+    } else {
+        let (left, right) = slice.split_at_mut(a);
+        Some((&mut right[0], &mut left[b]))
     }
 }
 
