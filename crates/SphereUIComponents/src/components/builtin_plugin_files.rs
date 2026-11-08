@@ -95,6 +95,22 @@ pub fn ensure_plugin_dirs(root: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Windows opens `CON`, `NUL`, `AUX`, `PRN`, `COM1`–`COM9` and `LPT1`–`LPT9`
+/// as devices even when a file extension follows the name (`COM1.nam`).
+fn is_windows_device_name(name: &str) -> bool {
+    let stem = name.split_once('.').map(|(stem, _)| stem).unwrap_or(name);
+    let stem = stem.trim_end_matches([' ', '.']);
+    if stem.is_empty() {
+        return false;
+    }
+    let upper = stem.to_ascii_uppercase();
+    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (upper.len() == 4
+            && (upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.as_bytes()[3].is_ascii_digit()
+            && upper.as_bytes()[3] != b'0')
+}
+
 /// Sandbox gate: accept only a bare leaf name with a whitelisted extension.
 /// Returns the cleaned name, or `None` for anything that could escape the
 /// kind directory or produce hidden/garbage files.
@@ -110,6 +126,9 @@ pub fn sanitize_file_name(kind: BuiltinFileKind, name: &str) -> Option<String> {
         return None;
     }
     let lower = name.to_ascii_lowercase();
+    if is_windows_device_name(&lower) {
+        return None;
+    }
     let has_allowed_ext = kind
         .allowed_exts()
         .iter()
@@ -240,6 +259,16 @@ mod tests {
         assert_eq!(sanitize_file_name(Nams, "amp.json"), None);
         assert_eq!(sanitize_file_name(Irs, "cab.nam"), None);
         assert_eq!(sanitize_file_name(Presets, "x.wav"), None);
+        // Windows device names, including with an allowed extension.
+        assert_eq!(sanitize_file_name(Nams, "CON.nam"), None);
+        assert_eq!(sanitize_file_name(Irs, "NUL.wav"), None);
+        assert_eq!(sanitize_file_name(Nams, "AUX.nam"), None);
+        assert_eq!(sanitize_file_name(Nams, "COM1.nam"), None);
+        assert_eq!(sanitize_file_name(Irs, "lpt1.wav"), None);
+        assert_eq!(
+            sanitize_file_name(Nams, "concert.nam"),
+            Some("concert.nam".into())
+        );
     }
 
     #[test]

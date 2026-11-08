@@ -208,7 +208,14 @@ fn plan_capture(
             rejected(insert_id, RodhareistFile::Capture, &name);
             None
         }
-        Some(name) if control.nam_loaded.as_deref() == Some(name.as_str()) => None,
+        // The capture that is already running matches this state, so there is
+        // nothing to build. Bump anyway: an older build of a different file
+        // is still in flight, and its generation would otherwise stay current
+        // and replace this one when it finished.
+        Some(name) if control.nam_loaded.as_deref() == Some(name.as_str()) => {
+            bump(&mut control.nam_generation);
+            None
+        }
         Some(name) => Some(Ticket {
             generation: bump(&mut control.nam_generation),
             epoch: shared.control_epoch(),
@@ -239,7 +246,10 @@ fn plan_impulse(
             rejected(insert_id, RodhareistFile::Impulse, &name);
             None
         }
-        Some(name) if control.ir_loaded.as_deref() == Some(name.as_str()) => None,
+        Some(name) if control.ir_loaded.as_deref() == Some(name.as_str()) => {
+            bump(&mut control.ir_generation);
+            None
+        }
         Some(name) => Some(Ticket {
             generation: bump(&mut control.ir_generation),
             epoch: shared.control_epoch(),
@@ -263,6 +273,9 @@ fn load_named_capture(shared: &Shared, params: &RodhareistParams, insert_id: &st
         ),
         Err(error) => {
             if still_current(shared, true, &ticket) {
+                // The name is what the state asked for, and the file is not
+                // usable. Drop the capture that was playing under the old name.
+                release_nam(shared, &ticket);
                 failed(insert_id, RodhareistFile::Capture, &ticket.name, &error);
                 shared.answered(true);
             }
@@ -285,6 +298,7 @@ fn load_named_impulse(shared: &Shared, params: &RodhareistParams, insert_id: &st
         }
         Err(error) => {
             if still_current(shared, false, &ticket) {
+                release_ir(shared, &ticket);
                 failed(insert_id, RodhareistFile::Impulse, &ticket.name, &error);
                 shared.answered(false);
             }
@@ -325,7 +339,10 @@ fn publish_capture(
             }
             Err(error) => {
                 let message = error.to_string();
+                control.nam_loaded = None;
+                let pending = control.nam.unload();
                 drop(guard);
+                drop(pending);
                 record_err(insert_id, RodhareistFile::Capture, name, message);
                 return;
             }
@@ -364,7 +381,10 @@ fn publish_impulse(
             }
             Err(error) => {
                 let message = error.to_string();
+                control.ir_loaded = None;
+                let pending = control.ir.unload();
                 drop(guard);
+                drop(pending);
                 record_err(insert_id, RodhareistFile::Impulse, name, message);
                 return;
             }
@@ -373,6 +393,42 @@ fn publish_impulse(
     let (replaced, frames) = replaced;
     drop(replaced);
     record_ok(insert_id, RodhareistFile::Impulse, name, frames as u64);
+}
+
+fn release_nam(shared: &Shared, ticket: &Ticket) {
+    let pending = {
+        let mut guard = shared
+            .control
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let Some(control) = guard.as_mut() else {
+            return;
+        };
+        if !owns(shared, control.nam_generation, ticket) {
+            return;
+        }
+        control.nam_loaded = None;
+        control.nam.unload()
+    };
+    drop(pending);
+}
+
+fn release_ir(shared: &Shared, ticket: &Ticket) {
+    let pending = {
+        let mut guard = shared
+            .control
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let Some(control) = guard.as_mut() else {
+            return;
+        };
+        if !owns(shared, control.ir_generation, ticket) {
+            return;
+        }
+        control.ir_loaded = None;
+        control.ir.unload()
+    };
+    drop(pending);
 }
 
 fn owns(shared: &Shared, generation: u64, ticket: &Ticket) -> bool {
@@ -423,6 +479,7 @@ mod tests {
     #[test]
     fn session_file_names_stay_inside_the_library() {
         assert!(library_file(BuiltinFileKind::Nams, "amp.nam").is_some());
+        assert!(library_file(BuiltinFileKind::Nams, "concert.nam").is_some());
         assert!(library_file(BuiltinFileKind::Irs, "cab.wav").is_some());
         assert!(library_file(BuiltinFileKind::Irs, "room.aiff").is_some());
         for bad in [
@@ -436,11 +493,126 @@ mod tests {
             "not-a-nam.txt",
             "",
             " .nam",
+            "CON.nam",
+            "NUL.wav",
+            "AUX.nam",
+            "COM1.nam",
+            "lpt1.wav",
         ] {
             assert!(
                 library_file(BuiltinFileKind::Nams, bad).is_none(),
                 "{bad} was accepted"
             );
         }
+    }
+
+    const TINY_NAM: &str = r#"{
+        "version": "0.5.4", "architecture": "WaveNet",
+        "config": { "layers": [{
+            "input_size": 1, "condition_size": 1, "channels": 1, "head_size": 1,
+            "kernel_size": 1, "dilations": [1], "activation": "ReLU",
+            "gated": false, "head_bias": false
+        }], "head": null, "head_scale": 1.0 },
+        "weights": [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0],
+        "sample_rate": 48000.0
+    }"#;
+
+    fn running_dsp(nam_loaded: Option<&str>, generation: u64) -> (rodharerist::Dsp, Arc<Shared>) {
+        let dsp = rodharerist::Dsp::new(48_000.0);
+        let shared = Arc::new(Shared::default());
+        {
+            let mut guard = shared.control.lock().unwrap();
+            *guard = Some(ControlSide {
+                nam: dsp.nam_loader(),
+                ir: dsp.ir_loader(),
+                sample_rate: 48_000.0,
+                nam_loaded: nam_loaded.map(str::to_string),
+                ir_loaded: None,
+                nam_generation: generation,
+                ir_generation: 0,
+            });
+        }
+        (dsp, shared)
+    }
+
+    #[test]
+    fn restoring_the_loaded_capture_cancels_an_older_build() {
+        let (dsp, shared) = running_dsp(Some("amp.nam"), 5);
+        let params = Arc::new(crate::params::RodhareistParams::default());
+        params.set_nam_file(Some("amp.nam".into()));
+        restore(&shared, &params, "insert");
+        let guard = shared.control.lock().unwrap();
+        let control = guard.as_ref().unwrap();
+        assert!(
+            control.nam_generation > 5,
+            "an in-flight build of another capture must lose its generation"
+        );
+        assert_eq!(control.nam_loaded.as_deref(), Some("amp.nam"));
+        drop(guard);
+        drop(dsp);
+    }
+
+    #[test]
+    fn a_missing_or_corrupt_capture_unloads_the_previous_one() {
+        let (mut dsp, shared) = running_dsp(Some("old.nam"), 2);
+        let params = Arc::new(crate::params::RodhareistParams::default());
+        dsp.nam_loader()
+            .load_json(TINY_NAM, "old.nam", 48_000.0, false, false)
+            .expect("load");
+        dsp.begin_block_with_frames(64);
+        assert!(dsp.nam_capture_info().is_some());
+
+        let ticket = Ticket {
+            name: "gone.nam".into(),
+            generation: 2,
+            epoch: shared.control_epoch(),
+            sample_rate: 48_000.0,
+        };
+        load_named_capture(&shared, &params, "insert", ticket);
+        dsp.begin_block_with_frames(64);
+        assert!(
+            dsp.nam_capture_info().is_none(),
+            "a missing file must take the capture out of the running slot"
+        );
+        assert!(shared
+            .control
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .nam_loaded
+            .is_none());
+
+        // A separate instance: the fade from the unload above is the DSP's
+        // job, covered by the capture tests. This checks the parse failure.
+        let (mut dsp, shared) = running_dsp(Some("old.nam"), 3);
+        let params = Arc::new(crate::params::RodhareistParams::default());
+        dsp.nam_loader()
+            .load_json(TINY_NAM, "old.nam", 48_000.0, false, false)
+            .expect("load");
+        dsp.begin_block_with_frames(64);
+        assert!(dsp.nam_capture_info().is_some());
+        let broken =
+            rodharerist::prepare_nam_runtime("{", "broken.nam".into(), 48_000.0, false, false);
+        let ticket = Ticket {
+            name: "broken.nam".into(),
+            generation: 3,
+            epoch: shared.control_epoch(),
+            sample_rate: 48_000.0,
+        };
+        publish_capture(&shared, &params, "insert", "broken.nam", broken, &ticket);
+        dsp.begin_block_with_frames(64);
+        assert!(
+            dsp.nam_capture_info().is_none(),
+            "a capture that fails to parse must leave the running slot"
+        );
+        assert!(shared
+            .control
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .nam_loaded
+            .is_none());
     }
 }
