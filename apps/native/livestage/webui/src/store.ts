@@ -389,28 +389,39 @@ function receive(message: ServerMessage) {
 
 // ── Users, login and lock (Phase 4) ─────────────────────────────────────
 
-const TOKEN_KEY = 'livestage.token'
+/** Where an older build kept every token, a login's among them: cleared, so
+ *  none lingers there. */
+const OLD_TOKEN_KEY = 'livestage.token'
+/** An open-mode lock's token. It logs nobody in (and lets no page past the
+ *  setup code); it only puts a page back under its lock, which takes the
+ *  lock's PIN to undo. Kept on the device, so a reload stays locked. */
+const LOCK_KEY = 'livestage.lock'
 
-/** The token this device keeps for `resume` (a login, or an open-mode lock). */
-function savedToken(): string | null {
+function savedLock(): string | null {
   try {
-    return localStorage.getItem(TOKEN_KEY)
+    localStorage.removeItem(OLD_TOKEN_KEY)
+    return localStorage.getItem(LOCK_KEY)
   } catch {
     return null
   }
 }
 
-let memoryToken: string | null = savedToken()
+/** The token this page sends with `resume` when its socket reconnects (a
+ *  login, or an open-mode lock). A login's is held in memory only, never in
+ *  web storage where any script on the page could read it: a reload asks
+ *  for the PIN again. */
+let memoryToken: string | null = savedLock()
 
 /** Keep (or forget, with null) the token sent with `resume` on every
- *  (re)connect. Blocked storage: it lasts until the page reloads. */
-export function keepToken(token: string | null) {
+ *  reconnect. `openLock`: it is an open-mode lock's (see `LOCK_KEY`), also
+ *  kept for after a reload; anything else lasts until the page reloads. */
+export function keepToken(token: string | null, openLock = false) {
   memoryToken = token
   try {
-    if (token) localStorage.setItem(TOKEN_KEY, token)
-    else localStorage.removeItem(TOKEN_KEY)
+    if (token && openLock) localStorage.setItem(LOCK_KEY, token)
+    else localStorage.removeItem(LOCK_KEY)
   } catch {
-    // Blocked storage: kept in memory only.
+    // Blocked storage: a lock lasts until the page reloads.
   }
 }
 
@@ -499,8 +510,9 @@ export async function logout() {
 export async function lock(pin?: string): Promise<string | null> {
   const reply = await request(pin === undefined ? { cmd: 'lock' } : { cmd: 'lock', pin })
   if (!reply.ok) return explain(reply.error)
-  // Open mode issues a token, so a reload stays locked after `resume`.
-  if (typeof reply.token === 'string') keepToken(reply.token)
+  // Open mode issues a token, so a reconnect or a reload stays locked after
+  // `resume`. Users mode answers with the login's own token: memory only.
+  if (typeof reply.token === 'string') keepToken(reply.token, state.auth?.mode !== 'users')
   return null
 }
 

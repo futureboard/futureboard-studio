@@ -19,12 +19,14 @@
 //! Who gets a connection slot is decided on the accept thread, before a
 //! byte is read: each address's rate of new connections ([`Arrivals`]),
 //! then the slot table ([`Slots`]). A connection that never logs in is
-//! closed at its deadline, and may be closed earlier to make room, but only
-//! once past its [`LOGIN_GRACE`]; one let in never is.
+//! closed at its deadline, and may be closed earlier to make room: once past
+//! its [`LOGIN_GRACE`], or at once when its address holds another connection
+//! that grace protects (one per address); one let in never is. An address is
+//! an IPv4 address, or an IPv6 `/64` (see [`peer_key`]).
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{Sender, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -70,11 +72,13 @@ const POLL: Duration = Duration::from_millis(8);
 /// The longest request head taken.
 const MAX_HEAD: usize = 16 * 1024;
 /// Connections served at once. When all are taken, a new one makes room by
-/// closing one that was never let in and is past its [`LOGIN_GRACE`] (see
-/// [`Slots::open`]); with none of those, it is turned away.
+/// closing one that was never let in and that grace no longer protects (see
+/// [`Slots::make_room`]); with none of those, it is turned away.
 const MAX_CONNECTIONS: usize = 64;
-/// Connections from one address at once (this machine's own excepted), so
-/// one client cannot take every slot.
+/// Connections never let in from one address at once (this machine's own
+/// excepted), so one client cannot take every slot. Those let in are not
+/// counted: devices logged in behind one address (or on one IPv6 `/64`)
+/// are not turned away.
 const MAX_PER_PEER: usize = 16;
 /// How long a connection may take to send its whole request head. A read
 /// timeout alone is per read: a client sending a byte at a time would keep
@@ -91,6 +95,12 @@ const LOGIN_DEADLINE: Duration = Duration::from_secs(120);
 /// never log in turns over four times as fast as they would time out. A page
 /// whose connection is closed after it reconnects within a second, keeping
 /// what was typed, and gets a new window.
+///
+/// One window per address, not per connection: grace protects one of an
+/// address's connections at a time, and a connection from an address that
+/// has been waiting already (open, or closed within the last window without
+/// being let in) continues that wait rather than starting a new one. So
+/// neither holding many connections nor reopening one keeps a slot.
 const LOGIN_GRACE: Duration = Duration::from_secs(30);
 /// New connections one address may open in a burst: a page load (the page,
 /// its script and style, the icon, the socket) takes five, so a few reloads
@@ -167,18 +177,31 @@ struct AdmissionState {
     /// Since when it has been waiting to be let in. Locked while the state
     /// leaves [`ADMITTED`] for [`WAITING`] and while an eviction decides, so
     /// an eviction never reads a stale time for a client just shut out.
-    waiting_since: Mutex<Instant>,
+    waiting_since: Mutex<Waiting>,
+}
+
+/// A connection's wait, on two clocks.
+#[derive(Clone, Copy)]
+struct Waiting {
+    /// Its own wait, for [`LOGIN_DEADLINE`].
+    since: Instant,
+    /// Where its [`LOGIN_GRACE`] counts from: `since`, or earlier when its
+    /// address had been waiting already (see [`Slots::open`]).
+    grace: Instant,
 }
 
 impl Admission {
     fn new(now: Instant) -> Self {
         Self(Arc::new(AdmissionState {
             state: AtomicU8::new(WAITING),
-            waiting_since: Mutex::new(now),
+            waiting_since: Mutex::new(Waiting {
+                since: now,
+                grace: now,
+            }),
         }))
     }
 
-    fn since(&self) -> std::sync::MutexGuard<'_, Instant> {
+    fn since(&self) -> std::sync::MutexGuard<'_, Waiting> {
         self.0
             .waiting_since
             .lock()
@@ -209,7 +232,11 @@ impl Admission {
             .compare_exchange(ADMITTED, WAITING, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            *since = Instant::now();
+            let now = Instant::now();
+            *since = Waiting {
+                since: now,
+                grace: now,
+            };
         }
     }
 
@@ -217,18 +244,26 @@ impl Admission {
         self.state() == WAITING
     }
 
-    /// Since when it has waited, if it may be evicted at `now`: never let
-    /// in, and past its [`LOGIN_GRACE`].
-    fn stale_since(&self, now: Instant) -> Option<Instant> {
-        let since = *self.since();
-        (self.waiting() && now.saturating_duration_since(since) >= LOGIN_GRACE).then_some(since)
+    /// Where its [`LOGIN_GRACE`] counts from, while it waits to be let in.
+    fn grace_since(&self) -> Option<Instant> {
+        let grace = self.since().grace;
+        self.waiting().then_some(grace)
     }
 
-    /// Mark it evicted if it still may be (see [`Self::stale_since`]):
-    /// `false` when it was let in, or shut out again, meanwhile.
-    fn evict(&self, now: Instant) -> bool {
+    /// Count its [`LOGIN_GRACE`] from `earlier`, if that is earlier: its
+    /// address was waiting already.
+    fn continue_grace(&self, earlier: Instant) {
+        let mut since = self.since();
+        since.grace = since.grace.min(earlier);
+    }
+
+    /// Mark it evicted if it still may be: `false` when it was let in, or
+    /// shut out again (a new grace), meanwhile. `unprotected`: its address
+    /// holds another connection that grace protects, so its own grace does
+    /// not count.
+    fn evict(&self, now: Instant, unprotected: bool) -> bool {
         let since = self.since();
-        if now.saturating_duration_since(*since) < LOGIN_GRACE {
+        if !unprotected && now.saturating_duration_since(since.grace) < LOGIN_GRACE {
             return false;
         }
         self.0
@@ -242,15 +277,34 @@ impl Admission {
         match self.state() {
             EVICTED => true,
             ADMITTED => false,
-            _ => now.saturating_duration_since(*self.since()) >= LOGIN_DEADLINE,
+            _ => now.saturating_duration_since(self.since().since) >= LOGIN_DEADLINE,
         }
     }
+}
+
+/// The address limits count by: an IPv4-mapped address is its IPv4
+/// address, and an IPv6 address (but loopback) its `/64`, which one machine
+/// can fill with as many addresses as it likes.
+fn peer_key(peer: IpAddr) -> IpAddr {
+    match peer.to_canonical() {
+        IpAddr::V6(v6) if !v6.is_loopback() => {
+            let [a, b, c, d, ..] = v6.segments();
+            IpAddr::V6(Ipv6Addr::new(a, b, c, d, 0, 0, 0, 0))
+        }
+        other => other,
+    }
+}
+
+/// An address held to one [`LOGIN_GRACE`] (see [`Slots`]): known, and not
+/// this machine (a browser here, or a proxy in front, which many share).
+fn grouped(peer: Option<IpAddr>) -> Option<IpAddr> {
+    peer.filter(|p| !p.is_loopback())
 }
 
 /// One open connection, as the slot table keeps it.
 struct Slot {
     id: ClientId,
-    /// Canonical form; `None` when the address could not be read.
+    /// As [`peer_key`] gives it; `None` when the address could not be read.
     peer: Option<IpAddr>,
     admission: Admission,
     /// To close it from the accept thread when it is evicted.
@@ -261,6 +315,19 @@ struct Slot {
 #[derive(Default)]
 struct Slots {
     open: Vec<Slot>,
+    /// Addresses whose connections closed without being let in, within the
+    /// last [`LOGIN_GRACE`]: a new connection from one continues their wait
+    /// (see [`Self::open`]). At most [`MAX_TRACKED_ADDRESSES`].
+    closed: HashMap<IpAddr, Closed>,
+}
+
+/// An address's connections that closed without being let in.
+#[derive(Clone, Copy)]
+struct Closed {
+    /// The earliest grace among them.
+    grace: Instant,
+    /// When the last one closed.
+    at: Instant,
 }
 
 type SharedSlots = Arc<Mutex<Slots>>;
@@ -268,8 +335,12 @@ type SharedSlots = Arc<Mutex<Slots>>;
 impl Slots {
     /// Take a slot for connection `id` from `peer`; `false` when there is no
     /// room. A peer other than this machine (a browser here, or a proxy in
-    /// front, is never limited this way) holds at most [`MAX_PER_PEER`].
-    /// When every slot is taken, room is made as [`Self::make_room`] says.
+    /// front, is never limited this way) holds at most [`MAX_PER_PEER`]
+    /// never let in. Its new connection continues the wait of those it
+    /// holds, or closed within the last [`LOGIN_GRACE`], rather than
+    /// starting a grace of its own: reopening a connection, or replacing an
+    /// old one with it, never keeps a slot safe. When every slot is taken,
+    /// room is made as [`Self::make_room`] says.
     fn open(
         &mut self,
         id: ClientId,
@@ -278,11 +349,30 @@ impl Slots {
         admission: Admission,
         stream: Option<TcpStream>,
     ) -> bool {
-        let peer = peer.map(|p| p.to_canonical());
-        if let Some(peer) = peer.filter(|p| !p.is_loopback()) {
-            let held = self.open.iter().filter(|s| s.peer == Some(peer)).count();
+        let peer = peer.map(peer_key);
+        if let Some(key) = grouped(peer) {
+            let held = self
+                .open
+                .iter()
+                .filter(|s| s.peer == Some(key) && s.admission.waiting())
+                .count();
             if held >= MAX_PER_PEER {
                 return false;
+            }
+            let closed = self
+                .closed
+                .get(&key)
+                .filter(|c| now.saturating_duration_since(c.at) < LOGIN_GRACE)
+                .map(|c| c.grace);
+            let earliest = self
+                .open
+                .iter()
+                .filter(|s| s.peer == Some(key))
+                .filter_map(|s| s.admission.grace_since())
+                .chain(closed)
+                .min();
+            if let Some(earliest) = earliest {
+                admission.continue_grace(earliest);
             }
         }
         if self.open.len() >= MAX_CONNECTIONS && !self.make_room(peer, now) {
@@ -297,43 +387,73 @@ impl Slots {
         true
     }
 
-    /// Close one connection to make room for a new one from `peer`; `false`
-    /// when none may be closed, and the new one is turned away instead.
+    /// Close one connection to make room for a new one from `peer` (as
+    /// [`peer_key`] gives it); `false` when none may be closed, and the new
+    /// one is turned away instead.
     ///
     /// - Never one let in (logged in, or past the setup code).
-    /// - Never one inside its [`LOGIN_GRACE`]: a fresh connection, an
-    ///   operator's about to log in among them, cannot be pushed out however
-    ///   many connections arrive. A pool full of those turns newcomers away.
+    /// - Never one inside its [`LOGIN_GRACE`] that is the only one its
+    ///   address has there (its longest waiting, when it has more): a fresh
+    ///   connection, an operator's about to log in among them, cannot be
+    ///   pushed out however many connections arrive. An address's others
+    ///   are not protected, so a few addresses holding many connections
+    ///   cannot keep the pool full: only as many addresses as there are
+    ///   slots, each holding one, turn newcomers away.
     /// - When `peer` itself holds connections past their grace, its own
     ///   longest waiting is the one replaced: reconnecting from one address
     ///   never pushes out somebody else's.
     /// - Otherwise, from the address with the most connections never let
     ///   in, its longest waiting: a few addresses holding many lose theirs
     ///   before one holding a single connection does.
+    ///
+    /// Somebody else's connection closed here gets a new grace when its page
+    /// reconnects: what its address had closed before is forgotten.
     fn make_room(&mut self, peer: Option<IpAddr>, now: Instant) -> bool {
+        let in_grace = |grace: Instant| now.saturating_duration_since(grace) < LOGIN_GRACE;
         let mut waiting: HashMap<Option<IpAddr>, usize> = HashMap::new();
-        for slot in self.open.iter().filter(|s| s.admission.waiting()) {
+        // Per grouped address, the one connection grace protects.
+        let mut protected: HashMap<IpAddr, (Instant, ClientId)> = HashMap::new();
+        for slot in &self.open {
+            let Some(grace) = slot.admission.grace_since() else {
+                continue;
+            };
             *waiting.entry(slot.peer).or_insert(0) += 1;
+            if let Some(key) = grouped(slot.peer).filter(|_| in_grace(grace)) {
+                let first = protected.entry(key).or_insert((grace, slot.id));
+                *first = (*first).min((grace, slot.id));
+            }
         }
-        // (index, own, held by its address, waiting since)
-        let mut stale: Vec<(usize, bool, usize, Instant)> = self
+        // (index, own and past its grace, held by its address, grace since,
+        // unprotected)
+        let mut candidates: Vec<(usize, bool, usize, Instant, bool)> = self
             .open
             .iter()
             .enumerate()
             .filter_map(|(i, slot)| {
-                let since = slot.admission.stale_since(now)?;
+                let grace = slot.admission.grace_since()?;
+                let unprotected = in_grace(grace)
+                    && grouped(slot.peer)
+                        .and_then(|key| protected.get(&key))
+                        .is_some_and(|&(_, first)| first != slot.id);
+                if in_grace(grace) && !unprotected {
+                    return None;
+                }
+                let own_stale = !unprotected && slot.peer == peer;
                 let held = waiting.get(&slot.peer).copied().unwrap_or(0);
-                Some((i, slot.peer == peer, held, since))
+                Some((i, own_stale, held, grace, unprotected))
             })
             .collect();
-        if stale.iter().any(|&(_, own, _, _)| own) {
-            stale.retain(|&(_, own, _, _)| own);
+        if candidates.iter().any(|&(_, own, ..)| own) {
+            candidates.retain(|&(_, own, ..)| own);
         }
-        stale.sort_by(|a, b| b.2.cmp(&a.2).then(a.3.cmp(&b.3)));
+        candidates.sort_by(|a, b| b.2.cmp(&a.2).then(a.3.cmp(&b.3)));
         // In order: one let in since the list was made is skipped.
-        for (i, _, _, _) in stale {
-            if self.open[i].admission.evict(now) {
+        for (i, _, _, _, unprotected) in candidates {
+            if self.open[i].admission.evict(now, unprotected) {
                 let slot = self.open.swap_remove(i);
+                if let Some(key) = grouped(slot.peer).filter(|_| slot.peer != peer) {
+                    self.closed.remove(&key);
+                }
                 if let Some(stream) = &slot.stream {
                     let _ = stream.shutdown(Shutdown::Both);
                 }
@@ -343,8 +463,37 @@ impl Slots {
         false
     }
 
-    fn close(&mut self, id: ClientId) {
-        self.open.retain(|slot| slot.id != id);
+    /// Connection `id` ended at `now`. One never let in is remembered for
+    /// its address (see [`Self::open`]).
+    fn close(&mut self, id: ClientId, now: Instant) {
+        let Some(at) = self.open.iter().position(|slot| slot.id == id) else {
+            return;
+        };
+        let slot = self.open.swap_remove(at);
+        let (Some(key), Some(grace)) = (grouped(slot.peer), slot.admission.grace_since()) else {
+            return;
+        };
+        let fresh = |c: &Closed| now.saturating_duration_since(c.at) < LOGIN_GRACE;
+        if !self.closed.contains_key(&key) && self.closed.len() >= MAX_TRACKED_ADDRESSES {
+            self.closed.retain(|_, c| fresh(c));
+            if self.closed.len() >= MAX_TRACKED_ADDRESSES {
+                let oldest = self
+                    .closed
+                    .iter()
+                    .min_by_key(|(_, c)| c.at)
+                    .map(|(k, _)| *k);
+                if let Some(oldest) = oldest {
+                    self.closed.remove(&oldest);
+                }
+            }
+        }
+        let entry = self.closed.entry(key).or_insert(Closed { grace, at: now });
+        if fresh(entry) {
+            entry.grace = entry.grace.min(grace);
+            entry.at = entry.at.max(now);
+        } else {
+            *entry = Closed { grace, at: now };
+        }
     }
 }
 
@@ -372,7 +521,7 @@ impl Bucket {
 }
 
 impl Arrivals {
-    /// Count a new connection from `peer` (canonical); `false`: too many
+    /// Count a new connection from `peer` (see [`peer_key`]); `false`: too many
     /// lately, turn it away. A turned-away attempt counts too.
     fn allow(&mut self, peer: Option<IpAddr>, now: Instant) -> bool {
         if peer.is_some_and(|p| p.is_loopback()) {
@@ -436,7 +585,7 @@ fn admit(
     admission: Admission,
     stream: Option<TcpStream>,
 ) -> Arrival {
-    let peer = peer.map(|p| p.to_canonical());
+    let peer = peer.map(peer_key);
     if !arrivals.allow(peer, now) {
         return Arrival::TooFast;
     }
@@ -499,11 +648,17 @@ pub fn serve(
                         let slots = slots.clone();
                         move || {
                             connection(stream, id, &inbound, &names, admission);
-                            slots.lock().unwrap_or_else(|e| e.into_inner()).close(id);
+                            slots
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .close(id, Instant::now());
                         }
                     });
                 if spawned.is_err() {
-                    slots.lock().unwrap_or_else(|e| e.into_inner()).close(id);
+                    slots
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .close(id, Instant::now());
                 }
             }
         })?;
@@ -740,10 +895,12 @@ fn serve_asset(stream: &mut TcpStream, request: &Request) -> io::Result<()> {
     let Some(asset) = ASSETS.resolve(&request.path) else {
         return respond(stream, 404, "Not Found", &[], b"not found");
     };
+    let csp = content_security_policy(request.header("host"));
     let etag = asset.etag.map(|tag| format!("\"{tag}\""));
     if let (Some(etag), Some(wanted)) = (&etag, request.header("if-none-match")) {
         if wanted == etag {
-            return respond(stream, 304, "Not Modified", &[("ETag", etag)], b"");
+            let headers = [("ETag", etag.as_str()), (CSP_HEADER, csp.as_str())];
+            return respond(stream, 304, "Not Modified", &headers, b"");
         }
     }
     // Vite names bundles by content: those never change under their name.
@@ -752,7 +909,11 @@ fn serve_asset(stream: &mut TcpStream, request: &Request) -> io::Result<()> {
     } else {
         "no-cache"
     };
-    let mut headers = vec![("Content-Type", asset.mime_type), ("Cache-Control", cache)];
+    let mut headers = vec![
+        ("Content-Type", asset.mime_type),
+        ("Cache-Control", cache),
+        (CSP_HEADER, csp.as_str()),
+    ];
     if let Some(etag) = &etag {
         headers.push(("ETag", etag));
     }
@@ -772,6 +933,38 @@ bun run --cwd apps/native/livestage/webui build\n\
 cargo build -p livestage --bin livestage-server</pre>\
 <p>The WebSocket at <code>/ws</code> works without it.</p></body>";
 
+const CSP_HEADER: &str = "Content-Security-Policy";
+
+/// What a page from this server may load and run: only this server's own
+/// script files (no inline script, no `eval`), so a script that ever got
+/// into the page some other way does not run; and never inside another
+/// site's frame, where a page could trick a click onto the mixer. Styles
+/// may be inline (the not-built page has some); pictures and fonts Vite
+/// inlined come as `data:`.
+const BASE_CSP: &str = "default-src 'self'; script-src 'self'; \
+style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; \
+object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+
+/// [`BASE_CSP`], and where the page may connect: this server, its
+/// WebSocket among it. `'self'` covers `ws:` only in newer browsers, so the
+/// socket's own address is named too when the request's `Host` is a plain
+/// `name:port` (it has passed [`host_allowed`] by then); anything else in
+/// it is left out rather than written into the policy.
+fn content_security_policy(host: Option<&str>) -> String {
+    let host = host.map(str::trim).filter(|h| {
+        !h.is_empty()
+            && h.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']'))
+    });
+    match host {
+        Some(host) => format!("{BASE_CSP}; connect-src 'self' ws://{host} wss://{host}"),
+        None => format!("{BASE_CSP}; connect-src 'self'"),
+    }
+}
+
+/// Writes the status line, `headers`, and the headers every answer
+/// carries; a [`CSP_HEADER`] among `headers` takes the place of the
+/// default one.
 fn write_head(
     stream: &mut TcpStream,
     code: u16,
@@ -783,11 +976,14 @@ fn write_head(
     for (name, value) in headers {
         head.push_str(&format!("{name}: {value}\r\n"));
     }
-    // Never inside another site's frame, where a page could trick a click
-    // onto the mixer.
+    if !headers.iter().any(|(name, _)| *name == CSP_HEADER) {
+        head.push_str(&format!(
+            "{CSP_HEADER}: {}\r\n",
+            content_security_policy(None)
+        ));
+    }
     head.push_str(
-        "X-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\n\
-         Content-Security-Policy: frame-ancestors 'none'\r\nConnection: close\r\n\r\n",
+        "X-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nConnection: close\r\n\r\n",
     );
     stream.write_all(head.as_bytes())
 }
@@ -1034,14 +1230,23 @@ mod tests {
         ));
         // This machine is never limited.
         fill(&mut slots, 200, MAX_PER_PEER + 1, "127.0.0.1", now);
-        slots.close(1);
+        slots.close(1, now);
         assert!(slots.open(102, Some(peer), now, Admission::new(now), None));
+        // Only those never let in count: devices logged in behind one
+        // address do not keep another from connecting.
+        let mut slots = Slots::default();
+        for admission in fill(&mut slots, 1, MAX_PER_PEER, "10.0.0.9", now) {
+            admission.set(true);
+        }
+        fill(&mut slots, 100, MAX_PER_PEER, "10.0.0.9", now);
+        assert!(!slots.open(200, Some(peer), now, Admission::new(now), None));
     }
 
-    /// Machines that connect and never log in fill every slot; once their
-    /// grace is over an operator still gets in, by closing the oldest
-    /// connection of the peer holding the most that were never let in — and
-    /// one let in is never closed.
+    /// Machines that connect and never log in fill every slot. An operator
+    /// gets in even while they are inside their grace, as grace protects
+    /// one connection per address; once their grace is over, by closing the
+    /// oldest connection of the peer holding the most that were never let
+    /// in — and one let in is never closed.
     #[test]
     fn idle_connections_make_room_for_an_operator() {
         let mut slots = Slots::default();
@@ -1063,13 +1268,21 @@ mod tests {
         }
         assert_eq!(slots.open.len(), MAX_CONNECTIONS);
 
-        // While all of them are inside their grace, a newcomer is turned
-        // away rather than one of them closed.
+        // While all of them are inside their grace, a newcomer still gets
+        // in: four addresses hold them, and grace protects one each. One of
+        // the first address's others is closed (it holds the most, and its
+        // connections are the oldest of those holding as many).
         let early = start + LOGIN_GRACE - Duration::from_secs(1);
         let early_one = Admission::new(early);
         let early_peer = Some("10.0.0.52".parse().unwrap());
-        assert!(!slots.open(998, early_peer, early, early_one, None));
-        assert!(idle.iter().all(|a| !a.should_close(early)));
+        assert!(slots.open(998, early_peer, early, early_one.clone(), None));
+        let closed_early = |range: std::ops::Range<usize>| {
+            idle[range].iter().filter(|a| a.should_close(early)).count()
+        };
+        assert_eq!(closed_early(0..MAX_PER_PEER), 1);
+        assert_eq!(closed_early(0..idle.len()), 1, "exactly one closed");
+        // Never the one grace protects: the address's longest waiting.
+        assert!(!idle[0].should_close(early));
 
         // An operator reconnecting (not logged in yet on the new socket).
         let later = start + LOGIN_GRACE + Duration::from_secs(1);
@@ -1082,10 +1295,10 @@ mod tests {
             None
         ));
         assert_eq!(slots.open.len(), MAX_CONNECTIONS);
-        // The victim: one of the first peer's (it holds the most, and its
-        // connections are older than the others holding as many).
+        // The victim: one of the second peer's (the first now holds one
+        // fewer; the second's are older than the third's).
         assert_eq!(
-            idle[..MAX_PER_PEER]
+            idle[MAX_PER_PEER..2 * MAX_PER_PEER]
                 .iter()
                 .filter(|a| a.should_close(later))
                 .count(),
@@ -1093,11 +1306,33 @@ mod tests {
         );
         assert_eq!(
             idle.iter().filter(|a| a.should_close(later)).count(),
-            1,
-            "exactly one closed"
+            2,
+            "one more closed"
         );
         assert!(!operator[0].should_close(later));
+        assert!(!early_one.should_close(later));
+        assert!(slots.open.iter().any(|s| s.id == 998));
         assert!(slots.open.iter().any(|s| s.id == 999));
+
+        // As many addresses as slots, each holding one fresh connection:
+        // grace protects them all, and a newcomer is turned away.
+        let mut singles = Slots::default();
+        for n in 0..MAX_CONNECTIONS {
+            fill(
+                &mut singles,
+                1 + n as ClientId,
+                1,
+                &address(n).to_string(),
+                start,
+            );
+        }
+        assert!(!singles.open(
+            600,
+            Some("10.0.0.99".parse().unwrap()),
+            early,
+            Admission::new(early),
+            None
+        ));
 
         // When every slot is someone let in, a new one is turned away.
         let mut full = Slots::default();
@@ -1162,11 +1397,14 @@ mod tests {
         let now = fresh_at + Duration::from_secs(1);
 
         // The lone address reconnects: its own stale connection goes, not
-        // one of the address holding ten.
+        // one of the address holding ten. The new one continues its wait:
+        // replacing a connection does not buy a new grace.
         let peer = Some("10.0.0.2".parse().unwrap());
-        assert!(slots.open(1000, peer, now, Admission::new(now), None));
+        let reconnect = Admission::new(now);
+        assert!(slots.open(1000, peer, now, reconnect.clone(), None));
         assert!(evicted(&lone[0]));
         assert!(many.iter().all(|a| !evicted(a)));
+        assert_eq!(reconnect.grace_since(), Some(start));
 
         // A new address: the oldest of the address holding the most.
         let peer = Some("10.0.0.5".parse().unwrap());
@@ -1174,12 +1412,14 @@ mod tests {
         assert!(evicted(&many[0]));
         assert_eq!(many.iter().filter(|a| evicted(a)).count(), 1);
 
-        // Its other nine go next, then nobody: the rest are fresh or let in.
-        for n in 0..9 {
+        // Its other nine go next, and the lone address's reconnect, then
+        // nobody: the rest are fresh or let in.
+        for n in 0..10 {
             let peer = Some(address(500 + n));
             assert!(slots.open(1002 + n as ClientId, peer, now, Admission::new(now), None));
         }
         assert!(many.iter().all(evicted));
+        assert!(evicted(&reconnect));
         let peer = Some(address(600));
         assert!(!slots.open(2000, peer, now, Admission::new(now), None));
         assert!(!evicted(&operator[0]) && !operator[0].should_close(now));
@@ -1265,7 +1505,7 @@ mod tests {
         /// Attacker `n` reconnects: closing its connection first, or (odd
         /// ones) opening the new one first.
         fn reconnect(&mut self, slots: &SharedSlots, n: usize, at: Instant) {
-            let close = |id: ClientId| slots.lock().unwrap().close(id);
+            let close = |id: ClientId| slots.lock().unwrap().close(id, at);
             // A connection closed to make room ends; so does one timed out.
             let old = self.attackers[n].held.take().filter(|(id, admission)| {
                 let ended = admission.should_close(at);
@@ -1369,7 +1609,8 @@ mod tests {
 
     /// The accept thread, the connections' threads and the command loop
     /// race over the slot table: a connection let in is never closed to
-    /// make room, and neither is one inside its grace.
+    /// make room, and neither is one inside its grace that is the only one
+    /// its address holds.
     #[test]
     fn a_concurrent_flood_never_evicts_a_logged_in_or_fresh_connection() {
         use std::sync::mpsc::channel;
@@ -1425,10 +1666,15 @@ mod tests {
                         };
                         if id % 7 == 0 {
                             admission.set(true);
-                            kept.push(admission);
+                            // Unless it was closed before the log-in came:
+                            // its address held another, which grace
+                            // protected instead.
+                            if admission.state() == ADMITTED {
+                                kept.push(admission);
+                            }
                         } else {
                             std::thread::yield_now();
-                            slots.lock().unwrap().close(id);
+                            slots.lock().unwrap().close(id, Instant::now());
                         }
                     }
                     kept
@@ -1472,6 +1718,7 @@ mod tests {
             .flat_map(|c| c.join().unwrap())
             .collect();
 
+        assert!(!kept.is_empty());
         let end = flood_at + Duration::from_secs(4);
         assert!(!evicted(&operator) && !operator.should_close(end));
         for user in users.iter().chain(&kept) {
@@ -1496,7 +1743,7 @@ mod tests {
             let admission = Admission::new(start);
             let other = admission.clone();
             let admit = std::thread::spawn(move || other.set(true));
-            let closed = admission.evict(now);
+            let closed = admission.evict(now, false);
             admit.join().unwrap();
             assert_eq!(closed, evicted(&admission));
             assert_eq!(closed, admission.should_close(now));
@@ -1505,10 +1752,11 @@ mod tests {
         // Let in, it cannot be evicted; within its grace, neither.
         let admitted = Admission::new(start);
         admitted.set(true);
-        assert!(!admitted.evict(now + LOGIN_DEADLINE));
+        assert!(!admitted.evict(now + LOGIN_DEADLINE, false));
+        assert!(!admitted.evict(now, true));
         let fresh = Admission::new(start);
-        assert!(!fresh.evict(start + LOGIN_GRACE - Duration::from_millis(1)));
-        assert!(fresh.evict(now));
+        assert!(!fresh.evict(start + LOGIN_GRACE - Duration::from_millis(1), false));
+        assert!(fresh.evict(now, false));
         // Evicted is final: a log-in arriving late does not undo it.
         fresh.set(true);
         assert!(fresh.should_close(now));
@@ -1634,5 +1882,288 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
         drop(server_side);
         client.join().unwrap();
+    }
+
+    /// #266: a few addresses keep the pool full with connections that never
+    /// log in, each reopened as soon as its grace is over (half of them
+    /// replacing the old one, which closes it to make room; half closing it
+    /// first), as fast as they are let. Before, an operator got 503 on
+    /// almost every try; now every try gets a slot, and the one that logs
+    /// in keeps it.
+    #[test]
+    fn a_handful_of_addresses_cannot_keep_an_operator_out() {
+        let slots: SharedSlots = Arc::default();
+        let mut arrivals = Arrivals::default();
+        let start = Instant::now();
+        let tick = Duration::from_millis(250);
+        let peers: Vec<IpAddr> = (0..4u8).map(|n| IpAddr::from([10, 0, 0, 1 + n])).collect();
+        // Per address: (id, admission, when it opened it).
+        let mut held: Vec<Vec<(ClientId, Admission, Instant)>> = vec![Vec::new(); peers.len()];
+        let mut next: ClientId = 10_000;
+        let mut reopened = 0usize;
+        let operator_peer: IpAddr = "10.9.9.9".parse().unwrap();
+        let mut tries = 0usize;
+        let mut full_tries = 0usize;
+        let mut operator: Option<(ClientId, Admission, Instant)> = None;
+        let mut logged_in = false;
+        let close = |id: ClientId, at: Instant| slots.lock().unwrap().close(id, at);
+        for step in 0..(4 * 180u32) {
+            let at = start + tick * step;
+            for (p, &peer) in peers.iter().enumerate() {
+                let mut open = |arrivals: &mut Arrivals| {
+                    let id = next;
+                    next += 1;
+                    let admission = Admission::new(at);
+                    let arrival = admit(
+                        &slots,
+                        arrivals,
+                        id,
+                        Some(peer),
+                        at,
+                        admission.clone(),
+                        None,
+                    );
+                    (arrival == Arrival::Taken).then_some((id, admission, at))
+                };
+                // Closed to make room, or timed out: gone.
+                held[p].retain(|(id, admission, _)| {
+                    let ended = admission.should_close(at);
+                    if ended {
+                        close(*id, at);
+                    }
+                    !ended
+                });
+                // Reopen each whose grace is over.
+                let mut kept = Vec::new();
+                for (id, admission, opened) in std::mem::take(&mut held[p]) {
+                    if at - opened < LOGIN_GRACE {
+                        kept.push((id, admission, opened));
+                        continue;
+                    }
+                    reopened += 1;
+                    if p % 2 == 0 {
+                        close(id, at);
+                        kept.extend(open(&mut arrivals));
+                    } else {
+                        match open(&mut arrivals) {
+                            Some(new) => {
+                                close(id, at);
+                                kept.push(new);
+                            }
+                            None => kept.push((id, admission, opened)),
+                        }
+                    }
+                }
+                held[p] = kept;
+                // Top up to as many as it may hold.
+                while held[p].len() < MAX_PER_PEER {
+                    match open(&mut arrivals) {
+                        Some(new) => held[p].push(new),
+                        None => break,
+                    }
+                }
+            }
+            // The operator's page tries every ten seconds until logged in;
+            // a try that is not the last is given up at once.
+            if !logged_in && step % 40 == 20 {
+                if slots.lock().unwrap().open.len() == MAX_CONNECTIONS {
+                    full_tries += 1;
+                }
+                tries += 1;
+                let id = next;
+                next += 1;
+                let admission = Admission::new(at);
+                let arrival = admit(
+                    &slots,
+                    &mut arrivals,
+                    id,
+                    Some(operator_peer),
+                    at,
+                    admission.clone(),
+                    None,
+                );
+                assert_eq!(arrival, Arrival::Taken, "try {tries} at {:?}", at - start);
+                if tries < 6 {
+                    close(id, at);
+                } else {
+                    operator = Some((id, admission, at));
+                }
+            }
+            if let Some((_, admission, since)) = &operator {
+                assert!(!admission.should_close(at), "operator closed");
+                // The PIN is typed within a few seconds.
+                if !logged_in && at - *since >= Duration::from_secs(5) {
+                    admission.set(true);
+                    logged_in = true;
+                }
+            }
+            assert!(slots.lock().unwrap().open.len() <= MAX_CONNECTIONS);
+        }
+        let (id, admission, _) = operator.expect("the operator never got a slot");
+        assert!(logged_in && !evicted(&admission));
+        assert!(slots.lock().unwrap().open.iter().any(|s| s.id == id));
+        // The flood was real: it kept reopening and the pool stayed full.
+        assert!(reopened > 200, "{reopened}");
+        assert!(
+            full_tries >= 4,
+            "{full_tries} of {tries} tries met a full pool"
+        );
+    }
+
+    /// #266: an address that reopens its one connection, by closing it
+    /// first or by replacing it, continues its wait instead of starting a
+    /// new grace; once that wait is past its grace, a newcomer gets in. One
+    /// closed by somebody else gets a new grace when it reconnects.
+    #[test]
+    fn reopening_a_connection_does_not_buy_a_new_grace() {
+        let mut slots = Slots::default();
+        let start = Instant::now();
+        let mut held: Vec<(IpAddr, ClientId, Admission)> = (0..MAX_CONNECTIONS)
+            .map(|n| {
+                let admission = Admission::new(start);
+                let id = 1 + n as ClientId;
+                assert!(slots.open(id, Some(address(n)), start, admission.clone(), None));
+                (address(n), id, admission)
+            })
+            .collect();
+        let mut next: ClientId = 1000;
+        // Closing first, inside the grace.
+        for secs in [15, 29] {
+            let at = start + Duration::from_secs(secs);
+            for (peer, id, admission) in held.iter_mut() {
+                slots.close(*id, at);
+                let new = Admission::new(at);
+                assert!(slots.open(next, Some(*peer), at, new.clone(), None));
+                assert_eq!(new.grace_since(), Some(start));
+                (*id, *admission) = (next, new);
+                next += 1;
+            }
+        }
+        // Replacing, just past it: its own old one is closed to make room.
+        let at = start + LOGIN_GRACE + Duration::from_millis(500);
+        for (peer, id, admission) in held.iter_mut().step_by(2) {
+            let new = Admission::new(at);
+            assert!(slots.open(next, Some(*peer), at, new.clone(), None));
+            assert!(evicted(admission));
+            slots.close(*id, at);
+            assert_eq!(new.grace_since(), Some(start));
+            (*id, *admission) = (next, new);
+            next += 1;
+        }
+        assert_eq!(slots.open.len(), MAX_CONNECTIONS);
+
+        // An operator gets in, and is safe in its own grace.
+        let at = start + LOGIN_GRACE + Duration::from_secs(1);
+        let operator = Admission::new(at);
+        let peer = Some("10.9.9.9".parse().unwrap());
+        assert!(slots.open(9000, peer, at, operator.clone(), None));
+        assert_eq!(operator.grace_since(), Some(at));
+        let victim = held.iter().position(|(_, _, a)| evicted(a)).unwrap();
+        assert_eq!(held.iter().filter(|(_, _, a)| evicted(a)).count(), 1);
+        let peer = Some("10.9.9.10".parse().unwrap());
+        assert!(slots.open(9001, peer, at, Admission::new(at), None));
+        assert!(!evicted(&operator));
+
+        // The one closed for the operator reconnects with a new grace.
+        let (peer, id) = (held[victim].0, held[victim].1);
+        slots.close(id, at);
+        let back = Admission::new(at);
+        let room = Some("10.9.9.11".parse().unwrap());
+        assert!(slots.open(9002, room, at, Admission::new(at), None));
+        assert!(slots.open(next, Some(peer), at, back.clone(), None));
+        assert_eq!(back.grace_since(), Some(at));
+    }
+
+    /// #266: an IPv6 `/64` is one address to every limit: one machine can
+    /// take as many addresses in it as it likes.
+    #[test]
+    fn ipv6_addresses_count_by_their_64() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert_eq!(peer_key(ip("2001:db8:1:2:a:b:c:d")), ip("2001:db8:1:2::"));
+        assert_eq!(peer_key(ip("fe80::1234")), ip("fe80::"));
+        assert_eq!(peer_key(ip("::ffff:10.0.0.7")), ip("10.0.0.7"));
+        assert_eq!(peer_key(ip("10.0.0.7")), ip("10.0.0.7"));
+        assert_eq!(peer_key(ip("::1")), ip("::1"));
+
+        let slots: SharedSlots = Arc::default();
+        let mut arrivals = Arrivals::default();
+        let now = Instant::now();
+        let mut attempt = |n: u32, peer: &str| {
+            admit(
+                &slots,
+                &mut arrivals,
+                n as ClientId,
+                Some(ip(peer)),
+                now,
+                Admission::new(now),
+                None,
+            )
+        };
+        // At most MAX_PER_PEER waiting from one /64, whatever the address.
+        for n in 0..MAX_PER_PEER as u32 {
+            let peer = format!("2001:db8:1:2::{:x}", n + 1);
+            assert_eq!(attempt(n, &peer), Arrival::Taken, "{peer}");
+        }
+        let mut n = MAX_PER_PEER as u32;
+        assert_eq!(attempt(n, "2001:db8:1:2:ffff::1"), Arrival::Busy);
+        n += 1;
+        // Another /64 is another address.
+        assert_eq!(attempt(n, "2001:db8:1:3::1"), Arrival::Taken);
+        n += 1;
+        // And one bucket of new connections for the whole /64.
+        while (n as usize) < ARRIVAL_BURST as usize + 1 {
+            assert_eq!(attempt(n, "2001:db8:1:2:dead::1"), Arrival::Busy);
+            n += 1;
+        }
+        assert_eq!(attempt(n, "2001:db8:1:2:beef::1"), Arrival::TooFast);
+    }
+
+    /// #267: every answer says only this server's own scripts may run, and
+    /// where the page may connect; a `Host` that would add to the policy is
+    /// left out of it.
+    #[test]
+    fn pages_may_run_only_this_servers_own_scripts() {
+        let csp = content_security_policy(Some("10.0.0.5:8730"));
+        for directive in [
+            "default-src 'self';",
+            "script-src 'self';",
+            "object-src 'none'",
+            "base-uri 'none'",
+            "frame-ancestors 'none'",
+            "connect-src 'self' ws://10.0.0.5:8730 wss://10.0.0.5:8730",
+        ] {
+            assert!(csp.contains(directive), "{directive} missing from {csp}");
+        }
+        assert!(!csp.contains("unsafe-eval"));
+        for host in ["evil.example; script-src *", "a b", "x'y", ""] {
+            let csp = content_security_policy(Some(host));
+            assert!(csp.ends_with("connect-src 'self'"), "{host}: {csp}");
+        }
+
+        // On the wire: once, on the page and on an error alike.
+        for head in [
+            "GET / HTTP/1.1\r\nHost: 10.0.0.5:8730\r\n",
+            "GET /no-such-file HTTP/1.1\r\nHost: 10.0.0.5:8730\r\n",
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                serve_asset(&mut stream, &request(head)).unwrap();
+            });
+            let mut client = TcpStream::connect(address).unwrap();
+            let mut raw = Vec::new();
+            client.read_to_end(&mut raw).unwrap();
+            server.join().unwrap();
+            let raw = String::from_utf8_lossy(&raw);
+            let (head, _) = raw.split_once("\r\n\r\n").unwrap();
+            let policies: Vec<&str> = head
+                .lines()
+                .filter_map(|line| line.strip_prefix("Content-Security-Policy: "))
+                .collect();
+            assert_eq!(policies.len(), 1, "{head}");
+            assert!(policies[0].contains("script-src 'self';"), "{head}");
+            assert!(policies[0].contains("frame-ancestors 'none'"), "{head}");
+        }
     }
 }
