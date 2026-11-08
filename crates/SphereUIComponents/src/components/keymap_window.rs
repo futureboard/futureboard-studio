@@ -132,6 +132,8 @@ pub struct KeymapWindow {
 impl KeymapWindow {
     fn new(manager: KeymapManager, on_changed: KeymapChangedCb, cx: &mut Context<Self>) -> Self {
         let json = manager.json_text().unwrap_or_default();
+        // Saved shortcuts that failed to load are reported, not hidden.
+        let status_message = manager.overrides_issue().map(str::to_string);
         Self {
             manager,
             on_changed,
@@ -148,7 +150,7 @@ impl KeymapWindow {
             profile_select_open: false,
             edit_dialog: None,
             create_dialog_open: false,
-            status_message: None,
+            status_message,
             scroll: UniformListScrollHandle::new(),
             focus_handle: cx.focus_handle(),
             recorder_intercept: None,
@@ -340,11 +342,14 @@ impl KeymapWindow {
                 self.edit_dialog = Some(restored);
             }
             Ok(_) => {
-                let _ = self.manager.save_changes();
+                let saved = self.manager.save_changes();
                 self.json_input
                     .set_value(self.manager.json_text().unwrap_or_default());
                 self.publish_changes(cx);
-                self.status_message = Some("Keybinding saved.".into());
+                self.status_message = Some(match saved {
+                    Ok(()) => "Keybinding saved.".into(),
+                    Err(error) => error,
+                });
             }
             Err(error) => {
                 self.status_message = Some(error);
@@ -369,11 +374,14 @@ impl KeymapWindow {
                     let _ = entity.update(cx, |this, cx| {
                         match this.manager.import_profile(&path) {
                             Ok(()) => {
-                                let _ = this.manager.save_changes();
+                                let saved = this.manager.save_changes();
                                 this.json_input
                                     .set_value(this.manager.json_text().unwrap_or_default());
                                 this.publish_changes(cx);
-                                this.status_message = Some(format!("Imported {}", path.display()));
+                                this.status_message = Some(match saved {
+                                    Ok(()) => format!("Imported {}", path.display()),
+                                    Err(error) => error,
+                                });
                             }
                             Err(error) => this.status_message = Some(error),
                         }
@@ -588,7 +596,9 @@ impl KeymapWindow {
                             .map(|row| (row.action_id.clone(), row.scope));
                         if let Some((action, scope)) = overridden {
                             self.manager.reset_binding(&action, scope);
-                            let _ = self.manager.save_changes();
+                            if let Err(error) = self.manager.save_changes() {
+                                self.status_message = Some(error);
+                            }
                             self.publish_changes(cx);
                             cx.notify();
                         }

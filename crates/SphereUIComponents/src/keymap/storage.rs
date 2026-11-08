@@ -219,27 +219,177 @@ pub fn save_profile_json(profile: &KeymapProfile, path: &Path) -> Result<(), Str
         fs::create_dir_all(parent)
             .map_err(|error| format!("Failed to create keymap folder: {error}"))?;
     }
-    fs::write(path, profile_json_text(profile))
+    write_file_atomically(path, profile_json_text(profile).as_bytes())
         .map_err(|error| format!("Failed to write keymap: {error}"))
 }
 
-pub fn load_user_overrides(app_data: &Path) -> KeymapProfile {
+/// Replace `path` with `bytes` atomically: the bytes go to a uniquely named
+/// temporary file in the same folder, are flushed to disk, and the temporary
+/// file is then renamed over `path` (on Windows `std::fs::rename` replaces an
+/// existing file). A crash or power loss mid-save leaves either the old file
+/// or the new one, never a truncated mix. The parent folder must exist.
+pub fn write_file_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name"))?
+        .to_string_lossy();
+    let temp = path.with_file_name(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let written = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temp, path)
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    written
+}
+
+/// Why the user-overrides file could not be used as it is on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserOverridesIssue {
+    /// What went wrong, worded for the keymap window.
+    pub message: String,
+    /// Where a copy of the unreadable file was kept. `None` means no copy
+    /// could be made, so saving must not replace the file.
+    pub backup: Option<PathBuf>,
+}
+
+impl UserOverridesIssue {
+    /// Whether a save would destroy the only copy of the user's file.
+    pub fn blocks_save(&self) -> bool {
+        self.backup.is_none()
+    }
+}
+
+/// The user overrides as read from disk, and why they could not be read.
+#[derive(Debug, Clone)]
+pub struct UserOverridesLoad {
+    pub profile: KeymapProfile,
+    pub issue: Option<UserOverridesIssue>,
+}
+
+fn empty_user_overrides() -> KeymapProfile {
+    KeymapProfile {
+        name: "User Overrides".to_string(),
+        extends: Some("default".to_string()),
+        ..KeymapProfile::default()
+    }
+}
+
+/// Read the user-overrides file. A missing file is an empty profile. A file
+/// that cannot be read or parsed also starts empty, but is never silently
+/// thrown away: it is copied aside first (see [`back_up_unreadable`]), and if
+/// that copy fails the returned issue blocks saving over it.
+pub fn load_user_overrides(app_data: &Path) -> UserOverridesLoad {
     let path = user_overrides_path(app_data);
-    let Ok(text) = fs::read_to_string(&path) else {
-        return KeymapProfile {
-            name: "User Overrides".to_string(),
-            extends: Some("default".to_string()),
-            ..KeymapProfile::default()
-        };
-    };
-    load_profile_json(&text).unwrap_or_else(|error| {
-        eprintln!("[keymap] failed to load user overrides: {error}");
-        KeymapProfile {
-            name: "User Overrides".to_string(),
-            extends: Some("default".to_string()),
-            ..KeymapProfile::default()
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return UserOverridesLoad {
+                profile: empty_user_overrides(),
+                issue: None,
+            };
         }
-    })
+        Err(error) => {
+            eprintln!("[keymap] failed to read user overrides: {error}");
+            return UserOverridesLoad {
+                profile: empty_user_overrides(),
+                issue: Some(UserOverridesIssue {
+                    message: format!(
+                        "Custom shortcuts could not be read from {} ({error}). \
+                         They are not shown, and changes will not be saved over that file.",
+                        path.display()
+                    ),
+                    backup: None,
+                }),
+            };
+        }
+    };
+    let parsed = std::str::from_utf8(&bytes)
+        .map_err(|error| format!("Invalid keymap text: {error}"))
+        .and_then(load_profile_json);
+    let error = match parsed {
+        Ok(profile) => {
+            return UserOverridesLoad {
+                profile,
+                issue: None,
+            }
+        }
+        Err(error) => error,
+    };
+    eprintln!("[keymap] failed to load user overrides: {error}");
+    let issue = match back_up_unreadable(&path, &bytes) {
+        Ok(backup) => UserOverridesIssue {
+            message: format!(
+                "Custom shortcuts file was unreadable ({error}). \
+                 It was copied to {} before starting with no custom shortcuts.",
+                backup.display()
+            ),
+            backup: Some(backup),
+        },
+        Err(backup_error) => {
+            eprintln!("[keymap] failed to back up user overrides: {backup_error}");
+            UserOverridesIssue {
+                message: format!(
+                    "Custom shortcuts file {} is unreadable ({error}) and could not be \
+                     backed up ({backup_error}). Changes will not be saved over it.",
+                    path.display()
+                ),
+                backup: None,
+            }
+        }
+    };
+    UserOverridesLoad {
+        profile: empty_user_overrides(),
+        issue: Some(issue),
+    }
+}
+
+/// Copy an unreadable keymap file next to itself as
+/// `<name>.unreadable.bak` (or `<name>.unreadable-N.bak`), reusing a backup
+/// that already holds the same bytes so reloading does not pile up copies,
+/// and never replacing a different earlier backup.
+fn back_up_unreadable(path: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name"))?
+        .to_string_lossy()
+        .into_owned();
+    for index in 0..100u32 {
+        let name = if index == 0 {
+            format!("{file_name}.unreadable.bak")
+        } else {
+            format!("{file_name}.unreadable-{index}.bak")
+        };
+        let candidate = path.with_file_name(name);
+        match fs::read(&candidate) {
+            Ok(existing) if existing == bytes => return Ok(candidate),
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                write_file_atomically(&candidate, bytes)?;
+                return Ok(candidate);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "too many earlier keymap backups",
+    ))
 }
 
 pub fn save_user_overrides(app_data: &Path, profile: &KeymapProfile) -> Result<(), String> {
@@ -322,6 +472,100 @@ mod tests {
             load_profile_json(r#"{ "version": 1, "bindings": { "tools:select-glue": null } }"#)
                 .unwrap();
         assert!(profile.bindings[0].keys.is_empty());
+    }
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "fb-keymap-storage-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(user_keymaps_dir(&dir)).unwrap();
+        dir
+    }
+
+    fn sample_overrides() -> KeymapProfile {
+        load_profile_json(
+            r#"{ "version": 2, "name": "User Overrides", "extends": "default",
+                 "global": { "transport:record": "F9" } }"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn user_overrides_round_trip_and_leave_no_temp_files() {
+        let dir = scratch_dir("roundtrip");
+        save_user_overrides(&dir, &sample_overrides()).unwrap();
+        // A second save replaces the existing file.
+        save_user_overrides(&dir, &sample_overrides()).unwrap();
+        let loaded = load_user_overrides(&dir);
+        assert!(loaded.issue.is_none());
+        assert_eq!(loaded.profile.bindings, sample_overrides().bindings);
+        let names: Vec<_> = fs::read_dir(user_keymaps_dir(&dir))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from(USER_OVERRIDES_FILE)]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_overrides_file_is_not_an_issue() {
+        let dir = scratch_dir("missing");
+        let loaded = load_user_overrides(&dir);
+        assert!(loaded.issue.is_none());
+        assert!(loaded.profile.bindings.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_torn_overrides_file_is_backed_up_and_reported() {
+        let dir = scratch_dir("torn");
+        let path = user_overrides_path(&dir);
+        let torn = br#"{ "version": 2, "global": { "transport:rec"#;
+        fs::write(&path, torn).unwrap();
+
+        let loaded = load_user_overrides(&dir);
+        let issue = loaded.issue.expect("a torn file is reported");
+        assert!(!issue.blocks_save());
+        let backup = issue.backup.unwrap();
+        assert_eq!(fs::read(&backup).unwrap(), torn);
+        assert_eq!(fs::read(&path).unwrap(), torn, "the original is untouched");
+
+        // Loading again reuses the same backup instead of piling up copies.
+        let again = load_user_overrides(&dir).issue.unwrap();
+        assert_eq!(again.backup.as_deref(), Some(backup.as_path()));
+
+        // A different unreadable file never replaces the earlier backup.
+        fs::write(&path, b"not json").unwrap();
+        let other = load_user_overrides(&dir).issue.unwrap().backup.unwrap();
+        assert_ne!(other, backup);
+        assert_eq!(fs::read(&backup).unwrap(), torn);
+        assert_eq!(fs::read(&other).unwrap(), b"not json");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_atomic_write_replaces_the_target_whole() {
+        let dir = scratch_dir("atomic");
+        let path = dir.join("target.json");
+        fs::write(&path, b"old contents that are longer").unwrap();
+        write_file_atomically(&path, b"new").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        let leftovers = fs::read_dir(&dir)
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

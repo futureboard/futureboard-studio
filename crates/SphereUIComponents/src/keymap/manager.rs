@@ -15,7 +15,7 @@ use super::normalize::{canonical_accel, format_accel_display};
 use super::storage::{
     ensure_user_keymaps_dir, import_profile_file, load_builtin_profile, load_user_overrides,
     profile_json_text, save_profile_json, save_user_overrides, user_keymaps_dir,
-    user_overrides_path,
+    user_overrides_path, UserOverridesIssue,
 };
 
 pub fn shortcut_debug_enabled() -> bool {
@@ -28,6 +28,9 @@ pub struct KeymapManager {
     app_data: PathBuf,
     active_profile_id: String,
     user_overrides: KeymapProfile,
+    /// Set when the user-overrides file on disk could not be read; see
+    /// [`KeymapManager::overrides_issue`].
+    overrides_issue: Option<UserOverridesIssue>,
     imported_profile: Option<KeymapProfile>,
     dirty: bool,
     action_labels: HashMap<String, String>,
@@ -50,11 +53,12 @@ impl KeymapManager {
     pub fn new(app_data: PathBuf) -> Self {
         let _ = ensure_user_keymaps_dir(&app_data);
         let action_labels = build_action_catalog();
-        let user_overrides = load_user_overrides(&app_data);
+        let loaded = load_user_overrides(&app_data);
         let mut manager = Self {
             app_data,
             active_profile_id: "default".to_string(),
-            user_overrides,
+            user_overrides: loaded.profile,
+            overrides_issue: loaded.issue,
             imported_profile: None,
             dirty: false,
             action_labels,
@@ -77,6 +81,14 @@ impl KeymapManager {
             .find(|p| p.id == self.active_profile_id)
             .map(|p| p.label)
             .unwrap_or("Default")
+    }
+
+    /// Why the saved custom shortcuts could not be loaded, if they could
+    /// not: shown to the user instead of silently starting from defaults.
+    pub fn overrides_issue(&self) -> Option<&str> {
+        self.overrides_issue
+            .as_ref()
+            .map(|issue| issue.message.as_str())
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -202,14 +214,23 @@ impl KeymapManager {
         profile
     }
 
+    /// Write the user overrides. Refused while the file on disk is
+    /// unreadable and no backup of it could be made, so a torn or locked file
+    /// is never replaced by the empty profile it was loaded as.
     pub fn save_changes(&mut self) -> Result<(), String> {
+        if let Some(issue) = self.overrides_issue.as_ref().filter(|i| i.blocks_save()) {
+            return Err(issue.message.clone());
+        }
         save_user_overrides(&self.app_data, &self.user_overrides)?;
+        self.overrides_issue = None;
         self.dirty = false;
         Ok(())
     }
 
     pub fn discard_dirty(&mut self) {
-        self.user_overrides = load_user_overrides(&self.app_data);
+        let loaded = load_user_overrides(&self.app_data);
+        self.user_overrides = loaded.profile;
+        self.overrides_issue = loaded.issue;
         self.canonicalize_overrides();
         self.dirty = false;
         self.rebuild();
@@ -1009,5 +1030,67 @@ mod default_binding_tests {
             Some("track:mute")
         );
         assert_eq!(resolve(&manager, Arrangement, "M"), None);
+    }
+
+    fn data_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "fb-keymap-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("Keymaps")).unwrap();
+        dir
+    }
+
+    /// A torn overrides file is reported and kept as a backup; saving a new
+    /// shortcut afterwards does not lose the original bytes.
+    #[test]
+    fn a_torn_overrides_file_is_kept_and_reported() {
+        let dir = data_dir("torn");
+        let path = user_overrides_path(&dir);
+        let torn = br#"{"version":2,"global":{"transport:record":"F"#;
+        std::fs::write(&path, torn).unwrap();
+
+        let mut manager = KeymapManager::new(dir.clone());
+        assert!(manager.overrides_issue().is_some());
+        manager
+            .tap_binding("midi:quantize", vec!["G".into()], MidiEditor, None, true)
+            .unwrap();
+        manager.save_changes().unwrap();
+        assert!(manager.overrides_issue().is_none());
+
+        let backup = path.with_file_name(format!(
+            "{}.unreadable.bak",
+            super::super::model::USER_OVERRIDES_FILE
+        ));
+        assert_eq!(std::fs::read(&backup).unwrap(), torn);
+        let reloaded = KeymapManager::new(dir.clone());
+        assert!(reloaded.overrides_issue().is_none());
+        assert_eq!(
+            resolve(&reloaded, MidiEditor, "G").as_deref(),
+            Some("midi:quantize")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// When the overrides file cannot even be read (here: a folder sits at
+    /// its path), saving is refused rather than replacing it.
+    #[test]
+    fn an_unreadable_overrides_file_is_not_overwritten() {
+        let dir = data_dir("unreadable");
+        let path = user_overrides_path(&dir);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("marker"), b"keep").unwrap();
+
+        let mut manager = KeymapManager::new(dir.clone());
+        assert!(manager.overrides_issue().is_some());
+        manager
+            .tap_binding("midi:quantize", vec!["G".into()], MidiEditor, None, true)
+            .unwrap();
+        assert!(manager.save_changes().is_err());
+        assert!(manager.is_dirty());
+        assert_eq!(std::fs::read(path.join("marker")).unwrap(), b"keep");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
