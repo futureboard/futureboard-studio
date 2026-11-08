@@ -24,15 +24,15 @@
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, App, AppContext, Context, FontWeight, InteractiveElement, IntoElement,
-    ParentElement, Render, Rgba, StatefulInteractiveElement, Styled, Window, div, px,
+    div, px, AnyElement, App, AppContext, Context, FontWeight, InteractiveElement, IntoElement,
+    ParentElement, Render, Rgba, StatefulInteractiveElement, Styled, Window,
 };
 use rodharerist::{CabModel, Line2Mode, Params, RowSend, StageChannel, StageKind, ToneEngineKind};
 
 use crate::components::controls::fb_tooltip;
 use crate::components::plate::{
-    self, Dial, DialUnit, FAINT, INK, KnobCell, KnobLook, PALE, SOFT, WHITE, caption, color,
-    color_a, icon, knob, numbers, plate_frame, plate_scale, type_px, words,
+    self, caption, color, color_a, icon, knob, numbers, plate_frame, plate_scale, type_px, words,
+    Dial, DialUnit, KnobCell, KnobLook, FAINT, INK, PALE, SOFT, WHITE,
 };
 use crate::components::rodhareist_blocks::{self as blocks, Category, ParamSpec};
 use crate::components::rodhareist_window::RodhareistEditorWindow;
