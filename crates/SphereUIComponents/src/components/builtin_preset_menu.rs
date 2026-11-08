@@ -69,14 +69,46 @@ pub struct BuiltinPresetMenu {
     presets: Vec<(String, PathBuf)>,
     view: PresetPopoverView,
     focus: FocusHandle,
-    /// When a click outside last closed the list. The same click lands on
-    /// the trigger next, and must not open it again (#228).
-    dismissed_at: Option<std::time::Instant>,
+    /// Keeps the press that closed the list from opening it again.
+    reopen: ReopenGuard,
 }
 
-/// How long after a click-outside close a trigger click counts as that same
-/// click.
+/// How long after a click-outside close a press on the trigger counts as that
+/// same press.
 const REOPEN_GUARD: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// A press that closes the list on the trigger must not reopen it on release
+/// (#228). GPUI closes the list in the press's capture phase
+/// (`on_mouse_down_out`), the trigger sees the same press in its bubble
+/// phase, and the click fires on release, however long the button is held
+/// (#264). So the decision is made at the press, not at the release.
+#[derive(Debug, Default)]
+struct ReopenGuard {
+    /// When a press outside the list last closed it.
+    dismissed_at: Option<std::time::Instant>,
+    /// The trigger's current press is the one that closed the list.
+    press_dismissed: bool,
+}
+
+impl ReopenGuard {
+    /// A press outside the list closed it.
+    fn dismissed(&mut self, now: std::time::Instant) {
+        self.dismissed_at = Some(now);
+    }
+
+    /// The left button went down on the trigger.
+    fn press(&mut self, now: std::time::Instant) {
+        self.press_dismissed = self
+            .dismissed_at
+            .take()
+            .is_some_and(|at| now.saturating_duration_since(at) < REOPEN_GUARD);
+    }
+
+    /// The trigger was clicked while the list was closed: whether to open it.
+    fn release_opens(&mut self) -> bool {
+        !std::mem::take(&mut self.press_dismissed)
+    }
+}
 
 impl BuiltinPresetMenu {
     pub fn new(key: PluginInstanceKey, identity: &ShellIdentity, cx: &mut Context<Self>) -> Self {
@@ -88,7 +120,7 @@ impl BuiltinPresetMenu {
             presets: Vec::new(),
             view: PresetPopoverView::default(),
             focus: cx.focus_handle(),
-            dismissed_at: None,
+            reopen: ReopenGuard::default(),
         }
     }
 
@@ -110,6 +142,7 @@ impl BuiltinPresetMenu {
         self.plugin_id = identity.plugin_id.clone();
         self.plugin_name = identity.preset_plugin_name.clone();
         self.open = false;
+        self.reopen = ReopenGuard::default();
         cx.notify();
     }
 
@@ -122,11 +155,7 @@ impl BuiltinPresetMenu {
             self.close(cx);
             return;
         }
-        if self
-            .dismissed_at
-            .take()
-            .is_some_and(|at| at.elapsed() < REOPEN_GUARD)
-        {
+        if !self.reopen.release_opens() {
             return;
         }
         self.presets =
@@ -343,7 +372,7 @@ impl BuiltinPresetMenu {
                         .shadow_lg()
                         .on_mouse_down_out(move |_, _, cx| {
                             let _ = close.update(cx, |menu, cx| {
-                                menu.dismissed_at = Some(std::time::Instant::now());
+                                menu.reopen.dismissed(std::time::Instant::now());
                                 menu.close(cx);
                             });
                         })
@@ -395,6 +424,10 @@ impl Render for BuiltinPresetMenu {
             .text_color(Colors::text_secondary())
             .cursor(gpui::CursorStyle::PointingHand)
             .hover(move |style| style.bg(hover).text_color(Colors::text_primary()))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|menu, _, _, _| menu.reopen.press(std::time::Instant::now())),
+            )
             .on_click(cx.listener(|menu, _, window, cx| menu.toggle(window, cx)))
             .child("Presets")
             .child(
@@ -424,6 +457,7 @@ impl Render for BuiltinPresetMenu {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn requests_are_drained_once_in_order() {
@@ -438,5 +472,70 @@ mod tests {
         assert_eq!(drained.len(), 2);
         assert_eq!(drained[0].1, BuiltinPresetRequest::RevealFolder);
         assert!(take_requests().is_empty());
+    }
+
+    /// Event order of one press on the trigger while the list is open:
+    /// capture-phase `on_mouse_down_out` closes it, the trigger's bubble-phase
+    /// mouse-down follows within the same dispatch, the click on release.
+    /// The release reads no clock, so the hold time cannot matter (#264).
+    #[test]
+    fn press_that_closed_the_list_never_reopens_it() {
+        let mut guard = ReopenGuard::default();
+        let t0 = Instant::now();
+        guard.dismissed(t0);
+        guard.press(t0);
+        assert!(!guard.release_opens());
+    }
+
+    /// Releasing long after `REOPEN_GUARD` (e.g. 500 ms or 1 second) must
+    /// still not reopen the list (#264).
+    #[test]
+    fn holding_trigger_past_guard_window_does_not_reopen_on_release() {
+        let mut guard = ReopenGuard::default();
+        let t0 = Instant::now();
+        guard.dismissed(t0);
+        guard.press(t0);
+        // The hold time does not affect release_opens since the decision was
+        // made at press time.
+        assert!(!guard.release_opens());
+    }
+
+    #[test]
+    fn plain_click_on_the_closed_trigger_opens_the_list() {
+        let mut guard = ReopenGuard::default();
+        guard.press(Instant::now());
+        assert!(guard.release_opens());
+    }
+
+    #[test]
+    fn next_click_after_a_swallowed_one_opens_the_list() {
+        let mut guard = ReopenGuard::default();
+        let t0 = Instant::now();
+        guard.dismissed(t0);
+        guard.press(t0);
+        assert!(!guard.release_opens());
+        guard.press(t0 + Duration::from_millis(100));
+        assert!(guard.release_opens());
+    }
+
+    #[test]
+    fn closing_elsewhere_does_not_block_a_later_trigger_click() {
+        let mut guard = ReopenGuard::default();
+        let t0 = Instant::now();
+        guard.dismissed(t0);
+        guard.press(t0 + REOPEN_GUARD + Duration::from_millis(10));
+        assert!(guard.release_opens());
+    }
+
+    #[test]
+    fn press_released_off_the_trigger_leaves_no_stale_state() {
+        let mut guard = ReopenGuard::default();
+        let t0 = Instant::now();
+        guard.dismissed(t0);
+        // Dismissing press on the trigger, released elsewhere: no click.
+        guard.press(t0);
+        // The next press on the trigger decides afresh.
+        guard.press(t0 + Duration::from_secs(1));
+        assert!(guard.release_opens());
     }
 }
