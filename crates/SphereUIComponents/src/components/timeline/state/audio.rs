@@ -12,23 +12,32 @@ impl TimelineState {
         drop_x: f32,
         drop_y: f32,
     ) -> String {
+        let placement = self.drop_placement_at(drop_x, drop_y);
+        self.import_audio_at_placement(source_path, clip_name, &placement)
+    }
+
+    /// Import an audio file where a drop resolved to (#385): on the
+    /// placement's track while it still exists and is an audio track,
+    /// otherwise on a new audio track.
+    pub fn import_audio_at_placement(
+        &mut self,
+        source_path: String,
+        clip_name: String,
+        placement: &crate::components::timeline::drop_batch::DropPlacement,
+    ) -> String {
         eprintln!(
-            "[import] drop path={} clip={} drop_x={:.1} drop_y={:.1}",
-            source_path, clip_name, drop_x, drop_y
+            "[import] drop path={} clip={} beat={:.3} track={:?}",
+            source_path, clip_name, placement.start_beat, placement.track_id
         );
-        // Resolve target track: an existing lane under drop_y, otherwise create one.
-        let track_id = match self.track_index_at_y(drop_y) {
-            Some(idx) if matches!(self.tracks[idx].track_type, TrackType::Audio) => {
-                self.tracks[idx].id.clone()
-            }
-            _ => self.create_audio_track(),
-        };
-
-        // Resolve start beat with snap.
-        let raw_beats = self.x_to_beats(drop_x.max(0.0));
-        let start_beat = self.snap_beats(raw_beats).max(0.0);
-
-        self.insert_audio_clip(track_id, source_path, clip_name, start_beat)
+        let track_id = self
+            .drop_target_track(placement, |kind| matches!(kind, TrackType::Audio))
+            .unwrap_or_else(|| self.create_audio_track());
+        self.insert_audio_clip(
+            track_id,
+            source_path,
+            clip_name,
+            placement.start_beat.max(0.0),
+        )
     }
 
     pub fn import_audio_to_selected_or_new_track(

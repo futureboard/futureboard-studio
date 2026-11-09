@@ -326,7 +326,12 @@ impl Timeline {
     /// rename a track the user never touched. The names revision takes a fresh
     /// value, so every surface that copies names out of the timeline reloads
     /// even if the new arrangement happens to carry the value it last saw.
+    ///
+    /// For the same reason file drops still waiting for a MIDI file's parse
+    /// are discarded, and an open MIDI import dialog no longer imports (#385):
+    /// they would land on the new project's tracks of the same id.
     pub fn end_track_rename_for_project_change(&mut self, cx: &mut Context<Self>) {
+        self.discard_pending_file_drops();
         self.end_track_rename(false, None, cx);
         self.state.touch_track_names();
         cx.notify();

@@ -8,7 +8,8 @@
 //!
 //! The dialog holds no timeline entity: it gets a plain snapshot of the counts,
 //! and on confirm the Timeline imports the parse the drop already made (read
-//! once, off the UI thread) at the drop position it already resolved.
+//! once, off the UI thread) at the placement the drop resolved — unless the
+//! project has changed since, when nothing is imported (#385).
 
 use std::sync::Arc;
 
@@ -82,14 +83,13 @@ impl StudioLayout {
         options: MidiImportOptions,
         cx: &mut Context<Self>,
     ) {
-        let (drop_x, drop_y) = (request.drop_x, request.drop_y);
         let imported = self.timeline.update(cx, |timeline, cx| {
             timeline.import_midi_tracks_with_options(
                 &request.path,
                 &request.tracks,
                 options,
-                drop_x,
-                drop_y,
+                &request.placement,
+                request.project_generation,
                 cx,
             )
         });

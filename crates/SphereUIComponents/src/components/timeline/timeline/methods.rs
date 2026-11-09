@@ -268,6 +268,9 @@ impl Timeline {
             on_midi_import_prompt: None,
             on_edit_notice: None,
             last_drag_position: None,
+            pending_file_drops: Default::default(),
+            next_file_drop_id: 0,
+            project_generation: 0,
             file_drop_hint: None,
             clip_clone_hint: None,
             song_text_drag_preview: None,
@@ -375,6 +378,9 @@ impl Timeline {
             on_midi_import_prompt: None,
             on_edit_notice: None,
             last_drag_position: None,
+            pending_file_drops: Default::default(),
+            next_file_drop_id: 0,
+            project_generation: 0,
             file_drop_hint: None,
             clip_clone_hint: None,
             song_text_drag_preview: None,
@@ -4268,17 +4274,188 @@ impl Timeline {
         self.state.track_viewport_y_from_window_y(y).max(0.0)
     }
 
-    pub(super) fn import_audio_path_at_last_drag(
+    /// Import the files dropped at the last drag position. Returns whether any
+    /// of them is a file the arrangement imports.
+    ///
+    /// Where they land is resolved now, from the view they were dropped onto
+    /// (#385): a MIDI file is read and parsed on the background executor
+    /// (#364), and by the time its parse finishes the view may have scrolled
+    /// or zoomed, a track may have been deleted, or another project may be
+    /// open. The files then land in drop order — each as soon as every file
+    /// ahead of it has — the first one that lands at the cursor and every
+    /// later one on a new track; a MIDI file that fails to parse is skipped as
+    /// if it had not been dropped. Each file is still its own undo step.
+    pub(super) fn begin_file_drop(
         &mut self,
-        path: &std::path::Path,
-        force_new_track: bool,
-        _window: &mut Window,
+        paths: &[std::path::PathBuf],
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if !is_supported_audio_ext(path) {
+        use crate::components::timeline::drop_batch::{DropBatch, DroppedFile, PendingFileDrop};
+
+        let mut batch = DropBatch::new();
+        let mut parses = Vec::new();
+        for path in paths {
+            if is_supported_midi_ext(path) {
+                parses.push((batch.push(None), path.clone()));
+            } else if is_supported_audio_ext(path) {
+                batch.push(Some(DroppedFile::Audio(path.clone())));
+            } else if sphere_video_player::is_supported_video_path(path) {
+                batch.push(Some(DroppedFile::Video(path.clone())));
+            }
+        }
+        if batch.is_empty() {
             return false;
         }
 
+        let drop_id = self.next_file_drop_id;
+        self.next_file_drop_id = self.next_file_drop_id.wrapping_add(1);
+        let pending = PendingFileDrop {
+            targets: self.resolve_drop_targets(),
+            batch,
+        };
+        // Files ahead of the first MIDI file have nothing to wait for.
+        self.run_file_drop(drop_id, pending, window, cx);
+
+        for (index, path) in parses {
+            cx.spawn_in(window, async move |this, cx| {
+                let read_path = path.clone();
+                let parsed = cx
+                    .background_executor()
+                    .spawn(async move { read_and_parse_midi_file(&read_path) })
+                    .await;
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.finish_dropped_file(
+                        drop_id,
+                        index,
+                        DroppedFile::Midi { path, parsed },
+                        window,
+                        cx,
+                    );
+                });
+            })
+            .detach();
+        }
+        true
+    }
+
+    /// Resolve where a drop lands from the view as it is now: the cursor's
+    /// beat and the id of the track under it, and the new-track placement of
+    /// every later file.
+    fn resolve_drop_targets(&self) -> crate::components::timeline::drop_batch::DropTargets {
+        let new_track = self.state.new_track_drop_placement();
+        let at_cursor = match self.last_drag_position {
+            Some(position) => {
+                let x: f32 = position.x.into();
+                let y: f32 = position.y.into();
+                let lane_x = self.state.lane_x_from_window_x(x).max(0.0);
+                let lane_y = self.state.track_viewport_y_from_window_y(y).max(0.0);
+                self.state.drop_placement_at(lane_x, lane_y)
+            }
+            None => new_track.clone(),
+        };
+        crate::components::timeline::drop_batch::DropTargets {
+            at_cursor,
+            new_track,
+        }
+    }
+
+    /// A MIDI file of a drop has been read and parsed. Discarded when its drop
+    /// is gone, which is what a project change does to it.
+    fn finish_dropped_file(
+        &mut self,
+        drop_id: u64,
+        index: usize,
+        file: crate::components::timeline::drop_batch::DroppedFile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut pending) = self.pending_file_drops.remove(&drop_id) else {
+            if let crate::components::timeline::drop_batch::DroppedFile::Midi { path, .. } = &file {
+                eprintln!(
+                    "[MidiImport] discarded {}: the project it was dropped into is closed",
+                    path.display()
+                );
+            }
+            return;
+        };
+        pending.batch.resolve(index, file);
+        self.run_file_drop(drop_id, pending, window, cx);
+    }
+
+    /// Apply the files of a drop that are ready, in drop order, and keep the
+    /// drop while any file is still waiting for its parse.
+    fn run_file_drop(
+        &mut self,
+        drop_id: u64,
+        mut pending: crate::components::timeline::drop_batch::PendingFileDrop,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let generation = self.project_generation;
+        let targets = pending.targets.clone();
+        let applied = pending.batch.apply_ready(|file, force_new_track| {
+            // An import prompt can reach the shell synchronously; should that
+            // ever replace the project, nothing more of this drop lands.
+            self.project_generation == generation
+                && self.apply_dropped_file(file, &targets, force_new_track, window, cx)
+        });
+        if self.project_generation != generation {
+            return;
+        }
+        if !pending.batch.is_finished() {
+            self.pending_file_drops.insert(drop_id, pending);
+        }
+        if applied > 0 {
+            cx.notify();
+        }
+    }
+
+    /// Import one file of a drop at the placement it resolved to. Returns
+    /// whether it landed (or went to the import dialog), which sends every
+    /// later file of the drop to a new track.
+    fn apply_dropped_file(
+        &mut self,
+        file: crate::components::timeline::drop_batch::DroppedFile,
+        targets: &crate::components::timeline::drop_batch::DropTargets,
+        force_new_track: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        use crate::components::timeline::drop_batch::DroppedFile;
+        let placement = targets.placement(force_new_track);
+        match file {
+            DroppedFile::Midi { path, parsed } => {
+                self.import_dropped_midi(&path, parsed, placement, window, cx)
+            }
+            DroppedFile::Audio(path) => self.import_dropped_audio(&path, placement, cx),
+            // The Video track is a singleton: a video takes the cursor's beat
+            // whichever file it is, and never a new track.
+            DroppedFile::Video(path) => {
+                self.import_dropped_video(&path, targets.at_cursor.start_beat, cx)
+            }
+        }
+    }
+
+    /// Drop the drops still waiting for a parse, and invalidate an open MIDI
+    /// import dialog: the project they were made in is being replaced.
+    pub(super) fn discard_pending_file_drops(&mut self) {
+        self.project_generation = self.project_generation.wrapping_add(1);
+        if !self.pending_file_drops.is_empty() {
+            eprintln!(
+                "[MidiImport] discarding {} pending file drop(s): project changed",
+                self.pending_file_drops.len()
+            );
+            self.pending_file_drops.clear();
+        }
+    }
+
+    fn import_dropped_audio(
+        &mut self,
+        path: &std::path::Path,
+        placement: &crate::components::timeline::drop_batch::DropPlacement,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let path_key = path.to_string_lossy().to_string();
         let clip_name = path
             .file_name()
@@ -4286,14 +4463,12 @@ impl Timeline {
             .map(|s| s.to_string())
             .unwrap_or_else(|| "Imported Audio".to_string());
 
-        let (drop_x, drop_y) = self.drop_position_or_new_track(force_new_track);
-
         let edit = self.begin_track_edit(
             crate::components::timeline::timeline_state::TrackEditScope::track_list(),
         );
         let clip_id = self
             .state
-            .import_audio_at(path_key.clone(), clip_name, drop_x, drop_y);
+            .import_audio_at_placement(path_key.clone(), clip_name, placement);
         self.record_clip_import("Import Audio", edit, std::slice::from_ref(&clip_id), cx);
         self.mark_project_changed(cx);
         self.mark_media_changed(cx);
@@ -4311,20 +4486,15 @@ impl Timeline {
     /// Places a dropped video on the Video track, creating the track if the
     /// project has none.
     ///
-    /// Unlike audio and MIDI this ignores `force_new_track`: the Video track is
+    /// Unlike audio and MIDI this never takes a new track: the Video track is
     /// a singleton, so a multi-file drop stacks reference videos on the one
     /// track rather than minting a second one.
-    pub(super) fn import_video_path_at_last_drag(
+    fn import_dropped_video(
         &mut self,
         path: &std::path::Path,
-        _force_new_track: bool,
-        _window: &mut Window,
+        start_beat: f32,
         cx: &mut Context<Self>,
     ) -> bool {
-        if !sphere_video_player::is_supported_video_path(path) {
-            return false;
-        }
-
         let path_key = path.to_string_lossy().to_string();
         let clip_name = path
             .file_name()
@@ -4332,11 +4502,12 @@ impl Timeline {
             .map(|s| s.to_string())
             .unwrap_or_else(|| "Reference Video".to_string());
 
-        let (drop_x, _drop_y) = self.drop_position_or_new_track(false);
         let edit = self.begin_track_edit(
             crate::components::timeline::timeline_state::TrackEditScope::track_list(),
         );
-        let clip_id = self.state.import_video_at(path_key, clip_name, drop_x);
+        let clip_id = self
+            .state
+            .insert_video_clip(path_key, clip_name, start_beat.max(0.0));
         self.record_clip_import("Import Video", edit, std::slice::from_ref(&clip_id), cx);
         self.mark_project_changed(cx);
         self.mark_media_changed(cx);
@@ -4388,52 +4559,23 @@ impl Timeline {
         .detach();
     }
 
-    pub(super) fn import_midi_path_at_last_drag(
-        &mut self,
-        path: &std::path::Path,
-        force_new_track: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if !is_supported_midi_ext(path) {
-            return false;
-        }
-        // Where it lands is resolved now: the drag position is gone once the
-        // drop is handled.
-        let (drop_x, drop_y) = self.drop_position_or_new_track(force_new_track);
-        // Read and parse on the background executor (#364): a large file, or
-        // one on a slow network share, froze the UI here and again after the
-        // import dialog. The parse is kept for the dialog's import.
-        let path = path.to_path_buf();
-        cx.spawn_in(window, async move |this, cx| {
-            let read_path = path.clone();
-            let parsed = cx
-                .background_executor()
-                .spawn(async move { read_and_parse_midi_file(&read_path) })
-                .await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                this.finish_midi_drop(&path, parsed, drop_x, drop_y, window, cx);
-            });
-        })
-        .detach();
-        true
-    }
-
-    /// The rest of a MIDI drop, once the file has been read and parsed.
-    fn finish_midi_drop(
+    /// A dropped MIDI file, once read and parsed (on the background executor,
+    /// #364), at the placement its drop resolved to. Returns whether it landed
+    /// or went to the import dialog; a file that could not be read or parsed
+    /// is a status notice and does not count.
+    fn import_dropped_midi(
         &mut self,
         path: &std::path::Path,
         parsed: Result<Vec<super::super::midi_import::ImportedMidiTrack>, String>,
-        drop_x: f32,
-        drop_y: f32,
+        placement: &crate::components::timeline::drop_batch::DropPlacement,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let imported_tracks = match parsed {
             Ok(tracks) => tracks,
             Err(message) => {
                 self.report_edit_notice(message, cx);
-                return;
+                return false;
             }
         };
 
@@ -4449,41 +4591,53 @@ impl Timeline {
                     path: path.to_path_buf(),
                     file_name: midi_import_display_name(path),
                     summary,
-                    drop_x,
-                    drop_y,
+                    placement: placement.clone(),
+                    project_generation: self.project_generation,
                     tracks: std::sync::Arc::new(imported_tracks),
                 };
                 prompt(&request, window, cx);
-                return;
+                return true;
             }
         }
 
-        if !self.apply_midi_import(
+        let imported = self.apply_midi_import(
             path,
             imported_tracks,
             super::super::midi_import::MidiImportOptions::default(),
-            drop_x,
-            drop_y,
+            placement,
             cx,
-        ) {
+        );
+        if !imported {
             eprintln!("[MidiImport] nothing imported from {}", path.display());
         }
+        imported
     }
 
     /// Import a dropped MIDI file with the options the import dialog
-    /// returned, at the lane coordinates its drop resolved to, from the parse
-    /// the drop already made — the file is not read again (#364).
+    /// returned, at the placement its drop resolved to, from the parse the
+    /// drop already made — the file is not read again (#364). Nothing is
+    /// imported when the project has changed since the drop (#385).
     pub fn import_midi_tracks_with_options(
         &mut self,
         path: &std::path::Path,
         tracks: &std::sync::Arc<Vec<super::super::midi_import::ImportedMidiTrack>>,
         options: super::super::midi_import::MidiImportOptions,
-        drop_x: f32,
-        drop_y: f32,
+        placement: &crate::components::timeline::drop_batch::DropPlacement,
+        project_generation: u64,
         cx: &mut Context<Self>,
     ) -> bool {
+        if project_generation != self.project_generation {
+            self.report_edit_notice(
+                format!(
+                    "{} was not imported: it was dropped into a project that is no longer open",
+                    midi_import_display_name(path)
+                ),
+                cx,
+            );
+            return false;
+        }
         let imported_tracks = tracks.as_ref().clone();
-        self.apply_midi_import(path, imported_tracks, options, drop_x, drop_y, cx)
+        self.apply_midi_import(path, imported_tracks, options, placement, cx)
     }
 
     fn apply_midi_import(
@@ -4491,8 +4645,7 @@ impl Timeline {
         path: &std::path::Path,
         mut imported_tracks: Vec<super::super::midi_import::ImportedMidiTrack>,
         options: super::super::midi_import::MidiImportOptions,
-        drop_x: f32,
-        drop_y: f32,
+        placement: &crate::components::timeline::drop_batch::DropPlacement,
         cx: &mut Context<Self>,
     ) -> bool {
         super::super::midi_import::apply_import_options(&mut imported_tracks, options);
@@ -4502,9 +4655,9 @@ impl Timeline {
             crate::components::timeline::timeline_state::TrackEditScope::track_list()
                 .with_markers(),
         );
-        let clips = self
-            .state
-            .import_midi_tracks_at(clip_name, imported_tracks, drop_x, drop_y);
+        let clips =
+            self.state
+                .import_midi_tracks_at_placement(clip_name, imported_tracks, placement);
         if clips.is_empty() {
             self.commit_track_edit("Import MIDI", edit, false, cx);
             return false;
@@ -4579,19 +4732,6 @@ impl Timeline {
         };
         callback(&(path.to_path_buf(), track_id), window, cx);
         true
-    }
-
-    pub(super) fn drop_position_or_new_track(&self, force_new_track: bool) -> (f32, f32) {
-        match self.last_drag_position {
-            Some(p) if !force_new_track => {
-                let x: f32 = p.x.into();
-                let y: f32 = p.y.into();
-                let lane_x = self.state.lane_x_from_window_x(x).max(0.0);
-                let lane_y = self.state.track_viewport_y_from_window_y(y).max(0.0);
-                (lane_x, lane_y)
-            }
-            _ => (0.0, 1.0e9_f32),
-        }
     }
 }
 

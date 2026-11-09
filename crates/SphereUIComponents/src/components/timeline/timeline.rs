@@ -243,6 +243,16 @@ pub struct Timeline {
     /// a synthetic MouseUp, so we have to remember the last cursor position
     /// observed during the drag.
     last_drag_position: Option<gpui::Point<gpui::Pixels>>,
+    /// File drops still waiting for a MIDI file's parse, by drop (#385). Each
+    /// carries the placement it resolved when it was made and applies its
+    /// files in drop order; a project change discards them all.
+    pending_file_drops:
+        std::collections::HashMap<u64, crate::components::timeline::drop_batch::PendingFileDrop>,
+    next_file_drop_id: u64,
+    /// Bumped whenever the project is replaced (opened, created, closed), so
+    /// work started on one project — a pending drop, an open MIDI import
+    /// dialog — is not applied to the next.
+    project_generation: u64,
     file_drop_hint: Option<FileDropHint>,
     clip_clone_hint: Option<ClipCloneHint>,
     /// UI-only Song Text positions calculated from the drag-start snapshot.
@@ -600,16 +610,17 @@ pub type TimelinePluginDragDropCb = std::sync::Arc<
 /// A dropped MIDI file that carries optional payload (markers, controller
 /// lanes, SysEx), parked until the user says what to bring in.
 ///
-/// Carries the resolved lane coordinates rather than relying on
-/// `last_drag_position`, which is cleared as soon as the drop is handled — the
-/// clip still has to land where it was dropped when the dialog closes.
+/// Carries the placement the drop resolved when it was made — a beat and a
+/// track id, not lane pixels the view would read differently once it has
+/// scrolled — so the clip lands where it was dropped when the dialog closes,
+/// and the project it was dropped into, so it never lands in another (#385).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TimelineMidiImportPrompt {
     pub path: std::path::PathBuf,
     pub file_name: String,
     pub summary: crate::components::timeline::midi_import::MidiImportSummary,
-    pub drop_x: f32,
-    pub drop_y: f32,
+    pub placement: crate::components::timeline::drop_batch::DropPlacement,
+    pub project_generation: u64,
     /// The file as read and parsed (once, off the UI thread) on drop; the
     /// import the dialog confirms uses it rather than reading the file again.
     pub tracks: std::sync::Arc<Vec<crate::components::timeline::midi_import::ImportedMidiTrack>>,

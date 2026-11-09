@@ -9,6 +9,7 @@ pub mod automation_target_picker;
 pub mod chord_track;
 pub mod crossfade_overlay;
 pub mod cut_guide;
+pub mod drop_batch;
 pub mod fade_handle_overlay;
 pub mod floating_tools_bar;
 pub mod folder_lane;

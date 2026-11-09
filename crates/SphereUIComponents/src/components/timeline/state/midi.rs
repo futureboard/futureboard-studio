@@ -768,7 +768,20 @@ impl TimelineState {
         drop_x: f32,
         drop_y: f32,
     ) -> Vec<(String, ClipState)> {
-        let start_beat = self.snap_beats(self.x_to_beats(drop_x.max(0.0))).max(0.0);
+        let placement = self.drop_placement_at(drop_x, drop_y);
+        self.import_midi_tracks_at_placement(file_stem, imported_tracks, &placement)
+    }
+
+    /// Import parsed MIDI tracks where a drop resolved to (#385): the first
+    /// track lands on the placement's track while it still exists and takes
+    /// MIDI, otherwise — and every further track always — on a new MIDI track.
+    pub fn import_midi_tracks_at_placement(
+        &mut self,
+        file_stem: String,
+        imported_tracks: Vec<crate::components::timeline::midi_import::ImportedMidiTrack>,
+        placement: &crate::components::timeline::drop_batch::DropPlacement,
+    ) -> Vec<(String, ClipState)> {
+        let start_beat = placement.start_beat.max(0.0);
         let mut markers = Vec::new();
         let mut musical_tracks = Vec::new();
         for track in imported_tracks {
@@ -783,17 +796,11 @@ impl TimelineState {
 
         self.import_midi_markers(start_beat, &markers);
 
-        let first_track_id = match self.track_index_at_y(drop_y) {
-            Some(idx)
-                if matches!(
-                    self.tracks[idx].track_type,
-                    TrackType::Midi | TrackType::Instrument
-                ) =>
-            {
-                self.tracks[idx].id.clone()
-            }
-            _ => self.create_midi_track(),
-        };
+        let first_track_id = self
+            .drop_target_track(placement, |kind| {
+                matches!(kind, TrackType::Midi | TrackType::Instrument)
+            })
+            .unwrap_or_else(|| self.create_midi_track());
 
         let multi_track = musical_tracks.len() > 1;
         let mut clips = Vec::with_capacity(musical_tracks.len());
