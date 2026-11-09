@@ -17,8 +17,8 @@ use mp3lame_encoder::{
 };
 
 use crate::format::{
-    AudioEncodeSpec, AudioEncodeSummary, AudioEncoder, AudioFileFormat, EncodeError, Mp3Bitrate,
-    check_interleaved_len, f32_to_i16,
+    AudioDither, AudioEncodeSpec, AudioEncodeSummary, AudioEncoder, AudioFileFormat, EncodeError,
+    Mp3Bitrate, Quantizer, check_interleaved_len,
 };
 use crate::metadata::AudioMetadata;
 
@@ -33,6 +33,9 @@ pub struct Mp3Encoder {
     pcm: Vec<i16>,
     /// Reused encoded-bytes scratch.
     out: Vec<u8>,
+    /// Float/i32 to the 16-bit PCM LAME takes; [`AudioDither::Off`] unless
+    /// set by [`with_dither`](Mp3Encoder::with_dither).
+    quantizer: Quantizer,
 }
 
 fn map_bitrate(b: Mp3Bitrate) -> Bitrate {
@@ -134,7 +137,14 @@ impl Mp3Encoder {
             finalized: false,
             pcm: Vec::new(),
             out: Vec::new(),
+            quantizer: Quantizer::new(AudioDither::Off),
         })
+    }
+
+    /// Dither the 16-bit PCM handed to LAME with `dither`.
+    pub fn with_dither(mut self, dither: AudioDither) -> Self {
+        self.quantizer = Quantizer::new(dither);
+        self
     }
 
     fn encode_pcm(&mut self) -> Result<(), EncodeError> {
@@ -177,7 +187,7 @@ impl AudioEncoder for Mp3Encoder {
         self.pcm.clear();
         self.pcm.reserve(frames.len());
         for &x in frames {
-            self.pcm.push(f32_to_i16(x));
+            self.pcm.push(self.quantizer.f32_to_i16(x));
         }
         self.encode_pcm()
     }
@@ -190,7 +200,7 @@ impl AudioEncoder for Mp3Encoder {
         self.pcm.clear();
         self.pcm.reserve(frames.len());
         for &x in frames {
-            self.pcm.push((x >> 16) as i16);
+            self.pcm.push(self.quantizer.i32_to_i16(x));
         }
         self.encode_pcm()
     }

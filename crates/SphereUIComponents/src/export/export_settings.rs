@@ -8,8 +8,8 @@
 use std::path::PathBuf;
 
 use sphere_encoder::{
-    AudioEncodeOptions, AudioFileFormat, AudioSampleFormat, FlacEncodeOptions, Mp3Bitrate,
-    Mp3EncodeOptions,
+    AudioDither, AudioEncodeOptions, AudioFileFormat, AudioSampleFormat, FlacEncodeOptions,
+    Mp3Bitrate, Mp3EncodeOptions,
 };
 use DirectAudio::types::EngineProjectSnapshot;
 use DirectAudio::{
@@ -602,6 +602,9 @@ impl ExportSettings {
 
         let mut encode_options = AudioEncodeOptions {
             format: self.format,
+            // Studio exports dither 16/24-bit output like the live device
+            // output does (#322). Float and 32-bit output is never dithered.
+            dither: AudioDither::Tpdf,
             ..Default::default()
         };
         encode_options.flac = FlacEncodeOptions {
