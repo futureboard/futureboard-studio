@@ -1,16 +1,15 @@
 //! VST3 MIDI preview + local audio output for the external PluginHost process.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use DirectAudio::vst3_processor::{
-    PluginMidiOutEvent, Vst3MidiEvent, Vst3PluginState, Vst3RuntimeProcessor,
+    PluginMidiOutEvent, Vst3MidiEvent, Vst3MidiEventKind, Vst3PluginState, Vst3RuntimeProcessor,
 };
 
-use crate::audio_bridge::{SharedMidiEvent, MAX_CHANNELS};
+use crate::audio_bridge::{SharedMidiEvent, MAX_CHANNELS, MIDI_RING_CAP};
 
 fn forensic_trace_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -112,137 +111,186 @@ impl VoiceMidiState {
             .push(Vst3MidiEvent::control_change(0, ch, CC_ALL_SOUND_OFF, 0.0));
         self.tail_blocks = PREVIEW_TAIL_BLOCKS;
     }
+}
 
-    /// Apply one engine-pushed shared-memory MIDI event. Raw status byte: high
-    /// nibble = message, low nibble = channel.
-    fn apply_shared(&mut self, ev: &SharedMidiEvent, instance_id: &str) {
-        let channel = ev.status & 0x0F;
-        let kind = ev.status & 0xF0;
-        match kind {
-            // Note-on with velocity 0 is a note-off (running-status idiom).
-            0x90 if ev.data2 > 0 => {
-                let vel = ev.data2.clamp(1, 127) as f32 / 127.0;
-                if forensic_trace_enabled() {
-                    eprintln!(
-                        "[plugin-host-midi-consume] note_on instance={instance_id} pitch={} offset={}",
-                        ev.data1, ev.sample_offset
-                    );
-                }
-                self.pending_events.push(Vst3MidiEvent::note_on(
-                    ev.sample_offset,
-                    channel,
-                    ev.data1.min(127),
-                    vel,
-                ));
-                let key = PreviewNoteKey {
-                    channel: channel.min(15),
-                    pitch: ev.data1.min(127),
-                };
-                if !self.active_notes.contains(&key) {
-                    self.active_notes.push(key);
-                }
-                self.tail_blocks = PREVIEW_TAIL_BLOCKS;
+/// Translate one engine-pushed shared-memory MIDI event into the bridge's
+/// event form. Raw status byte: high nibble = message, low nibble = channel.
+/// `None` for a message a VST3 voice has no use for.
+fn shared_event_to_vst3(ev: &SharedMidiEvent, instance_id: &str) -> Option<Vst3MidiEvent> {
+    let channel = ev.status & 0x0F;
+    match ev.status & 0xF0 {
+        // Note-on with velocity 0 is a note-off (running-status idiom).
+        0x90 if ev.data2 > 0 => {
+            if forensic_trace_enabled() {
+                eprintln!(
+                    "[plugin-host-midi-consume] note_on instance={instance_id} pitch={} offset={}",
+                    ev.data1, ev.sample_offset
+                );
             }
-            0x80 | 0x90 => {
-                if forensic_trace_enabled() {
-                    eprintln!(
-                        "[plugin-host-midi-consume] note_off instance={instance_id} pitch={} offset={}",
-                        ev.data1, ev.sample_offset
-                    );
-                }
-                self.pending_events.push(Vst3MidiEvent::note_off(
-                    ev.sample_offset,
-                    channel,
-                    ev.data1.min(127),
-                    0.0,
-                ));
-                let key = PreviewNoteKey {
-                    channel: channel.min(15),
-                    pitch: ev.data1.min(127),
-                };
-                self.active_notes.retain(|n| *n != key);
-                self.tail_blocks = PREVIEW_TAIL_BLOCKS;
-            }
-            0xB0 => {
-                self.pending_events.push(Vst3MidiEvent::control_change(
-                    ev.sample_offset,
-                    channel,
-                    ev.data1 as u16,
-                    ev.data2 as f32 / 127.0,
-                ));
-                self.tail_blocks = PREVIEW_TAIL_BLOCKS;
-            }
-            // Raw channel pressure / pitch bend map back to the VST3
-            // `kAfterTouch` (128) / `kPitchBend` (129) controllers, which the
-            // processor resolves through the plugin's IMidiMapping.
-            0xD0 => {
-                self.pending_events.push(Vst3MidiEvent::control_change(
-                    ev.sample_offset,
-                    channel,
-                    128,
-                    ev.data1.min(127) as f32 / 127.0,
-                ));
-                self.tail_blocks = PREVIEW_TAIL_BLOCKS;
-            }
-            // A program change maps back to VST3 `kCtrlProgramChange` (130),
-            // the program as n/127, which each bridge turns into its own
-            // form: a mapped or program-change parameter, or raw `0xC0`.
-            0xC0 => {
-                self.pending_events.push(Vst3MidiEvent::control_change(
-                    ev.sample_offset,
-                    channel,
-                    130,
-                    ev.data1.min(127) as f32 / 127.0,
-                ));
-                self.tail_blocks = PREVIEW_TAIL_BLOCKS;
-            }
-            0xE0 => {
-                let bend = u16::from(ev.data1 & 0x7F) | (u16::from(ev.data2 & 0x7F) << 7);
-                self.pending_events.push(Vst3MidiEvent::control_change(
-                    ev.sample_offset,
-                    channel,
-                    129,
-                    f32::from(bend) / 16_383.0,
-                ));
-                self.tail_blocks = PREVIEW_TAIL_BLOCKS;
-            }
-            _ => {}
+            let vel = ev.data2.clamp(1, 127) as f32 / 127.0;
+            Some(Vst3MidiEvent::note_on(
+                ev.sample_offset,
+                channel,
+                ev.data1.min(127),
+                vel,
+            ))
         }
+        0x80 | 0x90 => {
+            if forensic_trace_enabled() {
+                eprintln!(
+                    "[plugin-host-midi-consume] note_off instance={instance_id} pitch={} offset={}",
+                    ev.data1, ev.sample_offset
+                );
+            }
+            Some(Vst3MidiEvent::note_off(
+                ev.sample_offset,
+                channel,
+                ev.data1.min(127),
+                0.0,
+            ))
+        }
+        0xB0 => Some(Vst3MidiEvent::control_change(
+            ev.sample_offset,
+            channel,
+            ev.data1 as u16,
+            ev.data2 as f32 / 127.0,
+        )),
+        // Raw channel pressure / pitch bend map back to the VST3
+        // `kAfterTouch` (128) / `kPitchBend` (129) controllers, which the
+        // processor resolves through the plugin's IMidiMapping.
+        0xD0 => Some(Vst3MidiEvent::control_change(
+            ev.sample_offset,
+            channel,
+            128,
+            ev.data1.min(127) as f32 / 127.0,
+        )),
+        // A program change maps back to VST3 `kCtrlProgramChange` (130),
+        // the program as n/127, which each bridge turns into its own
+        // form: a mapped or program-change parameter, or raw `0xC0`.
+        0xC0 => Some(Vst3MidiEvent::control_change(
+            ev.sample_offset,
+            channel,
+            130,
+            ev.data1.min(127) as f32 / 127.0,
+        )),
+        0xE0 => {
+            let bend = u16::from(ev.data1 & 0x7F) | (u16::from(ev.data2 & 0x7F) << 7);
+            Some(Vst3MidiEvent::control_change(
+                ev.sample_offset,
+                channel,
+                129,
+                f32::from(bend) / 16_383.0,
+            ))
+        }
+        _ => None,
     }
 }
+
+/// Events one voice can take into a single block: a full engine ring plus as
+/// many preview events again. Preallocated when the voice is created, so the
+/// producer never grows it; what does not fit waits (in the ring, or in the
+/// preview queue) for the next block.
+const VOICE_BLOCK_EVENT_CAPACITY: usize = MIDI_RING_CAP * 2;
+/// One bit per channel and key.
+const HELD_NOTE_WORDS: usize = 16 * 128 / 64;
 
 /// What one plug-in instance shares between the host's main thread (IPC,
 /// editor windows, state) and its audio producer.
 ///
-/// Two locks, so the main thread never holds up audio and audio never holds
-/// up the main thread:
-/// - `events` is the MIDI queue. It is held only to push an event or to hand
-///   the queue to the producer (a pointer swap), never across `process()`.
+/// Two locks, and the producer only ever *tries* either, so the main thread
+/// never holds up audio and audio never holds up the main thread:
+/// - `events` is the preview MIDI queue the main thread pushes to. The
+///   producer copies from it into its own buffer when it is free; when the
+///   main thread happens to hold it, those events wait one block.
 /// - `render` is the producer's own: it holds it across `process()` with the
-///   events of that block. The main thread takes it only inside
-///   [`VoiceShared::suspend`], to wait out one block in flight.
+///   events of that block, in a buffer preallocated here. The main thread
+///   takes it only inside [`VoiceShared::suspend`], to wait out one block in
+///   flight.
+///
+/// Engine MIDI (the instance's shared-memory ring) goes straight from the
+/// ring into `render`'s buffer, never through `events`; the notes it leaves
+/// sounding are tracked in `held_notes` atomics so a panic can release them.
 ///
 /// A control call that must not overlap `process()` — `setState`, the
 /// editor's `removed()` — suspends the voice instead of holding a lock the
 /// producer waits on: the producer skips it (its input passes through) for
 /// as long as the call takes, and every other voice keeps playing.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct VoiceShared {
     events: Mutex<VoiceMidiState>,
     render: Mutex<Vec<Vst3MidiEvent>>,
     suspended: AtomicBool,
+    /// Set once on unload and never cleared, unlike `suspended`.
+    retired: AtomicBool,
+    held_notes: [AtomicU64; HELD_NOTE_WORDS],
+}
+
+impl Default for VoiceShared {
+    fn default() -> Self {
+        Self {
+            events: Mutex::new(VoiceMidiState::default()),
+            render: Mutex::new(Vec::with_capacity(VOICE_BLOCK_EVENT_CAPACITY)),
+            suspended: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
+            held_notes: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
 }
 
 impl VoiceShared {
     /// Takes the voice out of processing until the guard drops; returns once
     /// the block in flight, if any, has finished.
     fn suspend(&self) -> VoiceSuspended<'_> {
+        self.stop_processing();
+        VoiceSuspended(self)
+    }
+
+    /// Takes the voice out of processing for good (it is being unloaded).
+    /// The producer may still hold it in its block plan until it adopts one
+    /// without it; until then it skips it like a suspended voice.
+    fn retire(&self) {
+        self.retired.store(true, Ordering::SeqCst);
+        self.stop_processing();
+    }
+
+    fn stop_processing(&self) {
         self.suspended.store(true, Ordering::SeqCst);
         // A producer that took `render` before the flag was set is inside
         // `process()`: this waits for it. One that takes it after this lock is
         // released sees the flag (the lock orders the store before its load).
         drop(self.render.lock());
-        VoiceSuspended(self)
+    }
+
+    /// Producer: remember which engine notes are sounding. Wait-free.
+    fn track_engine_note(&self, event: &Vst3MidiEvent) {
+        let index = usize::from(event.channel.min(15)) * 128 + usize::from(event.pitch.min(127));
+        let (word, bit) = (index / 64, 1u64 << (index % 64));
+        if event.kind == Vst3MidiEventKind::NoteOn as u8 {
+            self.held_notes[word].fetch_or(bit, Ordering::Relaxed);
+        } else if event.kind == Vst3MidiEventKind::NoteOff as u8 {
+            self.held_notes[word].fetch_and(!bit, Ordering::Relaxed);
+        }
+    }
+
+    /// Main thread: release every sounding note — the preview notes queued
+    /// here and the engine notes the producer saw — then sustain and the
+    /// all-notes/all-sound controllers.
+    fn panic(&self) {
+        let mut state = self.events.lock();
+        for (word_index, word) in self.held_notes.iter().enumerate() {
+            let mut bits = word.swap(0, Ordering::Relaxed);
+            while bits != 0 {
+                let index = word_index * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                state.pending_events.push(Vst3MidiEvent::note_off(
+                    0,
+                    (index / 128) as u8,
+                    (index % 128) as u8,
+                    0.0,
+                ));
+            }
+        }
+        state.panic();
     }
 }
 
@@ -254,34 +302,66 @@ impl Drop for VoiceSuspended<'_> {
     }
 }
 
-/// One entry of the published block-path snapshot: a shallow processor handle
-/// (refcounted over the same C++ instance) plus the voice's shared state.
-#[derive(Debug, Clone)]
-struct BridgeVoice {
-    instance_id: String,
-    processor: Vst3RuntimeProcessor,
-    midi: Arc<VoiceShared>,
+/// A source of engine MIDI for one block: the instance's shared-memory ring
+/// (`try_pop`), or nothing.
+pub type EngineMidiSource<'a> = &'a mut dyn FnMut() -> Option<SharedMidiEvent>;
+
+/// Producer: move engine MIDI from the instance's ring into the voice's block
+/// buffer, up to the buffer's preallocated capacity; the rest stays in the
+/// ring for the next block. Returns how many ring events were taken.
+fn take_engine_midi(
+    voice: &VoiceShared,
+    block: &mut Vec<Vst3MidiEvent>,
+    engine_midi: EngineMidiSource<'_>,
+    instance_id: &str,
+) -> u32 {
+    let mut taken = 0;
+    while block.len() < block.capacity() {
+        let Some(ev) = engine_midi() else {
+            break;
+        };
+        taken += 1;
+        if let Some(event) = shared_event_to_vst3(&ev, instance_id) {
+            voice.track_engine_note(&event);
+            block.push(event);
+        }
+    }
+    taken
 }
 
-/// Starts a voice's block: the producer's lock and the block's events, or
-/// `None` when the voice is suspended or another renderer has it this block —
-/// never a wait. The queue is swapped in whole, so no event is copied and no
-/// buffer is allocated; the producer's cleared buffer becomes the new queue.
-fn begin_voice_block(
-    voice: &VoiceShared,
-) -> Option<parking_lot::MutexGuard<'_, Vec<Vst3MidiEvent>>> {
-    let mut block = voice.render.try_lock()?;
-    if voice.suspended.load(Ordering::Acquire) {
-        return None;
+/// Starts a voice's block: the producer's lock holding the block's events,
+/// or `None` when the voice is suspended, not `ready`, or another renderer
+/// has it this block — never a wait, and never an allocation. Engine MIDI is
+/// taken into the block buffer even when the voice will not render; it stays
+/// there, in order, for the next block that does. Also returns how many
+/// engine events were taken.
+fn begin_voice_block<'a>(
+    voice: &'a VoiceShared,
+    engine_midi: EngineMidiSource<'_>,
+    instance_id: &str,
+    ready: bool,
+) -> (Option<parking_lot::MutexGuard<'a, Vec<Vst3MidiEvent>>>, u32) {
+    let Some(mut block) = voice.render.try_lock() else {
+        return (None, 0);
+    };
+    let taken = take_engine_midi(voice, &mut block, engine_midi, instance_id);
+    if !ready || voice.suspended.load(Ordering::Acquire) || voice.retired.load(Ordering::Acquire) {
+        return (None, taken);
     }
-    let mut state = voice.events.lock();
-    std::mem::swap(&mut state.pending_events, &mut *block);
-    if block.is_empty() && state.active_notes.is_empty() {
-        state.tail_blocks = state.tail_blocks.saturating_sub(1);
-    } else {
-        state.tail_blocks = PREVIEW_TAIL_BLOCKS;
+    // Preview events from the main thread. Copied into the preallocated
+    // buffer (no allocation here: the queue only grows on the main thread).
+    // If the main thread is pushing right now they wait one block.
+    if let Some(mut state) = voice.events.try_lock() {
+        let room = block.capacity() - block.len();
+        let moved = state.pending_events.len().min(room);
+        block.extend(state.pending_events.drain(..moved));
+        if block.is_empty() && state.active_notes.is_empty() {
+            state.tail_blocks = state.tail_blocks.saturating_sub(1);
+        } else {
+            state.tail_blocks = PREVIEW_TAIL_BLOCKS;
+        }
     }
-    Some(block)
+    (Some(block), taken)
 }
 
 /// Render one voice block (legacy debug CPAL preview path). A voice it cannot
@@ -295,7 +375,7 @@ fn render_voice(
     out_r: &mut [f32],
     transport: DirectAudio::vst3_processor::RuntimeTransportContext,
 ) {
-    let Some(mut block) = begin_voice_block(voice) else {
+    let (Some(mut block), _) = begin_voice_block(voice, &mut || None, "", true) else {
         out_l.fill(0.0);
         out_r.fill(0.0);
         return;
@@ -305,70 +385,141 @@ fn render_voice(
     // no race. The clone shares the same C++ processor via Arc.
     processor.set_process_context(&transport);
     let _ = processor.process_stereo_block_with_midi(in_l, in_r, out_l, out_r, &block);
-    // Cleared, not dropped: it goes back into the queue next block with the
-    // capacity it has grown to.
+    // Cleared, not dropped: the buffer keeps its preallocated capacity.
     block.clear();
 }
 
-/// Render one voice block for the bridge, and move the MIDI the plug-in
-/// produced in it into `midi_out`. Returns `(channels, midi events)`; `0`
-/// channels when the voice is suspended, and the caller passes its input
-/// through for that block.
-#[allow(clippy::too_many_arguments)]
-fn render_voice_interleaved(
-    processor: &Vst3RuntimeProcessor,
-    voice: &VoiceShared,
-    in_l: &[f32],
-    in_r: &[f32],
-    out_interleaved: &mut [f32],
-    output_channels: usize,
-    transport: DirectAudio::vst3_processor::RuntimeTransportContext,
-    midi_out: &mut [PluginMidiOutEvent],
-) -> (usize, usize) {
-    let Some(mut block) = begin_voice_block(voice) else {
-        return (0, 0);
-    };
-    let mut processor = processor.clone();
-    processor.set_process_context(&transport);
-    let channels = output_channels.clamp(1, MAX_CHANNELS);
-    let got_channels = processor
-        .process_main_output_block_with_midi(in_l, in_r, out_interleaved, channels, &block)
-        .unwrap_or(0);
-    // Still under the voice's render lock: the bridge clears this list at
-    // the start of the next process call.
-    let midi = processor.take_output_midi(midi_out);
-    block.clear();
-    (got_channels.min(channels), midi)
+/// What one bridge block of a VST3 voice did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VoiceBlockResult {
+    /// Output channels produced; `0` when the voice did not render (not
+    /// ready, suspended, failed), and the caller passes its input through.
+    pub channels: usize,
+    /// Engine MIDI events taken from the ring this block.
+    pub midi_in: u32,
+    /// Plug-in MIDI output events written to `midi_out`.
+    pub midi_out: usize,
 }
 
-/// Block-path handle for the audio producer thread. Replaces taking the whole
-/// `PluginHostPreviewEngine` mutex per block: the voice list is an `Arc`
-/// snapshot republished by the engine on load/unload only, and the flags are
-/// atomics. The IPC thread can hold the engine mutex across `LoadPlugin` /
+/// One VST3 voice as the audio producer holds it: a shallow processor handle
+/// (refcounted over the same C++ instance) plus the voice's shared state.
+/// Resolved by instance id on the host's main thread when the producer's
+/// block plan is built, so the block path never looks a voice up by name.
+///
+/// The producer must not hold the last handle: plans it drops go back to the
+/// main thread (see [`crate::rt_handoff`]), which is where a removed voice's
+/// final release — VST3 `terminate` — runs.
+#[derive(Debug, Clone)]
+pub struct BridgeVoice {
+    instance_id: String,
+    processor: Vst3RuntimeProcessor,
+    midi: Arc<VoiceShared>,
+}
+
+impl BridgeVoice {
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    /// Identity of this loaded instance: a reload under the same instance id
+    /// is a different voice.
+    pub fn identity(&self) -> usize {
+        Arc::as_ptr(&self.midi) as usize
+    }
+
+    pub fn main_audio_output_channel_count(&self) -> u32 {
+        self.processor.main_audio_output_channel_count().max(1) as u32
+    }
+
+    /// The plug-in's reported processing latency in samples.
+    pub fn latency_samples(&self) -> i32 {
+        self.processor.get_latency_samples().max(0)
+    }
+
+    /// Apply one engine-pushed parameter change (normalized VST3 ParamID
+    /// value). The C++ processor queues it for the next `process()` call.
+    pub fn apply_param(&self, param_id: u32, value: f32) {
+        let mut processor = self.processor.clone();
+        processor.set_param(param_id, value as f64);
+    }
+
+    /// Render one block of this voice into the interleaved bridge buffer,
+    /// taking the block's engine MIDI from `engine_midi` and moving the MIDI
+    /// the plug-in produced into `midi_out`. Allocation-free and lock-wait-free.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_bridge_block(
+        &self,
+        dsp_ready: bool,
+        engine_midi: EngineMidiSource<'_>,
+        frames: usize,
+        in_l: &[f32],
+        in_r: &[f32],
+        out_interleaved: &mut [f32],
+        output_channels: usize,
+        transport: DirectAudio::vst3_processor::RuntimeTransportContext,
+        midi_out: &mut [PluginMidiOutEvent],
+    ) -> VoiceBlockResult {
+        let channels = output_channels.clamp(1, MAX_CHANNELS);
+        let n = frames
+            .min(in_l.len())
+            .min(in_r.len())
+            .min(out_interleaved.len() / channels);
+        out_interleaved[..n * channels].fill(0.0);
+        let (block, midi_in) =
+            begin_voice_block(&self.midi, engine_midi, &self.instance_id, dsp_ready);
+        let Some(mut block) = block else {
+            return VoiceBlockResult {
+                midi_in,
+                ..VoiceBlockResult::default()
+            };
+        };
+        let mut processor = self.processor.clone();
+        processor.set_process_context(&transport);
+        let got_channels = processor
+            .process_main_output_block_with_midi(
+                &in_l[..n],
+                &in_r[..n],
+                &mut out_interleaved[..n * channels],
+                channels,
+                &block,
+            )
+            .unwrap_or(0);
+        // Still under the voice's render lock: the bridge clears this list at
+        // the start of the next process call.
+        let midi = processor.take_output_midi(midi_out);
+        block.clear();
+        VoiceBlockResult {
+            channels: got_channels.min(channels),
+            midi_in,
+            midi_out: midi,
+        }
+    }
+}
+
+/// The engine's loaded VST3 voices, for the host's main thread to resolve
+/// into the audio producer's block plan, plus the block-path flags. The voice
+/// list is an `Arc` snapshot republished on load/unload; the producer itself
+/// never reads it (its plan carries resolved [`BridgeVoice`] handles), so the
+/// IPC thread can hold the engine mutex across `LoadPlugin` /
 /// `IPlugView::attached` for seconds without ever stalling block production.
 #[derive(Debug)]
 pub struct BridgeAudioShared {
     /// Swapped wholesale on load/unload; the mutex is held only to clone or
     /// replace the `Arc` (nanoseconds), never across plugin or editor work.
     voices: Mutex<Arc<Vec<BridgeVoice>>>,
+    /// `voices.len()`, readable without the mutex.
+    loaded_voices: AtomicUsize,
     dsp_ready: AtomicBool,
     continuous_mode: AtomicBool,
-    /// Bumped on every publish; the producer echoes it after releasing its
-    /// previous snapshot so unload can hand the final processor release (VST3
-    /// terminate) back to the IPC thread. Bounded wait, never required for
-    /// correctness.
-    generation: AtomicU64,
-    observed_generation: AtomicU64,
 }
 
 impl BridgeAudioShared {
     fn new() -> Self {
         Self {
             voices: Mutex::new(Arc::new(Vec::new())),
+            loaded_voices: AtomicUsize::new(0),
             dsp_ready: AtomicBool::new(false),
             continuous_mode: AtomicBool::new(false),
-            generation: AtomicU64::new(0),
-            observed_generation: AtomicU64::new(0),
         }
     }
 
@@ -377,29 +528,9 @@ impl BridgeAudioShared {
     }
 
     fn publish(&self, voices: Vec<BridgeVoice>) {
+        let count = voices.len();
         *self.voices.lock() = Arc::new(voices);
-        self.generation.fetch_add(1, Ordering::AcqRel);
-    }
-
-    /// Called by the producer once per loop iteration, after it has dropped any
-    /// snapshot it held for the block.
-    pub fn mark_snapshot_observed(&self) {
-        self.observed_generation
-            .store(self.generation.load(Ordering::Acquire), Ordering::Release);
-    }
-
-    /// Bounded wait until the producer has observed the latest publish (and so
-    /// released any retired voice's processor clone). Times out silently — the
-    /// worst case is the final release happening on the producer thread.
-    fn wait_snapshot_observed(&self, timeout: Duration) {
-        let target = self.generation.load(Ordering::Acquire);
-        let deadline = Instant::now() + timeout;
-        while self.observed_generation.load(Ordering::Acquire) < target {
-            if Instant::now() >= deadline {
-                return;
-            }
-            std::thread::sleep(Duration::from_micros(100));
-        }
+        self.loaded_voices.store(count, Ordering::Release);
     }
 
     pub fn dsp_ready(&self) -> bool {
@@ -411,7 +542,7 @@ impl BridgeAudioShared {
     }
 
     pub fn has_loaded_instances(&self) -> bool {
-        !self.snapshot().is_empty()
+        self.loaded_voices.load(Ordering::Acquire) > 0
     }
 
     pub fn loaded_instance_ids(&self) -> Vec<String> {
@@ -421,166 +552,14 @@ impl BridgeAudioShared {
             .collect()
     }
 
-    /// Apply one engine-pushed MIDI event to the voice owning `instance_id`.
-    ///
-    /// Each insert has its own shared region (and MIDI ring), so events are
-    /// routed only to the matching voice — never broadcast. With two VSTi
-    /// loaded, notes pushed to one instance must not sound on the other.
-    /// Events for an instance that is not loaded (yet, or anymore) are dropped.
-    pub fn apply_shared_midi(&self, instance_id: &str, ev: SharedMidiEvent) {
-        for voice in self.snapshot().iter() {
-            if voice.instance_id == instance_id {
-                voice
-                    .midi
-                    .events
-                    .lock()
-                    .apply_shared(&ev, &voice.instance_id);
-                return;
-            }
-        }
-    }
-
-    /// The reported processing latency (samples) of the voice owning
-    /// `instance_id`, or `None` if it is not loaded. Used by the host to publish
-    /// `latency_samples` into the shared region for the engine's PDC/reporting.
-    pub fn voice_latency_samples(&self, instance_id: &str) -> Option<i32> {
+    /// The voice loaded as `instance_id`, for building the producer's block
+    /// plan. Main thread only (it takes the snapshot mutex and compares
+    /// names); the block path uses the handle it returns.
+    pub fn voice_for(&self, instance_id: &str) -> Option<BridgeVoice> {
         self.snapshot()
             .iter()
-            .find(|v| v.instance_id == instance_id)
-            .map(|v| v.processor.get_latency_samples().max(0))
-    }
-
-    pub fn main_audio_output_channel_count_for_instance(&self, instance_id: &str) -> Option<u32> {
-        self.snapshot()
-            .iter()
-            .find(|v| v.instance_id == instance_id)
-            .map(|v| v.processor.main_audio_output_channel_count().max(1) as u32)
-    }
-
-    /// Apply one engine-pushed parameter change (normalized VST3 ParamID value)
-    /// to the voice owning `instance_id`. The C++ processor queues it for the
-    /// next `process()` call; routed to the matching voice only.
-    pub fn apply_shared_param(&self, instance_id: &str, param_id: u32, value: f32) {
-        for voice in self.snapshot().iter() {
-            if voice.instance_id == instance_id {
-                let mut processor = voice.processor.clone();
-                processor.set_param(param_id, value as f64);
-                return;
-            }
-        }
-    }
-
-    /// Render one block for a single insert instance (serial FX chain path)
-    /// into caller-provided output buffers. Allocation-free: the producer
-    /// thread reuses stack buffers every block instead of allocating two `Vec`s
-    /// per callback, which used to cause latency spikes on the producer and
-    /// occasional missed blocks (audible as VSTi stutter / dropped notes).
-    #[allow(clippy::too_many_arguments)]
-    pub fn render_single_voice(
-        &self,
-        instance_id: &str,
-        frames: usize,
-        in_l: &[f32],
-        in_r: &[f32],
-        out_l: &mut [f32],
-        out_r: &mut [f32],
-        transport: DirectAudio::vst3_processor::RuntimeTransportContext,
-    ) {
-        let n = frames.min(out_l.len()).min(out_r.len());
-        out_l[..n].fill(0.0);
-        out_r[..n].fill(0.0);
-        if !self.dsp_ready() {
-            return;
-        }
-        let voices = self.snapshot();
-        if let Some(voice) = voices.iter().find(|v| v.instance_id == instance_id) {
-            render_voice(
-                &voice.processor,
-                &voice.midi,
-                in_l,
-                in_r,
-                &mut out_l[..n],
-                &mut out_r[..n],
-                transport,
-            );
-        }
-    }
-
-    /// Render one block for a single insert instance into the interleaved
-    /// bridge buffer, and move the MIDI the plug-in produced in it into
-    /// `midi_out`. Returns `(channels, midi events)`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn render_single_voice_interleaved(
-        &self,
-        instance_id: &str,
-        frames: usize,
-        in_l: &[f32],
-        in_r: &[f32],
-        out_interleaved: &mut [f32],
-        output_channels: usize,
-        transport: DirectAudio::vst3_processor::RuntimeTransportContext,
-        midi_out: &mut [PluginMidiOutEvent],
-    ) -> (usize, usize) {
-        let channels = output_channels.clamp(1, MAX_CHANNELS);
-        let n = frames
-            .min(in_l.len())
-            .min(in_r.len())
-            .min(out_interleaved.len() / channels);
-        out_interleaved[..n * channels].fill(0.0);
-        if !self.dsp_ready() {
-            return (0, 0);
-        }
-        let voices = self.snapshot();
-        if let Some(voice) = voices.iter().find(|v| v.instance_id == instance_id) {
-            render_voice_interleaved(
-                &voice.processor,
-                &voice.midi,
-                &in_l[..n],
-                &in_r[..n],
-                &mut out_interleaved[..n * channels],
-                channels,
-                transport,
-                midi_out,
-            )
-        } else {
-            (0, 0)
-        }
-    }
-
-    /// Render one block of all loaded voices without touching the engine mutex.
-    pub fn render_block_with_input(
-        &self,
-        frames: usize,
-        in_l: &[f32],
-        in_r: &[f32],
-    ) -> (Vec<f32>, Vec<f32>) {
-        let mut mix_l = vec![0.0f32; frames];
-        let mut mix_r = vec![0.0f32; frames];
-        let voices = self.snapshot();
-        if voices.is_empty() || !self.dsp_ready() {
-            return (mix_l, mix_r);
-        }
-        let mut out_l = vec![0.0f32; frames];
-        let mut out_r = vec![0.0f32; frames];
-        // Legacy debug mixer path (CPAL preview): no engine transport available,
-        // so use defaults. The shared-bridge path supplies real transport.
-        let transport = DirectAudio::vst3_processor::RuntimeTransportContext::default();
-        for voice in voices.iter() {
-            render_voice(
-                &voice.processor,
-                &voice.midi,
-                in_l,
-                in_r,
-                &mut out_l,
-                &mut out_r,
-                transport,
-            );
-            for i in 0..frames {
-                mix_l[i] += out_l[i];
-                mix_r[i] += out_r[i];
-            }
-        }
-        (mix_l, mix_r)
+            .find(|voice| voice.instance_id == instance_id)
+            .cloned()
     }
 }
 
@@ -899,22 +878,25 @@ impl PluginHostPreviewEngine {
         eprintln!("[plugin-host-registry] unload instance={plugin_instance_id}");
         let retired = self.instances.remove(plugin_instance_id);
         if let Some(instance) = &retired {
-            let _suspended = instance.midi.suspend();
+            // Out of processing for good: from here the producer skips the
+            // voice (its input passes through) until it adopts a block plan
+            // without it.
+            instance.midi.retire();
             instance.processor.view_detach();
-            instance.midi.events.lock().panic();
+            instance.midi.panic();
         }
         if self.instances.is_empty() {
             self.set_continuous_mode(false);
         }
         if retired.is_some() {
-            // Publish the snapshot without this voice, then give the producer a
-            // bounded window to drop its block snapshot so the final processor
-            // release (VST3 terminate) happens on this thread, not mid-block on
-            // the audio producer.
             self.publish_bridge_snapshot();
-            self.bridge
-                .wait_snapshot_observed(Duration::from_millis(10));
         }
+        // No wait on the producer here. It may still hold this voice in its
+        // current block plan, but it never drops a plan: it hands the one it
+        // replaces back to the host's main thread, which frees it (see
+        // `rt_handoff`). So whichever handle goes last — this one or the
+        // plan's — the final release (VST3 `terminate`) runs on the main
+        // thread, however long the producer's block takes.
         drop(retired);
         eprintln!("[plugin-host-registry] instances={}", self.instances.len());
     }
@@ -997,7 +979,7 @@ impl PluginHostPreviewEngine {
         if let Some(instance) = self.instances.get(plugin_instance_id) {
             let _suspended = instance.midi.suspend();
             instance.processor.view_detach();
-            instance.midi.events.lock().panic();
+            instance.midi.panic();
         }
     }
 
@@ -1112,7 +1094,7 @@ impl PluginHostPreviewEngine {
         let Some(instance) = self.instances.get(plugin_instance_id) else {
             return;
         };
-        instance.midi.events.lock().panic();
+        instance.midi.panic();
     }
 
     pub fn midi_panic(&mut self, plugin_instance_id: &str) {
@@ -1293,7 +1275,8 @@ pub fn try_start_preview_output(shared: &SharedPluginHostPreview) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use DirectAudio::vst3_processor::Vst3MidiEventKind;
+    use crate::test_alloc::count_heap_events;
+    use std::collections::VecDeque;
 
     fn shared(status: u8, data1: u8, data2: u8) -> SharedMidiEvent {
         SharedMidiEvent {
@@ -1305,61 +1288,186 @@ mod tests {
         }
     }
 
+    /// Stands in for the instance's shared-memory ring.
+    fn ring(events: &[SharedMidiEvent]) -> VecDeque<SharedMidiEvent> {
+        events.iter().copied().collect()
+    }
+
     /// Raw pitch bend / channel pressure from the engine ring used to be
     /// dropped here, so a bridged VST3 never saw a keyboard's bend wheel.
     #[test]
     fn shared_pitch_bend_and_pressure_reach_the_vst3_controllers() {
-        let mut state = VoiceMidiState::default();
-        state.apply_shared(&shared(0xE3, 0x7F, 0x7F), "insert-1");
-        state.apply_shared(&shared(0xE3, 0x00, 0x40), "insert-1");
-        state.apply_shared(&shared(0xD3, 100, 0), "insert-1");
-
-        let events: Vec<(u8, u8, u8, f32)> = state
-            .pending_events
-            .iter()
-            .map(|ev| (ev.kind, ev.channel, ev.pitch, ev.velocity))
-            .collect();
+        let events: Vec<(u8, u8, u8, f32, u32)> = [
+            shared(0xE3, 0x7F, 0x7F),
+            shared(0xE3, 0x00, 0x40),
+            shared(0xD3, 100, 0),
+        ]
+        .iter()
+        .filter_map(|ev| shared_event_to_vst3(ev, "insert-1"))
+        .map(|ev| (ev.kind, ev.channel, ev.pitch, ev.velocity, ev.sample_offset))
+        .collect();
         let cc = Vst3MidiEventKind::ControlChange as u8;
         assert_eq!(events.len(), 3);
-        assert_eq!(events[0], (cc, 3, 129, 1.0));
+        assert_eq!(events[0], (cc, 3, 129, 1.0, 7));
         assert_eq!((events[1].0, events[1].1, events[1].2), (cc, 3, 129));
         assert!((events[1].3 - 0.5).abs() < 1.0e-3, "centre stays unbent");
         assert_eq!((events[2].0, events[2].1, events[2].2), (cc, 3, 128));
-        assert!(state.pending_events.iter().all(|ev| ev.sample_offset == 7));
+        assert!(events.iter().all(|ev| ev.4 == 7));
     }
 
-    /// The IPC preview fallback carries a 7-bit bend on controller 129; it
-    /// must stay a bend (not CC 127) and centre on the unbent value.
     #[test]
     fn a_suspended_voice_is_skipped_without_losing_its_events() {
         let voice = VoiceShared::default();
         voice.events.lock().preview_note_on(0, 60, 100);
+        let mut engine = ring(&[shared(0x90, 64, 90)]);
         {
             let _suspended = voice.suspend();
-            // The producer does not wait: it skips the voice.
-            assert!(begin_voice_block(&voice).is_none());
+            // The producer does not wait: it skips the voice, but takes the
+            // engine's events into its own buffer.
+            let (block, taken) = begin_voice_block(&voice, &mut || engine.pop_front(), "i", true);
+            assert!(block.is_none());
+            assert_eq!(taken, 1);
             // The main thread still queues events meanwhile.
             voice.events.lock().preview_note_off(0, 60);
         }
-        let block = begin_voice_block(&voice).expect("resumed");
+        let (block, taken) = begin_voice_block(&voice, &mut || engine.pop_front(), "i", true);
+        let block = block.expect("resumed");
+        assert_eq!(taken, 0);
         assert_eq!(
             block.len(),
-            2,
-            "events queued while suspended are delivered"
+            3,
+            "engine and preview events queued while suspended are delivered"
         );
+        assert_eq!(block[0].pitch, 64, "the engine note keeps its place");
         assert!(voice.events.lock().pending_events.is_empty());
     }
 
     #[test]
     fn the_event_queue_is_free_while_a_block_is_rendering() {
         let voice = VoiceShared::default();
-        let block = begin_voice_block(&voice).expect("block");
+        let (block, _) = begin_voice_block(&voice, &mut || None, "i", true);
+        let block = block.expect("block");
         // `process()` would run here, holding `render` only: the main thread
         // can still queue a note.
         assert!(voice.events.try_lock().is_some());
         // A second renderer does not wait for this one either.
-        assert!(begin_voice_block(&voice).is_none());
+        assert!(begin_voice_block(&voice, &mut || None, "i", true)
+            .0
+            .is_none());
         drop(block);
+    }
+
+    /// #318: the producer never waits on the main thread's preview queue. If
+    /// the main thread is pushing, the preview events wait one block.
+    #[test]
+    fn a_busy_preview_queue_does_not_hold_the_block() {
+        let voice = VoiceShared::default();
+        voice.events.lock().preview_note_on(0, 60, 100);
+        let held = voice.events.lock();
+        let mut engine = ring(&[shared(0x90, 64, 90)]);
+        {
+            let (block, taken) = begin_voice_block(&voice, &mut || engine.pop_front(), "i", true);
+            let mut block = block.expect("rendered");
+            assert_eq!(taken, 1);
+            assert_eq!(block.len(), 1, "engine MIDI only");
+            block.clear();
+        }
+        drop(held);
+        let (block, _) = begin_voice_block(&voice, &mut || None, "i", true);
+        assert_eq!(block.expect("rendered")[0].pitch, 60);
+    }
+
+    /// #318: dense engine MIDI reaches a VST3 voice without the producer
+    /// allocating, even in a burst far larger than any before it; what does
+    /// not fit this block stays in the ring for the next one.
+    #[test]
+    fn engine_midi_bursts_take_no_heap_and_overflow_waits_in_the_ring() {
+        let voice = VoiceShared::default();
+        voice.events.lock().preview_note_on(0, 1, 100);
+        let burst = VOICE_BLOCK_EVENT_CAPACITY + 100;
+        let mut engine: VecDeque<SharedMidiEvent> = (0..burst)
+            .map(|i| shared(0x90 | (i % 16) as u8, (i % 128) as u8, 100))
+            .collect();
+        let (taken, events) = count_heap_events(|| {
+            let (block, taken) = begin_voice_block(&voice, &mut || engine.pop_front(), "i", true);
+            let mut block = block.expect("rendered");
+            assert_eq!(block.len(), VOICE_BLOCK_EVENT_CAPACITY);
+            block.clear();
+            taken
+        });
+        assert_eq!(events, 0, "the block path allocated or freed");
+        assert_eq!(taken as usize, VOICE_BLOCK_EVENT_CAPACITY);
+        assert_eq!(engine.len(), 100, "the overflow stays in the ring");
+        // The preview event that did not fit is still queued.
+        assert_eq!(voice.events.lock().pending_events.len(), 1);
+
+        let (taken, events) = count_heap_events(|| {
+            let (block, taken) = begin_voice_block(&voice, &mut || engine.pop_front(), "i", true);
+            let mut block = block.expect("rendered");
+            assert_eq!(block.len(), 101);
+            block.clear();
+            taken
+        });
+        assert_eq!(events, 0);
+        assert_eq!(taken, 100);
+        assert!(voice.events.lock().pending_events.is_empty());
+    }
+
+    /// Engine notes no longer pass through the preview queue, so a panic
+    /// (editor detach, unload, all-notes-off) still has to release them.
+    #[test]
+    fn panic_releases_the_engine_notes_still_sounding() {
+        let voice = VoiceShared::default();
+        let mut engine = ring(&[
+            shared(0x92, 60, 100),
+            shared(0x92, 64, 100),
+            shared(0x82, 60, 0),
+            shared(0x9F, 127, 1),
+        ]);
+        let (block, _) = begin_voice_block(&voice, &mut || engine.pop_front(), "i", true);
+        block.expect("rendered").clear();
+        voice.panic();
+        let note_off = Vst3MidiEventKind::NoteOff as u8;
+        let released: Vec<(u8, u8)> = voice
+            .events
+            .lock()
+            .pending_events
+            .iter()
+            .filter(|ev| ev.kind == note_off)
+            .map(|ev| (ev.channel, ev.pitch))
+            .collect();
+        assert_eq!(released, vec![(2, 64), (15, 127)]);
+        assert!(voice
+            .held_notes
+            .iter()
+            .all(|word| word.load(Ordering::Relaxed) == 0));
+    }
+
+    /// #296: a voice being unloaded stays out of processing for good, even
+    /// though the producer may still hold it in its plan until it adopts the
+    /// next one — and a suspend/resume pair cannot bring it back.
+    #[test]
+    fn a_retired_voice_is_never_rendered_again() {
+        let voice = VoiceShared::default();
+        voice.retire();
+        assert!(begin_voice_block(&voice, &mut || None, "i", true)
+            .0
+            .is_none());
+        drop(voice.suspend());
+        assert!(begin_voice_block(&voice, &mut || None, "i", true)
+            .0
+            .is_none());
+    }
+
+    #[test]
+    fn a_voice_that_is_not_ready_keeps_its_events() {
+        let voice = VoiceShared::default();
+        let mut engine = ring(&[shared(0x90, 64, 90)]);
+        let (block, taken) = begin_voice_block(&voice, &mut || engine.pop_front(), "i", false);
+        assert!(block.is_none());
+        assert_eq!(taken, 1);
+        let (block, _) = begin_voice_block(&voice, &mut || None, "i", true);
+        assert_eq!(block.expect("ready").len(), 1);
     }
 
     #[test]
