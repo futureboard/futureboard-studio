@@ -659,3 +659,290 @@ fn slow_block_reports_are_published_without_heap_work_and_taken_once() {
     assert_eq!(taken.severity(), "error");
     assert_eq!(count, 3);
 }
+
+// ── #312: time signature map changes ──────────────────────────────────────
+
+#[test]
+fn first_time_signature_command_after_engine_creation_and_device_open_is_realtime_clean() {
+    let engine = EngineInner::new();
+    let (rx, mut runtime) = engine.open_test_stream(SR);
+    let shared = Arc::clone(&engine.shared);
+    let mut local = LocalAudioState::new(SR as f64);
+
+    let first = rx
+        .try_recv()
+        .expect("the device open re-seeds the callback with tempo map");
+    assert!(matches!(first, EngineCommand::SetTempoMap(_)));
+    let _ = callback_drains(first, &mut runtime, &shared, &mut local);
+
+    let second = rx
+        .try_recv()
+        .expect("the device open re-seeds the callback with time signature map");
+    assert!(matches!(second, EngineCommand::SetTimeSignatureMap(_)));
+    let cost = callback_drains(second, &mut runtime, &shared, &mut local);
+    assert_realtime_clean(cost, "the re-seed's SetTimeSignatureMap");
+    assert!(crate::graveyard::is_primed());
+    drain_commands(&rx, &mut runtime, &shared, &mut local, SR);
+
+    engine.set_time_signature(3, 4).unwrap();
+    let edit = rx
+        .try_recv()
+        .expect("a time signature edit reaches the callback");
+    let cost = callback_drains(edit, &mut runtime, &shared, &mut local);
+    assert_realtime_clean(cost, "a time signature edit");
+    assert_eq!(shared.time_sig_num.load(Ordering::Relaxed), 3);
+    assert_eq!(shared.time_sig_den.load(Ordering::Relaxed), 4);
+    assert_eq!(local.time_signature_map.points()[0].numerator, 3);
+    assert_eq!(local.time_signature_map.points()[0].denominator, 4);
+}
+
+#[test]
+fn first_time_signature_command_after_a_device_reopen_is_realtime_clean() {
+    let engine = EngineInner::new();
+    let (first_stream, _) = engine.open_test_stream(SR);
+    drop(first_stream);
+    engine.close_device();
+    let (rx, mut runtime) = engine.open_test_stream(SR);
+    let shared = Arc::clone(&engine.shared);
+    let mut local = LocalAudioState::new(SR as f64);
+
+    let first = rx.try_recv().expect("the reopen re-seeds the callback");
+    assert!(matches!(first, EngineCommand::SetTempoMap(_)));
+    let _ = callback_drains(first, &mut runtime, &shared, &mut local);
+
+    let second = rx.try_recv().expect("the reopen's SetTimeSignatureMap");
+    assert!(matches!(second, EngineCommand::SetTimeSignatureMap(_)));
+    let cost = callback_drains(second, &mut runtime, &shared, &mut local);
+    assert_realtime_clean(cost, "the reopen's SetTimeSignatureMap");
+}
+
+#[test]
+fn time_signature_edit_during_playback_is_realtime_clean() {
+    let engine = EngineInner::new();
+    let (rx, mut runtime) = engine.open_test_stream(SR);
+    let shared = Arc::clone(&engine.shared);
+    let mut local = LocalAudioState::new(SR as f64);
+    drain_commands(&rx, &mut runtime, &shared, &mut local, SR);
+
+    engine
+        .set_time_signature_map(vec![
+            crate::time_signature_map::RuntimeTimeSignaturePointSnapshot {
+                beat: 0.0,
+                numerator: 6,
+                denominator: 8,
+                grouping: Vec::new(),
+            },
+            crate::time_signature_map::RuntimeTimeSignaturePointSnapshot {
+                beat: 16.0,
+                numerator: 7,
+                denominator: 8,
+                grouping: Vec::new(),
+            },
+        ])
+        .unwrap();
+
+    let edit = rx
+        .try_recv()
+        .expect("time signature map reaches the callback");
+    let cost = callback_drains(edit, &mut runtime, &shared, &mut local);
+    assert_realtime_clean(cost, "time signature map edit during playback");
+    assert_eq!(local.time_signature_map.points().len(), 2);
+    assert_eq!(local.time_signature_map.points()[0].numerator, 6);
+    assert_eq!(local.time_signature_map.points()[1].numerator, 7);
+}
+
+// ── #291: plug-in parameter moves and bridge editors ──────────────────────
+
+#[test]
+fn moving_builtin_plugin_parameter_is_realtime_clean() {
+    let engine = EngineInner::new();
+    let mut proj = snapshot(Vec::new());
+    let mut params = HashMap::new();
+    params.insert("drive".to_string(), serde_json::Value::from(0.2));
+    proj.tracks[0]
+        .inserts
+        .push(crate::types::EngineInsertSnapshot {
+            id: "drive-1".to_string(),
+            kind: "sphere.drive".to_string(),
+            enabled: true,
+            params,
+            state: None,
+        });
+    engine.load_project(proj).unwrap();
+
+    let (rx, mut runtime) = engine.open_test_stream(SR);
+    let shared = Arc::clone(&engine.shared);
+    let mut local = LocalAudioState::new(SR as f64);
+    drain_commands(&rx, &mut runtime, &shared, &mut local, SR);
+
+    engine
+        .set_insert_param(
+            TRACK.to_string(),
+            "drive-1".to_string(),
+            "drive".to_string(),
+            0.8,
+        )
+        .unwrap();
+    let cmd = rx.try_recv().expect("insert param command");
+    let cost = callback_drains(cmd, &mut runtime, &shared, &mut local);
+    assert_realtime_clean(cost, "moving a builtin plugin parameter");
+
+    let insert = &runtime.tracks[0].inserts[0];
+    assert_eq!(
+        insert.params.get("drive"),
+        Some(&serde_json::Value::from(0.8f32 as f64))
+    );
+}
+
+#[test]
+fn moving_builtin_eq_parameter_rebuilds_dsp_is_realtime_clean() {
+    let engine = EngineInner::new();
+    let mut proj = snapshot(Vec::new());
+    let mut params = HashMap::new();
+    params.insert("band1Gain".to_string(), serde_json::Value::from(0.0));
+    proj.tracks[0]
+        .inserts
+        .push(crate::types::EngineInsertSnapshot {
+            id: "eq-1".to_string(),
+            kind: "sphere.eq8".to_string(),
+            enabled: true,
+            params,
+            state: None,
+        });
+    engine.load_project(proj).unwrap();
+
+    let (rx, mut runtime) = engine.open_test_stream(SR);
+    let shared = Arc::clone(&engine.shared);
+    let mut local = LocalAudioState::new(SR as f64);
+    drain_commands(&rx, &mut runtime, &shared, &mut local, SR);
+
+    engine
+        .set_insert_param(
+            TRACK.to_string(),
+            "eq-1".to_string(),
+            "band1Gain".to_string(),
+            3.5,
+        )
+        .unwrap();
+    let cmd = rx.try_recv().expect("insert param command");
+    let cost = callback_drains(cmd, &mut runtime, &shared, &mut local);
+    assert_realtime_clean(cost, "moving an eq parameter that rebuilds DSP state");
+
+    let insert = &runtime.tracks[0].inserts[0];
+    assert_eq!(
+        insert.params.get("band1Gain"),
+        Some(&serde_json::Value::from(3.5f32 as f64))
+    );
+}
+
+#[test]
+fn toggling_insert_bypass_is_realtime_clean() {
+    let engine = EngineInner::new();
+    let mut proj = snapshot(Vec::new());
+    let mut params = HashMap::new();
+    params.insert("drive".to_string(), serde_json::Value::from(0.2));
+    proj.tracks[0]
+        .inserts
+        .push(crate::types::EngineInsertSnapshot {
+            id: "drive-1".to_string(),
+            kind: "sphere.drive".to_string(),
+            enabled: true,
+            params,
+            state: None,
+        });
+    engine.load_project(proj).unwrap();
+
+    let (rx, mut runtime) = engine.open_test_stream(SR);
+    let shared = Arc::clone(&engine.shared);
+    let mut local = LocalAudioState::new(SR as f64);
+    drain_commands(&rx, &mut runtime, &shared, &mut local, SR);
+
+    // Bypass insert (value < 0.5)
+    engine
+        .set_insert_param(
+            TRACK.to_string(),
+            "drive-1".to_string(),
+            "enabled".to_string(),
+            0.0,
+        )
+        .unwrap();
+    let cmd = rx.try_recv().expect("bypass command");
+    let cost = callback_drains(cmd, &mut runtime, &shared, &mut local);
+    assert_realtime_clean(cost, "bypassing an insert");
+    assert!(!runtime.tracks[0].inserts[0].enabled);
+
+    // Re-enable insert (value >= 0.5)
+    engine
+        .set_insert_param(
+            TRACK.to_string(),
+            "drive-1".to_string(),
+            "enabled".to_string(),
+            1.0,
+        )
+        .unwrap();
+    let cmd = rx.try_recv().expect("re-enable command");
+    let cost = callback_drains(cmd, &mut runtime, &shared, &mut local);
+    assert_realtime_clean(cost, "re-enabling an insert");
+    assert!(runtime.tracks[0].inserts[0].enabled);
+}
+
+#[test]
+fn moving_bridged_plugin_parameter_is_realtime_clean() {
+    let engine = EngineInner::new();
+    let mut proj = snapshot(Vec::new());
+    let params = HashMap::new();
+    proj.tracks[0]
+        .inserts
+        .push(crate::types::EngineInsertSnapshot {
+            id: "bridge-1".to_string(),
+            kind: "external-bridge-plugin".to_string(),
+            enabled: true,
+            params,
+            state: None,
+        });
+    engine.load_project(proj).unwrap();
+
+    let (rx, mut runtime) = engine.open_test_stream(SR);
+    let shared = Arc::clone(&engine.shared);
+    let mut local = LocalAudioState::new(SR as f64);
+    drain_commands(&rx, &mut runtime, &shared, &mut local, SR);
+
+    engine
+        .set_insert_param(
+            TRACK.to_string(),
+            "bridge-1".to_string(),
+            "42".to_string(),
+            0.75,
+        )
+        .unwrap();
+    let cmd = rx.try_recv().expect("bridged insert param command");
+    let cost = callback_drains(cmd, &mut runtime, &shared, &mut local);
+    assert_realtime_clean(cost, "moving a bridged plugin parameter");
+}
+
+#[test]
+fn opening_and_closing_bridged_editor_is_realtime_clean() {
+    let engine = EngineInner::new();
+    let (rx, mut runtime) = engine.open_test_stream(SR);
+    let shared = Arc::clone(&engine.shared);
+    let mut local = LocalAudioState::new(SR as f64);
+    drain_commands(&rx, &mut runtime, &shared, &mut local, SR);
+
+    // Opening
+    engine
+        .set_bridge_editor_active(TRACK.to_string(), true)
+        .unwrap();
+    let open_cmd = rx.try_recv().expect("open editor command");
+    let cost = callback_drains(open_cmd, &mut runtime, &shared, &mut local);
+    assert_realtime_clean(cost, "opening a bridged editor");
+    assert!(runtime.bridge_editor_active.contains(TRACK));
+
+    // Closing
+    engine
+        .set_bridge_editor_active(TRACK.to_string(), false)
+        .unwrap();
+    let close_cmd = rx.try_recv().expect("close editor command");
+    let cost = callback_drains(close_cmd, &mut runtime, &shared, &mut local);
+    assert_realtime_clean(cost, "closing a bridged editor");
+    assert!(!runtime.bridge_editor_active.contains(TRACK));
+}

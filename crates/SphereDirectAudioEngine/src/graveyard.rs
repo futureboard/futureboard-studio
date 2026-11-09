@@ -27,7 +27,7 @@ use std::sync::OnceLock;
 use crossbeam_channel::{bounded, Sender};
 
 use crate::audio_file::AudioFileBuffer;
-use crate::command::TempoMapChange;
+use crate::command::{InsertParamChange, TempoMapChange};
 use crate::runtime::{RuntimeAraRenderer, RuntimeMidiData, RuntimeProject};
 
 /// Bounded so a pathological load storm cannot grow memory without limit. This
@@ -42,6 +42,9 @@ struct Graveyards {
     audio_file: Sender<Box<AudioFileBuffer>>,
     midi: Sender<Box<RuntimeMidiData>>,
     tempo: Sender<Box<TempoMapChange>>,
+    time_signature: Sender<Box<crate::time_signature_map::RuntimeTimeSignatureMapSnapshot>>,
+    insert_param: Sender<Box<InsertParamChange>>,
+    bridge_editor: Sender<Box<std::collections::HashSet<String>>>,
     ara: Sender<Vec<RuntimeAraRenderer>>,
 }
 
@@ -89,6 +92,9 @@ pub fn prime() {
         audio_file: spawn_worker("daux-audition-graveyard"),
         midi: spawn_worker("daux-midi-graveyard"),
         tempo: spawn_worker("daux-tempo-graveyard"),
+        time_signature: spawn_worker("daux-time-sig-graveyard"),
+        insert_param: spawn_worker("daux-param-graveyard"),
+        bridge_editor: spawn_worker("daux-editor-graveyard"),
         ara: spawn_worker("daux-ara-graveyard"),
     });
     let leaked = LEAKED.load(Ordering::Relaxed);
@@ -175,6 +181,26 @@ pub fn retire_midi(old: Box<RuntimeMidiData>) {
 #[inline]
 pub fn retire_tempo_change(old: Box<TempoMapChange>) {
     send_or_leak(graveyards().map(|g| &g.tempo), old);
+}
+
+/// Dispose an applied time-signature map away from the realtime callback.
+#[inline]
+pub fn retire_time_signature_map(
+    old: Box<crate::time_signature_map::RuntimeTimeSignatureMapSnapshot>,
+) {
+    send_or_leak(graveyards().map(|g| &g.time_signature), old);
+}
+
+/// Dispose replaced plug-in parameters and DSP state away from the realtime callback.
+#[inline]
+pub fn retire_insert_param_change(old: Box<InsertParamChange>) {
+    send_or_leak(graveyards().map(|g| &g.insert_param), old);
+}
+
+/// Dispose a replaced open-editor set away from the realtime callback.
+#[inline]
+pub fn retire_bridge_editor_active(old: Box<std::collections::HashSet<String>>) {
+    send_or_leak(graveyards().map(|g| &g.bridge_editor), old);
 }
 
 /// Dispose a retired ARA renderer list away from the realtime callback.

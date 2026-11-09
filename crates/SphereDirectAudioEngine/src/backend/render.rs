@@ -558,6 +558,23 @@ impl LocalAudioState {
         self.reset_metronome_schedule(position_sample, sample_rate);
     }
 
+    pub fn swap_time_signature_map(
+        &mut self,
+        map: &mut crate::time_signature_map::RuntimeTimeSignatureMapSnapshot,
+        position_sample: u64,
+        sample_rate: u32,
+    ) {
+        if map.points().is_empty() {
+            return;
+        }
+        std::mem::swap(&mut self.time_signature_map, map);
+        if let Some(pt) = self.time_signature_map.points().first() {
+            self.metronome_ts_num = pt.numerator as u32;
+            self.metronome_ts_den = pt.denominator as u32;
+        }
+        self.reset_metronome_schedule(position_sample, sample_rate);
+    }
+
     pub fn clear_metronome_clicks(&mut self, reason: &str) {
         self.metronome_click_remaining = 0;
         self.metronome_click_gain = 0.0;
@@ -1018,15 +1035,10 @@ pub fn drain_commands(
                 local.swap_tempo_map(&mut change.metronome_map, next_pos, output_sample_rate);
                 crate::graveyard::retire_tempo_change(change);
             }
-            EngineCommand::SetTimeSignature(num, den) => {
+            EngineCommand::SetTimeSignatureMap(mut change) => {
                 let pos = shared.position_samples.load(Ordering::Relaxed);
-                shared.time_sig_num.store(num.max(1), Ordering::Relaxed);
-                shared.time_sig_den.store(den.max(1), Ordering::Relaxed);
-                local.set_time_signature(num, den, pos, output_sample_rate);
-            }
-            EngineCommand::SetTimeSignatureMap(map) => {
-                let pos = shared.position_samples.load(Ordering::Relaxed);
-                if let Some(pt) = map.points().first() {
+                local.swap_time_signature_map(&mut *change, pos, output_sample_rate);
+                if let Some(pt) = local.time_signature_map.points().first() {
                     shared
                         .time_sig_num
                         .store(pt.numerator.max(1) as u32, Ordering::Relaxed);
@@ -1034,7 +1046,7 @@ pub fn drain_commands(
                         .time_sig_den
                         .store(pt.denominator.max(1) as u32, Ordering::Relaxed);
                 }
-                local.set_time_signature_map(map, pos, output_sample_rate);
+                crate::graveyard::retire_time_signature_map(change);
             }
             EngineCommand::SetLoop {
                 enabled,
@@ -1140,11 +1152,9 @@ pub fn drain_commands(
                 // been applied to the callback's runtime.
                 ack.store(true, Ordering::Release);
             }
-            EngineCommand::SetBridgeEditorActive { track_id, active } => {
-                // Bookkeeping only. Closing an editor no longer has to buy the
-                // graph a window to drain the host's note-offs: the graph runs
-                // every block, so the bridge handshake is always alive.
-                runtime.set_bridge_editor_active(&track_id, active);
+            EngineCommand::SetBridgeEditorActive(mut change) => {
+                std::mem::swap(&mut runtime.bridge_editor_active, &mut *change);
+                crate::graveyard::retire_bridge_editor_active(change);
             }
             EngineCommand::SetTrackVolume { track_index, value } => {
                 // Whether the index matched is the whole question when a fader
@@ -1209,12 +1219,22 @@ pub fn drain_commands(
                 runtime.update_soundfont_channels(track_index, &channels);
             }
             EngineCommand::SetInsertParam {
-                track_id,
-                insert_id,
+                track_index,
+                insert_index,
                 param_id,
                 value,
+                mut change,
             } => {
-                runtime.update_insert_param(&track_id, &insert_id, &param_id, value);
+                runtime.update_insert_param_at(
+                    track_index,
+                    insert_index,
+                    param_id,
+                    value,
+                    change.as_deref_mut(),
+                );
+                if let Some(change) = change {
+                    crate::graveyard::retire_insert_param_change(change);
+                }
             }
             EngineCommand::MidiPreviewNoteOn {
                 track_id,

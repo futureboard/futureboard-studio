@@ -1703,7 +1703,10 @@ impl EngineInner {
                 sample_rate: 0,
             },
         )));
-        let _ = self.send_command(EngineCommand::SetTimeSignatureMap(time_signature_map));
+        crate::graveyard::prime();
+        let _ = self.send_command(EngineCommand::SetTimeSignatureMap(Box::new(
+            time_signature_map,
+        )));
         let _ = self.send_command(EngineCommand::SetMetronomeVoice {
             volume: metronome_gain,
             sound: metronome_sound,
@@ -2057,11 +2060,85 @@ impl EngineInner {
         param_id: String,
         value: f32,
     ) -> Result<(), SphereAudioError> {
+        let mut runtime = self.runtime.lock();
+        let Some(track_index) = runtime.tracks.iter().position(|t| t.id == track_id) else {
+            return Ok(());
+        };
+        let Some(insert_index) = runtime.tracks[track_index]
+            .inserts
+            .iter()
+            .position(|i| i.id == insert_id)
+        else {
+            return Ok(());
+        };
+
+        let insert = &mut runtime.tracks[track_index].inserts[insert_index];
+        let (resolved, change) = if param_id == "enabled" {
+            insert.enabled = value >= 0.5;
+            let mut new_params = (*insert.params).clone();
+            new_params.insert("enabled".to_string(), serde_json::Value::from(value as f64));
+            insert.params = std::sync::Arc::new(new_params);
+            (crate::command::ResolvedParamId::Bypass, None)
+        } else if insert.kind_tag == crate::runtime::RuntimeInsertKind::ExternalBridge {
+            let wire_id = param_id.parse::<u32>().ok();
+            let mut new_params = (*insert.params).clone();
+            new_params.insert(param_id.clone(), serde_json::Value::from(value as f64));
+            insert.params = std::sync::Arc::new(new_params);
+            let resolved = wire_id
+                .map(crate::command::ResolvedParamId::Numeric)
+                .unwrap_or_else(|| {
+                    crate::command::ResolvedParamId::Named(crate::command::ParamKey::new(&param_id))
+                });
+            (resolved, None)
+        } else if insert.vst3.is_some() {
+            let vst3_id = param_id.parse::<u32>().ok();
+            let mut new_params = (*insert.params).clone();
+            new_params.insert(param_id.clone(), serde_json::Value::from(value as f64));
+            insert.params = std::sync::Arc::new(new_params);
+            let resolved = vst3_id
+                .map(crate::command::ResolvedParamId::Numeric)
+                .unwrap_or_else(|| {
+                    crate::command::ResolvedParamId::Named(crate::command::ParamKey::new(&param_id))
+                });
+            (resolved, None)
+        } else {
+            let mut new_params = (*insert.params).clone();
+            new_params.insert(param_id.clone(), serde_json::Value::from(value as f64));
+            let plugin_id = sphere_audio_plugins::canonical_plugin_id(&insert.kind);
+            let sample_rate = self.shared.sample_rate.load(Ordering::Relaxed).max(1);
+            if sphere_audio_plugins::should_rebuild_state(plugin_id, &param_id) {
+                insert.dsp.rebuild(plugin_id, &new_params, sample_rate);
+            } else {
+                insert.dsp.refresh_process_params(plugin_id, &new_params);
+            }
+            let new_params_arc = std::sync::Arc::new(new_params);
+            insert.params = std::sync::Arc::clone(&new_params_arc);
+            let new_dsp = insert.dsp.clone();
+            let resolved = if let Ok(id) = param_id.parse::<u32>() {
+                crate::command::ResolvedParamId::Numeric(id)
+            } else {
+                crate::command::ResolvedParamId::Named(crate::command::ParamKey::new(&param_id))
+            };
+            (
+                resolved,
+                Some(Box::new(crate::command::InsertParamChange {
+                    params: Some(new_params_arc),
+                    dsp: Some(new_dsp),
+                })),
+            )
+        };
+        drop(runtime);
+
+        if change.is_some() {
+            crate::graveyard::prime();
+        }
+
         self.send_command(EngineCommand::SetInsertParam {
-            track_id,
-            insert_id,
-            param_id,
+            track_index,
+            insert_index,
+            param_id: resolved,
             value,
+            change,
         })
     }
 
@@ -2208,7 +2285,16 @@ impl EngineInner {
         track_id: String,
         active: bool,
     ) -> Result<(), SphereAudioError> {
-        self.send_command(EngineCommand::SetBridgeEditorActive { track_id, active })
+        let mut runtime = self.runtime.lock();
+        if active {
+            runtime.bridge_editor_active.insert(track_id);
+        } else {
+            runtime.bridge_editor_active.remove(&track_id);
+        }
+        let next = Box::new(runtime.bridge_editor_active.clone());
+        drop(runtime);
+        crate::graveyard::prime();
+        self.send_command(EngineCommand::SetBridgeEditorActive(next))
     }
 
     /// Block the *calling control thread* (never the callback) until the audio
@@ -2253,8 +2339,6 @@ impl EngineInner {
         self.shared
             .time_sig_den
             .store(denominator.max(1), Ordering::Relaxed);
-        // The audio thread rebuilds a whole map (two heap allocations) for this
-        // command, so send it only when it actually changes the map it holds.
         let snapshot = crate::time_signature_map::RuntimeTimeSignatureMapSnapshot::static_sig(
             numerator.clamp(1, 64) as u16,
             denominator.clamp(1, 64) as u16,
@@ -2264,9 +2348,10 @@ impl EngineInner {
             if *last_sent == snapshot {
                 return Ok(());
             }
-            *last_sent = snapshot;
+            *last_sent = snapshot.clone();
         }
-        self.send_command(EngineCommand::SetTimeSignature(numerator, denominator))
+        crate::graveyard::prime();
+        self.send_command(EngineCommand::SetTimeSignatureMap(Box::new(snapshot)))
     }
 
     pub fn set_time_signature_map(
@@ -2290,7 +2375,8 @@ impl EngineInner {
             }
             *last_sent = snapshot.clone();
         }
-        self.send_command(EngineCommand::SetTimeSignatureMap(snapshot))
+        crate::graveyard::prime();
+        self.send_command(EngineCommand::SetTimeSignatureMap(Box::new(snapshot)))
     }
 
     /// Whether the control thread is holding a real marker map (more than one
@@ -3534,16 +3620,12 @@ impl EngineInner {
         param_id: &str,
         value: f64,
     ) -> Result<(), SphereAudioError> {
-        eprintln!(
-            "[SphereAudio] queue insert param track={} insert={} param={} value={:.6}",
-            track_id, insert_id, param_id, value
-        );
-        self.send_command(EngineCommand::SetInsertParam {
-            track_id: track_id.into(),
-            insert_id: insert_id.into(),
-            param_id: param_id.into(),
-            value: value as f32,
-        })
+        self.set_insert_param(
+            track_id.to_string(),
+            insert_id.to_string(),
+            param_id.to_string(),
+            value as f32,
+        )
     }
 
     pub fn open_insert_editor(
@@ -6321,13 +6403,12 @@ impl EngineInner {
                 EngineCommand::CancelCountIn => "CancelCountIn",
                 EngineCommand::SetBpm(_) => "SetBpm",
                 EngineCommand::SetTempoMap(_) => "SetTempoMap",
-                EngineCommand::SetTimeSignature(_, _) => "SetTimeSignature",
                 EngineCommand::SetTimeSignatureMap(_) => "SetTimeSignatureMap",
                 EngineCommand::SetLoop { .. } => "SetLoop",
                 EngineCommand::SetPluginBridgeSink { .. } => "SetPluginBridgeSink",
                 EngineCommand::SetAraRenderers { .. } => "SetAraRenderers",
                 EngineCommand::CommandBarrier { .. } => "CommandBarrier",
-                EngineCommand::SetBridgeEditorActive { .. } => "SetBridgeEditorActive",
+                EngineCommand::SetBridgeEditorActive(_) => "SetBridgeEditorActive",
                 EngineCommand::StartAudition { .. } => "StartAudition",
                 EngineCommand::StopAudition => "StopAudition",
             };
@@ -6944,15 +7025,14 @@ where
                             );
                             crate::graveyard::retire_tempo_change(change);
                         }
-                        EngineCommand::SetTimeSignature(num, den) => {
+                        EngineCommand::SetTimeSignatureMap(mut change) => {
                             let pos = shared.position_samples.load(Ordering::Relaxed);
-                            shared.time_sig_num.store(num.max(1), Ordering::Relaxed);
-                            shared.time_sig_den.store(den.max(1), Ordering::Relaxed);
-                            metronome.set_time_signature(num, den, pos, output_sample_rate);
-                        }
-                        EngineCommand::SetTimeSignatureMap(map) => {
-                            let pos = shared.position_samples.load(Ordering::Relaxed);
-                            if let Some(pt) = map.points().first() {
+                            metronome.swap_time_signature_map(
+                                &mut *change,
+                                pos,
+                                output_sample_rate,
+                            );
+                            if let Some(pt) = metronome.time_signature_map.points().first() {
                                 shared
                                     .time_sig_num
                                     .store(pt.numerator.max(1) as u32, Ordering::Relaxed);
@@ -6960,7 +7040,7 @@ where
                                     .time_sig_den
                                     .store(pt.denominator.max(1) as u32, Ordering::Relaxed);
                             }
-                            metronome.set_time_signature_map(map, pos, output_sample_rate);
+                            crate::graveyard::retire_time_signature_map(change);
                         }
                         EngineCommand::SetLoop {
                             enabled,
@@ -7063,12 +7143,9 @@ where
                             // has now been applied to the callback's runtime.
                             ack.store(true, Ordering::Release);
                         }
-                        EngineCommand::SetBridgeEditorActive { track_id, active } => {
-                            runtime.set_bridge_editor_active(&track_id, active);
-                            if !active {
-                                // Bookkeeping only: the graph runs every block,
-                                // so the bridge handshake is always alive.
-                            }
+                        EngineCommand::SetBridgeEditorActive(mut change) => {
+                            std::mem::swap(&mut runtime.bridge_editor_active, &mut *change);
+                            crate::graveyard::retire_bridge_editor_active(change);
                         }
                         EngineCommand::SetTrackVolume { track_index, value } => {
                             let applied = runtime.update_track_volume_at(track_index, value);
@@ -7134,8 +7211,23 @@ where
                         } => {
                             runtime.update_soundfont_channels(track_index, &channels);
                         }
-                        EngineCommand::SetInsertParam { track_id, insert_id, param_id, value } => {
-                            runtime.update_insert_param(&track_id, &insert_id, &param_id, value);
+                        EngineCommand::SetInsertParam {
+                            track_index,
+                            insert_index,
+                            param_id,
+                            value,
+                            mut change,
+                        } => {
+                            runtime.update_insert_param_at(
+                                track_index,
+                                insert_index,
+                                param_id,
+                                value,
+                                change.as_deref_mut(),
+                            );
+                            if let Some(change) = change {
+                                crate::graveyard::retire_insert_param_change(change);
+                            }
                         }
                         EngineCommand::MidiPreviewNoteOn {
                             track_id,
@@ -8030,7 +8122,7 @@ mod bridge_insert_tests {
                 enabled: true,
                 bypass_lane: None,
                 automation_bypassed: false,
-                params,
+                params: Arc::new(params),
                 bridge_is_effect: true,
                 bridge_is_builtin: false,
                 bridge_enabled_output_channels: Vec::new(),
@@ -8538,7 +8630,7 @@ mod bridge_insert_tests {
             enabled: true,
             bypass_lane: None,
             automation_bypassed: false,
-            params,
+            params: Arc::new(params),
             bridge_is_effect: true,
             bridge_is_builtin: false,
             bridge_enabled_output_channels: Vec::new(),

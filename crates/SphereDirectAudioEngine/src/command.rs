@@ -1,5 +1,47 @@
 use crate::runtime::RuntimeProject;
 
+/// Compact 31-byte inline string for parameter identifiers, avoiding heap allocations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParamKey {
+    len: u8,
+    bytes: [u8; 31],
+}
+
+impl ParamKey {
+    pub fn new(s: &str) -> Self {
+        let len = s.len().min(31);
+        let mut bytes = [0u8; 31];
+        bytes[..len].copy_from_slice(&s.as_bytes()[..len]);
+        Self {
+            len: len as u8,
+            bytes,
+        }
+    }
+
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..self.len as usize]).unwrap_or("")
+    }
+}
+
+/// Preallocated / resolved parameter identifier sent to the audio thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedParamId {
+    /// Bypass toggle ("enabled")
+    Bypass,
+    /// Numeric parameter ID (VST3 parameter or bridged wire ID)
+    Numeric(u32),
+    /// Named parameter for built-in plugins
+    Named(ParamKey),
+}
+
+/// Control-thread prepared parameter snapshot change for built-in plugins.
+#[derive(Debug)]
+pub struct InsertParamChange {
+    pub params: Option<std::sync::Arc<std::collections::HashMap<String, serde_json::Value>>>,
+    pub dsp: Option<crate::runtime::InsertDspState>,
+}
+
 /// A tempo-map change, prepared on the control thread so the callback only
 /// swaps: it neither clones a map, nor re-times and re-sorts a MIDI schedule,
 /// nor frees what it replaces (every replaced part goes back into this box,
@@ -154,12 +196,15 @@ pub enum EngineCommand {
         track_index: usize,
         channels: sphere_soundfont_player::SoundfontChannels,
     },
-    /// Set a plugin/insert parameter.
+    /// Set a plugin/insert parameter. Uses resolved track/insert indices and
+    /// preallocated/resolved parameter identifiers so the audio thread neither
+    /// searches by name nor allocates/frees strings.
     SetInsertParam {
-        track_id: String,
-        insert_id: String,
-        param_id: String,
+        track_index: usize,
+        insert_index: usize,
+        param_id: ResolvedParamId,
         value: f32,
+        change: Option<Box<InsertParamChange>>,
     },
     /// Immediate MIDI preview note-on from the UI piano roll. Bypasses timeline
     /// scheduling and can render while transport is stopped.
@@ -250,10 +295,10 @@ pub enum EngineCommand {
     /// Everything the callback needs is prepared on the control thread; see
     /// [`TempoMapChange`].
     SetTempoMap(Box<TempoMapChange>),
-    /// Set project time signature for metronome accent scheduling.
-    SetTimeSignature(u32, u32),
     /// Replace the authoritative time-signature map for metronome accents.
-    SetTimeSignatureMap(crate::time_signature_map::RuntimeTimeSignatureMapSnapshot),
+    /// Immutable snapshot prepared on the control thread and swapped on the
+    /// callback, retiring the replaced map to the graveyard without heap work.
+    SetTimeSignatureMap(Box<crate::time_signature_map::RuntimeTimeSignatureMapSnapshot>),
     /// Enable/disable loop region and set its bounds in seconds.
     SetLoop {
         enabled: bool,
@@ -288,8 +333,10 @@ pub enum EngineCommand {
     /// Stop the current standalone browser sample audition.
     StopAudition,
     /// Keep rendering a bridged track while its plugin editor is open (VSTi
-    /// internal keyboard / groove preview needs a live DSP loop).
-    SetBridgeEditorActive { track_id: String, active: bool },
+    /// internal keyboard / groove preview needs a live DSP loop). Carries an
+    /// immutable snapshot of the active editor set prepared on the control
+    /// thread so the callback neither modifies maps nor frees strings.
+    SetBridgeEditorActive(Box<std::collections::HashSet<String>>),
     /// Control-thread synchronization point: the callback sets `ack` when it
     /// drains this command, proving every command sent *before* it has been
     /// applied. Used by offline export to hand bridge-sink ownership across
