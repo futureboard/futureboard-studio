@@ -21,8 +21,8 @@
 //! then the slot table ([`Slots`]). A connection that never logs in is
 //! closed at its deadline, and may be closed earlier to make room: once past
 //! its [`LOGIN_GRACE`], or at once when its address holds another connection
-//! that grace protects (one per address); one let in never is. An address is
-//! an IPv4 address, or an IPv6 `/64` (see [`peer_key`]).
+//! that grace protects (one per address); one let in never is. Each client
+//! IP is limited individually (see [`peer_key`]).
 //!
 //! Who a client is ([`Peer`]) is read from its request head. A connection
 //! from this machine is taken for a browser here only when it names this
@@ -39,7 +39,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{Sender, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -366,17 +366,11 @@ impl Admission {
     }
 }
 
-/// The address limits count by: an IPv4-mapped address is its IPv4
-/// address, and an IPv6 address (but loopback) its `/64`, which one machine
-/// can fill with as many addresses as it likes.
+/// The address limits count by: an IPv4-mapped address is its canonical IPv4
+/// address, and each IPv6 address is counted on its own so devices sharing a
+/// `/64` prefix on the LAN do not lock each other out (#338).
 fn peer_key(peer: IpAddr) -> IpAddr {
-    match peer.to_canonical() {
-        IpAddr::V6(v6) if !v6.is_loopback() => {
-            let [a, b, c, d, ..] = v6.segments();
-            IpAddr::V6(Ipv6Addr::new(a, b, c, d, 0, 0, 0, 0))
-        }
-        other => other,
-    }
+    peer.to_canonical()
 }
 
 /// An address held to one [`LOGIN_GRACE`] (see [`Slots`]): known, and not
@@ -2425,13 +2419,16 @@ mod tests {
         assert_eq!(back.grace_since(), Some(at));
     }
 
-    /// #266: an IPv6 `/64` is one address to every limit: one machine can
-    /// take as many addresses in it as it likes.
+    /// #338 (superseding #266 prefix-grouping): each IPv6 address is counted
+    /// on its own so devices sharing a /64 on a LAN do not lock each other out.
     #[test]
-    fn ipv6_addresses_count_by_their_64() {
+    fn ipv6_addresses_count_individually() {
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
-        assert_eq!(peer_key(ip("2001:db8:1:2:a:b:c:d")), ip("2001:db8:1:2::"));
-        assert_eq!(peer_key(ip("fe80::1234")), ip("fe80::"));
+        assert_eq!(
+            peer_key(ip("2001:db8:1:2:a:b:c:d")),
+            ip("2001:db8:1:2:a:b:c:d")
+        );
+        assert_eq!(peer_key(ip("fe80::1234")), ip("fe80::1234"));
         assert_eq!(peer_key(ip("::ffff:10.0.0.7")), ip("10.0.0.7"));
         assert_eq!(peer_key(ip("10.0.0.7")), ip("10.0.0.7"));
         assert_eq!(peer_key(ip("::1")), ip("::1"));
@@ -2450,23 +2447,29 @@ mod tests {
                 None,
             )
         };
-        // At most MAX_PER_PEER waiting from one /64, whatever the address.
+        // Device 1 fills its own per-peer allocation.
         for n in 0..MAX_PER_PEER as u32 {
-            let peer = format!("2001:db8:1:2::{:x}", n + 1);
-            assert_eq!(attempt(n, &peer), Arrival::Taken, "{peer}");
+            assert_eq!(attempt(n, "2001:db8:1:2::1"), Arrival::Taken);
         }
-        let mut n = MAX_PER_PEER as u32;
-        assert_eq!(attempt(n, "2001:db8:1:2:ffff::1"), Arrival::Busy);
-        n += 1;
-        // Another /64 is another address.
-        assert_eq!(attempt(n, "2001:db8:1:3::1"), Arrival::Taken);
-        n += 1;
-        // And one bucket of new connections for the whole /64.
-        while (n as usize) < ARRIVAL_BURST as usize + 1 {
-            assert_eq!(attempt(n, "2001:db8:1:2:dead::1"), Arrival::Busy);
-            n += 1;
+        // Device 1 is now at capacity.
+        assert_eq!(
+            attempt(MAX_PER_PEER as u32, "2001:db8:1:2::1"),
+            Arrival::Busy
+        );
+
+        // Device 2 on the same /64 is NOT locked out by Device 1.
+        let mut id = MAX_PER_PEER as u32 + 1;
+        assert_eq!(attempt(id, "2001:db8:1:2::2"), Arrival::Taken);
+        id += 1;
+
+        // Link-local addresses in fe80:: also count individually.
+        for _ in 0..MAX_PER_PEER {
+            assert_eq!(attempt(id, "fe80::1"), Arrival::Taken);
+            id += 1;
         }
-        assert_eq!(attempt(n, "2001:db8:1:2:beef::1"), Arrival::TooFast);
+        assert_eq!(attempt(id, "fe80::1"), Arrival::Busy);
+        id += 1;
+        assert_eq!(attempt(id, "fe80::2"), Arrival::Taken);
     }
 
     /// #267: every answer says only this server's own scripts may run, and
