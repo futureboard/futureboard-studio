@@ -419,3 +419,125 @@ pub(crate) fn view_of(window: &Window) -> Option<usize> {
 pub(crate) fn detach_view(view: usize) {
     unsafe { gpui_macos::detach_embedded_view(view as *mut std::ffi::c_void) }
 }
+
+/// The HWND an embedded `window` draws into, as an integer so it can be kept by the editor's
+/// handle for [`detach_hwnd()`].
+#[cfg(target_os = "windows")]
+pub(crate) fn hwnd_of(window: &Window) -> Option<usize> {
+    let handle = HasWindowHandle::window_handle(window).ok()?;
+    match handle.as_raw() {
+        RawWindowHandle::Win32(handle) => Some(handle.hwnd.get() as usize),
+        _ => None,
+    }
+}
+
+/// Detach the child HWND from the host's parent window before teardown.
+#[cfg(target_os = "windows")]
+pub(crate) fn detach_hwnd(child: usize) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        IsWindow, SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWL_STYLE,
+        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, WS_POPUP,
+    };
+
+    if child == 0 {
+        return;
+    }
+    let child = HWND(child as *mut std::ffi::c_void);
+    unsafe {
+        if !IsWindow(Some(child)).as_bool() {
+            return;
+        }
+        let _ = ShowWindow(child, SW_HIDE);
+        let _ = SetParent(child, None);
+        let _ = SetWindowLongPtrW(child, GWL_STYLE, WS_POPUP.0 as isize);
+        let _ = SetWindowPos(
+            child,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::*;
+    use windows::core::w;
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, GetParent, RegisterClassW, WNDCLASSW,
+        WS_CHILD, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    };
+
+    unsafe extern "system" fn test_wnd_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+
+    #[test]
+    fn detach_hwnd_clears_parent() {
+        unsafe {
+            let class_name = w!("NihPlugGpuiDetachTest");
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(test_wnd_proc),
+                lpszClassName: class_name,
+                ..Default::default()
+            };
+            let _ = RegisterClassW(&wc);
+
+            // Create a parent window
+            let parent = CreateWindowExW(
+                Default::default(),
+                class_name,
+                w!("Parent"),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                100,
+                100,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("failed to create parent window");
+
+            // Create a child window
+            let child = CreateWindowExW(
+                Default::default(),
+                class_name,
+                w!("Child"),
+                WS_CHILD | WS_VISIBLE,
+                0,
+                0,
+                50,
+                50,
+                Some(parent),
+                None,
+                None,
+                None,
+            )
+            .expect("failed to create child window");
+
+            assert_eq!(GetParent(child).unwrap(), parent);
+
+            // Detach child
+            detach_hwnd(child.0 as usize);
+
+            // Child's parent should now be null/desktop
+            assert!(GetParent(child).is_err() || GetParent(child).unwrap().0 as usize == 0);
+
+            // Parent can be destroyed without destroying the detached child
+            let _ = DestroyWindow(parent);
+            let _ = DestroyWindow(child);
+        }
+    }
+}

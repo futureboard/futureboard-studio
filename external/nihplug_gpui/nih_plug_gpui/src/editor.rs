@@ -73,7 +73,8 @@ where
         // Set when the handle is dropped. The host may close the editor before the task below
         // gets to run, and may have destroyed `parent` by then.
         let closed = Arc::new(AtomicBool::new(false));
-        // The view embedded in `parent`, so the handle can take it out synchronously on macOS.
+        // The view or window embedded in `parent`, so the handle can take it out synchronously on
+        // macOS and Windows.
         let embedded_view: Arc<Mutex<Option<usize>>> = Arc::default();
 
         let window_slot = window.clone();
@@ -100,7 +101,6 @@ where
                 return;
             };
 
-            *window_slot.lock() = Some(handle);
             #[cfg(target_os = "macos")]
             {
                 *view_slot.lock() = handle
@@ -108,8 +108,41 @@ where
                     .ok()
                     .flatten();
             }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(target_os = "windows")]
+            {
+                *view_slot.lock() = handle
+                    .update(cx, |_, window, _| embed::hwnd_of(window))
+                    .ok()
+                    .flatten();
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             let _ = &view_slot;
+            *window_slot.lock() = Some(handle);
+
+            if task_closed.load(Ordering::Acquire) {
+                #[cfg(target_os = "windows")]
+                // The inner block drops the lock guard before the body runs; the body
+                // waits on the GPUI thread (#298). Do not simplify to `x.lock().take()`.
+                if let Some(hwnd) = {
+                    let taken = view_slot.lock().take();
+                    taken
+                } {
+                    embed::detach_hwnd(hwnd);
+                }
+                #[cfg(target_os = "macos")]
+                // The inner block drops the lock guard before the body runs; the body
+                // waits on the GPUI thread (#298). Do not simplify to `x.lock().take()`.
+                if let Some(view) = {
+                    let taken = view_slot.lock().take();
+                    taken
+                } {
+                    embed::detach_view(view);
+                }
+                let handle = window_slot.lock().take().unwrap_or(handle);
+                close_window(cx, handle);
+                return;
+            }
+
             spawn_frame_loop(cx, handle, gpui_state, standalone);
         }));
         if !opened {
@@ -364,8 +397,8 @@ struct GpuiEditorHandle {
     window: Arc<Mutex<Option<AnyWindowHandle>>>,
     /// Tells a window that hasn't been opened yet not to open.
     closed: Arc<AtomicBool>,
-    /// The `NSView` embedded in the host's view on macOS, once the window is open.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// The `NSView` or `HWND` embedded in the host's window, once the window is open.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     embedded_view: Arc<Mutex<Option<usize>>>,
 }
 
@@ -379,16 +412,208 @@ impl Drop for GpuiEditorHandle {
         // host's hierarchy right now.
         #[cfg(target_os = "macos")]
         if host::is_main_thread() {
-            if let Some(view) = self.embedded_view.lock().take() {
+            // The inner block drops the lock guard before the body runs; the body
+            // waits on the GPUI thread (#298). Do not simplify to `x.lock().take()`.
+            if let Some(view) = {
+                let taken = self.embedded_view.lock().take();
+                taken
+            } {
                 embed::detach_view(view);
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            // The inner block drops the lock guard before the body runs; the body
+            // waits on the GPUI thread (#298). Do not simplify to `x.lock().take()`.
+            if let Some(hwnd) = {
+                let taken = self.embedded_view.lock().take();
+                taken
+            } {
+                embed::detach_hwnd(hwnd);
             }
         }
 
         let window = self.window.clone();
         host::run_on_gpui_thread(Box::new(move |cx| {
-            if let Some(handle) = window.lock().take() {
+            // The inner block drops the lock guard before the body runs; the body
+            // waits on the GPUI thread (#298). Do not simplify to `x.lock().take()`.
+            if let Some(handle) = {
+                let taken = window.lock().take();
+                taken
+            } {
                 close_window(cx, handle);
             }
         }));
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::*;
+    use windows::core::w;
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, GetParent, GetWindowLongPtrW,
+        RegisterClassW, GWL_STYLE, WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
+    };
+
+    unsafe extern "system" fn test_wnd_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+
+    fn create_test_windows() -> (HWND, HWND) {
+        unsafe {
+            let class_name = w!("NihPlugGpuiEditorTest");
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(test_wnd_proc),
+                lpszClassName: class_name,
+                ..Default::default()
+            };
+            let _ = RegisterClassW(&wc);
+
+            let parent = CreateWindowExW(
+                Default::default(),
+                class_name,
+                w!("Parent"),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                100,
+                100,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("failed to create parent window");
+
+            let child = CreateWindowExW(
+                Default::default(),
+                class_name,
+                w!("Child"),
+                WS_CHILD | WS_VISIBLE,
+                0,
+                0,
+                50,
+                50,
+                Some(parent),
+                None,
+                None,
+                None,
+            )
+            .expect("failed to create child window");
+
+            assert_eq!(GetParent(child).unwrap(), parent);
+            (parent, child)
+        }
+    }
+
+    #[test]
+    fn drop_between_fill_and_recheck_detaches() {
+        let (parent, child) = create_test_windows();
+
+        let closed = Arc::new(AtomicBool::new(false));
+        let embedded_view = Arc::new(Mutex::new(None));
+        let window = Arc::new(Mutex::new(None));
+
+        let handle = GpuiEditorHandle {
+            gpui_state: GpuiState::from_size(100, 100),
+            window: window.clone(),
+            closed: closed.clone(),
+            embedded_view: embedded_view.clone(),
+        };
+
+        // Step 1: GPUI thread fills view_slot
+        *embedded_view.lock() = Some(child.0 as usize);
+
+        // Race: Host drops the editor handle BETWEEN fill view_slot and final closed re-check
+        drop(handle);
+
+        assert!(closed.load(Ordering::Acquire));
+
+        // Window must be detached right now by Drop
+        unsafe {
+            assert!(GetParent(child).is_err() || GetParent(child).unwrap().0 as usize == 0);
+            let style = GetWindowLongPtrW(child, GWL_STYLE) as u32;
+            assert_eq!(style & WS_POPUP.0, WS_POPUP.0);
+            assert_eq!(style & WS_CHILD.0, 0);
+            assert_eq!(style & WS_VISIBLE.0, 0);
+        }
+
+        // Step 2: GPUI thread reaches final closed re-check
+        if closed.load(Ordering::Acquire) {
+            let view = embedded_view.lock().take();
+            // view was already taken and detached by Drop
+            assert!(view.is_none());
+        } else {
+            panic!("closed should have been observed as true");
+        }
+
+        // Parent can be destroyed safely without destroying child
+        unsafe {
+            let _ = DestroyWindow(parent);
+            let _ = DestroyWindow(child);
+        }
+    }
+
+    #[test]
+    fn drop_before_fill_detaches_on_recheck() {
+        let (parent, child) = create_test_windows();
+
+        let closed = Arc::new(AtomicBool::new(false));
+        let embedded_view = Arc::new(Mutex::new(None));
+        let window = Arc::new(Mutex::new(None));
+
+        let handle = GpuiEditorHandle {
+            gpui_state: GpuiState::from_size(100, 100),
+            window: window.clone(),
+            closed: closed.clone(),
+            embedded_view: embedded_view.clone(),
+        };
+
+        // Race: Host drops editor handle BEFORE GPUI thread fills view_slot (e.g. during open_window)
+        drop(handle);
+
+        assert!(closed.load(Ordering::Acquire));
+
+        // At this point Drop could not detach because embedded_view was None
+        unsafe {
+            assert_eq!(GetParent(child).unwrap(), parent);
+        }
+
+        // Step 1: GPUI thread completes open_window and fills view_slot
+        *embedded_view.lock() = Some(child.0 as usize);
+
+        // Step 2: GPUI thread reaches final closed re-check
+        if closed.load(Ordering::Acquire) {
+            // The inner block drops the lock guard before the body runs; the body
+            // waits on the GPUI thread (#298). Do not simplify to `x.lock().take()`.
+            if let Some(hwnd) = {
+                let taken = embedded_view.lock().take();
+                taken
+            } {
+                embed::detach_hwnd(hwnd);
+            }
+        } else {
+            panic!("closed should have been observed as true");
+        }
+
+        // Window must now be detached
+        unsafe {
+            assert!(GetParent(child).is_err() || GetParent(child).unwrap().0 as usize == 0);
+            let style = GetWindowLongPtrW(child, GWL_STYLE) as u32;
+            assert_eq!(style & WS_POPUP.0, WS_POPUP.0);
+            assert_eq!(style & WS_CHILD.0, 0);
+            assert_eq!(style & WS_VISIBLE.0, 0);
+
+            let _ = DestroyWindow(parent);
+            let _ = DestroyWindow(child);
+        }
     }
 }

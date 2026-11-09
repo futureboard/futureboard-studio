@@ -404,9 +404,6 @@ impl<P: Vst2Plugin> Wrapper<P> {
         if previous == samples {
             return;
         }
-        unsafe {
-            (*self.effect_ptr()).initial_delay = samples as i32;
-        }
         self.inner.latency_dirty.store(true, Ordering::Release);
     }
 
@@ -998,7 +995,6 @@ impl<P: Vst2Plugin> Wrapper<P> {
             },
             Ordering::Relaxed,
         );
-        self.flush_latency();
     }
 
     fn read_transport(&self) -> crate::prelude::Transport {
@@ -1297,4 +1293,153 @@ fn scale_from_dpi(dpi: u32) -> f32 {
 extern "system" {
     fn GetDpiForWindow(hwnd: *mut c_void) -> u32;
     fn GetDpiForSystem() -> u32;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::prelude::*;
+    use std::num::NonZeroU32;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct LatencyTestPlugin {
+        params: Arc<LatencyTestParams>,
+    }
+
+    struct LatencyTestParams {
+        gain: FloatParam,
+    }
+
+    unsafe impl Params for LatencyTestParams {
+        fn param_map(&self) -> Vec<(String, ParamPtr, String)> {
+            vec![("gain".to_string(), self.gain.as_ptr(), String::new())]
+        }
+    }
+
+    impl Default for LatencyTestPlugin {
+        fn default() -> Self {
+            Self {
+                params: Arc::new(LatencyTestParams {
+                    gain: FloatParam::new("Gain", 1.0, FloatRange::Linear { min: 0.0, max: 1.0 }),
+                }),
+            }
+        }
+    }
+
+    impl Plugin for LatencyTestPlugin {
+        const NAME: &'static str = "Latency Test";
+        const VENDOR: &'static str = "Test Vendor";
+        const URL: &'static str = "https://example.com";
+        const EMAIL: &'static str = "info@example.com";
+        const VERSION: &'static str = "0.0.1";
+
+        const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
+            main_input_channels: NonZeroU32::new(2),
+            main_output_channels: NonZeroU32::new(2),
+            ..AudioIOLayout::const_default()
+        }];
+
+        const MIDI_INPUT: MidiConfig = MidiConfig::None;
+        const MIDI_OUTPUT: MidiConfig = MidiConfig::None;
+
+        type SysExMessage = ();
+        type BackgroundTask = ();
+
+        fn params(&self) -> Arc<dyn Params> {
+            self.params.clone()
+        }
+
+        fn process(
+            &mut self,
+            _buffer: &mut Buffer,
+            _aux: &mut AuxiliaryBuffers,
+            context: &mut impl ProcessContext<Self>,
+        ) -> ProcessStatus {
+            context.set_latency_samples(128);
+            ProcessStatus::Normal
+        }
+    }
+
+    impl Vst2Plugin for LatencyTestPlugin {
+        const VST2_UID: [u8; 4] = *b"LtPl";
+    }
+
+    static IO_CHANGED_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn mock_host_callback(
+        _effect: *mut AEffect,
+        opcode: i32,
+        _index: i32,
+        _value: isize,
+        _ptr: *mut c_void,
+        _opt: f32,
+    ) -> isize {
+        if opcode == AUDIO_MASTER_IO_CHANGED {
+            IO_CHANGED_CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+        0
+    }
+
+    #[test]
+    fn latency_change_deferred_from_audio_thread() {
+        IO_CHANGED_CALLS.store(0, Ordering::SeqCst);
+        let effect = Wrapper::<LatencyTestPlugin>::create(mock_host_callback);
+        assert!(!effect.is_null());
+
+        let dispatcher = unsafe { (*effect).dispatcher };
+        let process_replacing = unsafe { (*effect).process_replacing };
+
+        // Initialize / resume
+        unsafe {
+            dispatcher(effect, EFF_OPEN, 0, 0, std::ptr::null_mut(), 0.0);
+            dispatcher(effect, EFF_MAINS_CHANGED, 0, 1, std::ptr::null_mut(), 0.0);
+        }
+
+        // Reset count after initialization
+        IO_CHANGED_CALLS.store(0, Ordering::SeqCst);
+
+        // Audio processing thread calls process_replacing
+        let mut in_l = [0.0f32; 64];
+        let mut in_r = [0.0f32; 64];
+        let mut out_l = [0.0f32; 64];
+        let mut out_r = [0.0f32; 64];
+        let mut inputs = [in_l.as_mut_ptr(), in_r.as_mut_ptr()];
+        let mut outputs = [out_l.as_mut_ptr(), out_r.as_mut_ptr()];
+
+        unsafe {
+            process_replacing(effect, inputs.as_mut_ptr(), outputs.as_mut_ptr(), 64);
+        }
+
+        // CRITICAL CHECK: audio thread processing MUST NOT have called ioChanged!
+        assert_eq!(
+            IO_CHANGED_CALLS.load(Ordering::SeqCst),
+            0,
+            "AUDIO_MASTER_IO_CHANGED was called from audio processing thread!"
+        );
+
+        // Now host calls idle/editor-idle on main/GUI thread
+        unsafe {
+            dispatcher(effect, EFF_EDIT_IDLE, 0, 0, std::ptr::null_mut(), 0.0);
+        }
+
+        // Host callback should now have been invoked once on the idle/dispatcher thread
+        assert_eq!(
+            IO_CHANGED_CALLS.load(Ordering::SeqCst),
+            1,
+            "AUDIO_MASTER_IO_CHANGED was not deferred to idle/dispatcher thread!"
+        );
+        assert_eq!(unsafe { (*effect).initial_delay }, 128);
+
+        // Second idle call shouldn't re-trigger ioChanged since latency didn't change again
+        unsafe {
+            dispatcher(effect, EFF_IDLE, 0, 0, std::ptr::null_mut(), 0.0);
+        }
+        assert_eq!(IO_CHANGED_CALLS.load(Ordering::SeqCst), 1);
+
+        // Clean up
+        unsafe {
+            dispatcher(effect, EFF_CLOSE, 0, 0, std::ptr::null_mut(), 0.0);
+        }
+    }
 }
