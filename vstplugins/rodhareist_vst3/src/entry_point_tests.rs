@@ -382,7 +382,12 @@ fn vst2_tells_the_host_once_when_a_stomp_renames_its_titles() {
         reinitialize();
         assert_eq!(UPDATE_DISPLAY.load(Ordering::SeqCst), 0, "a knob move");
 
-        set_parameter(effect, drive_model, rat as f32 / (models.len() - 1) as f32);
+        // Model steps sit on the fixed catalogue range, not the list's (#342).
+        set_parameter(
+            effect,
+            drive_model,
+            rat as f32 / (crate::params::MODEL_SLOTS - 1) as f32,
+        );
         reinitialize();
         assert_eq!(UPDATE_DISPLAY.load(Ordering::SeqCst), 1, "a new stomp");
         assert!(

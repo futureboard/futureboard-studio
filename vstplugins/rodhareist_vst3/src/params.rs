@@ -154,7 +154,10 @@ pub enum EntryKind {
 
 pub enum WireParam {
     Float(FloatParam),
-    Int(IntParam),
+    /// An integer and the highest value the core takes from it: a model
+    /// catalogue keeps a fixed host range ([`MODEL_SLOTS`]) wider than its
+    /// list, and its unused top steps select the last model.
+    Int(IntParam, i32),
     Bool(BoolParam),
 }
 
@@ -333,7 +336,7 @@ impl WireParam {
     pub fn plain(&self) -> f32 {
         match self {
             WireParam::Float(p) => p.value(),
-            WireParam::Int(p) => p.value() as f32,
+            WireParam::Int(p, last) => p.value().min(*last) as f32,
             WireParam::Bool(p) => f32::from(u8::from(p.value())),
         }
     }
@@ -341,7 +344,7 @@ impl WireParam {
     pub fn ptr(&self) -> ParamPtr {
         match self {
             WireParam::Float(p) => p.as_ptr(),
-            WireParam::Int(p) => p.as_ptr(),
+            WireParam::Int(p, _) => p.as_ptr(),
             WireParam::Bool(p) => p.as_ptr(),
         }
     }
@@ -349,7 +352,7 @@ impl WireParam {
     fn begin(&self, setter: &ParamSetter) {
         match self {
             WireParam::Float(p) => setter.begin_set_parameter(p),
-            WireParam::Int(p) => setter.begin_set_parameter(p),
+            WireParam::Int(p, _) => setter.begin_set_parameter(p),
             WireParam::Bool(p) => setter.begin_set_parameter(p),
         }
     }
@@ -357,7 +360,7 @@ impl WireParam {
     fn set_plain(&self, setter: &ParamSetter, value: f32) {
         match self {
             WireParam::Float(p) => setter.set_parameter(p, value),
-            WireParam::Int(p) => setter.set_parameter(p, value.round() as i32),
+            WireParam::Int(p, _) => setter.set_parameter(p, value.round() as i32),
             WireParam::Bool(p) => setter.set_parameter(p, value >= 0.5),
         }
     }
@@ -365,7 +368,7 @@ impl WireParam {
     fn end(&self, setter: &ParamSetter) {
         match self {
             WireParam::Float(p) => setter.end_set_parameter(p),
-            WireParam::Int(p) => setter.end_set_parameter(p),
+            WireParam::Int(p, _) => setter.end_set_parameter(p),
             WireParam::Bool(p) => setter.end_set_parameter(p),
         }
     }
@@ -373,7 +376,7 @@ impl WireParam {
     fn display_name(&self) -> &str {
         match self {
             WireParam::Float(p) => p.name(),
-            WireParam::Int(p) => p.name(),
+            WireParam::Int(p, _) => p.name(),
             WireParam::Bool(p) => p.name(),
         }
     }
@@ -385,7 +388,7 @@ impl WireParam {
         }
         match self {
             WireParam::Float(p) => p.set_name(name),
-            WireParam::Int(p) => p.set_name(name),
+            WireParam::Int(p, _) => p.set_name(name),
             WireParam::Bool(p) => p.set_name(name),
         }
         true
@@ -420,6 +423,19 @@ fn tone_engine_label(engine: ToneEngineKind) -> &'static str {
         ToneEngineKind::NamCapture => "NAM capture",
         ToneEngineKind::Bypass => "Off",
     }
+}
+
+/// Host steps every model catalogue is exposed with, whatever its length
+/// today. Hosts store automation and MIDI learn as normalized values, so a
+/// range that grew with each new model moved what those values select
+/// (#342). New models take the next free step; the unused ones above the
+/// last model select it. Never shrink this: it would shift every stored value.
+pub const MODEL_SLOTS: i32 = 64;
+
+/// Whether `id` selects from a model catalogue (one that gains entries
+/// between releases), as opposed to a fixed list of modes.
+fn is_model_catalogue(id: &str) -> bool {
+    id.ends_with("_model") || id == "cab_mic_type"
 }
 
 /// The display names of a select's indices, if `id` is one.
@@ -666,7 +682,7 @@ fn build_entry(id: &'static str, default: f32, specs: &[(StageKind, ParamSpec)])
         return WireEntry {
             id,
             kind: EntryKind::PathSlot(slot),
-            param: WireParam::Int(param),
+            param: WireParam::Int(param, StageKind::COUNT as i32 - 1),
             title: Title::Fixed,
         };
     }
@@ -681,16 +697,26 @@ fn build_entry(id: &'static str, default: f32, specs: &[(StageKind, ParamSpec)])
         })
     } else if let Some(names) = choice_labels(id) {
         let parse_names = names.clone();
+        let last = names.len() as i32 - 1;
+        // A model catalogue grows between releases; a fixed range keeps the
+        // normalized values hosts stored for automation and MIDI learn on the
+        // same models (#342).
+        let max = if is_model_catalogue(id) {
+            MODEL_SLOTS - 1
+        } else {
+            last
+        };
         let param = IntParam::new(
             name,
             default.round() as i32,
-            IntRange::Linear {
-                min: 0,
-                max: names.len() as i32 - 1,
-            },
+            IntRange::Linear { min: 0, max },
         )
         .with_value_to_string(Arc::new(move |v| {
-            names.get(v as usize).copied().unwrap_or("?").to_string()
+            names
+                .get(v.clamp(0, last) as usize)
+                .copied()
+                .unwrap_or("?")
+                .to_string()
         }))
         .with_string_to_value(Arc::new(move |s| {
             let s = s.trim();
@@ -702,11 +728,14 @@ fn build_entry(id: &'static str, default: f32, specs: &[(StageKind, ParamSpec)])
         }));
         // Moving a block between lanes rebuilds the routing: edited in the
         // editor, not automated, like the path order.
-        WireParam::Int(if id.ends_with("_row") {
-            param.non_automatable()
-        } else {
-            param
-        })
+        WireParam::Int(
+            if id.ends_with("_row") {
+                param.non_automatable()
+            } else {
+                param
+            },
+            last,
+        )
     } else {
         let spec = spec_of(id, specs).unwrap_or_else(|| panic!("no range for wire id `{id}`"));
         let range = match spec.unit {
@@ -784,6 +813,63 @@ mod tests {
                 "`{id}`"
             );
         }
+    }
+
+    /// #342: a model catalogue's host range does not follow the length of its
+    /// list, so a stored normalized value keeps selecting the same model when
+    /// models are added; steps above the last model select it.
+    #[test]
+    fn model_catalogues_keep_a_fixed_host_range() {
+        let wire = WireParams::new();
+        let mut catalogues = 0;
+        for entry in wire.entries() {
+            let Some(names) = choice_labels(entry.id) else {
+                continue;
+            };
+            let WireParam::Int(param, last) = &entry.param else {
+                panic!("`{}` is a choice but not an IntParam", entry.id);
+            };
+            assert_eq!(*last, names.len() as i32 - 1, "`{}`", entry.id);
+            if !is_model_catalogue(entry.id) {
+                assert_eq!(param.range().unnormalize(1.0), *last, "`{}`", entry.id);
+                continue;
+            }
+            catalogues += 1;
+            assert!(
+                names.len() as i32 <= MODEL_SLOTS,
+                "`{}` has outgrown MODEL_SLOTS",
+                entry.id
+            );
+            assert_eq!(param.range().unnormalize(0.0), 0, "`{}`", entry.id);
+            assert_eq!(
+                param.range().unnormalize(1.0),
+                MODEL_SLOTS - 1,
+                "`{}`",
+                entry.id
+            );
+            // Model i sits at i / (MODEL_SLOTS - 1) whatever the list length.
+            for i in 0..names.len() as i32 {
+                let normalized = param.range().normalize(i);
+                assert_eq!(
+                    normalized,
+                    i as f32 / (MODEL_SLOTS - 1) as f32,
+                    "`{}` {i}",
+                    entry.id
+                );
+                assert_eq!(param.range().unnormalize(normalized), i);
+            }
+            // An unused top step reads, and applies, as the last model.
+            let top = MODEL_SLOTS - 1;
+            if top > *last {
+                assert_eq!(
+                    param.normalized_value_to_string(param.range().normalize(top), false),
+                    names[*last as usize],
+                    "`{}`",
+                    entry.id
+                );
+            }
+        }
+        assert!(catalogues >= 10, "only {catalogues} model catalogues found");
     }
 
     #[test]
