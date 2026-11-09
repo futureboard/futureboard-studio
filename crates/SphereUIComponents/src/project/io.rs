@@ -265,6 +265,7 @@ pub fn export_project_archive(
     let folder = scratch.0.join(&name);
     let project_file = folder.join(format!("{name}.{PROJECT_FILE_EXT}"));
     let saved = save_project_with_report_from(project, &project_file, records_root)?;
+    copy_videos_into_archive(project, &folder, &project_file, records_root)?;
     let external_media = media_outside(project, &folder);
 
     let partial = PathBuf::from(format!("{}.part", archive.display()));
@@ -285,6 +286,76 @@ pub fn export_project_archive(
         offline_media: saved.offline_media,
         external_media,
     })
+}
+
+/// Copy external videos into `folder/Assets/Video` when building a ZIP archive,
+/// and rewrite their clip references to project-relative paths so the archive is
+/// self-contained.
+fn copy_videos_into_archive(
+    project: &mut FutureboardProject,
+    folder: &Path,
+    project_file: &Path,
+    records_root: Option<&Path>,
+) -> Result<(), ProjectError> {
+    let mut copied: Vec<(PathBuf, String)> = Vec::new();
+    let media_video = folder.join("Assets").join("Video");
+    let mut any_copied = false;
+
+    for track in &mut project.tracks {
+        for clip in &mut track.clips {
+            let ClipSource::Video {
+                source_path: Some(ref mut source_path),
+                ..
+            } = clip.source
+            else {
+                continue;
+            };
+            let source_abs = if source_path.is_absolute() {
+                source_path.clone()
+            } else if let Some(root) = records_root {
+                let candidate = root.join(&source_path);
+                if candidate.exists() {
+                    candidate
+                } else {
+                    folder.join(&source_path)
+                }
+            } else {
+                folder.join(&source_path)
+            };
+            if !source_abs.exists() {
+                continue;
+            }
+            if path_relative_to_project(&source_abs, folder).is_some() {
+                continue;
+            }
+            let relative_string = if let Some((_, rel)) = copied
+                .iter()
+                .find(|(known_source, _)| same_source(known_source, &source_abs))
+            {
+                rel.clone()
+            } else {
+                let dest = unique_asset_destination(&media_video, &source_abs)?;
+                fs::copy(&source_abs, &dest)?;
+                let relative = path_relative_to_project(&dest, folder).ok_or_else(|| {
+                    ProjectError::Corrupted(format!(
+                        "copied asset escaped project folder: {}",
+                        dest.display()
+                    ))
+                })?;
+                let rel_str = path_to_project_string(&relative);
+                copied.push((source_abs.clone(), rel_str.clone()));
+                rel_str
+            };
+            *source_path = PathBuf::from(&relative_string);
+            any_copied = true;
+        }
+    }
+
+    if any_copied {
+        let bytes = encode_project(project);
+        fs::write(project_file, &bytes)?;
+    }
+    Ok(())
 }
 
 /// A scratch folder removed with everything in it when dropped, on the error
@@ -309,12 +380,25 @@ fn media_outside(project: &FutureboardProject, root: &Path) -> Vec<PathBuf> {
             }
             | ClipSource::Rauf {
                 source_path: path, ..
+            }
+            | ClipSource::Video {
+                source_path: Some(path),
+                ..
             } => path,
             _ => continue,
         };
         if path.is_absolute() && !path.starts_with(root) && path.exists() && !outside.contains(path)
         {
             outside.push(path.clone());
+        }
+    }
+    for freeze in project.tracks.iter().filter_map(|t| t.freeze.as_ref()) {
+        let path = Path::new(&freeze.media_path);
+        if path.is_absolute() && !path.starts_with(root) && path.exists() {
+            let path_buf = path.to_path_buf();
+            if !outside.contains(&path_buf) {
+                outside.push(path_buf);
+            }
         }
     }
     outside
@@ -374,16 +458,17 @@ fn collect_files(folder: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()>
     Ok(())
 }
 
-/// Audio is stored as it is: already-compressed formats do not shrink, and
-/// deflating PCM saves little for the time it costs on a large project.
+/// Audio and video are stored as they are: already-compressed formats do not shrink,
+/// and deflating PCM saves little for the time it costs on a large project.
 fn archive_stores_uncompressed(path: &Path) -> bool {
-    const AUDIO: &[&str] = &[
+    const MEDIA: &[&str] = &[
         "wav", "wave", "aif", "aiff", "flac", "mp3", "ogg", "opus", "m4a", "aac", "caf", "w64",
-        "rauf",
+        "rauf", "mp4", "m4v", "mov", "avi", "wmv", "asf", "mkv", "webm", "mpg", "mpeg", "ts",
+        "m2ts",
     ];
     path.extension()
         .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| AUDIO.iter().any(|known| ext.eq_ignore_ascii_case(known)))
+        .is_some_and(|ext| MEDIA.iter().any(|known| ext.eq_ignore_ascii_case(known)))
 }
 
 /// Move a finished temp file over `path`. `rename` replaces the target
@@ -838,6 +923,23 @@ fn prepare_portable_assets(
                     if let Some(relative) = path_relative_to_project(&metadata_abs, project_root) {
                         *metadata_path = PathBuf::from(path_to_project_string(&relative));
                     }
+                }
+                continue;
+            }
+
+            if let ClipSource::Video { source_path, .. } = &mut clip.source {
+                let Some(source_path) = source_path else {
+                    continue;
+                };
+                let source_abs = resolve_source_for_save(source_path, project_root);
+                if !source_abs.exists() {
+                    *source_path = offline_reference(&source_abs, project_root);
+                    note_offline(&mut offline, source_abs);
+                } else if let Some(relative) = path_relative_to_project(&source_abs, project_root) {
+                    let relative_string = path_to_project_string(&relative);
+                    *source_path = PathBuf::from(&relative_string);
+                } else {
+                    *source_path = source_abs;
                 }
                 continue;
             }
@@ -1421,6 +1523,18 @@ fn resolve_project_relative_assets(project: &mut FutureboardProject, project_fil
                 if metadata_path.is_relative() {
                     *metadata_path = project_root.join(&metadata_path);
                 }
+            }
+        }
+        for clip in &mut track.clips {
+            let ClipSource::Video {
+                source_path: Some(source_path),
+                ..
+            } = &mut clip.source
+            else {
+                continue;
+            };
+            if source_path.is_relative() {
+                *source_path = project_root.join(&source_path);
             }
         }
     }
@@ -3624,5 +3738,406 @@ mod tests {
         let expected = unpacked.join("My Song").join("Assets").join("Audio");
         assert_eq!(path, &expected.join("loop.wav"));
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// Video clips on the Video track are included in the archive under
+    /// Assets/Video, stored uncompressed, and their project-relative paths
+    /// resolve properly upon reopening the extracted archive on another machine.
+    #[test]
+    fn a_project_archive_holds_the_project_and_the_video_it_plays() {
+        use zip::CompressionMethod;
+
+        let root = temp_dir("video-archive");
+        let external = root.join("external_video");
+        fs::create_dir_all(&external).unwrap();
+        let video_source = external.join("scene.mp4");
+        fs::write(&video_source, b"fake mp4 video bytes").unwrap();
+
+        let mut project = FutureboardProject::new("FilmScore");
+        project.tracks.push(ProjectTrack {
+            id: "track-v1".to_string(),
+            name: "Video".to_string(),
+            track_type: ProjectTrackType::Video,
+            ara: None,
+            timebase: crate::components::timeline::timeline_state::TrackTimebase::Musical.to_tag(),
+            parent_group_id: None,
+            group_collapsed: false,
+            color_hex: "#B280FF".to_string(),
+            volume_norm: 1.0,
+            pan: 0.0,
+            muted: false,
+            solo: false,
+            record_arm: false,
+            input_monitor: crate::project::InputMonitorMode::Off,
+            routing: TrackRouting::default(),
+            inserts: Vec::new(),
+            automation_lanes: Vec::new(),
+            clips: vec![ProjectClip {
+                id: "clip-v1".to_string(),
+                name: "scene".to_string(),
+                start_beat: 0.0,
+                duration_beats: 16.0,
+                offset_beats: 0.0,
+                gain: 1.0,
+                muted: false,
+                source: ClipSource::Video {
+                    asset_id: video_source.to_string_lossy().into_owned(),
+                    source_path: Some(video_source.clone()),
+                },
+                stretch: AudioClipStretchState::default(),
+            }],
+            row_height_px: None,
+            soundfont: None,
+            volume_automation_read: true,
+            solfege: None,
+            takes: Vec::new(),
+            takes_expanded: false,
+            freeze: None,
+        });
+
+        let archive = root.join("FilmScore.zip");
+        let report = export_project_archive(&mut project, &archive, None).unwrap();
+        assert!(
+            report.offline_media.is_empty(),
+            "{:?}",
+            report.offline_media
+        );
+        assert!(
+            report.external_media.is_empty(),
+            "{:?}",
+            report.external_media
+        );
+
+        let mut zip = zip::ZipArchive::new(File::open(&archive).unwrap()).unwrap();
+        let mut names: Vec<String> = zip
+            .file_names()
+            .map(|name| name.unwrap().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "FilmScore/Assets/Video/scene.mp4",
+                "FilmScore/FilmScore.fbproj"
+            ]
+        );
+
+        let mut zip_entry = zip.by_name("FilmScore/Assets/Video/scene.mp4").unwrap();
+        assert_eq!(zip_entry.compression(), CompressionMethod::Stored);
+        let mut video_bytes = Vec::new();
+        zip_entry.read_to_end(&mut video_bytes).unwrap();
+        assert_eq!(video_bytes, b"fake mp4 video bytes");
+        drop(zip_entry);
+
+        // Round-trip test: unpack the archive to a different directory.
+        // The project must open cleanly and resolve its video path to the new directory.
+        let unpacked = root.join("unpacked_dest");
+        zip.extract(&unpacked).unwrap();
+        let project_file = unpacked.join("FilmScore").join("FilmScore.fbproj");
+        let loaded = load_project_strict(&project_file).unwrap();
+        let ClipSource::Video {
+            source_path: Some(path),
+            ..
+        } = &loaded.tracks[0].clips[0].source
+        else {
+            panic!("expected a video clip");
+        };
+        let expected = unpacked
+            .join("FilmScore")
+            .join("Assets")
+            .join("Video")
+            .join("scene.mp4");
+        assert_eq!(path, &expected);
+        assert!(path.exists());
+        assert_eq!(fs::read(path).unwrap(), b"fake mp4 video bytes");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A video inside the project folder is stored relative to it on save,
+    /// so moving the project folder keeps the video online.
+    #[test]
+    fn video_inside_project_folder_is_saved_relative_and_survives_moving() {
+        let base = temp_dir("video-relative");
+        let root_a = base.join("ProjectA");
+        let video_dir = root_a.join("Assets").join("Video");
+        fs::create_dir_all(&video_dir).unwrap();
+        let video_file = video_dir.join("cut.mp4");
+        fs::write(&video_file, b"cut video bytes").unwrap();
+
+        let mut project = FutureboardProject::new("ProjectA");
+        project.tracks.push(ProjectTrack {
+            id: "track-v".to_string(),
+            name: "Video".to_string(),
+            track_type: ProjectTrackType::Video,
+            ara: None,
+            timebase: crate::components::timeline::timeline_state::TrackTimebase::Musical.to_tag(),
+            parent_group_id: None,
+            group_collapsed: false,
+            color_hex: "#B280FF".to_string(),
+            volume_norm: 1.0,
+            pan: 0.0,
+            muted: false,
+            solo: false,
+            record_arm: false,
+            input_monitor: crate::project::InputMonitorMode::Off,
+            routing: TrackRouting::default(),
+            inserts: Vec::new(),
+            automation_lanes: Vec::new(),
+            clips: vec![ProjectClip {
+                id: "clip-v".to_string(),
+                name: "cut".to_string(),
+                start_beat: 0.0,
+                duration_beats: 8.0,
+                offset_beats: 0.0,
+                gain: 1.0,
+                muted: false,
+                source: ClipSource::Video {
+                    asset_id: "v-cut".to_string(),
+                    source_path: Some(video_file.clone()),
+                },
+                stretch: AudioClipStretchState::default(),
+            }],
+            row_height_px: None,
+            soundfont: None,
+            volume_automation_read: true,
+            solfege: None,
+            takes: Vec::new(),
+            takes_expanded: false,
+            freeze: None,
+        });
+
+        let file_a = root_a.join("ProjectA.fbproj");
+        save_project(&mut project, &file_a).unwrap();
+
+        // Stored relative to project root.
+        let ClipSource::Video {
+            source_path: Some(ref saved_path),
+            ..
+        } = project.tracks[0].clips[0].source
+        else {
+            panic!("expected video clip");
+        };
+        assert_eq!(saved_path, &PathBuf::from("Assets/Video/cut.mp4"));
+
+        // Move the project folder to a new location.
+        let root_b = base.join("MovedProject");
+        fs::rename(&root_a, &root_b).unwrap();
+        let file_b = root_b.join("ProjectA.fbproj");
+
+        let loaded = load_project_strict(&file_b).unwrap();
+        let ClipSource::Video {
+            source_path: Some(ref loaded_path),
+            ..
+        } = loaded.tracks[0].clips[0].source
+        else {
+            panic!("expected video clip");
+        };
+        let expected = root_b.join("Assets").join("Video").join("cut.mp4");
+        assert_eq!(loaded_path, &expected);
+        assert!(loaded_path.exists());
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// A missing video clip is reported in offline_media rather than silently skipped.
+    #[test]
+    fn a_missing_video_is_reported_as_offline_media() {
+        let root = temp_dir("video-offline");
+        fs::create_dir_all(&root).unwrap();
+        let missing = root.join("nonexistent_video.mp4");
+
+        let mut project = FutureboardProject::new("MissingVid");
+        project.tracks.push(ProjectTrack {
+            id: "track-v".to_string(),
+            name: "Video".to_string(),
+            track_type: ProjectTrackType::Video,
+            ara: None,
+            timebase: crate::components::timeline::timeline_state::TrackTimebase::Musical.to_tag(),
+            parent_group_id: None,
+            group_collapsed: false,
+            color_hex: "#B280FF".to_string(),
+            volume_norm: 1.0,
+            pan: 0.0,
+            muted: false,
+            solo: false,
+            record_arm: false,
+            input_monitor: crate::project::InputMonitorMode::Off,
+            routing: TrackRouting::default(),
+            inserts: Vec::new(),
+            automation_lanes: Vec::new(),
+            clips: vec![ProjectClip {
+                id: "clip-v".to_string(),
+                name: "missing".to_string(),
+                start_beat: 0.0,
+                duration_beats: 8.0,
+                offset_beats: 0.0,
+                gain: 1.0,
+                muted: false,
+                source: ClipSource::Video {
+                    asset_id: "v-missing".to_string(),
+                    source_path: Some(missing.clone()),
+                },
+                stretch: AudioClipStretchState::default(),
+            }],
+            row_height_px: None,
+            soundfont: None,
+            volume_automation_read: true,
+            solfege: None,
+            takes: Vec::new(),
+            takes_expanded: false,
+            freeze: None,
+        });
+
+        let archive = root.join("MissingVid.zip");
+        let report = export_project_archive(&mut project, &archive, None).unwrap();
+        assert_eq!(report.offline_media, vec![missing]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Ordinary Save/Save As/autosave with an external video copies nothing and
+    /// keeps the reference where it is; exporting the same project as a ZIP
+    /// archive includes the video clip under Assets/Video.
+    #[test]
+    fn ordinary_save_with_external_video_copies_nothing_and_zip_archive_contains_video() {
+        let base = temp_dir("video-save-vs-archive");
+        let project_dir = base.join("MyProject");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        let external_dir = base.join("ExternalMedia");
+        fs::create_dir_all(&external_dir).unwrap();
+        let external_video = external_dir.join("b-roll.mp4");
+        fs::write(&external_video, b"raw external b-roll footage").unwrap();
+
+        let mut project = FutureboardProject::new("MyProject");
+        project.tracks.push(ProjectTrack {
+            id: "track-v1".to_string(),
+            name: "Video".to_string(),
+            track_type: ProjectTrackType::Video,
+            ara: None,
+            timebase: crate::components::timeline::timeline_state::TrackTimebase::Musical.to_tag(),
+            parent_group_id: None,
+            group_collapsed: false,
+            color_hex: "#B280FF".to_string(),
+            volume_norm: 1.0,
+            pan: 0.0,
+            muted: false,
+            solo: false,
+            record_arm: false,
+            input_monitor: crate::project::InputMonitorMode::Off,
+            routing: TrackRouting::default(),
+            inserts: Vec::new(),
+            automation_lanes: Vec::new(),
+            clips: vec![ProjectClip {
+                id: "clip-v1".to_string(),
+                name: "b-roll".to_string(),
+                start_beat: 0.0,
+                duration_beats: 16.0,
+                offset_beats: 0.0,
+                gain: 1.0,
+                muted: false,
+                source: ClipSource::Video {
+                    asset_id: external_video.to_string_lossy().into_owned(),
+                    source_path: Some(external_video.clone()),
+                },
+                stretch: AudioClipStretchState::default(),
+            }],
+            row_height_px: None,
+            soundfont: None,
+            volume_automation_read: true,
+            solfege: None,
+            takes: Vec::new(),
+            takes_expanded: false,
+            freeze: None,
+        });
+
+        let project_file = project_dir.join("MyProject.fbproj");
+
+        // 1. Ordinary save must NOT copy the external video to project_dir/Assets/Video
+        save_project(&mut project, &project_file).unwrap();
+
+        let project_video_dir = project_dir.join("Assets").join("Video");
+        assert!(
+            !project_video_dir.exists()
+                || fs::read_dir(&project_video_dir).unwrap().next().is_none(),
+            "ordinary save must not copy external video into project Assets/Video"
+        );
+
+        // Saved project in memory keeps referencing the external video where it is.
+        let ClipSource::Video {
+            source_path: Some(ref saved_path),
+            ..
+        } = project.tracks[0].clips[0].source
+        else {
+            panic!("expected video clip");
+        };
+        assert_eq!(saved_path, &external_video);
+
+        // Loaded project from disk also keeps referencing the external video where it is.
+        let loaded = load_project_strict(&project_file).unwrap();
+        let ClipSource::Video {
+            source_path: Some(ref loaded_path),
+            ..
+        } = loaded.tracks[0].clips[0].source
+        else {
+            panic!("expected video clip");
+        };
+        assert_eq!(loaded_path, &external_video);
+
+        // 2. ZIP archive of the same project contains the video under Assets/Video
+        let archive = base.join("MyProject.zip");
+        let report = export_project_archive(&mut project, &archive, Some(&project_dir)).unwrap();
+        assert!(
+            report.offline_media.is_empty(),
+            "{:?}",
+            report.offline_media
+        );
+        assert!(
+            report.external_media.is_empty(),
+            "{:?}",
+            report.external_media
+        );
+
+        // Verify the ZIP archive contents
+        let mut zip = zip::ZipArchive::new(File::open(&archive).unwrap()).unwrap();
+        let mut names: Vec<String> = zip
+            .file_names()
+            .map(|name| name.unwrap().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "MyProject/Assets/Video/b-roll.mp4",
+                "MyProject/MyProject.fbproj"
+            ]
+        );
+
+        // Verify extraction and resolution
+        let unpacked = base.join("unpacked");
+        zip.extract(&unpacked).unwrap();
+        let unpacked_file = unpacked.join("MyProject").join("MyProject.fbproj");
+        let unpacked_project = load_project_strict(&unpacked_file).unwrap();
+        let ClipSource::Video {
+            source_path: Some(ref unpacked_video_path),
+            ..
+        } = unpacked_project.tracks[0].clips[0].source
+        else {
+            panic!("expected video clip");
+        };
+        let expected = unpacked
+            .join("MyProject")
+            .join("Assets")
+            .join("Video")
+            .join("b-roll.mp4");
+        assert_eq!(unpacked_video_path, &expected);
+        assert!(unpacked_video_path.exists());
+        assert_eq!(
+            fs::read(unpacked_video_path).unwrap(),
+            b"raw external b-roll footage"
+        );
+
+        let _ = fs::remove_dir_all(base);
     }
 }
