@@ -686,10 +686,11 @@ pub struct JamController {
     /// restates them.
     sends: BTreeMap<String, JamSend>,
     last_error: Option<String>,
-    /// A link from outside Studio waiting for consent: the link as it arrived
-    /// (it may carry an invite secret, so it is never published or logged) and
-    /// what the confirmation shows. See [`Self::request_join_from_link`].
-    link_request: Option<(String, JamLinkRequest)>,
+    /// Links from outside Studio waiting for consent: the link as it arrived
+    /// (which may carry an invite secret, so it is never published or logged) and
+    /// what the confirmation shows. Kept so confirming a card joins the specific
+    /// room shown even if a newer link arrived in the meantime (#358).
+    link_requests: Vec<(String, JamLinkRequest)>,
     /// Smoothed arrival latency per stream id, in milliseconds. One raw read
     /// moves by up to a block as the callback advances the ring, so the UI
     /// and the recorder see an average instead.
@@ -733,7 +734,7 @@ impl JamController {
             ingress: JamIngress::Routed,
             sends: BTreeMap::new(),
             last_error: None,
-            link_request: None,
+            link_requests: Vec::new(),
             arrival_latency: Mutex::new(BTreeMap::new()),
         })
     }
@@ -893,32 +894,61 @@ impl JamController {
                     });
             }
         }
-        self.link_request = Some((link.to_string(), request));
+        self.link_requests.retain(|(_, r)| r.code != request.code);
+        self.link_requests.push((link.to_string(), request));
+        if self.link_requests.len() > 8 {
+            self.link_requests.remove(0);
+        }
         self.publish_ui_state();
         Ok(())
     }
 
     /// The link waiting for consent, as the confirmation shows it.
     pub fn link_request(&self) -> Option<&JamLinkRequest> {
-        self.link_request.as_ref().map(|(_, request)| request)
+        self.link_requests.last().map(|(_, request)| request)
     }
 
     /// Follow the waiting link. With `send` false this Studio joins to listen
     /// and publishes nothing (neither the default send nor the project's jam
     /// sends) until the user switches a send on from the panel.
     pub fn accept_link_request(&mut self, send: bool) -> Result<()> {
-        let Some((link, _)) = self.link_request.take() else {
+        let Some((_, request)) = self.link_requests.last() else {
             return Err(JamError::Session(
                 "there is no jam link waiting to be joined".to_string(),
             ));
         };
+        let code = request.code.clone();
+        self.accept_link_request_for(&code, send)
+    }
+
+    /// Follow the waiting link for the specific room code the confirmation card
+    /// displayed. If another link arrived in the meantime, confirming the card
+    /// joins the jam the user actually consented to (#358).
+    pub fn accept_link_request_for(&mut self, code: &str, send: bool) -> Result<()> {
+        let Some(pos) = self
+            .link_requests
+            .iter()
+            .rposition(|(_, r)| r.code.eq_ignore_ascii_case(code))
+        else {
+            return Err(JamError::Session(
+                "that jam link is no longer waiting — confirm the new link".to_string(),
+            ));
+        };
+        let (link, _) = self.link_requests.remove(pos);
         self.publish_ui_state();
         self.join_with_link_sending(&link, send)
     }
 
+    /// Drop the waiting link for the given room code.
+    pub fn dismiss_link_request_for(&mut self, code: &str) {
+        self.link_requests
+            .retain(|(_, r)| !r.code.eq_ignore_ascii_case(code));
+        self.publish_ui_state();
+    }
+
     /// Drop the waiting link without joining.
     pub fn dismiss_link_request(&mut self) {
-        self.link_request = None;
+        self.link_requests.clear();
         self.publish_ui_state();
     }
 
@@ -933,7 +963,7 @@ impl JamController {
     fn join_sending(&mut self, jam_id: JamId, access_token: String, send: bool) -> Result<()> {
         // Any join, however it was asked for, supersedes a link still waiting
         // for an answer.
-        self.link_request = None;
+        self.link_requests.clear();
         if self.session.is_none() {
             let sink: Arc<dyn sphere_jam_client::JamAudioSink> =
                 Arc::clone(&self.sink) as Arc<dyn sphere_jam_client::JamAudioSink>;
@@ -2677,5 +2707,45 @@ mod link_request_tests {
         assert!(controller.link_request().is_none());
         assert!(controller.session.is_none());
         assert!(controller.published_keys.is_empty());
+    }
+
+    /// #358: accepting a confirmation card binds to the room code displayed
+    /// on that card, so a second link arriving in the meantime cannot cause
+    /// the user to join a different jam than the one they confirmed.
+    #[test]
+    fn confirming_a_link_joins_the_confirmed_room_not_a_newer_arrival() {
+        let mut controller = offline_controller();
+        controller
+            .request_join_from_link("fbrd://jam/j/AAAAAA#secretA")
+            .expect("held");
+        controller
+            .request_join_from_link("fbrd://jam/j/BBBBBB#secretB")
+            .expect("held");
+
+        // The user confirms room A: joins room A, not B.
+        let err = controller
+            .accept_link_request_for("AAAAAA", false)
+            .unwrap_err();
+        assert!(matches!(err, JamError::Auth(_)));
+
+        // Room A is consumed, while B is still waiting.
+        assert_eq!(
+            controller.link_request().map(|r| r.code.as_str()),
+            Some("BBBBBB")
+        );
+
+        // Attempting to confirm A again fails because it is no longer waiting.
+        let err = controller
+            .accept_link_request_for("AAAAAA", false)
+            .unwrap_err();
+        assert!(matches!(err, JamError::Session(_)));
+        assert!(err.to_string().contains("no longer waiting"));
+
+        // Room B can now be accepted.
+        let err = controller
+            .accept_link_request_for("BBBBBB", false)
+            .unwrap_err();
+        assert!(matches!(err, JamError::Auth(_)));
+        assert!(controller.link_request().is_none());
     }
 }
