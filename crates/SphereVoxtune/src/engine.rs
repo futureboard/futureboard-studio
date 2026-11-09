@@ -712,11 +712,11 @@ impl CantoEngine {
         let mono = if sample_rate == target_sr {
             samples
         } else {
+            crate::audio_io::check_load(samples.len(), sample_rate, target_sr)
+                .map_err(|limit| limit.to_string())?;
             let mono = crate::audio_io::resample_mono_cubic(&samples, sample_rate, target_sr);
             if mono.is_empty() {
-                return Err(
-                    "Audio is too long to load or its sample rate is unsupported".to_string(),
-                );
+                return Err("Not enough memory to load this audio".to_string());
             }
             mono
         };

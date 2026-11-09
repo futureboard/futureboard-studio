@@ -39,8 +39,8 @@ use ara2_bridge_sys::access::read_field;
 use ara2_bridge_sys::*;
 use parking_lot::Mutex;
 use sphere_voxtune::audio_io::{
-    bounded_output_len, compute_waveform_peaks, resample_mono_cubic, MAX_MONO_SAMPLES,
-    MAX_SAMPLE_RATE, MIN_SAMPLE_RATE,
+    bounded_output_len, check_load, compute_waveform_peaks, max_frames, resample_mono_cubic,
+    LoadLimit, MAX_SAMPLE_RATE, MIN_SAMPLE_RATE,
 };
 use sphere_voxtune::engine::{analyze_samples, Analysis, AnalysisProgress, CantoEngine, ORN_NONE};
 use sphere_voxtune::session::VoxDocument;
@@ -175,6 +175,8 @@ pub struct AudioSource {
     reported: AtomicU32,
     progress: Arc<AnalysisProgress>,
     reader: Mutex<Option<(JoinHandle<()>, Arc<AtomicBool>)>>,
+    /// Why the last read failed, when it is known; the editor shows it.
+    failure: Mutex<Option<String>>,
     /// Mono samples at the engine rate, once read.
     audio: Mutex<Option<Arc<Take>>>,
     /// The analysis new modifications start from.
@@ -437,6 +439,9 @@ fn find<T>(list: &[Arc<T>], r: *const c_void) -> Option<Arc<T>> {
         .cloned()
 }
 
+/// A large buffer could not be reserved.
+const NOT_ENOUGH_MEMORY: &str = "Not enough memory to read this audio.";
+
 fn engine_rate(source_rate: f64) -> u32 {
     let rate = source_rate.round();
     if !rate.is_finite() {
@@ -458,6 +463,7 @@ impl DcShared {
             return;
         }
         source.state.store(SOURCE_READING, Ordering::Release);
+        *source.failure.lock() = None;
         let cancel = Arc::new(AtomicBool::new(false));
         let dc = self.clone();
         let src = source.clone();
@@ -497,13 +503,26 @@ impl DcShared {
         let count_i = *source.sample_count.lock();
         // A broken header (1 Hz, or a sample count that cannot exist) must
         // fail before any allocation: `Vec::with_capacity` aborts the process.
-        if !rate.is_finite()
+        // The length limit is a duration, the same at every rate.
+        let refused = if !rate.is_finite()
             || rate < MIN_SAMPLE_RATE as f64
             || rate > MAX_SAMPLE_RATE as f64
-            || !(1..=16).contains(&channels_i)
-            || count_i <= 0
-            || count_i as u64 > MAX_MONO_SAMPLES as u64
         {
+            let shown = if rate.is_finite() {
+                rate.round().clamp(0.0, u32::MAX as f64) as u32
+            } else {
+                0
+            };
+            Some(LoadLimit::UnsupportedRate(shown).to_string())
+        } else if !(1..=16).contains(&channels_i) || count_i <= 0 {
+            Some("The host describes this audio in a way Voxtune cannot read.".to_string())
+        } else if count_i as u64 > max_frames(rate.round() as u32) as u64 {
+            Some(LoadLimit::TooLong.to_string())
+        } else {
+            None
+        };
+        if let Some(reason) = refused {
+            *source.failure.lock() = Some(reason);
             return false;
         }
         let channels = channels_i as usize;
@@ -538,6 +557,7 @@ impl DcShared {
                     self.host.audio_ref.0 as ARAAudioAccessControllerHostRef,
                     reader,
                 );
+                *source.failure.lock() = Some(NOT_ENOUGH_MEMORY.to_string());
                 return false;
             }
             let mut buffers = Vec::new();
@@ -617,11 +637,13 @@ impl DcShared {
             .unwrap_or(src_rate);
         let samples = if src_rate == target {
             mono
-        } else if bounded_output_len(count, src_rate, target).is_none() {
+        } else if let Err(limit) = check_load(count, src_rate, target) {
+            *source.failure.lock() = Some(limit.to_string());
             return false;
         } else {
             let samples = resample_mono_cubic(&mono, src_rate, target);
             if samples.is_empty() {
+                *source.failure.lock() = Some(NOT_ENOUGH_MEMORY.to_string());
                 return false;
             }
             samples
@@ -1064,6 +1086,7 @@ unsafe extern "C" fn create_audio_source(
             reported: AtomicU32::new(SOURCE_EMPTY),
             progress: Arc::new(AnalysisProgress::default()),
             reader: Mutex::new(None),
+            failure: Mutex::new(None),
             audio: Mutex::new(None),
             analysis: Mutex::new(None),
             modifications: Mutex::new(Vec::new()),
@@ -1728,11 +1751,14 @@ impl BindingShared {
         }
         Some(match state {
             SOURCE_READING | SOURCE_ANALYZING => (name, Some(p), None),
-            SOURCE_FAILED => (
-                name,
-                None,
-                Some("The host's audio could not be read.".to_string()),
-            ),
+            SOURCE_FAILED => {
+                let reason = src.failure.lock().clone();
+                (
+                    name,
+                    None,
+                    Some(reason.unwrap_or_else(|| "The host's audio could not be read.".into())),
+                )
+            }
             _ => (name, None, None),
         })
     }
@@ -2394,6 +2420,14 @@ mod tests {
         src
     }
 
+    fn failure_of(src: ARAAudioSourceRef) -> String {
+        unsafe { obj::<AudioSource>(src) }
+            .failure
+            .lock()
+            .clone()
+            .expect("the failure has a reason")
+    }
+
     #[test]
     fn an_absurd_source_fails_instead_of_allocating() {
         unsafe {
@@ -2401,6 +2435,7 @@ mod tests {
             let src = source_with(&d, SR, i64::MAX);
             d.i.enableAudioSourceSamplesAccess.unwrap()(d.r, src, kARATrue);
             wait_failed(obj::<AudioSource>(src));
+            assert!(failure_of(src).contains("too long"), "{}", failure_of(src));
             d.i.destroyDocumentController.unwrap()(d.r);
         }
     }
@@ -2412,6 +2447,34 @@ mod tests {
             let src = source_with(&d, 1.0, 200_000);
             d.i.enableAudioSourceSamplesAccess.unwrap()(d.r, src, kARATrue);
             wait_failed(obj::<AudioSource>(src));
+            assert!(failure_of(src).contains("1 Hz"), "{}", failure_of(src));
+            d.i.destroyDocumentController.unwrap()(d.r);
+        }
+    }
+
+    /// #367: a short source above 384 kHz is refused for its rate, with a
+    /// reason, and one just over an hour for its length.
+    #[test]
+    fn a_refused_source_says_why() {
+        unsafe {
+            let d = open();
+            let fast = source_with(&d, 768_000.0, 1_000);
+            d.i.enableAudioSourceSamplesAccess.unwrap()(d.r, fast, kARATrue);
+            wait_failed(obj::<AudioSource>(fast));
+            let reason = failure_of(fast);
+            assert!(
+                reason.contains("768000 Hz") && !reason.contains("too long"),
+                "{reason}"
+            );
+
+            let long = source_with(&d, SR, (61.0 * 60.0 * SR) as i64);
+            d.i.enableAudioSourceSamplesAccess.unwrap()(d.r, long, kARATrue);
+            wait_failed(obj::<AudioSource>(long));
+            assert!(
+                failure_of(long).contains("60 minutes"),
+                "{}",
+                failure_of(long)
+            );
             d.i.destroyDocumentController.unwrap()(d.r);
         }
     }
