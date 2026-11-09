@@ -39,6 +39,7 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects};
 
+use crate::backend::open_handshake::{reap_device_thread, wait_for_device_thread, OpenHandshake};
 use crate::backend::render::LocalAudioState;
 use crate::backend::DauxDeviceConfig;
 use crate::command::EngineCommand;
@@ -351,6 +352,9 @@ pub fn open(
     let stop_event_usize = stop_event.0 as usize;
 
     let (info_tx, info_rx) = std::sync::mpsc::channel::<Result<(u32, u32, String), String>>();
+    let handshake = Arc::new(OpenHandshake::new());
+    let thread_handshake = Arc::clone(&handshake);
+    let thread_shared = Arc::clone(&shared);
 
     let t = thread::Builder::new()
         .name("daux-wasapi-excl".into())
@@ -361,12 +365,13 @@ pub fn open(
                 requested_sr,
                 buf_frames,
                 rx,
-                shared,
+                thread_shared,
                 initial_runtime,
                 glitch2,
                 stop2,
                 stop_ev,
                 info_tx,
+                &thread_handshake,
             );
         })
         .map_err(|e| {
@@ -376,13 +381,33 @@ pub fn open(
             SphereAudioError::StreamOpenFailed(e.to_string())
         })?;
 
-    let (sample_rate, buffer_size, device_name) = info_rx
-        .recv_timeout(std::time::Duration::from_secs(8))
-        .map_err(|e| {
-            // Timeout or channel disconnect (thread panicked before sending).
-            SphereAudioError::StreamOpenFailed(format!("WASAPI Exclusive thread init failed: {e}"))
-        })
-        .and_then(|r| r.map_err(SphereAudioError::StreamOpenFailed))?;
+    let init = wait_for_device_thread(
+        info_rx,
+        &handshake,
+        std::time::Duration::from_secs(8),
+        "WASAPI Exclusive",
+    );
+    let (sample_rate, buffer_size, device_name) = match init {
+        Ok(info) => info,
+        Err(message) => {
+            // Failed or abandoned (#381): stop the thread -- a late driver
+            // finds the open abandoned and exits without rendering -- and join
+            // it off this thread. The stop event outlives the thread.
+            stop_flag.store(true, Ordering::Relaxed);
+            unsafe {
+                let _ = SetEvent(stop_event);
+            }
+            if handshake.is_abandoned() {
+                // The thread leaves MMCSS state alone from here; the next
+                // stream publishes its own.
+                shared.mmcss_active.store(false, Ordering::Relaxed);
+            }
+            reap_device_thread("daux-wasapi-excl", t, move || unsafe {
+                let _ = CloseHandle(HANDLE(stop_event_usize as *mut _));
+            });
+            return Err(SphereAudioError::StreamOpenFailed(message));
+        }
+    };
 
     Ok(WasapiExclusiveHandle {
         cmd_tx: tx,
@@ -410,6 +435,7 @@ unsafe fn wasapi_thread(
     stop_flag: Arc<AtomicBool>,
     stop_event: HANDLE,
     info_tx: std::sync::mpsc::Sender<Result<(u32, u32, String), String>>,
+    handshake: &OpenHandshake,
 ) {
     // ── COM init ──────────────────────────────────────────────────────────────
     let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -464,10 +490,15 @@ unsafe fn wasapi_thread(
         initial_runtime,
         &device_name,
         mmcss_h,
+        handshake,
     );
 
     cleanup_mmcss(mmcss_h);
-    shared.mmcss_active.store(false, Ordering::Relaxed);
+    // An abandoned open handed the shared state to whichever stream the
+    // caller opened next.
+    if !handshake.is_abandoned() {
+        shared.mmcss_active.store(false, Ordering::Relaxed);
+    }
     CoUninitialize();
 }
 
@@ -489,6 +520,7 @@ unsafe fn open_exclusive_stream(
     initial_runtime: RuntimeProject,
     device_name: &str,
     _mmcss_h: isize,
+    handshake: &OpenHandshake,
 ) -> bool {
     // ── IAudioClient ──────────────────────────────────────────────────────────
     let client: IAudioClient = match device.Activate(CLSCTX_ALL, None) {
@@ -611,6 +643,12 @@ unsafe fn open_exclusive_stream(
     // silently converted.
     let flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_NOPERSIST;
 
+    // `open()` gave up while the device was being probed: do not take it.
+    if handshake.is_abandoned() {
+        eprintln!("[DAUx WASAPI Excl] Open abandoned before '{device_name}' was taken");
+        return false;
+    }
+
     let init_result =
         client.Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, flags, hns, hns, wfx_ptr, None);
 
@@ -720,8 +758,28 @@ unsafe fn open_exclusive_stream(
         return false;
     }
 
+    // #381: a driver slower than `open()`'s wait lands here after the open was
+    // abandoned. Release the device and leave the runtime -- its plug-in
+    // processors are the live ones -- and the shared state untouched.
+    if !handshake.claim() {
+        let _ = client.Stop();
+        let _ = CloseHandle(buf_event);
+        eprintln!(
+            "[DAUx WASAPI Excl] '{device_name}' finished initialising after the open was abandoned; released without rendering"
+        );
+        return false;
+    }
     shared.sample_rate.store(sample_rate, Ordering::Relaxed);
-    let _ = info_tx.send(Ok((sample_rate, actual_buf, device_name.to_string())));
+    if info_tx
+        .send(Ok((sample_rate, actual_buf, device_name.to_string())))
+        .is_err()
+    {
+        // `open()` is gone (it waits for this send after a claim, so only a
+        // panic there gets here): nobody owns this stream.
+        let _ = client.Stop();
+        let _ = CloseHandle(buf_event);
+        return false;
+    }
     eprintln!(
         "[DAUx WASAPI Excl] Stream ready: device='{}' sr={} buf={} ch={} word={} ({} bytes/frame)",
         device_name,

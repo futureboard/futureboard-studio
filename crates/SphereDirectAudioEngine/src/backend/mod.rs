@@ -24,6 +24,8 @@ pub mod asio_session;
 pub mod cpal_backend;
 pub mod render;
 
+#[cfg(any(target_os = "windows", test))]
+pub(crate) mod open_handshake;
 #[cfg(target_os = "windows")]
 pub mod wasapi_exclusive;
 #[cfg(target_os = "windows")]

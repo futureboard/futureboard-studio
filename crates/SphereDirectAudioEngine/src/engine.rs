@@ -1909,7 +1909,9 @@ impl EngineInner {
         self.shared
             .sample_rate
             .store(sample_rate, Ordering::Relaxed);
-        let initial_runtime = self.get_initial_runtime(Some(sample_rate));
+        let mut initial_runtime = self.get_initial_runtime(Some(sample_rate));
+        // What every backend does with it before its first block.
+        initial_runtime.retarget_sample_rate(sample_rate);
         let (tx, rx) = bounded::<EngineCommand>(512);
         *self.cmd_tx.lock() = Some(tx);
         self.reseed_stream_transport_state();
@@ -6452,7 +6454,15 @@ impl EngineInner {
 
     // ── Internal helpers ───────────────────────────────────────────────────
 
+    /// The graph a new stream starts with. A clone of the cached graph keeps
+    /// the sample rate its sample positions were computed at: the backend
+    /// rescales clip durations, fades and warp segments from that rate to the
+    /// device's with `retarget_sample_rate`, so relabelling it here (it used to
+    /// be overwritten with `max(rate, 44100)`) made a switch away from a
+    /// sub-44.1 kHz device scale from the wrong rate (#379).
     fn get_initial_runtime(&self, sample_rate_override: Option<u32>) -> RuntimeProject {
+        // Only a graph built here (or an empty one) takes this rate; the
+        // 44.1 kHz floor is a default for before any device reported a rate.
         let sr = sample_rate_override
             .unwrap_or_else(|| self.shared.sample_rate.load(Ordering::Relaxed).max(44100));
 
@@ -6462,9 +6472,7 @@ impl EngineInner {
         {
             let cached = self.runtime.lock().clone();
             if !cached.tracks.is_empty() {
-                let mut runtime = cached;
-                runtime.sample_rate = sr;
-                return runtime;
+                return cached;
             }
         }
 
@@ -6483,6 +6491,8 @@ impl EngineInner {
                         eprintln!(
                             "[SphereAudio] get_initial_runtime: invalid routing graph ({e}), keeping previous runtime"
                         );
+                        // Has no tracks (a cached graph with tracks returned
+                        // above), so no sample positions to keep a rate for.
                         let mut runtime = self.runtime.lock().clone();
                         runtime.sample_rate = sr;
                         runtime
@@ -9491,6 +9501,113 @@ mod routing_tests {
         assert_eq!(rendered, frames as u64);
         let left: Vec<f32> = output.chunks(channels).map(|frame| frame[0]).collect();
         assert_eq!(left, vec![0.3, 0.4, 0.2, 0.3, 0.4]);
+    }
+
+    /// #379: a device switch hands the backend the cached graph, which
+    /// rescales it from the rate it was built at. A graph built for a 16 kHz
+    /// device was relabelled 44.1 kHz first, so the switch to 48 kHz scaled
+    /// clips by 48/44.1 instead of 3 and they stopped at about a third.
+    #[test]
+    fn device_switch_rescales_a_16k_graph_from_its_own_rate() {
+        const OLD_SR: u32 = 16_000;
+        const NEW_SR: u32 = 48_000;
+        let tracks = vec![track("audio", "audio", vec![])];
+        let audio_graph = crate::audio_graph::plan_runtime_audio_graph(&tracks).unwrap();
+        let source = Arc::new(ClipAudioSource::InMemory(Arc::new(AudioFileBuffer {
+            sample_rate: OLD_SR,
+            channels: 2,
+            frames: OLD_SR as usize,
+            samples: vec![0.0; OLD_SR as usize * 2],
+        })));
+        let clip = RuntimeClip {
+            id: "clip-1".to_string(),
+            track_id: "audio".to_string(),
+            track_index: None,
+            start_beat: 0.0,
+            duration_beats: 2.0,
+            start_sample: 0,
+            duration_samples: OLD_SR as u64,
+            offset_seconds: 0.0,
+            gain: 1.0,
+            gain_target: 1.0,
+            gain_step: 1.0,
+            stretch: SphereAudioProcessor::StretchParams::default(),
+            speed_ratio: 1.0,
+            source_read_rate: 1.0,
+            effective_time_ratio: 1.0,
+            pitch_ratio: 1.0,
+            stretch_backend: SphereAudioProcessor::StretchBackend::InternalRePitch,
+            source_start_samples: 0,
+            source_end_samples: OLD_SR as u64,
+            warp_markers: Vec::new(),
+            warp_segments: vec![crate::runtime::RuntimeWarpSegment {
+                out_start: 4_000,
+                out_end: OLD_SR as u64,
+                src_start: 4_000.0,
+                src_end: OLD_SR as f64,
+            }],
+            processor: ClipDspProcessor::Resample,
+            reverse: false,
+            denoise: SphereAudioProcessor::DenoiseProcessor::new(OLD_SR, 0.0),
+            id_hash: 1,
+            channel_transform: SphereAudioProcessor::ChannelTransform::Stereo,
+            dc_remove: false,
+            dc_left: 0.0,
+            dc_right: 0.0,
+            extra_gain: 1.0,
+            dehum: SphereAudioProcessor::DehumProcessor::new(
+                OLD_SR,
+                SphereAudioProcessor::DehumParams {
+                    base_hz: 0.0,
+                    harmonics: 0,
+                    reduction_db: 0.0,
+                },
+            ),
+            envelope_points: Vec::new(),
+            preview_bypass: false,
+            muted: false,
+            ara_rendered: false,
+            fade_in_samples: 1_600,
+            fade_out_samples: 3_200,
+            fade_in_curve: crate::runtime::FadeCurve::EqualPower,
+            fade_out_curve: crate::runtime::FadeCurve::EqualPower,
+            source,
+            stretch_processor: None,
+            stretch_input_l: Vec::new(),
+            stretch_input_r: Vec::new(),
+            stretch_output_l: Vec::new(),
+            stretch_output_r: Vec::new(),
+            stretch_prime_l: Vec::new(),
+            stretch_prime_r: Vec::new(),
+            stretch_next_project_sample: None,
+        };
+        let mut built = RuntimeProject {
+            spatial: Default::default(),
+            sample_rate: OLD_SR,
+            tracks,
+            clips: vec![clip],
+            audio_graph,
+            ..Default::default()
+        };
+        built.resolve_indices();
+
+        // `load_project` built the graph at the 16 kHz device's rate.
+        let engine = EngineInner::new();
+        engine.shared.sample_rate.store(OLD_SR, Ordering::Relaxed);
+        *engine.runtime.lock() = built;
+
+        // The switch: the graph handed over, then the 48 kHz backend's retarget.
+        let mut runtime = engine.get_initial_runtime(None);
+        assert_eq!(runtime.sample_rate, OLD_SR, "the recorded rate is kept");
+        runtime.retarget_sample_rate(NEW_SR);
+
+        let clip = &runtime.clips[0];
+        assert_eq!(runtime.sample_rate, NEW_SR);
+        assert_eq!(clip.duration_samples, NEW_SR as u64, "one second long");
+        assert_eq!(clip.fade_in_samples, 4_800);
+        assert_eq!(clip.fade_out_samples, 9_600);
+        assert_eq!(clip.warp_segments[0].out_start, 12_000);
+        assert_eq!(clip.warp_segments[0].out_end, NEW_SR as u64);
     }
 
     /// The stereo block renderer (live stereo playback and export) must apply

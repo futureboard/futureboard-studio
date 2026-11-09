@@ -57,6 +57,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::System::IO::DeviceIoControl;
 
+use crate::backend::open_handshake::{reap_device_thread, wait_for_device_thread, OpenHandshake};
 use crate::backend::render::LocalAudioState;
 use crate::backend::DauxDeviceConfig;
 use crate::command::EngineCommand;
@@ -446,6 +447,9 @@ pub fn open(
     let stop_event_usize = stop_event.0 as usize;
 
     let (info_tx, info_rx) = std::sync::mpsc::channel::<Result<(u32, u32, String), String>>();
+    let handshake = Arc::new(OpenHandshake::new());
+    let thread_handshake = Arc::clone(&handshake);
+    let thread_shared = Arc::clone(&shared);
 
     let thread_name = device_name.clone();
     let t = thread::Builder::new()
@@ -458,12 +462,13 @@ pub fn open(
                 period_frames,
                 thread_name,
                 rx,
-                shared,
+                thread_shared,
                 initial_runtime,
                 glitch2,
                 stop2,
                 stop_ev,
                 info_tx,
+                &thread_handshake,
             );
         })
         .map_err(|e| {
@@ -473,10 +478,33 @@ pub fn open(
             SphereAudioError::StreamOpenFailed(e.to_string())
         })?;
 
-    let (sample_rate, buffer_size, device_name) = info_rx
-        .recv_timeout(std::time::Duration::from_secs(8))
-        .map_err(|e| SphereAudioError::StreamOpenFailed(format!("WDM-KS thread init failed: {e}")))
-        .and_then(|r| r.map_err(SphereAudioError::StreamOpenFailed))?;
+    let init = wait_for_device_thread(
+        info_rx,
+        &handshake,
+        std::time::Duration::from_secs(8),
+        "WDM-KS",
+    );
+    let (sample_rate, buffer_size, device_name) = match init {
+        Ok(info) => info,
+        Err(message) => {
+            // Failed or abandoned (#381): stop the thread -- a late driver
+            // finds the open abandoned and exits without rendering -- and join
+            // it off this thread. The stop event outlives the thread.
+            stop_flag.store(true, Ordering::Relaxed);
+            unsafe {
+                let _ = SetEvent(stop_event);
+            }
+            if handshake.is_abandoned() {
+                // The thread leaves MMCSS state alone from here; the next
+                // stream publishes its own.
+                shared.mmcss_active.store(false, Ordering::Relaxed);
+            }
+            reap_device_thread("daux-wdm-ks", t, move || unsafe {
+                let _ = CloseHandle(HANDLE(stop_event_usize as *mut _));
+            });
+            return Err(SphereAudioError::StreamOpenFailed(message));
+        }
+    };
 
     Ok(WdmKsHandle {
         cmd_tx: tx,
@@ -522,6 +550,7 @@ unsafe fn wdm_ks_thread(
     stop_flag: Arc<AtomicBool>,
     stop_event: HANDLE,
     info_tx: std::sync::mpsc::Sender<Result<(u32, u32, String), String>>,
+    handshake: &OpenHandshake,
 ) {
     // ── MMCSS "Pro Audio" ─────────────────────────────────────────────────────
     let task: Vec<u16> = "Pro Audio\0".encode_utf16().collect();
@@ -533,14 +562,21 @@ unsafe fn wdm_ks_thread(
     } else {
         eprintln!("[DAUx WDM-KS] MMCSS set failed (non-fatal)");
     }
+    // An abandoned open handed the shared state to whichever stream the
+    // caller opened next.
+    let release_mmcss = || {
+        cleanup_mmcss(mmcss_h);
+        if !handshake.is_abandoned() {
+            shared.mmcss_active.store(false, Ordering::Relaxed);
+        }
+    };
 
     // ── Open the filter handle (owned by this thread) ─────────────────────────
     let filter = match open_filter_handle(&target.path) {
         Ok(h) => h,
         Err(e) => {
             let _ = info_tx.send(Err(e.to_string()));
-            cleanup_mmcss(mmcss_h);
-            shared.mmcss_active.store(false, Ordering::Relaxed);
+            release_mmcss();
             return;
         }
     };
@@ -551,8 +587,7 @@ unsafe fn wdm_ks_thread(
         Err(e) => {
             let _ = info_tx.send(Err(e));
             let _ = CloseHandle(filter);
-            cleanup_mmcss(mmcss_h);
-            shared.mmcss_active.store(false, Ordering::Relaxed);
+            release_mmcss();
             return;
         }
     };
@@ -578,6 +613,7 @@ unsafe fn wdm_ks_thread(
         &stop_flag,
         stop_event,
         &info_tx,
+        handshake,
     );
 
     // ── Teardown ──────────────────────────────────────────────────────────────
@@ -589,8 +625,7 @@ unsafe fn wdm_ks_thread(
     }
     let _ = CloseHandle(stream.pin);
     let _ = CloseHandle(filter);
-    cleanup_mmcss(mmcss_h);
-    shared.mmcss_active.store(false, Ordering::Relaxed);
+    release_mmcss();
     eprintln!("[DAUx WDM-KS] Stopped");
 }
 
@@ -664,12 +699,54 @@ unsafe fn run_rt_stream(
     stop_flag: &Arc<AtomicBool>,
     stop_event: HANDLE,
     info_tx: &std::sync::mpsc::Sender<Result<(u32, u32, String), String>>,
+    handshake: &OpenHandshake,
 ) {
     let sample_rate = stream.sample_rate;
     let block_align = stream.block_align;
     let buffer_bytes = stream.buffer_bytes;
     let channels = stream.channels;
     let buffer_frames = buffer_bytes / block_align;
+
+    // Pre-fill the whole buffer with silence before RUN so the DMA engine
+    // starts on valid audio rather than whatever the driver mapped. Silence,
+    // not a render: the stream is not this thread's until the handshake
+    // below, and the runtime's plug-in processors are the live ones (#381).
+    // Every negotiated word (float, signed PCM) is silent at all-zero bytes;
+    // the render loop fills ahead of the play cursor from the first wakeup.
+    std::ptr::write_bytes(stream.buffer, 0, buffer_bytes as usize);
+    std::sync::atomic::fence(Ordering::SeqCst);
+    let mut write_total: u64 = buffer_frames * block_align;
+
+    // STOP → ACQUIRE → PAUSE → RUN (KS requires single-step transitions).
+    for state in [KSSTATE_ACQUIRE, KSSTATE_PAUSE, KSSTATE_RUN] {
+        if let Err(e) = set_pin_state(stream.pin, state) {
+            let _ = info_tx.send(Err(format!("set pin state {state} failed: {e}")));
+            return;
+        }
+    }
+
+    // A driver slower than `open()`'s wait lands here after the open was
+    // abandoned: return to the caller's teardown, which releases the pin,
+    // without touching the runtime or the shared state.
+    if !handshake.claim() {
+        eprintln!(
+            "[DAUx WDM-KS] '{device_name}' finished initialising after the open was abandoned; released without rendering"
+        );
+        return;
+    }
+    shared.sample_rate.store(sample_rate, Ordering::Relaxed);
+    if info_tx
+        .send(Ok((
+            sample_rate,
+            stream.period_frames as u32,
+            device_name.clone(),
+        )))
+        .is_err()
+    {
+        // `open()` is gone (it waits for this send after a claim, so only a
+        // panic there gets here): nobody owns this stream.
+        return;
+    }
 
     // Realtime runtime + scratch (period-sized; the fill loop chunks by period).
     let mut runtime = initial_runtime;
@@ -685,33 +762,6 @@ unsafe fn run_rt_stream(
         channels.max(1),
         Arc::clone(shared),
     );
-
-    // Pre-fill the whole buffer before RUN so the DMA engine starts on valid
-    // audio rather than whatever the driver mapped.
-    let mut write_total: u64 = 0;
-    render_into_ring(
-        stream,
-        write_total,
-        buffer_frames,
-        &mut scratch,
-        &mut guarded,
-    );
-    write_total = buffer_frames * block_align;
-
-    // STOP → ACQUIRE → PAUSE → RUN (KS requires single-step transitions).
-    for state in [KSSTATE_ACQUIRE, KSSTATE_PAUSE, KSSTATE_RUN] {
-        if let Err(e) = set_pin_state(stream.pin, state) {
-            let _ = info_tx.send(Err(format!("set pin state {state} failed: {e}")));
-            return;
-        }
-    }
-
-    shared.sample_rate.store(sample_rate, Ordering::Relaxed);
-    let _ = info_tx.send(Ok((
-        sample_rate,
-        stream.period_frames as u32,
-        device_name.clone(),
-    )));
 
     // Monotonic reconstruction of the wrapping hardware play offset.
     let mut play_base: u64 = 0;
