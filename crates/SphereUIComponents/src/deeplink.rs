@@ -32,12 +32,12 @@
 //! ever handed to the same parser a pasted link goes through.
 
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// The scheme, without the `://`.
 pub const SCHEME: &str = "fbrd";
@@ -48,6 +48,14 @@ const RELAY_PORT_FILE: &str = "fbrd-relay.port";
 /// How long a second instance waits for the first to acknowledge a URL before
 /// deciding nobody is running and opening on its own.
 const RELAY_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// Longest line the relay reads. A link is far shorter; anything longer is not
+/// one and is cut off rather than buffered.
+const MAX_RELAY_LINE: usize = 8 * 1024;
+
+/// Relay connections served at once. Each one ends within [`RELAY_TIMEOUT`],
+/// so a full house frees up quickly; past it, a connection is closed unread.
+const MAX_RELAY_CONNECTIONS: usize = 16;
 
 /// What a parsed link asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,29 +229,93 @@ pub fn start_relay_listener() {
 
     let spawned = std::thread::Builder::new()
         .name("fbrd-relay".to_string())
-        .spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else {
-                    continue;
-                };
-                let _ = stream.set_read_timeout(Some(RELAY_TIMEOUT));
-                let mut line = String::new();
-                let accepted = {
-                    let mut reader = BufReader::new(&stream);
-                    reader.read_line(&mut line).is_ok() && is_scheme_url(&line)
-                };
-                if accepted {
-                    enqueue(line.trim());
-                    let _ = writeln!(stream, "ok");
-                } else {
-                    let _ = writeln!(stream, "refused");
-                }
-                let _ = stream.flush();
-            }
-        });
+        .spawn(move || serve_relay(listener, Arc::new(|url: String| enqueue(url))));
     if let Err(error) = spawned {
         crate::boot::log(&format!("fbrd relay: could not start: {error}"));
     }
+}
+
+/// The relay's accept loop. It only accepts: each connection is read and
+/// answered on its own short-lived thread, so one that stalls or trickles
+/// bytes cannot hold up the link hand-offs behind it.
+fn serve_relay(listener: TcpListener, deliver: Arc<dyn Fn(String) + Send + Sync>) {
+    let serving = Arc::new(AtomicUsize::new(0));
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else {
+            continue;
+        };
+        if serving.load(Ordering::Acquire) >= MAX_RELAY_CONNECTIONS {
+            continue; // dropped unread
+        }
+        serving.fetch_add(1, Ordering::AcqRel);
+        let deliver = deliver.clone();
+        let done = serving.clone();
+        let spawned = std::thread::Builder::new()
+            .name("fbrd-relay-connection".to_string())
+            .spawn(move || {
+                serve_relay_connection(stream, deliver.as_ref());
+                done.fetch_sub(1, Ordering::AcqRel);
+            });
+        if spawned.is_err() {
+            serving.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+/// Read one link from a relay connection and acknowledge it. The whole
+/// exchange has [`RELAY_TIMEOUT`], not each read, and the line is capped at
+/// [`MAX_RELAY_LINE`].
+fn serve_relay_connection(mut stream: TcpStream, deliver: &(dyn Fn(String) + Send + Sync)) {
+    // Accepted from a blocking listener, but be explicit: a timeout needs a
+    // blocking socket.
+    if stream.set_nonblocking(false).is_err() {
+        return;
+    }
+    let _ = stream.set_write_timeout(Some(RELAY_TIMEOUT));
+    let until = Instant::now() + RELAY_TIMEOUT;
+    match read_relay_line(&mut stream, until) {
+        Some(line) if is_scheme_url(&line) => {
+            deliver(line.trim().to_string());
+            let _ = writeln!(stream, "ok");
+        }
+        _ => {
+            let _ = writeln!(stream, "refused");
+        }
+    }
+    let _ = stream.flush();
+}
+
+/// One newline-terminated line (or everything before the peer closed), read
+/// until `until`. `None` when it stalls past the deadline, grows past
+/// [`MAX_RELAY_LINE`], or is not UTF-8.
+fn read_relay_line(stream: &mut TcpStream, until: Instant) -> Option<String> {
+    let mut line = Vec::with_capacity(256);
+    let mut chunk = [0u8; 1024];
+    loop {
+        let left = until
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())?;
+        stream.set_read_timeout(Some(left)).ok()?;
+        let read = match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        };
+        let received = &chunk[..read];
+        let (part, complete) = match received.iter().position(|&byte| byte == b'\n') {
+            Some(end) => (&received[..end], true),
+            None => (received, false),
+        };
+        if line.len() + part.len() > MAX_RELAY_LINE {
+            return None;
+        }
+        line.extend_from_slice(part);
+        if complete {
+            break;
+        }
+    }
+    String::from_utf8(line).ok()
 }
 
 // ── Registration ─────────────────────────────────────────────────────────────
@@ -463,6 +535,90 @@ mod tests {
         assert!(drained.contains(&"fbrd://jam/j/QUEUED".to_string()));
         assert!(!drained.iter().any(|url| url.starts_with("https")));
         assert!(drain().is_empty());
+    }
+
+    /// A relay on a private port that hands accepted links to a channel, not
+    /// the process-wide queue other tests drain.
+    fn test_relay() -> (SocketAddr, std::sync::mpsc::Receiver<String>) {
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel::<String>();
+        let sender = Mutex::new(sender);
+        std::thread::spawn(move || {
+            serve_relay(
+                listener,
+                Arc::new(move |url| {
+                    let _ = sender.lock().unwrap().send(url);
+                }),
+            )
+        });
+        (address, receiver)
+    }
+
+    fn reply_to(stream: &TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reply = String::new();
+        let _ = BufReader::new(stream).read_line(&mut reply);
+        reply.trim().to_string()
+    }
+
+    /// A connection that trickles bytes without ever ending its line must not
+    /// hold up the hand-off behind it, and is itself cut off at the deadline.
+    #[test]
+    fn a_slow_relay_connection_does_not_block_the_next_link() {
+        let (address, delivered) = test_relay();
+
+        let mut slow = TcpStream::connect(address).unwrap();
+        let trickle = std::thread::spawn(move || {
+            for _ in 0..30 {
+                if slow.write_all(b"f").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            slow
+        });
+        std::thread::sleep(Duration::from_millis(150));
+
+        let started = Instant::now();
+        let mut link = TcpStream::connect(address).unwrap();
+        link.write_all(b"fbrd://jam/j/RELAY1\n").unwrap();
+        assert_eq!(reply_to(&link), "ok");
+        assert!(
+            started.elapsed() < RELAY_TIMEOUT,
+            "the link waited behind the slow connection"
+        );
+        assert_eq!(
+            delivered.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "fbrd://jam/j/RELAY1"
+        );
+
+        let slow = trickle.join().unwrap();
+        assert_ne!(reply_to(&slow), "ok");
+        assert!(delivered.try_recv().is_err());
+    }
+
+    /// An endless line is refused once it passes the cap, not buffered.
+    #[test]
+    fn an_oversized_relay_line_is_refused() {
+        let (address, delivered) = test_relay();
+        let mut stream = TcpStream::connect(address).unwrap();
+        let mut oversized = b"fbrd://jam/j/".to_vec();
+        oversized.resize(MAX_RELAY_LINE + 64, b'A');
+        let _ = stream.write_all(&oversized);
+        assert_ne!(reply_to(&stream), "ok");
+        assert!(delivered.recv_timeout(Duration::from_millis(300)).is_err());
+
+        // And the relay still serves the next one.
+        let mut link = TcpStream::connect(address).unwrap();
+        link.write_all(b"fbrd://jam/j/RELAY2\n").unwrap();
+        assert_eq!(reply_to(&link), "ok");
+        assert_eq!(
+            delivered.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "fbrd://jam/j/RELAY2"
+        );
     }
 
     #[test]

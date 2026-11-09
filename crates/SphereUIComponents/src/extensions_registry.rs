@@ -7,13 +7,15 @@
 //! be called from GPUI's background executor, never from a render or audio path.
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gpui::Rgba;
 use serde::Deserialize;
 
-/// Override for local API work, e.g. `http://localhost:8080`.
+/// Override for local API work, e.g. `http://localhost:8080`. An override must
+/// be HTTPS; plain HTTP is accepted only for a loopback host in a debug build.
 const REGISTRY_BASE_URL_ENV: &str = "FUTUREBOARD_REGISTRY_URL";
 const DEFAULT_REGISTRY_BASE_URL: &str = "https://futureboard.studio";
 const REGISTRY_TIMEOUT_SECS: u64 = 10;
@@ -22,6 +24,9 @@ const REGISTRY_PAGE_SIZE: u32 = 60;
 /// A theme document is a small JSON file. Anything larger is not one, and is
 /// refused before it reaches the themes directory.
 const MAX_THEME_DOCUMENT_BYTES: usize = 1 << 20;
+
+/// Upper bound for one listing page (`REGISTRY_PAGE_SIZE` small rows).
+const MAX_LISTING_BYTES: usize = 4 << 20;
 
 /// Registry sections shown in the Extensions window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,25 +195,109 @@ impl From<ItemPayload> for RegistryItem {
 
 // ── Requests ────────────────────────────────────────────────────────────────
 
-fn registry_base_url() -> String {
-    std::env::var(REGISTRY_BASE_URL_ENV)
-        .ok()
-        .map(|value| value.trim().trim_end_matches('/').to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_REGISTRY_BASE_URL.to_string())
+fn registry_base_url() -> Result<reqwest::Url, String> {
+    match std::env::var(REGISTRY_BASE_URL_ENV) {
+        Ok(value) if !value.trim().is_empty() => {
+            parse_registry_base_url(&value, cfg!(debug_assertions))
+        }
+        _ => parse_registry_base_url(DEFAULT_REGISTRY_BASE_URL, false),
+    }
+}
+
+/// Validates a registry base URL. HTTPS is always required, except that a
+/// debug build may talk plain HTTP to a loopback host for local API work.
+fn parse_registry_base_url(value: &str, allow_loopback_http: bool) -> Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(value.trim())
+        .map_err(|_| format!("{REGISTRY_BASE_URL_ENV} is not a valid URL."))?;
+    let host_is_loopback = url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    });
+    match url.scheme() {
+        "https" if url.host().is_some() => {}
+        "http" if allow_loopback_http && host_is_loopback => {}
+        _ => {
+            return Err(format!(
+                "{REGISTRY_BASE_URL_ENV} must be an https:// URL (plain http is only accepted for localhost in a debug build)."
+            ));
+        }
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(format!(
+            "{REGISTRY_BASE_URL_ENV} must not carry credentials."
+        ));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(format!(
+            "{REGISTRY_BASE_URL_ENV} must not carry a query or fragment."
+        ));
+    }
+    Ok(url)
 }
 
 /// The registry's theme routes live under `/theme-registry`, not `/themes` —
-/// the marketing site owns `/themes` on the same origin.
-fn theme_registry_url(suffix: &str) -> String {
-    format!("{}/theme-registry{suffix}", registry_base_url())
+/// the marketing site owns `/themes` on the same origin. Each segment is
+/// percent-encoded, so a remote slug cannot change the route.
+fn theme_registry_url(
+    base: &reqwest::Url,
+    segments: &[&str],
+    query: Option<&str>,
+) -> Result<reqwest::Url, String> {
+    let mut url = base.clone();
+    {
+        let mut path = url
+            .path_segments_mut()
+            .map_err(|_| "The registry URL cannot hold a path.".to_string())?;
+        path.pop_if_empty().push("theme-registry");
+        for segment in segments {
+            path.push(segment);
+        }
+    }
+    url.set_query(query);
+    Ok(url)
 }
 
-fn client() -> Result<reqwest::blocking::Client, String> {
+fn client(base: &reqwest::Url) -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(REGISTRY_TIMEOUT_SECS))
+        // An HTTPS registry must not be redirected down to plain HTTP.
+        .https_only(base.scheme() == "https")
         .build()
         .map_err(|error| format!("Could not create the registry client: {error}"))
+}
+
+/// Reads at most `max` bytes of a body. A larger body is refused as soon as
+/// the limit is crossed, so an oversized response never lands in memory.
+fn read_bounded(reader: impl Read, max: usize, what: &str) -> Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+    reader
+        .take(max as u64 + 1)
+        .read_to_end(&mut body)
+        .map_err(|error| format!("Could not read the {what}: {error}"))?;
+    if body.len() > max {
+        return Err(format!("The {what} is too large."));
+    }
+    Ok(body)
+}
+
+/// Rejects a response whose declared length is already over the limit, then
+/// reads the body through [`read_bounded`] (the header can be absent or wrong).
+fn read_response_bounded(
+    response: reqwest::blocking::Response,
+    max: usize,
+    what: &str,
+) -> Result<Vec<u8>, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max as u64)
+    {
+        return Err(format!("The {what} is too large."));
+    }
+    read_bounded(response, max, what)
 }
 
 /// Fetches one registry section.
@@ -220,9 +309,14 @@ pub fn fetch_extensions(kind: ExtensionKind) -> Result<Vec<RegistryItem>, String
         return Ok(Vec::new());
     }
 
-    let url = theme_registry_url(&format!("?sort=recent&limit={REGISTRY_PAGE_SIZE}"));
-    let response = client()?
-        .get(&url)
+    let base = registry_base_url()?;
+    let url = theme_registry_url(
+        &base,
+        &[],
+        Some(&format!("sort=recent&limit={REGISTRY_PAGE_SIZE}")),
+    )?;
+    let response = client(&base)?
+        .get(url)
         .header(reqwest::header::ACCEPT, "application/json")
         .send()
         .map_err(|error| format!("Could not reach the extension registry: {error}"))?;
@@ -232,8 +326,8 @@ pub fn fetch_extensions(kind: ExtensionKind) -> Result<Vec<RegistryItem>, String
         return Err(format!("The registry returned HTTP {status}."));
     }
 
-    let payload = response
-        .json::<ListResponse>()
+    let body = read_response_bounded(response, MAX_LISTING_BYTES, "registry listing")?;
+    let payload = serde_json::from_slice::<ListResponse>(&body)
         .map_err(|error| format!("Could not read the registry listing: {error}"))?;
 
     Ok(payload.items.into_iter().map(RegistryItem::from).collect())
@@ -279,9 +373,10 @@ pub fn download_theme(slug: &str) -> Result<(PathBuf, String), String> {
         return Err("That extension has no download id.".to_string());
     }
 
-    let url = theme_registry_url(&format!("/{slug}/download"));
-    let response = client()?
-        .get(&url)
+    let base = registry_base_url()?;
+    let url = theme_registry_url(&base, &[slug, "download"], None)?;
+    let response = client(&base)?
+        .get(url)
         .header(reqwest::header::ACCEPT, "application/json")
         .send()
         .map_err(|error| format!("Could not reach the extension registry: {error}"))?;
@@ -291,12 +386,9 @@ pub fn download_theme(slug: &str) -> Result<(PathBuf, String), String> {
         return Err(format!("The registry returned HTTP {status}."));
     }
 
-    let body = response
-        .text()
-        .map_err(|error| format!("Could not read the download: {error}"))?;
-    if body.len() > MAX_THEME_DOCUMENT_BYTES {
-        return Err("That download is too large to be a theme document.".to_string());
-    }
+    let body = read_response_bounded(response, MAX_THEME_DOCUMENT_BYTES, "theme download")?;
+    let body = String::from_utf8(body)
+        .map_err(|_| "The registry did not return a theme document.".to_string())?;
 
     // Validate before writing: a misrouted request answers with an HTML page and
     // a 200, and an unreadable file in the themes directory would then fail on
@@ -392,6 +484,57 @@ mod tests {
         assert!(validate_theme_document("<!doctype html><html></html>").is_err());
         assert!(validate_theme_document(r#"{"id":"community.x"}"#).is_err());
         assert!(validate_theme_document(r#"{"tokens":{}}"#).is_err());
+    }
+
+    #[test]
+    fn bounded_read_stops_at_the_limit() {
+        // An endless body: reading it whole would never finish.
+        let endless = std::io::repeat(b'x');
+        assert!(read_bounded(endless, MAX_THEME_DOCUMENT_BYTES, "theme download").is_err());
+
+        let exact = [b'a'; 16];
+        assert_eq!(read_bounded(&exact[..], 16, "x").unwrap().len(), 16);
+        assert!(read_bounded(&[b'a'; 17][..], 16, "x").is_err());
+    }
+
+    #[test]
+    fn registry_override_requires_https() {
+        assert!(parse_registry_base_url("https://registry.example", false).is_ok());
+        assert!(parse_registry_base_url("http://registry.example", false).is_err());
+        assert!(parse_registry_base_url("http://registry.example", true).is_err());
+        assert!(parse_registry_base_url("http://localhost:8080", false).is_err());
+        assert!(parse_registry_base_url("ftp://registry.example", false).is_err());
+        assert!(parse_registry_base_url("not a url", false).is_err());
+        assert!(parse_registry_base_url("https://user:pw@registry.example", false).is_err());
+        // Local API work in a debug build only.
+        assert!(parse_registry_base_url("http://localhost:8080", true).is_ok());
+        assert!(parse_registry_base_url("http://127.0.0.1:8080", true).is_ok());
+        assert!(parse_registry_base_url("http://[::1]:8080", true).is_ok());
+        assert!(parse_registry_base_url(DEFAULT_REGISTRY_BASE_URL, false).is_ok());
+    }
+
+    #[test]
+    fn theme_registry_url_encodes_the_slug() {
+        let base = parse_registry_base_url("https://futureboard.studio/", false).unwrap();
+        let url = theme_registry_url(&base, &["midnight", "download"], None).unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://futureboard.studio/theme-registry/midnight/download"
+        );
+
+        let hostile = theme_registry_url(&base, &["../../admin?x=1#y", "download"], None).unwrap();
+        assert_eq!(hostile.host_str(), Some("futureboard.studio"));
+        assert!(hostile.path().starts_with("/theme-registry/"));
+        assert!(hostile.path().ends_with("/download"));
+        assert!(hostile.query().is_none());
+        assert!(hostile.fragment().is_none());
+        assert_eq!(hostile.path_segments().unwrap().count(), 3);
+
+        let listing = theme_registry_url(&base, &[], Some("sort=recent&limit=60")).unwrap();
+        assert_eq!(
+            listing.as_str(),
+            "https://futureboard.studio/theme-registry?sort=recent&limit=60"
+        );
     }
 
     #[test]

@@ -147,17 +147,52 @@ fn bearer_get(
     let key = api_key().ok_or_else(|| {
         "TONE3000 API key is not configured (set FUTUREBOARD_TONE3000_API_KEY in the environment Studio runs in)".to_string()
     })?;
-    let url = if path_and_query.starts_with("http://") || path_and_query.starts_with("https://") {
-        path_and_query.to_string()
-    } else {
-        format!("{API_BASE}{path_and_query}")
-    };
-    http_client(timeout_secs)?
-        .get(&url)
-        .header("Authorization", format!("Bearer {key}"))
-        .header("Accept", "application/json")
+    let target = resolve_request_target(path_and_query)?;
+    let mut request = http_client(timeout_secs)?
+        .get(target.url)
+        .header("Accept", "application/json");
+    // The key belongs to the TONE3000 API origin only. A download URL the API
+    // hands back may name a CDN or storage host; that host is fetched without
+    // the credential (redirects already drop it, see reqwest's sensitive
+    // header handling).
+    if target.attach_key {
+        request = request.header("Authorization", format!("Bearer {key}"));
+    }
+    request
         .send()
         .map_err(|error| format!("TONE3000 request failed: {error}"))
+}
+
+/// Where a TONE3000 request goes and whether it may carry the API key.
+#[derive(Debug)]
+struct RequestTarget {
+    url: reqwest::Url,
+    attach_key: bool,
+}
+
+/// Resolve an API-relative path or an absolute URL from an API response.
+/// Only an exact match of the configured API origin (scheme, host and
+/// effective port) is allowed to receive the bearer key; every other host is
+/// still reachable over HTTPS, but anonymously.
+fn resolve_request_target(path_and_query: &str) -> Result<RequestTarget, String> {
+    let base = reqwest::Url::parse(API_BASE)
+        .map_err(|error| format!("TONE3000 API base is invalid: {error}"))?;
+    let raw = path_and_query.trim();
+    let url = if raw.starts_with("http://") || raw.starts_with("https://") {
+        reqwest::Url::parse(raw)
+            .map_err(|error| format!("TONE3000 returned an invalid URL: {error}"))?
+    } else if raw.starts_with('/') && !raw.starts_with("//") {
+        base.join(raw)
+            .map_err(|error| format!("TONE3000 request path is invalid: {error}"))?
+    } else {
+        return Err("TONE3000 request path must be absolute".to_string());
+    };
+    if url.scheme() != "https" {
+        return Err("TONE3000 requests must use HTTPS".to_string());
+    }
+    let attach_key =
+        url.origin() == base.origin() && url.username().is_empty() && url.password().is_none();
+    Ok(RequestTarget { url, attach_key })
 }
 
 fn require_ok(
@@ -406,6 +441,39 @@ mod tests {
             architecture_version: arch,
             model_url: format!("https://www.tone3000.com/files/{size}.nam"),
         }
+    }
+
+    #[test]
+    fn api_key_is_only_attached_to_the_api_origin() {
+        let relative = resolve_request_target("/api/v1/tones/7?architecture=2").unwrap();
+        assert!(relative.attach_key);
+        assert_eq!(relative.url.host_str(), Some("www.tone3000.com"));
+
+        let same_origin =
+            resolve_request_target("https://www.tone3000.com/files/standard.nam").unwrap();
+        assert!(same_origin.attach_key);
+        let explicit_port =
+            resolve_request_target("https://www.tone3000.com:443/files/a.nam").unwrap();
+        assert!(explicit_port.attach_key);
+
+        for foreign in [
+            "https://cdn.example/files/a.nam",
+            "https://tone3000.com/files/a.nam",
+            "https://www.tone3000.com.evil.example/a.nam",
+            "https://www.tone3000.com:8443/files/a.nam",
+            "https://user@www.tone3000.com/files/a.nam",
+            "https://evil.example/?u=https://www.tone3000.com",
+        ] {
+            let target = resolve_request_target(foreign).unwrap();
+            assert!(!target.attach_key, "{foreign} must not receive the key");
+        }
+    }
+
+    #[test]
+    fn non_https_and_scheme_relative_targets_are_refused() {
+        assert!(resolve_request_target("http://www.tone3000.com/files/a.nam").is_err());
+        assert!(resolve_request_target("//evil.example/a.nam").is_err());
+        assert!(resolve_request_target("files/a.nam").is_err());
     }
 
     #[test]
