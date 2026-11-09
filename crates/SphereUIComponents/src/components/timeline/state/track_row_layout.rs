@@ -716,6 +716,40 @@ impl TimelineState {
         live.next().is_none()
     }
 
+    /// The mean height of the arrangement's track rows: what the Classic tool
+    /// bar's vertical zoom slider shows. Track zoom scales every row by one
+    /// factor, so the mean moves by that factor too. No allocation; mixer-only
+    /// channels are left out, as in the zoom itself.
+    pub fn mean_track_row_height(&self) -> f32 {
+        let (sum, count) = self
+            .tracks
+            .iter()
+            .filter(|track| !is_arrangement_hidden_track(track))
+            .fold((0.0_f32, 0_u32), |(sum, count), track| {
+                (sum + self.track_row_height(track), count + 1)
+            });
+        if count == 0 {
+            DEFAULT_TRACK_HEIGHT
+        } else {
+            sum / count as f32
+        }
+    }
+
+    /// Vertical zoom as a slider position, `0.0..=1.0` on a log scale between
+    /// the smallest and largest track row.
+    pub fn vertical_zoom_norm(&self) -> f32 {
+        zoom_norm(
+            self.mean_track_row_height(),
+            MIN_TRACK_ROW_HEIGHT,
+            MAX_TRACK_HEIGHT,
+        )
+    }
+
+    /// The mean track row height a vertical zoom slider position stands for.
+    pub fn track_row_height_for_zoom_norm(norm: f32) -> f32 {
+        zoom_from_norm(norm, MIN_TRACK_ROW_HEIGHT, MAX_TRACK_HEIGHT)
+    }
+
     /// One Ctrl/Cmd+Shift+wheel tick: scale every arrangement track's height by
     /// `tick_factor` and keep the track under `anchor_viewport_y` in place.
     ///

@@ -1289,6 +1289,74 @@ mod midi_edit_tests {
         assert_eq!(state.tracks[0].id, first_id);
     }
 
+    /// The Classic tool bar zoom sliders map a log scale onto the same limits
+    /// as the wheel, and a position read back lands where it was set.
+    #[test]
+    fn zoom_slider_positions_round_trip_on_a_log_scale() {
+        assert_eq!(zoom_norm(1.0, 1.0, 16.0), 0.0);
+        assert_eq!(zoom_norm(16.0, 1.0, 16.0), 1.0);
+        assert!((zoom_norm(4.0, 1.0, 16.0) - 0.5).abs() < 1.0e-6);
+        assert!((zoom_from_norm(0.5, 1.0, 16.0) - 4.0).abs() < 1.0e-4);
+        assert_eq!(zoom_norm(f32::NAN, 1.0, 16.0), 0.0);
+
+        let mut state = TimelineState::default();
+        assert!(state.set_waveform_zoom_norm(0.5));
+        assert!((state.waveform_zoom - 4.0).abs() < 1.0e-3);
+        assert!((state.waveform_zoom_norm() - 0.5).abs() < 1.0e-4);
+        // Back to the start of the rail settles on true scale exactly.
+        assert!(state.set_waveform_zoom_norm(0.0));
+        assert_eq!(state.waveform_zoom, 1.0);
+
+        let pps = TimelineState::pixels_per_second_for_zoom_norm(state.horizontal_zoom_norm());
+        assert!((pps - state.viewport.pixels_per_second).abs() < 1.0e-2);
+        state.zoom_by(
+            TimelineState::pixels_per_second_for_zoom_norm(0.75) / pps,
+            0.0,
+        );
+        assert!((state.horizontal_zoom_norm() - 0.75).abs() < 1.0e-4);
+        assert!(
+            (TimelineState::default_horizontal_zoom_norm() - zoom_norm(150.0, 0.5, 4000.0)).abs()
+                < 1.0e-6
+        );
+    }
+
+    /// The vertical slider reads the mean arrangement row height, which a
+    /// track zoom scales by its factor.
+    #[test]
+    fn vertical_zoom_position_follows_the_mean_track_height() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        assert_eq!(state.mean_track_row_height(), DEFAULT_TRACK_HEIGHT);
+        for name in ["A", "B"] {
+            state.create_track(CreateTrackOptions {
+                track_type: TrackType::Audio,
+                name: name.into(),
+                color: gpui::Rgba {
+                    r: 0.1,
+                    g: 0.1,
+                    b: 0.1,
+                    a: 1.0,
+                },
+                volume: 1.0,
+                pan: 0.0,
+                armed: false,
+                input_monitor: InputMonitorMode::Off,
+            });
+        }
+        let first = state.tracks[0].id.clone();
+        state.set_track_row_height(&first, 120.0);
+        assert!((state.mean_track_row_height() - 96.0).abs() < 1.0e-3);
+
+        let mut session = None;
+        let now = std::time::Instant::now();
+        let target = TimelineState::track_row_height_for_zoom_norm(0.6);
+        let factor = target / state.mean_track_row_height();
+        state.track_zoom_tick(&mut session, factor, 0.0, 400.0, now);
+        // Rows round to whole pixels, so the mean lands within a pixel.
+        assert!((state.mean_track_row_height() - target).abs() < 1.0);
+        assert!((state.vertical_zoom_norm() - 0.6).abs() < 0.01);
+    }
+
     /// Deleting a bus or return from the mixer must not leave sends or
     /// outputs pointing at a track that is gone; undo puts them back.
     #[test]

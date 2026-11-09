@@ -79,6 +79,7 @@ impl AssetSource for EmbeddedAssets {
         let bytes = match path {
             assets::ICON_PALETTE_PATH => Some(assets::icons::PALETTE.as_bytes()),
             assets::ICON_MOVE_HORIZONTAL_PATH => Some(assets::icons::MOVE_HORIZONTAL.as_bytes()),
+            assets::ICON_MOVE_VERTICAL_PATH => Some(assets::icons::MOVE_VERTICAL.as_bytes()),
             assets::ICON_TYPE_PATH => Some(assets::icons::TYPE.as_bytes()),
             assets::ICON_LIST_MUSIC_PATH => Some(assets::icons::LIST_MUSIC.as_bytes()),
             assets::ICON_GAUGE_PATH => Some(assets::icons::GAUGE.as_bytes()),

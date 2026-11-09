@@ -53,6 +53,99 @@ impl Timeline {
         }
     }
 
+    /// Classic tool bar zoom sliders. Each reads a `0.0..=1.0` log position
+    /// and writes through the same path as its wheel gesture, so a slider and
+    /// the wheel cannot disagree about limits, anchoring or what gets dirtied.
+    pub fn zoom_slider_positions(&self) -> (f32, f32, f32) {
+        (
+            self.state.horizontal_zoom_norm(),
+            self.state.vertical_zoom_norm(),
+            self.state.waveform_zoom_norm(),
+        )
+    }
+
+    /// Time zoom from the slider: kept around the playhead while it is on
+    /// screen, otherwise around the view's left edge. A view change: no undo
+    /// entry and nothing dirtied, like Ctrl/Cmd+wheel.
+    pub fn set_horizontal_zoom_norm(
+        &mut self,
+        norm: f32,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let target = TimelineState::pixels_per_second_for_zoom_norm(norm);
+        let current = self.state.viewport.pixels_per_second.max(1.0e-4);
+        let factor = target / current;
+        if (factor - 1.0).abs() < 1.0e-4 {
+            return;
+        }
+        let playhead_x = self.state.beats_to_x(self.state.transport.playhead_beats);
+        let anchor = if (0.0..=self.state.viewport.viewport_width).contains(&playhead_x) {
+            playhead_x
+        } else {
+            0.0
+        };
+        self.state.zoom_by(factor, anchor);
+        let (max_x, max_y) = self.max_scroll_offsets(window);
+        self.state.clamp_scroll(max_x, max_y);
+        self.refresh_marquee(window, cx);
+        cx.notify();
+    }
+
+    /// Track heights from the slider: every arrangement row scales by one
+    /// factor, keeping their proportions, through the Ctrl/Cmd+Shift+wheel
+    /// burst. Anchored at the top of the view; marks the project view-dirty.
+    pub fn set_vertical_zoom_norm(
+        &mut self,
+        norm: f32,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let target = TimelineState::track_row_height_for_zoom_norm(norm);
+        let current = self.state.mean_track_row_height().max(1.0);
+        let factor = target / current;
+        if (factor - 1.0).abs() < 1.0e-3 {
+            return;
+        }
+        let (_, track_view_h, _) = self.scroll_geometry(window);
+        let tick = self.track_zoom_wheel_tick(factor, 0.0, track_view_h, std::time::Instant::now());
+        if tick.mark_view_dirty {
+            self.mark_control_state_changed(cx);
+        }
+        if let Some(scroll_y) = tick.scroll_y {
+            let (max_x, max_y) = self.max_scroll_offsets(window);
+            let scroll_x = self.state.viewport.scroll_x;
+            self.state
+                .set_scroll_immediate(scroll_x, scroll_y, max_x, max_y);
+            if self.cut_hover.take().is_some() {
+                self.hide_cut_guide(cx);
+            }
+            cx.notify();
+        }
+    }
+
+    /// Waveform zoom from the slider. Display only, like Ctrl/Cmd+Alt+wheel.
+    pub fn set_waveform_zoom_norm(&mut self, norm: f32, cx: &mut gpui::Context<Self>) {
+        if self.state.set_waveform_zoom_norm(norm) {
+            cx.notify();
+        }
+    }
+
+    /// Horizontal zoom back to the default 150 px/s (the View menu's reset).
+    pub fn reset_horizontal_zoom(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) {
+        let norm = TimelineState::default_horizontal_zoom_norm();
+        self.set_horizontal_zoom_norm(norm, window, cx);
+    }
+
+    /// Every arrangement row back to the default height.
+    pub fn reset_vertical_zoom(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) {
+        use crate::components::timeline::timeline_state::{
+            zoom_norm, DEFAULT_TRACK_HEIGHT, MAX_TRACK_HEIGHT, MIN_TRACK_ROW_HEIGHT,
+        };
+        let norm = zoom_norm(DEFAULT_TRACK_HEIGHT, MIN_TRACK_ROW_HEIGHT, MAX_TRACK_HEIGHT);
+        self.set_vertical_zoom_norm(norm, window, cx);
+    }
+
     pub(super) fn hit_test_debug_enabled() -> bool {
         static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *FLAG.get_or_init(|| std::env::var_os("FUTUREBOARD_HITTEST_DEBUG").is_some())

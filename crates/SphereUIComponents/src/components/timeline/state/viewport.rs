@@ -42,6 +42,26 @@ const CONTINUOUS_PIN_FRACTION: f32 = 0.5;
 /// view), enough to read a -40 dB tail.
 pub const WAVEFORM_ZOOM_MAX: f32 = 16.0;
 
+/// `value` as a `0.0..=1.0` position on a log scale from `min` to `max`, the
+/// mapping the Classic tool bar's zoom sliders use: equal travel is an equal
+/// zoom ratio, as with the wheel.
+pub fn zoom_norm(value: f32, min: f32, max: f32) -> f32 {
+    if !(min > 0.0 && max > min) || !value.is_finite() {
+        return 0.0;
+    }
+    ((value.clamp(min, max) / min).ln() / (max / min).ln()).clamp(0.0, 1.0)
+}
+
+/// Inverse of [`zoom_norm`].
+pub fn zoom_from_norm(norm: f32, min: f32, max: f32) -> f32 {
+    let norm = if norm.is_finite() {
+        norm.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    min * (max / min).powf(norm)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimelineTool {
     Pointer,
@@ -602,6 +622,47 @@ impl TimelineState {
         let changed = (next - self.waveform_zoom).abs() > 1.0e-4;
         self.waveform_zoom = next;
         changed
+    }
+
+    /// Time zoom as a Classic tool bar slider position, `0.0..=1.0`, on a log
+    /// scale between the zoom limits so equal travel is an equal ratio.
+    pub fn horizontal_zoom_norm(&self) -> f32 {
+        zoom_norm(
+            self.viewport.pixels_per_second,
+            TIMELINE_MIN_PIXELS_PER_SECOND,
+            TIMELINE_MAX_PIXELS_PER_SECOND,
+        )
+    }
+
+    /// Slider position of the default time zoom (150 px/s, a new project's).
+    pub fn default_horizontal_zoom_norm() -> f32 {
+        zoom_norm(
+            150.0,
+            TIMELINE_MIN_PIXELS_PER_SECOND,
+            TIMELINE_MAX_PIXELS_PER_SECOND,
+        )
+    }
+
+    /// The pixels per second a horizontal zoom slider position stands for.
+    pub fn pixels_per_second_for_zoom_norm(norm: f32) -> f32 {
+        zoom_from_norm(
+            norm,
+            TIMELINE_MIN_PIXELS_PER_SECOND,
+            TIMELINE_MAX_PIXELS_PER_SECOND,
+        )
+    }
+
+    /// Waveform zoom as a slider position, `0.0..=1.0` from true scale to
+    /// [`WAVEFORM_ZOOM_MAX`], on a log scale.
+    pub fn waveform_zoom_norm(&self) -> f32 {
+        zoom_norm(self.waveform_zoom, 1.0, WAVEFORM_ZOOM_MAX)
+    }
+
+    /// Set the waveform zoom from a slider position. Same limits and the same
+    /// settling on true scale as the wheel. Returns whether it changed.
+    pub fn set_waveform_zoom_norm(&mut self, norm: f32) -> bool {
+        let target = zoom_from_norm(norm, 1.0, WAVEFORM_ZOOM_MAX);
+        self.scale_waveform_zoom(target / self.waveform_zoom.max(1.0e-6))
     }
 
     /// Called when the user manually scrolls/drags the viewport — temporarily

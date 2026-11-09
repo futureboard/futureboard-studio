@@ -7,6 +7,8 @@ pub mod icons {
     pub const PALETTE: &str = include_str!("../../../packages/shared/lucide/icons/palette.svg");
     pub const MOVE_HORIZONTAL: &str =
         include_str!("../../../packages/shared/lucide/icons/move-horizontal.svg");
+    pub const MOVE_VERTICAL: &str =
+        include_str!("../../../packages/shared/lucide/icons/move-vertical.svg");
     pub const TYPE: &str = include_str!("../../../packages/shared/lucide/icons/type.svg");
     pub const LIST_MUSIC: &str =
         include_str!("../../../packages/shared/lucide/icons/list-music.svg");
@@ -174,6 +176,7 @@ pub const ICON_LAYERS_PATH: &str = "icons/layers.svg";
 pub const ICON_DRUM_PATH: &str = "icons/drum.svg";
 pub const ICON_PALETTE_PATH: &str = "icons/palette.svg";
 pub const ICON_MOVE_HORIZONTAL_PATH: &str = "icons/move-horizontal.svg";
+pub const ICON_MOVE_VERTICAL_PATH: &str = "icons/move-vertical.svg";
 pub const ICON_TYPE_PATH: &str = "icons/type.svg";
 pub const ICON_LIST_MUSIC_PATH: &str = "icons/list-music.svg";
 pub const ICON_GAUGE_PATH: &str = "icons/gauge.svg";

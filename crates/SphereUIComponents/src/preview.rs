@@ -659,7 +659,7 @@ pub fn scenes() -> Vec<Scene> {
         },
         Scene {
             name: "tool-bars",
-            width: 900.0,
+            width: 1_100.0,
             height: 220.0,
             open: tool_bars_scene,
         },

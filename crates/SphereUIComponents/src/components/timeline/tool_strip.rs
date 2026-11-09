@@ -3,22 +3,27 @@
 //!
 //! Region contract — owner: the studio shell, which stacks this strip on top
 //! of the arrangement (directly above its ruler) when Appearance → Tool Bar is
-//! Classic. State owner: the [`Timeline`] (active tool, waveform zoom); this
-//! view only reads it and calls the same [`Timeline::select_tool`] /
-//! [`Timeline::step_waveform_zoom`] the floating bar calls. Coordinate space:
-//! its own; it sits outside the arrangement, whose pointer maths reads the
-//! measured lane and ruler origins and so follows the arrangement down by the
-//! strip's height on its own. Size source: [`CLASSIC_TOOL_STRIP_HEIGHT`],
-//! fixed; it takes the arrangement's width. Scroll owner: none — it clips if
-//! the arrangement is narrower than its controls.
+//! Classic. State owner: the [`Timeline`] (active tool, time zoom, track
+//! heights, waveform zoom); this view only reads it and calls the same
+//! [`Timeline::select_tool`] the floating bar calls and the zoom setters the
+//! wheel gestures share. Coordinate space: its own; it sits outside the
+//! arrangement, whose pointer maths reads the measured lane and ruler origins
+//! and so follows the arrangement down by the strip's height on its own. Size
+//! source: [`CLASSIC_TOOL_STRIP_HEIGHT`], fixed; it takes the arrangement's
+//! width. Scroll owner: none — it clips if the arrangement is narrower than its
+//! controls.
+//!
+//! The right end holds three zoom sliders, as in Logic Pro: waveform height,
+//! track height (vertical) and time (horizontal). Each is a log-scale slider
+//! over the same limits as its wheel gesture; double-click resets it.
 //!
 //! A cached view of its own, observing the timeline but repainting only when
-//! the tool or the zoom actually changes, so an edit in the arrangement does
-//! not cost a strip rebuild.
+//! the tool or a zoom actually changes, so an edit in the arrangement does not
+//! cost a strip rebuild.
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, svg, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
+    div, px, svg, App, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
     StatefulInteractiveElement, Styled, Subscription, Window,
 };
 
@@ -27,33 +32,65 @@ use super::timeline_state::TimelineTool;
 use super::Timeline;
 use crate::assets;
 use crate::components::controls::fb_tooltip;
+use crate::components::slider::slider_with_drag_callbacks;
 use crate::theme::{radius, size, space, typography, Colors};
 
 /// Height of the docked strip: a comfortable button with a tight inset above
 /// and below, the lower one holding the selection marker.
 pub const CLASSIC_TOOL_STRIP_HEIGHT: f32 = size::COMFORTABLE + 2.0 * space::TIGHT;
 
-/// Width of a waveform-zoom step button: narrower than a tool, because it is
-/// a stepper rather than a mode.
-const STEP_WIDTH: f32 = size::DENSE;
+/// Rail width of the waveform and vertical zoom sliders.
+const ZOOM_SLIDER_W: f32 = 72.0;
+/// The time zoom covers a much wider range, so it gets a longer rail.
+const TIME_ZOOM_SLIDER_W: f32 = 96.0;
+/// A slider position change smaller than this is not worth a repaint.
+const ZOOM_REPAINT_EPSILON: f32 = 1.0e-3;
+
+/// What the strip last drew.
+#[derive(Clone, Copy, PartialEq)]
+struct Shown {
+    tool: TimelineTool,
+    /// Slider positions, `0.0..=1.0`: time, track height, waveform.
+    horizontal: f32,
+    vertical: f32,
+    waveform: f32,
+    /// The waveform zoom factor, for the readout.
+    waveform_factor: f32,
+}
+
+impl Shown {
+    fn of(timeline: &Timeline) -> Self {
+        let (horizontal, vertical, waveform) = timeline.zoom_slider_positions();
+        Self {
+            tool: timeline.active_tool(),
+            horizontal,
+            vertical,
+            waveform,
+            waveform_factor: timeline.waveform_zoom(),
+        }
+    }
+
+    /// Whether `next` draws differently from `self`.
+    fn differs_from(&self, next: &Self) -> bool {
+        self.tool != next.tool
+            || (self.horizontal - next.horizontal).abs() > ZOOM_REPAINT_EPSILON
+            || (self.vertical - next.vertical).abs() > ZOOM_REPAINT_EPSILON
+            || (self.waveform - next.waveform).abs() > ZOOM_REPAINT_EPSILON
+    }
+}
 
 pub struct ClassicToolStrip {
     timeline: Entity<Timeline>,
-    /// What the strip last drew: the active tool and the waveform zoom.
-    shown: (TimelineTool, f32),
+    shown: Shown,
     _observer: Subscription,
 }
 
 impl ClassicToolStrip {
     pub fn new(timeline: &Entity<Timeline>, cx: &mut Context<Self>) -> Self {
-        let shown = {
-            let timeline = timeline.read(cx);
-            (timeline.active_tool(), timeline.waveform_zoom())
-        };
+        let shown = Shown::of(timeline.read(cx));
         let _observer = cx.observe(timeline, |this, timeline, cx| {
-            let timeline = timeline.read(cx);
-            let next = (timeline.active_tool(), timeline.waveform_zoom());
-            if next != this.shown {
+            let next = Shown::of(timeline.read(cx));
+            if this.shown.differs_from(&next) {
                 this.shown = next;
                 cx.notify();
             }
@@ -129,39 +166,6 @@ impl ClassicToolStrip {
                 Colors::text_secondary()
             }))
     }
-
-    fn zoom_step(
-        &self,
-        id: &'static str,
-        icon: &'static str,
-        tip: &'static str,
-        steps: i32,
-    ) -> impl IntoElement {
-        let base = Colors::surface_panel();
-        let hover = Colors::composite(base, Colors::state_hover());
-        let timeline = self.timeline.clone();
-        div()
-            .id(id)
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_center()
-            .w(px(STEP_WIDTH))
-            .h(px(size::COMFORTABLE))
-            .rounded(px(radius::CONTROL_SM))
-            .cursor(gpui::CursorStyle::PointingHand)
-            .hover(move |style| style.bg(hover))
-            .tooltip(fb_tooltip(tip))
-            .on_click(move |_, _window, cx| {
-                let _ = timeline.update(cx, |timeline, cx| timeline.step_waveform_zoom(steps, cx));
-            })
-            .child(
-                svg()
-                    .path(icon)
-                    .size(px(12.0))
-                    .text_color(Colors::text_muted()),
-            )
-    }
 }
 
 /// A short hairline between tool groups.
@@ -174,10 +178,59 @@ fn divider() -> impl IntoElement {
         .bg(Colors::border_subtle())
 }
 
+/// One labelled zoom slider: an icon naming the axis, then the rail.
+///
+/// `set` receives the new `0.0..=1.0` position while dragging (Shift for
+/// fine), `reset` runs on a double-click. The tooltip sits on the icon so it
+/// never covers the rail mid-drag.
+fn zoom_slider(
+    id: &'static str,
+    icon: &'static str,
+    tip: &'static str,
+    position: f32,
+    rail_w: f32,
+    set: impl Fn(&f32, &mut Window, &mut App) + 'static,
+    reset: impl Fn(&mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .flex_none()
+        .items_center()
+        .gap(px(space::TIGHT))
+        .child(
+            div()
+                .id(id)
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .size(px(size::DENSE))
+                .tooltip(fb_tooltip(tip))
+                .child(
+                    svg()
+                        .path(icon)
+                        .size(px(14.0))
+                        .text_color(Colors::text_muted()),
+                ),
+        )
+        .child(div().flex().flex_none().items_center().w(px(rail_w)).child(
+            slider_with_drag_callbacks(
+                format!("{id}-rail"),
+                position,
+                Colors::accent_primary(),
+                None::<fn(&f32, &mut Window, &mut App)>,
+                Some(set),
+                None::<fn(&mut Window, &mut App)>,
+                Some(reset),
+            ),
+        ))
+}
+
 impl Render for ClassicToolStrip {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let (active_tool, zoom) = self.shown;
-        let zoomed = zoom > 1.0 + 1.0e-3;
+        let shown = self.shown;
+        let zoomed = shown.waveform_factor > 1.0 + 1.0e-3;
 
         let mut strip = div()
             .size_full()
@@ -191,72 +244,94 @@ impl Render for ClassicToolStrip {
             .border_b(px(1.0))
             .border_color(Colors::border_subtle());
         for (index, (tool, label, icon, group_end)) in TIMELINE_TOOLS.into_iter().enumerate() {
-            strip = strip.child(self.tool_button(index, tool, label, icon, tool == active_tool));
+            strip = strip.child(self.tool_button(index, tool, label, icon, tool == shown.tool));
             if group_end {
                 strip = strip.child(divider());
             }
         }
 
-        // Waveform zoom at the far end: out, the readout (click for 1×), in.
-        // View only — clip gain is unchanged.
-        let reset_timeline = self.timeline.clone();
-        let reset_hover = Colors::composite(Colors::surface_panel(), Colors::state_hover());
+        // Zoom at the far end: waveform height (view only — clip gain is
+        // unchanged), then track height and time.
+        let waveform = {
+            let timeline = self.timeline.clone();
+            let reset = self.timeline.clone();
+            zoom_slider(
+                "classic-waveform-zoom",
+                assets::ICON_AUDIO_LINES_PATH,
+                "Waveform zoom — view only, clip gain is unchanged. Double-click for 1×",
+                shown.waveform,
+                ZOOM_SLIDER_W,
+                move |norm, _window, cx| {
+                    let _ = timeline.update(cx, |timeline, cx| {
+                        timeline.set_waveform_zoom_norm(*norm, cx)
+                    });
+                },
+                move |_window, cx| {
+                    let _ = reset.update(cx, |timeline, cx| timeline.step_waveform_zoom(0, cx));
+                },
+            )
+        };
+        let vertical = {
+            let timeline = self.timeline.clone();
+            let reset = self.timeline.clone();
+            zoom_slider(
+                "classic-vertical-zoom",
+                assets::ICON_MOVE_VERTICAL_PATH,
+                "Track height zoom. Double-click for the default height",
+                shown.vertical,
+                ZOOM_SLIDER_W,
+                move |norm, window, cx| {
+                    let _ = timeline.update(cx, |timeline, cx| {
+                        timeline.set_vertical_zoom_norm(*norm, window, cx)
+                    });
+                },
+                move |window, cx| {
+                    let _ =
+                        reset.update(cx, |timeline, cx| timeline.reset_vertical_zoom(window, cx));
+                },
+            )
+        };
+        let horizontal = {
+            let timeline = self.timeline.clone();
+            let reset = self.timeline.clone();
+            zoom_slider(
+                "classic-horizontal-zoom",
+                assets::ICON_MOVE_HORIZONTAL_PATH,
+                "Time zoom. Double-click for the default zoom",
+                shown.horizontal,
+                TIME_ZOOM_SLIDER_W,
+                move |norm, window, cx| {
+                    let _ = timeline.update(cx, |timeline, cx| {
+                        timeline.set_horizontal_zoom_norm(*norm, window, cx)
+                    });
+                },
+                move |window, cx| {
+                    let _ = reset.update(cx, |timeline, cx| {
+                        timeline.reset_horizontal_zoom(window, cx)
+                    });
+                },
+            )
+        };
+
         strip
             .child(div().flex_1().min_w(px(space::BASE)))
-            .child(self.zoom_step(
-                "classic-waveform-zoom-out",
-                assets::ICON_MINUS_PATH,
-                "Waveform zoom out",
-                -1,
-            ))
+            .child(waveform)
             .child(
                 div()
-                    .id("classic-waveform-zoom-reset")
-                    .flex()
-                    .flex_row()
                     .flex_none()
-                    .items_center()
-                    .gap(px(space::TIGHT))
-                    .h(px(size::COMFORTABLE))
-                    .px(px(space::TIGHT))
-                    .rounded(px(radius::CONTROL_SM))
-                    .cursor(gpui::CursorStyle::PointingHand)
-                    .hover(move |style| style.bg(reset_hover))
-                    .tooltip(fb_tooltip(
-                        "Waveform zoom — view only, clip gain is unchanged. Click for 1×",
-                    ))
-                    .on_click(move |_, _window, cx| {
-                        let _ = reset_timeline
-                            .update(cx, |timeline, cx| timeline.step_waveform_zoom(0, cx));
+                    .min_w(px(28.0))
+                    .text_size(px(typography::UI_XS))
+                    .text_color(if zoomed {
+                        Colors::text_primary()
+                    } else {
+                        Colors::text_muted()
                     })
-                    .child(
-                        svg()
-                            .path(assets::ICON_AUDIO_LINES_PATH)
-                            .size(px(14.0))
-                            .text_color(if zoomed {
-                                Colors::text_primary()
-                            } else {
-                                Colors::text_muted()
-                            }),
-                    )
-                    .child(
-                        div()
-                            .min_w(px(22.0))
-                            .text_size(px(typography::UI_XS))
-                            .text_color(if zoomed {
-                                Colors::text_primary()
-                            } else {
-                                Colors::text_muted()
-                            })
-                            .child(format!("{zoom:.1}×")),
-                    ),
+                    .child(format!("{:.1}×", shown.waveform_factor)),
             )
-            .child(self.zoom_step(
-                "classic-waveform-zoom-in",
-                assets::ICON_PLUS_PATH,
-                "Waveform zoom in",
-                1,
-            ))
+            .child(divider())
+            .child(vertical)
+            .child(div().flex_none().w(px(space::SNUG)))
+            .child(horizontal)
     }
 }
 
