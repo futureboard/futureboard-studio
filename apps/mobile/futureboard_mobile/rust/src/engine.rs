@@ -439,6 +439,9 @@ pub struct TelemetrySnapshot {
     /// (filled by the FFI handle).
     #[serde(default)]
     pub render_lock_misses: u32,
+    /// Live note-ons rejected because the bounded live MIDI queue was full.
+    #[serde(default)]
+    pub live_midi_dropped_note_ons: u64,
 }
 
 pub struct TrackRuntime {
@@ -447,6 +450,10 @@ pub struct TrackRuntime {
     pub insert_instances: Vec<BuiltinPluginInstance>,
     pub binaural_source: BinauralSource,
     pub active_midi_notes: [bool; 128],
+    /// Live note-offs (one bit per MIDI pitch) that did not fit in the bounded live MIDI
+    /// queue. They are applied at the next render block, after the queue, so a full
+    /// queue can never leave a live note stuck.
+    pending_live_note_offs: u128,
     pub buf_l: Vec<f32>,
     pub buf_r: Vec<f32>,
     pub spatial_scratch_l: Vec<f32>,
@@ -466,6 +473,7 @@ impl TrackRuntime {
             insert_instances: Vec::new(),
             binaural_source: BinauralSource::new(sample_rate, MAX_RENDER_BLOCK_FRAMES),
             active_midi_notes: [false; 128],
+            pending_live_note_offs: 0,
             buf_l: vec![0.0; MAX_RENDER_BLOCK_FRAMES],
             buf_r: vec![0.0; MAX_RENDER_BLOCK_FRAMES],
             spatial_scratch_l: vec![0.0; MAX_RENDER_BLOCK_FRAMES],
@@ -538,6 +546,20 @@ impl TrackRuntime {
             inst.all_notes_off();
         }
         self.active_midi_notes.fill(false);
+        self.pending_live_note_offs = 0;
+    }
+
+    /// Applies live note-offs that overflowed the live MIDI queue. Allocation-free.
+    fn flush_pending_live_note_offs(&mut self) {
+        let mut mask = std::mem::take(&mut self.pending_live_note_offs);
+        let Some(inst) = &mut self.instrument_instance else {
+            return;
+        };
+        while mask != 0 {
+            let note = mask.trailing_zeros() as u8;
+            inst.note_off(note);
+            mask &= mask - 1;
+        }
     }
 }
 
@@ -574,6 +596,9 @@ pub struct StudioMobileEngine {
     pub audio_pool: HashMap<String, Arc<StereoAudioBuffer>>,
 
     live_midi_queue: Vec<LiveMidiEvent>,
+    /// Live note-ons rejected because the live MIDI queue was full (note-offs are never
+    /// dropped; see `TrackRuntime::pending_live_note_offs`).
+    live_midi_dropped_note_ons: u64,
     mic_ring: Arc<MicInputRing>,
     recording_worker: RecordingWorker,
     recording_start_beat: f64,
@@ -652,6 +677,7 @@ impl StudioMobileEngine {
             master_track: TrackRuntime::new(master_snap, sr),
             audio_pool: HashMap::new(),
             live_midi_queue: Vec::with_capacity(LIVE_MIDI_QUEUE_CAPACITY),
+            live_midi_dropped_note_ons: 0,
             mic_ring,
             recording_worker,
             recording_start_beat: 0.0,
@@ -1517,7 +1543,18 @@ impl StudioMobileEngine {
             return false;
         };
         self.push_undo();
-        self.live_midi_queue.clear();
+        // Queued live events address tracks by index. Drop only the deleted track's events
+        // (its instrument goes away with it) and shift later tracks down, so pending
+        // note-offs for every other track are still delivered.
+        self.live_midi_queue.retain_mut(|ev| {
+            if ev.track_idx == pos {
+                return false;
+            }
+            if ev.track_idx > pos {
+                ev.track_idx -= 1;
+            }
+            true
+        });
         self.tracks.remove(pos);
         if self.selected_track_id == track_id {
             self.selected_track_id = self.tracks[0].snapshot.id.clone();
@@ -2007,13 +2044,21 @@ impl StudioMobileEngine {
         let Some(track_idx) = self.tracks.iter().position(|t| t.snapshot.id == target) else {
             return;
         };
+        let note = note.min(127);
+        let velocity = velocity.min(127);
         if self.live_midi_queue.len() < LIVE_MIDI_QUEUE_CAPACITY {
             self.live_midi_queue.push(LiveMidiEvent {
                 track_idx,
-                note: note.min(127),
-                velocity: velocity.min(127),
+                note,
+                velocity,
                 is_note_on,
             });
+        } else if !is_note_on || velocity == 0 {
+            // Queue full: a note-off must still reach the instrument or the note sticks.
+            // Every queued event predates this one, so applying it after the queue keeps order.
+            self.tracks[track_idx].pending_live_note_offs |= 1u128 << note;
+        } else {
+            self.live_midi_dropped_note_ons += 1;
         }
     }
 
@@ -2048,6 +2093,11 @@ impl StudioMobileEngine {
                         inst.note_off(ev.note);
                     }
                 }
+            }
+        }
+        for tr in &mut self.tracks {
+            if tr.pending_live_note_offs != 0 {
+                tr.flush_pending_live_note_offs();
             }
         }
 
@@ -2474,6 +2524,7 @@ impl StudioMobileEngine {
             inspected_plugin_meter,
             render_faults: 0,
             render_lock_misses: 0,
+            live_midi_dropped_note_ons: self.live_midi_dropped_note_ons,
         }
     }
 
@@ -2584,4 +2635,94 @@ fn eval_automation_points(points: &[AutomationPoint], beat: f64) -> f32 {
         }
     }
     points.last().map(|p| p.value).unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn track_index(engine: &StudioMobileEngine, id: &str) -> usize {
+        engine
+            .tracks
+            .iter()
+            .position(|t| t.snapshot.id == id)
+            .expect("track exists")
+    }
+
+    /// Renders `blocks` blocks with the transport stopped and returns the peak of the
+    /// given track's output in the last block.
+    fn render_and_peak(engine: &mut StudioMobileEngine, id: &str, blocks: usize) -> f32 {
+        let mut out = vec![0.0f32; 512 * 2];
+        for _ in 0..blocks {
+            engine.render_interleaved_stereo(&mut out, 512);
+        }
+        let tr = &engine.tracks[track_index(engine, id)];
+        tr.buf_l[..512]
+            .iter()
+            .chain(tr.buf_r[..512].iter())
+            .fold(0.0f32, |m, s| m.max(s.abs()))
+    }
+
+    /// Regression for #346: deleting another track between a live note-off and the next
+    /// render must not discard that note-off.
+    #[test]
+    fn deleting_a_track_keeps_pending_live_note_offs_for_other_tracks() {
+        let mut engine = StudioMobileEngine::new(48_000);
+        let live = engine.add_track("Live Keys", TrackKind::Instrument, Some("wrapsynth"));
+        // Control: a note that is never released keeps sounding, so silence below proves
+        // the note-off was delivered rather than the patch simply decaying.
+        let held = engine.add_track("Held Keys", TrackKind::Instrument, Some("wrapsynth"));
+        assert!(!engine.is_playing);
+
+        engine.trigger_live_midi(&held, 48, 110, true);
+        engine.trigger_live_midi(&live, 60, 110, true);
+        assert!(
+            render_and_peak(&mut engine, &live, 4) > 1.0e-3,
+            "held live note must sound"
+        );
+
+        // Release the pad, then delete a track that sits before it, before the next render.
+        engine.trigger_live_midi(&live, 60, 0, false);
+        let doomed = engine.tracks[0].snapshot.id.clone();
+        assert!(engine.delete_track(&doomed));
+
+        let live_idx = track_index(&engine, &live);
+        assert_eq!(engine.live_midi_queue.len(), 1);
+        let ev = engine.live_midi_queue[0];
+        assert_eq!(ev.track_idx, live_idx, "queued event must follow its track");
+        assert!(!ev.is_note_on && ev.note == 60);
+
+        // Generous release time, then the track must be silent.
+        let tail = render_and_peak(&mut engine, &live, 400);
+        assert!(tail < 1.0e-4, "live note stuck after track delete: {tail}");
+        let held_level = render_and_peak(&mut engine, &held, 1);
+        assert!(
+            held_level > 1.0e-3,
+            "control note must still sound: {held_level}"
+        );
+    }
+
+    /// Regression for #346: a note-off arriving while the live queue is full must still
+    /// reach the instrument; overflowed note-ons are counted, not silently dropped.
+    #[test]
+    fn full_live_midi_queue_never_drops_note_offs() {
+        let mut engine = StudioMobileEngine::new(48_000);
+        let live = engine.add_track("Live Keys", TrackKind::Instrument, Some("wrapsynth"));
+
+        engine.trigger_live_midi(&live, 64, 110, true);
+        for _ in 1..LIVE_MIDI_QUEUE_CAPACITY {
+            engine.trigger_live_midi(&live, 64, 110, true);
+        }
+        assert_eq!(engine.live_midi_queue.len(), LIVE_MIDI_QUEUE_CAPACITY);
+
+        engine.trigger_live_midi(&live, 64, 0, false);
+        engine.trigger_live_midi(&live, 65, 100, true);
+        let idx = track_index(&engine, &live);
+        assert_eq!(engine.tracks[idx].pending_live_note_offs, 1u128 << 64);
+        assert_eq!(engine.telemetry().live_midi_dropped_note_ons, 1);
+
+        let tail = render_and_peak(&mut engine, &live, 400);
+        assert_eq!(engine.tracks[idx].pending_live_note_offs, 0);
+        assert!(tail < 1.0e-4, "overflowed note-off was lost: {tail}");
+    }
 }
