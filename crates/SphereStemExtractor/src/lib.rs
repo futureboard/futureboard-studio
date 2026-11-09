@@ -33,6 +33,7 @@ pub use device::{
 pub use download::{
     HTDEMUCS_MODEL_BASE, StemModelDownloadProgress, UVR_MODEL_RELEASE_BASE, default_models_dir,
     download_model, ensure_models_dir, model_installed, resolve_installed_model_files,
+    verify_file_hash, verify_model_installed,
 };
 pub use error::StemExtractError;
 pub use extractor::{StemExtractInput, StemExtractOutput, StemExtractResult, extract_stems};

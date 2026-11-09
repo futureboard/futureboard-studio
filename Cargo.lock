@@ -55,6 +55,7 @@ dependencies = [
  "rustfft",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "ureq 3.3.0",
 ]
