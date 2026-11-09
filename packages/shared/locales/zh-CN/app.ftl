@@ -251,7 +251,6 @@ menu.audio-fast_forward = 快进
 menu.audio-find_tempo_key = 检测速度与调性…
 menu.audio-flatten_frozen_tracks = 拼合已冻结轨道
 menu.audio-freeze_selected_tracks = 冻结所选轨道
-menu.audio-unfreeze_selected_tracks = 解冻所选轨道
 menu.audio-go_to_end = 转到结尾
 menu.audio-go_to_start = 转到开头
 menu.audio-insert_plugin = 插入插件…
@@ -274,6 +273,7 @@ menu.audio-stem_extractor = 分轨提取…
 menu.audio-stop = 停止
 menu.audio-supported_plugin_formats = 支持的插件格式
 menu.audio-tap_tempo = 敲击速度
+menu.audio-unfreeze_selected_tracks = 解冻所选轨道
 menu.audio-tap_tempo-add_marker = 在播放头处添加当前速度
 menu.audio-tap_tempo-reset = 重置敲击
 menu.audio-tap_tempo-tap = 敲击
@@ -1037,7 +1037,7 @@ window.restore = 还原
 
 dialog.old-version-project.title = 旧版本项目
 dialog.old-version-project.message = 此项目是使用 Futureboard v{ $version } 创建的（当前版本为 v{ $currentVersion }）。\n仍可打开，但部分功能可能缺失或表现异常。\n保存时将升级为当前格式。
-dialog.old-version-project.detail = 最低支持版本: v{ $minVersion }\n项目版本: v{ $version }\n当前版本: v{ $currentVersion }
+dialog.old-version-project.detail = 最低支持版本\: v{ $minVersion }\n项目版本\: v{ $version }\n当前版本\: v{ $currentVersion }
 dialog.old-version-project.button.open-anyway = 仍要打开
 dialog.old-version-project.button.cancel = 取消
 dialog.old-version-project.open-failed = 无法打开项目文件。
@@ -1077,7 +1077,3 @@ wizard.summary.template = 模板
 wizard.summary.tracks = 轨道
 wizard.summary.tracks-value = { $audio } 音频 / { $midi } MIDI
 wizard.title = 新建项目
-
-## Dialogs
-
-

@@ -251,7 +251,6 @@ menu.audio-fast_forward = กรอไปข้างหน้า
 menu.audio-find_tempo_key = หา Tempo และ Key…
 menu.audio-flatten_frozen_tracks = Flatten แทร็กที่ Freeze
 menu.audio-freeze_selected_tracks = Freeze แทร็กที่เลือก
-menu.audio-unfreeze_selected_tracks = Unfreeze แทร็กที่เลือก
 menu.audio-go_to_end = ไปยังจุดสิ้นสุด
 menu.audio-go_to_start = ไปยังจุดเริ่มต้น
 menu.audio-insert_plugin = แทรก Plug-in…
@@ -274,6 +273,7 @@ menu.audio-stem_extractor = Stem Extractor…
 menu.audio-stop = หยุด
 menu.audio-supported_plugin_formats = รูปแบบปลั๊กอินที่รองรับ
 menu.audio-tap_tempo = Tap Tempo
+menu.audio-unfreeze_selected_tracks = Unfreeze แทร็กที่เลือก
 menu.audio-tap_tempo-add_marker = เพิ่ม Tempo ปัจจุบันที่ Playhead
 menu.audio-tap_tempo-reset = รีเซ็ตการ Tap
 menu.audio-tap_tempo-tap = Tap
@@ -625,7 +625,7 @@ plugin-manager.filter.instruments = เครื่องดนตรี
 plugin-manager.filter.kind = ชนิด
 plugin-manager.filter.library = Library
 plugin-manager.footer.cached = แคชไว้ { $count } รายการ
-plugin-manager.footer.last-scan = สแกนล่าสุด: { $when }
+plugin-manager.footer.last-scan = สแกนล่าสุด\: { $when }
 plugin-manager.footer.missing = หายไป { $count } รายการ
 plugin-manager.kind.effect = เอฟเฟกต์
 plugin-manager.kind.instrument = เครื่องดนตรี
@@ -851,7 +851,7 @@ settings.field.master-plugin-latency = ปลั๊กอินมาสเต�
 settings.field.pdc-status = การชดเชยดีเลย์
 settings.field.latency-compensation = การชดเชยดีเลย์ปลั๊กอิน
 settings.field.audioguard = Solfege Audioguard
-settings.hint.audioguard = ป้องกันเสียงขาดหาย: เรนเดอร์ล่วงหน้าเมื่อไม่มีอะไรเล่นสด ปิดเสียงเมื่อเอาต์พุตผิดปกติหรือดังเกินควบคุม และข้ามปลั๊กอินที่ผิดพลาดซ้ำ ๆ ปิด = เรนเดอร์ทุกบล็อกขณะเล่น
+settings.hint.audioguard = ป้องกันเสียงขาดหาย\: เรนเดอร์ล่วงหน้าเมื่อไม่มีอะไรเล่นสด ปิดเสียงเมื่อเอาต์พุตผิดปกติหรือดังเกินควบคุม และข้ามปลั๊กอินที่ผิดพลาดซ้ำ ๆ ปิด \= เรนเดอร์ทุกบล็อกขณะเล่น
 settings.audioguard.off = ปิด
 settings.audioguard.normal = ปกติ (แนะนำ)
 settings.audioguard.high = สูง
@@ -1037,7 +1037,7 @@ window.restore = คืนค่า
 
 dialog.old-version-project.title = โปรเจกต์รุ่นเก่า
 dialog.old-version-project.message = โปรเจกต์นี้สร้างด้วย Futureboard v{ $version } (รุ่นปัจจุบันคือ v{ $currentVersion })\nยังเปิดได้ แต่บางฟีเจอร์อาจหายไปหรือทำงานต่างออกไป\nบันทึกแล้วจะอัปเกรดเป็นรูปแบบรุ่นใหม่
-dialog.old-version-project.detail = รุ่นขั้นต่ำที่รองรับ: v{ $minVersion }\nรุ่นของโปรเจกต์นี้: v{ $version }\nรุ่นปัจจุบัน: v{ $currentVersion }
+dialog.old-version-project.detail = รุ่นขั้นต่ำที่รองรับ\: v{ $minVersion }\nรุ่นของโปรเจกต์นี้\: v{ $version }\nรุ่นปัจจุบัน\: v{ $currentVersion }
 dialog.old-version-project.button.open-anyway = เปิดอยู่ดี
 dialog.old-version-project.button.cancel = ยกเลิก
 dialog.old-version-project.open-failed = ไม่สามารถเปิดไฟล์โปรเจกต์ได้
@@ -1077,7 +1077,3 @@ wizard.summary.template = เทมเพลต
 wizard.summary.tracks = แทร็ก
 wizard.summary.tracks-value = เสียง { $audio } / MIDI { $midi }
 wizard.title = โปรเจกต์ใหม่
-
-## Dialogs
-
-

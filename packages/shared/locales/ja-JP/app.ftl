@@ -251,7 +251,6 @@ menu.audio-fast_forward = 早送り
 menu.audio-find_tempo_key = テンポとキーを検出…
 menu.audio-flatten_frozen_tracks = フリーズしたトラックをフラット化
 menu.audio-freeze_selected_tracks = 選択したトラックをフリーズ
-menu.audio-unfreeze_selected_tracks = 選択したトラックのフリーズを解除
 menu.audio-go_to_end = 終端へ移動
 menu.audio-go_to_start = 先頭へ移動
 menu.audio-insert_plugin = プラグインを挿入…
@@ -274,6 +273,7 @@ menu.audio-stem_extractor = ステム抽出…
 menu.audio-stop = 停止
 menu.audio-supported_plugin_formats = 対応プラグイン形式
 menu.audio-tap_tempo = タップテンポ
+menu.audio-unfreeze_selected_tracks = 選択したトラックのフリーズを解除
 menu.audio-tap_tempo-add_marker = 現在のテンポを再生位置に追加
 menu.audio-tap_tempo-reset = タップをリセット
 menu.audio-tap_tempo-tap = タップ
@@ -625,7 +625,7 @@ plugin-manager.filter.instruments = Instruments
 plugin-manager.filter.kind = Kind
 plugin-manager.filter.library = Library
 plugin-manager.footer.cached = キャッシュ { $count } 件
-plugin-manager.footer.last-scan = 最終スキャン: { $when }
+plugin-manager.footer.last-scan = 最終スキャン\: { $when }
 plugin-manager.footer.missing = 不明 { $count } 件
 plugin-manager.kind.effect = Effect
 plugin-manager.kind.instrument = Instrument
@@ -1037,7 +1037,7 @@ window.restore = RESTORE
 
 dialog.old-version-project.title = 古いプロジェクトバージョン
 dialog.old-version-project.message = このプロジェクトは Futureboard v{ $version } で作成されました (現在のバージョンは v{ $currentVersion } です)。\n開くことはできますが、一部の機能が欠けているか、動作が異なる場合があります。\nプロジェクトを保存すると、現在のフォーマットにアップグレードされます。
-dialog.old-version-project.detail = 最小対応バージョン: v{ $minVersion }\nプロジェクトのバージョン: v{ $version }\n現在のバージョン: v{ $currentVersion }
+dialog.old-version-project.detail = 最小対応バージョン\: v{ $minVersion }\nプロジェクトのバージョン\: v{ $version }\n現在のバージョン\: v{ $currentVersion }
 dialog.old-version-project.button.open-anyway = このまま開く
 dialog.old-version-project.button.cancel = キャンセル
 dialog.old-version-project.open-failed = プロジェクトファイルを開けませんでした。
@@ -1077,7 +1077,3 @@ wizard.summary.template = Template
 wizard.summary.tracks = Tracks
 wizard.summary.tracks-value = { $audio } audio / { $midi } MIDI
 wizard.title = New Project
-
-## Dialogs
-
-
