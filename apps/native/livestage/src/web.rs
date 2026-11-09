@@ -33,7 +33,11 @@
 //! from this machine is taken for a browser here only when it names this
 //! machine (`localhost`, a loopback address) and carries no proxy
 //! forwarding header: behind a reverse proxy on this machine every browser
-//! connects from loopback, and must not skip the setup code. A connection
+//! connects from loopback, and must not skip the setup code. Nor is any
+//! connection taken for one once the operator says browsers reach this
+//! server from elsewhere ([`reached_from_elsewhere`]): a proxy here may pass
+//! the client's own `Host` on and add no forwarding header (#351), so a
+//! browser here then needs the setup code too. A connection
 //! from a proxy given with `--trusted-proxy` is counted (log-in failures,
 //! slots and arrivals alike) under the client address that proxy forwards
 //! in the one header `--forwarded-header` names, and is never taken for
@@ -1070,16 +1074,13 @@ fn machine_name() -> Option<String> {
 /// notes), and whether a trusted proxy said so (the address it forwarded
 /// is then the [`Peer::addr`]).
 ///
-/// - When the operator has configured a public web host (`--web-host`) or a
-///   trusted proxy (`--trusted-proxy`), LiveStage is exposed to remote clients.
-///   A reverse proxy on loopback might pass through the client's `Host` without
-///   forwarding headers, so no connection is treated as this machine (#351).
 /// - From a proxy in `proxies`: the client its forwarding header names;
 ///   never this machine, as the proxy may be anywhere. Without that header
 ///   it is the proxy itself, and not taken for this machine either.
 /// - Otherwise the connection's own address; this machine only when that
 ///   is loopback, the request names this machine, no forwarding header
-///   says a proxy sent it, and no public web host or trusted proxy is configured.
+///   says a proxy sent it, and the server is not
+///   [`reached_from_elsewhere`] (#351).
 fn client_peer(
     socket: Option<IpAddr>,
     request: &Request,
@@ -1104,12 +1105,10 @@ fn client_peer(
             ),
         };
     }
-    let public_facing =
-        !proxies.addrs.is_empty() || names.iter().any(|name| !names_this_machine(name));
     let proxied = FORWARDING_HEADERS
         .iter()
         .any(|name| request.header(name).is_some());
-    let local = !public_facing
+    let local = !reached_from_elsewhere(names, proxies)
         && socket.is_some_and(|s| s.to_canonical().is_loopback())
         && !proxied
         && request.header("host").is_some_and(names_this_machine);
@@ -1120,6 +1119,16 @@ fn client_peer(
         },
         false,
     )
+}
+
+/// Whether the operator said browsers reach this server from elsewhere
+/// through a name or a proxy: a `--web-host` (`names`) that does not name
+/// this machine only, or any `--trusted-proxy`. A proxy here may then pass a
+/// remote client's `Host: localhost` on with no forwarding header, so no
+/// connection is taken for a browser on this machine, and every browser
+/// needs the setup code while there are no users (#351).
+pub fn reached_from_elsewhere(names: &[String], proxies: &Proxies) -> bool {
+    !proxies.addrs.is_empty() || names.iter().any(|name| !names_this_machine(name))
 }
 
 /// Whether a `Host` names this machine only: `localhost` (or a name under
@@ -2977,6 +2986,24 @@ mod tests {
         }
         // Another machine naming this one's loopback is still another.
         assert!(!here("10.0.0.7", "GET /ws HTTP/1.1\r\nHost: localhost\r\n"));
+
+        // #351: what counts as being reached from elsewhere.
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let none = Proxies::default();
+        assert!(!reached_from_elsewhere(&[], &none));
+        assert!(!reached_from_elsewhere(
+            &names(&["localhost", "127.0.0.1"]),
+            &none
+        ));
+        assert!(reached_from_elsewhere(
+            &names(&["mixer.example.org"]),
+            &none
+        ));
+        let proxy = Proxies {
+            addrs: vec![ip("127.0.0.1")],
+            header: ForwardedHeader::XForwardedFor,
+        };
+        assert!(reached_from_elsewhere(&[], &proxy));
 
         // #351: when a public web host or trusted proxy is configured, no connection
         // (even from loopback naming localhost without forwarding headers) is treated as local.
