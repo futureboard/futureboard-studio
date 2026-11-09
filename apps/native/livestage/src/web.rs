@@ -46,8 +46,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use builtin_ui_embed::EmbeddedUiAssetTable;
-use tungstenite::Message;
 use tungstenite::protocol::WebSocketConfig;
+use tungstenite::Message;
 
 mod assets {
     include!(concat!(env!("OUT_DIR"), "/embedded_ui_assets.rs"));
@@ -731,7 +731,11 @@ fn forwarded(limits: Limits<'_>, id: ClientId, client: IpAddr, now: Instant) -> 
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .forwarded(id, client, now);
-    if kept { Arrival::Taken } else { Arrival::Busy }
+    if kept {
+        Arrival::Taken
+    } else {
+        Arrival::Busy
+    }
 }
 
 /// Admit a new connection: its address's rate first, then a slot.
@@ -752,7 +756,11 @@ fn admit(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .open(id, peer, now, admission, stream);
-    if taken { Arrival::Taken } else { Arrival::Busy }
+    if taken {
+        Arrival::Taken
+    } else {
+        Arrival::Busy
+    }
 }
 
 /// Admit a new connection from a trusted proxy: held to no address's
@@ -770,7 +778,11 @@ fn admit_proxied(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .open(id, None, now, admission, stream);
-    if taken { Arrival::Taken } else { Arrival::Busy }
+    if taken {
+        Arrival::Taken
+    } else {
+        Arrival::Busy
+    }
 }
 
 /// Admit a new connection from `socket` on the accept thread: as
@@ -957,13 +969,22 @@ fn machine_name() -> Option<String> {
 /// notes), and whether a trusted proxy said so (the address it forwarded
 /// is then the [`Peer::addr`]).
 ///
+/// - When the operator has configured a public web host (`--web-host`) or a
+///   trusted proxy (`--trusted-proxy`), LiveStage is exposed to remote clients.
+///   A reverse proxy on loopback might pass through the client's `Host` without
+///   forwarding headers, so no connection is treated as this machine (#351).
 /// - From a proxy in `proxies`: the client its forwarding header names;
 ///   never this machine, as the proxy may be anywhere. Without that header
 ///   it is the proxy itself, and not taken for this machine either.
 /// - Otherwise the connection's own address; this machine only when that
-///   is loopback, the request names this machine, and no forwarding header
-///   says a proxy sent it.
-fn client_peer(socket: Option<IpAddr>, request: &Request, proxies: &Proxies) -> (Peer, bool) {
+///   is loopback, the request names this machine, no forwarding header
+///   says a proxy sent it, and no public web host or trusted proxy is configured.
+fn client_peer(
+    socket: Option<IpAddr>,
+    request: &Request,
+    names: &[String],
+    proxies: &Proxies,
+) -> (Peer, bool) {
     if proxies.trusts(socket) {
         return match forwarded_client(request, proxies.header) {
             Some(client) => (
@@ -982,10 +1003,13 @@ fn client_peer(socket: Option<IpAddr>, request: &Request, proxies: &Proxies) -> 
             ),
         };
     }
+    let public_facing =
+        !proxies.addrs.is_empty() || names.iter().any(|name| !names_this_machine(name));
     let proxied = FORWARDING_HEADERS
         .iter()
         .any(|name| request.header(name).is_some());
-    let local = socket.is_some_and(|s| s.to_canonical().is_loopback())
+    let local = !public_facing
+        && socket.is_some_and(|s| s.to_canonical().is_loopback())
         && !proxied
         && request.header("host").is_some_and(names_this_machine);
     (
@@ -1087,7 +1111,7 @@ fn connection(
         return;
     }
     let socket = stream.peer_addr().ok().map(|a| a.ip());
-    let (peer, through_proxy) = client_peer(socket, &request, &config.proxies);
+    let (peer, through_proxy) = client_peer(socket, &request, &config.names, &config.proxies);
     if let (true, Some(client)) = (through_proxy, peer.addr) {
         let arrival = forwarded(limits, id, client, Instant::now());
         if let Some((code, reason, body)) = arrival.refusal() {
@@ -2499,7 +2523,16 @@ mod tests {
 
     /// The peer `client_peer` makes of a request head from `socket`.
     fn peer_of(socket: &str, head: &str, proxies: &Proxies) -> (Peer, bool) {
-        client_peer(Some(ip(socket)), &request(head), proxies)
+        client_peer(Some(ip(socket)), &request(head), &[], proxies)
+    }
+
+    fn peer_of_with_names(
+        socket: &str,
+        head: &str,
+        names: &[String],
+        proxies: &Proxies,
+    ) -> (Peer, bool) {
+        client_peer(Some(ip(socket)), &request(head), names, proxies)
     }
 
     /// #293: behind a reverse proxy on this machine every browser connects
@@ -2545,6 +2578,29 @@ mod tests {
         }
         // Another machine naming this one's loopback is still another.
         assert!(!here("10.0.0.7", "GET /ws HTTP/1.1\r\nHost: localhost\r\n"));
+
+        // #351: when a public web host or trusted proxy is configured, no connection
+        // (even from loopback naming localhost without forwarding headers) is treated as local.
+        let public_names = vec!["mixer.example.org".to_string()];
+        let (peer, _) = peer_of_with_names(
+            "127.0.0.1",
+            "GET /ws HTTP/1.1\r\nHost: localhost\r\n",
+            &public_names,
+            &Proxies::default(),
+        );
+        assert!(!peer.local);
+
+        let trusted_proxies = Proxies {
+            addrs: vec![ip("10.0.0.1")],
+            header: ForwardedHeader::XForwardedFor,
+        };
+        let (peer, _) = peer_of_with_names(
+            "127.0.0.1",
+            "GET /ws HTTP/1.1\r\nHost: localhost\r\n",
+            &[],
+            &trusted_proxies,
+        );
+        assert!(!peer.local);
     }
 
     /// #293: a proxy given with `--trusted-proxy` names the client, in the
@@ -2776,12 +2832,12 @@ mod tests {
     /// client, directly and through a proxy here, trusted or not.
     #[test]
     fn the_command_loop_learns_who_a_web_client_is() {
-        let joined = |addrs: Vec<IpAddr>, host: &str, extra: &str| -> Peer {
+        let joined = |names: Vec<String>, addrs: Vec<IpAddr>, host: &str, extra: &str| -> Peer {
             let (tx, rx) = std::sync::mpsc::channel();
             let bound = serve(
                 "127.0.0.1:0".parse().unwrap(),
                 tx,
-                vec!["mixer.example.org".to_string()],
+                names,
                 Proxies {
                     addrs,
                     header: ForwardedHeader::XForwardedFor,
@@ -2804,12 +2860,26 @@ mod tests {
             }
         };
         let lo = Some(ip("127.0.0.1"));
-        // A browser here.
+        // A browser here without public web host or trusted proxy.
         assert_eq!(
-            joined(Vec::new(), "localhost:8730", ""),
+            joined(Vec::new(), Vec::new(), "localhost:8730", ""),
             Peer {
                 addr: lo,
                 local: true
+            }
+        );
+        // #351: with a public web host configured, a request naming localhost
+        // over loopback is NOT treated as this machine.
+        assert_eq!(
+            joined(
+                vec!["mixer.example.org".to_string()],
+                Vec::new(),
+                "localhost:8730",
+                ""
+            ),
+            Peer {
+                addr: lo,
+                local: false
             }
         );
         // Through a proxy here that is not trusted: one shared address,
@@ -2819,11 +2889,32 @@ mod tests {
             addr: lo,
             local: false,
         };
-        assert_eq!(joined(Vec::new(), "mixer.example.org", ""), untrusted);
-        assert_eq!(joined(Vec::new(), "mixer.example.org", proxied), untrusted);
+        assert_eq!(
+            joined(
+                vec!["mixer.example.org".to_string()],
+                Vec::new(),
+                "mixer.example.org",
+                ""
+            ),
+            untrusted
+        );
+        assert_eq!(
+            joined(
+                vec!["mixer.example.org".to_string()],
+                Vec::new(),
+                "mixer.example.org",
+                proxied
+            ),
+            untrusted
+        );
         // Trusted: the client it forwards for.
         assert_eq!(
-            joined(vec![ip("127.0.0.1")], "mixer.example.org", proxied),
+            joined(
+                vec!["mixer.example.org".to_string()],
+                vec![ip("127.0.0.1")],
+                "mixer.example.org",
+                proxied
+            ),
             Peer {
                 addr: Some(ip("203.0.113.7")),
                 local: false
