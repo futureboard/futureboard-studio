@@ -485,6 +485,15 @@ class TelemetryModel {
   /// Render callbacks that panicked and were replaced with silence.
   final int renderFaults;
 
+  /// Maximum length of one microphone take, in seconds (0 = unknown).
+  final int recordingLimitSeconds;
+
+  /// The current/last take was ended by the length limit, not by the user.
+  final bool recordingStoppedAtLimit;
+
+  /// Microphone frames lost to input overruns in the current/last take.
+  final int recordingDroppedFrames;
+
   const TelemetryModel({
     required this.playheadBeats,
     required this.isPlaying,
@@ -503,6 +512,9 @@ class TelemetryModel {
     required this.trackMeters,
     this.inspectedPluginMeter,
     this.renderFaults = 0,
+    this.recordingLimitSeconds = 0,
+    this.recordingStoppedAtLimit = false,
+    this.recordingDroppedFrames = 0,
   });
 
   factory TelemetryModel.empty() => TelemetryModel(
@@ -548,6 +560,12 @@ class TelemetryModel {
                 j['inspectedPluginMeter'] as Map<String, dynamic>)
             : null,
         renderFaults: (j['renderFaults'] as num? ?? 0).toInt(),
+        recordingLimitSeconds:
+            (j['recordingLimitSeconds'] as num? ?? 0).toInt(),
+        recordingStoppedAtLimit:
+            j['recordingStoppedAtLimit'] as bool? ?? false,
+        recordingDroppedFrames:
+            (j['recordingDroppedFrames'] as num? ?? 0).toInt(),
       );
 
   TrackMeterModel meterForTrack(String trackId) {

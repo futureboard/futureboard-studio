@@ -412,7 +412,13 @@ pub unsafe extern "C" fn fb_engine_get_telemetry_json(handle: *mut FbEngineHandl
     if handle.is_null() {
         return to_c_string("{}".to_string());
     }
-    let mut tel = unsafe { (*handle).lock() }.telemetry();
+    let mut tel = {
+        let mut engine = unsafe { (*handle).lock() };
+        // The UI polls telemetry continuously, so this is where a take that reached the
+        // length limit gets committed and reported (recordingStoppedAtLimit).
+        engine.service_recording();
+        engine.telemetry()
+    };
     // Handle-level realtime counters live outside the engine mutex.
     tel.render_faults = unsafe { (*handle).render_faults() };
     tel.render_lock_misses = unsafe { (*handle).lock_misses() };

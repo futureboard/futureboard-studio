@@ -34,6 +34,7 @@ pub struct MicInputRing {
     read: AtomicUsize,
     active: AtomicBool,
     dropped_frames: AtomicU64,
+    limit_reached: AtomicBool,
 }
 
 impl MicInputRing {
@@ -46,6 +47,7 @@ impl MicInputRing {
             read: AtomicUsize::new(0),
             active: AtomicBool::new(false),
             dropped_frames: AtomicU64::new(0),
+            limit_reached: AtomicBool::new(false),
         }
     }
 
@@ -68,11 +70,20 @@ impl MicInputRing {
         let w = self.write.load(Ordering::Acquire);
         self.read.store(w, Ordering::Release);
         self.dropped_frames.store(0, Ordering::Relaxed);
+        self.limit_reached.store(false, Ordering::Release);
     }
 
+    /// Frames lost because the ring was full when the input callback pushed them
+    /// (input overruns) since the last `clear`.
     #[inline]
     pub fn dropped_frames(&self) -> u64 {
         self.dropped_frames.load(Ordering::Relaxed)
+    }
+
+    /// True once a drain hit the take's frame limit; input is stopped at that point.
+    #[inline]
+    pub fn limit_reached(&self) -> bool {
+        self.limit_reached.load(Ordering::Acquire)
     }
 
     /// Realtime producer entry point. Never allocates and never blocks.
@@ -112,7 +123,8 @@ impl MicInputRing {
     }
 
     /// Non-realtime consumer: drains available stereo frames into `out_l` and `out_r`,
-    /// capped at `max_total_frames`.
+    /// capped at `max_total_frames`. Reaching the cap stops input and sets
+    /// `limit_reached`; frames past the cap are discarded but are not input overruns.
     pub fn drain_into(
         &self,
         out_l: &mut Vec<f32>,
@@ -136,9 +148,9 @@ impl MicInputRing {
         }
         self.read
             .store(r.wrapping_add(available), Ordering::Release);
-        if keep < available {
-            self.dropped_frames
-                .fetch_add((available - keep) as u64, Ordering::Relaxed);
+        if current + keep >= max_total_frames {
+            self.active.store(false, Ordering::Release);
+            self.limit_reached.store(true, Ordering::Release);
         }
         keep
     }
@@ -442,6 +454,15 @@ pub struct TelemetrySnapshot {
     /// Live note-ons rejected because the bounded live MIDI queue was full.
     #[serde(default)]
     pub live_midi_dropped_note_ons: u64,
+    /// Maximum length of one microphone take; recording stops automatically there.
+    #[serde(default)]
+    pub recording_limit_seconds: u32,
+    /// The current/last take was ended by the length limit rather than by the user.
+    #[serde(default)]
+    pub recording_stopped_at_limit: bool,
+    /// Microphone frames lost to input overruns in the current/last take.
+    #[serde(default)]
+    pub recording_dropped_frames: u64,
 }
 
 pub struct TrackRuntime {
@@ -602,6 +623,10 @@ pub struct StudioMobileEngine {
     mic_ring: Arc<MicInputRing>,
     recording_worker: RecordingWorker,
     recording_start_beat: f64,
+    /// Length limit of one take (`MAX_RECORDING_SECONDS`; shorter only in tests).
+    max_recording_seconds: usize,
+    /// The last take was ended by the length limit, not by the user.
+    last_take_stopped_at_limit: bool,
     metronome_phase: f32,
     metronome_env: f32,
     metronome_freq: f32,
@@ -681,6 +706,8 @@ impl StudioMobileEngine {
             mic_ring,
             recording_worker,
             recording_start_beat: 0.0,
+            max_recording_seconds: MAX_RECORDING_SECONDS,
+            last_take_stopped_at_limit: false,
             metronome_phase: 0.0,
             metronome_env: 0.0,
             metronome_freq: 1000.0,
@@ -1347,12 +1374,13 @@ impl StudioMobileEngine {
         }
         if recording {
             // Preallocate the take on the control thread; the writer thread only appends
-            // within this capacity (up to MAX_RECORDING_SECONDS).
-            let max_frames = (self.sample_rate as usize) * MAX_RECORDING_SECONDS;
+            // within this capacity (up to the take length limit).
+            let max_frames = (self.sample_rate as usize) * self.max_recording_seconds;
             let prealloc_frames =
                 ((self.sample_rate as usize) * INITIAL_TAKE_RESERVE_SECONDS).min(max_frames);
             self.recording_start_beat = self.playhead_beats;
             self.is_recording = true;
+            self.last_take_stopped_at_limit = false;
             self.recording_worker.begin_take(
                 &self.mic_ring,
                 Vec::with_capacity(prealloc_frames),
@@ -1365,6 +1393,19 @@ impl StudioMobileEngine {
         } else {
             self.finish_recording_clip();
         }
+    }
+
+    /// Control-thread housekeeping for an active take: when the writer has hit the take
+    /// length limit (input is already stopped), ends the take and commits the
+    /// clip so it is not silently truncated while the UI still shows "recording".
+    /// Returns true when the take was ended here.
+    pub fn service_recording(&mut self) -> bool {
+        if !self.is_recording || !self.mic_ring.limit_reached() {
+            return false;
+        }
+        self.finish_recording_clip();
+        self.last_take_stopped_at_limit = true;
+        true
     }
 
     fn finish_recording_clip(&mut self) {
@@ -2525,6 +2566,9 @@ impl StudioMobileEngine {
             render_faults: 0,
             render_lock_misses: 0,
             live_midi_dropped_note_ons: self.live_midi_dropped_note_ons,
+            recording_limit_seconds: self.max_recording_seconds as u32,
+            recording_stopped_at_limit: self.last_take_stopped_at_limit,
+            recording_dropped_frames: self.mic_ring.dropped_frames(),
         }
     }
 
@@ -2724,5 +2768,77 @@ mod tests {
         let tail = render_and_peak(&mut engine, &live, 400);
         assert_eq!(engine.tracks[idx].pending_live_note_offs, 0);
         assert!(tail < 1.0e-4, "overflowed note-off was lost: {tail}");
+    }
+
+    fn recorded_clip_frames(engine: &StudioMobileEngine) -> Option<usize> {
+        let clip = engine
+            .tracks
+            .iter()
+            .flat_map(|t| &t.snapshot.audio_clips)
+            .find(|c| c.source_path == "recorded://mic_take.wav")?;
+        engine.audio_pool.get(&clip.source_id).map(|b| b.frames)
+    }
+
+    /// Regression for #347: reaching the take length limit ends the recording, commits
+    /// the take and reports it, instead of silently truncating while still "recording".
+    #[test]
+    fn recording_stops_and_reports_at_take_length_limit() {
+        let sr = 48_000usize;
+        let mut engine = StudioMobileEngine::new(sr as u32);
+        engine.max_recording_seconds = 1;
+        engine.set_recording(true);
+        assert_eq!(engine.telemetry().recording_limit_seconds, 1);
+
+        // 2 s of input against a 1 s limit (the ring holds MIC_RING_SECONDS).
+        let block = vec![0.25f32; 4800 * 2];
+        for _ in 0..20 {
+            engine.push_mic_input_interleaved(&block, 2);
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !engine.service_recording() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "writer never reported the take limit"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(!engine.is_recording, "recording must stop at the limit");
+        let tel = engine.telemetry();
+        assert!(tel.recording_stopped_at_limit);
+        assert!(!tel.is_recording);
+        assert_eq!(
+            tel.recording_dropped_frames, 0,
+            "frames past the limit are not input overruns"
+        );
+        assert_eq!(recorded_clip_frames(&engine), Some(sr));
+        // Input is no longer accepted once the limit stopped the take.
+        assert_eq!(engine.mic_ring.push_interleaved(&block, 2), 0);
+
+        // A new take clears the flag.
+        engine.set_recording(true);
+        assert!(!engine.telemetry().recording_stopped_at_limit);
+        engine.set_recording(false);
+    }
+
+    /// Regression for #347: input overruns are reported through telemetry.
+    #[test]
+    fn recording_input_overruns_are_reported_in_telemetry() {
+        let sr = 48_000usize;
+        let mut engine = StudioMobileEngine::new(sr as u32);
+        engine.set_recording(true);
+        let ring_cap = engine.mic_ring.capacity_frames();
+        // One push larger than the whole ring: the excess cannot be stored.
+        let burst = vec![0.1f32; (ring_cap + sr) * 2];
+        engine.push_mic_input_interleaved(&burst, 2);
+        assert_eq!(engine.telemetry().recording_dropped_frames, sr as u64);
+        assert!(
+            !engine.service_recording(),
+            "an overrun is not the take limit"
+        );
+        engine.set_recording(false);
+        assert_eq!(engine.telemetry().recording_dropped_frames, sr as u64);
+        assert!(!engine.telemetry().recording_stopped_at_limit);
     }
 }
