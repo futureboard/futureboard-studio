@@ -584,7 +584,7 @@ impl<P: Vst3Plugin> IEditController for Wrapper<P> {
     ) -> tresult {
         check_null_ptr!(info);
 
-        if param_index < 0 || param_index > self.get_parameter_count() {
+        if param_index < 0 || param_index >= self.get_parameter_count() {
             return kInvalidArgument;
         }
 
@@ -1946,5 +1946,100 @@ impl<P: Vst3Plugin> IUnitInfo for Wrapper<P> {
         _data: SharedVstPtr<dyn IBStream>,
     ) -> tresult {
         kInvalidArgument
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::prelude::*;
+    use std::num::NonZeroU32;
+    use std::sync::Arc;
+
+    struct TestPlugin {
+        params: Arc<TestParams>,
+    }
+
+    struct TestParams {
+        pub gain: FloatParam,
+    }
+
+    unsafe impl Params for TestParams {
+        fn param_map(&self) -> Vec<(String, ParamPtr, String)> {
+            vec![("gain".to_string(), self.gain.as_ptr(), String::new())]
+        }
+    }
+
+    impl Default for TestPlugin {
+        fn default() -> Self {
+            Self {
+                params: Arc::new(TestParams {
+                    gain: FloatParam::new("Gain", 1.0, FloatRange::Linear { min: 0.0, max: 1.0 }),
+                }),
+            }
+        }
+    }
+
+    impl Plugin for TestPlugin {
+        const NAME: &'static str = "Test Plugin";
+        const VENDOR: &'static str = "Test Vendor";
+        const URL: &'static str = "https://example.com";
+        const EMAIL: &'static str = "info@example.com";
+        const VERSION: &'static str = "0.0.1";
+
+        const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
+            main_input_channels: NonZeroU32::new(2),
+            main_output_channels: NonZeroU32::new(2),
+            ..AudioIOLayout::const_default()
+        }];
+
+        const MIDI_INPUT: MidiConfig = MidiConfig::None;
+        const MIDI_OUTPUT: MidiConfig = MidiConfig::None;
+
+        type SysExMessage = ();
+        type BackgroundTask = ();
+
+        fn params(&self) -> Arc<dyn Params> {
+            self.params.clone()
+        }
+
+        fn process(
+            &mut self,
+            _buffer: &mut Buffer,
+            _aux: &mut AuxiliaryBuffers,
+            _context: &mut impl ProcessContext<Self>,
+        ) -> ProcessStatus {
+            ProcessStatus::Normal
+        }
+    }
+
+    impl Vst3Plugin for TestPlugin {
+        const VST3_CLASS_ID: [u8; 16] = *b"TestPluginClsId!";
+        const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[Vst3SubCategory::Fx];
+    }
+
+    #[test]
+    fn get_parameter_info_boundary_check() {
+        let wrapper = Wrapper::<TestPlugin>::new();
+        let param_count = unsafe { wrapper.get_parameter_count() };
+        assert!(param_count > 0);
+
+        let mut info: vst3_sys::vst::ParameterInfo = unsafe { std::mem::zeroed() };
+
+        // Valid index returns kResultOk
+        let res = unsafe { wrapper.get_parameter_info(0, &mut info) };
+        assert_eq!(res, kResultOk);
+
+        // Negative index returns kInvalidArgument
+        let res = unsafe { wrapper.get_parameter_info(-1, &mut info) };
+        assert_eq!(res, kInvalidArgument);
+
+        // Index equal to parameter count must return kInvalidArgument (and NOT panic)
+        let res = unsafe { wrapper.get_parameter_info(param_count, &mut info) };
+        assert_eq!(res, kInvalidArgument);
+
+        // Index greater than parameter count must return kInvalidArgument
+        let res = unsafe { wrapper.get_parameter_info(param_count + 1, &mut info) };
+        assert_eq!(res, kInvalidArgument);
     }
 }
