@@ -33,6 +33,21 @@ jobs:
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
           echo "App version: ${VERSION}"
 
+      # #339: a nightly is published to users on the Nightly channel, so it
+      # must carry the update key (and be signed in `publish`), or it can
+      # never update. Checked here, before an hour of building.
+      - name: Check the update signing public key
+        env:
+          UPDATE_PUBLIC_KEY: ${{ secrets.FUTUREBOARD_UPDATE_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          key="$(printf '%s' "${UPDATE_PUBLIC_KEY}" | tr -d '[:space:]')"
+          if ! [[ "$key" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            echo "::error::secret FUTUREBOARD_UPDATE_PUBLIC_KEY must be set to the Ed25519 public key as 64 hex characters; without it the nightly reports updates as unavailable."
+            exit 1
+          fi
+          echo "Update signing public key is set."
+
   build_native:
     name: Build Native (${{ matrix.os }})
     needs: version
@@ -53,6 +68,10 @@ jobs:
       # rather than per-run so the build script does not rerun every build.
       FUTUREBOARD_TONE3000_API_KEY: fb-release-canary-tone3000-3c9e1a7f52d4
       TONE3000_API_KEY: fb-release-canary-tone3000-3c9e1a7f52d4
+      # Public half of the update signing key, read by `option_env!` in
+      # apps/native/studio/src/updater.rs (#339). Public by construction; it
+      # is a secret only so the private and public halves live side by side.
+      FUTUREBOARD_UPDATE_PUBLIC_KEY: ${{ secrets.FUTUREBOARD_UPDATE_PUBLIC_KEY }}
       CARGO_BUILD_JOBS: 2
     strategy:
       fail-fast: false
@@ -221,6 +240,27 @@ jobs:
           & ./scripts/check-release-secret.ps1 -Canary $env:FUTUREBOARD_TONE3000_API_KEY -Path $files
           exit $LASTEXITCODE
 
+      # #339: the key reaches the binary only through the compiler's
+      # environment. Prove every staged package (each macOS architecture
+      # too) actually carries it, so a dropped env var cannot ship builds
+      # that refuse every update.
+      - name: Verify the update public key is baked in
+        shell: bash
+        run: |
+          set -euo pipefail
+          key="$(printf '%s' "$FUTUREBOARD_UPDATE_PUBLIC_KEY" | tr -d '[:space:]')"
+          test -n "$key" || { echo "::error::FUTUREBOARD_UPDATE_PUBLIC_KEY is empty"; exit 1; }
+          fail=0
+          for package in out/release/community/*/; do
+            if grep -rqF -- "$key" "$package"; then
+              echo "update public key baked in: $package"
+            else
+              echo "::error::$package does not contain FUTUREBOARD_UPDATE_PUBLIC_KEY"
+              fail=1
+            fi
+          done
+          exit $fail
+
       # Three images per release: macos-arm64, macos-x86_64, and macos-universal.
       # Per-arch packages are already staged by the xtask passes above; the
       # universal tree is their lipo merge. Bundling costs no extra compile.
@@ -311,14 +351,64 @@ jobs:
       contents: write
 
     steps:
+      # For the signing script only. Checked out before the download because
+      # checkout cleans the workspace.
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
       - name: Download all artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
 
+      # #339: every installer needs `<asset>.sig`, an Ed25519 signature by the
+      # key whose public half the build baked in (#268); the updater offers
+      # nothing without one. Signed (and verified) before yesterday's nightly
+      # is deleted, so a signing failure leaves it in place.
+      - name: Sign installers for the in-app updater
+        env:
+          FUTUREBOARD_UPDATE_SIGNING_KEY: ${{ secrets.FUTUREBOARD_UPDATE_SIGNING_KEY }}
+          FUTUREBOARD_UPDATE_PUBLIC_KEY: ${{ secrets.FUTUREBOARD_UPDATE_PUBLIC_KEY }}
+        run: bash .github/workflows/sign-update-assets.sh dist
+
       - name: List release assets
         run: ls -lh dist/
+
+      # Same asset shapes the updater resolves (see release.yml), each with
+      # its signature. A nightly missing one is un-updatable on that platform.
+      - name: Verify every platform installer is signed
+        env:
+          APP_VERSION: ${{ needs.version.outputs.app-version }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob nocaseglob
+          fail=0
+          check() {
+            local label="$1" pattern="$2"
+            local -a matches=(dist/$pattern)
+            if [ ${#matches[@]} -ne 1 ]; then
+              echo "::error::$label: expected one asset matching '$pattern', found ${#matches[@]}: ${matches[*]}"
+              fail=1
+            elif [[ "${matches[0]}" != *"$APP_VERSION"* ]]; then
+              echo "::error::$label asset ${matches[0]} is not version $APP_VERSION"
+              fail=1
+            elif [ ! -s "${matches[0]}.sig" ]; then
+              echo "::error::$label asset ${matches[0]} has no signature ${matches[0]}.sig"
+              fail=1
+            else
+              echo "$label: ${matches[0]} (+ .sig)"
+            fi
+          }
+          check "windows"         "*setup*.exe"
+          check "macos-universal" "*macos-universal*.dmg"
+          check "macos-arm64"     "*macos-arm64*.dmg"
+          check "macos-x86_64"    "*macos-x86_64*.dmg"
+          check "linux"           "*x86_64*.AppImage"
+          exit $fail
 
       - name: Delete previous nightly tag + release
         run: |
