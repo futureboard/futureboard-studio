@@ -2152,11 +2152,27 @@ const INSERT_BUS_OPTIONS: &[InspectorSelectOption<InsertSignalBus>] = &[
     },
 ];
 
-/// Bus for a VST3 effect while the track's wet/dry/wet return is live.
+/// The same choice while the track has no live wet/dry/wet return: an
+/// insert still stored on that bus runs in this channel's chain until the
+/// split is back, and says so.
+const INSERT_BUS_OPTIONS_SPLIT_OFF: &[InspectorSelectOption<InsertSignalBus>] = &[
+    InspectorSelectOption {
+        label: "Main",
+        value: InsertSignalBus::Main,
+    },
+    InspectorSelectOption {
+        label: "WDW (off, runs on Main)",
+        value: InsertSignalBus::Wdw,
+    },
+];
+
+/// Bus for a VST3 effect while the track's wet/dry/wet return is live, or
+/// while it is still stored on a split that has gone.
 /// Main keeps it in this channel's chain. WDW runs it on that return.
 fn insert_bus_row(
     track: &TrackState,
     slot: &InsertSlotState,
+    wdw_live: bool,
     callbacks: &InspectorCallbacks,
 ) -> impl IntoElement {
     let track_id = track.id.clone();
@@ -2167,7 +2183,11 @@ fn insert_bus_row(
         inspector_select(
             gpui::SharedString::from(format!("insert-bus-{}", slot.id)),
             slot.signal_bus,
-            INSERT_BUS_OPTIONS,
+            if wdw_live {
+                INSERT_BUS_OPTIONS
+            } else {
+                INSERT_BUS_OPTIONS_SPLIT_OFF
+            },
             false,
             move |bus, window, cx| {
                 on_set(&(track_id.clone(), insert_id.clone(), bus), window, cx);
@@ -2836,8 +2856,12 @@ fn insert_effects_section(track: &TrackState, callbacks: &InspectorCallbacks) ->
             false,
             row_gap,
         ));
-        if wdw_live && slot.plugin_format == Some(InsertPluginFormat::Vst3) {
-            chain = chain.child(insert_bus_row(track, slot, callbacks));
+        // Also shown for an insert left on the W bus after the split went
+        // away, so it can be moved back rather than stranded out of sight.
+        if slot.plugin_format == Some(InsertPluginFormat::Vst3)
+            && (wdw_live || slot.signal_bus == InsertSignalBus::Wdw)
+        {
+            chain = chain.child(insert_bus_row(track, slot, wdw_live, callbacks));
         }
     }
     // End of the chain — rendered for an empty chain too, so it can take a

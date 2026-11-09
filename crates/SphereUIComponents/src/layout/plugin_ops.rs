@@ -610,13 +610,20 @@ impl StudioLayout {
 
     /// The Rodhareist split changed. Create or retire its send and return,
     /// then publish the graph so the return is in the mix.
+    ///
+    /// One undo step, like adding a return and a send by hand: without it an
+    /// undo jumped back past the split to an older snapshot of the track,
+    /// leaving its return orphaned, and a redo could not bring it back.
     pub(super) fn sync_rodhareist_wdw(&mut self, track_id: &str, cx: &mut Context<Self>) {
+        let scope = self.timeline.read(cx).state.wdw_split_edit_scope(track_id);
+        let edit = self.begin_track_edit(scope, cx);
         let changed = self
             .timeline
             .update(cx, |timeline, _| timeline.state.sync_wdw_split(track_id));
         if !changed {
             return;
         }
+        self.commit_track_edit("Wet/Dry/Wet Bus", edit, cx);
         self.mark_dirty();
         self.schedule_audio_project_sync(cx, false, "wdw_split");
         cx.notify();
@@ -630,6 +637,10 @@ impl StudioLayout {
         bus: crate::components::timeline::timeline_state::InsertSignalBus,
         cx: &mut Context<Self>,
     ) {
+        let edit = self.begin_track_edit(
+            crate::components::timeline::timeline_state::TrackEditScope::channel(track_id),
+            cx,
+        );
         let changed = self.timeline.update(cx, |timeline, _| {
             timeline
                 .state
@@ -638,6 +649,7 @@ impl StudioLayout {
         if !changed {
             return;
         }
+        self.commit_track_edit("Insert Bus", edit, cx);
         self.mark_dirty();
         self.schedule_audio_project_sync(cx, false, "insert_signal_bus");
         self.push_mixer_snapshot_to_window(cx);

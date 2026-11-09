@@ -14,6 +14,12 @@ use crate::runtime::RuntimeTrack;
 pub struct RuntimeLatencyGraph {
     /// Sum of enabled native-plugin insert latencies on each track strip.
     pub track_plugin_latency: Vec<u32>,
+    /// Latency of what actually runs on each track's block: its strip, less
+    /// the wet/dry/wet inserts it hands to its return, plus the ones it runs
+    /// for its source. Equal to `track_plugin_latency` on a track without a
+    /// live split. Paths are planned on this; `track_plugin_latency` stays the
+    /// strip's own total, which the refresh path compares observations with.
+    pub track_block_latency: Vec<u32>,
     /// Latency at each track's output tap (includes upstream feed for routing tracks).
     pub track_output_latency: Vec<u32>,
     /// Delay applied to post-fader **main output** after sends, so dry/wet
@@ -84,6 +90,68 @@ pub fn resolve_latency_routing_indices(tracks: &mut [RuntimeTrack]) {
             send.return_track_index = id_to_index.get(&send.return_track_id).copied();
         }
     }
+    for src in 0..tracks.len() {
+        let ret = wdw_return_for(tracks, src);
+        tracks[src].wdw_return_index = ret;
+    }
+}
+
+/// The return `src`'s wet/dry/wet inserts run on: the target of its first
+/// enabled wet/dry/wet send that resolves to another routing track, provided
+/// `src` is the source that return runs inserts for (the first track with
+/// such a send to it, as the render pass picks). `None` leaves them in the
+/// track's own chain. Reads resolved send indices only.
+fn wdw_return_for(tracks: &[RuntimeTrack], src: usize) -> Option<usize> {
+    let feeds_wdw = |track: &RuntimeTrack, ret: usize| {
+        track
+            .sends
+            .iter()
+            .any(|send| send.wdw && send.enabled && send.return_track_index == Some(ret))
+    };
+    tracks[src]
+        .sends
+        .iter()
+        .filter(|send| send.wdw && send.enabled)
+        .filter_map(|send| send.return_track_index)
+        .find(|&ret| {
+            ret != src
+                && ret < tracks.len()
+                && is_routing_track_type(&tracks[ret].track_type)
+                && tracks.iter().position(|track| feeds_wdw(track, ret)) == Some(src)
+        })
+}
+
+/// Latency of the wet/dry/wet inserts `track` runs on its return instead of
+/// its own chain; 0 while its split is not live.
+///
+/// Per insert this is what the refresh path observed for it (the step in
+/// [`crate::runtime::RuntimeInsert::chain_latency_samples`], which carries a
+/// bridged insert's handshake block) or, before any refresh, what an
+/// in-process VST3 reports. Allocation-free.
+pub fn wdw_bus_latency_samples(track: &RuntimeTrack) -> u32 {
+    if track.wdw_return_index.is_none() {
+        return 0;
+    }
+    let mut before = track
+        .soundfont_player
+        .as_ref()
+        .map(crate::runtime::RuntimeSoundfontPlayer::latency_samples)
+        .unwrap_or(0);
+    let mut total = 0u32;
+    for insert in &track.inserts {
+        let observed = insert.chain_latency_samples.saturating_sub(before);
+        before = before.max(insert.chain_latency_samples);
+        if insert.signal_bus != crate::runtime::SIGNAL_BUS_WDW || !insert.enabled {
+            continue;
+        }
+        let reported = insert
+            .vst3
+            .as_ref()
+            .filter(|vst3| vst3.is_ready())
+            .map_or(0, |vst3| vst3.get_latency_samples().max(0) as u32);
+        total = total.saturating_add(observed.max(reported));
+    }
+    total
 }
 
 /// The track a main output feeds, or `None` when it reaches the master sum
@@ -223,6 +291,7 @@ pub fn plan_runtime_latency_graph(
 
     let mut graph = RuntimeLatencyGraph {
         track_plugin_latency: vec![0; n],
+        track_block_latency: vec![0; n],
         track_output_latency: vec![0; n],
         track_pdc_delay: vec![0; n],
         send_pdc_delay: tracks
@@ -262,6 +331,7 @@ pub fn recompute_runtime_latency_graph(
     debug_assert_eq!(graph.track_pdc_delay.len(), n);
     if n == 0
         || graph.track_plugin_latency.len() != n
+        || graph.track_block_latency.len() != n
         || graph.track_output_latency.len() != n
         || graph.track_pdc_delay.len() != n
         || graph.send_pdc_delay.len() != n
@@ -277,7 +347,8 @@ pub fn recompute_runtime_latency_graph(
     // Destructured so the passes below can read one vector while writing
     // another without the borrow checker seeing the whole graph as borrowed.
     let RuntimeLatencyGraph {
-        track_plugin_latency: plugin_latency,
+        track_plugin_latency: strip_latency,
+        track_block_latency: plugin_latency,
         track_output_latency: output_latency,
         track_pdc_delay,
         send_pdc_delay,
@@ -286,7 +357,20 @@ pub fn recompute_runtime_latency_graph(
     } = graph;
 
     for (idx, track) in tracks.iter().enumerate() {
-        plugin_latency[idx] = strip_plugin_latency_samples(track);
+        strip_latency[idx] = strip_plugin_latency_samples(track);
+    }
+    // Wet/dry/wet inserts are this track's, but their latency is on the
+    // return they run on: the dry path does not wait for them, the wet one
+    // does. Planning on the strip total instead delayed the dry signal by
+    // their latency too, and left the wet return that much late.
+    plugin_latency.copy_from_slice(strip_latency);
+    for (idx, track) in tracks.iter().enumerate() {
+        let Some(ret) = track.wdw_return_index.filter(|&ret| ret < n && ret != idx) else {
+            continue;
+        };
+        let moved = wdw_bus_latency_samples(track).min(plugin_latency[idx]);
+        plugin_latency[idx] -= moved;
+        plugin_latency[ret] = plugin_latency[ret].saturating_add(moved);
     }
     let master_index = audio_graph.master_index;
     *master_plugin_latency = master_index
@@ -543,6 +627,7 @@ mod tests {
             plugin_latency_samples: plugin_latency,
             smoothed_gain_l: 1.0,
             smoothed_gain_r: 1.0,
+            wdw_return_index: None,
         }
     }
 
