@@ -233,6 +233,10 @@ pub struct Timeline {
     /// besides its notes. Unset (tests, embedded editors) imports everything,
     /// which is what a drop did before the dialog existed.
     on_midi_import_prompt: Option<TimelineMidiImportPromptCb>,
+    /// A short status-bar line for an edit that did not land, such as a MIDI
+    /// file the importer could not read. Unset in tests: the failure is still
+    /// logged, and the shell wires this to the status bar.
+    on_edit_notice: Option<TimelineEditNoticeCb>,
     /// Window-space position of the last drag-move event while files are
     /// being dragged. We need this because `on_drop::<ExternalPaths>` does
     /// not carry the drop position itself — gpui translates the submit into
@@ -610,6 +614,10 @@ pub struct TimelineMidiImportPrompt {
 
 pub type TimelineMidiImportPromptCb =
     std::sync::Arc<dyn Fn(&TimelineMidiImportPrompt, &mut gpui::Window, &mut gpui::App) + 'static>;
+
+/// One status-bar sentence. The shell shows it; the timeline does not own a
+/// status bar of its own.
+pub type TimelineEditNoticeCb = std::sync::Arc<dyn Fn(String, &mut gpui::App) + 'static>;
 
 pub type TimelineProjectChangedCb = std::sync::Arc<dyn Fn(&mut gpui::App) + 'static>;
 /// Clip gains to play now, as `(clip id, linear gain)`.
