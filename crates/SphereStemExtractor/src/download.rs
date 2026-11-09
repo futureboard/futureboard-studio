@@ -111,16 +111,9 @@ pub fn verify_file_hash(path: &Path, expected_bytes: u64, expected_sha256: &str)
     format!("{:x}", hasher.finalize()).eq_ignore_ascii_case(expected_sha256)
 }
 
-/// True when every ONNX file for `model` is present under `models_dir` with the expected size.
+/// True when every ONNX file for `model` is present under `models_dir` and matches its pinned SHA-256 hash.
 pub fn model_installed(model: StemModel, models_dir: &Path) -> bool {
-    let package = model.package();
-    package.files.iter().all(|file| {
-        let path = models_dir.join(file.file_name);
-        path.is_file()
-            && fs::metadata(&path)
-                .map(|meta| meta.len() == file.expected_bytes)
-                .unwrap_or(false)
-    })
+    verify_model_installed(model, models_dir)
 }
 
 /// Verify that every ONNX file for `model` is present and matches its pinned SHA-256 hash.
@@ -132,7 +125,7 @@ pub fn verify_model_installed(model: StemModel, models_dir: &Path) -> bool {
     })
 }
 
-/// Absolute paths for installed model files, or `None` if incomplete.
+/// Absolute paths for installed model files, or `None` if incomplete or hash verification fails.
 pub fn resolve_installed_model_files(model: StemModel, models_dir: &Path) -> Option<Vec<PathBuf>> {
     if !model_installed(model, models_dir) {
         return None;
@@ -372,7 +365,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn installed_requires_exact_size_and_every_package_file() {
+    fn installed_requires_matching_sha256_and_every_package_file() {
         let dir = std::env::temp_dir().join(format!(
             "fb-stem-models-{}",
             std::time::SystemTime::now()
@@ -387,15 +380,16 @@ mod tests {
         fs::write(&path, vec![0u8; 2048]).unwrap();
         assert!(!model_installed(StemModel::MdxNetKaraoke, &dir));
         assert!(!verify_model_installed(StemModel::MdxNetKaraoke, &dir));
+        assert!(resolve_installed_model_files(StemModel::MdxNetKaraoke, &dir).is_none());
 
-        // Matching size counts as installed in fast metadata check
+        // Matching size with invalid content must NOT count as installed (#359)
         let file = File::create(&path).unwrap();
         file.set_len(StemModel::MdxNetKaraoke.package().files[0].expected_bytes)
             .unwrap();
         drop(file);
-        assert!(model_installed(StemModel::MdxNetKaraoke, &dir));
-        // But hash verification still detects non-matching weights
+        assert!(!model_installed(StemModel::MdxNetKaraoke, &dir));
         assert!(!verify_model_installed(StemModel::MdxNetKaraoke, &dir));
+        assert!(resolve_installed_model_files(StemModel::MdxNetKaraoke, &dir).is_none());
 
         assert!(!model_installed(StemModel::MdxNet, &dir));
         let _ = fs::remove_dir_all(dir);
