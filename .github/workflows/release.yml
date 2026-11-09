@@ -72,6 +72,11 @@ jobs:
       contents: read
     with:
       app-version: ${{ inputs.app-version }}
+      # A release is what installed builds update to, and what new users
+      # install; one built without the update key could never update (#339).
+      require-update-key: true
+    secrets:
+      FUTUREBOARD_UPDATE_PUBLIC_KEY: ${{ secrets.FUTUREBOARD_UPDATE_PUBLIC_KEY }}
 
   publish:
     name: Attach Release Assets
@@ -86,11 +91,29 @@ jobs:
       APP_VERSION: ${{ needs.build.outputs.app-version }}
 
     steps:
+      # For the signing script only. Checked out before the download because
+      # checkout cleans the workspace.
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
       - name: Download all artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
+
+      # #339: every installer needs `<asset>.sig`, an Ed25519 signature by the
+      # key whose public half the build baked in (#268); the updater offers
+      # nothing without one. The script checks the two secrets belong
+      # together and verifies each signature before anything is uploaded.
+      - name: Sign installers for the in-app updater
+        env:
+          FUTUREBOARD_UPDATE_SIGNING_KEY: ${{ secrets.FUTUREBOARD_UPDATE_SIGNING_KEY }}
+          FUTUREBOARD_UPDATE_PUBLIC_KEY: ${{ secrets.FUTUREBOARD_UPDATE_PUBLIC_KEY }}
+        run: bash .github/workflows/sign-update-assets.sh dist
 
       - name: List release assets
         run: ls -lh dist/
@@ -100,7 +123,8 @@ jobs:
       # needs `x86_64` + `.appimage`, and macOS ranks `macos-<arch>` above
       # `macos-universal` and refuses the other architecture outright. A renamed
       # or missing bundle silently makes the release un-updatable for a whole
-      # platform, so fail here instead.
+      # platform, so fail here instead. Each one also needs its `<asset>.sig`
+      # (#339): without it the updater skips the release entirely.
       - name: Verify updater can resolve every platform asset
         run: |
           set -euo pipefail
@@ -122,8 +146,11 @@ jobs:
             elif [[ "${matches[0]}" != *"$APP_VERSION"* ]]; then
               echo "::error::$label asset ${matches[0]} is not version $APP_VERSION"
               fail=1
+            elif [ ! -s "${matches[0]}.sig" ]; then
+              echo "::error::$label asset ${matches[0]} has no signature ${matches[0]}.sig"
+              fail=1
             else
-              echo "$label: ${matches[0]}"
+              echo "$label: ${matches[0]} (+ .sig)"
             fi
           }
           check "windows"         "*setup*.exe"

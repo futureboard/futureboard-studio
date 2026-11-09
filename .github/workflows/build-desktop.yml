@@ -23,6 +23,17 @@ on:
         type: string
         required: false
         default: ""
+      require-update-key:
+        description: Fail unless FUTUREBOARD_UPDATE_PUBLIC_KEY is set. Release Build sets it, so no release ships unable to update.
+        type: boolean
+        required: false
+        default: false
+    secrets:
+      # The updater's Ed25519 public key (64 hex chars), baked in at compile
+      # time (apps/native/studio/src/updater.rs, #268). Without it a build
+      # reports updates as unavailable and never offers one (#339).
+      FUTUREBOARD_UPDATE_PUBLIC_KEY:
+        required: false
     outputs:
       app-version:
         description: Version the artifacts were built with.
@@ -61,6 +72,30 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "App version: $VERSION"
 
+      # #339: the updater only offers installers signed by the key baked in at
+      # build time, and a build without one says "updates are unavailable".
+      # Checked here, before an hour of building, rather than after.
+      - name: Check the update signing public key
+        env:
+          UPDATE_PUBLIC_KEY: ${{ secrets.FUTUREBOARD_UPDATE_PUBLIC_KEY }}
+          REQUIRE_UPDATE_KEY: ${{ inputs.require-update-key }}
+        run: |
+          set -euo pipefail
+          key="$(printf '%s' "${UPDATE_PUBLIC_KEY}" | tr -d '[:space:]')"
+          if [ -z "$key" ]; then
+            if [ "${REQUIRE_UPDATE_KEY}" = "true" ]; then
+              echo "::error::secret FUTUREBOARD_UPDATE_PUBLIC_KEY is not set; this release would report updates as unavailable."
+              exit 1
+            fi
+            echo "::warning::secret FUTUREBOARD_UPDATE_PUBLIC_KEY is not set; this build will report updates as unavailable."
+            exit 0
+          fi
+          if ! [[ "$key" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            echo "::error::secret FUTUREBOARD_UPDATE_PUBLIC_KEY must be the Ed25519 public key as 64 hex characters."
+            exit 1
+          fi
+          echo "Update signing public key is set."
+
   build:
     name: Build Native (${{ matrix.os }})
     needs: version
@@ -77,6 +112,10 @@ jobs:
       # rather than per-run so the build script does not rerun every build.
       FUTUREBOARD_TONE3000_API_KEY: fb-release-canary-tone3000-3c9e1a7f52d4
       TONE3000_API_KEY: fb-release-canary-tone3000-3c9e1a7f52d4
+      # Public half of the update signing key, read by `option_env!` in
+      # apps/native/studio/src/updater.rs (#339). Public by construction; it
+      # is a secret only so the private and public halves live side by side.
+      FUTUREBOARD_UPDATE_PUBLIC_KEY: ${{ secrets.FUTUREBOARD_UPDATE_PUBLIC_KEY }}
       CARGO_BUILD_JOBS: 2
     strategy:
       fail-fast: false
@@ -246,6 +285,27 @@ jobs:
           Write-Output "Scanning $($files.Count) packaged files"
           & ./scripts/check-release-secret.ps1 -Canary $env:FUTUREBOARD_TONE3000_API_KEY -Path $files
           exit $LASTEXITCODE
+
+      # #339: the key reaches the binary only through the compiler's
+      # environment. Prove every staged package (each macOS architecture
+      # too) actually carries it, so a dropped env var cannot ship builds
+      # that refuse every update.
+      - name: Verify the update public key is baked in
+        if: env.FUTUREBOARD_UPDATE_PUBLIC_KEY != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          key="$(printf '%s' "$FUTUREBOARD_UPDATE_PUBLIC_KEY" | tr -d '[:space:]')"
+          fail=0
+          for package in out/release/community/*/; do
+            if grep -rqF -- "$key" "$package"; then
+              echo "update public key baked in: $package"
+            else
+              echo "::error::$package does not contain FUTUREBOARD_UPDATE_PUBLIC_KEY"
+              fail=1
+            fi
+          done
+          exit $fail
 
       # Three images per release: macos-arm64, macos-x86_64, and macos-universal.
       # Per-arch packages are already staged by the xtask passes above; the
