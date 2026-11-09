@@ -1289,6 +1289,75 @@ mod midi_edit_tests {
         assert_eq!(state.tracks[0].id, first_id);
     }
 
+    /// Deleting a bus or return from the mixer must not leave sends or
+    /// outputs pointing at a track that is gone; undo puts them back.
+    #[test]
+    fn deleting_a_return_detaches_its_sends_and_outputs_until_undone() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let track = |state: &mut TimelineState, track_type, name: &str| {
+            state.create_track(CreateTrackOptions {
+                track_type,
+                name: name.into(),
+                color: gpui::Rgba {
+                    r: 0.1,
+                    g: 0.1,
+                    b: 0.1,
+                    a: 1.0,
+                },
+                volume: 1.0,
+                pan: 0.0,
+                armed: false,
+                input_monitor: InputMonitorMode::Off,
+            })
+        };
+        let sender = track(&mut state, TrackType::Audio, "Vocal");
+        let routed = track(&mut state, TrackType::Audio, "Guitar");
+        let other = track(&mut state, TrackType::Return, "Delay");
+        let ret = track(&mut state, TrackType::Return, "Reverb");
+        state
+            .add_send_to_target(&sender, &ret)
+            .expect("send to reverb");
+        state
+            .add_send_to_target(&sender, &other)
+            .expect("send to delay");
+        state
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == routed)
+            .unwrap()
+            .routing
+            .output = TrackOutputRouting::Bus {
+            bus_id: ret.clone(),
+        };
+        let before_sends = state.find_track(&sender).unwrap().sends.clone();
+
+        let snapshot = TrackSnapshot::capture(&state, &ret).expect("snapshot");
+        let cmd = EditCommand::DeleteTrack { snapshot };
+        cmd.execute(&mut state);
+        assert!(state.find_track(&ret).is_none());
+        let sends = &state.find_track(&sender).unwrap().sends;
+        assert_eq!(sends.len(), 1, "only the send to the deleted return goes");
+        assert_eq!(sends[0].target_track_id, other);
+        assert_eq!(
+            state.find_track(&routed).unwrap().routing.output,
+            TrackOutputRouting::Main
+        );
+
+        cmd.undo(&mut state);
+        assert!(state.find_track(&ret).is_some());
+        assert_eq!(state.find_track(&sender).unwrap().sends, before_sends);
+        assert_eq!(
+            state.find_track(&routed).unwrap().routing.output,
+            TrackOutputRouting::Bus {
+                bus_id: ret.clone()
+            }
+        );
+
+        cmd.execute(&mut state);
+        assert_eq!(state.find_track(&sender).unwrap().sends.len(), 1);
+    }
+
     #[test]
     fn edit_midi_notes_velocity_roundtrips() {
         let (mut state, clip_id) = state_with_midi_clip();

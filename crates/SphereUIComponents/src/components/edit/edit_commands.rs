@@ -5,8 +5,8 @@ use std::collections::VecDeque;
 use crate::components::timeline::timeline_state::{
     AudioClipStretchState, AutomationLaneState, ClipState, GlobalLaneHeights,
     MidiArticulationEvent, MidiControllerKind, MidiControllerPoint, MidiNoteState, MidiSysExEvent,
-    SongTextEvent, TempoPoint, TimeSignaturePoint, TimelineMarkerState, TimelineRegionState,
-    TimelineState, TrackOutputRouting, TrackState, TrackTake,
+    SendSlotState, SongTextEvent, TempoPoint, TimeSignaturePoint, TimelineMarkerState,
+    TimelineRegionState, TimelineState, TrackOutputRouting, TrackState, TrackTake,
 };
 use sphere_midi_service::mpe::MpeTrackConfiguration;
 
@@ -150,11 +150,35 @@ pub struct TrackSnapshot {
     /// an undone delete puts them back inside it (deleting a folder moves its
     /// members up a level).
     pub members: Vec<(String, Option<String>, TrackOutputRouting)>,
+    /// For a bus or return: every other track that sends to it or outputs
+    /// to it, with that output and those sends as they were. Deleting the
+    /// track detaches them (sends to it removed, outputs back to Main) so no
+    /// route points at a track that is gone; undo puts them back.
+    pub routed_here: Vec<(String, TrackOutputRouting, Vec<SendSlotState>)>,
 }
 
 impl TrackSnapshot {
     pub fn capture(state: &TimelineState, track_id: &str) -> Option<Self> {
         let index = state.tracks.iter().position(|track| track.id == track_id)?;
+        let routed_here = state
+            .tracks
+            .iter()
+            .filter(|track| {
+                track.id != track_id
+                    && (track.routing.output.targets_bus(track_id)
+                        || track
+                            .sends
+                            .iter()
+                            .any(|send| send.target_track_id == track_id))
+            })
+            .map(|track| {
+                (
+                    track.id.clone(),
+                    track.routing.output.clone(),
+                    track.sends.clone(),
+                )
+            })
+            .collect();
         let members = state
             .tracks
             .iter()
@@ -171,6 +195,7 @@ impl TrackSnapshot {
             index,
             track: state.tracks[index].clone(),
             members,
+            routed_here,
         })
     }
 }
@@ -984,7 +1009,16 @@ impl EditCommand {
                     .unwrap_or_default();
             }
             EditCommand::DeleteTrack { snapshot } => {
-                state.delete_track(&snapshot.track.id);
+                let deleted = snapshot.track.id.as_str();
+                state.delete_track(deleted);
+                for (id, _, _) in &snapshot.routed_here {
+                    if let Some(track) = state.tracks.iter_mut().find(|track| track.id == *id) {
+                        if track.routing.output.targets_bus(deleted) {
+                            track.routing.output = TrackOutputRouting::Main;
+                        }
+                        track.sends.retain(|send| send.target_track_id != deleted);
+                    }
+                }
             }
             EditCommand::CreateMidiNote { clip_id, note } => {
                 if let Some(notes) = state.midi_clip_notes_mut(clip_id) {
@@ -2412,6 +2446,12 @@ fn restore_track_snapshot(state: &mut TimelineState, snapshot: &TrackSnapshot) {
         if let Some(member) = state.tracks.iter_mut().find(|track| track.id == *id) {
             member.parent_group_id = parent.clone();
             member.routing.output = output.clone();
+        }
+    }
+    for (id, output, sends) in &snapshot.routed_here {
+        if let Some(track) = state.tracks.iter_mut().find(|track| track.id == *id) {
+            track.routing.output = output.clone();
+            track.sends = sends.clone();
         }
     }
     state.selection.selected_track_id = Some(snapshot.track.id.clone());

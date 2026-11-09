@@ -84,6 +84,11 @@ pub enum TrackOutputRouting {
 }
 
 impl TrackOutputRouting {
+    /// Whether this output feeds the bus, return or folder `track_id`.
+    pub fn targets_bus(&self, track_id: &str) -> bool {
+        matches!(self, Self::Bus { bus_id } if bus_id == track_id)
+    }
+
     pub fn label(&self) -> String {
         match self {
             Self::Main => "Main".to_string(),

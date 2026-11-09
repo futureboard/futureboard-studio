@@ -208,6 +208,10 @@ impl StudioLayout {
                         !shown,
                     ));
                 }
+                // Close the group: a native menu nests every row up to the
+                // next separator into the "Automation" submenu, which hid the
+                // Delete Track row callers append after these entries.
+                entries.push(ContextMenuEntry::Separator);
             }
         }
         entries
