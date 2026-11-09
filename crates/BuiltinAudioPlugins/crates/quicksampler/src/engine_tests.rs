@@ -183,6 +183,38 @@ fn the_sustain_pedal_holds_released_notes_until_it_lifts() {
 }
 
 #[test]
+fn reset_all_controllers_releases_the_sustain_pedal() {
+    let mut sampler = QuickSampler::new(SR, Some(sine(440.0, 1.0)), params());
+    // 1. Hold sustain pedal and play notes, releasing one key so it is sustained by pedal.
+    sampler.controller(0, 64, 127);
+    sampler.note_on(0, 60, 127);
+    sampler.note_off(0, 60);
+    sampler.note_on(0, 64, 127);
+    let _ = render(&mut sampler, 480);
+    assert_eq!(sampler.active_voice_count(), 2);
+
+    // 2. CC121 (Reset All Controllers) on channel 0 resets sustain pedal.
+    sampler.controller(0, 121, 0);
+    let _ = render(&mut sampler, 480);
+    // Note 60 was released while pedal was down; CC121 releases it.
+    // Note 64's key was still held, so it remains active.
+    assert_eq!(sampler.active_voice_count(), 1);
+
+    // 3. Release note 64's key: since pedal is no longer down, it releases immediately.
+    sampler.note_off(0, 64);
+    let _ = render(&mut sampler, 480);
+    assert_eq!(sampler.active_voice_count(), 0);
+
+    // Play a new short note: note off should not be held.
+    sampler.note_on(0, 67, 127);
+    let _ = render(&mut sampler, 480);
+    assert_eq!(sampler.active_voice_count(), 1);
+    sampler.note_off(0, 67);
+    let _ = render(&mut sampler, 480);
+    assert_eq!(sampler.active_voice_count(), 0);
+}
+
+#[test]
 fn velocity_scales_the_level_by_its_amount() {
     let peak = |velocity: u8, amount: f32| {
         let p = QuickSamplerParams {

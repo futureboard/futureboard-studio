@@ -293,6 +293,78 @@ fn the_sustain_pedal_holds_released_notes() {
 }
 
 #[test]
+fn short_note_during_voice_stealing_respects_sustain_pedal() {
+    let mut dsp = synth(Params {
+        release_ms: 20.0,
+        ..default_params()
+    });
+    // 1. Poly mode with sustain pedal down.
+    dsp.midi(0xb0, 64, 127);
+
+    // 2. Play enough notes to use up all 16 voices, releasing keys so they are held by pedal.
+    for note in 40..56 {
+        dsp.note_on(note, 100);
+        dsp.note_off(note);
+    }
+    render(&mut dsp, 480);
+    assert_eq!(dsp.active_voices(), 16);
+
+    // 3. Send a staccato note shorter than 3 ms (e.g. 1 ms = 48 samples at 48kHz).
+    dsp.note_on(56, 100);
+    render(&mut dsp, 48);
+    dsp.note_off(56);
+
+    // Render past the voice stealing fade (~3 ms) and release time (20 ms = 960 samples).
+    render(&mut dsp, 9_600);
+
+    // Expected: note 56 is held by the sustain pedal, so all 16 voices are active.
+    assert_eq!(dsp.active_voices(), 16);
+    assert!(
+        dsp.voices
+            .iter()
+            .any(|v| v.active && v.note == 56 && v.sustained),
+        "note 56 must be active and sustained"
+    );
+
+    // Lifting the sustain pedal releases the notes.
+    dsp.midi(0xb0, 64, 0);
+    render(&mut dsp, 9_600);
+    assert_eq!(dsp.active_voices(), 0);
+}
+
+#[test]
+fn pedal_lift_during_voice_stealing_releases_pending_note() {
+    let mut dsp = synth(Params {
+        release_ms: 20.0,
+        ..default_params()
+    });
+    // 1. Poly mode with sustain pedal down.
+    dsp.midi(0xb0, 64, 127);
+
+    // 2. Play enough notes to use up all 16 voices.
+    for note in 40..56 {
+        dsp.note_on(note, 100);
+        dsp.note_off(note);
+    }
+    render(&mut dsp, 480);
+    assert_eq!(dsp.active_voices(), 16);
+
+    // 3. Send a staccato note shorter than 3 ms during steal fade.
+    dsp.note_on(56, 100);
+    render(&mut dsp, 48);
+    dsp.note_off(56);
+
+    // 4. Lift pedal while note 56 is still pending (steal fade is ~144 samples).
+    dsp.midi(0xb0, 64, 0);
+
+    // 5. Render past steal fade and release time.
+    render(&mut dsp, 9_600);
+
+    // All notes should have released to 0.
+    assert_eq!(dsp.active_voices(), 0);
+}
+
+#[test]
 fn switching_off_fades_rather_than_cuts() {
     let mut dsp = synth(bare(Wavetable::ClassicSine));
     dsp.note_on(57, 127);
