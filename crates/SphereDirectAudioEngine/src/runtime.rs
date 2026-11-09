@@ -5645,7 +5645,10 @@ impl RuntimeProject {
                 std::mem::swap(&mut insert.params, new_params);
             }
             if let Some(ref mut new_dsp) = change.dsp {
-                std::mem::swap(&mut insert.dsp, new_dsp);
+                // The control thread's copy never runs audio: adopt its
+                // settings but keep this insert's running filter memory, or
+                // every edit (even Output or Mix) resets the EQ (#366).
+                insert.dsp.adopt_settings(new_dsp);
             }
         }
 
