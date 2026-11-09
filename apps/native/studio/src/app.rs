@@ -592,11 +592,12 @@ fn handle_deep_link(url: &str, cx: &mut App) {
     }
 }
 
-/// Open the Audio Jam window in `studio` and join what `link` names.
+/// Open the Audio Jam window in `studio` and hold what `link` names for the
+/// user to confirm there (#292): opening a link never joins or sends by itself.
 ///
 /// Opening the window is what installs the jam controller, so it happens
-/// first and synchronously; the join is a network round trip and runs on the
-/// background pool exactly as a pasted link does.
+/// first and synchronously; looking the room up is a network round trip and
+/// runs on the background pool.
 fn open_jam_from_link(studio: WindowHandle<StudioLayout>, link: String, cx: &mut App) {
     let opened = studio.update(cx, |layout, _window, cx| {
         layout.dispatch_command_id("window:audio-jam", cx);
@@ -607,11 +608,13 @@ fn open_jam_from_link(studio: WindowHandle<StudioLayout>, link: String, cx: &mut
     }
     cx.background_executor()
         .spawn(async move {
-            if let Err(error) =
-                sphere_ui_components::jam::run_action(|controller| controller.join_with_link(&link))
-            {
+            if let Err(error) = sphere_ui_components::jam::run_action(|controller| {
+                // Hold the link for the Jam window to confirm (#292): opening a
+                // link must not join the room or start sending audio by itself.
+                controller.request_join_from_link(&link)
+            }) {
                 boot::log(&format!(
-                    "fbrd jam link: join failed: {}",
+                    "fbrd jam link: link not understood: {}",
                     error.user_message()
                 ));
             }

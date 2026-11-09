@@ -440,8 +440,17 @@ fn deliver(
             if header.has(packet::FLAG_SILENCE) {
                 // A transmit gap: the payload is empty and the receiver must
                 // insert silence rather than conceal a loss it did not have.
+                // The header's counts are untrusted: a gap must agree with the
+                // negotiated channel count and may never describe more audio
+                // than a real packet of this format could carry.
+                if stream.format.channels > 0 && channels != stream.format.channels as usize {
+                    return;
+                }
+                let Some(samples) = silence_samples(header.frames, channels, format) else {
+                    return;
+                };
                 decoded.clear();
-                decoded.resize(header.frames as usize * channels, 0.0);
+                decoded.resize(samples, 0.0);
             } else {
                 packet::pcm_to_f32(payload, format, channels, decoded);
             }
@@ -488,6 +497,22 @@ fn deliver(
         sink.stream_ended(&stream.id);
     }
     record_stats(shared, &stream.id, JitterStats::default(), Some(peak));
+}
+
+/// Interleaved sample count a silence packet may expand to, or `None` when its
+/// header describes more audio than one media packet of `format` could carry.
+///
+/// A silence packet has no payload, so nothing but this check stops a header
+/// claiming 65 535 frames of 255 channels from making every listener allocate
+/// and process ~16.7 million samples on the receive thread.
+fn silence_samples(frames: u16, channels: usize, format: SampleFormat) -> Option<usize> {
+    let bytes_per_sample = format.bytes_per_sample();
+    if channels == 0 || bytes_per_sample == 0 {
+        return None;
+    }
+    let samples = (frames as usize).checked_mul(channels)?;
+    let max_samples = (packet::MAX_MEDIA_FRAME - packet::HEADER_SIZE) / bytes_per_sample;
+    (samples <= max_samples).then_some(samples)
 }
 
 /// Merge live counters for one stream.
@@ -641,6 +666,116 @@ mod tests {
         assert_eq!(header.frames, 128);
         assert!(header.has(packet::FLAG_MARKER));
         assert_eq!(header.capture_timestamp, 20_000_000);
+    }
+
+    /// Records what reached the sink: (frames, channels, samples) per block.
+    #[derive(Default)]
+    struct RecordingSink(Mutex<Vec<(usize, usize, usize)>>);
+
+    impl JamAudioSink for RecordingSink {
+        fn deliver(&self, _stream: &StreamId, frame: JamAudioFrame<'_>) {
+            self.0.lock().expect("sink lock").push((
+                frame.frames,
+                frame.channels,
+                frame.samples.len(),
+            ));
+        }
+        fn stream_ended(&self, _stream: &StreamId) {}
+    }
+
+    fn pcm_stream(channels: i32) -> SubscribedStream {
+        SubscribedStream {
+            id: StreamId::new("str_1"),
+            format: AudioFormat {
+                codec: AudioCodec::Pcm,
+                sample_rate: 48_000,
+                channels,
+                format: SampleFormat::F32Le,
+                bitrate: 0,
+                frame_samples: 128,
+            },
+            latency: LatencyMetadata::default(),
+        }
+    }
+
+    fn silence_header(frames: u16, channels: u8) -> AudioPacketHeader {
+        let mut header = outbound_header(1, 1, 1, 0, 0, 0, 1, false).expect("valid");
+        header.flags = packet::FLAG_SILENCE;
+        header.frames = frames;
+        header.channels = channels;
+        header
+    }
+
+    #[test]
+    fn an_oversized_silence_header_is_dropped_without_a_large_allocation() {
+        let recording = Arc::new(RecordingSink::default());
+        let sink: Arc<dyn JamAudioSink> = recording.clone();
+        let shared = MediaShared::new();
+        let stream = pcm_stream(2);
+        let mut decoded = Vec::new();
+
+        // The worst case the header can describe: 65 535 frames x 255 channels.
+        for (frames, channels) in [(u16::MAX, u8::MAX), (u16::MAX, 2), (8_192, 2), (1, u8::MAX)] {
+            let header = silence_header(frames, channels);
+            deliver(&stream, &header, &[], &sink, &mut decoded, &shared, 4);
+        }
+        assert!(recording.0.lock().expect("sink lock").is_empty());
+        assert!(
+            decoded.capacity() * std::mem::size_of::<f32>() <= packet::MAX_MEDIA_FRAME,
+            "a rejected silence header grew the decode buffer to {} samples",
+            decoded.capacity()
+        );
+    }
+
+    #[test]
+    fn a_silence_header_within_the_packet_limit_still_inserts_silence() {
+        let recording = Arc::new(RecordingSink::default());
+        let sink: Arc<dyn JamAudioSink> = recording.clone();
+        let shared = MediaShared::new();
+        let stream = pcm_stream(2);
+        let mut decoded = Vec::new();
+
+        deliver(
+            &stream,
+            &silence_header(128, 2),
+            &[],
+            &sink,
+            &mut decoded,
+            &shared,
+            4,
+        );
+        // A header without a channel count falls back to the negotiated format.
+        deliver(
+            &stream,
+            &silence_header(128, 0),
+            &[],
+            &sink,
+            &mut decoded,
+            &shared,
+            4,
+        );
+        assert_eq!(
+            *recording.0.lock().expect("sink lock"),
+            vec![(128, 2, 256), (128, 2, 256)]
+        );
+        assert!(decoded.iter().all(|sample| *sample == 0.0));
+    }
+
+    #[test]
+    fn silence_samples_follow_the_media_frame_bound() {
+        let max_f32 = (packet::MAX_MEDIA_FRAME - packet::HEADER_SIZE) / 4;
+        assert_eq!(silence_samples(128, 2, SampleFormat::F32Le), Some(256));
+        assert_eq!(
+            silence_samples((max_f32 / 2) as u16, 2, SampleFormat::F32Le),
+            Some(max_f32 / 2 * 2)
+        );
+        assert_eq!(
+            silence_samples((max_f32 / 2 + 1) as u16, 2, SampleFormat::F32Le),
+            None
+        );
+        assert_eq!(silence_samples(u16::MAX, 255, SampleFormat::S16Le), None);
+        assert_eq!(silence_samples(128, 0, SampleFormat::F32Le), None);
+        assert_eq!(silence_samples(128, 2, SampleFormat::None), None);
     }
 
     #[test]
