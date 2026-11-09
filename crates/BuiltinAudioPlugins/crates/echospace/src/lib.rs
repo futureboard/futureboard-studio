@@ -24,7 +24,7 @@ use biquad::{Biquad, Coefficients, DirectForm1};
 use builtin_dsp_core::delay::{Allpass, DelayRing, Smoothed, smoothing_step};
 use builtin_dsp_core::{
     ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, biquad_response_db, clamp,
-    db_to_linear, make_eq_coefficients,
+    db_to_linear, flush_denormal, make_eq_coefficients,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1288,14 +1288,18 @@ impl Dsp {
             self.lines[side].ring.push(saturate(x, drive));
         }
 
-        // Duck: the repeats step back while the input plays.
-        let level = left.abs().max(right.abs());
+        // Duck: the repeats step back while the input plays. The follower's
+        // release decays geometrically in silence and would otherwise settle
+        // in the denormal range (the plug-in host's audio thread does not
+        // enable flush-to-zero), so the input and the state snap to zero
+        // below the shared floor.
+        let level = flush_denormal(left.abs().max(right.abs()));
         let rate = if level > self.duck_env {
             self.duck_attack
         } else {
             self.duck_release
         };
-        self.duck_env += (level - self.duck_env) * rate;
+        self.duck_env = flush_denormal(self.duck_env + (level - self.duck_env) * rate);
         let duck = 1.0 / (1.0 + self.duck_depth.next(smooth) * self.duck_env);
 
         let mid = (wet[0] + wet[1]) * FRAC_1_SQRT_2 * self.mid_gain.next(smooth);
@@ -1691,6 +1695,32 @@ mod tests {
             ducked_after > open_after * 0.7,
             "{ducked_after} vs {open_after}"
         );
+    }
+
+    /// #361: the ducking follower's release decays geometrically in silence.
+    /// Unflushed, it reaches the denormal range (below ~1.2e-38) after about
+    /// 630 k samples at 48 kHz and stays there; flushed, it is exactly zero,
+    /// and a denormal input cannot re-seed it.
+    #[test]
+    fn silence_flushes_the_duck_envelope_to_zero() {
+        let mut params = plain(DelayMode::Stereo);
+        params.duck = 100.0;
+        let mut dsp = dsp_with(params);
+        for n in 0..4_800 {
+            let x = (n as f32 * TAU * 200.0 / SR).sin() * 0.8;
+            let _ = dsp.process_stereo(x, x);
+        }
+        assert!(
+            dsp.duck_env > 0.1,
+            "follower did not rise: {}",
+            dsp.duck_env
+        );
+        for _ in 0..700_000 {
+            let _ = dsp.process_stereo(0.0, 0.0);
+        }
+        assert_eq!(dsp.duck_env, 0.0);
+        let _ = dsp.process_stereo(1.0e-40, -1.0e-40);
+        assert_eq!(dsp.duck_env, 0.0);
     }
 
     #[test]
