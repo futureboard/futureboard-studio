@@ -54,8 +54,9 @@ use crate::components::sidebar::BrowserDragItem;
 use crate::components::timeline::timeline_state::{
     is_vsti_output_child_track_id, volume, vsti_output_bus_flat_range,
     vsti_output_child_channels_for_bus_layout, vsti_output_child_insert_id, GroupTree,
-    InsertLoadStatus, InsertSlotState, ListenMode, MasterBusState, MonitorBusState, SendSlotState,
-    TrackOutputRouting, TrackState, TrackType, MASTER_TRACK_ID,
+    InsertLoadStatus, InsertPluginFormat, InsertSignalBus, InsertSlotState, ListenMode,
+    MasterBusState, MonitorBusState, SendSlotState, TrackOutputRouting, TrackState, TrackType,
+    MASTER_TRACK_ID,
 };
 use crate::components::timeline::vu_meter::meter_surface;
 use crate::i18n::I18n;
@@ -801,6 +802,7 @@ fn insert_chip(
     dnd: Option<(FxSlotDrag, InsertDropTarget)>,
     callbacks: &MixerCallbacks,
     base: gpui::Rgba,
+    wdw_live: bool,
 ) -> impl IntoElement {
     let track_id_owned = track_id.to_string();
     let slot_id = slot.id.clone();
@@ -833,6 +835,8 @@ fn insert_chip(
     let preset_track = track_id_owned.clone();
     let preset_slot = insert_index;
 
+    let bus_track = track_id_owned.clone();
+    let bus_slot = slot_id.clone();
     let open_target = (track_id_owned, insert_index, slot_id);
 
     // The glyphs forward slot drops to the chip, so a drop released over one
@@ -897,6 +901,50 @@ fn insert_chip(
                 .block_mouse_except_scroll(),
         ))
         .child(div().flex_1().min_w(px(0.0)).truncate().child(display))
+        .when(
+            wdw_live && slot.plugin_format == Some(InsertPluginFormat::Vst3),
+            |row| {
+                let on_bus = callbacks.on_set_insert_bus.clone();
+                let track_id = bus_track.clone();
+                let slot_id = bus_slot.clone();
+                let current = slot.signal_bus;
+                let next = match current {
+                    InsertSignalBus::Main => InsertSignalBus::Wdw,
+                    InsertSignalBus::Wdw => InsertSignalBus::Main,
+                };
+                row.child(forward_drops(
+                    div()
+                        .id(gpui::SharedString::from(format!("insert-bus-{}", slot_id)))
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .justify_center()
+                        .w(px(16.0))
+                        .h_full()
+                        .text_size(px(type_scale::LABEL))
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_color(if current == InsertSignalBus::Wdw {
+                            Colors::state_monitor()
+                        } else {
+                            Colors::text_faint()
+                        })
+                        .tooltip(crate::components::controls::fb_tooltip(format!(
+                            "Bus: {} — click for {}",
+                            current.label(),
+                            next.label()
+                        )))
+                        .child(if current == InsertSignalBus::Wdw {
+                            "W"
+                        } else {
+                            "M"
+                        })
+                        .on_click(move |_e, w, cx| {
+                            on_bus(&(track_id.clone(), slot_id.clone(), next), w, cx);
+                        })
+                        .block_mouse_except_scroll(),
+                ))
+            },
+        )
         // Remove ×.
         .child(forward_drops(
             div()
@@ -1098,6 +1146,7 @@ fn inserts_section(
                 ),
             )
         });
+        let wdw_live = track.sends.iter().any(|send| send.wdw && send.enabled);
         chips = chips.child(insert_chip(
             &track.id,
             insert_index,
@@ -1105,6 +1154,7 @@ fn inserts_section(
             dnd,
             callbacks,
             base,
+            wdw_live,
         ));
     }
     let end = InsertDropTarget::for_track(
@@ -1243,6 +1293,7 @@ fn master_inserts_section(
             Some(dnd),
             callbacks,
             base,
+            false,
         ));
     }
     let end = InsertDropTarget::for_master(

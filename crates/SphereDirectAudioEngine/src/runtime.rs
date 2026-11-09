@@ -1694,6 +1694,22 @@ pub struct RuntimeInsert {
     /// multi-out instrument's child strips are fed from right here, so their
     /// compensation is planned from it.
     pub chain_latency_samples: u32,
+    /// `0` processes in the owning track's chain. `1` is the wet/dry/wet
+    /// return: the chain skips it, and the return named by the split send
+    /// runs it. Resolved from `params["signalBus"]` when the graph is built.
+    pub signal_bus: u8,
+}
+
+/// Main insert chain. The audio callback compares this, never the param string.
+pub(crate) const SIGNAL_BUS_MAIN: u8 = 0;
+/// Wet/dry/wet send/return. See [`RuntimeInsert::signal_bus`].
+pub(crate) const SIGNAL_BUS_WDW: u8 = 1;
+
+fn signal_bus_from_params(params: &HashMap<String, Value>) -> u8 {
+    match params.get("signalBus").and_then(Value::as_str) {
+        Some(bus) if bus.eq_ignore_ascii_case("wdw") => SIGNAL_BUS_WDW,
+        _ => SIGNAL_BUS_MAIN,
+    }
 }
 
 /// One multi-out route: a 1-based plugin output channel pair (`channel_l`,
@@ -1814,6 +1830,9 @@ pub struct RuntimeSend {
     pub enabled: bool,
     /// Pre-fader tap (Phase 3). See [`EngineSendSnapshot::pre_fader`].
     pub pre_fader: bool,
+    /// Wet/dry/wet split. The return runs the source inserts whose
+    /// [`RuntimeInsert::signal_bus`] is [`SIGNAL_BUS_WDW`].
+    pub wdw: bool,
     /// The owning track's Send Level automation lane for this send, resolved
     /// to an index into its `automation_lanes` off the audio thread.
     pub level_lane: Option<usize>,
@@ -3797,6 +3816,7 @@ impl RuntimeProject {
                     vsti_output_children: vsti_output_children_from_params(&insert.params),
                     scratch_multi: Vec::new(),
                     chain_latency_samples: 0,
+                    signal_bus: signal_bus_from_params(&insert.params),
                 });
             }
 
@@ -3877,6 +3897,7 @@ impl RuntimeProject {
                         level: send.level.clamp(0.0, 2.0),
                         enabled: send.enabled,
                         pre_fader: send.pre_fader,
+                        wdw: send.wdw,
                         level_lane: None,
                         enabled_lane: None,
                         pdc: Default::default(),
@@ -8851,6 +8872,7 @@ mod midi_tests {
             level: 1.0,
             enabled: true,
             pre_fader: false,
+            wdw: false,
         }];
         let runtime = automation_runtime(track);
         let src = runtime
@@ -9044,6 +9066,7 @@ mod midi_tests {
                 vsti_output_children: Vec::new(),
                 scratch_multi: Vec::new(),
                 chain_latency_samples: 0,
+                signal_bus: 0,
             }],
             sends: Vec::new(),
             automation_lanes: Vec::new(),

@@ -78,6 +78,7 @@ fn send(target: &str, level: f32, pre_fader: bool) -> EngineSendSnapshot {
         level,
         enabled: true,
         pre_fader,
+        wdw: false,
     }
 }
 
@@ -273,6 +274,111 @@ fn routed_output_peak(target: Option<(&str, &str)>, from_clip: bool) -> f32 {
             .fold(peak, |peak, sample| peak.max(sample.abs()));
     }
     peak
+}
+
+/// Peak meters of the source and the wet/dry/wet return after a constant
+/// monitored input has run through a −20 dB gain. `on_wdw_bus` puts that
+/// gain on the split; otherwise it stays in the source chain. The send
+/// itself is the split in both cases, so the only thing that moves is
+/// which buffer the gain processes.
+fn wdw_bus_peaks(on_wdw_bus: bool) -> (f32, f32, f32) {
+    let mut source = track("audio-0", "audio");
+    let mut insert = gain_insert("gain", -20.0);
+    if on_wdw_bus {
+        insert
+            .params
+            .insert("signalBus".to_string(), serde_json::json!("wdw"));
+    }
+    source.inserts = vec![insert];
+    source.sends = vec![EngineSendSnapshot {
+        id: "send-wdw".to_string(),
+        return_track_id: "wdw".to_string(),
+        level: 1.0,
+        enabled: true,
+        pre_fader: false,
+        wdw: true,
+    }];
+    let snapshot = EngineProjectSnapshot {
+        spatial: Default::default(),
+        project_id: "wdw-bus".to_string(),
+        project_root: None,
+        preferred_input_device: None,
+        bpm: 120.0,
+        tempo_points: Vec::new(),
+        time_signature: [4, 4],
+        sample_rate: SAMPLE_RATE,
+        tracks: vec![source, track("wdw", "return"), track("master", "master")],
+        clips: Vec::new(),
+        midi_clips: Vec::new(),
+        pdc_enabled: true,
+        latency_graph_version: 1,
+        routing: EngineRoutingSnapshot {
+            master_output_device: None,
+            sample_rate: SAMPLE_RATE,
+            buffer_size: 256,
+        },
+    };
+    let mut runtime =
+        RuntimeProject::build(&snapshot, SAMPLE_RATE, &mut HashMap::new(), None, true)
+            .expect("wdw bus runtime");
+    let input_l = vec![0.5f32; FRAMES];
+    let input_r = vec![0.5f32; FRAMES];
+    let mut master_peak = 0.0f32;
+    for block in 0..8 {
+        let mut output = vec![0.0f32; FRAMES * CHANNELS];
+        render_project_block_interleaved_with_live_input(
+            &mut runtime,
+            (block * FRAMES) as u64,
+            1.0,
+            &mut output,
+            CHANNELS,
+            true,
+            4,
+            4,
+            None,
+            &input_l,
+            &input_r,
+        );
+        master_peak = output
+            .iter()
+            .fold(master_peak, |peak, sample| peak.max(sample.abs()));
+    }
+    let meter = |id: &str| {
+        runtime
+            .tracks
+            .iter()
+            .find(|track| track.id == id)
+            .map(|track| track.meter_peak_l.max(track.meter_peak_r))
+            .unwrap_or(0.0)
+    };
+    (meter("audio-0"), meter("wdw"), master_peak)
+}
+
+#[test]
+fn a_wdw_insert_is_summed_on_the_return_and_a_main_insert_stays_on_the_source() {
+    let (source, ret, master) = wdw_bus_peaks(false);
+    assert!(
+        (source - 0.05).abs() < 1e-3 && (ret - 0.05).abs() < 1e-3,
+        "gain on the main bus should reach the source and the return: source={source} return={ret}"
+    );
+    assert!(
+        (master - 0.10).abs() < 1e-3,
+        "dry plus the copy on the return should sum near 0.10, got {master}"
+    );
+
+    let (source, ret, master) = wdw_bus_peaks(true);
+    assert!(
+        (source - 0.5).abs() < 1e-3,
+        "the gain must leave the source chain: source={source}"
+    );
+    assert!(
+        (ret - 0.05).abs() < 1e-3,
+        "the same gain must run on the return: return={ret}"
+    );
+    assert!(
+        (master - 0.55).abs() < 1e-3,
+        "dry source plus the gained return should sum near 0.55, got {master}"
+    );
 }
 
 #[test]

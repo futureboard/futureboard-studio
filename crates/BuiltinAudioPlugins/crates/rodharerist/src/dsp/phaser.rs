@@ -84,6 +84,12 @@ pub(super) enum PhaserVoice {
     /// "Wide Vibe" — real linked stereo spread (unlike every mono voice
     /// above), staggered corners, a lush width-forward swirl.
     WideVibe,
+    /// "Chainsaw Phase" — six stages, hard feedback, a fast narrow sweep.
+    Chainsaw,
+    /// "Panic Vibe" — staggered corners and a lopsided snap.
+    Panic,
+    /// "Shred Phase" — twelve stages across the mid.
+    Shred,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -242,6 +248,42 @@ impl PhaserVoice {
                 skew: 1.30,
                 spread: 0.22,
                 rate_scale: 0.60,
+                max_blend: MAX_BLEND,
+                mono: false,
+            },
+            Self::Chainsaw => Profile {
+                stages: 6,
+                feedback: 0.72,
+                sweep_lo: 700.0,
+                sweep_hi: 4_200.0,
+                stagger: 1.0,
+                skew: 1.05,
+                spread: 0.0,
+                rate_scale: 1.8,
+                max_blend: MAX_BLEND,
+                mono: true,
+            },
+            Self::Panic => Profile {
+                stages: 4,
+                feedback: 0.62,
+                sweep_lo: 120.0,
+                sweep_hi: 3_200.0,
+                stagger: 1.85,
+                skew: 2.4,
+                spread: 0.0,
+                rate_scale: 1.6,
+                max_blend: MAX_BLEND,
+                mono: true,
+            },
+            Self::Shred => Profile {
+                stages: 12,
+                feedback: 0.58,
+                sweep_lo: 400.0,
+                sweep_hi: 3_400.0,
+                stagger: 1.04,
+                skew: 1.0,
+                spread: 0.04,
+                rate_scale: 1.45,
                 max_blend: MAX_BLEND,
                 mono: false,
             },

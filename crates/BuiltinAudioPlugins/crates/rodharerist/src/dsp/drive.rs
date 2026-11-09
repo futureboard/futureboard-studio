@@ -167,6 +167,37 @@ impl DiodeVoicing {
             DriveModel::CleanPush => {
                 Self::new(1.0, 1.0, 0.420, 0.420, 2.0e-6, 2.0e-6, 16_000.0, 30.0)
             }
+            // Hard knee, fast junctions, a high corner so the low end is
+            // already gone before the clip. The scoop is the post EQ.
+            DriveModel::RazorSaw => {
+                Self::new(0.55, 0.55, 0.028, 0.028, 8.0e-8, 8.0e-8, 9_000.0, 280.0)
+            }
+            // The corner sits high: low strings stay near unity and never
+            // reach the diodes. What clips is tight.
+            DriveModel::DjentClamp => {
+                Self::new(0.70, 0.72, 0.034, 0.032, 1.2e-7, 1.4e-7, 8_500.0, 420.0)
+            }
+            DriveModel::Chainsaw => {
+                Self::new(0.48, 1.40, 0.022, 0.090, 6.0e-8, 3.0e-7, 7_500.0, 900.0)
+            }
+            // Everything reaches the diodes, and they leave slowly.
+            DriveModel::DoomWall => {
+                Self::new(0.80, 1.20, 0.040, 0.038, 9.0e-7, 1.1e-6, 2_400.0, 35.0)
+            }
+            DriveModel::MidSpike => {
+                Self::new(0.90, 0.92, 0.048, 0.046, 1.6e-7, 1.8e-7, 5_500.0, 700.0)
+            }
+            DriveModel::IcePick => {
+                Self::new(0.62, 0.64, 0.030, 0.030, 5.0e-8, 6.0e-8, 14_000.0, 1_800.0)
+            }
+            // The two junctions disagree harder than Sputter Fuzz, and the
+            // corner is higher so the choke is tighter.
+            DriveModel::GateGrind => {
+                Self::new(0.32, 1.80, 0.220, 0.040, 6.0e-6, 8.0e-8, 4_800.0, 160.0)
+            }
+            DriveModel::RedLead => {
+                Self::new(0.78, 1.05, 0.036, 0.034, 1.4e-7, 1.8e-7, 8_000.0, 240.0)
+            }
             // Dedicated-topology models never reach this table.
             _ => Self::new(1.0, 1.0, 0.075, 0.075, 2.0e-8, 2.0e-8, 12_000.0, 400.0),
         }
@@ -352,6 +383,14 @@ impl Drive {
             DriveModel::SmoothLead => (0.45 + g * 26.0, 0.14 + lvl * 0.58, 0.96),
             DriveModel::SputterFuzz => (0.30 + g * 46.0, 0.09 + lvl * 0.48, 1.0),
             DriveModel::CleanPush => (0.85 + g * 3.5, 0.35 + lvl * 0.70, 0.62),
+            DriveModel::RazorSaw => (0.30 + g * 72.0, 0.12 + lvl * 0.70, 1.0),
+            DriveModel::DjentClamp => (0.32 + g * 50.0, 0.14 + lvl * 0.66, 1.0),
+            DriveModel::Chainsaw => (0.22 + g * 84.0, 0.10 + lvl * 0.62, 1.0),
+            DriveModel::DoomWall => (0.28 + g * 66.0, 0.11 + lvl * 0.55, 1.0),
+            DriveModel::MidSpike => (0.34 + g * 44.0, 0.13 + lvl * 0.64, 1.0),
+            DriveModel::IcePick => (0.40 + g * 38.0, 0.15 + lvl * 0.68, 0.96),
+            DriveModel::GateGrind => (0.26 + g * 58.0, 0.09 + lvl * 0.50, 1.0),
+            DriveModel::RedLead => (0.30 + g * 54.0, 0.13 + lvl * 0.66, 1.0),
             // Dedicated-topology models returned above.
             _ => (1.0, 1.0, 1.0),
         };
@@ -505,6 +544,62 @@ impl Drive {
                 self.mid_boost
                     .set(make_eq_coefficients("bell", 2_000.0, 1.2, 0.5, sr));
                 let cutoff = (8_000.0 + t * 6_000.0).min(sr * 0.45);
+                self.tone_lpf
+                    .set(make_eq_coefficients("lowpass", cutoff, 0.0, 0.707, sr));
+            }
+            DriveModel::RazorSaw => {
+                self.mid_boost
+                    .set(make_eq_coefficients("bell", 750.0, -8.0, 0.7, sr));
+                let cutoff = (4_200.0 + t * 6_000.0).min(sr * 0.45);
+                self.tone_lpf
+                    .set(make_eq_coefficients("lowpass", cutoff, 0.0, 0.707, sr));
+            }
+            DriveModel::DjentClamp => {
+                self.mid_boost
+                    .set(make_eq_coefficients("bell", 1_800.0, 3.5, 0.9, sr));
+                let cutoff = (3_400.0 + t * 5_000.0).min(sr * 0.45);
+                self.tone_lpf
+                    .set(make_eq_coefficients("lowpass", cutoff, 0.0, 0.707, sr));
+            }
+            DriveModel::Chainsaw => {
+                self.mid_boost
+                    .set(make_eq_coefficients("bell", 1_600.0, 10.0, 2.4, sr));
+                let cutoff = (2_800.0 + t * 4_200.0).min(sr * 0.45);
+                self.tone_lpf
+                    .set(make_eq_coefficients("lowpass", cutoff, 0.0, 0.707, sr));
+            }
+            DriveModel::DoomWall => {
+                self.mid_boost
+                    .set(make_eq_coefficients("bell", 180.0, 6.0, 0.6, sr));
+                let cutoff = (700.0 + t * 1_600.0).min(sr * 0.45);
+                self.tone_lpf
+                    .set(make_eq_coefficients("lowpass", cutoff, 0.0, 0.707, sr));
+            }
+            DriveModel::MidSpike => {
+                self.mid_boost
+                    .set(make_eq_coefficients("bell", 1_150.0, 12.0, 2.8, sr));
+                let cutoff = (2_200.0 + t * 3_400.0).min(sr * 0.45);
+                self.tone_lpf
+                    .set(make_eq_coefficients("lowpass", cutoff, 0.0, 0.707, sr));
+            }
+            DriveModel::IcePick => {
+                self.mid_boost
+                    .set(make_eq_coefficients("bell", 450.0, -6.0, 0.8, sr));
+                let cutoff = (6_500.0 + t * 6_000.0).min(sr * 0.45);
+                self.tone_lpf
+                    .set(make_eq_coefficients("lowpass", cutoff, 0.0, 0.707, sr));
+            }
+            DriveModel::GateGrind => {
+                self.mid_boost
+                    .set(make_eq_coefficients("bell", 900.0, 4.0, 1.1, sr));
+                let cutoff = (1_800.0 + t * 2_600.0).min(sr * 0.45);
+                self.tone_lpf
+                    .set(make_eq_coefficients("lowpass", cutoff, 0.0, 0.707, sr));
+            }
+            DriveModel::RedLead => {
+                self.mid_boost
+                    .set(make_eq_coefficients("bell", 980.0, 7.0, 1.0, sr));
+                let cutoff = (3_000.0 + t * 4_400.0).min(sr * 0.45);
                 self.tone_lpf
                     .set(make_eq_coefficients("lowpass", cutoff, 0.0, 0.707, sr));
             }

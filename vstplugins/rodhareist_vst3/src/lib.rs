@@ -364,6 +364,9 @@ impl Plugin for Rodhareist {
         self.held_path = None;
         self.shared.clear_path_target();
         files::restore(&self.shared, &self.params, &self.insert_id);
+        // Titles follow the stomps in the state that just loaded. Not the
+        // audio thread: initialize runs before processing.
+        self.params.wire.refresh_host_names();
 
         self.shared
             .set_stream(sample_rate, buffer_config.max_buffer_size);

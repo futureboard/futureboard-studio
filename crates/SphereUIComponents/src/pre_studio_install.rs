@@ -67,6 +67,9 @@ pub fn run_pre_studio_session_install(
     let mut timeline_state = TimelineState::default();
     // See session_load: warning surfacing is deferred.
     let _load_warnings = apply_to_timeline(&package.project, &mut timeline_state);
+    // Same split the session load grows: one send and one return when a
+    // Rodhareist rig is in wet/dry/wet, and nothing when it is not.
+    timeline_state.sync_all_wdw_splits();
 
     let mut bridge_slot: Option<SharedPluginBridgeRuntime> = None;
     if !plugin_bridge_runtime::bridge_enabled() {

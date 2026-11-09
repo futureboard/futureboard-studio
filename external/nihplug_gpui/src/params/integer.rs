@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 
 use super::internals::ParamPtr;
+use super::name_cell::NameCell;
 use super::range::IntRange;
 use super::smoothing::{Smoother, SmoothingStyle};
 use super::{Param, ParamFlags, ParamMut};
@@ -48,7 +49,7 @@ pub struct IntParam {
     /// The distribution of the parameter's values.
     range: IntRange,
     /// The parameter's human readable display name.
-    name: String,
+    name: NameCell,
     /// The parameter value's unit, added after `value_to_string` if that is set. NIH-plug will not
     /// automatically add a space before the unit.
     unit: &'static str,
@@ -82,9 +83,9 @@ impl Debug for IntParam {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // This uses the above `Display` instance to show the value
         if self.modulated_plain_value() != self.unmodulated_plain_value() {
-            write!(f, "{}: {} (modulated)", &self.name, &self)
+            write!(f, "{}: {} (modulated)", self.name.get(), &self)
         } else {
-            write!(f, "{}: {}", &self.name, &self)
+            write!(f, "{}: {}", self.name.get(), &self)
         }
     }
 }
@@ -96,7 +97,7 @@ impl Param for IntParam {
     type Plain = i32;
 
     fn name(&self) -> &str {
-        &self.name
+        self.name.get()
     }
 
     fn unit(&self) -> &'static str {
@@ -264,12 +265,17 @@ impl IntParam {
             value_changed: None,
 
             range,
-            name: name.into(),
+            name: NameCell::new(name),
             unit: "",
             poly_modulation_id: None,
             value_to_string: None,
             string_to_value: None,
         }
+    }
+
+    /// Replace the display name a host reads from [`Param::name`].
+    pub fn set_name(&self, name: impl Into<String>) {
+        self.name.set(name);
     }
 
     /// The field's current plain value, after monophonic modulation has been applied. Equivalent to

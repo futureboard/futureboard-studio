@@ -13,7 +13,7 @@ pub mod ui;
 mod wire;
 
 pub use dsp::{
-    AmpModel, CabModel, DelayModel, DriveModel, Dsp, EqModel, IR_PARTITION_SAMPLES, IrInfo,
+    AmpModel, CabModel, CompModel, DelayModel, DriveModel, Dsp, EqModel, IR_PARTITION_SAMPLES, IrInfo,
     IrLoadError, IrLoader, Line2Mode, MAX_IR_SECONDS, MicModel, ModModel, NAM_BLOCK_SAMPLES,
     NamCaptureInfo, NamLoadError, NamLoader, PATH_SLOTS, PLUGIN_ID, Params, PreparedIrRuntime,
     PreparedNamRuntime, Retired, ReverbModel, RowSend, StageBParams, StageChannel, StageKind,

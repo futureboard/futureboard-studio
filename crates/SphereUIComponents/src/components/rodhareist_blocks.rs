@@ -9,7 +9,8 @@
 //! DSP does not route.
 
 use rodharerist::{
-    AmpModel, CabModel, DelayModel, DriveModel, EqModel, MicModel, ModModel, Params, ReverbModel,
+    AmpModel, CabModel, CompModel, DelayModel, DriveModel, EqModel, MicModel, ModModel, Params,
+    ReverbModel,
     StageChannel, StageKind, ToneEngineKind, WahModel,
 };
 
@@ -247,7 +248,14 @@ pub(crate) fn models(p: &Params, kind: StageKind) -> (Vec<ModelChoice>, Option<u
     };
     match kind {
         StageKind::Gate => fixed("Noise Gate"),
-        StageKind::Comp | StageKind::Comp2 => fixed("Studio Compressor"),
+        StageKind::Comp => (
+            choices(CompModel::ALL, "comp_model", comp_model_label),
+            position(CompModel::ALL, &p.comp_model),
+        ),
+        StageKind::Comp2 => (
+            choices(CompModel::ALL, "comp2_model", comp_model_label),
+            position(CompModel::ALL, &b.comp_model),
+        ),
         StageKind::Wah => (
             choices(WahModel::ALL, "wah_model", wah_model_label),
             position(WahModel::ALL, &p.wah_model),
@@ -554,6 +562,28 @@ pub(crate) fn drive_model_label(m: DriveModel) -> &'static str {
         SmoothLead => "Smooth Lead",
         SputterFuzz => "Sputter Fuzz",
         CleanPush => "Clean Push",
+        RazorSaw => "Razor Saw",
+        DjentClamp => "Djent Clamp",
+        Chainsaw => "Chainsaw",
+        DoomWall => "Doom Wall",
+        MidSpike => "Mid Spike",
+        IcePick => "Ice Pick",
+        GateGrind => "Gate Grind",
+        RedLead => "Red Lead",
+    }
+}
+
+pub(crate) fn comp_model_label(model: CompModel) -> &'static str {
+    match model {
+        CompModel::Studio => "Studio Compressor",
+        CompModel::Smash => "Smash Box",
+        CompModel::Brick => "Brick Limit",
+        CompModel::PickAttack => "Pick Attack",
+        CompModel::DeepPump => "Deep Pump",
+        CompModel::MidPunch => "Mid Punch",
+        CompModel::BassHold => "Bass Hold",
+        CompModel::ParallelCrush => "Parallel Crush",
+        CompModel::OptoSlam => "Opto Slam",
     }
 }
 
@@ -592,6 +622,14 @@ pub(crate) fn amp_model_label(m: AmpModel) -> &'static str {
         VintageModern => "Vintage Modern",
         StudioBass => "Studio Bass",
         ExpressLead => "Express Lead",
+        RazorModern => "Razor Modern",
+        MidCannon => "Mid Cannon",
+        DjentStack => "Djent Stack",
+        ChainsawLead => "Chainsaw Lead",
+        Blackfire => "Blackfire",
+        CrunchSaw => "Crunch Saw",
+        UltraScoop => "Ultra Scoop",
+        SlamHead => "Slam Head",
     }
 }
 
@@ -625,6 +663,14 @@ pub(crate) fn cab_model_label(model: CabModel) -> &'static str {
         CabModel::Combo1x15 => "Combo 1x15",
         CabModel::Alnico1x10 => "Alnico 1x10",
         CabModel::Dark15 => "Dark 1x15",
+        CabModel::Razor4x12 => "Razor 4x12",
+        CabModel::HonkStack => "Honk Stack 4x12",
+        CabModel::Djent4x12 => "Djent 4x12",
+        CabModel::SawStack => "Saw Stack 4x12",
+        CabModel::Cannon4x12 => "Cannon 4x12",
+        CabModel::Ice4x12 => "Ice 4x12",
+        CabModel::Doom810 => "Doom 8x10",
+        CabModel::Tight2x12 => "Tight 2x12",
     }
 }
 
@@ -655,6 +701,14 @@ pub(crate) fn mod_model_label(model: ModModel) -> &'static str {
         ModModel::SlowJet => "Slow Jet",
         ModModel::HarmonicTrem => "Harmonic Trem",
         ModModel::BiasTrem => "Bias Trem",
+        ModModel::RazorChorus => "Razor Chorus",
+        ModModel::MetalJet => "Metal Jet",
+        ModModel::ChainsawPhase => "Chainsaw Phase",
+        ModModel::ChopTrem => "Chop Trem",
+        ModModel::PanicVibe => "Panic Vibe",
+        ModModel::StabFlange => "Stab Flange",
+        ModModel::SquareTrem => "Square Trem",
+        ModModel::ShredPhase => "Shred Phase",
     }
 }
 

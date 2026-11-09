@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use super::internals::ParamPtr;
+use super::name_cell::NameCell;
 use super::range::FloatRange;
 use super::smoothing::{Smoother, SmoothingStyle};
 use super::{Param, ParamFlags, ParamMut};
@@ -51,8 +52,10 @@ pub struct FloatParam {
     /// input. If this is set and if [`value_to_string`][Self::value_to_string] is not set, then
     /// this is also used when formatting the parameter. This must be a positive, nonzero number.
     step_size: Option<f32>,
-    /// The parameter's human readable display name.
-    name: String,
+    /// The parameter's human readable display name. Replaced when a host
+    /// should see a new title (a Rodhareist stomp change) without rebuilding
+    /// the parameter the host already holds a pointer to.
+    name: NameCell,
     /// The parameter value's unit, added after [`value_to_string`][Self::value_to_string] if that
     /// is set. NIH-plug will not automatically add a space before the unit.
     unit: &'static str,
@@ -90,9 +93,9 @@ impl Debug for FloatParam {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // This uses the above `Display` instance to show the value
         if self.modulated_plain_value() != self.unmodulated_plain_value() {
-            write!(f, "{}: {} (modulated)", &self.name, &self)
+            write!(f, "{}: {} (modulated)", self.name.get(), &self)
         } else {
-            write!(f, "{}: {}", &self.name, &self)
+            write!(f, "{}: {}", self.name.get(), &self)
         }
     }
 }
@@ -104,7 +107,7 @@ impl Param for FloatParam {
     type Plain = f32;
 
     fn name(&self) -> &str {
-        &self.name
+        self.name.get()
     }
 
     fn unit(&self) -> &'static str {
@@ -285,12 +288,20 @@ impl FloatParam {
 
             range,
             step_size: None,
-            name: name.into(),
+            name: NameCell::new(name),
             unit: "",
             poly_modulation_id: None,
             value_to_string: None,
             string_to_value: None,
         }
+    }
+
+    /// Replace the display name a host reads from [`Param::name`].
+    ///
+    /// Safe to call while the host is querying the name: the previous string
+    /// stays valid for any caller that already loaded it.
+    pub fn set_name(&self, name: impl Into<String>) {
+        self.name.set(name);
     }
 
     /// The field's current plain value, after monophonic modulation has been applied. Equivalent to

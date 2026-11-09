@@ -113,6 +113,7 @@ fn slot_from_preset(slot: &PresetSlot) -> InsertSlotState {
         enabled_audio_output_channels: slot.output_channels.clone(),
         plugin_is_instrument: slot.is_instrument,
         multiout_collapsed: slot.multiout_collapsed,
+        signal_bus: 0,
         plugin: Some(ProjectPluginInstance {
             instance_id: "preset".to_string(),
             format,

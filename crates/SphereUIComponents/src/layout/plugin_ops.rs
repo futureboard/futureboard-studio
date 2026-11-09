@@ -608,6 +608,42 @@ impl StudioLayout {
         .detach();
     }
 
+    /// The Rodhareist split changed. Create or retire its send and return,
+    /// then publish the graph so the return is in the mix.
+    pub(super) fn sync_rodhareist_wdw(&mut self, track_id: &str, cx: &mut Context<Self>) {
+        let changed = self
+            .timeline
+            .update(cx, |timeline, _| timeline.state.sync_wdw_split(track_id));
+        if !changed {
+            return;
+        }
+        self.mark_dirty();
+        self.schedule_audio_project_sync(cx, false, "wdw_split");
+        cx.notify();
+    }
+
+    /// Move a VST3 insert between the main chain and the wet/dry/wet return.
+    pub(super) fn set_insert_signal_bus(
+        &mut self,
+        track_id: &str,
+        insert_id: &str,
+        bus: crate::components::timeline::timeline_state::InsertSignalBus,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = self.timeline.update(cx, |timeline, _| {
+            timeline
+                .state
+                .set_insert_signal_bus(track_id, insert_id, bus)
+        });
+        if !changed {
+            return;
+        }
+        self.mark_dirty();
+        self.schedule_audio_project_sync(cx, false, "insert_signal_bus");
+        self.push_mixer_snapshot_to_window(cx);
+        cx.notify();
+    }
+
     pub(super) fn poll_plugin_bridge_runtime(&mut self, cx: &mut Context<Self>) {
         use crate::components::timeline::timeline_state::{
             PluginRuntimeBackend, PluginRuntimeState,
@@ -2986,12 +3022,20 @@ impl StudioLayout {
                         // mirror). Deferred: this runs inside the editor
                         // window's update, and the studio is its parent.
                         let studio = studio.clone();
+                        let wdw_track = crate::components::timeline::timeline_state::rodhareist_wdw_wire(
+                            &mirror_plugin_id,
+                            index,
+                        )
+                        .then(|| key.track_id.clone());
                         cx.defer(move |cx| {
                             let _ = studio.update(cx, |layout, cx| {
                                 layout.note_plugin_state_edited(cx);
                                 // A pad sent to another output: give it a
                                 // mixer strip, or retire an unused one.
                                 layout.sync_builtin_output_strips(cx);
+                                if let Some(track_id) = wdw_track {
+                                    layout.sync_rodhareist_wdw(&track_id, cx);
+                                }
                             });
                         });
                     },

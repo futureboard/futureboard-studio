@@ -726,6 +726,7 @@ fn build_engine_inserts_for(
                 );
                 params.insert("bridge".to_string(), serde_json::json!(true));
                 params.insert("role".to_string(), serde_json::json!(role));
+                params.insert("signalBus".to_string(), signal_bus_json(slot));
 
                 if crate::perf::engine_sync_debug_enabled() {
                     eprintln!(
@@ -790,6 +791,7 @@ fn build_engine_inserts_for(
                 "vstiOutputChildren".to_string(),
                 vsti_output_children_json(slot),
             );
+            params.insert("signalBus".to_string(), signal_bus_json(slot));
 
             Some(EngineInsertSnapshot {
                 id: slot.id.clone(),
@@ -808,6 +810,13 @@ fn build_engine_inserts_for(
             })
         })
         .collect()
+}
+
+fn signal_bus_json(slot: &InsertSlotState) -> serde_json::Value {
+    serde_json::json!(match slot.signal_bus {
+        timeline_state::InsertSignalBus::Wdw => "wdw",
+        timeline_state::InsertSignalBus::Main => "main",
+    })
 }
 
 fn normalized_enabled_audio_outputs(slot: &InsertSlotState) -> Vec<u8> {
@@ -902,6 +911,7 @@ fn build_engine_sends(track: &TrackState) -> Vec<EngineSendSnapshot> {
             level: s.gain_linear(),
             enabled: s.enabled,
             pre_fader: s.pre_fader,
+            wdw: s.wdw,
         })
         .collect()
 }

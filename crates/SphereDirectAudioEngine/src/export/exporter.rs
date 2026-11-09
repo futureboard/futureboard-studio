@@ -1177,6 +1177,7 @@ mod tests {
             level: 1.0,
             enabled: true,
             pre_fader: false,
+            wdw: false,
         });
         snapshot.tracks.push(EngineTrackSnapshot {
             track_type: "return".to_string(),
@@ -1255,6 +1256,7 @@ mod tests {
             level: 1.0,
             enabled: true,
             pre_fader: false,
+            wdw: false,
         });
         let mut ret = EngineTrackSnapshot {
             track_type: "return".to_string(),
