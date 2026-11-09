@@ -17,7 +17,8 @@
 //! Interaction matches the faders ([`crate::components::fader`]): a vertical
 //! drag moves the value by how far the pointer travels — never to where it is
 //! pressed — with Shift for fine adjustment, and a double-click or Alt-click
-//! puts it back to its default.
+//! puts it back to its default. The pointer is hidden while it drags and
+//! comes back where it was pressed ([`crate::components::drag_pointer`]).
 
 use std::f32::consts::PI;
 
@@ -205,10 +206,22 @@ fn render_knob(
             .left_0()
             .size_full(),
         )
+        // The value follows the hand's travel, not the pointer's position, so
+        // the pointer is hidden for the drag and put back where it was
+        // pressed, as on a fader.
         .on_drag(
             FaderDrag::new(id_string.clone()),
-            |drag, _offset, _window, cx| cx.new(|_| FaderDrag::new(drag.id.clone())),
+            |drag, _offset, _window, cx| {
+                crate::components::drag_pointer::hide_for_drag();
+                cx.new(|_| FaderDrag::new(drag.id.clone()))
+            },
         )
+        .on_mouse_up(gpui::MouseButton::Left, |_event, _window, _cx| {
+            crate::components::drag_pointer::show_after_drag();
+        })
+        .on_mouse_up_out(gpui::MouseButton::Left, |_event, _window, _cx| {
+            crate::components::drag_pointer::show_after_drag();
+        })
         .on_drag_move::<FaderDrag>(move |event, window, cx| {
             let drag = event.drag(cx);
             if drag.id != id_string {

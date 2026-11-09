@@ -1408,13 +1408,23 @@ fn send_level_text(gain_db: f32) -> String {
     }
 }
 
+/// Width of a send row's grip zone (left).
+const SEND_GRIP_W: f32 = 9.0;
+/// Width of a send row's remove zone (right).
+const SEND_REMOVE_W: f32 = 14.0;
+
 /// One send: where it goes, and how much of this channel goes there.
 ///
 /// The row is a bar that fills with the level, so a rack of sends reads as a
 /// small bar chart of how much of this channel is going where, with the exact
-/// value printed at its end. Dragging the bar sideways sets the level — Shift
-/// for fine steps — and a double-click puts it back to unity. The target's
-/// name is the handle that moves the send up or down the list.
+/// value printed at its end. The row has three zones:
+///
+/// - **left**: a grip that moves the send up or down the list;
+/// - **centre** (the name and the value): dragging sets the level, Shift for
+///   fine steps, with the pointer hidden like a fader's; a double-click puts
+///   it back to unity;
+/// - **right**: an × that shows while the pointer is over it, and removes
+///   the send.
 fn send_chip(
     track_id: &str,
     send_index: usize,
@@ -1459,7 +1469,8 @@ fn send_chip(
     let gain_reset = callbacks.on_send_gain_change.clone();
 
     // The level bar. Its own drag sets the level; it covers the row, under
-    // the name and the remove button, which take their own presses.
+    // the grip and the remove zone, which take their own presses. The name
+    // and the value have no handlers, so a press on them lands here.
     let bar = div()
         .id(gpui::SharedString::from(gain_drag_id.clone()))
         .absolute()
@@ -1510,6 +1521,10 @@ fn send_chip(
             }
         });
 
+    // The remove zone paints over the end of the value while it shows, so it
+    // takes the row's hover colour, opaque, rather than a wash.
+    let remove_hover = Colors::composite(hover, Colors::state_hover());
+
     // The row's look; the interactive element around it is transparent and
     // owns the spacing below, as an insert chip's does.
     let body = div()
@@ -1524,53 +1539,78 @@ fn send_chip(
         .bg(rest)
         .border(px(1.0))
         .border_color(Colors::border_subtle())
+        .group("fb-send-row")
         .hover(move |style| style.bg(hover))
         .child(bar)
-        // The target's name: the handle the send is dragged up or down by.
+        // Left: the grip the send is dragged up or down the list by. Its
+        // dots show while the row is under the pointer.
         .child(
             div()
-                .id(gpui::SharedString::from(format!("send-chip-{}", send.id)))
-                .relative()
-                .flex_none()
-                .max_w(gpui::relative(0.62))
-                .pl(px(5.0))
-                .pr(px(2.0))
-                .truncate()
-                .text_size(px(type_scale::LABEL))
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(text)
-                .cursor(gpui::CursorStyle::PointingHand)
-                .child(target_name.to_string())
-                .on_drag(chip_drag_payload, |drag, _offset, _window, cx| {
-                    drag.refusal.reset();
-                    cx.new(|_| drag.clone())
-                }),
-        )
-        .child(div().flex_1())
-        .child(
-            div()
-                .relative()
-                .flex_none()
-                .text_size(px(type_scale::CAPTION + 0.5))
-                .text_color(Colors::text_secondary())
-                .child(level_text),
-        )
-        .child(
-            div()
-                .id(gpui::SharedString::from(format!("send-remove-{}", send.id)))
+                .id(gpui::SharedString::from(format!("send-grip-{}", send.id)))
                 .relative()
                 .flex()
                 .flex_none()
                 .items_center()
                 .justify_center()
-                .w(px(13.0))
+                .w(px(SEND_GRIP_W))
                 .h_full()
+                .cursor(gpui::CursorStyle::OpenHand)
+                .child(
+                    svg()
+                        .path(assets::ICON_GRIP_VERTICAL_PATH)
+                        .w(px(8.0))
+                        .h(px(8.0))
+                        .text_color(gpui::transparent_black())
+                        .group_hover("fb-send-row", |s| s.text_color(Colors::text_faint())),
+                )
+                .on_drag(chip_drag_payload, |drag, _offset, _window, cx| {
+                    drag.refusal.reset();
+                    cx.new(|_| drag.clone())
+                })
+                .occlude(),
+        )
+        // Centre: the name and the value. No handlers of their own: a press
+        // here is the level bar's. The value always shows in full; the name
+        // takes what is left and truncates.
+        .child(
+            div()
+                .relative()
+                .flex_1()
+                .min_w_0()
+                .pr(px(2.0))
+                .truncate()
                 .text_size(px(type_scale::LABEL))
-                .text_color(Colors::text_faint())
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(text)
+                .child(target_name.to_string()),
+        )
+        .child(
+            div()
+                .relative()
+                .flex_none()
+                .pr(px(4.0))
+                .text_size(px(type_scale::CAPTION + 0.5))
+                .text_color(Colors::text_secondary())
+                .child(level_text),
+        )
+        // Right: remove. Nothing shows until the pointer is over it.
+        .child(
+            div()
+                .id(gpui::SharedString::from(format!("send-remove-{}", send.id)))
+                .absolute()
+                .top_0()
+                .right_0()
+                .bottom_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(SEND_REMOVE_W))
+                .text_size(px(type_scale::LABEL))
+                .text_color(gpui::transparent_black())
                 .cursor(gpui::CursorStyle::PointingHand)
-                .hover(|s| s.text_color(Colors::text_primary()))
+                .hover(move |s| s.bg(remove_hover).text_color(Colors::text_primary()))
                 .child("×")
-                .on_mouse_down(gpui::MouseButton::Left, move |_e, w, cx| {
+                .on_click(move |_e, w, cx| {
                     on_remove(&remove_pair, w, cx);
                 })
                 .occlude(),
