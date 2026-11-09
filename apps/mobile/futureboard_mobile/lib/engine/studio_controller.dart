@@ -88,8 +88,18 @@ class StudioController extends ChangeNotifier {
     if (_audioTrackStarted && pcmBytes.isNotEmpty) {
       _audioChannel.invokeMethod('writePcm', {'pcm': pcmBytes}).catchError((_) {});
     }
-    telemetry = TelemetryModel.fromJson(_ffi.getTelemetryMap());
+    _applyTelemetry(TelemetryModel.fromJson(_ffi.getTelemetryMap()));
     notifyListeners();
+  }
+
+  /// Stores fresh engine telemetry and surfaces engine faults reported by it.
+  void _applyTelemetry(TelemetryModel next) {
+    final prev = telemetry;
+    telemetry = next;
+    if (next.renderFaults > prev.renderFaults) {
+      statusBanner =
+          'Audio Engine Error • Render fault recovered (${next.renderFaults}), output muted for the faulty block';
+    }
   }
 
   /// Manually renders one block (useful in unit/widget tests when timer pump is disabled).
@@ -101,7 +111,7 @@ class StudioController extends ChangeNotifier {
   void refreshSnapshot() {
     if (_disposed || !_ffi.isLoaded) return;
     project = ProjectModel.fromJson(_ffi.getSnapshotMap());
-    telemetry = TelemetryModel.fromJson(_ffi.getTelemetryMap());
+    _applyTelemetry(TelemetryModel.fromJson(_ffi.getTelemetryMap()));
     notifyListeners();
   }
 

@@ -482,6 +482,9 @@ class TelemetryModel {
   final List<TrackMeterModel> trackMeters;
   final PluginMeterModel? inspectedPluginMeter;
 
+  /// Render callbacks that panicked and were replaced with silence.
+  final int renderFaults;
+
   const TelemetryModel({
     required this.playheadBeats,
     required this.isPlaying,
@@ -499,6 +502,7 @@ class TelemetryModel {
     required this.spectrumDb,
     required this.trackMeters,
     this.inspectedPluginMeter,
+    this.renderFaults = 0,
   });
 
   factory TelemetryModel.empty() => TelemetryModel(
@@ -543,6 +547,7 @@ class TelemetryModel {
             ? PluginMeterModel.fromJson(
                 j['inspectedPluginMeter'] as Map<String, dynamic>)
             : null,
+        renderFaults: (j['renderFaults'] as num? ?? 0).toInt(),
       );
 
   TrackMeterModel meterForTrack(String trackId) {

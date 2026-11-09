@@ -432,6 +432,13 @@ pub struct TelemetrySnapshot {
     pub spectrum_db: Vec<f32>,
     pub track_meters: Vec<TrackMeterFrame>,
     pub inspected_plugin_meter: Option<PluginMeterSnapshot>,
+    /// Render callbacks that panicked and were replaced with silence (filled by the FFI handle).
+    #[serde(default)]
+    pub render_faults: u32,
+    /// Render callbacks that output silence because a control call held the engine lock
+    /// (filled by the FFI handle).
+    #[serde(default)]
+    pub render_lock_misses: u32,
 }
 
 pub struct TrackRuntime {
@@ -2465,6 +2472,8 @@ impl StudioMobileEngine {
             spectrum_db: self.spectrum_bins_cache.to_vec(),
             track_meters,
             inspected_plugin_meter,
+            render_faults: 0,
+            render_lock_misses: 0,
         }
     }
 

@@ -15,6 +15,7 @@ pub struct FbEngineHandle {
     inner: Mutex<StudioMobileEngine>,
     mic_ring: Arc<MicInputRing>,
     lock_misses: AtomicU32,
+    render_faults: AtomicU32,
 }
 
 impl FbEngineHandle {
@@ -25,17 +26,34 @@ impl FbEngineHandle {
             inner: Mutex::new(engine),
             mic_ring,
             lock_misses: AtomicU32::new(0),
+            render_faults: AtomicU32::new(0),
         }
     }
 
+    /// Locks the engine for a control call.
+    ///
+    /// A panic caught in the render callback poisons the mutex. Control calls must keep
+    /// working afterwards (otherwise the user cannot stop playback or remove the faulty
+    /// plug-in), so the poison is recovered and cleared here instead of being treated as
+    /// "engine unavailable". The fault itself is counted in `render_faults` and reported
+    /// through telemetry.
     pub fn lock(&self) -> MutexGuard<'_, StudioMobileEngine> {
-        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+        match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                self.inner.clear_poison();
+                poisoned.into_inner()
+            }
+        }
     }
 
     pub fn try_lock(&self) -> Option<MutexGuard<'_, StudioMobileEngine>> {
         match self.inner.try_lock() {
             Ok(guard) => Some(guard),
-            Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
+            Err(TryLockError::Poisoned(p)) => {
+                self.inner.clear_poison();
+                Some(p.into_inner())
+            }
             Err(TryLockError::WouldBlock) => None,
         }
     }
@@ -59,6 +77,15 @@ impl FbEngineHandle {
 
     pub fn lock_misses(&self) -> u32 {
         self.lock_misses.load(Ordering::Relaxed)
+    }
+
+    /// Number of render callbacks that panicked and were replaced with silence.
+    pub fn render_faults(&self) -> u32 {
+        self.render_faults.load(Ordering::Relaxed)
+    }
+
+    fn note_render_fault(&self) {
+        self.render_faults.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -245,6 +272,7 @@ pub unsafe extern "C" fn fb_engine_render_f32(
     if res.is_err() {
         let slice = unsafe { std::slice::from_raw_parts_mut(out_interleaved, len) };
         slice.fill(0.0);
+        unsafe { (*handle).note_render_fault() };
     }
 }
 
@@ -269,9 +297,7 @@ pub unsafe extern "C" fn fb_engine_set_playing(handle: *mut FbEngineHandle, play
     if handle.is_null() {
         return;
     }
-    if let Ok(mut engine) = unsafe { (*handle).inner.lock() } {
-        engine.set_playing(playing);
-    }
+    unsafe { (*handle).lock() }.set_playing(playing);
 }
 
 #[unsafe(no_mangle)]
@@ -279,9 +305,7 @@ pub unsafe extern "C" fn fb_engine_set_recording(handle: *mut FbEngineHandle, re
     if handle.is_null() {
         return;
     }
-    if let Ok(mut engine) = unsafe { (*handle).inner.lock() } {
-        engine.set_recording(recording);
-    }
+    unsafe { (*handle).lock() }.set_recording(recording);
 }
 
 #[unsafe(no_mangle)]
@@ -289,9 +313,7 @@ pub unsafe extern "C" fn fb_engine_seek_beats(handle: *mut FbEngineHandle, beats
     if handle.is_null() {
         return;
     }
-    if let Ok(mut engine) = unsafe { (*handle).inner.lock() } {
-        engine.seek_beats(beats);
-    }
+    unsafe { (*handle).lock() }.seek_beats(beats);
 }
 
 #[unsafe(no_mangle)]
@@ -299,9 +321,7 @@ pub unsafe extern "C" fn fb_engine_set_bpm(handle: *mut FbEngineHandle, bpm: f64
     if handle.is_null() {
         return;
     }
-    if let Ok(mut engine) = unsafe { (*handle).inner.lock() } {
-        engine.set_bpm(bpm);
-    }
+    unsafe { (*handle).lock() }.set_bpm(bpm);
 }
 
 #[unsafe(no_mangle)]
@@ -316,9 +336,7 @@ pub unsafe extern "C" fn fb_engine_trigger_midi(
         return;
     }
     let track_id = from_c_str(track_id_ptr).unwrap_or_default();
-    if let Ok(mut engine) = unsafe { (*handle).inner.lock() } {
-        engine.trigger_live_midi(&track_id, note, velocity, is_note_on);
-    }
+    unsafe { (*handle).lock() }.trigger_live_midi(&track_id, note, velocity, is_note_on);
 }
 
 #[unsafe(no_mangle)]
@@ -338,25 +356,23 @@ pub unsafe extern "C" fn fb_engine_set_track_mixer(
     let Some(track_id) = from_c_str(track_id_ptr) else {
         return;
     };
-    if let Ok(mut engine) = unsafe { (*handle).inner.lock() } {
-        engine.set_track_mixer(
-            &track_id,
-            if volume_db.is_finite() {
-                Some(volume_db)
-            } else {
-                None
-            },
-            if pan.is_finite() { Some(pan) } else { None },
-            if muted >= 0 { Some(muted != 0) } else { None },
-            if soloed >= 0 { Some(soloed != 0) } else { None },
-            if armed >= 0 { Some(armed != 0) } else { None },
-            if input_monitoring >= 0 {
-                Some(input_monitoring != 0)
-            } else {
-                None
-            },
-        );
-    }
+    unsafe { (*handle).lock() }.set_track_mixer(
+        &track_id,
+        if volume_db.is_finite() {
+            Some(volume_db)
+        } else {
+            None
+        },
+        if pan.is_finite() { Some(pan) } else { None },
+        if muted >= 0 { Some(muted != 0) } else { None },
+        if soloed >= 0 { Some(soloed != 0) } else { None },
+        if armed >= 0 { Some(armed != 0) } else { None },
+        if input_monitoring >= 0 {
+            Some(input_monitoring != 0)
+        } else {
+            None
+        },
+    );
 }
 
 #[unsafe(no_mangle)]
@@ -379,9 +395,7 @@ pub unsafe extern "C" fn fb_engine_set_plugin_param(
     } else {
         Some(slot_index as usize)
     };
-    if let Ok(mut engine) = unsafe { (*handle).inner.lock() } {
-        engine.set_plugin_param(&track_id, slot, &param_id, value);
-    }
+    unsafe { (*handle).lock() }.set_plugin_param(&track_id, slot, &param_id, value);
 }
 
 #[unsafe(no_mangle)]
@@ -389,12 +403,7 @@ pub unsafe extern "C" fn fb_engine_get_snapshot_json(handle: *mut FbEngineHandle
     if handle.is_null() {
         return to_c_string("{}".to_string());
     }
-    let snap = {
-        let Ok(mut engine) = (unsafe { (*handle).inner.lock() }) else {
-            return to_c_string("{}".to_string());
-        };
-        engine.snapshot()
-    };
+    let snap = unsafe { (*handle).lock() }.snapshot();
     to_c_string(serde_json::to_string(&snap).unwrap_or_else(|_| "{}".to_string()))
 }
 
@@ -403,12 +412,10 @@ pub unsafe extern "C" fn fb_engine_get_telemetry_json(handle: *mut FbEngineHandl
     if handle.is_null() {
         return to_c_string("{}".to_string());
     }
-    let tel = {
-        let Ok(engine) = (unsafe { (*handle).inner.lock() }) else {
-            return to_c_string("{}".to_string());
-        };
-        engine.telemetry()
-    };
+    let mut tel = unsafe { (*handle).lock() }.telemetry();
+    // Handle-level realtime counters live outside the engine mutex.
+    tel.render_faults = unsafe { (*handle).render_faults() };
+    tel.render_lock_misses = unsafe { (*handle).lock_misses() };
     to_c_string(serde_json::to_string(&tel).unwrap_or_else(|_| "{}".to_string()))
 }
 
@@ -441,9 +448,7 @@ pub unsafe extern "C" fn fb_engine_dispatch_action_json(
             );
         }
     };
-    let Ok(mut engine) = (unsafe { (*handle).inner.lock() }) else {
-        return to_c_string(r#"{"ok":false,"error":"engine lock poisoned"}"#.to_string());
-    };
+    let mut engine = unsafe { (*handle).lock() };
 
     let result = match action {
         EngineAction::LoadDemo => {
@@ -660,4 +665,67 @@ pub unsafe extern "C" fn fb_engine_dispatch_action_json(
     };
 
     to_c_string(result.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn take_json(ptr: *mut c_char) -> serde_json::Value {
+        let s = from_c_str(ptr).expect("non-null json");
+        unsafe { fb_string_free(ptr) };
+        serde_json::from_str(&s).expect("valid json")
+    }
+
+    /// Regression for #345: a panic caught in the render path poisons the engine mutex;
+    /// transport, editing and snapshot calls must keep working afterwards.
+    #[test]
+    fn control_calls_recover_after_render_panic_poisons_engine_lock() {
+        let handle = fb_engine_new(48_000);
+        assert!(!handle.is_null());
+        let h = unsafe { &*handle };
+
+        unsafe { fb_engine_set_playing(handle, true) };
+        assert!(h.lock().is_playing);
+
+        // Simulate what a panicking render callback leaves behind: a poisoned mutex.
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = h.lock();
+            panic!("simulated render fault");
+        }));
+        assert!(h.inner.is_poisoned());
+        h.note_render_fault();
+
+        // Stop must take effect.
+        unsafe { fb_engine_set_playing(handle, false) };
+        assert!(
+            !h.inner.is_poisoned(),
+            "control lock must clear the poison once recovered"
+        );
+        assert!(!h.lock().is_playing, "Stop must work after a render panic");
+
+        // Snapshot must not degrade to an empty object.
+        let snap = take_json(unsafe { fb_engine_get_snapshot_json(handle) });
+        assert!(
+            snap.get("tracks")
+                .and_then(|t| t.as_array())
+                .is_some_and(|t| !t.is_empty()),
+            "snapshot must contain the project after a render panic"
+        );
+
+        // Editing must still apply.
+        let action = CString::new(r#"{"action":"setMetronome","enabled":true}"#).unwrap();
+        let res = take_json(unsafe { fb_engine_dispatch_action_json(handle, action.as_ptr()) });
+        assert_eq!(res["ok"], serde_json::Value::Bool(true));
+        assert!(h.lock().metronome_enabled);
+
+        // The fault is reported, and rendering keeps producing output.
+        let tel = take_json(unsafe { fb_engine_get_telemetry_json(handle) });
+        assert_eq!(tel["renderFaults"], serde_json::json!(1));
+        let mut out = vec![1.0f32; 256 * 2];
+        unsafe { fb_engine_render_f32(handle, out.as_mut_ptr(), 256) };
+        assert!(out.iter().all(|s| s.is_finite()));
+
+        unsafe { fb_engine_free(handle) };
+    }
 }
