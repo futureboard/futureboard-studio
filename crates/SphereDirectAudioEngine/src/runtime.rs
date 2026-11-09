@@ -26,7 +26,7 @@ use crate::latency_graph::{
     RuntimeLatencyGraph,
 };
 use serde_json::Value;
-use sphere_audio_plugins::{canonical_plugin_id, should_rebuild_state, AudioPluginDspState};
+use sphere_audio_plugins::{canonical_plugin_id, AudioPluginDspState};
 use sphere_soundfont_player::{
     SoundFont, SoundfontChannels, SoundfontEnvelope, SoundfontPlayer, SoundfontPlayerMode,
     SoundfontPlayerSettings, SoundfontRenderQuality,
@@ -1639,7 +1639,7 @@ pub struct RuntimeInsert {
     /// Set per block from that lane while playing: the insert is bypassed by
     /// automation, whatever `enabled` says. Read through [`Self::active`].
     pub automation_bypassed: bool,
-    pub params: HashMap<String, Value>,
+    pub params: std::sync::Arc<HashMap<String, Value>>,
     /// For [`RuntimeInsertKind::ExternalBridge`]: `params["role"] == "effect"`,
     /// resolved at build time so the block path never reads the params map.
     pub bridge_is_effect: bool,
@@ -3778,7 +3778,7 @@ impl RuntimeProject {
                         &insert.params,
                     ),
                     bridge_sink: None,
-                    params: insert.params.clone(),
+                    params: std::sync::Arc::new(insert.params.clone()),
                     dsp: InsertDspState::new(
                         canonical_plugin_id(&insert.kind),
                         &insert.params,
@@ -5604,6 +5604,75 @@ impl RuntimeProject {
     }
 
     #[inline]
+    pub fn update_insert_param_at(
+        &mut self,
+        track_index: usize,
+        insert_index: usize,
+        param_id: crate::command::ResolvedParamId,
+        value: f32,
+        change: Option<&mut crate::command::InsertParamChange>,
+    ) {
+        let Some(track) = self.tracks.get_mut(track_index) else {
+            return;
+        };
+        let Some(insert) = track.inserts.get_mut(insert_index) else {
+            return;
+        };
+
+        if let Some(change) = change {
+            if let Some(ref mut new_params) = change.params {
+                std::mem::swap(&mut insert.params, new_params);
+            }
+            if let Some(ref mut new_dsp) = change.dsp {
+                std::mem::swap(&mut insert.dsp, new_dsp);
+            }
+        }
+
+        match param_id {
+            crate::command::ResolvedParamId::Bypass => {
+                insert.enabled = value >= 0.5;
+                if insert.enabled {
+                    insert.guard.rearm();
+                }
+            }
+            crate::command::ResolvedParamId::Numeric(wire_param_id) => {
+                if insert.kind_tag == RuntimeInsertKind::ExternalBridge {
+                    if insert.bridge_is_builtin {
+                        if let Some(sink) = insert.bridge_sink.as_ref() {
+                            sink.push_param(wire_param_id, value, 0);
+                        }
+                    } else if let Some(sink) = insert.bridge_sink.as_ref() {
+                        sink.push_param(wire_param_id, value.clamp(0.0, 1.0), 0);
+                    }
+                } else if let Some(vst3) = insert.vst3.as_mut() {
+                    vst3.set_param(wire_param_id, value as f64);
+                    insert.callback_process_log_done = false;
+                    insert.silent_process_blocks = 0;
+                }
+            }
+            crate::command::ResolvedParamId::Named(key) => {
+                if insert.kind_tag == RuntimeInsertKind::ExternalBridge {
+                    if let Ok(wire_id) = key.as_str().parse::<u32>() {
+                        if insert.bridge_is_builtin {
+                            if let Some(sink) = insert.bridge_sink.as_ref() {
+                                sink.push_param(wire_id, value, 0);
+                            }
+                        } else if let Some(sink) = insert.bridge_sink.as_ref() {
+                            sink.push_param(wire_id, value.clamp(0.0, 1.0), 0);
+                        }
+                    }
+                } else if let Some(vst3) = insert.vst3.as_mut() {
+                    if let Ok(vst3_id) = key.as_str().parse::<u32>() {
+                        vst3.set_param(vst3_id, value as f64);
+                        insert.callback_process_log_done = false;
+                        insert.silent_process_blocks = 0;
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline]
     pub fn update_insert_param(
         &mut self,
         track_id: &str,
@@ -5611,79 +5680,24 @@ impl RuntimeProject {
         param_id: &str,
         value: f32,
     ) {
-        let Some(track) = self.tracks.iter_mut().find(|t| t.id == track_id) else {
+        let Some(track_index) = self.tracks.iter().position(|t| t.id == track_id) else {
             return;
         };
-        let Some(insert) = track.inserts.iter_mut().find(|i| i.id == insert_id) else {
+        let Some(insert_index) = self.tracks[track_index]
+            .inserts
+            .iter()
+            .position(|i| i.id == insert_id)
+        else {
             return;
         };
-
-        // "enabled" toggles bypass for all insert types.
-        if param_id == "enabled" {
-            insert.enabled = value >= 0.5;
-            // Switching it on is the user taking it back from Audioguard: it
-            // processes again, and is watched afresh.
-            if insert.enabled {
-                insert.guard.rearm();
-            }
-            return;
-        }
-
-        // Bridged plugin (runs in the host process): forward the numeric
-        // param id through the shared param ring. Previously this fell
-        // through to the built-in branch and was silently dropped.
-        if insert.kind_tag == RuntimeInsertKind::ExternalBridge {
-            if let Ok(wire_param_id) = param_id.parse::<u32>() {
-                if insert.bridge_is_builtin {
-                    // Built-in DSP params travel in raw editor units (e.g.
-                    // delay_time 40..1200, path_slot -1..6); the DSP clamps
-                    // per-field itself. Not persisted into the params map —
-                    // built-in state persistence is a separate path, and the
-                    // insert would only accumulate numeric-index keys (plus a
-                    // per-edit heap alloc on the callback thread).
-                    if let Some(sink) = insert.bridge_sink.as_ref() {
-                        sink.push_param(wire_param_id, value, 0);
-                    }
-                } else {
-                    // VST3: normalized value; persist for snapshot/recall.
-                    insert
-                        .params
-                        .insert(param_id.to_string(), Value::from(value as f64));
-                    if let Some(sink) = insert.bridge_sink.as_ref() {
-                        sink.push_param(wire_param_id, value.clamp(0.0, 1.0), 0);
-                    }
-                }
-            }
-            return;
-        }
-
-        // For native VST3 inserts: forward numeric param IDs to the C++ processor.
-        // The web UI sends VST3 ParamIDs as decimal strings ("12345"), and values
-        // are normalized (0..1) as required by IParameterChanges.
-        if let Some(vst3) = insert.vst3.as_mut() {
-            if let Ok(vst3_param_id) = param_id.parse::<u32>() {
-                vst3.set_param(vst3_param_id, value as f64);
-                insert.callback_process_log_done = false;
-                insert.silent_process_blocks = 0;
-                // Also persist in params map for snapshot/recall, then return —
-                // built-in DSP state rebuild is not applicable to VST3 inserts.
-                insert
-                    .params
-                    .insert(param_id.to_string(), Value::from(value as f64));
-                return;
-            }
-        }
-
-        // Built-in plugin insert: update params map and rebuild DSP state if needed.
-        insert
-            .params
-            .insert(param_id.to_string(), Value::from(value as f64));
-        let plugin_id = canonical_plugin_id(&insert.kind);
-        if should_rebuild_state(plugin_id, param_id) {
-            insert
-                .dsp
-                .rebuild(plugin_id, &insert.params, self.sample_rate);
-        }
+        let resolved = if param_id == "enabled" {
+            crate::command::ResolvedParamId::Bypass
+        } else if let Ok(wire_param_id) = param_id.parse::<u32>() {
+            crate::command::ResolvedParamId::Numeric(wire_param_id)
+        } else {
+            crate::command::ResolvedParamId::Named(crate::command::ParamKey::new(param_id))
+        };
+        self.update_insert_param_at(track_index, insert_index, resolved, value, None);
     }
 
     pub fn set_bridge_editor_active(&mut self, track_id: &str, active: bool) {
@@ -9013,7 +9027,7 @@ mod midi_tests {
                 enabled: true,
                 bypass_lane: None,
                 automation_bypassed: false,
-                params: HashMap::new(),
+                params: std::sync::Arc::new(HashMap::new()),
                 bridge_is_effect: false,
                 bridge_is_builtin: false,
                 bridge_enabled_output_channels: Vec::new(),
