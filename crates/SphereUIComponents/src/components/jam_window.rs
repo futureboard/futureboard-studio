@@ -302,6 +302,33 @@ impl JamWindow {
             .detach();
     }
 
+    /// Follow the jam link that arrived from outside Studio, now that the user
+    /// has said so. `send` false joins to listen, publishing nothing.
+    fn accept_link_request(&mut self, send: bool, cx: &mut Context<Self>) {
+        self.set_status("Joining…");
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(error) =
+                    jam::run_action(|controller| controller.accept_link_request(send))
+                {
+                    eprintln!("[jam] join failed: {}", error.user_message());
+                }
+            })
+            .detach();
+    }
+
+    /// Drop the waiting jam link. A lock and a field write, so it runs here.
+    fn dismiss_link_request(&mut self, cx: &mut Context<Self>) {
+        self.state.link_request = None;
+        if let Err(error) = jam::with_controller(|controller| {
+            controller.dismiss_link_request();
+            Ok(())
+        }) {
+            eprintln!("[jam] {}", error.user_message());
+        }
+        cx.notify();
+    }
+
     /// Replace the wire format.
     ///
     /// A quality change is a lock and two field writes, so it runs here rather
@@ -710,6 +737,95 @@ impl JamWindow {
             .child(join)
     }
 
+    /// The confirmation for a jam link that arrived from a web page or another
+    /// process: where it leads, what joining sends, and the three answers.
+    fn link_request_card(
+        &self,
+        request: &jam::JamLinkRequest,
+        state: &JamUiState,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let room = match request.jam_name.as_deref() {
+            Some(name) => format!("{name} · code {}", request.code),
+            None => format!("Room code {}", request.code),
+        };
+        let host = match request.host.as_deref() {
+            Some(host) => format!("Hosted by {host}"),
+            None => "The host is shown once you are in the room".to_string(),
+        };
+        let can_join = state.signed_in && !in_session(state);
+        card(
+            "Join this jam?",
+            Some(if request.invite {
+                "an invite link was opened outside Studio"
+            } else {
+                "a room link was opened outside Studio"
+            }),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(space::BASE))
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(typography::UI_MD))
+                        .text_color(Colors::text_primary())
+                        .child(room),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(typography::UI_SM))
+                        .text_color(Colors::text_secondary())
+                        .child(host),
+                )
+                .child(
+                    div()
+                        .text_size(px(typography::UI_SM))
+                        .text_color(Colors::text_secondary())
+                        .child(
+                            "Nothing is sent until you choose. Join sends your audio as usual: this project's jam sends, or your master mix when it has none. Listen Only sends nothing until you switch a send on here.",
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .gap(px(space::BASE))
+                        .child(fb_button(
+                            "jam-link-request-cancel",
+                            "Cancel",
+                            FbButtonKind::Default,
+                            true,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.dismiss_link_request(cx);
+                            }),
+                        ))
+                        .child(fb_button(
+                            "jam-link-request-listen",
+                            "Listen Only",
+                            FbButtonKind::Default,
+                            can_join,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.accept_link_request(false, cx);
+                                cx.notify();
+                            }),
+                        ))
+                        .child(fb_button(
+                            "jam-link-request-join",
+                            "Join",
+                            FbButtonKind::Primary,
+                            can_join,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.accept_link_request(true, cx);
+                                cx.notify();
+                            }),
+                        )),
+                ),
+        )
+    }
+
     /// Everything below the header, in one scroller.
     fn body(
         &self,
@@ -728,6 +844,12 @@ impl JamWindow {
             .py(px(space::SECTION))
             .overflow_y_scroll()
             .children(self.notices(state));
+
+        // A link opened from outside Studio is a question, not an instruction:
+        // nothing has been joined or sent until one of these buttons is used.
+        if let Some(request) = state.link_request.as_ref() {
+            list = list.child(self.link_request_card(request, state, cx));
+        }
 
         if !state.connected {
             return list.child(self.start_cards(state, window, cx));

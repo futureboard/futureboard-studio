@@ -225,6 +225,26 @@ pub struct JamUiState {
     pub quality: JamPublishQuality,
     /// Tracks the multitrack stream carries, in channel-pair order.
     pub multitrack_tracks: Vec<(String, String)>,
+    /// A jam link that arrived from outside Studio and is waiting for the user
+    /// to accept or dismiss it. Nothing has been joined or sent for it yet.
+    pub link_request: Option<JamLinkRequest>,
+}
+
+/// A jam link that arrived from outside Studio (a web page, another process),
+/// as the confirmation names it. See [`JamController::request_join_from_link`].
+///
+/// Display only. The link itself, which may carry an invite secret, stays in
+/// the controller and never reaches the published UI state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JamLinkRequest {
+    /// The room code the link names.
+    pub code: String,
+    /// The room's name, when the server would say before joining.
+    pub jam_name: Option<String>,
+    /// The host, as a person reads them, when the server would say.
+    pub host: Option<String>,
+    /// Whether the link carries an invite secret rather than naming a room.
+    pub invite: bool,
 }
 
 impl JamUiState {
@@ -666,6 +686,10 @@ pub struct JamController {
     /// restates them.
     sends: BTreeMap<String, JamSend>,
     last_error: Option<String>,
+    /// A link from outside Studio waiting for consent: the link as it arrived
+    /// (it may carry an invite secret, so it is never published or logged) and
+    /// what the confirmation shows. See [`Self::request_join_from_link`].
+    link_request: Option<(String, JamLinkRequest)>,
     /// Smoothed arrival latency per stream id, in milliseconds. One raw read
     /// moves by up to a block as the callback advances the ring, so the UI
     /// and the recorder see an average instead.
@@ -674,8 +698,20 @@ pub struct JamController {
 
 impl JamController {
     fn new(shared: Arc<SharedState>, engine: Option<DirectAudio::AudioEngine>) -> Result<Self> {
-        let config = JamConfig::from_env()?;
-        let credentials: SharedCredentials = Arc::new(StudioCredentials);
+        Self::with_config(
+            JamConfig::from_env()?,
+            Arc::new(StudioCredentials),
+            shared,
+            engine,
+        )
+    }
+
+    fn with_config(
+        config: JamConfig,
+        credentials: SharedCredentials,
+        shared: Arc<SharedState>,
+        engine: Option<DirectAudio::AudioEngine>,
+    ) -> Result<Self> {
         let clock = Arc::new(Mutex::new(SessionClock::default()));
         let sink = Arc::new(JamEngineSink::new(Arc::clone(&shared), Arc::clone(&clock)));
         let api = JamApiClient::new(config.clone(), Arc::clone(&credentials))?;
@@ -697,6 +733,7 @@ impl JamController {
             ingress: JamIngress::Routed,
             sends: BTreeMap::new(),
             last_error: None,
+            link_request: None,
             arrival_latency: Mutex::new(BTreeMap::new()),
         })
     }
@@ -764,10 +801,14 @@ impl JamController {
     /// Follow an invite link: exchange the secret, then join what it admitted
     /// this account to.
     pub fn join_with_invite(&mut self, code: &str, secret: &str) -> Result<()> {
+        self.join_with_invite_sending(code, secret, true)
+    }
+
+    fn join_with_invite_sending(&mut self, code: &str, secret: &str, send: bool) -> Result<()> {
         self.clear_error();
         let exchanged = self.api.exchange_invite(secret, code)?;
         let jam_id = JamId::new(exchanged.jam.id.clone());
-        self.join(jam_id, exchanged.access_token)
+        self.join_sending(jam_id, exchanged.access_token, send)
     }
 
     /// Join whatever a pasted link or code names.
@@ -784,12 +825,20 @@ impl JamController {
     /// than both being tried in turn. A link with no fragment that resolves to
     /// a jam this account cannot enter fails as a permission error, which is
     /// the truth, instead of as "invalid link".
+    ///
+    /// This is for a link the user typed or pasted into a jam panel. A link
+    /// that arrives from outside Studio goes through
+    /// [`Self::request_join_from_link`] instead, which asks first.
     pub fn join_with_link(&mut self, link: &str) -> Result<()> {
+        self.join_with_link_sending(link, true)
+    }
+
+    fn join_with_link_sending(&mut self, link: &str, send: bool) -> Result<()> {
         self.clear_error();
         let parsed = parse_jam_link(link)
             .ok_or_else(|| JamError::Config(format!("{link:?} is not a jam link or code")))?;
         match parsed.secret {
-            Some(secret) => self.join_with_invite(&parsed.code, &secret),
+            Some(secret) => self.join_with_invite_sending(&parsed.code, &secret, send),
             None => {
                 let jam = self.api.jam_by_code(&parsed.code)?;
                 let jam_id = JamId::new(jam.jam.id.clone());
@@ -799,13 +848,92 @@ impl JamController {
                 // member gets in, and everybody else is refused. Saying which
                 // link this was is the difference between a refusal somebody
                 // can act on and one that reads as the app being broken.
-                self.join(jam_id, String::new()).map_err(room_link_refusal)
+                self.join_sending(jam_id, String::new(), send)
+                    .map_err(room_link_refusal)
             }
         }
     }
 
+    /// Hold a jam link that arrived from outside Studio until the user says
+    /// whether to follow it.
+    ///
+    /// A `fbrd://` link can be opened by any web page or local process, so its
+    /// arrival is not consent, and joining publishes this Studio's audio to the
+    /// room. Nothing is joined and nothing is sent here. The room's name and
+    /// host are looked up read-only and best effort, so the confirmation can
+    /// say where the link leads; a lookup the server refuses before joining
+    /// leaves them unknown rather than failing the request. A second link
+    /// replaces the first. [`Self::accept_link_request`] follows it and
+    /// [`Self::dismiss_link_request`] drops it.
+    pub fn request_join_from_link(&mut self, link: &str) -> Result<()> {
+        self.clear_error();
+        let parsed = parse_jam_link(link)
+            .ok_or_else(|| JamError::Config("that is not a jam link or code".to_string()))?;
+        let mut request = JamLinkRequest {
+            code: parsed.code.clone(),
+            invite: parsed.secret.is_some(),
+            ..Default::default()
+        };
+        if let Ok(found) = self.api.jam_by_code(&parsed.code) {
+            let name = found.jam.name.trim();
+            if !name.is_empty() {
+                request.jam_name = Some(name.to_string());
+            }
+            let host_id = found.jam.host_user_id.as_str();
+            if !host_id.is_empty() {
+                request.host = self
+                    .api
+                    .participants(&found.jam.id)
+                    .ok()
+                    .and_then(|people| {
+                        people
+                            .into_iter()
+                            .find(|person| person.user.id == host_id)
+                            .map(|person| person.user.label())
+                    });
+            }
+        }
+        self.link_request = Some((link.to_string(), request));
+        self.publish_ui_state();
+        Ok(())
+    }
+
+    /// The link waiting for consent, as the confirmation shows it.
+    pub fn link_request(&self) -> Option<&JamLinkRequest> {
+        self.link_request.as_ref().map(|(_, request)| request)
+    }
+
+    /// Follow the waiting link. With `send` false this Studio joins to listen
+    /// and publishes nothing (neither the default send nor the project's jam
+    /// sends) until the user switches a send on from the panel.
+    pub fn accept_link_request(&mut self, send: bool) -> Result<()> {
+        let Some((link, _)) = self.link_request.take() else {
+            return Err(JamError::Session(
+                "there is no jam link waiting to be joined".to_string(),
+            ));
+        };
+        self.publish_ui_state();
+        self.join_with_link_sending(&link, send)
+    }
+
+    /// Drop the waiting link without joining.
+    pub fn dismiss_link_request(&mut self) {
+        self.link_request = None;
+        self.publish_ui_state();
+    }
+
     /// Join a jam this account is already a member of, or was invited to.
     pub fn join(&mut self, jam_id: JamId, access_token: String) -> Result<()> {
+        self.join_sending(jam_id, access_token, true)
+    }
+
+    /// [`Self::join`], choosing whether audio leaves on arrival. With `send`
+    /// false it joins to listen: nothing is published until the user turns a
+    /// send on.
+    fn join_sending(&mut self, jam_id: JamId, access_token: String, send: bool) -> Result<()> {
+        // Any join, however it was asked for, supersedes a link still waiting
+        // for an answer.
+        self.link_request = None;
         if self.session.is_none() {
             let sink: Arc<dyn sphere_jam_client::JamAudioSink> =
                 Arc::clone(&self.sink) as Arc<dyn sphere_jam_client::JamAudioSink>;
@@ -839,6 +967,9 @@ impl JamController {
             session.subscribe(wanted)?;
         }
         session.join(jam_id, access_token)?;
+        if !send {
+            return Ok(());
+        }
         // Sends are queued the same way: the worker publishes them as soon as
         // the room exists, so an output bus already bound to the jam is live on
         // join without a routing edit to remind it.
@@ -1618,6 +1749,7 @@ impl JamController {
         next.sending = self.send_views();
         next.quality = self.quality.clone();
         next.multitrack_tracks = self.multitrack_tracks.clone();
+        next.link_request = self.link_request().cloned();
 
         if let Ok(mut state) = ui_state().write() {
             // The join url comes from the REST response, which the session
@@ -1848,6 +1980,7 @@ fn build_ui_state(
         invite_link: None,
         quality: JamPublishQuality::default(),
         multitrack_tracks: Vec::new(),
+        link_request: None,
     }
 }
 
@@ -2450,5 +2583,99 @@ mod jam_offset_tests {
 
         let jumped = 40.0 + ARRIVAL_LATENCY_RESET_MS + 1.0;
         assert_eq!(smoothed_arrival_latency(Some(40.0), jumped), jumped);
+    }
+}
+
+#[cfg(test)]
+mod link_request_tests {
+    use super::*;
+
+    /// Refuses every request before it reaches the network, so a controller
+    /// built for a test can never talk to a real jam service.
+    struct SignedOut;
+
+    impl JamCredentialProvider for SignedOut {
+        fn access_token(&self) -> Result<String> {
+            Err(JamError::Auth("signed out for the test".to_string()))
+        }
+        fn account_hint(&self) -> Option<String> {
+            None
+        }
+    }
+
+    fn offline_controller() -> JamController {
+        JamController::with_config(
+            JamConfig::default(),
+            Arc::new(SignedOut),
+            Arc::new(SharedState::default()),
+            None,
+        )
+        .expect("a controller with no engine")
+    }
+
+    #[test]
+    fn a_link_from_outside_studio_waits_for_consent_and_sends_nothing() {
+        let mut controller = offline_controller();
+        controller
+            .request_join_from_link("fbrd://jam/j/J8KM4V#u3Qb1n7secret")
+            .expect("a well-formed link is held, not refused");
+
+        // Nothing joined, nothing published.
+        assert!(
+            controller.session.is_none(),
+            "the link must not join by itself"
+        );
+        assert!(controller.published_keys.is_empty(), "no audio may leave");
+        let request = controller.link_request().expect("held for the user");
+        assert_eq!(request.code, "J8KM4V");
+        assert!(request.invite);
+        // The lookup was refused before joining, so the room is named by its
+        // code alone rather than by a guess.
+        assert_eq!(request.jam_name, None);
+        assert_eq!(request.host, None);
+        // The secret stays in the controller; the published state never has it.
+        assert!(!format!("{:?}", snapshot()).contains("u3Qb1n7secret"));
+
+        controller.dismiss_link_request();
+        assert!(controller.link_request().is_none());
+        assert!(controller.session.is_none());
+        assert!(
+            controller.accept_link_request(true).is_err(),
+            "nothing is left to accept"
+        );
+    }
+
+    #[test]
+    fn a_second_link_replaces_the_first_and_a_bad_one_is_refused() {
+        let mut controller = offline_controller();
+        controller
+            .request_join_from_link("fbrd://jam/j/AAAAAA")
+            .expect("held");
+        controller
+            .request_join_from_link("fbrd://jam/j/BBBBBB")
+            .expect("held");
+        let request = controller.link_request().expect("held");
+        assert_eq!(request.code, "BBBBBB");
+        assert!(!request.invite);
+        assert!(controller
+            .request_join_from_link("https://example.com/a/b")
+            .is_err());
+        assert_eq!(
+            controller.link_request().map(|r| r.code.as_str()),
+            Some("BBBBBB")
+        );
+    }
+
+    #[test]
+    fn accepting_a_link_consumes_it_even_when_the_join_is_refused() {
+        let mut controller = offline_controller();
+        controller
+            .request_join_from_link("fbrd://jam/j/J8KM4V#secret")
+            .expect("held");
+        // Signed out: the invite exchange is refused, so no session starts.
+        assert!(controller.accept_link_request(false).is_err());
+        assert!(controller.link_request().is_none());
+        assert!(controller.session.is_none());
+        assert!(controller.published_keys.is_empty());
     }
 }
