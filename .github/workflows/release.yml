@@ -3,10 +3,12 @@ name: Release Build
 # Builds the Windows installer, macOS DMG and Linux AppImage, then attaches
 # them to an existing GitHub release without touching its release notes.
 #
-# `build-desktop.yml` already publishes on pushed version tags (`2026.11.1-…`
-# or `v`-prefixed) with generated notes. This workflow is the
-# hand-written-notes path: it uploads assets onto a prepared (usually draft)
-# release and leaves the body alone, so a curated changelog survives the build.
+# This is the only workflow that publishes a versioned release. It uploads
+# assets onto a prepared (usually draft) release and leaves the body alone, so
+# a curated changelog survives the build; `visibility` decides whether it then
+# goes public. Pushing a tag publishes nothing (#341): `build-desktop.yml` has
+# no tag trigger. The AUR checksum is updated here too (#360), since this is
+# the only place the released AppImage exists.
 #
 # Dispatch only, on purpose. This used to carry a `schedule:` that started the
 # build 90 minutes ahead of a planned release moment, with a date guard making
@@ -64,21 +66,12 @@ jobs:
   build:
     name: Build Native
     uses: ./.github/workflows/build-desktop.yml
-    # A called workflow can never hold more than its caller grants, and this
-    # repository's default GITHUB_TOKEN permission is read-only. `build-desktop`'s
-    # own `release` job asks for `contents: write`, so without this the whole run
-    # is rejected before any job starts — which is why this path failed the first
-    # time it was dispatched, while `build-desktop` kept working on push (there it
-    # is the top-level workflow, not a callee).
+    # A called workflow can never hold more than its caller grants. Its jobs
+    # only build, so read is all they get.
     permissions:
-      contents: write
+      contents: read
     with:
       app-version: ${{ inputs.app-version }}
-      # Do not let the reusable workflow publish. Running this workflow with
-      # the ref set to the release tag makes github.ref a tag, and build-desktop
-      # would otherwise publish that release as non-draft before `visibility`
-      # is applied. This job attaches the assets and honors draft vs publish.
-      publish-release: false
 
   publish:
     name: Attach Release Assets
@@ -193,3 +186,95 @@ jobs:
             echo "::warning::$TAG was already published — the uploaded assets are live now."
           fi
           gh release view "$TAG" --json tagName,isDraft,isPrerelease
+
+  # The AUR package (packaging/aur) downloads the AppImage from the release at
+  # `_appver` and verifies it against `sha256sums_x86_64`. This was written
+  # only by build-desktop's tag-push publish job, which never ran for Release
+  # Build releases and is gone now (#341), so the committed checksum stayed all
+  # zeros and the package could not build (#360). It is written here, from the
+  # exact AppImage `publish` just attached, whether the release stays a draft
+  # or not: a draft published later in the UI is the same file, and a re-run
+  # for the same tag (assets uploaded with --clobber) rewrites the checksum.
+  aur-checksum:
+    name: Update AUR PKGBUILD
+    needs: [build, publish]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ inputs.tag }}
+      VERSION: ${{ needs.build.outputs.app-version }}
+      BRANCH: ${{ github.event.repository.default_branch }}
+
+    steps:
+      # The bump lands on the default branch, whatever ref this run was
+      # dispatched from (a tag ref is a detached HEAD `git push` cannot use).
+      - name: Checkout default branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download the Linux bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: futureboard-native-linux-bundle
+          path: dist
+
+      # sync-version.mjs owns the AUR fields: `pkgver` with `-` mapped to `_`
+      # (AUR forbids `-`) and `_appver` with the exact asset version. It also
+      # rewrites other version-carrying files; only the AUR pair is committed.
+      - name: Update AUR PKGBUILD version and checksum
+        run: |
+          set -euo pipefail
+          # The PKGBUILD downloads releases/download/<_appver>/. A `v`-prefixed
+          # (or otherwise different) tag would leave the AUR package pointing at
+          # a tag that does not exist, so do not bump it from such a release.
+          if [ "${TAG}" != "${VERSION}" ]; then
+            echo "::warning::Tag ${TAG} is not the bare version ${VERSION}; AUR PKGBUILD not updated."
+            exit 0
+          fi
+          node scripts/sync-version.mjs --version "${VERSION}"
+          python3 - <<'PY'
+          import hashlib, os, pathlib, re, sys
+          version = os.environ["VERSION"]
+          expected = f"Futureboard.Studio-{version}-x86_64.AppImage"
+          matches = sorted(pathlib.Path("dist").glob("*x86_64*.AppImage"))
+          if [m.name for m in matches] != [expected]:
+              sys.exit(f"expected exactly {expected} in dist/, found {[m.name for m in matches]}")
+          digest = hashlib.sha256(matches[0].read_bytes()).hexdigest()
+          pkgbuild = pathlib.Path("packaging/aur/PKGBUILD")
+          srcinfo = pathlib.Path("packaging/aur/.SRCINFO")
+          pkg_text = pkgbuild.read_text(encoding="utf-8")
+          pkg_next, pkg_count = re.subn(
+              r"^sha256sums_x86_64=\('.*'\)$",
+              f"sha256sums_x86_64=('{digest}')",
+              pkg_text,
+              count=1,
+              flags=re.M,
+          )
+          if pkg_count != 1:
+              sys.exit("PKGBUILD is missing sha256sums_x86_64")
+          pkgbuild.write_text(pkg_next, encoding="utf-8")
+          info_text = srcinfo.read_text(encoding="utf-8")
+          info_next, info_count = re.subn(
+              "^[ \t]*sha256sums_x86_64 = .*$",
+              f"\tsha256sums_x86_64 = {digest}",
+              info_text,
+              count=1,
+              flags=re.M,
+          )
+          if info_count != 1:
+              sys.exit(".SRCINFO is missing sha256sums_x86_64")
+          srcinfo.write_text(info_next, encoding="utf-8")
+          print(f"AUR sha256 {digest} ({matches[0].name})")
+          PY
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add packaging/aur/PKGBUILD packaging/aur/.SRCINFO
+          if git diff --cached --quiet; then
+            echo "AUR files already at ${VERSION} with this checksum; nothing to push."
+            exit 0
+          fi
+          git commit -m "chore: update AUR package to ${VERSION} [skip ci]"
+          git push origin "HEAD:refs/heads/${BRANCH}"

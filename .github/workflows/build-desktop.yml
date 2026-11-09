@@ -6,22 +6,16 @@ on:
       - main
       - master
       - dev
-    # Release tags are bare calendar versions (`2026.11.1-beta2.0.0`, see
-    # version.json); `v*` is kept for a v-prefixed tag, which release.yml also
-    # accepts. Three numeric components keep `nightly` (daily-build.yml) and
-    # the old two-part `2026.06`-style tags out.
-    tags:
-      - "[0-9]+.[0-9]+.[0-9]+*"
-      - "v[0-9]+.[0-9]+.[0-9]+*"
-  # Build only. A manual run never publishes, even from a tag (see `release`).
+    # No `tags:` trigger. This workflow never publishes: releases go only
+    # through Release Build (release.yml), which attaches the assets to a
+    # draft and publishes when a maintainer says so. A tag push used to run a
+    # publish job here that created a public release with generated notes,
+    # racing the curated draft and uploading the same assets twice (#341).
+  # Build only.
   workflow_dispatch:
   # Called by `release.yml` so the release build uses these exact steps instead
-  # of a third copy of them. The `release` job below does not publish for
-  # callers: dispatching Release Build with the workflow ref set to the tag
-  # makes `github.ref` a tag, and publishing here used to flip that release
-  # to public (`draft: false`) before the caller could honor its visibility
-  # input. Callers that want this job opt in with `publish-release`.
-  # release.yml does not.
+  # of a third copy of them. Publishing, signing and the AUR checksum all live
+  # in the caller.
   workflow_call:
     inputs:
       app-version:
@@ -29,11 +23,6 @@ on:
         type: string
         required: false
         default: ""
-      publish-release:
-        description: Also run the tag publish job. Release Build leaves this false so a draft stays a draft.
-        type: boolean
-        required: false
-        default: false
     outputs:
       app-version:
         description: Version the artifacts were built with.
@@ -43,9 +32,8 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Read-only by default. Only `release` below publishes, and asks for write
-# itself. As a callee of release.yml this can only narrow what the caller
-# grants, never widen it.
+# Read-only: nothing here writes to the repository or its releases. As a
+# callee of release.yml this can only narrow what the caller grants.
 permissions:
   contents: read
 
@@ -301,8 +289,8 @@ jobs:
           ./packaging/windows/build-installer.ps1 -AppVersion "${{ needs.version.outputs.app-version }}" -SourceDir $env:FUTUREBOARD_PACKAGE_DIR
           Move-Item target/installer/FutureboardStudioSetup.exe "target/installer/Futureboard.Studio-${{ needs.version.outputs.app-version }}-windows-x86_64-Setup.exe"
 
-      # Bare `version.json` version (no nightly suffix here — this workflow
-      # only publishes on tagged releases), matching the AUR PKGBUILD's
+      # Bare `version.json` version (no nightly suffix here — Release Build
+      # publishes these at version tags), matching the AUR PKGBUILD's
       # `_appver` so its hardcoded AppImage filename resolves against it.
       - name: Build AppImage (Linux)
         if: matrix.os == 'ubuntu-24.04'
@@ -345,115 +333,3 @@ jobs:
           path: ${{ matrix.native-bundle-glob }}
           if-no-files-found: error
           retention-days: 7
-
-  release:
-    name: Publish Release
-    needs: [version, build]
-    runs-on: ubuntu-24.04
-    # Publishes only for:
-    # - a tag push of this workflow itself. In a called workflow the github
-    #   context is the caller's, so `workflow_ref` names build-desktop.yml
-    #   only when this file is the top-level run;
-    # - a workflow_call that sets `publish-release: true`. release.yml passes
-    #   false: its `visibility` input decides draft vs public, and this job's
-    #   `draft: false` must not run first (#304).
-    # A direct workflow_dispatch, even from a tag, builds but never publishes:
-    # it has no `publish-release` input (null), and releasing by hand goes
-    # through Release Build. Compare with `== true` only: Actions coerces null
-    # and false both to 0, so `!= false` cannot tell them apart.
-    if: >-
-      startsWith(github.ref, 'refs/tags/') &&
-      ((github.event_name == 'push' &&
-        contains(github.workflow_ref, '/.github/workflows/build-desktop.yml@')) ||
-       inputs.publish-release == true)
-    permissions:
-      contents: write
-
-    steps:
-      # A tag push checks out a detached HEAD, which `git push` cannot push
-      # from. The AUR bump below lands on the default branch, so check that
-      # branch out instead; nothing else in this job reads the tree.
-      - name: Checkout default branch
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          path: dist
-          merge-multiple: true
-
-      - name: List release assets
-        run: ls -lh dist/
-
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
-        with:
-          name: "Futureboard Studio v${{ needs.version.outputs.app-version }}"
-          files: dist/*
-          generate_release_notes: true
-          draft: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      # sync-version.mjs owns the AUR fields: `pkgver` with `-` mapped to `_`
-      # (AUR forbids `-`) and `_appver` with the exact asset version. It also
-      # rewrites other version-carrying files; only the AUR pair is committed.
-      - name: Update AUR PKGBUILD version
-        env:
-          VERSION: ${{ needs.version.outputs.app-version }}
-          BRANCH: ${{ github.event.repository.default_branch }}
-        run: |
-          set -euo pipefail
-          # The PKGBUILD downloads releases/download/<_appver>/. A `v`-prefixed
-          # (or otherwise different) tag would leave the AUR package pointing at
-          # a tag that does not exist, so do not bump it from such a release.
-          if [ "${GITHUB_REF_NAME}" != "${VERSION}" ]; then
-            echo "::warning::Tag ${GITHUB_REF_NAME} is not the bare version ${VERSION}; AUR PKGBUILD not bumped."
-            exit 0
-          fi
-          node scripts/sync-version.mjs --version "${VERSION}"
-          python3 - <<'PY'
-          import hashlib, pathlib, re, sys
-          matches = sorted(pathlib.Path("dist").glob("*x86_64*.AppImage"))
-          if len(matches) != 1:
-              sys.exit(f"expected one x86_64 AppImage in dist/, found {len(matches)}: {matches}")
-          digest = hashlib.sha256(matches[0].read_bytes()).hexdigest()
-          pkgbuild = pathlib.Path("packaging/aur/PKGBUILD")
-          srcinfo = pathlib.Path("packaging/aur/.SRCINFO")
-          pkg_text = pkgbuild.read_text()
-          pkg_next, pkg_count = re.subn(
-              r"^sha256sums_x86_64=\('.*'\)$",
-              f"sha256sums_x86_64=('{digest}')",
-              pkg_text,
-              count=1,
-              flags=re.M,
-          )
-          if pkg_count != 1:
-              sys.exit("PKGBUILD is missing sha256sums_x86_64")
-          pkgbuild.write_text(pkg_next)
-          info_text = srcinfo.read_text()
-          info_next, info_count = re.subn(
-              "^[ \t]*sha256sums_x86_64 = .*$",
-              f"\tsha256sums_x86_64 = {digest}",
-              info_text,
-              count=1,
-              flags=re.M,
-          )
-          if info_count != 1:
-              sys.exit(".SRCINFO is missing sha256sums_x86_64")
-          srcinfo.write_text(info_next)
-          print(f"AUR sha256 {digest} ({matches[0].name})")
-          PY
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add packaging/aur/PKGBUILD packaging/aur/.SRCINFO
-          if git diff --cached --quiet; then
-            echo "AUR files already at ${VERSION}; nothing to push."
-            exit 0
-          fi
-          git commit -m "chore: bump AUR pkgver to ${VERSION} [skip ci]"
-          git push origin "HEAD:refs/heads/${BRANCH}"

@@ -36,8 +36,9 @@ install=futureboard-studio-bin.install
 # every day and whose files are named with the build date.
 _appimage="Futureboard.Studio-${_appver}-x86_64.AppImage"
 source_x86_64=("${_appimage}::https://github.com/futureboard/futureboard-studio/releases/download/${_appver}/${_appimage}")
-# The desktop release workflow replaces this with the sha256 of the AppImage
-# it just uploaded. It is never SKIP.
+# Release Build (.github/workflows/release.yml, `aur-checksum`) replaces this
+# with the sha256 of the AppImage it just attached to the release. It is never
+# SKIP; all zeros means no release has been built for `_appver` yet.
 sha256sums_x86_64=('0000000000000000000000000000000000000000000000000000000000000000')
 
 prepare() {
