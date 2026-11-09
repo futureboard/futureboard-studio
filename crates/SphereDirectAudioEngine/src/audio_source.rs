@@ -135,6 +135,36 @@ impl MappedWavSource {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static STREAMING_WAV_THRESHOLD_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// WAVs this size or larger stream from disk. Tests on this thread can lower
+/// it ([`with_streaming_wav_threshold`]) to stream a small file.
+#[inline]
+fn streaming_wav_threshold_bytes() -> u64 {
+    #[cfg(test)]
+    if let Some(bytes) = STREAMING_WAV_THRESHOLD_OVERRIDE.with(|cell| cell.get()) {
+        return bytes;
+    }
+    STREAMING_WAV_THRESHOLD_BYTES
+}
+
+/// Run `f` with WAVs of `bytes` or more streamed from disk on this thread.
+#[cfg(test)]
+pub(crate) fn with_streaming_wav_threshold<R>(bytes: u64, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<u64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            STREAMING_WAV_THRESHOLD_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(STREAMING_WAV_THRESHOLD_OVERRIDE.with(|cell| cell.replace(Some(bytes))));
+    f()
+}
+
 /// Open the best playback source for `path`.
 ///
 /// Large WAVs and large compressed files use the disk-streaming source. Small
@@ -148,7 +178,7 @@ pub fn open_clip_audio_source(path: &str) -> Result<ClipAudioSource, String> {
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    if matches!(ext.as_str(), "wav" | "wave") && file_size >= STREAMING_WAV_THRESHOLD_BYTES {
+    if matches!(ext.as_str(), "wav" | "wave") && file_size >= streaming_wav_threshold_bytes() {
         let source = StreamingSource::open(path)?;
         eprintln!(
             "[SphereAudio] stream WAV '{}': {} bytes, {} frames @ {}Hz",

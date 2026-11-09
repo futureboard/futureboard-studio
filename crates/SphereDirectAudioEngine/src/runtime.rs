@@ -3678,6 +3678,7 @@ impl RuntimeProject {
             decoded_by_path,
             &mut open_clip_audio_source,
         );
+        publish_stream_clip_spans(&clips, output_sample_rate);
 
         if skipped_no_path > 0 || skipped_decode_err > 0 || loaded_fresh > 0 {
             eprintln!(
@@ -7557,6 +7558,32 @@ pub(crate) fn clip_gain_step(sample_rate: u32) -> f32 {
 /// collide with one and are easy to tell apart when pruning.
 fn stream_lane_key(path: &str, lane: usize) -> String {
     format!("{path}\u{0}stream-lane:{lane}")
+}
+
+/// Tell every disk stream where the clips reading it sit on the timeline, so
+/// a transport seek can cue its target before the audio thread reads there
+/// (#380, [`crate::streaming_source::StreamingSource::prefetch_timeline`]).
+///
+/// Control thread only: allocates and takes each stream's span lock.
+fn publish_stream_clip_spans(clips: &[RuntimeClip], output_sample_rate: u32) {
+    use crate::streaming_source::{StreamClipSpan, StreamingSource};
+    let mut by_stream: Vec<(&Arc<StreamingSource>, Vec<StreamClipSpan>)> = Vec::new();
+    for clip in clips {
+        let ClipAudioSource::Streaming(stream) = clip.source.as_ref() else {
+            continue;
+        };
+        let span = StreamClipSpan::from_clip(clip, output_sample_rate);
+        match by_stream
+            .iter_mut()
+            .find(|(known, _)| Arc::ptr_eq(known, stream))
+        {
+            Some((_, spans)) => spans.push(span),
+            None => by_stream.push((stream, vec![span])),
+        }
+    }
+    for (stream, spans) in by_stream {
+        stream.set_clip_spans(spans);
+    }
 }
 
 /// Give clips of one disk-streamed file that overlap in time their own stream.

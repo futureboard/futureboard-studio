@@ -2044,6 +2044,17 @@ impl EngineInner {
     }
 
     pub fn seek(&self, position_seconds: f64) -> Result<(), SphereAudioError> {
+        // #380: have each disk stream start decoding the seek target now, so
+        // the first callback after the seek finds it buffered instead of
+        // playing a block of silence. Skipped (never waited for) while a
+        // graph build holds the cache.
+        if let Some(cache) = self.audio_cache.try_lock() {
+            for source in cache.values() {
+                if let ClipAudioSource::Streaming(stream) = source.as_ref() {
+                    stream.prefetch_timeline(position_seconds);
+                }
+            }
+        }
         self.send_command(EngineCommand::Seek { position_seconds })
     }
 

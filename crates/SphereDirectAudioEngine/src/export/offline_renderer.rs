@@ -411,6 +411,21 @@ fn render_offline_impl(
         snapshot.pdc_enabled,
     )
     .map_err(|e| ExportError::Build(e.to_string()))?;
+    // #370: a disk stream returns silence for frames its decoder has not
+    // delivered yet, and an export runs far faster than real time — the start
+    // of a streamed clip was lost, differently on every run. The streams in
+    // this fresh cache belong to this graph alone, so they are switched to
+    // reads that wait for their decoder; no live playback reads them.
+    let streams: Vec<Arc<crate::streaming_source::StreamingSource>> = audio_cache
+        .values()
+        .filter_map(|source| match source.as_ref() {
+            ClipAudioSource::Streaming(stream) => Some(Arc::clone(stream)),
+            _ => None,
+        })
+        .collect();
+    for stream in &streams {
+        stream.set_blocking(true);
+    }
     let bridge_failure = Arc::new(OfflineBridgeFailure::default());
     runtime.sample_rate = request.sample_rate;
     let block = if bridge_sinks.is_some() {
@@ -656,6 +671,9 @@ fn render_offline_impl(
         }
         if let Some(message) = bridge_failure.message() {
             return Err(ExportError::PluginBridge(message));
+        }
+        if let Some(message) = streams.iter().find_map(|stream| stream.blocking_failure()) {
+            return Err(ExportError::SourceRead(message));
         }
         // Match the realtime path: per-block MIDI events are consumed once,
         // and so are the Solfege pitch and articulation lists. An export that
@@ -1331,6 +1349,116 @@ mod tests {
         );
         // Must not panic on a missing processor / unparseable blob.
         restore_offline_plugin_states(&snapshot, &mut runtime);
+    }
+
+    /// #370: a clip on a disk-streamed file exports exactly like the same file
+    /// decoded in memory, on every run. The stream used to answer the
+    /// exporter (far faster than real time) with silence wherever its decoder
+    /// had not caught up, so the clip's start was lost, by a different amount
+    /// each time.
+    #[test]
+    fn streamed_clip_exports_identical_to_the_in_memory_path_every_run() {
+        use crate::audio_source::{open_clip_audio_source, with_streaming_wav_threshold};
+
+        // 12.5 s of 16-bit stereo, never zero, so silence can only be absence.
+        let frames = 600_000u32;
+        let path = std::env::temp_dir().join(format!(
+            "fb_export_stream_{}_{frames}.wav",
+            std::process::id()
+        ));
+        let data_len = frames * 4;
+        let mut bytes = Vec::with_capacity(44 + data_len as usize);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&48_000u32.to_le_bytes());
+        bytes.extend_from_slice(&(48_000u32 * 4).to_le_bytes());
+        bytes.extend_from_slice(&4u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        for f in 0..frames {
+            let l = (f % 20_011) as i16 + 1;
+            let r = -((f % 7_919) as i16) - 1;
+            bytes.extend_from_slice(&l.to_le_bytes());
+            bytes.extend_from_slice(&r.to_le_bytes());
+        }
+        std::fs::write(&path, bytes).expect("write test wav");
+        let media = path.to_str().expect("utf-8 temp path").to_string();
+
+        // The issue's case: a clip from beat 4 (2 s) with a source offset,
+        // in a 10 s export.
+        let mut snapshot = silence_snapshot(48_000);
+        snapshot.clips.push(crate::types::EngineClipSnapshot {
+            id: "streamed".to_string(),
+            track_id: "track-1".to_string(),
+            asset_id: "asset".to_string(),
+            media_path: Some(media.clone()),
+            start_beat: 4.0,
+            duration_beats: 12.0,
+            offset_seconds: 5.0,
+            gain: 1.0,
+            muted: false,
+            ara_rendered: false,
+            fades: None,
+            stretch: Default::default(),
+            audio_process: None,
+        });
+        let req = request(0, 480_000);
+        let render = || {
+            let mut mix = Vec::new();
+            render_offline(
+                &snapshot,
+                &req,
+                &ExportCancelToken::new(),
+                1.0,
+                |block| {
+                    mix.extend_from_slice(block);
+                    Ok(())
+                },
+                |_| {},
+            )
+            .expect("render");
+            mix
+        };
+        let silent_frames = |mix: &[f32]| {
+            mix.chunks_exact(2)
+                .filter(|f| f[0] == 0.0 && f[1] == 0.0)
+                .count()
+        };
+
+        assert!(!open_clip_audio_source(&media).unwrap().is_streaming());
+        let in_memory = render();
+        assert_eq!(in_memory.len(), 480_000 * 2);
+        // 2 s before the clip and 2 s after its 6 s.
+        assert_eq!(silent_frames(&in_memory), 192_000);
+        assert_eq!(
+            in_memory
+                .chunks_exact(2)
+                .position(|f| f[0] != 0.0 || f[1] != 0.0),
+            Some(96_000)
+        );
+
+        let streamed: Vec<Vec<f32>> = with_streaming_wav_threshold(0, || {
+            assert!(open_clip_audio_source(&media).unwrap().is_streaming());
+            (0..3).map(|_| render()).collect()
+        });
+        let _ = std::fs::remove_file(&path);
+        for (run, mix) in streamed.iter().enumerate() {
+            assert_eq!(silent_frames(mix), 192_000, "run {run}");
+            assert_eq!(mix.len(), in_memory.len(), "run {run}");
+            let first_difference = mix
+                .iter()
+                .zip(&in_memory)
+                .position(|(a, b)| a.to_bits() != b.to_bits());
+            assert_eq!(
+                first_difference, None,
+                "run {run} differs from the in-memory export"
+            );
+        }
     }
 
     #[test]

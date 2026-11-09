@@ -56,6 +56,9 @@ pub enum ExportError {
     Build(String),
     /// A bridged plug-in did not return a complete block during offline render.
     PluginBridge(String),
+    /// A clip's audio could not be read (a disk stream's decoder failed or
+    /// stalled), so the file would have had silence in its place.
+    SourceRead(String),
     /// The encoder rejected the spec or failed to write.
     Encode(sphere_encoder::EncodeError),
     Io(std::io::Error),
@@ -70,6 +73,7 @@ impl std::fmt::Display for ExportError {
         match self {
             Self::Build(message) => write!(f, "render graph build failed: {message}"),
             Self::PluginBridge(message) => write!(f, "offline plug-in bridge failed: {message}"),
+            Self::SourceRead(message) => write!(f, "could not read clip audio: {message}"),
             Self::Encode(error) => write!(f, "encode failed: {error}"),
             Self::Io(error) => write!(f, "io error: {error}"),
             Self::Cancelled => write!(f, "export cancelled"),

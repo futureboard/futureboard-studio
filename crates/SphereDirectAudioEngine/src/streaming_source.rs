@@ -38,11 +38,40 @@
 //! read. In both directions a slot is only rewritten after the window stopped
 //! covering it, and the reader keeps at least `THROTTLE_MARGIN` frames away
 //! from the edge being dropped.
+//!
+//! ## Cues (#380)
+//!
+//! The window follows the reader, so a jump — a loop wrap, a seek back —
+//! always lands outside it, and the first block after the jump used to play
+//! silence while the worker repositioned. A *cue* is a small second buffer
+//! (`CUE_FRAMES`) the worker fills ahead of time around a frame the control
+//! side or the render path says the reader is about to jump to: the loop
+//! start of a looped clip ([`StreamCue::Loop`], requested from the render path
+//! every block with a relaxed compare-and-store) and a transport seek target
+//! ([`StreamCue::Seek`], requested from the control thread before the seek
+//! command is sent). Reads that miss the window fall back to the cues, and
+//! the reader keeps publishing `reader_frame`, so the worker repositions the
+//! window while the cue covers the jump. A cue is only rewritten when its
+//! request changes, after its window was unpublished (the loop cue only once
+//! the window has caught up with the reader, so the reader is not on it; a
+//! read racing a new seek request can at worst get one stale sample, never
+//! UB — the slots are atomics).
+//!
+//! ## Offline reads (#370)
+//!
+//! An export runs far faster than real time and must be sample-identical to
+//! the in-memory path, so silence on a miss is never acceptable there. A source
+//! switched to blocking reads ([`StreamingSource::set_blocking`]) waits for
+//! the worker instead — wakes it, then yields/sleeps until the frame and its
+//! interpolation partner are buffered — and records a failure (reported by the
+//! exporter as an error) if the decoder stopped or did not deliver in
+//! `BLOCKING_READ_TIMEOUT`. Only the offline renderer's private streams are
+//! switched; the realtime read path never waits.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use std::fs::File;
 use std::io;
@@ -81,6 +110,45 @@ const DIRECTION_JUMP: u64 = 16384;
 /// rest (2^44 frames — far beyond any file).
 const WINDOW_LEN_BITS: u32 = 20;
 const WINDOW_LEN_MASK: u64 = (1 << WINDOW_LEN_BITS) - 1;
+
+/// Frames per cue. 32768 frames ≈ 0.68 s @ 48 kHz (256 KB): the time the
+/// worker has to reposition the main window after the reader jumps into it.
+const CUE_FRAMES: usize = 1 << 15;
+
+/// Frames a cue keeps on the near side of its target, for readers that start
+/// a little before the frame they were cued at (a stretcher priming its
+/// input, a grain pair).
+const CUE_LEAD_IN: u64 = 4096;
+
+/// `Cue::request` when nothing is requested.
+const NO_CUE: u64 = u64::MAX;
+
+const CUE_COUNT: usize = 2;
+
+/// How long an offline (blocking) read waits for the decoder before the
+/// export fails with an error instead of writing silence.
+const BLOCKING_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Which prefetch slot a cue request fills (see "Cues" in the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamCue {
+    /// A transport seek target, requested from the control thread.
+    Seek = 0,
+    /// The loop start of a looped clip, requested from the render path.
+    Loop = 1,
+}
+
+/// Pack a cue target for `Cue::request`: the frame, and whether the reader
+/// moves backward from it (a reversed clip).
+#[inline]
+fn cue_request_word(frame: f64, reverse: bool, total_frames: u64) -> u64 {
+    let frame = if frame.is_finite() && frame > 0.0 {
+        (frame as u64).min(total_frames.saturating_sub(1))
+    } else {
+        0
+    };
+    (frame << 1) | reverse as u64
+}
 
 #[inline]
 fn pack_window(start: u64, end: u64) -> u64 {
@@ -147,6 +215,74 @@ pub fn diagnostics() -> DiskStreamDiagnostics {
     }
 }
 
+fn atomic_frames(frames: usize) -> Box<[AtomicU32]> {
+    (0..frames * 2)
+        .map(|_| AtomicU32::new(0))
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
+/// One prefetched region outside the main window (see "Cues" in the module
+/// docs). Slot `i` holds frame `start + i` of the published window.
+#[derive(Debug)]
+struct Cue {
+    /// Interleaved stereo f32 bits; length `CUE_FRAMES * 2`.
+    data: Box<[AtomicU32]>,
+    /// Packed `[start, end)` of the frames the cue holds.
+    window: AtomicU64,
+    /// What the cue should hold: [`cue_request_word`] or [`NO_CUE`].
+    request: AtomicU64,
+}
+
+impl Cue {
+    fn new() -> Self {
+        Self {
+            data: atomic_frames(CUE_FRAMES),
+            window: AtomicU64::new(pack_window(0, 0)),
+            request: AtomicU64::new(NO_CUE),
+        }
+    }
+
+    #[inline]
+    fn window(&self) -> (u64, u64) {
+        unpack_window(self.window.load(Ordering::Acquire))
+    }
+
+    #[inline]
+    fn load_frame(&self, start: u64, idx: u64) -> (f32, f32) {
+        let slot = (idx - start) as usize * 2;
+        (
+            f32::from_bits(self.data[slot].load(Ordering::Relaxed)),
+            f32::from_bits(self.data[slot + 1].load(Ordering::Relaxed)),
+        )
+    }
+
+    #[inline]
+    fn store_frame(&self, start: u64, idx: u64, l: f32, r: f32) {
+        let slot = (idx - start) as usize * 2;
+        self.data[slot].store(l.to_bits(), Ordering::Relaxed);
+        self.data[slot + 1].store(r.to_bits(), Ordering::Relaxed);
+    }
+}
+
+/// What a read found.
+enum Lookup {
+    /// The frame and its interpolation partner were buffered.
+    Hit((f32, f32)),
+    /// The frame was buffered but its interpolation partner was not: the
+    /// frame itself, held.
+    Partial((f32, f32)),
+    Miss,
+}
+
+#[inline]
+fn lerp_frames(pos: f64, idx: u64, (l0, r0): (f32, f32), (l1, r1): (f32, f32)) -> (f32, f32) {
+    // The same arithmetic as `audio_source::sample_source_stereo`, so a
+    // streamed read is bit-identical to an in-memory one.
+    let frac = (pos - idx as f64) as f32;
+    (l0 + (l1 - l0) * frac, r0 + (r1 - r0) * frac)
+}
+
 /// Lock-free stereo ring shared between the decoder thread (producer) and the
 /// audio callback (consumer).
 #[derive(Debug)]
@@ -160,23 +296,46 @@ pub struct StreamingRing {
     window: AtomicU64,
     reader_frame: AtomicU64,
     underruns: AtomicU64,
+    /// Prefetched jump targets, indexed by [`StreamCue`].
+    cues: [Cue; CUE_COUNT],
+    /// Frame at which the decoder reached the end of the stream, if it ended
+    /// before `total_frames` (an estimated length); `u64::MAX` until then.
+    eof_frame: AtomicU64,
+    /// Offline reads: wait for the decoder instead of returning silence.
+    blocking: AtomicBool,
+    /// First offline read that could not be served: `frame + 1`, or 0.
+    blocking_failed_frame: AtomicU64,
+    /// The decoder thread has exited (error or stop).
+    worker_exited: AtomicBool,
 }
 
 impl StreamingRing {
     fn new(total_frames: u64, sample_rate: u32, capacity: usize) -> Self {
         let capacity = capacity.clamp(2, WINDOW_LEN_MASK as usize);
-        let data = (0..capacity * 2)
-            .map(|_| AtomicU32::new(0))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
         Self {
             capacity,
             total_frames,
             sample_rate,
-            data,
+            data: atomic_frames(capacity),
             window: AtomicU64::new(pack_window(0, 0)),
             reader_frame: AtomicU64::new(0),
             underruns: AtomicU64::new(0),
+            cues: [Cue::new(), Cue::new()],
+            eof_frame: AtomicU64::new(u64::MAX),
+            blocking: AtomicBool::new(false),
+            blocking_failed_frame: AtomicU64::new(0),
+            worker_exited: AtomicBool::new(false),
+        }
+    }
+
+    /// Ask the worker to prefetch around `frame` into `cue`. Realtime-safe:
+    /// one relaxed load, and a release store only when the target changed.
+    #[inline]
+    pub fn request_cue(&self, cue: StreamCue, frame: f64, reverse: bool) {
+        let word = cue_request_word(frame, reverse, self.total_frames);
+        let slot = &self.cues[cue as usize].request;
+        if slot.load(Ordering::Relaxed) != word {
+            slot.store(word, Ordering::Release);
         }
     }
 
@@ -221,9 +380,59 @@ impl StreamingRing {
 
     // ── Consumer side (audio callback) ───────────────────────────────────────
 
+    /// Frame `idx` from a cue, if one holds it.
+    #[inline]
+    fn cue_frame(&self, idx: u64) -> Option<(f32, f32)> {
+        self.cues.iter().find_map(|cue| {
+            let (start, end) = cue.window();
+            (idx >= start && idx < end).then(|| cue.load_frame(start, idx))
+        })
+    }
+
+    /// Frame `idx` from the window or a cue, if either holds it.
+    #[inline]
+    fn buffered_frame(&self, idx: u64) -> Option<(f32, f32)> {
+        let (start, end) = self.window();
+        if idx >= start && idx < end {
+            return Some(self.load_frame(idx));
+        }
+        self.cue_frame(idx)
+    }
+
+    /// The interpolated sample at `pos` (`idx = floor(pos)`, in range) from
+    /// the window, falling back to the cues. Atomic loads only.
+    #[inline]
+    fn lookup(&self, pos: f64, idx: u64) -> Lookup {
+        // Next frame for interpolation, clamped to the last real frame.
+        let next = (idx + 1).min(self.total_frames - 1);
+        let (start, end) = self.window();
+        let first = if idx >= start && idx < end {
+            let first = self.load_frame(idx);
+            if next == idx {
+                return Lookup::Hit(first);
+            }
+            if next < end {
+                return Lookup::Hit(lerp_frames(pos, idx, first, self.load_frame(next)));
+            }
+            first
+        } else {
+            match self.cue_frame(idx) {
+                Some(first) => first,
+                None => return Lookup::Miss,
+            }
+        };
+        if next == idx {
+            return Lookup::Hit(first);
+        }
+        match self.buffered_frame(next) {
+            Some(second) => Lookup::Hit(lerp_frames(pos, idx, first, second)),
+            None => Lookup::Partial(first),
+        }
+    }
+
     /// Read a linearly-interpolated stereo sample at fractional frame `pos`.
-    /// Realtime-safe: relaxed atomic loads only. Out-of-window reads return
-    /// silence and bump the underrun counters.
+    /// Realtime-safe: relaxed atomic loads only. Reads the window, else a cue;
+    /// a frame in neither returns silence and bumps the underrun counters.
     #[inline]
     pub fn read_interp(&self, pos: f64) -> (f32, f32) {
         GLOBAL_READS.fetch_add(1, Ordering::Relaxed);
@@ -237,24 +446,83 @@ impl StreamingRing {
         // Tell the worker where playback is so it can prefetch / reposition.
         self.reader_frame.store(idx, Ordering::Release);
 
-        let (start, end) = self.window();
-        if idx < start || idx >= end {
-            self.bump_underrun();
+        match self.lookup(pos, idx) {
+            // A missing interpolation partner (at the window's edge) holds
+            // this frame rather than counting an underrun.
+            Lookup::Hit(value) | Lookup::Partial(value) => {
+                GLOBAL_HITS.fetch_add(1, Ordering::Relaxed);
+                value
+            }
+            Lookup::Miss => {
+                self.bump_underrun();
+                (0.0, 0.0)
+            }
+        }
+    }
+
+    /// Offline read: like [`Self::read_interp`], but waits for the decoder
+    /// (waking it through `wake`) until the frame and its interpolation
+    /// partner are buffered, so an export never writes the silence of a
+    /// frame that simply was not decoded yet. A read that cannot be served —
+    /// the decoder stopped, or did not deliver in `BLOCKING_READ_TIMEOUT` —
+    /// records a failure for the exporter and returns silence; once failed,
+    /// reads stop waiting. Never called on the audio thread.
+    fn read_interp_blocking(&self, pos: f64, wake: impl Fn()) -> (f32, f32) {
+        GLOBAL_READS.fetch_add(1, Ordering::Relaxed);
+        if pos < 0.0 || self.total_frames == 0 {
             return (0.0, 0.0);
         }
-        GLOBAL_HITS.fetch_add(1, Ordering::Relaxed);
-
-        // Next frame for interpolation, clamped to the last real frame.
-        let next = (idx + 1).min(self.total_frames - 1);
-        let (l0, r0) = self.load_frame(idx);
-        if next == idx || next >= end {
-            // At EOF, or the next frame is not buffered yet: hold this frame
-            // rather than counting an underrun for the interpolation partner.
-            return (l0, r0);
+        let idx = pos.floor() as u64;
+        if idx >= self.total_frames {
+            return (0.0, 0.0);
         }
-        let frac = (pos - idx as f64) as f32;
-        let (l1, r1) = self.load_frame(next);
-        (l0 + (l1 - l0) * frac, r0 + (r1 - r0) * frac)
+        let next = (idx + 1).min(self.total_frames - 1);
+        let mut want = idx;
+        let mut deadline: Option<Instant> = None;
+        let mut attempts = 0u32;
+        loop {
+            self.reader_frame.store(want, Ordering::Release);
+            let eof = self.eof_frame.load(Ordering::Acquire);
+            match self.lookup(pos, idx) {
+                Lookup::Hit(value) => {
+                    GLOBAL_HITS.fetch_add(1, Ordering::Relaxed);
+                    return value;
+                }
+                // The partner is past the end the decoder found: hold, as
+                // the in-memory path does on its last frame.
+                Lookup::Partial(value) if next >= eof => {
+                    GLOBAL_HITS.fetch_add(1, Ordering::Relaxed);
+                    return value;
+                }
+                // Ask for the partner; the frame itself is already there.
+                Lookup::Partial(_) => want = next,
+                // The stream ended before this frame (an estimated length).
+                Lookup::Miss if idx >= eof => return (0.0, 0.0),
+                Lookup::Miss => want = idx,
+            }
+            if self.blocking_failed_frame.load(Ordering::Acquire) != 0 {
+                return (0.0, 0.0);
+            }
+            let now = Instant::now();
+            let deadline = *deadline.get_or_insert(now + BLOCKING_READ_TIMEOUT);
+            if self.worker_exited.load(Ordering::Acquire) || now >= deadline {
+                self.bump_underrun();
+                let _ = self.blocking_failed_frame.compare_exchange(
+                    0,
+                    idx + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+                return (0.0, 0.0);
+            }
+            wake();
+            attempts = attempts.saturating_add(1);
+            if attempts < 64 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(Duration::from_micros(100));
+            }
+        }
     }
 
     #[inline]
@@ -279,6 +547,120 @@ pub struct StreamingSource {
     ring: Arc<StreamingRing>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
+    /// Where the clips reading this stream sit on the timeline, so a seek
+    /// can cue its target (#380). Control thread only: written by
+    /// `RuntimeProject::build`, read by [`Self::prefetch_timeline`].
+    clip_spans: parking_lot::Mutex<Vec<StreamClipSpan>>,
+}
+
+/// One clip's mapping from timeline samples to frames of its stream: the
+/// resample path's mapping (`resolved_clip_source_frame` in the render
+/// kernel), which the stretch paths read close around. Used to cue a stream
+/// before the reader jumps; an approximate frame only costs a miss.
+#[derive(Debug, Clone)]
+pub(crate) struct StreamClipSpan {
+    start_sample: u64,
+    duration_samples: u64,
+    output_sample_rate: u32,
+    offset_seconds: f64,
+    read_rate: f64,
+    reverse: bool,
+    warp_segments: Vec<crate::runtime::RuntimeWarpSegment>,
+}
+
+impl StreamClipSpan {
+    /// Control thread only (clones the warp map).
+    pub(crate) fn from_clip(clip: &crate::runtime::RuntimeClip, output_sample_rate: u32) -> Self {
+        Self {
+            start_sample: clip.start_sample,
+            duration_samples: clip.duration_samples,
+            output_sample_rate,
+            offset_seconds: clip.offset_seconds,
+            read_rate: cue_read_rate(clip),
+            reverse: clip.reverse,
+            warp_segments: clip.warp_segments.clone(),
+        }
+    }
+
+    fn source_frame(&self, rel: u64, source_sample_rate: u32) -> f64 {
+        cue_source_frame(
+            rel,
+            self.duration_samples,
+            self.output_sample_rate,
+            self.offset_seconds,
+            self.read_rate,
+            self.reverse,
+            &self.warp_segments,
+            source_sample_rate,
+        )
+    }
+}
+
+/// Source frames per output frame a clip reads at: its stretch ratio on the
+/// stretch paths, its resample rate otherwise (mirrors the render kernel).
+#[inline]
+fn cue_read_rate(clip: &crate::runtime::RuntimeClip) -> f64 {
+    if matches!(
+        clip.processor,
+        crate::runtime::ClipDspProcessor::PhaseVocoderBasic
+    ) && clip.warp_segments.is_empty()
+    {
+        1.0 / clip.effective_time_ratio.max(0.01) as f64
+    } else {
+        clip.source_read_rate as f64
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn cue_source_frame(
+    rel: u64,
+    duration_samples: u64,
+    output_sample_rate: u32,
+    offset_seconds: f64,
+    read_rate: f64,
+    reverse: bool,
+    warp_segments: &[crate::runtime::RuntimeWarpSegment],
+    source_sample_rate: u32,
+) -> f64 {
+    if let Some(frame) =
+        crate::runtime::map_warp_source_frame(rel, duration_samples, reverse, warp_segments)
+    {
+        return frame;
+    }
+    let advance = if reverse {
+        duration_samples.saturating_sub(1).saturating_sub(rel)
+    } else {
+        rel
+    } as f64;
+    (offset_seconds + advance / output_sample_rate.max(1) as f64 * read_rate)
+        * source_sample_rate as f64
+}
+
+/// Cue a looped, disk-streamed clip's loop start (#380): `rel` is the loop
+/// start relative to the clip. Realtime-safe — arithmetic and the atomics of
+/// [`StreamingRing::request_cue`] only; no allocation, lock, or wakeup (the
+/// worker polls).
+#[inline]
+pub(crate) fn cue_loop_start(
+    stream: &StreamingSource,
+    clip: &crate::runtime::RuntimeClip,
+    rel: u64,
+    output_sample_rate: u32,
+) {
+    let frame = cue_source_frame(
+        rel,
+        clip.duration_samples,
+        output_sample_rate,
+        clip.offset_seconds,
+        cue_read_rate(clip),
+        clip.reverse,
+        &clip.warp_segments,
+        stream.sample_rate(),
+    );
+    stream
+        .ring
+        .request_cue(StreamCue::Loop, frame, clip.reverse);
 }
 
 impl std::fmt::Debug for StreamingSource {
@@ -313,7 +695,10 @@ impl StreamingSource {
         let worker = std::thread::Builder::new()
             .name("daux-stream-decoder".to_string())
             .spawn(move || {
-                if let Err(e) = decode_loop(&worker_path, &worker_ring, &worker_stop) {
+                let result = decode_loop(&worker_path, &worker_ring, &worker_stop);
+                // Offline reads stop waiting for a decoder that is gone.
+                worker_ring.worker_exited.store(true, Ordering::Release);
+                if let Err(e) = result {
                     if disk_stream_debug_enabled() {
                         eprintln!("[DAUx stream] decoder exited: {e}");
                     }
@@ -334,6 +719,7 @@ impl StreamingSource {
             ring,
             stop,
             worker: Some(worker),
+            clip_spans: parking_lot::Mutex::new(Vec::new()),
         })
     }
 
@@ -347,14 +733,102 @@ impl StreamingSource {
         self.ring.total_frames as usize
     }
 
+    /// Interpolated stereo sample at `pos`. Realtime streams never wait (a
+    /// miss is silence); an offline stream waits for its decoder (#370).
     #[inline]
     pub fn read_interp(&self, pos: f64) -> (f32, f32) {
+        if self.ring.blocking.load(Ordering::Relaxed) {
+            return self.ring.read_interp_blocking(pos, || self.wake_worker());
+        }
         self.ring.read_interp(pos)
     }
 
     #[inline]
     pub fn read_frame_stereo(&self, frame: usize) -> (f32, f32) {
-        self.ring.read_interp(frame as f64)
+        self.read_interp(frame as f64)
+    }
+
+    /// Switch this stream to offline reads that wait for the decoder (#370).
+    /// Only for a stream no realtime graph reads: the offline renderer opens
+    /// its own.
+    pub fn set_blocking(&self, blocking: bool) {
+        self.ring.blocking.store(blocking, Ordering::Relaxed);
+    }
+
+    /// Why an offline read could not be served, once one could not.
+    pub fn blocking_failure(&self) -> Option<String> {
+        let failed = self.ring.blocking_failed_frame.load(Ordering::Acquire);
+        if failed == 0 {
+            return None;
+        }
+        let frame = failed - 1;
+        Some(if self.ring.worker_exited.load(Ordering::Acquire) {
+            format!(
+                "the disk-stream decoder stopped before frame {frame} of {} was decoded",
+                self.ring.total_frames
+            )
+        } else {
+            format!(
+                "the disk-stream decoder did not deliver frame {frame} within {} s",
+                BLOCKING_READ_TIMEOUT.as_secs()
+            )
+        })
+    }
+
+    /// Prefetch around `frame` into `cue` now, waking the decoder. Control
+    /// thread (the wakeup is a syscall); the render path uses
+    /// [`StreamingRing::request_cue`] through [`cue_loop_start`].
+    pub fn prefetch(&self, cue: StreamCue, frame: f64, reverse: bool) {
+        self.ring.request_cue(cue, frame, reverse);
+        self.wake_worker();
+    }
+
+    /// Replace the clip mappings [`Self::prefetch_timeline`] uses. Control
+    /// thread only.
+    pub(crate) fn set_clip_spans(&self, spans: Vec<StreamClipSpan>) {
+        *self.clip_spans.lock() = spans;
+    }
+
+    /// The transport is about to jump to `position_seconds`: cue the frame
+    /// the clip there will read — or, between clips, the first frame of the
+    /// next clip of this stream — before the audio thread gets there (#380).
+    /// Control thread only.
+    pub fn prefetch_timeline(&self, position_seconds: f64) {
+        let target = {
+            let spans = self.clip_spans.lock();
+            let mut covering = None;
+            let mut upcoming: Option<(u64, &StreamClipSpan)> = None;
+            for span in spans.iter() {
+                // The same truncation the Seek command applies.
+                let t = (position_seconds.max(0.0) * span.output_sample_rate as f64) as u64;
+                let end = span.start_sample.saturating_add(span.duration_samples);
+                if t >= span.start_sample && t < end {
+                    covering = Some((
+                        span.source_frame(t - span.start_sample, self.ring.sample_rate),
+                        span.reverse,
+                    ));
+                    break;
+                }
+                if span.start_sample > t
+                    && upcoming.is_none_or(|(start, _)| span.start_sample < start)
+                {
+                    upcoming = Some((span.start_sample, span));
+                }
+            }
+            covering.or_else(|| {
+                upcoming
+                    .map(|(_, span)| (span.source_frame(0, self.ring.sample_rate), span.reverse))
+            })
+        };
+        if let Some((frame, reverse)) = target {
+            self.prefetch(StreamCue::Seek, frame, reverse);
+        }
+    }
+
+    fn wake_worker(&self) {
+        if let Some(worker) = &self.worker {
+            worker.thread().unpark();
+        }
     }
 }
 
@@ -362,6 +836,7 @@ impl Drop for StreamingSource {
     fn drop(&mut self) {
         GLOBAL_ACTIVE_SOURCES.fetch_sub(1, Ordering::Relaxed);
         self.stop.store(true, Ordering::Release);
+        self.wake_worker();
         if let Some(handle) = self.worker.take() {
             let _ = handle.join();
         }
@@ -565,6 +1040,8 @@ struct Filler<'a> {
     dec: StreamDecoder,
     start: u64,
     end: u64,
+    /// The cue request each cue was last filled for.
+    cue_served: [u64; CUE_COUNT],
 }
 
 impl Filler<'_> {
@@ -647,10 +1124,86 @@ impl Filler<'_> {
         match self.dec.decode_next()? {
             Packet::Frames(first) => self.append(first),
             Packet::Skipped => {}
-            // Nothing more to decode; idle until a seek wakes us.
-            Packet::Eof => return Ok(Step::Idle),
+            // Nothing more to decode; idle until a seek wakes us. Record
+            // where the stream really ended, so offline reads past it (an
+            // estimated length) do not wait for frames that do not exist.
+            Packet::Eof => {
+                self.ring
+                    .eof_frame
+                    .fetch_min(self.dec.next_frame, Ordering::AcqRel);
+                return Ok(Step::Idle);
+            }
         }
         Ok(Step::Busy)
+    }
+
+    /// Fill `cue` if its request changed since it was last served. Returns
+    /// whether it did any work. The cue's window is unpublished before its
+    /// slots are rewritten and republished once they hold the new frames; the
+    /// decoder's position is left wherever the fill ended (the window fills
+    /// reseek when they find it moved).
+    fn serve_cue(&mut self, cue: StreamCue, stop: &AtomicBool) -> Result<bool, String> {
+        let slot = &self.ring.cues[cue as usize];
+        let request = slot.request.load(Ordering::Acquire);
+        if request == self.cue_served[cue as usize] {
+            return Ok(false);
+        }
+        self.cue_served[cue as usize] = request;
+        slot.window.store(pack_window(0, 0), Ordering::Release);
+        if request == NO_CUE {
+            return Ok(true);
+        }
+
+        let total = self.ring.total_frames;
+        let target = request >> 1;
+        let reverse = request & 1 == 1;
+        let span = CUE_FRAMES as u64;
+        // Most of the cue lies the way the reader will move from the target.
+        let from = if reverse {
+            (target + CUE_LEAD_IN + 1).saturating_sub(span)
+        } else {
+            target.saturating_sub(CUE_LEAD_IN)
+        };
+        let to = from.saturating_add(span).min(total);
+        if from >= to {
+            return Ok(true);
+        }
+
+        self.dec.seek(from);
+        let landed = self.dec.next_frame;
+        let cue_start = landed.max(from);
+        let mut reached = landed;
+        while reached < to {
+            if stop.load(Ordering::Acquire) {
+                return Ok(true);
+            }
+            match self.dec.decode_next()? {
+                Packet::Frames(first) => {
+                    if first != reached {
+                        break; // the decoder skipped: keep what is contiguous
+                    }
+                    let upto = (first + self.dec.decoded as u64).min(to);
+                    for f in first.max(cue_start)..upto {
+                        let (l, r) = self.dec.frame((f - first) as usize);
+                        slot.store_frame(cue_start, f, l, r);
+                    }
+                    reached = first + self.dec.decoded as u64;
+                }
+                Packet::Skipped => {}
+                Packet::Eof => break,
+            }
+        }
+        let cue_end = reached.min(to);
+        if cue_end > cue_start {
+            slot.window
+                .store(pack_window(cue_start, cue_end), Ordering::Release);
+        }
+        if disk_stream_debug_enabled() {
+            eprintln!(
+                "[DAUx stream] {cue:?} cue -> frames {cue_start}..{cue_end} (target={target})"
+            );
+        }
+        Ok(true)
     }
 
     /// Backward playback: keep the window reaching as far below the reader as
@@ -725,18 +1278,27 @@ impl Filler<'_> {
 /// Decoder thread body: open the file, then loop decoding and filling the ring
 /// in the reader's direction, repositioning on seek and throttling so the
 /// buffer stays ahead of the playhead without overrunning unread frames.
+///
+/// A seek cue is served as soon as it is requested (the reader is about to
+/// jump there); the loop cue once the window has caught up, so it never
+/// delays the frames the reader needs now. Idle waits park, so a seek
+/// prefetch or an offline read can wake the worker at once.
 fn decode_loop(path: &str, ring: &StreamingRing, stop: &AtomicBool) -> Result<(), String> {
     let mut filler = Filler {
         ring,
         dec: StreamDecoder::open(path)?,
         start: 0,
         end: 0,
+        cue_served: [NO_CUE; CUE_COUNT],
     };
     let mut dir = Direction::new();
 
     loop {
         if stop.load(Ordering::Acquire) {
             return Ok(());
+        }
+        if filler.serve_cue(StreamCue::Seek, stop)? {
+            continue;
         }
         let reader = ring.reader_frame();
         dir.observe(reader);
@@ -746,7 +1308,10 @@ fn decode_loop(path: &str, ring: &StreamingRing, stop: &AtomicBool) -> Result<()
             filler.fill_forward(reader, &mut dir)?
         };
         if step == Step::Idle {
-            std::thread::sleep(Duration::from_millis(2));
+            if filler.serve_cue(StreamCue::Loop, stop)? {
+                continue;
+            }
+            std::thread::park_timeout(Duration::from_millis(2));
         }
     }
 }
@@ -996,6 +1561,241 @@ mod tests {
         for f in (695_000..701_000u64).step_by(97) {
             read_waiting(&source, f);
         }
+        drop(source);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── Cues (#380) and offline reads (#370) ────────────────────────────────
+
+    /// Wait until `ready` holds, failing after 10 s.
+    fn wait_for(what: &str, ready: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn window_covers(source: &StreamingSource, from: u64, to: u64) -> bool {
+        let (start, end) = source.ring.window();
+        start <= from && to <= end
+    }
+
+    fn cue_covers(source: &StreamingSource, cue: StreamCue, from: u64, to: u64) -> bool {
+        let (start, end) = source.ring.cues[cue as usize].window();
+        start <= from && to <= end
+    }
+
+    /// The worker has filled the window as far ahead of the reader as it
+    /// ever does, so the window has left everything well behind the reader.
+    fn settled(source: &StreamingSource) -> bool {
+        let ring = &source.ring;
+        let reader = ring.reader_frame();
+        let target = (reader + ring.capacity as u64 - THROTTLE_MARGIN).min(ring.total_frames);
+        let (start, end) = ring.window();
+        start <= reader && end >= target
+    }
+
+    /// Play `[from, from + frames)` the way the callback does — 256-frame
+    /// blocks, without waiting for the worker — at about 2.5x real time.
+    /// Every frame must be the right one: never the silence of an underrun.
+    fn play(source: &StreamingSource, from: u64, frames: u64) {
+        let before = source.ring.underruns();
+        for block in (from..from + frames).step_by(256) {
+            for f in block..(block + 256).min(from + frames) {
+                let value = source.read_interp(f as f64);
+                assert_eq!(
+                    decode_index(value),
+                    f,
+                    "frame {f} read back other audio or the silence of an underrun"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(source.ring.underruns(), before, "underruns while playing");
+    }
+
+    /// #380: a loop wrap or a seek back to a cued frame plays on without a
+    /// silent block. Before cues the first read at the new position missed
+    /// the window (still at the old position) and the block was silence; now
+    /// the first reads come from the cue while the worker repositions the
+    /// window, which takes over before the cue runs out.
+    #[test]
+    fn a_cued_jump_plays_on_without_an_underrun() {
+        let frames = 900_000u64;
+        let path = write_index_wav("cue", frames);
+        let source = StreamingSource::open(path.to_str().unwrap()).expect("open stream");
+
+        for (cue, away, target) in [
+            (StreamCue::Loop, 500_000u64, 100_000u64),
+            (StreamCue::Seek, 300_000, 40_000),
+        ] {
+            // Play somewhere else until the window has left the target.
+            read_waiting(&source, away);
+            wait_for("the window to settle", || settled(&source));
+            play(&source, away, 4096);
+            wait_for("the window to settle", || settled(&source));
+            assert!(
+                !window_covers(&source, target, target + 1),
+                "the jump target must not still be in the window"
+            );
+
+            match cue {
+                // The render path's request: no wakeup, the worker polls.
+                StreamCue::Loop => source.ring.request_cue(cue, target as f64, false),
+                // The control thread's seek prefetch.
+                StreamCue::Seek => source.prefetch(cue, target as f64, false),
+            }
+            wait_for("the cue to fill", || {
+                cue_covers(&source, cue, target, target + 256)
+            });
+
+            // The jump, and on past the end of the cue.
+            play(&source, target, CUE_FRAMES as u64 * 2);
+        }
+        drop(source);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #380 end to end: the render path cues a looped streamed clip's loop
+    /// start, and every wrap plays it from the cue — while the stream's
+    /// window is still at the loop end — instead of a block of silence.
+    #[test]
+    fn looped_streamed_clip_wraps_without_a_silent_block() {
+        use crate::audio_source::ClipAudioSource;
+        use crate::engine::render_project_block_interleaved_with_taps;
+        use crate::runtime::RuntimeProject;
+        use crate::transport::{advance_loop_position, segment_frames_until_loop_wrap, LoopBounds};
+
+        let frames = 600_000u64;
+        let path = write_index_wav("loop", frames);
+        let media = path.to_str().unwrap().to_string();
+        let stream = Arc::new(StreamingSource::open(&media).expect("open stream"));
+        let mut cache = std::collections::HashMap::new();
+        cache.insert(
+            media.clone(),
+            Arc::new(ClipAudioSource::Streaming(Arc::clone(&stream))),
+        );
+        let mut snapshot = crate::export::silence_snapshot(48_000);
+        snapshot.clips.push(crate::types::EngineClipSnapshot {
+            id: "looped".to_string(),
+            track_id: "track-1".to_string(),
+            asset_id: "asset".to_string(),
+            media_path: Some(media.clone()),
+            start_beat: 0.0,
+            duration_beats: 20.0,
+            offset_seconds: 0.0,
+            gain: 1.0,
+            muted: false,
+            ara_rendered: false,
+            fades: None,
+            stretch: Default::default(),
+            audio_process: None,
+        });
+        let mut runtime =
+            RuntimeProject::build(&snapshot, 48_000, &mut cache, None, true).expect("runtime");
+
+        // A 1 s loop from 2 s; 48000 is not a multiple of the block, so the
+        // wrap falls inside a block, as it usually does.
+        let bounds = LoopBounds {
+            start: 96_000,
+            end: 144_000,
+        };
+        let block = 256u64;
+        let mut out = vec![0.0f32; block as usize * 2];
+        let mut pos = bounds.start;
+        let mut wraps = 0;
+        while wraps < 3 {
+            let wraps_here = segment_frames_until_loop_wrap(pos, block, Some(bounds)) < block;
+            if wraps_here {
+                wait_for("the window to settle", || settled(&stream));
+                assert!(
+                    !window_covers(&stream, bounds.start, bounds.start + 1),
+                    "the wrap must not be served by the window"
+                );
+                wait_for("the loop cue to fill", || {
+                    cue_covers(&stream, StreamCue::Loop, bounds.start, bounds.start + block)
+                });
+            } else {
+                // Stand-in for real-time pacing: the decoder had its time.
+                wait_for("the block's audio", || {
+                    stream.ring.buffered_frame(pos).is_some()
+                        && stream.ring.buffered_frame(pos + block).is_some()
+                });
+            }
+            out.fill(0.0);
+            render_project_block_interleaved_with_taps(
+                &mut runtime,
+                pos,
+                1.0,
+                &mut out,
+                2,
+                true,
+                4,
+                4,
+                Some(bounds),
+                None,
+            );
+            let silent = out
+                .chunks_exact(2)
+                .filter(|frame| frame[0] == 0.0 && frame[1] == 0.0)
+                .count();
+            assert_eq!(
+                silent, 0,
+                "the block at {pos} (wrap: {wraps_here}) played {silent} silent frames"
+            );
+            let (next, wrapped) = advance_loop_position(pos, block, Some(bounds));
+            wraps += usize::from(wrapped);
+            pos = next;
+        }
+        assert_eq!(stream.ring.underruns(), 0);
+        drop(runtime);
+        drop(cache);
+        drop(stream);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #370: an offline stream never answers with the silence of a frame its
+    /// decoder has not reached yet. Reads anywhere, at once, wait and return
+    /// the right frame.
+    #[test]
+    fn blocking_reads_wait_for_the_decoder() {
+        let frames = 900_000u64;
+        let path = write_index_wav("blocking", frames);
+        let source = StreamingSource::open(path.to_str().unwrap()).expect("open stream");
+        source.set_blocking(true);
+
+        for f in [0u64, 850_000, 123_457, 700_001, 5, frames - 1] {
+            assert_eq!(decode_index(source.read_interp(f as f64)), f);
+        }
+        for f in (300_000..420_000u64).step_by(37) {
+            assert_eq!(decode_index(source.read_interp(f as f64)), f);
+        }
+        assert_eq!(source.ring.underruns(), 0);
+        assert!(source.blocking_failure().is_none());
+        drop(source);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #370: an offline read the decoder can no longer serve fails the
+    /// render with a reason instead of waiting forever or writing silence.
+    #[test]
+    fn blocking_read_reports_a_stopped_decoder() {
+        let frames = 600_000u64;
+        let path = write_index_wav("blocking_stopped", frames);
+        let source = StreamingSource::open(path.to_str().unwrap()).expect("open stream");
+        source.set_blocking(true);
+        source.stop.store(true, Ordering::Release);
+        source.wake_worker();
+        wait_for("the decoder to stop", || {
+            source.ring.worker_exited.load(Ordering::Acquire)
+        });
+
+        assert_eq!(source.read_interp(550_000.0), (0.0, 0.0));
+        let failure = source
+            .blocking_failure()
+            .expect("the failed read is reported");
+        assert!(failure.contains("550000"), "{failure}");
         drop(source);
         let _ = std::fs::remove_file(&path);
     }

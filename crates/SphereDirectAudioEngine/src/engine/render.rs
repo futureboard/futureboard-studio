@@ -1780,6 +1780,21 @@ fn render_project_block_interleaved_core(
         }
 
         let clip_end = clip_start.saturating_add(clip_duration);
+        // #380: keep a looped disk-streamed clip's loop start prefetched in a
+        // cue, so the wrap does not miss the stream's window and play a block
+        // of silence. Arithmetic and a relaxed compare-and-store only.
+        if let (Some(bounds), crate::audio_source::ClipAudioSource::Streaming(stream)) =
+            (loop_bounds, source.as_ref())
+        {
+            if bounds.start >= clip_start && bounds.start < clip_end {
+                crate::streaming_source::cue_loop_start(
+                    stream,
+                    &runtime.clips[clip_index],
+                    bounds.start - clip_start,
+                    runtime.sample_rate,
+                );
+            }
+        }
         let mut segment_sample =
             crate::transport::normalize_loop_position(base_sample, loop_bounds);
         let mut callback_offset = 0usize;
