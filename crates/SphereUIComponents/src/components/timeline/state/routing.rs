@@ -859,6 +859,22 @@ impl TimelineState {
         changed
     }
 
+    /// What [`Self::sync_wdw_split`] on `track_id` can change, for its undo
+    /// step: the track (its sends) and the returns its split sends feed,
+    /// which turning the split off may delete. A return the sync creates is
+    /// picked up from the track order and needs no entry.
+    pub fn wdw_split_edit_scope(&self, track_id: &str) -> TrackEditScope {
+        let mut ids = vec![track_id.to_string()];
+        if let Some(track) = self.find_track(track_id) {
+            for send in track.sends.iter().filter(|send| send.wdw) {
+                if !ids.contains(&send.target_track_id) {
+                    ids.push(send.target_track_id.clone());
+                }
+            }
+        }
+        TrackEditScope::tracks(ids)
+    }
+
     /// One send and one return while a Rodhareist wet/dry/wet split is on,
     /// and neither while it is off. Other sends and returns stay.
     pub fn sync_wdw_split(&mut self, track_id: &str) -> bool {
@@ -1641,6 +1657,112 @@ mod tests {
             .map(|send| send.id.as_str())
             .collect();
         assert_eq!(ids, vec![saved.as_str(), fifth.as_str()]);
+    }
+
+    /// #336: creating and removing the split, and moving an insert onto it,
+    /// are undo steps that come back exactly on redo.
+    #[cfg(feature = "builtin-plugin-editor")]
+    #[test]
+    fn wdw_split_and_insert_bus_are_undo_steps() {
+        use crate::components::edit::edit_commands::{EditCommand, EditHistory};
+
+        fn step(
+            state: &mut TimelineState,
+            history: &mut EditHistory,
+            scope: TrackEditScope,
+            action: impl FnOnce(&mut TimelineState) -> bool,
+        ) {
+            let before = state.capture_track_edit(&scope);
+            assert!(action(state), "the action changes something");
+            let (prev, next) = state
+                .finish_track_edit(&scope, before)
+                .expect("the change is recorded");
+            history.push(EditCommand::SetTracks {
+                label: "Edit",
+                prev: Box::new(prev),
+                next: Box::new(next),
+            });
+        }
+        fn set_wdw(state: &mut TimelineState, track_id: &str, slot_id: &str, on: bool) {
+            let slot = state
+                .tracks
+                .iter_mut()
+                .find(|track| track.id == track_id)
+                .and_then(|track| track.inserts.iter_mut().find(|slot| slot.id == slot_id))
+                .expect("slot");
+            slot.vst3_state = Some(rodhareist_json(on));
+        }
+        let bus_of = |state: &TimelineState, track: &str, slot: &str| {
+            state.find_insert_slot(track, slot).unwrap().signal_bus
+        };
+
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let audio = create_track(&mut state, TrackType::Audio, "Guitar");
+        let rig = install_rodhareist(&mut state, &audio, true);
+        let vst = state.add_insert(&audio).expect("vst");
+        if let Some(slot) = state
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == audio)
+            .and_then(|track| track.inserts.iter_mut().find(|slot| slot.id == vst))
+        {
+            slot.plugin_format = Some(InsertPluginFormat::Vst3);
+            slot.plugin_id = Some("vst3:test".to_string());
+        }
+        let mut history = EditHistory::new(16);
+
+        let scope = state.wdw_split_edit_scope(&audio);
+        step(&mut state, &mut history, scope, |s| {
+            s.sync_wdw_split(&audio)
+        });
+        let (send_id, ret) = {
+            let split = wdw_sends(&state, &audio);
+            (split[0].id.clone(), split[0].target_track_id.clone())
+        };
+        step(
+            &mut state,
+            &mut history,
+            TrackEditScope::channel(&audio),
+            |s| s.set_insert_signal_bus(&audio, &vst, InsertSignalBus::Wdw),
+        );
+        assert_eq!(bus_of(&state, &audio, &vst), InsertSignalBus::Wdw);
+
+        assert!(history.undo(&mut state));
+        assert_eq!(bus_of(&state, &audio, &vst), InsertSignalBus::Main);
+        assert!(
+            state.find_track(&ret).is_some(),
+            "the split is a step of its own"
+        );
+        assert!(history.undo(&mut state));
+        assert!(wdw_sends(&state, &audio).is_empty());
+        assert!(state.find_track(&ret).is_none(), "no orphaned return");
+
+        assert!(history.redo(&mut state));
+        let split = wdw_sends(&state, &audio);
+        assert_eq!(split.len(), 1);
+        assert_eq!(split[0].id, send_id);
+        assert_eq!(split[0].target_track_id, ret);
+        assert!(split[0].enabled);
+        assert!(state.find_track(&ret).is_some());
+        assert!(history.redo(&mut state));
+        assert_eq!(bus_of(&state, &audio, &vst), InsertSignalBus::Wdw);
+
+        // Turning the split off deletes its return; the undo brings both the
+        // return and the send back.
+        set_wdw(&mut state, &audio, &rig, false);
+        let scope = state.wdw_split_edit_scope(&audio);
+        assert!(scope.tracks.contains(&ret));
+        step(&mut state, &mut history, scope, |s| {
+            s.sync_wdw_split(&audio)
+        });
+        assert!(state.find_track(&ret).is_none());
+        assert!(history.undo(&mut state));
+        assert!(state.find_track(&ret).is_some());
+        let split = wdw_sends(&state, &audio);
+        assert_eq!(split.len(), 1);
+        assert_eq!(split[0].id, send_id);
+        assert_eq!(bus_of(&state, &audio, &vst), InsertSignalBus::Wdw);
     }
 
     /// #334: turning wet/dry/wet off and on again never takes over a user's
