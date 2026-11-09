@@ -618,7 +618,8 @@ fn read_request_head(stream: &mut TcpStream, until: Instant) -> Option<Vec<u8>> 
 }
 
 /// What one loopback request line means for the sign-in, and the page to
-/// answer it with. `None`: not the callback (a favicon, a stray hit).
+/// answer it with. `None`: not the callback (a favicon, a stray hit, or a
+/// request whose `fbstate` is not this attempt's nonce).
 fn callback_verdict(
     request_line: &str,
     expected_state: &str,
@@ -639,10 +640,10 @@ fn callback_verdict(
         .map(|(_, v)| constant_time_eq(v.as_bytes(), expected_state.as_bytes()))
         .unwrap_or(false);
     if !state_ok {
-        return (
-            Some(Err("the sign-in response failed verification".to_string())),
-            "Sign-in could not be verified.",
-        );
+        // Not this attempt's callback: anything on the machine can reach the
+        // port, so an unverified request is answered and ignored rather than
+        // allowed to end the sign-in (the scheme path does the same).
+        return (None, "Sign-in could not be verified.");
     }
 
     if let Some((_, error)) = params.iter().find(|(k, _)| k == "error") {
@@ -1280,8 +1281,53 @@ mod tests {
     fn a_stray_request_is_answered_and_the_wait_goes_on() {
         let (verdict, _) = callback_verdict("GET /favicon.ico HTTP/1.1", "n");
         assert!(verdict.is_none());
+        // A wrong or missing nonce is not this sign-in's answer: ignored, not
+        // a reason to abort.
         let (verdict, _) = callback_verdict("GET /?fbsession=s&fbstate=bad HTTP/1.1", "n");
+        assert!(verdict.is_none());
+        let (verdict, _) = callback_verdict("GET /?error=access_denied HTTP/1.1", "n");
+        assert!(verdict.is_none());
+        let (verdict, _) = callback_verdict("GET /?error=x&fbstate=bad HTTP/1.1", "n");
+        assert!(verdict.is_none());
+        // The real nonce still decides, for a session or a refusal.
+        let (verdict, _) = callback_verdict("GET /?fbsession=s&fbstate=n HTTP/1.1", "n");
+        assert_eq!(verdict, Some(Ok("s".to_string())));
+        let (verdict, _) = callback_verdict("GET /?error=denied&fbstate=n HTTP/1.1", "n");
         assert!(verdict.unwrap().is_err());
+    }
+
+    /// A stray request carrying a session but the wrong nonce must not cancel
+    /// the sign-in in progress: the real redirect that follows still lands.
+    #[test]
+    fn a_forged_callback_does_not_cancel_the_sign_in() {
+        let (listener, address) = callback_listener();
+        let waiter = std::thread::spawn(move || {
+            wait_for_session(listener, "nonce-xyz", Duration::from_secs(20))
+        });
+
+        let mut stray = TcpStream::connect(address).unwrap();
+        stray
+            .write_all(b"GET /?fbsession=attacker&fbstate=guess HTTP/1.1\r\n\r\n")
+            .unwrap();
+        stray
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reply = String::new();
+        let _ = stray.read_to_string(&mut reply);
+        assert!(reply.contains("could not be verified"), "{reply}");
+
+        let mut browser = TcpStream::connect(address).unwrap();
+        browser
+            .write_all(b"GET /?fbsession=sess-ok&fbstate=nonce-xyz HTTP/1.1\r\n\r\n")
+            .unwrap();
+        browser
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reply = String::new();
+        let _ = browser.read_to_string(&mut reply);
+
+        assert_eq!(waiter.join().unwrap(), Ok("sess-ok".to_string()));
+        assert!(reply.contains("Signed in"), "{reply}");
     }
 
     fn session_dir(name: &str) -> PathBuf {
