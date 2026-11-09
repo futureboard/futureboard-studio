@@ -1546,6 +1546,10 @@ impl StudioLayout {
         // starts asking it for audio at the new position.
         self.refresh_ara_sessions(cx);
 
+        // Every plug-in parameter edit up to here is already in the timeline
+        // state the snapshot reads; the engine carries any later one into the
+        // graph it builds from this snapshot (#365).
+        let insert_param_revision = engine.insert_param_revision();
         let snapshot = {
             let timeline = self.timeline.read(cx);
             let mut snapshot = build_engine_project_snapshot(
@@ -1740,7 +1744,7 @@ impl StudioLayout {
                 .background_executor()
                 .spawn(async move {
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                        engine.load_project(snapshot)
+                        engine.load_project_as_of(snapshot, insert_param_revision)
                     }))
                     .unwrap_or_else(|_| {
                         Err(DirectAudio::SphereAudioError::NativeError(
