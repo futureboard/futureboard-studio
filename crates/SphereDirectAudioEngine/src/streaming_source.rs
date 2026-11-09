@@ -392,8 +392,12 @@ enum Packet {
 
 impl StreamDecoder {
     fn open(path: &str) -> Result<Self, String> {
-        let file = File::open(Path::new(path)).map_err(|e| format!("open failed: {e}"))?;
-        let mss = MediaSourceStream::new(Box::new(file), Default::default());
+        // Through the same source as the probe, so a pre-#352 FLAC export
+        // streams with its STREAMINFO corrected too (#388).
+        let file = File::open(Path::new(path))
+            .and_then(crate::audio_file::symphonia_file_source)
+            .map_err(|e| format!("open failed: {e}"))?;
+        let mss = MediaSourceStream::new(file, Default::default());
 
         let mut hint = Hint::new();
         if let Some(ext) = Path::new(path).extension().and_then(|e| e.to_str()) {

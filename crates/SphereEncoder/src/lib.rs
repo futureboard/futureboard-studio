@@ -6,6 +6,7 @@
 //! Arrangement rendering lives in the audio engine; building an export request
 //! from project state lives in the UI/layout layer.
 
+pub mod flac_header;
 pub mod format;
 pub mod metadata;
 pub mod rauf;

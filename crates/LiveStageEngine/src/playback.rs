@@ -86,12 +86,12 @@ fn is_audio_file(path: &Path) -> bool {
 /// A take file read with a few header bytes replaced, so symphonia accepts
 /// what the recorder writes.
 ///
-/// * **FLAC** ([`Self::flac`]): `flacenc` (what the recorder's FLAC encoder
-///   uses) writes the last block's length as the minimum block size.
-///   symphonia then takes the fixed-blocksize stream for a variable one and
-///   accepts none of its frames. When the first frame says the stream is
-///   fixed-blocksize, the minimum is read as the maximum, as the FLAC format
-///   has it.
+/// * **FLAC** ([`Self::flac`]): takes recorded before #352 have the last
+///   block's length as the minimum block size. symphonia then takes the
+///   fixed-blocksize stream for a variable one and accepts none of its
+///   frames. When the first frame says the stream is fixed-blocksize, the
+///   minimum is read as the maximum, as the FLAC format has it
+///   (`sphere_encoder::flac_header`, shared with Studio's import path).
 /// * **WAV** ([`Self::wav`]): a take that outgrew 4 GiB is RF64, which
 ///   symphonia does not read. It is presented as RIFF with `ds64` turned
 ///   into a skipped `JUNK` chunk and the data size taken from `ds64`, capped
@@ -107,7 +107,7 @@ struct PatchedFile {
 }
 
 impl PatchedFile {
-    const MIN_BLOCK_AT: u64 = 8;
+    const MIN_BLOCK_AT: u64 = sphere_encoder::flac_header::STREAMINFO_MIN_BLOCK_SIZE_OFFSET;
 
     fn patch(&mut self, at: u64, bytes: &[u8]) {
         for (i, byte) in bytes.iter().enumerate() {
@@ -169,31 +169,11 @@ impl PatchedFile {
     }
 
     fn flac(path: &Path) -> std::io::Result<Self> {
-        use std::io::{Read, Seek, SeekFrom};
+        use std::io::{Seek, SeekFrom};
         let mut file = std::fs::File::open(path)?;
         let len = file.metadata()?.len();
-        let mut min_block = None;
-        let mut head = [0u8; 8 + 34];
-        if file.read_exact(&mut head).is_ok() && &head[..4] == b"fLaC" && head[4] & 0x7f == 0 {
-            // Past the metadata blocks to the first frame's sync code.
-            let mut at = 4u64;
-            let mut header = [0u8; 4];
-            loop {
-                file.seek(SeekFrom::Start(at))?;
-                file.read_exact(&mut header)?;
-                let length = u64::from(u32::from_be_bytes([0, header[1], header[2], header[3]]));
-                at += 4 + length;
-                if header[0] & 0x80 != 0 {
-                    break;
-                }
-            }
-            let mut sync = [0u8; 2];
-            file.seek(SeekFrom::Start(at))?;
-            let fixed = file.read_exact(&mut sync).is_ok() && sync == [0xff, 0xf8];
-            if fixed && head[8..10] != head[10..12] {
-                min_block = Some([head[10], head[11]]);
-            }
-        }
+        // Shared with Studio's import path (#388).
+        let min_block = sphere_encoder::flac_header::legacy_min_block_size_fix(&mut file);
         file.seek(SeekFrom::Start(0))?;
         let mut source = Self {
             file,
@@ -202,7 +182,7 @@ impl PatchedFile {
             patches: Vec::new(),
         };
         if let Some(fix) = min_block {
-            source.patch(Self::MIN_BLOCK_AT, &fix);
+            source.patch(Self::MIN_BLOCK_AT, &fix.to_be_bytes());
         }
         Ok(source)
     }

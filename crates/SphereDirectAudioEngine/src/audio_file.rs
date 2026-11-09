@@ -906,14 +906,80 @@ fn probe_rauf_file(path: &Path) -> Result<AudioFileInfo, SphereAudioError> {
     })
 }
 
+/// A FLAC file read with STREAMINFO's minimum block size replaced (#388).
+///
+/// FLAC exports from Studio builds before #352 record the last block's length
+/// as the minimum block size, which symphonia reads as a variable-block-size
+/// stream (or an invalid one) and refuses. Reads of those two bytes return
+/// the corrected value; the file on disk is never written.
+struct FlacHeaderFixSource {
+    file: File,
+    len: u64,
+    pos: u64,
+    min_block: [u8; 2],
+}
+
+impl Read for FlacHeaderFixSource {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.file.read(buf)?;
+        let at = sphere_encoder::flac_header::STREAMINFO_MIN_BLOCK_SIZE_OFFSET;
+        for (i, byte) in self.min_block.iter().enumerate() {
+            let offset = at + i as u64;
+            if (self.pos..self.pos + n as u64).contains(&offset) {
+                buf[(offset - self.pos) as usize] = *byte;
+            }
+        }
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for FlacHeaderFixSource {
+    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+        self.pos = self.file.seek(to)?;
+        Ok(self.pos)
+    }
+}
+
+impl symphonia::core::io::MediaSource for FlacHeaderFixSource {
+    fn is_seekable(&self) -> bool {
+        true
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        Some(self.len)
+    }
+}
+
+/// `file` as a symphonia source, positioned at its start. A pre-#352 FLAC
+/// export (see [`sphere_encoder::flac_header::legacy_min_block_size_fix`]) is
+/// read with its STREAMINFO corrected; every other file is read as it is.
+pub(crate) fn symphonia_file_source(
+    mut file: File,
+) -> io::Result<Box<dyn symphonia::core::io::MediaSource>> {
+    let fix = sphere_encoder::flac_header::legacy_min_block_size_fix(&mut file);
+    file.seek(SeekFrom::Start(0))?;
+    Ok(match fix {
+        Some(min_block) => Box::new(FlacHeaderFixSource {
+            len: file.metadata()?.len(),
+            file,
+            pos: 0,
+            min_block: min_block.to_be_bytes(),
+        }),
+        None => Box::new(file),
+    })
+}
+
 fn probe_via_symphonia(
     path: &Path,
     format_kind: AudioFileFormat,
 ) -> Result<AudioFileInfo, SphereAudioError> {
-    let src = File::open(path).map_err(|e| {
-        SphereAudioError::NativeError(format!("Cannot open '{}': {e}", path.display()))
-    })?;
-    let mss = MediaSourceStream::new(Box::new(src), Default::default());
+    let src = File::open(path)
+        .and_then(symphonia_file_source)
+        .map_err(|e| {
+            SphereAudioError::NativeError(format!("Cannot open '{}': {e}", path.display()))
+        })?;
+    let mss = MediaSourceStream::new(src, Default::default());
 
     let mut hint = Hint::new();
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
@@ -1048,12 +1114,14 @@ fn load_via_symphonia(path: &Path) -> Result<AudioFileBuffer, String> {
         ));
     }
 
-    let src = File::open(path).map_err(|e| format!("Cannot open '{}': {e}", path.display()))?;
+    let src = File::open(path)
+        .and_then(symphonia_file_source)
+        .map_err(|e| format!("Cannot open '{}': {e}", path.display()))?;
     let ext_hint = path
         .extension()
         .and_then(|e| e.to_str())
         .map(|s| s.to_string());
-    decode_symphonia_source(Box::new(src), ext_hint.as_deref())
+    decode_symphonia_source(src, ext_hint.as_deref())
 }
 
 /// Decode an in-memory audio file, for callers that only receive bytes (e.g.
@@ -1070,7 +1138,15 @@ pub fn load_audio_bytes(bytes: &[u8], ext_hint: &str) -> Result<AudioFileBuffer,
             bytes.len()
         ));
     }
-    let cursor = io::Cursor::new(bytes.to_vec());
+    let mut bytes = bytes.to_vec();
+    // A pre-#352 FLAC export: correct its STREAMINFO in this copy (#388).
+    if let Some(min_block) =
+        sphere_encoder::flac_header::legacy_min_block_size_fix(&mut io::Cursor::new(&bytes))
+    {
+        let at = sphere_encoder::flac_header::STREAMINFO_MIN_BLOCK_SIZE_OFFSET as usize;
+        bytes[at..at + 2].copy_from_slice(&min_block.to_be_bytes());
+    }
+    let cursor = io::Cursor::new(bytes);
     let hint = (!ext_hint.is_empty()).then_some(ext_hint);
     decode_symphonia_source(Box::new(cursor), hint)
 }
@@ -1700,6 +1776,125 @@ mod flac_roundtrip_tests {
             let loaded = loaded.unwrap_or_else(|e| panic!("{frames} frames: load: {e}"));
             assert_eq!(loaded.channels, 2);
             assert_eq!(loaded.samples.len(), frames * 2, "{frames} frames");
+        }
+    }
+
+    /// Decode `src` through symphonia, seek to `target`, and return the
+    /// timestamp the seek landed on.
+    fn seek_landing(src: Box<dyn symphonia::core::io::MediaSource>, target: u64) -> u64 {
+        use symphonia::core::formats::{SeekMode, SeekTo};
+        let mss = MediaSourceStream::new(src, Default::default());
+        let mut hint = Hint::new();
+        hint.with_extension("flac");
+        let mut format = symphonia::default::get_probe()
+            .format(
+                &hint,
+                mss,
+                &FormatOptions::default(),
+                &MetadataOptions::default(),
+            )
+            .unwrap()
+            .format;
+        let track_id = format.tracks()[0].id;
+        format
+            .seek(
+                SeekMode::Accurate,
+                SeekTo::TimeStamp {
+                    ts: target,
+                    track_id,
+                },
+            )
+            .unwrap()
+            .actual_ts
+    }
+
+    /// #388: a FLAC exported before the #352 fix — STREAMINFO's minimum
+    /// block size is the last block's length — probes, decodes (from a file
+    /// and from bytes) and seeks like the same file with the fixed header,
+    /// through every symphonia open Studio does, the streamed decoder's
+    /// included. The file on disk is not modified.
+    #[test]
+    fn pre_352_flac_exports_import_with_the_header_corrected() {
+        for frames in [150_001usize, 65_537, 65_541] {
+            let base = std::env::temp_dir()
+                .join(format!("fb_flac_pre352_{}_{frames}", std::process::id()));
+            let (fixed_path, old_path) = (
+                base.with_extension("fixed.flac"),
+                base.with_extension("old.flac"),
+            );
+            let mut enc = FlacEncoder::create(
+                &fixed_path,
+                AudioEncodeSpec {
+                    sample_rate: 48_000,
+                    channels: 2,
+                    sample_format: AudioSampleFormat::I16,
+                },
+                FlacEncodeOptions::default(),
+                AudioMetadata::default(),
+            )
+            .unwrap();
+            let input: Vec<f32> = (0..frames * 2)
+                .map(|i| ((i / 2) as f32 * 0.01 + (i % 2) as f32).sin() * 0.5)
+                .collect();
+            enc.write_interleaved_f32(&input).unwrap();
+            enc.finalize().unwrap();
+
+            // The header the old encoder wrote: min block = last block.
+            let mut old = std::fs::read(&fixed_path).unwrap();
+            assert_eq!(&old[8..12], &[0x10, 0x00, 0x10, 0x00], "fixed header");
+            let last_block = (frames % 4_096) as u16;
+            old[8..10].copy_from_slice(&last_block.to_be_bytes());
+            std::fs::write(&old_path, &old).unwrap();
+
+            let old_str = old_path.to_str().unwrap();
+            // The fixture reproduces the bug: symphonia on the raw file
+            // does not produce the file's frames.
+            let raw =
+                decode_symphonia_source(Box::new(File::open(&old_path).unwrap()), Some("flac"));
+            assert!(
+                raw.map_or(true, |b| b.frames != frames),
+                "{frames}: the raw pre-#352 file unexpectedly decoded"
+            );
+
+            let info = probe_audio_file(&old_path);
+            let loaded = load_audio_file(old_str);
+            let from_bytes = load_audio_bytes(&old, "flac");
+            let reference = load_audio_file(fixed_path.to_str().unwrap()).unwrap();
+            let target = 4_096 * 9 + 123;
+            let landed_old = seek_landing(
+                symphonia_file_source(File::open(&old_path).unwrap()).unwrap(),
+                target,
+            );
+            let landed_fixed = seek_landing(
+                symphonia_file_source(File::open(&fixed_path).unwrap()).unwrap(),
+                target,
+            );
+            let on_disk = std::fs::read(&old_path).unwrap();
+            let fixed_untouched = sphere_encoder::flac_header::legacy_min_block_size_fix(
+                &mut File::open(&fixed_path).unwrap(),
+            );
+            let _ = std::fs::remove_file(&old_path);
+            let _ = std::fs::remove_file(&fixed_path);
+
+            let info = info.unwrap_or_else(|e| panic!("{frames}: probe: {e}"));
+            assert_eq!(info.total_frames, frames as u64, "{frames}: probed frames");
+            let loaded = loaded.unwrap_or_else(|e| panic!("{frames}: load: {e}"));
+            assert_eq!((loaded.channels, loaded.frames), (2, frames), "{frames}");
+            assert!(
+                loaded.samples == reference.samples,
+                "{frames}: decoded samples differ from the fixed-header file"
+            );
+            for (got, want) in loaded.samples.iter().zip(&input) {
+                assert!((got - want).abs() < 1e-4, "{frames}: {got} vs {want}");
+            }
+            let from_bytes = from_bytes.unwrap_or_else(|e| panic!("{frames}: bytes: {e}"));
+            assert!(from_bytes.samples == reference.samples, "{frames}: bytes");
+            assert_eq!(landed_old, landed_fixed, "{frames}: seek");
+            assert!(on_disk == old, "{frames}: the file on disk was modified");
+            assert_eq!(
+                fixed_untouched, None,
+                "{frames}: a valid header was corrected"
+            );
         }
     }
 }
