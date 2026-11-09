@@ -15,6 +15,9 @@ pub enum ResampleError {
     Rubato(String),
     #[error("i/o: {0}")]
     Io(#[from] std::io::Error),
+    /// The result needs more than the 4 GiB a RIFF WAV can describe.
+    #[error("the result is too large to save as a WAV file (over 4 GiB)")]
+    TooLarge { frames: u64, channels: u16 },
 }
 
 /// Resample interleaved PCM from `source_rate` to `target_rate`.
@@ -100,6 +103,17 @@ pub fn resample_interleaved(
     Ok(interleaved)
 }
 
+/// The `data` size of a 32-bit float WAV holding `frames` frames, or `None`
+/// when its RIFF size (the 50 header bytes after the first 8, plus the data)
+/// does not fit the 32-bit field. Such a result is refused rather than
+/// written with a wrapped size that later reads back truncated (#321).
+fn float_wav_data_bytes(frames: u64, channels: u16) -> Option<u32> {
+    frames
+        .checked_mul(channels as u64 * 4)
+        .filter(|bytes| 50 + bytes <= u32::MAX as u64)
+        .map(|bytes| bytes as u32)
+}
+
 /// Write interleaved PCM as a 32-bit IEEE-float WAV. Used for every derived
 /// (edited/processed) asset.
 ///
@@ -117,7 +131,11 @@ pub fn write_wav_f32(
     let channels = channels.max(1);
     let frames = samples.len() / channels as usize;
     let block_align = channels as u32 * 4;
-    let data_bytes = frames as u32 * block_align;
+    let data_bytes =
+        float_wav_data_bytes(frames as u64, channels).ok_or(ResampleError::TooLarge {
+            frames: frames as u64,
+            channels,
+        })?;
     // fmt (18 bytes, cbSize = 0) + fact chunk, as the spec asks for
     // non-PCM formats.
     let mut bytes = Vec::with_capacity(58 + data_bytes as usize);
@@ -176,6 +194,21 @@ mod tests {
         assert_eq!(read, vec![0.123_456_78, -0.5, 1.5, -1.25, 0.0, 0.0]);
         assert!(!path.with_extension("wav.tmp").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #321: the largest result whose RIFF size fits is written; one frame
+    /// more is refused instead of wrapping the 32-bit size.
+    #[test]
+    fn float_wav_sizes_past_4_gib_are_refused_not_wrapped() {
+        let max_frames = (u32::MAX as u64 - 50) / 8;
+        assert_eq!(
+            float_wav_data_bytes(max_frames, 2),
+            Some((max_frames * 8) as u32)
+        );
+        assert_eq!(float_wav_data_bytes(max_frames + 1, 2), None);
+        // Above u32 frames, where the old `frames as u32` cast wrapped too.
+        assert_eq!(float_wav_data_bytes(u32::MAX as u64 + 1, 1), None);
+        assert_eq!(float_wav_data_bytes(u64::MAX, 8), None);
     }
 
     #[test]
