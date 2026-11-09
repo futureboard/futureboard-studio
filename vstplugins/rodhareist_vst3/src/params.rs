@@ -13,9 +13,13 @@ use std::sync::{Arc, RwLock};
 use nih_plug::params::persist::PersistentField;
 use nih_plug::prelude::*;
 use nih_plug_gpui::EditorContext;
+// Not `rodharerist::Params`: an explicit import of it would shadow the
+// prelude's `Params` trait that `RodhareistParams` derives and `WireParams`
+// implements. The core struct is spelled `CoreParams` here.
 use rodharerist::{
-    AmpModel, CabModel, CompModel, DelayModel, DriveModel, EqModel, MicModel, ModModel, Params,
-    ReverbModel, StageChannel, StageKind, ToneEngineKind, WahModel, PATH_SLOTS, UI_PARAM_IDS,
+    AmpModel, CabModel, CompModel, DelayModel, DriveModel, EqModel, MicModel, ModModel,
+    Params as CoreParams, ReverbModel, StageChannel, StageKind, ToneEngineKind, WahModel,
+    PATH_SLOTS, UI_PARAM_IDS,
 };
 
 use crate::components::rodhareist_blocks::{self as blocks, ParamSpec};
@@ -488,11 +492,11 @@ pub fn describe(id: &str) -> (String, String) {
 /// the block category ("Drive A", "Amp"). A second instance of the same
 /// stomp gets " 2" so the two stay distinct. Lanes, the signal path, and
 /// the global trims keep the group `describe` already uses.
-pub fn host_name_for(params: &Params, id: &str) -> String {
+pub fn host_name_for(params: &CoreParams, id: &str) -> String {
     display_name(params, id, &block_specs())
 }
 
-fn display_name(params: &Params, id: &str, specs: &[(StageKind, ParamSpec)]) -> String {
+fn display_name(params: &CoreParams, id: &str, specs: &[(StageKind, ParamSpec)]) -> String {
     let (group, label) = describe(id);
     if group == "Global" {
         return label;
@@ -532,7 +536,7 @@ fn kind_owning(id: &str, specs: &[(StageKind, ParamSpec)]) -> Option<StageKind> 
 
 /// The stomp a host should show. The later instance of a repeated name is
 /// "Green Screamer 2"; a different model needs no suffix.
-fn stomp_title(params: &Params, kind: StageKind) -> String {
+fn stomp_title(params: &CoreParams, kind: StageKind) -> String {
     let name = blocks::model_name(params, kind).unwrap_or_else(|| blocks::block_name(kind));
     let repeated = StageKind::ALL.iter().any(|other| {
         other.index() < kind.index() && blocks::model_name(params, *other) == Some(name)
