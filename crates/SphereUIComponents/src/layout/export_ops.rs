@@ -120,7 +120,7 @@ impl StudioLayout {
                     None
                 }
             },
-            mp3_available: sphere_encoder::mp3_available(),
+            opus_available: sphere_encoder::opus_available(),
             track_targets: tl_state
                 .tracks
                 .iter()

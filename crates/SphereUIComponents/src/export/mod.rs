@@ -105,7 +105,7 @@ mod tests {
             content_end_beat: 4.0,
             time_selection: None,
             loop_range: None,
-            mp3_available: false,
+            opus_available: false,
             track_targets: Vec::new(),
             live_sample_rate: 48_000,
         }
@@ -253,24 +253,53 @@ mod tests {
     }
 
     #[test]
-    fn mp3_disabled_fails_cleanly() {
+    fn opus_disabled_fails_cleanly() {
         let mut s = valid_wav();
-        s.format = AudioFileFormat::Mp3;
-        s.output_path = Some(std::env::temp_dir().join("fb-export-test.mp3"));
+        s.format = AudioFileFormat::Opus;
+        s.output_path = Some(std::env::temp_dir().join("fb-export-test.opus"));
         assert_eq!(
             s.validate(&defaults()),
-            Err(ExportSettingsError::Mp3Unavailable)
+            Err(ExportSettingsError::OpusUnavailable)
         );
     }
 
+    /// #284: Opus replaced MP3. It writes `.opus`, carries the chosen VBR
+    /// bitrate to the encoder, takes the render as float (so dither does not
+    /// apply), and accepts any export rate — the encoder converts to 48 kHz.
     #[test]
-    fn mp3_enabled_passes_validation() {
+    fn opus_request_carries_bitrate_and_is_never_dithered() {
+        use sphere_encoder::{AudioSampleFormat, OpusBitrate};
         let mut d = defaults();
-        d.mp3_available = true;
+        d.opus_available = true;
+        d.project_sample_rate = 44_100;
         let mut s = valid_wav();
-        s.format = AudioFileFormat::Mp3;
-        s.sample_rate = ExportSampleRateChoice::Hz48000;
+        s.format = AudioFileFormat::Opus;
+        assert_eq!(s.opus_bitrate(), OpusBitrate::Kbps160, "default 160 kbps");
+        s.opus_bitrate_kbps = 96;
         assert!(s.validate(&d).is_ok());
+        assert!(!s.dither_applies());
+
+        let snapshot = snapshot_with_content(4.0);
+        let req = s.to_request(&snapshot, &d).unwrap();
+        assert_eq!(req.output_path.extension().unwrap(), "opus");
+        assert_eq!(req.format, AudioFileFormat::Opus);
+        assert_eq!(req.encode_options.format, AudioFileFormat::Opus);
+        assert_eq!(req.sample_format, AudioSampleFormat::F32);
+        assert_eq!(req.encode_options.opus.bitrate, OpusBitrate::Kbps96);
+        assert_eq!(req.render.sample_rate, 44_100);
+        let estimate = s.estimate(&snapshot, &d).unwrap();
+        assert_eq!(estimate.opus_bitrate_kbps, Some(96));
+        assert_eq!(estimate.uncompressed_bytes, None);
+
+        // A value off the preset list falls back to the default.
+        s.opus_bitrate_kbps = 320;
+        assert_eq!(s.opus_bitrate(), OpusBitrate::default());
+        assert_eq!(
+            ExportSettings::default_file_name("Song", AudioFileFormat::Opus),
+            "Song.opus"
+        );
+        // The retired "mp3" id selects Opus.
+        assert_eq!(AudioFileFormat::from_id("mp3"), Some(AudioFileFormat::Opus));
     }
 
     #[test]
@@ -311,6 +340,8 @@ mod tests {
         assert!(!s.dither_applies(), "float WAV");
         s.format = sphere_encoder::AudioFileFormat::Flac;
         assert!(s.dither_applies(), "FLAC");
+        s.format = sphere_encoder::AudioFileFormat::Opus;
+        assert!(!s.dither_applies(), "Opus");
     }
 
     #[test]

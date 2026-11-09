@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use sphere_encoder::{
     AudioDither, AudioEncodeOptions, AudioFileFormat, AudioSampleFormat, FlacEncodeOptions,
-    Mp3Bitrate, Mp3EncodeOptions,
+    OpusBitrate, OpusEncodeOptions,
 };
 use DirectAudio::types::EngineProjectSnapshot;
 use DirectAudio::{
@@ -165,8 +165,8 @@ pub struct ExportProjectDefaults {
     pub content_end_beat: f64,
     pub time_selection: Option<(f64, f64)>,
     pub loop_range: Option<(f64, f64)>,
-    /// Whether the build can encode MP3 (the `mp3` feature is compiled in).
-    pub mp3_available: bool,
+    /// Whether the build can encode Opus (the `opus` feature is compiled in).
+    pub opus_available: bool,
     pub track_targets: Vec<ExportTrackTarget>,
     /// The running audio device's sample rate, which a realtime render is
     /// recorded at. `0` when no device is running: realtime is unavailable.
@@ -183,12 +183,13 @@ pub struct ExportSettings {
     pub wav_sample_format: AudioSampleFormat,
     pub flac_bit_depth: u16,
     pub flac_compression_level: Option<u8>,
-    pub mp3_bitrate_kbps: u16,
+    /// Opus target bitrate, one of [`OpusBitrate::ALL`].
+    pub opus_bitrate_kbps: u16,
     pub normalize: ExportNormalizeChoice,
     pub tail: ExportTailChoice,
-    /// Dither for 16/24-bit output (and the 16-bit PCM an MP3 is made from):
-    /// TPDF by default, like the live device output (#322), or off. Float
-    /// output is never dithered.
+    /// Dither for 16/24-bit output: TPDF by default, like the live device
+    /// output (#322), or off. Float output and Opus (which encodes the float
+    /// samples) are never dithered.
     pub dither: AudioDither,
     /// Write the stereo mixdown (the master).
     pub include_mixdown: bool,
@@ -209,7 +210,7 @@ impl Default for ExportSettings {
             wav_sample_format: AudioSampleFormat::I24,
             flac_bit_depth: 24,
             flac_compression_level: Some(5),
-            mp3_bitrate_kbps: 256,
+            opus_bitrate_kbps: OpusBitrate::default().kbps() as u16,
             normalize: ExportNormalizeChoice::Off,
             // Capture reverb/delay/instrument-release tails past the last content
             // by default so exports don't hard-cut the decay.
@@ -229,7 +230,7 @@ pub enum ExportSettingsError {
     InvalidRange,
     NoContent,
     UnsupportedSampleRate(u32),
-    Mp3Unavailable,
+    OpusUnavailable,
     FlacUnsupportedBitDepth(u16),
     /// Neither the mixdown nor any channel is selected.
     NothingToRender,
@@ -252,7 +253,7 @@ impl ExportSettingsError {
             Self::InvalidRange => "export.error.invalid-range",
             Self::NoContent => "export.error.no-content",
             Self::UnsupportedSampleRate(_) => "export.error.unsupported-sample-rate",
-            Self::Mp3Unavailable => "export.error.mp3-unavailable",
+            Self::OpusUnavailable => "export.error.opus-unavailable",
             Self::FlacUnsupportedBitDepth(_) => "export.error.flac-bit-depth",
             Self::NothingToRender => "export.error.nothing-to-render",
             Self::RealtimeUnavailable => "export.error.realtime-unavailable",
@@ -270,7 +271,7 @@ impl ExportSettingsError {
             Self::InvalidRange => "No valid export range selected.".to_string(),
             Self::NoContent => "The arrangement is empty — nothing to export.".to_string(),
             Self::UnsupportedSampleRate(sr) => format!("Unsupported sample rate: {sr} Hz."),
-            Self::Mp3Unavailable => "MP3 export is not available in this build.".to_string(),
+            Self::OpusUnavailable => "Opus export is not available in this build.".to_string(),
             Self::FlacUnsupportedBitDepth(b) => {
                 format!("FLAC supports 16-bit or 24-bit, not {b}-bit.")
             }
@@ -302,8 +303,8 @@ pub struct ExportEstimate {
     pub channels: u16,
     pub sample_format: AudioSampleFormat,
     pub format: AudioFileFormat,
-    /// MP3 is lossy, so its "depth" is a bitrate. `None` for PCM containers.
-    pub mp3_bitrate_kbps: Option<u16>,
+    /// Opus is lossy, so its "depth" is a bitrate. `None` for PCM containers.
+    pub opus_bitrate_kbps: Option<u16>,
     pub start_sample: u64,
     pub end_sample: u64,
     pub content_frames: u64,
@@ -316,7 +317,7 @@ pub struct ExportEstimate {
     /// Number of files this export will write.
     pub file_count: usize,
     /// Size of one uncompressed output file, when the container stores
-    /// fixed-width PCM. `None` for FLAC/MP3 — only the encoder knows those.
+    /// fixed-width PCM. `None` for FLAC/Opus — only the encoder knows those.
     pub uncompressed_bytes: Option<u64>,
 }
 
@@ -439,12 +440,18 @@ impl ExportSettings {
     }
 
     /// Whether the output is quantized to integers, so the dither choice
-    /// matters: WAV at 16 or 24 bits, FLAC, MP3.
+    /// matters: WAV at 16 or 24 bits, FLAC. Not float WAV, not Opus.
     pub fn dither_applies(&self) -> bool {
         matches!(
             self.sample_format(),
             AudioSampleFormat::I16 | AudioSampleFormat::I24
         )
+    }
+
+    /// The Opus preset `opus_bitrate_kbps` names; the default for any value
+    /// that is not one, so a stray number never fails an export.
+    pub fn opus_bitrate(&self) -> OpusBitrate {
+        OpusBitrate::from_kbps(u32::from(self.opus_bitrate_kbps)).unwrap_or_default()
     }
 
     fn sample_format(&self) -> AudioSampleFormat {
@@ -457,8 +464,9 @@ impl ExportSettings {
                     AudioSampleFormat::I24
                 }
             }
-            // MP3 is lossy; sample format is informational only.
-            AudioFileFormat::Mp3 => AudioSampleFormat::I16,
+            // Opus encodes the float render as it is: nothing is quantized
+            // before the codec, so there is nothing to dither.
+            AudioFileFormat::Opus => AudioSampleFormat::F32,
             AudioFileFormat::Rauf => AudioSampleFormat::F32,
         }
     }
@@ -484,8 +492,8 @@ impl ExportSettings {
         if !SUPPORTED_RATES.contains(&sr) && !(realtime && self.format == AudioFileFormat::Wav) {
             return Err(ExportSettingsError::UnsupportedSampleRate(sr));
         }
-        if self.format == AudioFileFormat::Mp3 && !defaults.mp3_available {
-            return Err(ExportSettingsError::Mp3Unavailable);
+        if self.format == AudioFileFormat::Opus && !defaults.opus_available {
+            return Err(ExportSettingsError::OpusUnavailable);
         }
         if self.format == AudioFileFormat::Flac
             && self.flac_bit_depth != 16
@@ -528,8 +536,8 @@ impl ExportSettings {
             channels: request.render.channels,
             sample_format: request.sample_format,
             format: request.format,
-            mp3_bitrate_kbps: (request.format == AudioFileFormat::Mp3)
-                .then_some(self.mp3_bitrate_kbps),
+            opus_bitrate_kbps: (request.format == AudioFileFormat::Opus)
+                .then(|| self.opus_bitrate().kbps() as u16),
             start_sample: request.render.start_sample,
             end_sample: request.render.end_sample,
             content_frames,
@@ -625,10 +633,9 @@ impl ExportSettings {
             compression_level: self.flac_compression_level.unwrap_or(5),
             block_size: 4096,
         };
-        encode_options.mp3 = Mp3EncodeOptions {
-            bitrate: Mp3Bitrate::from_kbps(self.mp3_bitrate_kbps as u32)
-                .unwrap_or(Mp3Bitrate::Kbps256),
-            quality: 2,
+        encode_options.opus = OpusEncodeOptions {
+            bitrate: self.opus_bitrate(),
+            ..Default::default()
         };
 
         Ok(ArrangementExportRequest {

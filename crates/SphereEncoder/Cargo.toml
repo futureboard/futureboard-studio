@@ -10,15 +10,24 @@ path = "src/lib.rs"
 
 [dependencies]
 flacenc = { version = "0.5.1", default-features = false, features = ["par"], optional = true }
-mp3lame-encoder = { version = "0.2.4", features = ["std"], optional = true }
+# Ogg Opus export. `opus` (MIT/Apache-2.0) wraps libopus (BSD-3-Clause), which
+# `opusic-sys` (BSD-3-Clause) builds from its bundled source with CMake and
+# links statically on every platform; `ogg` (BSD-3-Clause) is the pure-Rust
+# container. `rubato` (MIT) brings other rates to the 48 kHz Opus runs at.
+ogg = { version = "0.9.2", optional = true }
+opus = { version = "0.4.0", optional = true }
+rubato = { workspace = true, optional = true }
+serde.workspace = true
 tracing.workspace = true
 
-# FLAC is on by default (pure-Rust `flacenc`, no native deps). MP3 is OFF by
-# default because `mp3lame-sys` compiles libmp3lame from source via autotools,
-# which is not guaranteed available in every build environment. No FFmpeg/libav
-# is involved in either path.
+[dev-dependencies]
+serde_json.workspace = true
+
+# FLAC is on by default (pure-Rust `flacenc`, no native deps). Opus is OFF by
+# default because libopus is compiled from C through CMake, which not every
+# consumer (e.g. LiveStage) wants to need. No FFmpeg/libav is involved in
+# either path.
 [features]
 default = ["flac"]
 flac = ["dep:flacenc"]
-mp3 = ["mp3-lame"]
-mp3-lame = ["dep:mp3lame-encoder"]
+opus = ["dep:opus", "dep:ogg", "dep:rubato"]

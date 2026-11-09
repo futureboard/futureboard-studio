@@ -11,12 +11,20 @@ use std::path::Path;
 use crate::metadata::AudioMetadata;
 
 /// Container/codec a render is written to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// Stored by its lower-case id (`"wav"`, `"flac"`, `"opus"`, `"rauf"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum AudioFileFormat {
     #[default]
     Wav,
     Flac,
-    Mp3,
+    /// Ogg Opus (RFC 7845), encoded with libopus.
+    ///
+    /// Replaced MP3 export, whose LAME encoder is LGPL (#284): a stored
+    /// `"mp3"` reads back as Opus, so nothing that saved MP3 fails to load.
+    #[serde(alias = "mp3", alias = "Mp3", alias = "MP3")]
+    Opus,
     /// Internal Futureboard recording/cache format. Useful as a debug export
     /// target; not expected to be readable by general-purpose tools.
     Rauf,
@@ -27,7 +35,7 @@ impl AudioFileFormat {
         match self {
             Self::Wav => "wav",
             Self::Flac => "flac",
-            Self::Mp3 => "mp3",
+            Self::Opus => "opus",
             Self::Rauf => "rauf",
         }
     }
@@ -35,6 +43,18 @@ impl AudioFileFormat {
     /// File extension (without the dot) conventionally used for this format.
     pub fn extension(self) -> &'static str {
         self.as_str()
+    }
+
+    /// The format an id from [`as_str`](Self::as_str) names, ignoring case.
+    /// The retired `"mp3"` id maps to [`Opus`](Self::Opus), as in serde.
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id.trim().to_ascii_lowercase().as_str() {
+            "wav" => Some(Self::Wav),
+            "flac" => Some(Self::Flac),
+            "opus" | "mp3" => Some(Self::Opus),
+            "rauf" => Some(Self::Rauf),
+            _ => None,
+        }
     }
 }
 
@@ -145,49 +165,89 @@ impl Default for FlacEncodeOptions {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mp3Bitrate {
+/// The rate every Opus stream decodes at (and its granule-position unit),
+/// whatever the source rate was.
+pub const OPUS_SAMPLE_RATE: u32 = 48_000;
+
+/// Target bitrate of an Opus export (VBR), for the whole stream rather than
+/// per channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OpusBitrate {
+    Kbps64,
+    Kbps96,
     Kbps128,
+    #[default]
+    Kbps160,
     Kbps192,
     Kbps256,
-    Kbps320,
 }
 
-impl Mp3Bitrate {
+impl OpusBitrate {
+    /// Every preset, lowest first.
+    pub const ALL: [Self; 6] = [
+        Self::Kbps64,
+        Self::Kbps96,
+        Self::Kbps128,
+        Self::Kbps160,
+        Self::Kbps192,
+        Self::Kbps256,
+    ];
+
     pub fn from_kbps(kbps: u32) -> Result<Self, EncodeError> {
-        match kbps {
-            128 => Ok(Self::Kbps128),
-            192 => Ok(Self::Kbps192),
-            256 => Ok(Self::Kbps256),
-            320 => Ok(Self::Kbps320),
-            other => Err(EncodeError::UnsupportedSpec(format!(
-                "unsupported MP3 CBR bitrate {other} kbps (expected 128/192/256/320)"
-            ))),
-        }
+        Self::ALL
+            .into_iter()
+            .find(|preset| preset.kbps() == kbps)
+            .ok_or_else(|| {
+                EncodeError::UnsupportedSpec(format!(
+                    "unsupported Opus bitrate {kbps} kbps (expected 64/96/128/160/192/256)"
+                ))
+            })
     }
 
     pub fn kbps(self) -> u32 {
         match self {
+            Self::Kbps64 => 64,
+            Self::Kbps96 => 96,
             Self::Kbps128 => 128,
+            Self::Kbps160 => 160,
             Self::Kbps192 => 192,
             Self::Kbps256 => 256,
-            Self::Kbps320 => 320,
+        }
+    }
+
+    pub fn bits_per_second(self) -> i32 {
+        self.kbps() as i32 * 1000
+    }
+
+    /// The Opus preset that stands in for an MP3 CBR bitrate saved before
+    /// MP3 export was removed (#284): about the same quality, not the same
+    /// number, since Opus needs far fewer bits. MP3's 256 kbps default maps
+    /// to Opus's 160 kbps default. Never fails: any other value takes the
+    /// nearest step.
+    pub fn from_legacy_mp3_kbps(kbps: u32) -> Self {
+        match kbps {
+            0..=112 => Self::Kbps64,
+            113..=160 => Self::Kbps96,
+            161..=224 => Self::Kbps128,
+            225..=288 => Self::Kbps160,
+            _ => Self::Kbps192,
         }
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct Mp3EncodeOptions {
-    pub bitrate: Mp3Bitrate,
-    /// 0 (best/slowest) .. 9 (worst/fastest), LAME quality preset.
-    pub quality: u8,
+pub struct OpusEncodeOptions {
+    pub bitrate: OpusBitrate,
+    /// libopus encoder complexity, 0 (fastest) ..= 10 (best). Export is
+    /// offline, so the default spends the CPU.
+    pub complexity: u8,
 }
 
-impl Default for Mp3EncodeOptions {
+impl Default for OpusEncodeOptions {
     fn default() -> Self {
         Self {
-            bitrate: Mp3Bitrate::Kbps256,
-            quality: 2,
+            bitrate: OpusBitrate::default(),
+            complexity: 10,
         }
     }
 }
@@ -214,11 +274,12 @@ pub enum AudioDither {
 pub struct AudioEncodeOptions {
     pub format: AudioFileFormat,
     /// Dither applied when float samples are quantized to a 16- or 24-bit
-    /// integer stream (WAV, FLAC, and the 16-bit PCM fed to the MP3 encoder).
+    /// integer stream (WAV, FLAC). Opus encodes the float samples, so it is
+    /// never dithered.
     pub dither: AudioDither,
     pub wav: WavEncodeOptions,
     pub flac: FlacEncodeOptions,
-    pub mp3: Mp3EncodeOptions,
+    pub opus: OpusEncodeOptions,
     pub metadata: AudioMetadata,
 }
 
@@ -232,7 +293,7 @@ pub enum EncodeError {
     UnsupportedFormat(AudioFileFormat),
     UnsupportedSpec(String),
     /// The format is recognized but its codec is not compiled into this build
-    /// (e.g. MP3 without the `mp3` feature). Never silently faked.
+    /// (e.g. Opus without the `opus` feature). Never silently faked.
     CodecUnavailable {
         format: AudioFileFormat,
         reason: String,
@@ -306,11 +367,11 @@ pub trait AudioEncoder: Send {
     }
 }
 
-/// Whether MP3 encoding is compiled into this build (the `mp3` feature). The UI
-/// uses this to show MP3 as available or disabled with a clear explanation —
-/// never to silently fall back.
-pub fn mp3_available() -> bool {
-    cfg!(feature = "mp3-lame")
+/// Whether Opus encoding is compiled into this build (the `opus` feature). The
+/// UI uses this to show Opus as available or disabled with a clear
+/// explanation — never to silently fall back.
+pub fn opus_available() -> bool {
+    cfg!(feature = "opus")
 }
 
 /// Whether FLAC encoding is compiled into this build (the `flac` feature).
@@ -335,7 +396,7 @@ pub fn create_encoder(
         )),
         AudioFileFormat::Rauf => Ok(Box::new(crate::rauf::RaufEncoder::create(path, spec)?)),
         AudioFileFormat::Flac => create_flac_encoder(path, spec, options),
-        AudioFileFormat::Mp3 => create_mp3_encoder(path, spec, options),
+        AudioFileFormat::Opus => create_opus_encoder(path, spec, options),
     }
 }
 
@@ -363,27 +424,30 @@ fn create_flac_encoder(
     })
 }
 
-#[cfg(feature = "mp3-lame")]
-fn create_mp3_encoder(
+#[cfg(feature = "opus")]
+fn create_opus_encoder(
     path: &Path,
     spec: AudioEncodeSpec,
     options: AudioEncodeOptions,
 ) -> Result<Box<dyn AudioEncoder>, EncodeError> {
-    Ok(Box::new(
-        crate::mp3::Mp3Encoder::create(path, spec, options.mp3, options.metadata)?
-            .with_dither(options.dither),
-    ))
+    // No dither: Opus takes the float samples as they are.
+    Ok(Box::new(crate::ogg_opus::OpusEncoder::create(
+        path,
+        spec,
+        options.opus,
+        options.metadata,
+    )?))
 }
 
-#[cfg(not(feature = "mp3-lame"))]
-fn create_mp3_encoder(
+#[cfg(not(feature = "opus"))]
+fn create_opus_encoder(
     _path: &Path,
     _spec: AudioEncodeSpec,
     _options: AudioEncodeOptions,
 ) -> Result<Box<dyn AudioEncoder>, EncodeError> {
     Err(EncodeError::CodecUnavailable {
-        format: AudioFileFormat::Mp3,
-        reason: "MP3 export is not available in this build (`mp3` feature disabled)".to_string(),
+        format: AudioFileFormat::Opus,
+        reason: "Opus export is not available in this build (`opus` feature disabled)".to_string(),
     })
 }
 
@@ -664,5 +728,64 @@ mod tests {
     #[test]
     fn the_shared_default_does_not_dither() {
         assert_eq!(AudioEncodeOptions::default().dither, AudioDither::Off);
+    }
+
+    /// #284: MP3 export is gone. Whatever stored the MP3 format (by serde or
+    /// by id) loads as Opus instead of failing, and the format ids round-trip.
+    #[test]
+    fn a_stored_mp3_format_loads_as_opus() {
+        for legacy in ["\"mp3\"", "\"Mp3\"", "\"MP3\""] {
+            let format: AudioFileFormat = serde_json::from_str(legacy).unwrap();
+            assert_eq!(format, AudioFileFormat::Opus, "{legacy}");
+        }
+        assert_eq!(AudioFileFormat::from_id("mp3"), Some(AudioFileFormat::Opus));
+        assert_eq!(
+            AudioFileFormat::from_id(" MP3 "),
+            Some(AudioFileFormat::Opus)
+        );
+        assert_eq!(AudioFileFormat::from_id("ogg"), None);
+
+        for format in [
+            AudioFileFormat::Wav,
+            AudioFileFormat::Flac,
+            AudioFileFormat::Opus,
+            AudioFileFormat::Rauf,
+        ] {
+            let json = serde_json::to_string(&format).unwrap();
+            assert_eq!(json, format!("\"{}\"", format.as_str()));
+            assert_eq!(
+                serde_json::from_str::<AudioFileFormat>(&json).unwrap(),
+                format
+            );
+            assert_eq!(AudioFileFormat::from_id(format.as_str()), Some(format));
+        }
+        assert_eq!(AudioFileFormat::Opus.extension(), "opus");
+    }
+
+    #[test]
+    fn a_legacy_mp3_bitrate_maps_to_a_comparable_opus_preset() {
+        assert_eq!(OpusBitrate::from_legacy_mp3_kbps(128), OpusBitrate::Kbps96);
+        assert_eq!(OpusBitrate::from_legacy_mp3_kbps(192), OpusBitrate::Kbps128);
+        // The old MP3 default lands on the Opus default.
+        assert_eq!(
+            OpusBitrate::from_legacy_mp3_kbps(256),
+            OpusBitrate::default()
+        );
+        assert_eq!(OpusBitrate::from_legacy_mp3_kbps(320), OpusBitrate::Kbps192);
+        assert_eq!(OpusBitrate::from_legacy_mp3_kbps(0), OpusBitrate::Kbps64);
+        assert_eq!(
+            OpusBitrate::from_legacy_mp3_kbps(9_999),
+            OpusBitrate::Kbps192
+        );
+    }
+
+    #[test]
+    fn opus_bitrate_presets_validate() {
+        assert_eq!(OpusBitrate::default().kbps(), 160);
+        for preset in OpusBitrate::ALL {
+            assert_eq!(OpusBitrate::from_kbps(preset.kbps()).unwrap(), preset);
+        }
+        assert!(OpusBitrate::from_kbps(320).is_err());
+        assert!(OpusBitrate::from_kbps(123).is_err());
     }
 }

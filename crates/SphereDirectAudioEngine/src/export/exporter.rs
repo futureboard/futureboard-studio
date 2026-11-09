@@ -26,7 +26,7 @@ pub struct ArrangementExportRequest {
     pub format: AudioFileFormat,
     pub sample_format: AudioSampleFormat,
     pub render: OfflineRenderRequest,
-    /// Per-format encoder options (WAV/FLAC/MP3 + metadata).
+    /// Per-format encoder options (WAV/FLAC/Opus + metadata).
     pub encode_options: AudioEncodeOptions,
 }
 
@@ -51,8 +51,8 @@ pub struct ArrangementExportSummary {
     /// encoder.
     pub levels: LevelReport,
     /// The file's sample format cannot hold samples above full scale (every
-    /// integer format, MP3), so the overs in `levels` were clipped flat in the
-    /// file itself. `false` for 32-bit float WAV, which keeps them.
+    /// integer format), so the overs in `levels` were clipped flat in the
+    /// file itself. `false` for 32-bit float WAV and Opus, which keep them.
     pub overs_clamped: bool,
 }
 
@@ -63,9 +63,15 @@ pub fn partial_path_for(output: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Whether a file of this format keeps samples above full scale.
+/// Whether a file of this format keeps samples above full scale. Opus encodes
+/// the float samples unclipped (a float decoder gets the overs back; one
+/// decoding to integers clips them on playback, not in the file).
 fn keeps_overs(format: AudioFileFormat, sample_format: AudioSampleFormat) -> bool {
-    matches!(format, AudioFileFormat::Wav) && matches!(sample_format, AudioSampleFormat::F32)
+    match format {
+        AudioFileFormat::Wav => matches!(sample_format, AudioSampleFormat::F32),
+        AudioFileFormat::Opus => true,
+        AudioFileFormat::Flac | AudioFileFormat::Rauf => false,
+    }
 }
 
 /// One render: the stereo mixdown, any number of mixer channels, or both,
@@ -1456,6 +1462,36 @@ mod tests {
         );
         let plain = export(sphere_encoder::AudioDither::Off);
         assert!(plain.iter().all(|&s| s == 0));
+    }
+
+    /// #284: Opus replaced MP3. A 44.1 kHz render goes through the same
+    /// streaming export path into an Ogg Opus file that decodes at 48 kHz for
+    /// the render's duration, and its overs are not reported as clamped.
+    #[test]
+    fn exports_a_44k1_render_to_ogg_opus() {
+        let out = temp_path("opus").with_extension("opus");
+        let mut req = wav_request(out.clone(), 44_100);
+        req.render.sample_rate = 44_100;
+        req.format = AudioFileFormat::Opus;
+        req.sample_format = AudioSampleFormat::F32;
+        req.encode_options.format = AudioFileFormat::Opus;
+        let summary = export_arrangement(
+            &silence_snapshot(44_100),
+            &req,
+            &ExportCancelToken::new(),
+            |_p| {},
+        )
+        .unwrap();
+        assert_eq!(summary.format, AudioFileFormat::Opus);
+        assert_eq!(summary.sample_rate, 48_000);
+        assert_eq!(summary.frames_written, 48_000);
+        assert!((summary.duration_seconds - 1.0).abs() < 1e-9);
+        assert!(keeps_overs(AudioFileFormat::Opus, AudioSampleFormat::F32));
+        assert!(!partial_path_for(&out).exists());
+        let bytes = std::fs::read(&out).unwrap();
+        assert_eq!(&bytes[..4], b"OggS");
+        assert_eq!(&bytes[28..36], b"OpusHead");
+        let _ = std::fs::remove_file(out);
     }
 
     /// #302: FLAC stems stream through the single-pass export — several

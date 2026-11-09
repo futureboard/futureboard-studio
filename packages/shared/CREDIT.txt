@@ -31,7 +31,7 @@ Audio, DSP & MIDI
 CPAL - Cross-platform real-time audio input/output
 midir - Cross-platform MIDI input/output
 Symphonia - Audio decoding (WAV, MP3, FLAC, AAC, ALAC, OGG/Vorbis, AIFF, MP4)
-LAME (libmp3lame) - MP3 encoding for export
+libopus (Xiph.Org) - Opus encoding for export (Ogg container via the ogg crate)
 RustFFT - Fast Fourier Transform
 rubato - High-quality sample-rate conversion
 fundsp - DSP / synthesis building blocks

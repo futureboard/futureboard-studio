@@ -1,8 +1,8 @@
 //! Optional descriptive metadata attached to an exported audio file.
 //!
-//! Container support is best-effort: WAV/RAUF ignore it for now, FLAC writes
-//! Vorbis comments where practical, and MP3 writes a minimal ID3 tag. Missing
-//! metadata never blocks an export.
+//! Container support is best-effort: WAV/RAUF ignore it for now, FLAC does not
+//! write Vorbis comments yet, and Opus writes every field as a Vorbis comment
+//! in its OpusTags header. Missing metadata never blocks an export.
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AudioMetadata {
@@ -21,5 +21,24 @@ impl AudioMetadata {
             && self.album.is_none()
             && self.date.is_none()
             && self.comment.is_none()
+    }
+
+    /// The fields as Vorbis comment `(FIELD, value)` pairs, in a fixed order,
+    /// skipping unset and blank ones. Field names follow the Xiph
+    /// recommendations (`TITLE`, `ARTIST`, `ALBUM`, `DATE`, `COMMENT`).
+    pub fn vorbis_comments(&self) -> Vec<(&'static str, &str)> {
+        [
+            ("TITLE", &self.title),
+            ("ARTIST", &self.artist),
+            ("ALBUM", &self.album),
+            ("DATE", &self.date),
+            ("COMMENT", &self.comment),
+        ]
+        .into_iter()
+        .filter_map(|(field, value)| {
+            let value = value.as_deref()?.trim();
+            (!value.is_empty()).then_some((field, value))
+        })
+        .collect()
     }
 }
