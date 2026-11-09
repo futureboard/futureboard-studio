@@ -264,6 +264,34 @@ sphere_daux_clap_is_valid(SphereDauxClapProcessor *processor);
 SPHERE_DAUX_CLAP_API int
 sphere_daux_clap_get_latency_samples(SphereDauxClapProcessor *processor);
 
+// ── Main-thread servicing ───────────────────────────────────────────────────
+//
+// CLAP plug-ins ask the host for main-thread work from any thread
+// (`request_callback`, `request_restart`, `clap.latency` changed). The bridge
+// only records those requests; the host's main-thread idle loop carries them
+// out through `sphere_daux_clap_main_thread_tick`.
+
+/// 1 (and resets) when any CLAP instance has main-thread work pending since the
+/// last call. Lets the idle loop skip walking its instances when there is none.
+SPHERE_DAUX_CLAP_API int sphere_daux_clap_take_main_thread_work(void);
+
+/// Re-raises the flag `sphere_daux_clap_take_main_thread_work` consumed, for a
+/// caller that took it but could not service its instances this time.
+SPHERE_DAUX_CLAP_API void sphere_daux_clap_request_main_thread_work(void);
+
+/// Services one instance on the thread that created it: calls
+/// `on_main_thread` after `request_callback`, and runs a requested restart —
+/// asks the audio thread to `stop_processing` at the top of its next block
+/// (or stops it here when no audio has flowed for a grace period), then
+/// `deactivate`, `activate` with the original sample rate and block sizes,
+/// re-reads the latency, and lets the audio thread `start_processing` again.
+/// Never blocks: a restart that is waiting for the audio thread finishes on a
+/// later tick, and keeps the work flag raised until it does. Returns 1 when
+/// the reported latency changed (re-read it with
+/// `sphere_daux_clap_get_latency_samples`), 0 otherwise.
+SPHERE_DAUX_CLAP_API int
+sphere_daux_clap_main_thread_tick(SphereDauxClapProcessor *processor);
+
 SPHERE_DAUX_CLAP_API void sphere_daux_clap_set_process_context(
     SphereDauxClapProcessor *processor, double tempo, int time_sig_num,
     int time_sig_den, long long project_time_samples, double ppq,

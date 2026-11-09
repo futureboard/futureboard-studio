@@ -4593,6 +4593,60 @@ fn run_ipc_loop(mut out: IpcOut, shutdown: Arc<AtomicBool>) {
                 );
             }
         });
+        // CLAP main-thread requests: `on_main_thread` after `request_callback`,
+        // and the deactivate → re-read latency → reactivate restart after
+        // `request_restart` or a latency change. This loop is the thread that
+        // created the plug-ins (`plugin_lifecycle_on_main_thread`), which is
+        // the CLAP main thread. Gated on one atomic, so nothing is walked
+        // unless a CLAP instance asked; a restart waiting on the audio thread
+        // re-raises it until it completes.
+        if DirectAudio::clap_processor::take_main_thread_work() {
+            timed_section!("clap_main_thread", {
+                let targets: Option<
+                    Vec<(String, DirectAudio::vst3_processor::Vst3RuntimeProcessor)>,
+                > = preview
+                    .try_lock_for(Duration::from_millis(2))
+                    .map(|engine| {
+                        engine
+                            .loaded_instance_ids()
+                            .into_iter()
+                            .filter_map(|id| {
+                                engine
+                                    .clone_processor_for(&id)
+                                    .map(|processor| (id, processor))
+                            })
+                            .collect()
+                    });
+                match targets {
+                    // Lock busy: try again next tick rather than drop the work.
+                    None => DirectAudio::clap_processor::request_main_thread_work(),
+                    Some(targets) => {
+                        for (instance_id, processor) in targets {
+                            // Runs with the preview lock released: a restart
+                            // calls the plug-in's activate.
+                            if !processor.main_thread_tick() {
+                                continue;
+                            }
+                            // New latency after a restart: publish it now, the
+                            // same way the periodic latency republish does, so
+                            // delay compensation does not wait ~4 s for it.
+                            let latency = processor.get_latency_samples().max(0) as u32;
+                            if let Ok(slots) = region_slots.lock() {
+                                if let Some(region) = slots.get(&instance_id) {
+                                    region
+                                        .bridge()
+                                        .latency_samples
+                                        .store(latency, Ordering::Relaxed);
+                                }
+                            }
+                            eprintln!(
+                                "[plugin-host-dsp] latency instance={instance_id} samples={latency} reason=clap_restart"
+                            );
+                        }
+                    }
+                }
+            });
+        }
         timed_section!("resize_poll", {
             let resizes = preview
                 .try_lock_for(Duration::from_millis(2))

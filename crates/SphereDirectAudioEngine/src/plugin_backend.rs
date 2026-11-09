@@ -245,6 +245,23 @@ pub(crate) mod backend {
         }
     }
 
+    /// One main-thread service tick (see `sphere_daux_clap_main_thread_tick`).
+    /// Only CLAP has one: its plug-ins ask for `on_main_thread` callbacks and
+    /// restarts that the host must carry out from its own main thread. VST3
+    /// and VST2 have no equivalent, so this is a no-op for them. Returns 1
+    /// when the reported latency changed.
+    #[inline]
+    pub unsafe fn main_thread_tick(
+        format: PluginModuleFormat,
+        raw: *mut SphereDauxVst3Processor,
+    ) -> i32 {
+        if format == PluginModuleFormat::Clap {
+            clap::main_thread_tick(as_clap(raw))
+        } else {
+            0
+        }
+    }
+
     // ── Entry points that take no instance pointer ───────────────────────────
 
     #[inline]

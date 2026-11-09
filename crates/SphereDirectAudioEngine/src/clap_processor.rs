@@ -13,6 +13,27 @@ pub struct SphereDauxClapProcessor {
     _private: [u8; 0],
 }
 
+/// `true` (and resets) when any CLAP instance asked for main-thread work since
+/// the last call: a `request_callback`, a `request_restart`, a latency change,
+/// or a restart still waiting on the audio thread.
+///
+/// The host's main-thread idle loop polls this every tick and, when it is set,
+/// calls [`crate::vst3_processor::Vst3RuntimeProcessor::main_thread_tick`] on
+/// its instances. One atomic exchange, so the poll is free when nothing is
+/// pending.
+pub fn take_main_thread_work() -> bool {
+    // SAFETY: no arguments; touches one process-wide atomic.
+    unsafe { ffi::sphere_daux_clap_take_main_thread_work() != 0 }
+}
+
+/// Re-raises the flag [`take_main_thread_work`] consumed, for a caller that
+/// took it but could not reach its instances this tick (a busy lock), so the
+/// work is retried on the next one rather than lost.
+pub fn request_main_thread_work() {
+    // SAFETY: no arguments; touches one process-wide atomic.
+    unsafe { ffi::sphere_daux_clap_request_main_thread_work() }
+}
+
 /// Raw CLAP bridge entry points, mirroring `vst3_processor::ffi`.
 pub(crate) mod ffi {
     use super::SphereDauxClapProcessor;
@@ -118,6 +139,11 @@ pub(crate) mod ffi {
             -> i32;
         pub(crate) fn sphere_daux_clap_is_valid(processor: *mut SphereDauxClapProcessor) -> i32;
         pub(crate) fn sphere_daux_clap_get_latency_samples(
+            processor: *mut SphereDauxClapProcessor,
+        ) -> i32;
+        pub(crate) fn sphere_daux_clap_take_main_thread_work() -> i32;
+        pub(crate) fn sphere_daux_clap_request_main_thread_work();
+        pub(crate) fn sphere_daux_clap_main_thread_tick(
             processor: *mut SphereDauxClapProcessor,
         ) -> i32;
         pub(crate) fn sphere_daux_clap_set_process_context(
@@ -295,6 +321,7 @@ pub(crate) mod ffi {
         sphere_daux_clap_list_parameters_json as list_parameters_json,
         sphere_daux_clap_main_audio_input_channel_count as main_audio_input_channel_count,
         sphere_daux_clap_main_audio_output_channel_count as main_audio_output_channel_count,
+        sphere_daux_clap_main_thread_tick as main_thread_tick,
         sphere_daux_clap_open_editor as open_editor,
         sphere_daux_clap_output_bus_channel_counts as output_bus_channel_counts,
         sphere_daux_clap_parameters_json_free as parameters_json_free,

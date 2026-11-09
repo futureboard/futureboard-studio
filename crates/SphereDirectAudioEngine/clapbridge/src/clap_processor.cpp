@@ -32,6 +32,20 @@ namespace {
 
 std::atomic<unsigned long long> g_next_editor_handle{1};
 
+/// Raised whenever any instance has main-thread work pending (a callback
+/// request, a restart, a latency change), so the host's idle loop can skip
+/// walking its instances when there is nothing to do. One flag for the whole
+/// bridge: a spurious wake costs one walk; a missed one would stall a plug-in.
+std::atomic<bool> g_main_thread_work{false};
+
+/// How long the main thread lets the audio thread perform a requested stop
+/// before concluding no audio is flowing and stopping it itself.
+constexpr auto kAudioStopGrace = std::chrono::milliseconds(100);
+
+void raise_main_thread_work() {
+  g_main_thread_work.store(true, std::memory_order_release);
+}
+
 SphereDauxClapProcessor *processor_for(const clap_host_t *host) {
   return host ? static_cast<SphereDauxClapProcessor *>(host->host_data)
               : nullptr;
@@ -132,21 +146,31 @@ std::string mac_executable_path(const std::string &bundle_path) {
 const void *CLAP_ABI host_get_extension(const clap_host_t *host,
                                         const char *extension_id);
 
+// [thread-safe] Deactivate and reactivate soon. Only recorded here; the
+// restart itself runs from `service_main_thread`. A request made from inside
+// the activate this host is running is already being honoured by it.
 void CLAP_ABI host_request_restart(const clap_host_t *host) {
   if (auto *p = processor_for(host)) {
+    if (p->activating.load(std::memory_order_acquire)) {
+      return;
+    }
     p->restart_requested.store(true, std::memory_order_release);
+    raise_main_thread_work();
   }
 }
 
-void CLAP_ABI host_request_process(const clap_host_t *host) {
-  if (auto *p = processor_for(host)) {
-    p->process_requested.store(true, std::memory_order_release);
-  }
-}
+// [thread-safe] Wake a sleeping plug-in. This host never stops calling
+// process() while a stream runs (CLAP_PROCESS_SLEEP and friends are not acted
+// on), so a plug-in is never asleep from the host's side and there is nothing
+// to resume: the next block already calls it. Deliberately a no-op.
+void CLAP_ABI host_request_process(const clap_host_t *) {}
 
+// [thread-safe] Call plugin->on_main_thread() soon. Serviced by the host's
+// main-thread idle loop through `sphere_daux_clap_main_thread_tick`.
 void CLAP_ABI host_request_callback(const clap_host_t *host) {
   if (auto *p = processor_for(host)) {
     p->callback_requested.store(true, std::memory_order_release);
+    raise_main_thread_work();
   }
 }
 
@@ -184,12 +208,22 @@ bool CLAP_ABI host_is_audio_thread(const clap_host_t *host) {
 }
 
 // clap.latency
+//
+// [main-thread] Only marks the latency stale; it is never read from inside
+// the plug-in's own callback. The spec allows the latency to change only
+// during activate(), so:
+//  - inside the activate this host is running, the re-read happens as soon as
+//    activate returns (see `service_main_thread` and `setup`);
+//  - while activated, the change takes effect only through a restart, so one
+//    is scheduled here even for a plug-in that forgot to call
+//    request_restart() itself. A plug-in that does call it gets one restart,
+//    not two: both flags are consumed by the same restart.
 void CLAP_ABI host_latency_changed(const clap_host_t *host) {
   if (auto *p = processor_for(host)) {
-    if (p->ext_latency && p->plugin) {
-      p->reported_latency.store(
-          static_cast<int>(p->ext_latency->get(p->plugin)),
-          std::memory_order_release);
+    p->latency_dirty.store(true, std::memory_order_release);
+    if (!p->activating.load(std::memory_order_acquire)) {
+      p->restart_requested.store(true, std::memory_order_release);
+      raise_main_thread_work();
     }
   }
 }
@@ -612,8 +646,11 @@ bool SphereDauxClapProcessor::setup(double sr) {
                     CLAP_TRANSPORT_HAS_BEATS_TIMELINE |
                     CLAP_TRANSPORT_HAS_TIME_SIGNATURE;
 
-  if (!plugin->activate(plugin, sample_rate, 1,
-                        static_cast<uint32_t>(kMaxProcessFrames))) {
+  activating.store(true, std::memory_order_release);
+  const bool activate_ok = plugin->activate(
+      plugin, sample_rate, 1, static_cast<uint32_t>(kMaxProcessFrames));
+  activating.store(false, std::memory_order_release);
+  if (!activate_ok) {
     clap_set_last_error("clap_plugin->activate() returned false");
     return false;
   }
@@ -624,7 +661,11 @@ bool SphereDauxClapProcessor::setup(double sr) {
     return false;
   }
   processing = true;
+  audio_state.store(kAudioRunning, std::memory_order_release);
 
+  // Any latency change the plug-in reported during activate is covered by
+  // this read.
+  latency_dirty.store(false, std::memory_order_release);
   if (ext_latency) {
     reported_latency.store(static_cast<int>(ext_latency->get(plugin)),
                            std::memory_order_release);
@@ -657,6 +698,9 @@ void SphereDauxClapProcessor::shutdown() {
 #endif
 
   if (plugin) {
+    // By now no audio thread holds this instance, so a restart that was cut
+    // short (stopped, or reactivated but never started) is finished here:
+    // `processing` and `activated` say what is still open.
     if (processing) {
       plugin->stop_processing(plugin);
       processing = false;
@@ -836,12 +880,176 @@ void SphereDauxClapProcessor::build_events(
   }
 }
 
+// ── Restart (main thread ↔ audio thread) ────────────────────────────────────
+
+bool SphereDauxClapProcessor::audio_gate_allows_process() {
+  // Runs with `audio_busy` set (seq_cst), so this load cannot be ordered
+  // before it: either the main thread sees this block as busy, or this block
+  // sees the main thread's request.
+  int state = audio_state.load(std::memory_order_seq_cst);
+  if (state == kAudioRunning) {
+    return true;
+  }
+  if (state == kAudioStopRequested) {
+    int expected = kAudioStopRequested;
+    if (audio_state.compare_exchange_strong(expected, kAudioStopping,
+                                            std::memory_order_seq_cst)) {
+      plugin->stop_processing(plugin);
+      processing = false;
+      audio_state.store(kAudioStopped, std::memory_order_release);
+    }
+    return false;
+  }
+  if (state == kAudioStartRequested) {
+    int expected = kAudioStartRequested;
+    if (!audio_state.compare_exchange_strong(expected, kAudioStarting,
+                                             std::memory_order_seq_cst)) {
+      return false;
+    }
+    if (!plugin->start_processing(plugin)) {
+      // Stays parked: activated but not processing, until the next restart
+      // or teardown. No logging here — this is the audio thread.
+      audio_state.store(kAudioStopped, std::memory_order_release);
+      return false;
+    }
+    processing = true;
+    audio_state.store(kAudioRunning, std::memory_order_release);
+    return true;
+  }
+  // Stopping / stopped / starting: the instance is mid-restart.
+  return false;
+}
+
+int SphereDauxClapProcessor::service_main_thread() {
+  if (!plugin || !plugin_initialized ||
+      !processor_valid.load(std::memory_order_acquire)) {
+    return 0;
+  }
+  int latency_changed = 0;
+
+  if (callback_requested.exchange(false, std::memory_order_acq_rel) &&
+      plugin->on_main_thread) {
+    plugin->on_main_thread(plugin);
+  }
+
+  // Begin a restart: ask the audio thread to stop processing. Also the retry
+  // path for an instance whose last reactivation failed (inactive, stopped).
+  if (restart_phase == kRestartIdle &&
+      restart_requested.load(std::memory_order_acquire)) {
+    int state = audio_state.load(std::memory_order_seq_cst);
+    bool begun = false;
+    if (state == kAudioRunning) {
+      begun = audio_state.compare_exchange_strong(
+          state, kAudioStopRequested, std::memory_order_seq_cst);
+    } else if (state == kAudioStartRequested) {
+      // Reactivated earlier but the audio thread never came back to start
+      // it: nothing is processing, so it can go straight back to stopped.
+      begun = audio_state.compare_exchange_strong(state, kAudioStopped,
+                                                  std::memory_order_seq_cst);
+    } else if (state == kAudioStopped) {
+      begun = true;
+    }
+    // A transient state (stopping/starting) is the audio thread mid-step;
+    // retried on the next tick.
+    if (begun) {
+      restart_requested.store(false, std::memory_order_release);
+      restart_phase = kRestartWaitingForStop;
+      restart_stop_requested_at = std::chrono::steady_clock::now();
+    }
+  }
+
+  if (restart_phase == kRestartWaitingForStop) {
+    // No audio flowing (transport idle, device stopped): after a grace
+    // period stop it from here instead of waiting for a block that may never
+    // come. `audio_busy` false after our seq_cst request means no block is
+    // inside process(), and any block that starts now sees the request.
+    if (audio_state.load(std::memory_order_seq_cst) == kAudioStopRequested &&
+        std::chrono::steady_clock::now() - restart_stop_requested_at >=
+            kAudioStopGrace &&
+        !audio_busy.load(std::memory_order_seq_cst)) {
+      int expected = kAudioStopRequested;
+      if (audio_state.compare_exchange_strong(expected, kAudioStopping,
+                                              std::memory_order_seq_cst)) {
+        plugin->stop_processing(plugin);
+        processing = false;
+        audio_state.store(kAudioStopped, std::memory_order_release);
+      }
+    }
+
+    if (audio_state.load(std::memory_order_acquire) == kAudioStopped) {
+      restart_phase = kRestartIdle;
+      if (activated) {
+        plugin->deactivate(plugin);
+        activated = false;
+      }
+
+      activating.store(true, std::memory_order_release);
+      const bool ok = plugin->activate(
+          plugin, sample_rate, 1, static_cast<uint32_t>(kMaxProcessFrames));
+      activating.store(false, std::memory_order_release);
+
+      if (!ok) {
+        // Left deactivated and parked: process() is never called again,
+        // the host passes audio through, and a later restart request retries.
+        std::fprintf(stderr,
+                     "[SphereCLAP] restart: activate() failed id=\"%s\"; "
+                     "instance left inactive\n",
+                     plugin_id.c_str());
+      } else {
+        activated = true;
+        // The re-read the latency change was waiting for.
+        latency_dirty.store(false, std::memory_order_release);
+        if (ext_latency) {
+          const int latency = static_cast<int>(ext_latency->get(plugin));
+          const int previous =
+              reported_latency.exchange(latency, std::memory_order_acq_rel);
+          latency_changed = previous != latency ? 1 : 0;
+          if (latency_changed || daux_clap_debug()) {
+            std::fprintf(stderr,
+                         "[SphereCLAP] restart id=\"%s\" latency %d -> %d\n",
+                         plugin_id.c_str(), previous, latency);
+          }
+        }
+        audio_state.store(kAudioStartRequested, std::memory_order_release);
+      }
+    }
+  }
+
+  // Still waiting on the audio thread, or the plug-in asked for more while we
+  // were in it (`on_main_thread` may request again): keep the idle loop
+  // coming back.
+  if (restart_phase != kRestartIdle ||
+      restart_requested.load(std::memory_order_acquire) ||
+      callback_requested.load(std::memory_order_acquire)) {
+    raise_main_thread_work();
+  }
+  return latency_changed;
+}
+
 // ── Processing ──────────────────────────────────────────────────────────────
+
+namespace {
+
+/// Holds `audio_busy` for the whole of one block's gate check and process().
+struct AudioBusyScope {
+  std::atomic<bool> &busy;
+  explicit AudioBusyScope(std::atomic<bool> &flag) : busy(flag) {
+    busy.store(true, std::memory_order_seq_cst);
+  }
+  ~AudioBusyScope() { busy.store(false, std::memory_order_release); }
+  AudioBusyScope(const AudioBusyScope &) = delete;
+  AudioBusyScope &operator=(const AudioBusyScope &) = delete;
+};
+
+} // namespace
 
 bool SphereDauxClapProcessor::process_planar(
     const float *in_l, const float *in_r, int frames,
     const SphereDauxClapMidiEvent *events, int midi_event_count) {
-  if (!plugin || !processing || frames <= 0 || frames > allocated_frames) {
+  // Cleared before any early return, so a block that does not process can
+  // never hand the previous block's MIDI out a second time.
+  output_midi_count = 0;
+  if (!plugin || frames <= 0 || frames > allocated_frames) {
     return false;
   }
 
@@ -851,6 +1059,14 @@ bool SphereDauxClapProcessor::process_planar(
   if (!audio_thread_known.load(std::memory_order_acquire)) {
     audio_thread_id = std::this_thread::get_id();
     audio_thread_known.store(true, std::memory_order_release);
+  }
+
+  const AudioBusyScope busy_scope(audio_busy);
+  // Performs a requested stop/start here, on the audio thread, and keeps
+  // process() away from a plug-in the main thread is restarting. A parked
+  // block returns false and the caller passes its input through.
+  if (!audio_gate_allows_process()) {
+    return false;
   }
 
   build_events(events, midi_event_count);
@@ -1284,6 +1500,18 @@ int sphere_daux_clap_get_latency_samples(SphereDauxClapProcessor *p) {
     return 0;
   }
   return std::max(0, p->reported_latency.load(std::memory_order_acquire));
+}
+
+int sphere_daux_clap_take_main_thread_work(void) {
+  return g_main_thread_work.exchange(false, std::memory_order_acq_rel) ? 1 : 0;
+}
+
+void sphere_daux_clap_request_main_thread_work(void) {
+  raise_main_thread_work();
+}
+
+int sphere_daux_clap_main_thread_tick(SphereDauxClapProcessor *p) {
+  return p ? p->service_main_thread() : 0;
 }
 
 void sphere_daux_clap_set_process_context(SphereDauxClapProcessor *p,

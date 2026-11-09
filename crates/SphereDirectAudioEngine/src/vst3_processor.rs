@@ -1420,6 +1420,25 @@ impl Vst3RuntimeProcessor {
         unsafe { backend::view_idle(self.inner.format, self.inner.raw) };
     }
 
+    /// Carries out the main-thread work a CLAP plug-in asked for: its
+    /// `on_main_thread` callback, and a requested restart (stop processing on
+    /// the audio thread, deactivate, reactivate, re-read the latency, start
+    /// again). Returns `true` when the reported latency changed, so the caller
+    /// can republish it for delay compensation at once.
+    ///
+    /// Call from the thread that created the instance, whenever
+    /// [`crate::clap_processor::take_main_thread_work`] says there is work.
+    /// Never blocks; a restart waiting on the audio thread completes on a
+    /// later call. A no-op for VST3 and VST2.
+    pub fn main_thread_tick(&self) -> bool {
+        if self.inner.raw.is_null() {
+            return false;
+        }
+        // SAFETY: `raw` is a live processor of `format` for as long as this
+        // handle is.
+        unsafe { backend::main_thread_tick(self.inner.format, self.inner.raw) != 0 }
+    }
+
     /// Hands one key press to the VST3 view (`IPlugView::onKeyDown`, then
     /// `onKeyUp`). Returns whether the view handled it.
     ///

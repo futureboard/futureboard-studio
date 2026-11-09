@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -155,8 +156,11 @@ struct SphereDauxClapProcessor {
   double sample_rate{44100.0};
   bool entry_initialized{false};
   bool plugin_initialized{false};
+  /// Main thread only: activate/deactivate run there.
   bool activated{false};
-  bool processing{false};
+  /// Between start_processing and stop_processing. Written by whichever side
+  /// owns that transition (see `audio_state`), read by `shutdown`.
+  std::atomic<bool> processing{false};
 
   // ── Extensions (queried once after init) ─────────────────────────────────
   const clap_plugin_audio_ports_t *ext_audio_ports{nullptr};
@@ -218,10 +222,43 @@ struct SphereDauxClapProcessor {
   std::vector<ClapParamRange> param_ranges;
 
   // ── Host-callback flags ──────────────────────────────────────────────────
+  // Raised from any thread by the plug-in's `clap_host` calls; consumed on
+  // the main thread by `service_main_thread`.
   std::atomic<bool> restart_requested{false};
-  std::atomic<bool> process_requested{false};
   std::atomic<bool> callback_requested{false};
+  /// `clap.latency` changed() arrived: the latency must be re-read. The
+  /// re-read happens on the main thread right after the next activate.
+  std::atomic<bool> latency_dirty{false};
+  /// True while this host is inside `plugin->activate()`. A latency change
+  /// reported there is the one the spec allows and is re-read when activate
+  /// returns, so it must not schedule yet another restart.
+  std::atomic<bool> activating{false};
   std::atomic<int> reported_latency{0};
+
+  // ── Restart hand-off with the audio thread ───────────────────────────────
+  // CLAP wants start/stop_processing on the audio thread and activate/
+  // deactivate on the main thread, with processing stopped before deactivate.
+  // `audio_state` is the hand-off between the two; neither side blocks. The
+  // main thread asks for a stop, the audio thread performs it at the top of
+  // its next block and parks, the main thread reactivates and asks for a
+  // start, and the audio thread starts again at the top of its next block.
+  enum AudioState : int {
+    kAudioRunning = 0,        // processing; blocks are rendered
+    kAudioStopRequested = 1,  // main asked the audio thread to stop
+    kAudioStopping = 2,       // owner of the stop is calling stop_processing
+    kAudioStopped = 3,        // not processing; main may (de)activate
+    kAudioStartRequested = 4, // reactivated; audio thread must start
+    kAudioStarting = 5,       // audio thread is calling start_processing
+  };
+  std::atomic<int> audio_state{kAudioRunning};
+  /// Set by the audio thread for the whole of a block's gate check and
+  /// `process()`, so the main thread can tell a parked audio thread from one
+  /// that is mid-block (see `service_main_thread`'s idle fallback).
+  std::atomic<bool> audio_busy{false};
+  /// Main thread only: where the current restart is.
+  enum RestartPhase : int { kRestartIdle = 0, kRestartWaitingForStop = 1 };
+  int restart_phase{kRestartIdle};
+  std::chrono::steady_clock::time_point restart_stop_requested_at{};
 
   // ── Diagnostics ──────────────────────────────────────────────────────────
   unsigned long long process_count{0};
@@ -309,6 +346,17 @@ struct SphereDauxClapProcessor {
     }
     return nullptr;
   }
+
+  /// Main-thread work the plug-in asked for: `on_main_thread` after
+  /// `request_callback`, and the deactivate → re-read latency → reactivate
+  /// restart after `request_restart` or a latency change. Returns 1 when the
+  /// published latency changed. Main thread only.
+  int service_main_thread();
+
+  /// Audio-thread side of the restart hand-off, run at the top of every block
+  /// with `audio_busy` already set. Performs a requested stop or start on the
+  /// audio thread and returns whether this block may call `process()`.
+  bool audio_gate_allows_process();
 
   /// Core block processing into the preallocated output buffers.
   bool process_planar(const float *in_l, const float *in_r, int frames,
