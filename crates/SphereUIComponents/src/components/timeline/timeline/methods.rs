@@ -4398,14 +4398,44 @@ impl Timeline {
         if !is_supported_midi_ext(path) {
             return false;
         }
-        let imported_tracks = match read_and_parse_midi_file(path) {
+        // Where it lands is resolved now: the drag position is gone once the
+        // drop is handled.
+        let (drop_x, drop_y) = self.drop_position_or_new_track(force_new_track);
+        // Read and parse on the background executor (#364): a large file, or
+        // one on a slow network share, froze the UI here and again after the
+        // import dialog. The parse is kept for the dialog's import.
+        let path = path.to_path_buf();
+        cx.spawn_in(window, async move |this, cx| {
+            let read_path = path.clone();
+            let parsed = cx
+                .background_executor()
+                .spawn(async move { read_and_parse_midi_file(&read_path) })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.finish_midi_drop(&path, parsed, drop_x, drop_y, window, cx);
+            });
+        })
+        .detach();
+        true
+    }
+
+    /// The rest of a MIDI drop, once the file has been read and parsed.
+    fn finish_midi_drop(
+        &mut self,
+        path: &std::path::Path,
+        parsed: Result<Vec<super::super::midi_import::ImportedMidiTrack>, String>,
+        drop_x: f32,
+        drop_y: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let imported_tracks = match parsed {
             Ok(tracks) => tracks,
             Err(message) => {
                 self.report_edit_notice(message, cx);
-                return false;
+                return;
             }
         };
-        let (drop_x, drop_y) = self.drop_position_or_new_track(force_new_track);
 
         // A file that carries markers, controller lanes, or SysEx goes through
         // the import dialog first — a song file can ship hundreds of markers,
@@ -4421,40 +4451,38 @@ impl Timeline {
                     summary,
                     drop_x,
                     drop_y,
+                    tracks: std::sync::Arc::new(imported_tracks),
                 };
                 prompt(&request, window, cx);
-                return true;
+                return;
             }
         }
 
-        self.apply_midi_import(
+        if !self.apply_midi_import(
             path,
             imported_tracks,
             super::super::midi_import::MidiImportOptions::default(),
             drop_x,
             drop_y,
             cx,
-        )
+        ) {
+            eprintln!("[MidiImport] nothing imported from {}", path.display());
+        }
     }
 
-    /// Import a MIDI file with the options the import dialog returned, at the
-    /// lane coordinates its drop resolved to. Re-reads the file so nothing has
-    /// to be parked across the dialog.
-    pub fn import_midi_path_with_options(
+    /// Import a dropped MIDI file with the options the import dialog
+    /// returned, at the lane coordinates its drop resolved to, from the parse
+    /// the drop already made — the file is not read again (#364).
+    pub fn import_midi_tracks_with_options(
         &mut self,
         path: &std::path::Path,
+        tracks: &std::sync::Arc<Vec<super::super::midi_import::ImportedMidiTrack>>,
         options: super::super::midi_import::MidiImportOptions,
         drop_x: f32,
         drop_y: f32,
         cx: &mut Context<Self>,
     ) -> bool {
-        let imported_tracks = match read_and_parse_midi_file(path) {
-            Ok(tracks) => tracks,
-            Err(message) => {
-                self.report_edit_notice(message, cx);
-                return false;
-            }
-        };
+        let imported_tracks = tracks.as_ref().clone();
         self.apply_midi_import(path, imported_tracks, options, drop_x, drop_y, cx)
     }
 

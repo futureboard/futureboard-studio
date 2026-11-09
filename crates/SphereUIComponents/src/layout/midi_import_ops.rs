@@ -7,8 +7,8 @@
 //! floods the ruler on a single drag.
 //!
 //! The dialog holds no timeline entity: it gets a plain snapshot of the counts,
-//! and on confirm the Timeline re-reads the file at the drop position it
-//! already resolved.
+//! and on confirm the Timeline imports the parse the drop already made (read
+//! once, off the UI thread) at the drop position it already resolved.
 
 use std::sync::Arc;
 
@@ -82,13 +82,22 @@ impl StudioLayout {
         options: MidiImportOptions,
         cx: &mut Context<Self>,
     ) {
-        let path = request.path.clone();
         let (drop_x, drop_y) = (request.drop_x, request.drop_y);
         let imported = self.timeline.update(cx, |timeline, cx| {
-            timeline.import_midi_path_with_options(&path, options, drop_x, drop_y, cx)
+            timeline.import_midi_tracks_with_options(
+                &request.path,
+                &request.tracks,
+                options,
+                drop_x,
+                drop_y,
+                cx,
+            )
         });
         if !imported {
-            eprintln!("[MidiImport] nothing imported from {}", path.display());
+            eprintln!(
+                "[MidiImport] nothing imported from {}",
+                request.path.display()
+            );
             return;
         }
         cx.notify();
