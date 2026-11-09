@@ -23,6 +23,19 @@
 //! its [`LOGIN_GRACE`], or at once when its address holds another connection
 //! that grace protects (one per address); one let in never is. An address is
 //! an IPv4 address, or an IPv6 `/64` (see [`peer_key`]).
+//!
+//! Who a client is ([`Peer`]) is read from its request head. A connection
+//! from this machine is taken for a browser here only when it names this
+//! machine (`localhost`, a loopback address) and carries no proxy
+//! forwarding header: behind a reverse proxy on this machine every browser
+//! connects from loopback, and must not skip the setup code. A connection
+//! from a proxy given with `--trusted-proxy` is counted (log-in failures,
+//! slots and arrivals alike) under the client address that proxy forwards
+//! in the one header `--forwarded-header` names, and is never taken for
+//! this machine; a forwarding header from anyone else, or another header
+//! from it, is not believed. Until its request head is read, a trusted
+//! proxy's connection is held to no address's limits, as this machine's
+//! are not: they are the client's to bear once it is known.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -53,16 +66,37 @@ pub enum Inbound {
     /// A text frame from a web client, counted against its backlog until
     /// the [`Queued`] is dropped.
     Web(ClientId, String, Queued),
-    /// A web client connected from that address; what is sent into the
+    /// A web client connected as that [`Peer`]; what is sent into the
     /// outbox reaches it. The command loop tells the [`Admission`] when the
     /// client is let in or shut out.
-    Joined(ClientId, SyncSender<String>, Option<IpAddr>, Admission),
+    Joined(ClientId, SyncSender<String>, Peer, Admission),
     Left(ClientId),
     /// The storage worker's answer (see `storage`).
     Storage(crate::storage::Done),
     /// An OSC packet or a MIDI message (see `remote`).
     Remote(crate::remote::RemoteIn),
 }
+
+/// Who a web client is, as far as this server can tell (see the module
+/// notes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Peer {
+    /// Its address: the connection's, or the one a trusted proxy forwarded.
+    /// `None` when it could not be read.
+    pub addr: Option<IpAddr>,
+    /// A browser on this machine, which needs no setup code.
+    pub local: bool,
+}
+
+/// Request headers a proxy adds to say who it forwards for.
+const FORWARDING_HEADERS: [&str; 6] = [
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-real-ip",
+    "via",
+];
 
 /// Messages a client may have queued before it counts as stalled.
 pub const OUTBOX: usize = 256;
@@ -154,9 +188,59 @@ impl Drop for Queued {
     }
 }
 
-/// The names a request's `Host` may carry besides IP addresses, `localhost`
-/// and this machine's own name: `--web-host`'s, lower-cased.
-type Names = Arc<Vec<String>>;
+/// The one header a trusted proxy names its client in
+/// (`--forwarded-header`). Only that one is read: a proxy passes on what
+/// the client sent in the others, and the client could name itself there.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ForwardedHeader {
+    /// `X-Forwarded-For`, its last address (the one the proxy appended).
+    #[default]
+    XForwardedFor,
+    /// `Forwarded`, the `for=` of its last element.
+    Forwarded,
+    /// `X-Real-IP`.
+    XRealIp,
+}
+
+impl ForwardedHeader {
+    /// As `--forwarded-header` takes it, any case.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "x-forwarded-for" => Some(Self::XForwardedFor),
+            "forwarded" => Some(Self::Forwarded),
+            "x-real-ip" => Some(Self::XRealIp),
+            _ => None,
+        }
+    }
+}
+
+/// Reverse proxies whose word on who a client is is taken
+/// (`--trusted-proxy`), and where they give it (`--forwarded-header`).
+#[derive(Clone, Debug, Default)]
+pub struct Proxies {
+    pub addrs: Vec<IpAddr>,
+    pub header: ForwardedHeader,
+}
+
+impl Proxies {
+    /// Whether a connection from `socket` comes from one of them.
+    fn trusts(&self, socket: Option<IpAddr>) -> bool {
+        socket.is_some_and(|s| {
+            let s = s.to_canonical();
+            self.addrs.iter().any(|a| a.to_canonical() == s)
+        })
+    }
+}
+
+/// What the operator said about how browsers reach this server.
+#[derive(Default)]
+struct Config {
+    /// The names a request's `Host` may carry besides IP addresses,
+    /// `localhost` and this machine's own name: `--web-host`'s, lower-cased.
+    names: Vec<String>,
+    /// Reverse proxies whose forwarding header is believed.
+    proxies: Proxies,
+}
 
 /// Whether the command loop has let a connection's client in, shared by the
 /// connection's thread, the slot table and the command loop.
@@ -350,30 +434,8 @@ impl Slots {
         stream: Option<TcpStream>,
     ) -> bool {
         let peer = peer.map(peer_key);
-        if let Some(key) = grouped(peer) {
-            let held = self
-                .open
-                .iter()
-                .filter(|s| s.peer == Some(key) && s.admission.waiting())
-                .count();
-            if held >= MAX_PER_PEER {
-                return false;
-            }
-            let closed = self
-                .closed
-                .get(&key)
-                .filter(|c| now.saturating_duration_since(c.at) < LOGIN_GRACE)
-                .map(|c| c.grace);
-            let earliest = self
-                .open
-                .iter()
-                .filter(|s| s.peer == Some(key))
-                .filter_map(|s| s.admission.grace_since())
-                .chain(closed)
-                .min();
-            if let Some(earliest) = earliest {
-                admission.continue_grace(earliest);
-            }
+        if !self.join_peer(id, peer, now, &admission) {
+            return false;
         }
         if self.open.len() >= MAX_CONNECTIONS && !self.make_room(peer, now) {
             return false;
@@ -384,6 +446,60 @@ impl Slots {
             admission,
             stream,
         });
+        true
+    }
+
+    /// Count connection `id` under `peer` (as [`peer_key`] gives it): `false`
+    /// when that address holds [`MAX_PER_PEER`] never let in already. Its
+    /// grace continues that address's wait (see [`Self::open`]).
+    fn join_peer(
+        &self,
+        id: ClientId,
+        peer: Option<IpAddr>,
+        now: Instant,
+        admission: &Admission,
+    ) -> bool {
+        let Some(key) = grouped(peer) else {
+            return true;
+        };
+        let others = || {
+            self.open
+                .iter()
+                .filter(move |s| s.id != id && s.peer == Some(key))
+        };
+        let held = others().filter(|s| s.admission.waiting()).count();
+        if held >= MAX_PER_PEER {
+            return false;
+        }
+        let closed = self
+            .closed
+            .get(&key)
+            .filter(|c| now.saturating_duration_since(c.at) < LOGIN_GRACE)
+            .map(|c| c.grace);
+        let earliest = others()
+            .filter_map(|s| s.admission.grace_since())
+            .chain(closed)
+            .min();
+        if let Some(earliest) = earliest {
+            admission.continue_grace(earliest);
+        }
+        true
+    }
+
+    /// Connection `id`, taken under its proxy's address, is from `client`
+    /// (as a trusted proxy forwarded it): count it under that address from
+    /// now on, as if it had come from there. `false`: it may not stay (that
+    /// address holds too many already, or it was closed meanwhile).
+    fn forwarded(&mut self, id: ClientId, client: IpAddr, now: Instant) -> bool {
+        let Some(at) = self.open.iter().position(|slot| slot.id == id) else {
+            return false;
+        };
+        let key = Some(peer_key(client));
+        let admission = self.open[at].admission.clone();
+        if !self.join_peer(id, key, now, &admission) {
+            return false;
+        }
+        self.open[at].peer = key;
         true
     }
 
@@ -575,6 +691,49 @@ enum Arrival {
     TooFast,
 }
 
+impl Arrival {
+    /// The answer for one turned away.
+    fn refusal(&self) -> Option<(u16, &'static str, &'static [u8])> {
+        match self {
+            Arrival::Taken => None,
+            Arrival::Busy => Some((503, "Service Unavailable", b"busy")),
+            Arrival::TooFast => Some((429, "Too Many Requests", b"too many connections")),
+        }
+    }
+}
+
+type SharedArrivals = Arc<Mutex<Arrivals>>;
+
+/// The accept thread's limits, for a connection that turns out to come
+/// through a trusted proxy (see [`forwarded`]).
+#[derive(Clone, Copy)]
+struct Limits<'a> {
+    slots: &'a SharedSlots,
+    arrivals: &'a SharedArrivals,
+}
+
+/// Count connection `id` under the `client` a trusted proxy forwarded it
+/// for, as [`admit`] would have had it connected directly: its rate first,
+/// then its share of the slots. Taken under the proxy's address (this
+/// machine's, most often), it was let through both.
+fn forwarded(limits: Limits<'_>, id: ClientId, client: IpAddr, now: Instant) -> Arrival {
+    let key = Some(peer_key(client));
+    if !limits
+        .arrivals
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .allow(key, now)
+    {
+        return Arrival::TooFast;
+    }
+    let kept = limits
+        .slots
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .forwarded(id, client, now);
+    if kept { Arrival::Taken } else { Arrival::Busy }
+}
+
 /// Admit a new connection: its address's rate first, then a slot.
 fn admit(
     slots: &SharedSlots,
@@ -596,23 +755,69 @@ fn admit(
     if taken { Arrival::Taken } else { Arrival::Busy }
 }
 
+/// Admit a new connection from a trusted proxy: held to no address's
+/// limits (the proxy speaks for many clients), as one from this machine is
+/// not; once its request head names the client, [`forwarded`] counts it
+/// under that client's. It still needs a slot.
+fn admit_proxied(
+    slots: &SharedSlots,
+    id: ClientId,
+    now: Instant,
+    admission: Admission,
+    stream: Option<TcpStream>,
+) -> Arrival {
+    let taken = slots
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .open(id, None, now, admission, stream);
+    if taken { Arrival::Taken } else { Arrival::Busy }
+}
+
+/// Admit a new connection from `socket` on the accept thread: as
+/// [`admit_proxied`] says when a trusted proxy opened it, else as [`admit`].
+fn accept(
+    limits: Limits<'_>,
+    proxies: &Proxies,
+    id: ClientId,
+    socket: Option<IpAddr>,
+    now: Instant,
+    admission: Admission,
+    stream: Option<TcpStream>,
+) -> Arrival {
+    if proxies.trusts(socket) {
+        return admit_proxied(limits.slots, id, now, admission, stream);
+    }
+    admit(
+        limits.slots,
+        &mut limits.arrivals.lock().unwrap_or_else(|e| e.into_inner()),
+        id,
+        socket,
+        now,
+        admission,
+        stream,
+    )
+}
+
 /// Listen on `addr` and serve until the process ends. Returns the address
 /// actually bound (port 0 picks one). `names`: what `--web-host` added to
-/// the names a request may reach this server by.
+/// the names a request may reach this server by. `proxies`: the reverse
+/// proxies whose forwarding header says who a client is
+/// (`--trusted-proxy`, `--forwarded-header`).
 pub fn serve(
     addr: SocketAddr,
     inbound: Sender<Inbound>,
     names: Vec<String>,
+    proxies: Proxies,
 ) -> io::Result<SocketAddr> {
     let listener = TcpListener::bind(addr)?;
     let bound = listener.local_addr()?;
-    let names: Names = Arc::new(names);
+    let config = Arc::new(Config { names, proxies });
     let slots: SharedSlots = Arc::default();
+    let arrivals: SharedArrivals = Arc::default();
     std::thread::Builder::new()
         .name("livestage-web".to_string())
         .spawn(move || {
             let mut next_id: ClientId = 1;
-            let mut arrivals = Arrivals::default();
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else {
                     continue;
@@ -621,33 +826,38 @@ pub fn serve(
                 next_id += 1;
                 let now = Instant::now();
                 let admission = Admission::new(now);
-                let arrival = admit(
-                    &slots,
-                    &mut arrivals,
+                let socket = stream.peer_addr().ok().map(|a| a.ip());
+                let limits = Limits {
+                    slots: &slots,
+                    arrivals: &arrivals,
+                };
+                let arrival = accept(
+                    limits,
+                    &config.proxies,
                     id,
-                    stream.peer_addr().ok().map(|a| a.ip()),
+                    socket,
                     now,
                     admission.clone(),
                     stream.try_clone().ok(),
                 );
-                let refusal: Option<(u16, &str, &[u8])> = match arrival {
-                    Arrival::Taken => None,
-                    Arrival::Busy => Some((503, "Service Unavailable", b"busy")),
-                    Arrival::TooFast => Some((429, "Too Many Requests", b"too many connections")),
-                };
-                if let Some((code, reason, body)) = refusal {
+                if let Some((code, reason, body)) = arrival.refusal() {
                     let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
                     let _ = respond(&mut stream, code, reason, &[("Retry-After", "2")], body);
                     continue;
                 }
                 let inbound = inbound.clone();
-                let names = names.clone();
+                let config = config.clone();
                 let spawned = std::thread::Builder::new()
                     .name("livestage-web-conn".to_string())
                     .spawn({
                         let slots = slots.clone();
+                        let arrivals = arrivals.clone();
                         move || {
-                            connection(stream, id, &inbound, &names, admission);
+                            let limits = Limits {
+                                slots: &slots,
+                                arrivals: &arrivals,
+                            };
+                            connection(stream, id, &inbound, &config, limits, admission);
                             slots
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
@@ -743,6 +953,103 @@ fn machine_name() -> Option<String> {
     }
 }
 
+/// Who sent `request` over a connection from `socket` (see the module
+/// notes), and whether a trusted proxy said so (the address it forwarded
+/// is then the [`Peer::addr`]).
+///
+/// - From a proxy in `proxies`: the client its forwarding header names;
+///   never this machine, as the proxy may be anywhere. Without that header
+///   it is the proxy itself, and not taken for this machine either.
+/// - Otherwise the connection's own address; this machine only when that
+///   is loopback, the request names this machine, and no forwarding header
+///   says a proxy sent it.
+fn client_peer(socket: Option<IpAddr>, request: &Request, proxies: &Proxies) -> (Peer, bool) {
+    if proxies.trusts(socket) {
+        return match forwarded_client(request, proxies.header) {
+            Some(client) => (
+                Peer {
+                    addr: Some(client),
+                    local: false,
+                },
+                true,
+            ),
+            None => (
+                Peer {
+                    addr: socket,
+                    local: false,
+                },
+                false,
+            ),
+        };
+    }
+    let proxied = FORWARDING_HEADERS
+        .iter()
+        .any(|name| request.header(name).is_some());
+    let local = socket.is_some_and(|s| s.to_canonical().is_loopback())
+        && !proxied
+        && request.header("host").is_some_and(names_this_machine);
+    (
+        Peer {
+            addr: socket,
+            local,
+        },
+        false,
+    )
+}
+
+/// Whether a `Host` names this machine only: `localhost` (or a name under
+/// it) or a loopback address. A reverse proxy passes on the name the
+/// browser used, which is the proxy's.
+fn names_this_machine(host: &str) -> bool {
+    let Some(host) = host_name(host) else {
+        return false;
+    };
+    host == "localhost"
+        || host.ends_with(".localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip.to_canonical().is_loopback())
+}
+
+/// The client a proxy forwarded `request` for, from `header` only (see
+/// [`ForwardedHeader`]): the last address of `X-Forwarded-For` (the one
+/// the proxy appended; those before it are what the client claimed), the
+/// last `for=` of `Forwarded`, or `X-Real-IP`. `None` when it holds no
+/// address.
+fn forwarded_client(request: &Request, header: ForwardedHeader) -> Option<IpAddr> {
+    match header {
+        ForwardedHeader::XForwardedFor => request
+            .header("x-forwarded-for")?
+            .rsplit(',')
+            .next()
+            .and_then(forwarded_address),
+        ForwardedHeader::Forwarded => request
+            .header("forwarded")?
+            .rsplit(',')
+            .next()?
+            .split(';')
+            .filter_map(|pair| pair.split_once('='))
+            .find(|(name, _)| name.trim().eq_ignore_ascii_case("for"))
+            .and_then(|(_, value)| forwarded_address(value)),
+        ForwardedHeader::XRealIp => request.header("x-real-ip").and_then(forwarded_address),
+    }
+}
+
+/// One forwarded address: `192.0.2.1`, `192.0.2.1:4711`, `2001:db8::1`,
+/// `[2001:db8::1]:4711`, quoted or not. `None` for anything else (`unknown`,
+/// an obfuscated name).
+fn forwarded_address(value: &str) -> Option<IpAddr> {
+    let value = value.trim().trim_matches('"').trim();
+    if let Ok(ip) = value.parse::<IpAddr>() {
+        return Some(ip.to_canonical());
+    }
+    let host = match value.strip_prefix('[') {
+        Some(rest) => rest.split_once(']')?.0,
+        None => value.rsplit_once(':')?.0,
+    };
+    host.parse::<IpAddr>().ok().map(|ip| ip.to_canonical())
+}
+
 const WRONG_HOST_PAGE: &[u8] =
     b"This LiveStage server does not answer to that name. Open it by its \
 IP address or NAME.local, or start the server with --web-host NAME for this name.";
@@ -751,7 +1058,8 @@ fn connection(
     mut stream: TcpStream,
     id: ClientId,
     inbound: &Sender<Inbound>,
-    names: &[String],
+    config: &Config,
+    limits: Limits<'_>,
     admission: Admission,
 ) {
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
@@ -764,7 +1072,11 @@ fn connection(
         return;
     };
     // Asked for by name each time: the appliance's setup may rename it.
-    if !host_allowed(request.header("host"), names, machine_name().as_deref()) {
+    if !host_allowed(
+        request.header("host"),
+        &config.names,
+        machine_name().as_deref(),
+    ) {
         let _ = respond(
             &mut stream,
             421,
@@ -773,6 +1085,15 @@ fn connection(
             WRONG_HOST_PAGE,
         );
         return;
+    }
+    let socket = stream.peer_addr().ok().map(|a| a.ip());
+    let (peer, through_proxy) = client_peer(socket, &request, &config.proxies);
+    if let (true, Some(client)) = (through_proxy, peer.addr) {
+        let arrival = forwarded(limits, id, client, Instant::now());
+        if let Some((code, reason, body)) = arrival.refusal() {
+            let _ = respond(&mut stream, code, reason, &[("Retry-After", "2")], body);
+            return;
+        }
     }
     if request.path == "/ws" && request.wants_websocket() {
         // A page on another site must not drive the mixer through the
@@ -789,6 +1110,7 @@ fn connection(
                 stream,
             },
             id,
+            peer,
             inbound,
             admission,
         );
@@ -1034,7 +1356,13 @@ fn is_timeout(error: &tungstenite::Error) -> bool {
         if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut))
 }
 
-fn websocket(stream: Replay, id: ClientId, inbound: &Sender<Inbound>, admission: Admission) {
+fn websocket(
+    stream: Replay,
+    id: ClientId,
+    peer: Peer,
+    inbound: &Sender<Inbound>,
+    admission: Admission,
+) {
     let config = WebSocketConfig::default()
         .max_message_size(Some(MAX_MESSAGE))
         .max_frame_size(Some(MAX_MESSAGE));
@@ -1045,8 +1373,7 @@ fn websocket(stream: Replay, id: ClientId, inbound: &Sender<Inbound>, admission:
     // Short reads from here on: between frames the thread drains its outbox.
     let _ = ws.get_ref().stream.set_read_timeout(Some(POLL));
     let (outbox, pending) = std::sync::mpsc::sync_channel::<String>(OUTBOX);
-    // Failed log-ins are counted per address.
-    let peer = ws.get_ref().stream.peer_addr().ok().map(|a| a.ip());
+    // Failed log-ins are counted per address (see `client_peer`).
     if inbound
         .send(Inbound::Joined(id, outbox, peer, admission.clone()))
         .is_err()
@@ -2165,5 +2492,342 @@ mod tests {
             assert!(policies[0].contains("script-src 'self';"), "{head}");
             assert!(policies[0].contains("frame-ancestors 'none'"), "{head}");
         }
+    }
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    /// The peer `client_peer` makes of a request head from `socket`.
+    fn peer_of(socket: &str, head: &str, proxies: &Proxies) -> (Peer, bool) {
+        client_peer(Some(ip(socket)), &request(head), proxies)
+    }
+
+    /// #293: behind a reverse proxy on this machine every browser connects
+    /// from loopback; only one that names this machine, with no forwarding
+    /// header, is taken for a browser here.
+    #[test]
+    fn a_browser_behind_a_proxy_here_is_not_this_machine() {
+        let here = |socket: &str, head: &str| {
+            let (peer, through_proxy) = peer_of(socket, head, &Proxies::default());
+            assert!(!through_proxy, "{head}");
+            assert_eq!(peer.addr, Some(ip(socket)), "{head}");
+            peer.local
+        };
+        for host in [
+            "localhost",
+            "localhost:8730",
+            "127.0.0.1:8730",
+            "[::1]:8730",
+        ] {
+            let head = format!("GET /ws HTTP/1.1\r\nHost: {host}\r\n");
+            assert!(here("127.0.0.1", &head), "{host}");
+            assert!(here("::ffff:127.0.0.1", &head), "{host}");
+            assert!(here("::1", &head), "{host}");
+        }
+        // The proxy passes on the name the browser used.
+        assert!(!here(
+            "127.0.0.1",
+            "GET /ws HTTP/1.1\r\nHost: mixer.example.org\r\n"
+        ));
+        // No Host: no browser, and no way to tell.
+        assert!(!here("127.0.0.1", "GET /ws HTTP/1.1\r\n"));
+        // A proxy that says so, whatever name it passes on.
+        for header in [
+            "X-Forwarded-For: 203.0.113.7",
+            "Forwarded: for=203.0.113.7",
+            "X-Real-IP: 203.0.113.7",
+            "X-Forwarded-Host: localhost",
+            "X-Forwarded-Proto: https",
+            "Via: 1.1 proxy",
+        ] {
+            let head = format!("GET /ws HTTP/1.1\r\nHost: localhost\r\n{header}\r\n");
+            assert!(!here("127.0.0.1", &head), "{header}");
+        }
+        // Another machine naming this one's loopback is still another.
+        assert!(!here("10.0.0.7", "GET /ws HTTP/1.1\r\nHost: localhost\r\n"));
+    }
+
+    /// #293: a proxy given with `--trusted-proxy` names the client, in the
+    /// one header `--forwarded-header` says; nobody else does, and what it
+    /// forwards is never this machine.
+    #[test]
+    fn a_trusted_proxy_names_the_client() {
+        use ForwardedHeader::*;
+        let proxies = |header| Proxies {
+            addrs: vec![ip("127.0.0.1"), ip("10.0.0.1")],
+            header,
+        };
+        let forwarded_for = |socket: &str, header: &str, kind: ForwardedHeader| {
+            let head = format!("GET /ws HTTP/1.1\r\nHost: mixer.example.org\r\n{header}\r\n");
+            let (peer, through_proxy) = peer_of(socket, &head, &proxies(kind));
+            assert!(!peer.local, "{header}");
+            through_proxy.then_some(peer.addr).flatten()
+        };
+        // The last address is the one the proxy added; before it, what the
+        // client claimed.
+        for (header, kind, client) in [
+            ("X-Forwarded-For: 203.0.113.7", XForwardedFor, "203.0.113.7"),
+            (
+                "X-Forwarded-For: 127.0.0.1, 198.51.100.2",
+                XForwardedFor,
+                "198.51.100.2",
+            ),
+            ("X-Forwarded-For: 2001:db8::5", XForwardedFor, "2001:db8::5"),
+            (
+                "X-Forwarded-For: ::ffff:192.0.2.9",
+                XForwardedFor,
+                "192.0.2.9",
+            ),
+            (
+                "Forwarded: for=192.0.2.60;proto=http, for=\"[2001:db8::1]:4711\"",
+                Forwarded,
+                "2001:db8::1",
+            ),
+            (
+                "Forwarded: proto=https;For=\"192.0.2.61:80\"",
+                Forwarded,
+                "192.0.2.61",
+            ),
+            ("X-Real-IP: 192.0.2.62", XRealIp, "192.0.2.62"),
+        ] {
+            assert_eq!(forwarded_for("127.0.0.1", header, kind), Some(ip(client)));
+            assert_eq!(
+                forwarded_for("::ffff:10.0.0.1", header, kind),
+                Some(ip(client))
+            );
+            // Anyone else's forwarding header is not believed.
+            assert_eq!(forwarded_for("10.0.0.2", header, kind), None, "{header}");
+            // Nor another header than the one named: the client may have
+            // sent it, and a proxy that sets another passes it on.
+            for other in [XForwardedFor, Forwarded, XRealIp] {
+                if other != kind {
+                    assert_eq!(forwarded_for("127.0.0.1", header, other), None, "{header}");
+                }
+            }
+        }
+        // A proxy that sets X-Real-IP only, passing on what the client put
+        // in X-Forwarded-For: X-Real-IP is the client.
+        assert_eq!(
+            forwarded_for(
+                "127.0.0.1",
+                "X-Forwarded-For: 192.0.2.1\r\nX-Real-IP: 203.0.113.9",
+                XRealIp
+            ),
+            Some(ip("203.0.113.9"))
+        );
+        // A loopback client a proxy names is the proxy's own machine, or a
+        // lie: not this machine either way (asserted in `forwarded_for`).
+        assert_eq!(
+            forwarded_for("127.0.0.1", "X-Forwarded-For: 127.0.0.1", XForwardedFor),
+            Some(ip("127.0.0.1"))
+        );
+        assert_eq!(ForwardedHeader::parse("X-Real-IP"), Some(XRealIp));
+        assert_eq!(ForwardedHeader::parse("forwarded"), Some(Forwarded));
+        assert_eq!(ForwardedHeader::parse("via"), None);
+        // Nothing usable: the proxy itself, not a browser here.
+        for header in [
+            "X-Forwarded-For: unknown",
+            "Forwarded: for=_hidden",
+            "X-Other: 1",
+        ] {
+            let head = format!("GET /ws HTTP/1.1\r\nHost: localhost\r\n{header}\r\n");
+            let (peer, through_proxy) = peer_of("127.0.0.1", &head, &proxies(XForwardedFor));
+            assert!(!through_proxy && !peer.local, "{header}");
+            assert_eq!(peer.addr, Some(ip("127.0.0.1")));
+        }
+    }
+
+    /// #293: connections a trusted proxy forwards are limited per client,
+    /// as if each client had connected directly; one client's do not count
+    /// against another's.
+    #[test]
+    fn clients_behind_a_trusted_proxy_get_their_own_limits() {
+        let slots: SharedSlots = Arc::default();
+        let arrivals: SharedArrivals = Arc::default();
+        let limits = Limits {
+            slots: &slots,
+            arrivals: &arrivals,
+        };
+        let now = Instant::now();
+        let mut next: ClientId = 1;
+        // The proxy's connection, as the accept thread takes it.
+        let mut connect = |admission: &Admission| {
+            let id = next;
+            next += 1;
+            let taken = admit(
+                &slots,
+                &mut arrivals.lock().unwrap(),
+                id,
+                Some(ip("127.0.0.1")),
+                now,
+                admission.clone(),
+                None,
+            );
+            assert_eq!(taken, Arrival::Taken);
+            id
+        };
+        let (a, b) = (ip("203.0.113.7"), ip("203.0.113.8"));
+
+        // Never let in: at most MAX_PER_PEER per client.
+        for n in 0..MAX_PER_PEER {
+            let id = connect(&Admission::new(now));
+            assert_eq!(forwarded(limits, id, a, now), Arrival::Taken, "{n}");
+        }
+        let id = connect(&Admission::new(now));
+        assert_eq!(forwarded(limits, id, a, now), Arrival::Busy);
+        let id = connect(&Admission::new(now));
+        assert_eq!(forwarded(limits, id, b, now), Arrival::Taken);
+        {
+            let slots = slots.lock().unwrap();
+            let held =
+                |client: IpAddr| slots.open.iter().filter(|s| s.peer == Some(client)).count();
+            assert_eq!((held(a), held(b)), (MAX_PER_PEER, 1));
+        }
+
+        // New connections: ARRIVAL_BURST per client, counting all above.
+        let c = ip("203.0.113.9");
+        for n in 0..ARRIVAL_BURST as usize {
+            let admission = Admission::new(now);
+            let id = connect(&admission);
+            assert_eq!(forwarded(limits, id, c, now), Arrival::Taken, "{n}");
+            admission.set(true);
+        }
+        let id = connect(&Admission::new(now));
+        assert_eq!(forwarded(limits, id, c, now), Arrival::TooFast);
+        let id = connect(&Admission::new(now));
+        assert_eq!(
+            forwarded(limits, id, ip("203.0.113.10"), now),
+            Arrival::Taken
+        );
+    }
+
+    /// #293 review: a trusted proxy on another machine speaks for many
+    /// clients. Its connections are held to no address's limits on
+    /// arrival; once each names its client, that client's limits apply, and
+    /// one client's do not count against another's.
+    #[test]
+    fn clients_behind_a_trusted_proxy_elsewhere_are_limited_apart() {
+        let slots: SharedSlots = Arc::default();
+        let arrivals: SharedArrivals = Arc::default();
+        let limits = Limits {
+            slots: &slots,
+            arrivals: &arrivals,
+        };
+        let proxy = ip("10.0.0.1");
+        let proxies = Proxies {
+            addrs: vec![proxy],
+            header: ForwardedHeader::XForwardedFor,
+        };
+        let now = Instant::now();
+        let mut next: ClientId = 1;
+        let mut connect = |from: IpAddr| {
+            let id = next;
+            next += 1;
+            let admission = Admission::new(now);
+            let arrival = accept(
+                limits,
+                &proxies,
+                id,
+                Some(from),
+                now,
+                admission.clone(),
+                None,
+            );
+            (arrival, id, admission)
+        };
+        let (a, b) = (ip("203.0.113.7"), ip("203.0.113.8"));
+
+        // Client A, noisy: more connections, never let in, than one address
+        // may hold or open in a burst. The proxy is not turned away for it.
+        let total = MAX_PER_PEER.max(ARRIVAL_BURST as usize) + 4;
+        let mut a_taken = 0;
+        for n in 0..total {
+            let (arrival, id, _) = connect(proxy);
+            assert_eq!(arrival, Arrival::Taken, "{n}");
+            if forwarded(limits, id, a, now) == Arrival::Taken {
+                a_taken += 1;
+            }
+        }
+        assert_eq!(a_taken, MAX_PER_PEER);
+        // Client B behind the same proxy: its own budget, untouched by A's.
+        for n in 0..MAX_PER_PEER {
+            let (arrival, id, _) = connect(proxy);
+            assert_eq!(arrival, Arrival::Taken, "{n}");
+            assert_eq!(forwarded(limits, id, b, now), Arrival::Taken, "{n}");
+        }
+        let (_, id, _) = connect(proxy);
+        assert_eq!(forwarded(limits, id, b, now), Arrival::Busy);
+
+        // Client A's arrival budget ran out with its burst; B's is its own.
+        let (_, id, admission) = connect(proxy);
+        admission.set(true);
+        assert_eq!(forwarded(limits, id, a, now), Arrival::TooFast);
+
+        // The same address, not trusted, is one client like any other.
+        let other = ip("10.0.0.2");
+        let refused = (0..total)
+            .map(|_| connect(other).0)
+            .filter(|arrival| *arrival != Arrival::Taken)
+            .count();
+        assert!(refused > 0);
+    }
+
+    /// #293 end to end: what the command loop is told about a WebSocket
+    /// client, directly and through a proxy here, trusted or not.
+    #[test]
+    fn the_command_loop_learns_who_a_web_client_is() {
+        let joined = |addrs: Vec<IpAddr>, host: &str, extra: &str| -> Peer {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let bound = serve(
+                "127.0.0.1:0".parse().unwrap(),
+                tx,
+                vec!["mixer.example.org".to_string()],
+                Proxies {
+                    addrs,
+                    header: ForwardedHeader::XForwardedFor,
+                },
+            )
+            .unwrap();
+            let mut client = TcpStream::connect(bound).unwrap();
+            let head = format!(
+                "GET /ws HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n\
+                 Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                 Sec-WebSocket-Version: 13\r\n{extra}\r\n"
+            );
+            client.write_all(head.as_bytes()).unwrap();
+            loop {
+                match rx.recv_timeout(Duration::from_secs(10)) {
+                    Ok(Inbound::Joined(_, _, peer, _)) => return peer,
+                    Ok(_) => {}
+                    Err(error) => panic!("no client joined: {error}"),
+                }
+            }
+        };
+        let lo = Some(ip("127.0.0.1"));
+        // A browser here.
+        assert_eq!(
+            joined(Vec::new(), "localhost:8730", ""),
+            Peer {
+                addr: lo,
+                local: true
+            }
+        );
+        // Through a proxy here that is not trusted: one shared address,
+        // and not this machine.
+        let proxied = "X-Forwarded-For: 203.0.113.7\r\n";
+        let untrusted = Peer {
+            addr: lo,
+            local: false,
+        };
+        assert_eq!(joined(Vec::new(), "mixer.example.org", ""), untrusted);
+        assert_eq!(joined(Vec::new(), "mixer.example.org", proxied), untrusted);
+        // Trusted: the client it forwards for.
+        assert_eq!(
+            joined(vec![ip("127.0.0.1")], "mixer.example.org", proxied),
+            Peer {
+                addr: Some(ip("203.0.113.7")),
+                local: false
+            }
+        );
     }
 }

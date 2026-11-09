@@ -56,6 +56,7 @@ fn options() -> Options {
         remote: None,
         web_hosts: Vec::new(),
         setup_code_file: None,
+        trusted_proxies: crate::web::Proxies::default(),
     }
 }
 
