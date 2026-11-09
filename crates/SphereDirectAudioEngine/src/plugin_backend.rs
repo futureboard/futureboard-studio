@@ -103,6 +103,7 @@ pub(crate) mod backend {
             $(
                 $(#[$meta])*
                 #[inline(always)]
+                #[allow(clippy::too_many_arguments)]
                 pub unsafe fn $name(
                     format: PluginModuleFormat,
                     raw: *mut SphereDauxVst3Processor,

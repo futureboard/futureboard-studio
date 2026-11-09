@@ -543,10 +543,6 @@ fn atomic_max_bits(target: &AtomicU32, value: f32) {
     }
 }
 
-/// Whether this callback should feed take-only capture paths.
-///
-/// Pure and realtime-safe: callers provide callback-local atomic snapshots.
-
 /// Which armed tracks the growing waveform can describe, and on which input
 /// channels, in `shared.preview_rings` slot order.
 ///
@@ -1958,8 +1954,10 @@ mod dropped_input_tests {
         let bytes = std::fs::read(&final_path).unwrap();
         let data = &bytes[reader.header().data_offset as usize..];
         let samples: Vec<i32> = data
-            .chunks_exact(4)
-            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| i32::from_le_bytes(*b))
             .collect();
         assert_eq!(samples, vec![1, -1, 2, -2, 0, 0, 0, 0, 0, 0, 3, -3, 4, -4]);
         let _ = std::fs::remove_dir_all(&dir);

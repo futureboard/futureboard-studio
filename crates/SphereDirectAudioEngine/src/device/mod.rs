@@ -353,7 +353,7 @@ pub(crate) fn format_alsa_display_name(id: &str) -> String {
             // Unparsed exotic PCMs: pretty-print separators instead of a wall of
             // `KEY=value` commas.
             if id.contains(':') || id.contains(',') {
-                id.replace(',', " · ").replace(':', " · ")
+                id.replace([',', ':'], " · ")
             } else {
                 kind.to_string()
             }

@@ -603,11 +603,17 @@ pub fn record_render_job(
                     let stereo = &lane_buffers[lane][from * 2..to * 2];
                     out.clear();
                     if channels == 1 {
-                        out.extend(stereo.chunks_exact(2).map(|pair| (pair[0] + pair[1]) * 0.5));
+                        out.extend(
+                            stereo
+                                .as_chunks::<2>()
+                                .0
+                                .iter()
+                                .map(|pair| (pair[0] + pair[1]) * 0.5),
+                        );
                     } else {
-                        for pair in stereo.chunks_exact(2) {
+                        for pair in stereo.as_chunks::<2>().0 {
                             out.extend_from_slice(pair);
-                            out.extend(std::iter::repeat(0.0).take(channels - 2));
+                            out.extend(std::iter::repeat_n(0.0, channels - 2));
                         }
                     }
                     if verdict == TailBlock::Quiet {

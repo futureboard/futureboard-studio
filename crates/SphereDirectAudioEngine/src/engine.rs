@@ -7262,7 +7262,7 @@ where
                         EngineCommand::SetTimeSignatureMap(mut change) => {
                             let pos = shared.position_samples.load(Ordering::Relaxed);
                             metronome.swap_time_signature_map(
-                                &mut *change,
+                                &mut change,
                                 pos,
                                 output_sample_rate,
                             );
@@ -8009,7 +8009,7 @@ mod live_input_tests {
             "arming a track never returned: the route change is deadlocked on \
              the recording lock it already holds"
         );
-        assert_eq!(armed.unwrap(), true, "arming an audio track should succeed");
+        assert!(armed.unwrap(), "arming an audio track should succeed");
         handle.join().expect("worker thread");
     }
 

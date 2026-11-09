@@ -441,7 +441,10 @@ impl LocalAudioState {
             return None;
         }
         if self.count_in_to_next_click == 0 {
-            let accent = if self.count_in_beat_index % self.count_in_beats_per_bar == 0 {
+            let accent = if self
+                .count_in_beat_index
+                .is_multiple_of(self.count_in_beats_per_bar)
+            {
                 MetronomeAccent::Downbeat
             } else {
                 MetronomeAccent::Normal
@@ -1037,7 +1040,7 @@ pub fn drain_commands(
             }
             EngineCommand::SetTimeSignatureMap(mut change) => {
                 let pos = shared.position_samples.load(Ordering::Relaxed);
-                local.swap_time_signature_map(&mut *change, pos, output_sample_rate);
+                local.swap_time_signature_map(&mut change, pos, output_sample_rate);
                 if let Some(pt) = local.time_signature_map.points().first() {
                     shared
                         .time_sig_num
@@ -2026,9 +2029,7 @@ pub(crate) fn run_control_room(
                 }
                 return Some((0.0, 0.0));
             };
-            let Some((master_l, master_r)) = resolved_output_pair(pair, channels) else {
-                return None;
-            };
+            let (master_l, master_r) = resolved_output_pair(pair, channels)?;
             move_master_feed(data, channels, frames, master_l, master_r);
             return None;
         }
@@ -2860,8 +2861,10 @@ mod jam_master_click_tests {
     /// A callback with the transport running, the metronome on, and an empty
     /// project — so every non-zero sample in the block is the click.
     fn render_one_block(include_click: bool) -> (Vec<f32>, Vec<f32>) {
-        let mut runtime = RuntimeProject::default();
-        runtime.sample_rate = 48_000;
+        let mut runtime = RuntimeProject {
+            sample_rate: 48_000,
+            ..Default::default()
+        };
         let shared = Arc::new(SharedState::default());
         shared.sample_rate.store(48_000, Ordering::Relaxed);
         shared.engine_state.store(

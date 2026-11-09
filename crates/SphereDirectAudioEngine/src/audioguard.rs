@@ -1040,8 +1040,10 @@ mod tests {
     }
 
     fn playing_core() -> (RenderCore, crossbeam_channel::Sender<EngineCommand>) {
-        let mut runtime = RuntimeProject::default();
-        runtime.sample_rate = 48_000;
+        let runtime = RuntimeProject {
+            sample_rate: 48_000,
+            ..Default::default()
+        };
         let mut local = LocalAudioState::new(48_000.0);
         local.playing_local = true;
         local.set_metronome_enabled(true, 0, 48_000);

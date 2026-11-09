@@ -1346,8 +1346,8 @@ fn load_rauf(path: &Path) -> Result<AudioFileBuffer, String> {
         .map_err(|e| format!("read failed: {e}"))?;
 
     let mut samples = Vec::with_capacity(sample_count);
-    for chunk in bytes.chunks_exact(4) {
-        let sample = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    for chunk in bytes.as_chunks::<4>().0 {
+        let sample = i32::from_le_bytes(*chunk);
         samples.push((sample as f32 / 2_147_483_648.0).clamp(-1.0, 1.0));
     }
 

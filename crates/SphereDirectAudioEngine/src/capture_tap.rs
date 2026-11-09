@@ -147,6 +147,9 @@ impl CaptureTapControl {
     /// Fails only when the command queue is full, which means the callback has
     /// stopped draining — the stream is gone. The caller falls back to opening
     /// its own capture stream rather than starting a take that captures nothing.
+    // The error hands the caller its sink back to reuse; boxing it would
+    // allocate on this path only to unbox it again.
+    #[allow(clippy::result_large_err)]
     pub fn install(&self, sink: RecordSink) -> Result<(), RecordSink> {
         self.cmd_tx
             .try_send(TapCommand::Set(Box::new(sink)))

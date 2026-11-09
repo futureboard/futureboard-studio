@@ -217,7 +217,7 @@ fn estimate_hz(samples: &[f32], sample_rate: u32, fmin: f32, fmax: f32) -> Optio
     while lag < max_lag && nsdf[lag] < threshold {
         lag += 1;
     }
-    while lag + 1 <= max_lag && nsdf[lag + 1] > nsdf[lag] {
+    while lag < max_lag && nsdf[lag + 1] > nsdf[lag] {
         lag += 1;
     }
     if lag <= min_lag || lag >= max_lag {

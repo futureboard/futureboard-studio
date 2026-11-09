@@ -44,6 +44,7 @@ struct Graveyards {
     tempo: Sender<Box<TempoMapChange>>,
     time_signature: Sender<Box<crate::time_signature_map::RuntimeTimeSignatureMapSnapshot>>,
     insert_param: Sender<Box<InsertParamChange>>,
+    #[allow(clippy::box_collection)] // matches EngineCommand::SetBridgeEditorActive
     bridge_editor: Sender<Box<std::collections::HashSet<String>>>,
     ara: Sender<Vec<RuntimeAraRenderer>>,
 }
@@ -199,6 +200,7 @@ pub fn retire_insert_param_change(old: Box<InsertParamChange>) {
 
 /// Dispose a replaced open-editor set away from the realtime callback.
 #[inline]
+#[allow(clippy::box_collection)] // matches EngineCommand::SetBridgeEditorActive
 pub fn retire_bridge_editor_active(old: Box<std::collections::HashSet<String>>) {
     send_or_leak(graveyards().map(|g| &g.bridge_editor), old);
 }

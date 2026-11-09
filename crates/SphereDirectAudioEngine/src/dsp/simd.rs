@@ -220,8 +220,8 @@ kernel! {
         const LANES: usize = 8;
         let mut peak = [0.0f32; LANES];
         let mut sum = [0.0f32; LANES];
-        let mut chunks = samples.chunks_exact(LANES);
-        for chunk in &mut chunks {
+        let (chunks, rest) = samples.as_chunks::<LANES>();
+        for chunk in chunks {
             for lane in 0..LANES {
                 let x = chunk[lane];
                 peak[lane] = peak[lane].max(x.abs());
@@ -234,7 +234,7 @@ kernel! {
             total_peak = total_peak.max(peak[lane]);
             total_sum += sum[lane];
         }
-        for &x in chunks.remainder() {
+        for &x in rest {
             total_peak = total_peak.max(x.abs());
             total_sum += x * x;
         }

@@ -334,6 +334,7 @@ fn sample_to_beat(runtime: &RuntimeProject, sample: u64) -> f64 {
 /// Warp segments, when present, replace the global read rate so marker
 /// positions stay monotonic and allocation-free on the audio thread.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn resolved_clip_source_frame(
     rel: u64,
     duration_samples: u64,

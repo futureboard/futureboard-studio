@@ -1737,7 +1737,9 @@ mod tests {
                 None,
             );
             let silent = out
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .filter(|frame| frame[0] == 0.0 && frame[1] == 0.0)
                 .count();
             assert_eq!(

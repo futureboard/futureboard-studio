@@ -431,8 +431,7 @@ fn render_offline_impl(
     let block = if bridge_sinks.is_some() {
         request
             .block_size
-            .max(1)
-            .min(crate::plugin_bridge::MAX_BRIDGE_BLOCK_FRAMES)
+            .clamp(1, crate::plugin_bridge::MAX_BRIDGE_BLOCK_FRAMES)
     } else {
         request.block_size.max(1)
     };
@@ -870,7 +869,7 @@ impl StereoFrameDelay {
         if self.ring.is_empty() {
             return;
         }
-        for frame in block.chunks_exact_mut(2) {
+        for frame in block.as_chunks_mut::<2>().0 {
             let slot = &mut self.ring[self.pos..self.pos + 2];
             let (l, r) = (slot[0], slot[1]);
             slot.copy_from_slice(frame);
@@ -1213,7 +1212,9 @@ mod tests {
         // after the dry hit. (Where it lands depends on the bridge's block
         // timing, so it is found in the audio rather than computed.)
         let last_loud = mix
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .rposition(|frame| frame[0].abs() >= 0.001)
             .expect("the render holds sound") as u64;
         let last_echo = mix[last_loud as usize * 2].abs();
@@ -1427,7 +1428,9 @@ mod tests {
             mix
         };
         let silent_frames = |mix: &[f32]| {
-            mix.chunks_exact(2)
+            mix.as_chunks::<2>()
+                .0
+                .iter()
                 .filter(|f| f[0] == 0.0 && f[1] == 0.0)
                 .count()
         };
@@ -1439,7 +1442,9 @@ mod tests {
         assert_eq!(silent_frames(&in_memory), 192_000);
         assert_eq!(
             in_memory
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .position(|f| f[0] != 0.0 || f[1] != 0.0),
             Some(96_000)
         );

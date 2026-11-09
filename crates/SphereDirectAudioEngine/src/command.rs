@@ -336,6 +336,8 @@ pub enum EngineCommand {
     /// internal keyboard / groove preview needs a live DSP loop). Carries an
     /// immutable snapshot of the active editor set prepared on the control
     /// thread so the callback neither modifies maps nor frees strings.
+    // Boxed so the old set is retired through the graveyard as one pointer.
+    #[allow(clippy::box_collection)]
     SetBridgeEditorActive(Box<std::collections::HashSet<String>>),
     /// Control-thread synchronization point: the callback sets `ack` when it
     /// drains this command, proving every command sent *before* it has been

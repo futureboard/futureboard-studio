@@ -6348,8 +6348,7 @@ fn midi_event_priority(kind: RuntimeMidiEventKind) -> u8 {
 fn mpe_voice_release_beat(note_end: f64, clip_end: f64, sustain_changes: &[(f64, bool)]) -> f64 {
     let sustain_down = sustain_changes
         .iter()
-        .filter(|(beat, _)| *beat <= note_end)
-        .last()
+        .rfind(|(beat, _)| *beat <= note_end)
         .is_some_and(|(_, down)| *down);
     if !sustain_down {
         return note_end;

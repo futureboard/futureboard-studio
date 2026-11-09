@@ -285,7 +285,7 @@ pub(crate) unsafe fn dispatch(count: usize, ctx: *const (), run: RunFn) -> bool 
         std::hint::spin_loop();
         spins = spins.wrapping_add(1);
         // A worker preempted mid-item may share this core; let it finish.
-        if spins % 1024 == 0 {
+        if spins.is_multiple_of(1024) {
             std::thread::yield_now();
         }
     }
@@ -398,7 +398,7 @@ mod tests {
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(2);
-        assert!(threads >= 1 && threads <= AUTO_THREAD_CAP);
+        assert!((1..=AUTO_THREAD_CAP).contains(&threads));
         if cores > 2 {
             assert!(threads < cores);
         }

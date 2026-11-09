@@ -1397,10 +1397,12 @@ fn following_row(
     stage_row: &[u8; PATH_SLOTS],
     index: usize,
 ) -> Option<usize> {
-    for later in order.iter().skip(index + 1).flatten() {
-        return Some(row_of(stage_row, *later));
-    }
-    None
+    order
+        .iter()
+        .skip(index + 1)
+        .flatten()
+        .next()
+        .map(|later| row_of(stage_row, *later))
 }
 
 /// A time-based block: the dry tap for line 2 is the signal just before

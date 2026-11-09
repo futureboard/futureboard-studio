@@ -38,9 +38,10 @@
 /// instrument tracks, aux/send buses, return channels, group buses, and master
 /// insert processing — because it is tapped from the master bus output rather
 /// than from any individual source.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum MonitorSource {
     /// The full master bus output, post master inserts and master fader.
+    #[default]
     MasterBus,
     /// A group / aux / return bus, tapped post-fader.
     Bus(String),
@@ -52,12 +53,6 @@ pub enum MonitorSource {
     /// explicit user action, and until it is selected the engine does not open
     /// or read a capture device on the Control Room's behalf at all.
     HardwareInput(String),
-}
-
-impl Default for MonitorSource {
-    fn default() -> Self {
-        Self::MasterBus
-    }
 }
 
 impl MonitorSource {
