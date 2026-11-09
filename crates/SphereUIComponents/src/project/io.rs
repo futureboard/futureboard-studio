@@ -27,6 +27,8 @@ pub fn project_temp_path(path: &Path) -> PathBuf {
 
 /// Temp path for one save job: `<project>.fbproj.<pid>-<n>.tmp`. Unique per
 /// job, so two writers can never truncate or rename each other's temp file.
+/// A save that cannot replace the project keeps its temp file for recovery
+/// until the next save: a later failure replaces it, a success removes it.
 fn unique_project_temp_path(path: &Path) -> PathBuf {
     static NEXT_JOB: AtomicU64 = AtomicU64::new(0);
     let job = NEXT_JOB.fetch_add(1, Ordering::Relaxed);
@@ -219,11 +221,18 @@ pub fn save_project_with_report_from(
     match replace_project_file(&tmp_path, path) {
         Ok(()) => {
             project_save_log(format_args!("atomic rename complete: {}", path.display()));
+            // A failed save before this one kept its copy for recovery; the
+            // project file now holds newer work, so it is no longer needed
+            // (#363). So is an older build's fixed-name temp file.
+            remove_save_job_temps_locked(path, None);
+            let _ = fs::remove_file(project_temp_path(path));
             Ok(ProjectSaveReport { offline_media })
         }
         Err(error) => {
             // The temp file is a complete, synced save. Keep it so the user
-            // can recover the new state, and say where it is.
+            // can recover the new state, and say where it is. It supersedes
+            // any copy an earlier failed save kept: at most one stays (#363).
+            remove_save_job_temps_locked(path, Some(&tmp_path));
             project_save_log(format_args!(
                 "save failed: {error}; new save kept at {}",
                 tmp_path.display()
@@ -726,12 +735,20 @@ fn remove_finished_autosave_files(autosave: &Path) {
 /// Caller holds [`PROJECT_WRITE_LOCK`].
 fn remove_autosave_files_locked(autosave: &Path) {
     remove_finished_autosave_files(autosave);
+    remove_save_job_temps_locked(autosave, None);
+}
+
+/// Remove `path`'s save-job temp files (`<file>.<pid>-<n>.tmp`), all but
+/// `keep`. Caller holds [`PROJECT_WRITE_LOCK`], so none of them is a write
+/// still in progress in this process.
+fn remove_save_job_temps_locked(path: &Path, keep: Option<&Path>) {
     let (Some(dir), Some(name)) = (
-        autosave.parent(),
-        autosave.file_name().and_then(|name| name.to_str()),
+        path.parent(),
+        path.file_name().and_then(|name| name.to_str()),
     ) else {
         return;
     };
+    let keep = keep.and_then(|keep| keep.file_name());
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -751,7 +768,7 @@ fn remove_autosave_files_locked(autosave: &Path) {
                 && pid.bytes().all(|b| b.is_ascii_digit())
                 && n.bytes().all(|b| b.is_ascii_digit())
         });
-        if is_job_temp {
+        if is_job_temp && keep != Some(file_name.as_os_str()) {
             let _ = fs::remove_file(entry.path());
         }
     }
@@ -2384,6 +2401,84 @@ mod tests {
         );
         let recovered = load_project(&kept[0], false).unwrap();
         assert_eq!(recovered.name, "After");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// #363: a successful save removes the copies earlier failed saves kept
+    /// (this process's or an older one's) and an older build's temp file, and
+    /// nothing that is not this project's own save temp.
+    #[test]
+    fn a_successful_save_removes_kept_failed_saves() {
+        let dir = temp_dir("kept-saves-cleanup");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Song.fbproj");
+        let kept = [
+            PathBuf::from(format!("{}.123-4.tmp", path.display())),
+            PathBuf::from(format!("{}.{}-99.tmp", path.display(), std::process::id())),
+            project_temp_path(&path),
+        ];
+        let unrelated = [
+            PathBuf::from(format!("{}.notes.tmp", path.display())),
+            dir.join("Other.fbproj.123-4.tmp"),
+        ];
+        for file in kept.iter().chain(&unrelated) {
+            fs::write(file, b"x").unwrap();
+        }
+
+        save_project(&mut FutureboardProject::new("Saved"), &path).unwrap();
+
+        for gone in &kept {
+            assert!(!gone.exists(), "{} should be removed", gone.display());
+        }
+        for left in &unrelated {
+            assert!(left.exists(), "{} is not this save's", left.display());
+        }
+        assert_eq!(load_project(&path, false).unwrap().name, "Saved");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// #363, as in the report: saving again and again while another program
+    /// holds the project keeps one recovery copy, the newest, and the first
+    /// save that gets through removes it.
+    #[cfg(windows)]
+    #[test]
+    fn repeated_failed_saves_keep_one_copy_until_a_save_succeeds() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 1;
+
+        let dir = temp_dir("held-open-repeated-save");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Held.fbproj");
+        save_project(&mut FutureboardProject::new("Before"), &path).unwrap();
+        let temps = || -> Vec<PathBuf> {
+            fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|p| p.extension().is_some_and(|ext| ext == "tmp"))
+                .collect()
+        };
+
+        let holder = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&path)
+            .unwrap();
+        for attempt in 1..=3 {
+            let name = format!("Attempt {attempt}");
+            let error = save_project(&mut FutureboardProject::new(&name), &path).unwrap_err();
+            let kept = temps();
+            assert_eq!(kept.len(), 1, "after failed save {attempt}: {kept:?}");
+            assert!(error
+                .technical_detail()
+                .contains(&kept[0].display().to_string()));
+            assert_eq!(load_project(&kept[0], false).unwrap().name, name);
+        }
+        drop(holder);
+
+        save_project(&mut FutureboardProject::new("After"), &path).unwrap();
+        assert_eq!(temps(), Vec::<PathBuf>::new(), "the kept copy is removed");
+        assert_eq!(load_project(&path, false).unwrap().name, "After");
         let _ = fs::remove_dir_all(dir);
     }
 
