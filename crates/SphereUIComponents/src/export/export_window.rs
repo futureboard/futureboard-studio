@@ -1092,12 +1092,12 @@ impl ExportArrangementWindow {
             SelectOption::new("wav", "WAV"),
             SelectOption::new("flac", "FLAC"),
             {
-                let option = SelectOption::new("mp3", "MP3");
-                if self.defaults.mp3_available {
+                let option = SelectOption::new("opus", "Opus");
+                if self.defaults.opus_available {
                     option
                 } else {
                     option.disabled(true).description(i18n.tr_or(
-                        "export.hint.mp3-unavailable",
+                        "export.hint.opus-unavailable",
                         "Not compiled into this build.",
                     ))
                 }
@@ -1132,10 +1132,17 @@ impl ExportArrangementWindow {
         // Dither only exists where samples are cut to integers; float output
         // keeps its choice greyed with the reason rather than hiding the row.
         let dither_block = (!self.settings.dither_applies()).then(|| {
-            i18n.tr_or(
-                "export.hint.dither-float",
-                "Float output is never dithered.",
-            )
+            if self.settings.format == AudioFileFormat::Opus {
+                i18n.tr_or(
+                    "export.hint.dither-opus",
+                    "Opus encodes the float mix, so it is never dithered.",
+                )
+            } else {
+                i18n.tr_or(
+                    "export.hint.dither-float",
+                    "Float output is never dithered.",
+                )
+            }
         });
         let dither_options = [
             ("tpdf", i18n.tr_or("export.dither.tpdf", "TPDF")),
@@ -1358,15 +1365,22 @@ impl ExportArrangementWindow {
                     SelectOption::new("24", "24-bit"),
                 ],
             )),
-            AudioFileFormat::Mp3 => Some((
+            AudioFileFormat::Opus => Some((
                 i18n.tr_or("export.field.bitrate", "Bitrate"),
-                self.settings.mp3_bitrate_kbps.to_string(),
-                vec![
-                    SelectOption::new("128", "128 kbps"),
-                    SelectOption::new("192", "192 kbps"),
-                    SelectOption::new("256", "256 kbps"),
-                    SelectOption::new("320", "320 kbps"),
-                ],
+                self.settings.opus_bitrate().kbps().to_string(),
+                sphere_encoder::OpusBitrate::ALL
+                    .into_iter()
+                    .map(|preset| {
+                        let kbps = preset.kbps().to_string();
+                        let label = tr_vars_or(
+                            i18n,
+                            "export.opus.bitrate",
+                            "{ $kbps } kbps VBR",
+                            &[("kbps", kbps.clone())],
+                        );
+                        SelectOption::new(kbps, label)
+                    })
+                    .collect(),
             )),
             AudioFileFormat::Rauf => None,
         }
@@ -1641,9 +1655,9 @@ impl ExportArrangementWindow {
     fn apply_select(&mut self, field: SelectField, value: &str) {
         match field {
             SelectField::Format => {
-                self.settings.format = match value {
-                    "flac" => AudioFileFormat::Flac,
-                    "mp3" => AudioFileFormat::Mp3,
+                // Rauf is never offered; the retired "mp3" id reads as Opus.
+                self.settings.format = match AudioFileFormat::from_id(value) {
+                    Some(format @ (AudioFileFormat::Flac | AudioFileFormat::Opus)) => format,
                     _ => AudioFileFormat::Wav,
                 };
                 self.sync_output_from_name();
@@ -1659,8 +1673,13 @@ impl ExportArrangementWindow {
                 AudioFileFormat::Flac => {
                     self.settings.flac_bit_depth = if value == "16" { 16 } else { 24 };
                 }
-                AudioFileFormat::Mp3 => {
-                    self.settings.mp3_bitrate_kbps = value.parse().unwrap_or(256);
+                AudioFileFormat::Opus => {
+                    let preset = value
+                        .parse::<u32>()
+                        .ok()
+                        .and_then(|kbps| sphere_encoder::OpusBitrate::from_kbps(kbps).ok())
+                        .unwrap_or_default();
+                    self.settings.opus_bitrate_kbps = preset.kbps() as u16;
                 }
                 AudioFileFormat::Rauf => {}
             },

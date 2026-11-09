@@ -282,13 +282,29 @@ pub(super) fn channel_label(channels: u16, i18n: I18n) -> String {
     }
 }
 
-/// Rate · channels · resolution. MP3 has no meaningful bit depth — the settings
-/// model only carries one because the container API wants a field — so it shows
-/// the bitrate it is actually encoded at.
+/// Rate · channels · resolution. Opus has no bit depth, so it shows the
+/// bitrate it is encoded at, and the 48 kHz every Opus file plays at — naming
+/// the render rate when the encoder converts from another one.
 pub(super) fn output_spec(estimate: &ExportEstimate, i18n: I18n) -> String {
     let channels = channel_label(estimate.channels, i18n);
-    match estimate.mp3_bitrate_kbps {
-        Some(kbps) => format!("{} Hz · {channels} · {kbps} kbps", estimate.sample_rate),
+    match estimate.opus_bitrate_kbps {
+        Some(kbps) => {
+            let opus_rate = sphere_encoder::OPUS_SAMPLE_RATE;
+            let rate = if estimate.sample_rate == opus_rate {
+                format!("{opus_rate} Hz")
+            } else {
+                tr_vars_or(
+                    i18n,
+                    "export.readout.opus-rate",
+                    "{ $opus } Hz (from { $render } Hz)",
+                    &[
+                        ("opus", opus_rate.to_string()),
+                        ("render", estimate.sample_rate.to_string()),
+                    ],
+                )
+            };
+            format!("{rate} · {channels} · {kbps} kbps")
+        }
         None => format!(
             "{} Hz · {channels} · {}-bit",
             estimate.sample_rate,
