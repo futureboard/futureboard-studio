@@ -1,9 +1,34 @@
 use super::*;
 use crate::measure::{
-    self, Metrics, dsp_for, frames_for, impulse_response, measure, modulation_spread_hz,
+    self, dsp_for, frames_for, impulse_response, measure, modulation_spread_hz, Metrics,
 };
 
 const SR: f32 = measure::SR;
+
+#[test]
+fn one_non_finite_sample_does_not_stick() {
+    let mut dsp = Dsp::new(SR);
+    let before = signal_energy(&mut dsp);
+    assert!(before > 1.0e-4, "fixture produced no audio ({before})");
+    let _ = dsp.process_stereo(f32::INFINITY, 0.2);
+    let _ = dsp.process_stereo(f32::NAN, f32::NEG_INFINITY);
+    let after = signal_energy(&mut dsp);
+    assert!(
+        after > before * 0.25,
+        "level did not recover: before {before} after {after}"
+    );
+}
+
+fn signal_energy(dsp: &mut Dsp) -> f32 {
+    let mut acc = 0.0f32;
+    for n in 0..4_000 {
+        let x = (n as f32 * 0.17).sin() * 0.25;
+        let (l, r) = dsp.process_stereo(x, x * 0.8);
+        assert!(l.is_finite() && r.is_finite(), "non-finite at {n}");
+        acc += l * l + r * r;
+    }
+    acc
+}
 
 fn wet_only(mut params: Params) -> Params {
     params.mix = 100.0;
@@ -1000,10 +1025,8 @@ fn every_preset_sounds_like_its_name() {
         assert!(sheen(&plate) > sheen(other), "{plate:?} vs {other:?}");
     }
     // A plate has no discrete reflections.
-    assert!(
-        decay_profile(&plate_params, SR)
-            .early
-            .iter()
-            .all(|e| e.gain == 0.0)
-    );
+    assert!(decay_profile(&plate_params, SR)
+        .early
+        .iter()
+        .all(|e| e.gain == 0.0));
 }

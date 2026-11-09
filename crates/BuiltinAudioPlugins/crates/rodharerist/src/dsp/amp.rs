@@ -18,9 +18,9 @@
 
 use builtin_dsp_core::time_constant;
 
-use super::AmpModel;
 use super::nonlinear::{PushPullParams, TriodeParams, TriodeState};
 use super::smooth::{Oversampler4x, Oversampler8x, Smoothed};
+use super::AmpModel;
 
 const MAX_PREAMP_STAGES: usize = 4;
 const CONTROL_SMOOTH_SECONDS: f32 = 0.012;
@@ -1898,6 +1898,10 @@ impl AmpLane {
         };
         lane.configure(model, Settings::default());
         lane.snap_controls();
+        // The host builds the instance and applies state, and does not call
+        // reset. Without this the valves start at 0 instead of their operating
+        // point and the first second of silence is a pop.
+        lane.core.prime(&lane.voicing);
         lane
     }
 
@@ -2280,6 +2284,31 @@ impl Amp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A host insert never receives `reset` before the first block. Silence
+    /// must already be silence — the same result `reset` produces.
+    #[test]
+    fn a_fresh_amp_is_silent_without_reset() {
+        for model in AmpModel::ALL {
+            for &rate in &[44_100.0, 48_000.0, 192_000.0] {
+                let mut amp = Amp::new(rate);
+                amp.configure(*model, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0);
+                let mut peak = 0.0f32;
+                let frames = rate as usize;
+                for _ in 0..frames {
+                    let (l, r) = amp.process(0.0, 0.0);
+                    peak = peak.max(l.abs()).max(r.abs());
+                }
+                // The unsettled amp peaked near −9 dBFS. Under −60 dBFS is the
+                // valve model's residual, not that pop.
+                assert!(
+                    peak < 1.0e-3,
+                    "{model:?} at {rate} Hz popped at {peak} ({:.1} dBFS) with no input",
+                    20.0 * peak.max(1.0e-12).log10()
+                );
+            }
+        }
+    }
 
     fn render(model: AmpModel, gain: f32, master: f32, tone: [f32; 3]) -> Vec<f32> {
         let mut amp = Amp::new(48_000.0);

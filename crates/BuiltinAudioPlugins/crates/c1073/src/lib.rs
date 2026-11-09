@@ -5,10 +5,10 @@
 //! mild class-A style tanh saturation.
 
 use biquad::{Biquad, Coefficients, DirectForm1};
-use builtin_dsp_core::delay::{Smoothed, smoothing_step};
+use builtin_dsp_core::delay::{smoothing_step, Smoothed};
 use builtin_dsp_core::{
-    ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, clamp, db_to_linear,
-    make_eq_coefficients, mix,
+    clamp, db_to_linear, make_eq_coefficients, mix, ParamDescriptor, PluginCategory,
+    PluginDescriptor, StereoEffect,
 };
 
 pub const PLUGIN_ID: &str = "futureboard.c1073";
@@ -520,6 +520,8 @@ impl StereoEffect for Dsp {
     }
 
     fn process_stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
+        let left = if left.is_finite() { left } else { 0.0 };
+        let right = if right.is_finite() { right } else { 0.0 };
         let step = self.smooth_step;
         if self.fade >= 1.0 {
             // A chain that is off has heard nothing: the instance stays
@@ -546,6 +548,31 @@ impl StereoEffect for Dsp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_non_finite_sample_does_not_stick() {
+        let mut dsp = Dsp::new(48_000.0);
+        let before = signal_energy(&mut dsp);
+        assert!(before > 1.0e-4, "fixture produced no audio ({before})");
+        let _ = dsp.process_stereo(f32::NAN, 0.2);
+        let _ = dsp.process_stereo(f32::NEG_INFINITY, f32::NAN);
+        let after = signal_energy(&mut dsp);
+        assert!(
+            after > before * 0.25,
+            "level did not recover: before {before} after {after}"
+        );
+    }
+
+    fn signal_energy(dsp: &mut Dsp) -> f32 {
+        let mut acc = 0.0f32;
+        for n in 0..4_000 {
+            let x = (n as f32 * 0.17).sin() * 0.25;
+            let (l, r) = dsp.process_stereo(x, x * 0.8);
+            assert!(l.is_finite() && r.is_finite(), "non-finite at {n}");
+            acc += l * l + r * r;
+        }
+        acc
+    }
 
     #[test]
     fn snaps_mid_frequency() {

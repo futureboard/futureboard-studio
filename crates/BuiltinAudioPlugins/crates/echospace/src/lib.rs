@@ -21,10 +21,10 @@
 use std::f32::consts::{FRAC_1_SQRT_2, FRAC_PI_2, TAU};
 
 use biquad::{Biquad, Coefficients, DirectForm1};
-use builtin_dsp_core::delay::{Allpass, DelayRing, Smoothed, smoothing_step};
+use builtin_dsp_core::delay::{smoothing_step, Allpass, DelayRing, Smoothed};
 use builtin_dsp_core::{
-    ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, biquad_response_db, clamp,
-    db_to_linear, flush_denormal, make_eq_coefficients,
+    biquad_response_db, clamp, db_to_linear, flush_denormal, make_eq_coefficients, ParamDescriptor,
+    PluginCategory, PluginDescriptor, StereoEffect,
 };
 use serde::{Deserialize, Serialize};
 
@@ -34,8 +34,8 @@ pub mod ui;
 
 /// Editor-facing parameter id table, re-exported at the crate root so the host
 /// resolves ids the same way for every built-in (`<plugin>::ui_param_index`).
-pub use ipc::{UI_PARAM_IDS, ui_param_id, ui_param_index};
-pub use presets::{FactoryPreset, factory_presets};
+pub use ipc::{ui_param_id, ui_param_index, UI_PARAM_IDS};
+pub use presets::{factory_presets, FactoryPreset};
 
 pub const PLUGIN_ID: &str = "futureboard.echospace";
 
@@ -600,7 +600,7 @@ pub fn echo_pattern(
     while let Some(index) = pending
         .iter()
         .enumerate()
-        .min_by(|a, b| (a.1.1 + times[a.1.0]).total_cmp(&(b.1.1 + times[b.1.0])))
+        .min_by(|a, b| (a.1 .1 + times[a.1 .0]).total_cmp(&(b.1 .1 + times[b.1 .0])))
         .map(|(i, _)| i)
     {
         if echoes.len() >= max_echoes {
@@ -1206,6 +1206,8 @@ impl StereoEffect for Dsp {
     }
 
     fn process_stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
+        let left = if left.is_finite() { left } else { 0.0 };
+        let right = if right.is_finite() { right } else { 0.0 };
         if self.power.is_off() {
             return (left, right);
         }
@@ -1318,6 +1320,31 @@ mod tests {
     use super::*;
 
     const SR: f32 = 48_000.0;
+
+    #[test]
+    fn one_non_finite_sample_does_not_stick() {
+        let mut dsp = Dsp::new(SR);
+        let before = signal_energy(&mut dsp);
+        assert!(before > 1.0e-4, "fixture produced no audio ({before})");
+        let _ = dsp.process_stereo(f32::INFINITY, 0.2);
+        let _ = dsp.process_stereo(f32::NAN, f32::NEG_INFINITY);
+        let after = signal_energy(&mut dsp);
+        assert!(
+            after > before * 0.25,
+            "level did not recover: before {before} after {after}"
+        );
+    }
+
+    fn signal_energy(dsp: &mut Dsp) -> f32 {
+        let mut acc = 0.0f32;
+        for n in 0..4_000 {
+            let x = (n as f32 * 0.17).sin() * 0.25;
+            let (l, r) = dsp.process_stereo(x, x * 0.8);
+            assert!(l.is_finite() && r.is_finite(), "non-finite at {n}");
+            acc += l * l + r * r;
+        }
+        acc
+    }
 
     /// Wet only, tone stage wide open and clean: what the routing alone does.
     fn plain(mode: DelayMode) -> Params {

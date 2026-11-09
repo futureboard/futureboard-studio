@@ -90,7 +90,10 @@ impl Oscillator {
 
     pub(crate) fn process(&mut self, data: &[i16], block: &mut [f32], pitch: f32) -> bool {
         let pitch_change = self.pitch_change_scale * (pitch - self.root_key as f32) + self.tune;
-        let pitch_ratio = self.sample_rate_ratio * 2_f32.powf(pitch_change / 12_f32);
+        let mut pitch_ratio = self.sample_rate_ratio * 2_f32.powf(pitch_change / 12_f32);
+        if !pitch_ratio.is_finite() {
+            pitch_ratio = 0.0;
+        }
         self.fill_block(data, block, pitch_ratio as f64)
     }
 
@@ -106,8 +109,10 @@ impl Oscillator {
 
     fn fill_block_no_loop(&mut self, data: &[i16], block: &mut [f32], pitch_ratio_fp: i64) -> bool {
         for t in 0..block.len() {
-            let index = (self.position_fp >> Oscillator::FRAC_BITS) as usize;
-            if index >= self.end as usize {
+            // A negative rate, or a step that wrapped, puts the cursor before
+            // the sample. Casting that to usize would index off the end.
+            let index_i = self.position_fp >> Oscillator::FRAC_BITS;
+            if index_i < 0 || index_i >= self.end as i64 || index_i as usize + 1 >= data.len() {
                 if t > 0 {
                     let len = block.len();
                     block[t..len].fill(0_f32);
@@ -117,13 +122,16 @@ impl Oscillator {
                 }
             }
 
+            let index = index_i as usize;
             let x1 = data[index] as i64;
             let x2 = data[index + 1] as i64;
             let a_fp = self.position_fp & (Oscillator::FRAC_UNIT - 1);
             block[t] = Oscillator::FP_TO_SAMPLE
                 * ((x1 << Oscillator::FRAC_BITS) + a_fp * (x2 - x1)) as f32;
 
-            self.position_fp += pitch_ratio_fp;
+            // Saturating: a huge rate must not overflow the cursor (a debug
+            // panic) or wrap it into a plausible index.
+            self.position_fp = self.position_fp.saturating_add(pitch_ratio_fp);
         }
 
         true
@@ -135,19 +143,51 @@ impl Oscillator {
         block: &mut [f32],
         pitch_ratio_fp: i64,
     ) -> bool {
+        let loop_length = self.end_loop as i64 - self.start_loop as i64;
+        let Some(loop_length_fp) = loop_length.checked_shl(Oscillator::FRAC_BITS as u32) else {
+            return false;
+        };
+        if loop_length_fp <= 0 {
+            return false;
+        }
+        let start_fp = (self.start_loop as i64) << Oscillator::FRAC_BITS;
         let end_loop_fp = (self.end_loop as i64) << Oscillator::FRAC_BITS;
-        let loop_length = (self.end_loop - self.start_loop) as i64;
-        let loop_length_fp = loop_length << Oscillator::FRAC_BITS;
+        let end_loop = self.end_loop.max(0) as usize;
+        let loop_length_us = loop_length as usize;
 
         for sample in block.iter_mut() {
-            if self.position_fp >= end_loop_fp {
-                self.position_fp -= loop_length_fp;
+            // The attack before the loop point plays once. Only a cursor that
+            // has passed the loop end — by more than one loop, when the step
+            // is longer than the loop — or run back before the sample start
+            // is folded into the loop. A single subtraction used to leave that
+            // cursor past the sample, and the next read panicked.
+            let index_i = self.position_fp >> Oscillator::FRAC_BITS;
+            let before_sample = index_i < 0 || index_i < self.start as i64;
+            if self.position_fp >= end_loop_fp || before_sample {
+                let rel = self.position_fp.wrapping_sub(start_fp);
+                self.position_fp =
+                    if rel >= loop_length_fp && rel < loop_length_fp.saturating_mul(2) {
+                        start_fp + (rel - loop_length_fp)
+                    } else {
+                        start_fp + rel.rem_euclid(loop_length_fp)
+                    };
             }
 
-            let index1 = (self.position_fp >> Oscillator::FRAC_BITS) as usize;
+            let index_i = self.position_fp >> Oscillator::FRAC_BITS;
+            if index_i < 0 || index_i as usize >= data.len() {
+                *sample = 0.0;
+                self.position_fp = self.position_fp.wrapping_add(pitch_ratio_fp);
+                continue;
+            }
+            let index1 = index_i as usize;
             let mut index2 = index1 + 1;
-            if index2 >= self.end_loop as usize {
-                index2 -= loop_length as usize;
+            if index2 >= end_loop {
+                index2 = index2.saturating_sub(loop_length_us);
+            }
+            if index2 >= data.len() {
+                *sample = 0.0;
+                self.position_fp = self.position_fp.wrapping_add(pitch_ratio_fp);
+                continue;
             }
 
             let x1 = data[index1] as i64;
@@ -156,9 +196,46 @@ impl Oscillator {
             *sample = Oscillator::FP_TO_SAMPLE
                 * ((x1 << Oscillator::FRAC_BITS) + a_fp * (x2 - x1)) as f32;
 
-            self.position_fp += pitch_ratio_fp;
+            self.position_fp = self.position_fp.wrapping_add(pitch_ratio_fp);
         }
 
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Oscillator;
+    use crate::loop_mode::LoopMode;
+    use crate::synthesizer_settings::SynthesizerSettings;
+
+    fn render(mode: LoopMode, sample_rate: i32, pitch: f32) -> Vec<f32> {
+        let settings = SynthesizerSettings::new(44_100);
+        let mut osc = Oscillator::new(&settings);
+        // Loop is four frames long, inside a 32-frame sample.
+        osc.start(mode, sample_rate, 0, 32, 8, 12, 60, 0, 0, 100);
+        let data = vec![1_000i16; 32];
+        let mut block = vec![0.0f32; 128];
+        let _ = osc.process(&data, &mut block, pitch);
+        block
+    }
+
+    #[test]
+    fn a_step_longer_than_the_loop_stays_inside_the_sample() {
+        for &(rate, pitch) in &[(8_000_000, 60.0), (44_100, 127.0), (192_000, 120.0)] {
+            let block = render(LoopMode::Continuous, rate, pitch);
+            assert!(
+                block.iter().all(|sample| sample.is_finite()),
+                "rate {rate} pitch {pitch} left the sample"
+            );
+        }
+    }
+
+    #[test]
+    fn a_negative_position_does_not_read_past_the_sample() {
+        let looping = render(LoopMode::Continuous, -48_000, 60.0);
+        let once = render(LoopMode::NoLoop, -48_000, 60.0);
+        assert!(looping.iter().all(|sample| sample.is_finite()));
+        assert!(once.iter().all(|sample| sample.is_finite()));
     }
 }

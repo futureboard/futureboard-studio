@@ -36,8 +36,8 @@ use builtin_dsp_core::crossover::FourBandSplitter as BandSplitter;
 use builtin_dsp_core::crossover::TwoBandSplitter;
 use builtin_dsp_core::delay::{Allpass, DelayRing};
 use builtin_dsp_core::{
-    ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, clamp, db_to_linear,
-    flush_denormal, max_filter_frequency, time_constant,
+    clamp, db_to_linear, flush_denormal, max_filter_frequency, time_constant, ParamDescriptor,
+    PluginCategory, PluginDescriptor, StereoEffect,
 };
 use serde::{Deserialize, Serialize};
 
@@ -48,8 +48,8 @@ pub mod ui;
 
 /// Editor-facing parameter id table, re-exported at the crate root so the host
 /// resolves ids the same way for every built-in (`<plugin>::ui_param_index`).
-pub use ipc::{UI_PARAM_IDS, ui_param_id, ui_param_index};
-pub use presets::{FactoryPreset, factory_presets};
+pub use ipc::{ui_param_id, ui_param_index, UI_PARAM_IDS};
+pub use presets::{factory_presets, FactoryPreset};
 
 pub const PLUGIN_ID: &str = "futureboard.imager";
 
@@ -755,7 +755,11 @@ impl Dsp {
     /// multiband is off.
     #[inline]
     fn source_band(&self, band: usize) -> usize {
-        if self.params.multiband { band } else { 0 }
+        if self.params.multiband {
+            band
+        } else {
+            0
+        }
     }
 
     /// The side gain `band` plays at: its width plus the global offset, or
@@ -925,6 +929,8 @@ impl StereoEffect for Dsp {
     }
 
     fn process_stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
+        let left = if left.is_finite() { left } else { 0.0 };
+        let right = if right.is_finite() { right } else { 0.0 };
         self.input_level
             .push(left, right, self.peak_release, self.correlation_coeff);
         if self.power.is_off() {
@@ -1020,6 +1026,31 @@ mod tests {
     use super::*;
 
     const RATE: f32 = 48_000.0;
+
+    #[test]
+    fn one_non_finite_sample_does_not_stick() {
+        let mut dsp = Dsp::new(RATE);
+        let before = signal_energy(&mut dsp);
+        assert!(before > 1.0e-4, "fixture produced no audio ({before})");
+        let _ = dsp.process_stereo(f32::INFINITY, 0.2);
+        let _ = dsp.process_stereo(f32::NAN, f32::NEG_INFINITY);
+        let after = signal_energy(&mut dsp);
+        assert!(
+            after > before * 0.25,
+            "level did not recover: before {before} after {after}"
+        );
+    }
+
+    fn signal_energy(dsp: &mut Dsp) -> f32 {
+        let mut acc = 0.0f32;
+        for n in 0..4_000 {
+            let x = (n as f32 * 0.17).sin() * 0.25;
+            let (l, r) = dsp.process_stereo(x, x * 0.8);
+            assert!(l.is_finite() && r.is_finite(), "non-finite at {n}");
+            acc += l * l + r * r;
+        }
+        acc
+    }
 
     fn settle(dsp: &mut Dsp, samples: usize) {
         for i in 0..samples {

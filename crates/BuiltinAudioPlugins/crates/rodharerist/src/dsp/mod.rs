@@ -49,8 +49,8 @@ mod wah;
 mod wav;
 
 use builtin_dsp_core::{
-    ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, clamp, db_to_linear,
-    time_constant,
+    clamp, db_to_linear, time_constant, ParamDescriptor, PluginCategory, PluginDescriptor,
+    StereoEffect,
 };
 
 use cab::Cabinet;
@@ -61,13 +61,13 @@ use eq::EqStage;
 use gate::NoiseGate;
 pub use handoff::Retired;
 pub use ir::{
-    IrInfo, IrLoadError, IrLoader, MAX_IR_SECONDS, PARTITION as IR_PARTITION_SAMPLES,
-    PreparedIrRuntime, prepare_ir_runtime,
+    prepare_ir_runtime, IrInfo, IrLoadError, IrLoader, PreparedIrRuntime, MAX_IR_SECONDS,
+    PARTITION as IR_PARTITION_SAMPLES,
 };
 use mod_stage::ModStage;
 pub use nam::{
-    NAM_BLOCK as NAM_BLOCK_SAMPLES, NamCaptureInfo, NamLoadError, NamLoader, PreparedNamRuntime,
-    prepare_nam_runtime,
+    prepare_nam_runtime, NamCaptureInfo, NamLoadError, NamLoader, PreparedNamRuntime,
+    NAM_BLOCK as NAM_BLOCK_SAMPLES,
 };
 use reverb::PlateReverb;
 pub use tone_stage::ToneEngineKind;
@@ -3651,7 +3651,11 @@ fn set_row(p: &mut Params, kind: StageKind, value: f32) {
 /// applying `amp_model` resets `tone_engine` to Classic.
 pub fn ui_values(p: &Params) -> Vec<(&'static str, f32)> {
     fn b(v: bool) -> f32 {
-        if v { 1.0 } else { 0.0 }
+        if v {
+            1.0
+        } else {
+            0.0
+        }
     }
     fn model_index<T: PartialEq + Copy>(all: &[T], value: T) -> f32 {
         all.iter().position(|m| *m == value).unwrap_or(0) as f32
@@ -3924,6 +3928,12 @@ impl StereoEffect for Dsp {
     }
 
     fn process_stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
+        // One non-finite sample latches envelopes and filter memories at
+        // infinity. The output of that state stays finite, so a downstream
+        // finiteness check never clears it. Drop the sample before any stage,
+        // the bypass line, or the tuner sees it.
+        let left = if left.is_finite() { left } else { 0.0 };
+        let right = if right.is_finite() { right } else { 0.0 };
         // The tuner hears the input whether or not the rig is on — a player
         // tunes with the board bypassed as often as not.
         if self.params.tuner_on {
@@ -4572,6 +4582,63 @@ pub(crate) use builtin_dsp_core::flush_denormal;
 mod tests {
     use super::*;
 
+    fn silence_peak(dsp: &mut Dsp, frames: usize) -> f32 {
+        let mut peak = 0.0f32;
+        for _ in 0..frames {
+            let (l, r) = dsp.process_stereo(0.0, 0.0);
+            peak = peak.max(l.abs()).max(r.abs());
+        }
+        peak
+    }
+
+    #[test]
+    fn a_fresh_or_loaded_rig_does_not_pop_on_silence() {
+        let mut fresh = Dsp::new(48_000.0);
+        let peak = silence_peak(&mut fresh, 48_000);
+        assert!(
+            peak < 1.0e-4,
+            "fresh rig popped at {peak} ({:.1} dBFS)",
+            20.0 * peak.max(1.0e-12).log10()
+        );
+
+        let mut loaded = Dsp::new(48_000.0);
+        let mut params = loaded.params().clone();
+        params.amp_model = AmpModel::Recto;
+        params.amp_gain = 8.0;
+        loaded.set_params(params);
+        let peak = silence_peak(&mut loaded, 48_000);
+        assert!(
+            peak < 1.0e-4,
+            "loaded rig popped at {peak} ({:.1} dBFS)",
+            20.0 * peak.max(1.0e-12).log10()
+        );
+    }
+
+    #[test]
+    fn one_infinite_sample_does_not_stick() {
+        let mut dsp = Dsp::new(48_000.0);
+        let before = sine_energy(&mut dsp);
+        assert!(before > 1.0e-4, "fixture produced no audio ({before})");
+        let _ = dsp.process_stereo(0.2, f32::INFINITY);
+        let _ = dsp.process_stereo(f32::NEG_INFINITY, f32::NAN);
+        let after = sine_energy(&mut dsp);
+        assert!(
+            after > before * 0.25,
+            "level did not recover: before {before} after {after}"
+        );
+    }
+
+    fn sine_energy(dsp: &mut Dsp) -> f32 {
+        let mut acc = 0.0f32;
+        for n in 0..4_000 {
+            let x = (n as f32 * 0.13).sin() * 0.2;
+            let (l, r) = dsp.process_stereo(x, x);
+            assert!(l.is_finite() && r.is_finite(), "non-finite at {n}");
+            acc += l * l + r * r;
+        }
+        acc
+    }
+
     const TINY_WAVENET_48K: &str = r#"{
         "version": "0.5.4", "architecture": "WaveNet",
         "config": { "layers": [{
@@ -5192,7 +5259,7 @@ mod tests {
         assert!(dsp.apply_ui_param("path_slot_0", 2.0)); // Amp first
         assert!(dsp.apply_ui_param("path_slot_1", 0.0)); // Gate
         assert!(dsp.apply_ui_param("path_slot_2", -1.0)); // clear
-        // Remaining slots still have defaults until overwritten — sanitize packs.
+                                                          // Remaining slots still have defaults until overwritten — sanitize packs.
         let mut order = [None; PATH_SLOTS];
         order[0] = Some(StageKind::Amp);
         order[1] = Some(StageKind::Cab);
@@ -7020,10 +7087,7 @@ mod telemetry_tests {
         assert_eq!(CabModel::ALL[27], CabModel::Dark15);
         assert_eq!(CabModel::ALL[28], CabModel::Razor4x12);
         assert_eq!(CabModel::from_index(35), CabModel::Tight2x12);
-        assert_eq!(
-            CabModel::from_model_id("doom_810"),
-            Some(CabModel::Doom810)
-        );
+        assert_eq!(CabModel::from_model_id("doom_810"), Some(CabModel::Doom810));
         assert_eq!(ModModel::ALL[16], ModModel::BiasTrem);
         assert_eq!(ModModel::ALL[17], ModModel::RazorChorus);
         assert_eq!(ModModel::from_index(24), ModModel::ShredPhase);

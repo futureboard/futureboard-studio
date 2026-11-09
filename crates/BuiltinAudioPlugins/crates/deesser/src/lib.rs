@@ -23,10 +23,10 @@
 //! milliseconds and switches at the bottom of the dip rather than clicking.
 
 use biquad::{Biquad, Coefficients, DirectForm1};
-use builtin_dsp_core::delay::{DelayRing, Smoothed, smoothing_step};
+use builtin_dsp_core::delay::{smoothing_step, DelayRing, Smoothed};
 use builtin_dsp_core::{
-    ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, clamp, db_to_linear,
-    flush_denormal, linear_to_db, make_eq_coefficients, time_constant,
+    clamp, db_to_linear, flush_denormal, linear_to_db, make_eq_coefficients, time_constant,
+    ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect,
 };
 use serde::{Deserialize, Serialize};
 
@@ -34,8 +34,8 @@ pub mod ipc;
 pub mod presets;
 pub mod ui;
 
-pub use ipc::{UI_PARAM_IDS, ui_param_id, ui_param_index};
-pub use presets::{FactoryPreset, factory_presets};
+pub use ipc::{ui_param_id, ui_param_index, UI_PARAM_IDS};
+pub use presets::{factory_presets, FactoryPreset};
 
 pub const PLUGIN_ID: &str = "futureboard.deesser";
 
@@ -706,6 +706,8 @@ impl StereoEffect for Dsp {
     }
 
     fn process_stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
+        let left = if left.is_finite() { left } else { 0.0 };
+        let right = if right.is_finite() { right } else { 0.0 };
         self.started = true;
 
         // A new lookahead, mode, stereo mode or listen: dip, switch at the
@@ -777,7 +779,11 @@ impl StereoEffect for Dsp {
         let wide = self.active.mode == Mode::Wide;
         let process = |x: f32, band: f32, on: bool| -> f32 {
             if !on {
-                if listen { 0.0 } else { x }
+                if listen {
+                    0.0
+                } else {
+                    x
+                }
             } else if listen {
                 band
             } else {
@@ -810,6 +816,38 @@ mod tests {
     use super::*;
 
     const SR: f32 = 48_000.0;
+
+    #[test]
+    fn one_non_finite_sample_does_not_stick_even_while_bypassed() {
+        let mut dsp = Dsp::new(SR);
+        let before = signal_energy(&mut dsp);
+        assert!(before > 1.0e-4, "fixture produced no audio ({before})");
+        let mut params = dsp.params().clone();
+        params.power = false;
+        dsp.set_params(params.clone());
+        for _ in 0..2_000 {
+            let (l, r) = dsp.process_stereo(f32::NAN, f32::INFINITY);
+            assert!(l.is_finite() && r.is_finite());
+        }
+        params.power = true;
+        dsp.set_params(params);
+        let after = signal_energy(&mut dsp);
+        assert!(
+            after > before * 0.25,
+            "level did not recover: before {before} after {after}"
+        );
+    }
+
+    fn signal_energy(dsp: &mut Dsp) -> f32 {
+        let mut acc = 0.0f32;
+        for n in 0..4_000 {
+            let x = (n as f32 * 0.17).sin() * 0.25;
+            let (l, r) = dsp.process_stereo(x, x * 0.8);
+            assert!(l.is_finite() && r.is_finite(), "non-finite at {n}");
+            acc += l * l + r * r;
+        }
+        acc
+    }
 
     fn sine(freq: f32, amp: f32, n: usize) -> f32 {
         amp * (std::f32::consts::TAU * freq * n as f32 / SR).sin()
