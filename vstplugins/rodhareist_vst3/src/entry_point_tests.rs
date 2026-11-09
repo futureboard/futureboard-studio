@@ -296,3 +296,105 @@ fn vst2_main_instantiates_and_processes() {
         call(EFF_CLOSE, 0, 0.0);
     }
 }
+
+/// #343: a host caches parameter names. When a state or automation selects
+/// another stomp, the plug-in renames that block's CC titles and tells the
+/// host once (`audioMasterUpdateDisplay`); a knob move tells it nothing.
+#[test]
+fn vst2_tells_the_host_once_when_a_stomp_renames_its_titles() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const EFF_OPEN: i32 = 0;
+    const EFF_CLOSE: i32 = 1;
+    const EFF_GET_PARAM_NAME: i32 = 8;
+    const EFF_SET_SAMPLE_RATE: i32 = 10;
+    const EFF_SET_BLOCK_SIZE: i32 = 11;
+    const EFF_MAINS_CHANGED: i32 = 12;
+    const AUDIO_MASTER_UPDATE_DISPLAY: i32 = 42;
+
+    static UPDATE_DISPLAY: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn host(
+        _effect: *mut AEffect,
+        opcode: i32,
+        _index: i32,
+        _value: isize,
+        _ptr: *mut c_void,
+        _opt: f32,
+    ) -> isize {
+        if opcode == AUDIO_MASTER_UPDATE_DISPLAY {
+            UPDATE_DISPLAY.fetch_add(1, Ordering::SeqCst);
+        }
+        0
+    }
+
+    let index_of = |id: &str| {
+        rodharerist::UI_PARAM_IDS
+            .iter()
+            .filter(|known| **known != crate::params::CLEAR_CLIP)
+            .position(|known| *known == id)
+            .unwrap() as i32
+    };
+    let drive_model = index_of("drive_model");
+    let drive_gain = index_of("drive_gain");
+    let models = rodharerist::DriveModel::ALL;
+    let rat = models
+        .iter()
+        .position(|m| *m == rodharerist::DriveModel::Rat)
+        .unwrap();
+
+    unsafe {
+        let effect = crate::vst2_export::VSTPluginMain(host);
+        assert!(!effect.is_null());
+        let fx = &mut *effect;
+        let dispatch = fx.dispatcher;
+        let set_parameter = fx.set_parameter;
+        let call = |opcode: i32, value: isize, opt: f32| {
+            dispatch(effect, opcode, 0, value, std::ptr::null_mut(), opt)
+        };
+        // Suspend and resume: the host's way to have a VST2 take new values
+        // into `initialize`, as a state load does.
+        let reinitialize = || {
+            call(EFF_MAINS_CHANGED, 0, 0.0);
+            call(EFF_MAINS_CHANGED, 1, 0.0);
+        };
+        let name_of = |index: i32| {
+            let mut buf = [0 as c_char; 64];
+            dispatch(
+                effect,
+                EFF_GET_PARAM_NAME,
+                index,
+                0,
+                buf.as_mut_ptr() as *mut c_void,
+                0.0,
+            );
+            CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned()
+        };
+
+        call(EFF_OPEN, 0, 0.0);
+        call(EFF_SET_SAMPLE_RATE, 0, RATE as f32);
+        call(EFF_SET_BLOCK_SIZE, BLOCK as isize, 0.0);
+        call(EFF_MAINS_CHANGED, 1, 0.0);
+        assert_eq!(UPDATE_DISPLAY.load(Ordering::SeqCst), 0, "defaults");
+        assert!(name_of(drive_gain).starts_with("Green"));
+
+        set_parameter(effect, drive_gain, 0.9);
+        reinitialize();
+        assert_eq!(UPDATE_DISPLAY.load(Ordering::SeqCst), 0, "a knob move");
+
+        set_parameter(effect, drive_model, rat as f32 / (models.len() - 1) as f32);
+        reinitialize();
+        assert_eq!(UPDATE_DISPLAY.load(Ordering::SeqCst), 1, "a new stomp");
+        assert!(
+            name_of(drive_gain).starts_with("Rats"),
+            "{}",
+            name_of(drive_gain)
+        );
+
+        reinitialize();
+        assert_eq!(UPDATE_DISPLAY.load(Ordering::SeqCst), 1, "nothing renamed");
+
+        call(EFF_MAINS_CHANGED, 0, 0.0);
+        call(EFF_CLOSE, 0, 0.0);
+    }
+}

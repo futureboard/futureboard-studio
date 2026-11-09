@@ -31,6 +31,8 @@ pub(crate) struct WrapperInitContext<'a, P: ClapPlugin> {
 pub(crate) struct PendingInitContextRequests {
     /// The value of the last `.set_latency_samples()` call.
     latency_changed: Cell<Option<u32>>,
+    /// `.param_titles_changed()` was called.
+    titles_changed: Cell<bool>,
 }
 
 /// A [`ProcessContext`] implementation for the wrapper. This is a separate object so it can hold on
@@ -68,6 +70,9 @@ impl<P: ClapPlugin> Drop for WrapperInitContext<'_, P> {
         if let Some(samples) = self.pending_requests.latency_changed.take() {
             self.wrapper.set_latency_samples(samples)
         }
+        if self.pending_requests.titles_changed.take() {
+            self.wrapper.param_titles_changed();
+        }
     }
 }
 
@@ -83,6 +88,11 @@ impl<P: ClapPlugin> InitContext<P> for WrapperInitContext<'_, P> {
     fn set_latency_samples(&self, samples: u32) {
         // See this struct's docstring
         self.pending_requests.latency_changed.set(Some(samples));
+    }
+
+    fn param_titles_changed(&self) {
+        // See this struct's docstring
+        self.pending_requests.titles_changed.set(true);
     }
 
     fn set_current_voice_capacity(&self, capacity: u32) {
@@ -134,6 +144,10 @@ impl<P: ClapPlugin> GuiContext for WrapperGuiContext<P> {
 
     fn request_resize(&self) -> bool {
         self.wrapper.request_resize()
+    }
+
+    fn param_titles_changed(&self) {
+        self.wrapper.param_titles_changed();
     }
 
     // All of these functions are supposed to be called from the main thread, so we'll put some

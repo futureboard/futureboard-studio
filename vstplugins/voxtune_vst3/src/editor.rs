@@ -300,12 +300,12 @@ impl Render for PluginEditor {
                                 .child(format!("Reading and analysing… {}%", (p * 100.0).round())),
                         );
                     }
-                    Some((_, None, true)) => {
+                    Some((_, None, Some(error))) => {
                         bar = bar.child(
                             div()
                                 .text_size(px(typography::UI_XS))
                                 .text_color(Colors::status_warning())
-                                .child("The host's audio could not be read."),
+                                .child(error),
                         );
                     }
                     _ => {}

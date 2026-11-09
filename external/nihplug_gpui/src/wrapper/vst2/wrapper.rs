@@ -13,6 +13,7 @@ use crossbeam::atomic::AtomicCell;
 use crossbeam::queue::ArrayQueue;
 use parking_lot::Mutex;
 
+use crate::event_loop::{EventLoop, MainThreadExecutor, OsEventLoop};
 use crate::plugin::vst2::Vst2Plugin;
 use crate::prelude::{
     AsyncExecutor, AudioIOLayout, AuxiliaryBuffers, BufferConfig, Editor, ParamFlags, ParamPtr,
@@ -75,6 +76,8 @@ const AUDIO_MASTER_AUTOMATE: i32 = 0;
 const AUDIO_MASTER_GET_TIME: i32 = 7;
 const AUDIO_MASTER_IO_CHANGED: i32 = 13;
 const AUDIO_MASTER_SIZE_WINDOW: i32 = 15;
+// "Something in the plug-in changed, update the display": hosts read parameter names again.
+const AUDIO_MASTER_UPDATE_DISPLAY: i32 = 42;
 const AUDIO_MASTER_BEGIN_EDIT: i32 = 43;
 const AUDIO_MASTER_END_EDIT: i32 = 44;
 
@@ -87,6 +90,10 @@ const BARS_VALID: i32 = 1 << 11;
 const CYCLE_POS_VALID: i32 = 1 << 12;
 const TIME_SIG_VALID: i32 = 1 << 13;
 const PLUG_CATEG_EFFECT: i32 = 1;
+
+/// Bits of [`Inner::pending_notifications`]: host callbacks waiting for the main thread.
+const NOTIFY_LATENCY: u32 = 1 << 0;
+const NOTIFY_TITLES: u32 = 1 << 1;
 
 /// Host callback. `extern "C"` matches the VST2 cdecl calling convention.
 pub type HostCallback = unsafe extern "C" fn(
@@ -200,7 +207,15 @@ pub(super) struct Inner<P: Vst2Plugin> {
     sample_rate: AtomicF32,
     max_block: AtomicU32,
     latency: AtomicU32,
-    latency_dirty: AtomicBool,
+    /// `NOTIFY_*` bits the host has not been told about yet. Only the main thread tells it.
+    pending_notifications: AtomicU32,
+    /// A [`Notify`] is queued on the main thread's event loop and has not run yet.
+    notify_posted: AtomicBool,
+    /// Wakes the main thread when a notification is requested from another thread (the audio
+    /// thread, the editor's own GUI thread). Created in `finish_init`, on the thread that created
+    /// the instance, which hosts do on their main thread.
+    event_loop: Option<OsEventLoop<Notify, MainThread<P>>>,
+    main_thread: Option<Arc<MainThread<P>>>,
     flushing: AtomicBool,
     tail: AtomicI32,
     active: AtomicBool,
@@ -226,6 +241,32 @@ unsafe impl<P: Vst2Plugin> Sync for WrapperPtr<P> {}
 impl<P: Vst2Plugin> WrapperPtr<P> {
     fn enqueue(&self, task: P::BackgroundTask) {
         unsafe { (*self.0).enqueue_task(task) }
+    }
+}
+
+/// The task posted to the main thread: deliver the pending host notifications.
+pub(super) struct Notify;
+
+/// Runs [`Notify`] on the main thread for one instance. The pointer is cleared in `effClose`
+/// before the instance is freed; the lock keeps a notification that is running (on Linux, on the
+/// event loop's own thread) from outliving the instance.
+pub(super) struct MainThread<P: Vst2Plugin> {
+    wrapper: Mutex<*const Wrapper<P>>,
+}
+
+unsafe impl<P: Vst2Plugin> Send for MainThread<P> {}
+unsafe impl<P: Vst2Plugin> Sync for MainThread<P> {}
+
+impl<P: Vst2Plugin> MainThreadExecutor<Notify> for MainThread<P> {
+    fn execute(&self, _task: Notify, _is_gui_thread: bool) {
+        let wrapper = self.wrapper.lock();
+        if wrapper.is_null() {
+            return;
+        }
+        let wrapper = unsafe { &**wrapper };
+        // Cleared first: a request made while this runs posts a new one.
+        wrapper.inner.notify_posted.store(false, Ordering::Release);
+        wrapper.flush_host_notifications();
     }
 }
 
@@ -341,7 +382,10 @@ impl<P: Vst2Plugin> Wrapper<P> {
                 sample_rate: AtomicF32::new(44100.0),
                 max_block: AtomicU32::new(max_block),
                 latency: AtomicU32::new(0),
-                latency_dirty: AtomicBool::new(false),
+                pending_notifications: AtomicU32::new(0),
+                notify_posted: AtomicBool::new(false),
+                event_loop: None,
+                main_thread: None,
                 flushing: AtomicBool::new(false),
                 tail: AtomicI32::new(1),
                 active: AtomicBool::new(false),
@@ -358,6 +402,14 @@ impl<P: Vst2Plugin> Wrapper<P> {
         unsafe {
             (*self.effect_ptr()).object = wrapper_ptr as *mut c_void;
         }
+
+        // `create` runs on the thread the host instantiates plugins on, its main thread. That
+        // thread becomes the one host notifications are delivered on.
+        let main_thread = Arc::new(MainThread {
+            wrapper: Mutex::new(wrapper_ptr),
+        });
+        self.inner.event_loop = Some(OsEventLoop::new_and_spawn(Arc::downgrade(&main_thread)));
+        self.inner.main_thread = Some(main_thread);
 
         let background = WrapperPtr(wrapper_ptr);
         let gui = WrapperPtr(wrapper_ptr);
@@ -404,29 +456,85 @@ impl<P: Vst2Plugin> Wrapper<P> {
         if previous == samples {
             return;
         }
-        self.inner.latency_dirty.store(true, Ordering::Release);
+        self.request_host_notification(NOTIFY_LATENCY);
     }
 
-    fn flush_latency(&self) {
-        if self.inner.flushing.swap(true, Ordering::AcqRel) {
+    pub(super) fn param_titles_changed(&self) {
+        self.request_host_notification(NOTIFY_TITLES);
+    }
+
+    /// Whether this is the thread the instance was created on. Hosts make their non-realtime
+    /// calls there.
+    fn on_main_thread(&self) -> bool {
+        self.inner
+            .event_loop
+            .as_ref()
+            .map_or(true, |event_loop| event_loop.is_main_thread())
+    }
+
+    /// Queue a host notification. Realtime safe: from any other thread this only posts a wakeup to
+    /// the main thread. On the main thread it is delivered at the end of the current dispatcher
+    /// call or `initialize_plugin`, after this wrapper's locks are released: the host may answer
+    /// `audioMasterIOChanged` by suspending and resuming the plugin.
+    fn request_host_notification(&self, bits: u32) {
+        self.inner
+            .pending_notifications
+            .fetch_or(bits, Ordering::AcqRel);
+        if !self.on_main_thread() {
+            self.post_notification();
+        }
+    }
+
+    fn post_notification(&self) {
+        if self.inner.notify_posted.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let posted = self
+            .inner
+            .event_loop
+            .as_ref()
+            .is_some_and(|event_loop| event_loop.schedule_gui(Notify));
+        if !posted {
+            self.inner.notify_posted.store(false, Ordering::Release);
+        }
+    }
+
+    /// Deliver pending notifications if this is the main thread, or wake the main thread for them.
+    /// Dispatcher calls some hosts make from the audio thread (start/stop processing, bypass) end
+    /// up here too, and must not call the host from there.
+    fn deliver_or_post_notifications(&self) {
+        if self.inner.pending_notifications.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        if self.on_main_thread() {
+            self.flush_host_notifications();
+        } else {
+            self.post_notification();
+        }
+    }
+
+    /// Tell the host what changed. Only on the main thread (or, on Linux, the event loop's thread),
+    /// never with the plugin locked.
+    fn flush_host_notifications(&self) {
+        if self.inner.closed.load(Ordering::Acquire)
+            || self.inner.flushing.swap(true, Ordering::AcqRel)
+        {
             return;
         }
         for _ in 0..4 {
-            if !self.inner.latency_dirty.swap(false, Ordering::AcqRel) {
+            let pending = self.inner.pending_notifications.swap(0, Ordering::AcqRel);
+            if pending == 0 {
                 break;
             }
-            let samples = self.inner.latency.load(Ordering::Relaxed);
-            unsafe {
-                let effect = self.effect_ptr();
-                (*effect).initial_delay = samples as i32;
-                (self.inner.host)(
-                    effect,
-                    AUDIO_MASTER_IO_CHANGED,
-                    0,
-                    0,
-                    std::ptr::null_mut(),
-                    0.0,
-                );
+            if pending & NOTIFY_LATENCY != 0 {
+                let samples = self.inner.latency.load(Ordering::Relaxed);
+                unsafe {
+                    (*self.effect_ptr()).initial_delay = samples as i32;
+                }
+                self.host_callback(AUDIO_MASTER_IO_CHANGED, 0, 0, 0.0);
+            }
+            if pending & NOTIFY_TITLES != 0 {
+                self.host_callback(AUDIO_MASTER_UPDATE_DISPLAY, 0, 0, 0.0);
             }
         }
         self.inner.flushing.store(false, Ordering::Release);
@@ -488,7 +596,7 @@ impl<P: Vst2Plugin> Wrapper<P> {
         plugin.reset();
         drop(plugin);
         self.inner.initialized.store(true, Ordering::Release);
-        self.flush_latency();
+        self.deliver_or_post_notifications();
     }
 
     fn resume(&self) {
@@ -683,13 +791,18 @@ impl<P: Vst2Plugin> Wrapper<P> {
             EFF_GET_VST_VERSION => VST_VERSION_2_4 as isize,
             _ => 0,
         };
-        self.flush_latency();
+        self.deliver_or_post_notifications();
         result
     }
 
     fn shutdown(&self) {
         if self.inner.closed.swap(true, Ordering::AcqRel) {
             return;
+        }
+        // A notification already posted to the main thread finds no instance. Taking the lock
+        // also waits for one that is running.
+        if let Some(main_thread) = &self.inner.main_thread {
+            *main_thread.wrapper.lock() = std::ptr::null();
         }
         self.close_editor();
         self.suspend();
@@ -1438,6 +1551,115 @@ mod tests {
         assert_eq!(IO_CHANGED_CALLS.load(Ordering::SeqCst), 1);
 
         // Clean up
+        unsafe {
+            dispatcher(effect, EFF_CLOSE, 0, 0, std::ptr::null_mut(), 0.0);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    static OFF_THREAD_IO_CHANGED: AtomicUsize = AtomicUsize::new(0);
+    #[cfg(target_os = "windows")]
+    static OFF_THREAD_WRONG_THREAD: AtomicUsize = AtomicUsize::new(0);
+    #[cfg(target_os = "windows")]
+    static OFF_THREAD_MAIN: std::sync::Mutex<Option<std::thread::ThreadId>> =
+        std::sync::Mutex::new(None);
+
+    #[cfg(target_os = "windows")]
+    unsafe extern "C" fn off_thread_host_callback(
+        _effect: *mut AEffect,
+        opcode: i32,
+        _index: i32,
+        _value: isize,
+        _ptr: *mut c_void,
+        _opt: f32,
+    ) -> isize {
+        if opcode == AUDIO_MASTER_IO_CHANGED {
+            let main = *OFF_THREAD_MAIN.lock().unwrap();
+            if main != Some(std::thread::current().id()) {
+                OFF_THREAD_WRONG_THREAD.fetch_add(1, Ordering::SeqCst);
+            }
+            OFF_THREAD_IO_CHANGED.fetch_add(1, Ordering::SeqCst);
+        }
+        0
+    }
+
+    /// Run this thread's message loop, as a host's main thread does between dispatcher calls,
+    /// until `done` or a timeout.
+    #[cfg(target_os = "windows")]
+    fn run_main_loop_until(done: impl Fn() -> bool) -> bool {
+        use std::time::{Duration, Instant};
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageA, PeekMessageA, TranslateMessage, MSG, PM_REMOVE,
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            unsafe {
+                let mut msg = MSG::default();
+                while PeekMessageA(&mut msg, HWND(0), 0, 0, PM_REMOVE).as_bool() {
+                    TranslateMessage(&msg);
+                    DispatchMessageA(&msg);
+                }
+            }
+            if done() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        done()
+    }
+
+    /// #355: with the editor closed nothing calls `effEditIdle`, and some hosts make dispatcher
+    /// calls from the audio thread. A latency change made on the audio thread still has to reach
+    /// the host, promptly and on the main thread.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn audio_thread_latency_reaches_the_host_on_the_main_thread_without_a_dispatcher_call() {
+        *OFF_THREAD_MAIN.lock().unwrap() = Some(std::thread::current().id());
+        OFF_THREAD_IO_CHANGED.store(0, Ordering::SeqCst);
+        OFF_THREAD_WRONG_THREAD.store(0, Ordering::SeqCst);
+
+        let effect = Wrapper::<LatencyTestPlugin>::create(off_thread_host_callback);
+        assert!(!effect.is_null());
+        let dispatcher = unsafe { (*effect).dispatcher };
+        let process_replacing = unsafe { (*effect).process_replacing };
+        unsafe {
+            dispatcher(effect, EFF_OPEN, 0, 0, std::ptr::null_mut(), 0.0);
+            dispatcher(effect, EFF_MAINS_CHANGED, 0, 1, std::ptr::null_mut(), 0.0);
+        }
+        OFF_THREAD_IO_CHANGED.store(0, Ordering::SeqCst);
+
+        let effect_addr = effect as usize;
+        std::thread::spawn(move || {
+            let effect = effect_addr as *mut AEffect;
+            let mut in_l = [0.0f32; 64];
+            let mut in_r = [0.0f32; 64];
+            let mut out_l = [0.0f32; 64];
+            let mut out_r = [0.0f32; 64];
+            let mut inputs = [in_l.as_mut_ptr(), in_r.as_mut_ptr()];
+            let mut outputs = [out_l.as_mut_ptr(), out_r.as_mut_ptr()];
+            unsafe {
+                process_replacing(effect, inputs.as_mut_ptr(), outputs.as_mut_ptr(), 64);
+                // A dispatcher call some hosts make from the audio thread
+                dispatcher(effect, EFF_STOP_PROCESS, 0, 0, std::ptr::null_mut(), 0.0);
+            }
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(
+            OFF_THREAD_IO_CHANGED.load(Ordering::SeqCst),
+            0,
+            "the audio thread called the host"
+        );
+        assert!(
+            run_main_loop_until(|| OFF_THREAD_IO_CHANGED.load(Ordering::SeqCst) == 1),
+            "the main thread's message loop never delivered the latency change"
+        );
+        assert_eq!(OFF_THREAD_WRONG_THREAD.load(Ordering::SeqCst), 0);
+        assert_eq!(unsafe { (*effect).initial_delay }, 128);
+
         unsafe {
             dispatcher(effect, EFF_CLOSE, 0, 0, std::ptr::null_mut(), 0.0);
         }

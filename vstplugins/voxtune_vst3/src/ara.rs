@@ -39,8 +39,8 @@ use ara2_bridge_sys::access::read_field;
 use ara2_bridge_sys::*;
 use parking_lot::Mutex;
 use sphere_voxtune::audio_io::{
-    bounded_output_len, compute_waveform_peaks, resample_mono_cubic, DecodedAudio,
-    MAX_MONO_SAMPLES, MAX_SAMPLE_RATE, MIN_SAMPLE_RATE,
+    bounded_output_len, check_load, compute_waveform_peaks, max_frames, resample_mono_cubic,
+    LoadLimit, MAX_SAMPLE_RATE, MIN_SAMPLE_RATE,
 };
 use sphere_voxtune::engine::{analyze_samples, Analysis, AnalysisProgress, CantoEngine, ORN_NONE};
 use sphere_voxtune::session::VoxDocument;
@@ -175,11 +175,22 @@ pub struct AudioSource {
     reported: AtomicU32,
     progress: Arc<AnalysisProgress>,
     reader: Mutex<Option<(JoinHandle<()>, Arc<AtomicBool>)>>,
+    /// Why the last read failed, when it is known; the editor shows it.
+    failure: Mutex<Option<String>>,
     /// Mono samples at the engine rate, once read.
-    audio: Mutex<Option<Arc<DecodedAudio>>>,
+    audio: Mutex<Option<Arc<Take>>>,
     /// The analysis new modifications start from.
     analysis: Mutex<Option<Analysis>>,
     modifications: Mutex<Vec<Weak<AudioModification>>>,
+}
+
+/// A source's audio once read: mono, at `sample_rate`. Every modification
+/// of the source at that rate (and every region playing one) plays this one
+/// buffer; a long take is held once, not once per modification.
+pub struct Take {
+    samples: Arc<Vec<f32>>,
+    sample_rate: u32,
+    waveform_peaks: Vec<f32>,
 }
 
 pub struct AudioModification {
@@ -193,6 +204,8 @@ pub struct AudioModification {
     pub doc: Mutex<Option<VoxDocument>>,
     /// Edits restored from an archive, installed once the take is read.
     restored: Mutex<Option<VoxDocument>>,
+    /// Why the take could not be installed into this modification's engine.
+    install_error: Mutex<Option<String>>,
     /// Bumped when the engine got (new) audio or edits from outside the
     /// editor (load, restore).
     pub generation: AtomicU64,
@@ -298,8 +311,9 @@ impl AudioModification {
         self.dirty.store(true, Ordering::Release);
     }
 
-    /// Installs the source's audio with `doc` (or the source's analysis).
-    fn install(&self, audio: &DecodedAudio, doc: Option<VoxDocument>) {
+    /// Installs the source's take with `doc` (or the source's analysis). The
+    /// take's buffer is shared, not copied, when it is at this engine's rate.
+    fn install(&self, take: &Take, doc: Option<VoxDocument>) {
         let analysis_doc = match doc {
             Some(d) => d,
             None => match self.source.analysis.lock().as_ref() {
@@ -313,10 +327,24 @@ impl AudioModification {
                 None => return,
             },
         };
-        let audio = audio_at_rate(audio, self.engine.sample_rate().round() as u32);
+        let samples = match take_at_rate(take, self.engine.sample_rate().round() as u32) {
+            Ok(samples) => samples,
+            Err(error) => {
+                // Keep the edits for the archive; the engine stays without
+                // audio rather than playing the take at the wrong speed.
+                *self.doc.lock() = Some(analysis_doc);
+                *self.install_error.lock() = Some(error);
+                return;
+            }
+        };
+        *self.install_error.lock() = None;
         {
             let mut engine = self.engine.lock();
-            engine.install_analyzed(audio, analysis_doc.to_analysis());
+            engine.install_analyzed_shared(
+                samples,
+                take.waveform_peaks.clone(),
+                analysis_doc.to_analysis(),
+            );
             analysis_doc.apply_to(&mut engine);
         }
         *self.doc.lock() = Some(analysis_doc);
@@ -357,24 +385,26 @@ impl AudioModification {
     }
 }
 
-/// Samples at `rate`. A take recorded at another rate is resampled so it
-/// matches the engine it is installed into.
-fn audio_at_rate(audio: &DecodedAudio, rate: u32) -> DecodedAudio {
-    if audio.sample_rate == rate || audio.samples.is_empty() || rate < 8_000 {
-        return audio.clone();
+/// The take's samples at `rate`: its own buffer, shared, when it is already
+/// at that rate; otherwise resampled into a new buffer, with a fallible
+/// allocation. Never the take at another rate: that plays at the wrong speed
+/// and pitch.
+fn take_at_rate(take: &Take, rate: u32) -> Result<Arc<Vec<f32>>, String> {
+    if take.sample_rate == rate || take.samples.is_empty() {
+        return Ok(Arc::clone(&take.samples));
     }
-    let samples = resample_mono_cubic(&audio.samples, audio.sample_rate, rate);
+    let samples = if bounded_output_len(take.samples.len(), take.sample_rate, rate).is_some() {
+        resample_mono_cubic(&take.samples, take.sample_rate, rate)
+    } else {
+        Vec::new()
+    };
     if samples.is_empty() {
-        return audio.clone();
+        return Err(format!(
+            "The take could not be converted from {} Hz to {} Hz.",
+            take.sample_rate, rate
+        ));
     }
-    DecodedAudio {
-        duration_sec: samples.len() as f64 / rate as f64,
-        waveform_peaks: compute_waveform_peaks(&samples, 240),
-        samples,
-        sample_rate: rate,
-        source_sample_rate: audio.source_sample_rate,
-        source_channels: audio.source_channels,
-    }
+    Ok(Arc::new(samples))
 }
 
 /// The document controller's state, shared with bound plug-in instances.
@@ -409,6 +439,9 @@ fn find<T>(list: &[Arc<T>], r: *const c_void) -> Option<Arc<T>> {
         .cloned()
 }
 
+/// A large buffer could not be reserved.
+const NOT_ENOUGH_MEMORY: &str = "Not enough memory to read this audio.";
+
 fn engine_rate(source_rate: f64) -> u32 {
     let rate = source_rate.round();
     if !rate.is_finite() {
@@ -430,6 +463,7 @@ impl DcShared {
             return;
         }
         source.state.store(SOURCE_READING, Ordering::Release);
+        *source.failure.lock() = None;
         let cancel = Arc::new(AtomicBool::new(false));
         let dc = self.clone();
         let src = source.clone();
@@ -469,13 +503,26 @@ impl DcShared {
         let count_i = *source.sample_count.lock();
         // A broken header (1 Hz, or a sample count that cannot exist) must
         // fail before any allocation: `Vec::with_capacity` aborts the process.
-        if !rate.is_finite()
+        // The length limit is a duration, the same at every rate.
+        let refused = if !rate.is_finite()
             || rate < MIN_SAMPLE_RATE as f64
             || rate > MAX_SAMPLE_RATE as f64
-            || !(1..=16).contains(&channels_i)
-            || count_i <= 0
-            || count_i as u64 > MAX_MONO_SAMPLES as u64
         {
+            let shown = if rate.is_finite() {
+                rate.round().clamp(0.0, u32::MAX as f64) as u32
+            } else {
+                0
+            };
+            Some(LoadLimit::UnsupportedRate(shown).to_string())
+        } else if !(1..=16).contains(&channels_i) || count_i <= 0 {
+            Some("The host describes this audio in a way Voxtune cannot read.".to_string())
+        } else if count_i as u64 > max_frames(rate.round() as u32) as u64 {
+            Some(LoadLimit::TooLong.to_string())
+        } else {
+            None
+        };
+        if let Some(reason) = refused {
+            *source.failure.lock() = Some(reason);
             return false;
         }
         let channels = channels_i as usize;
@@ -510,6 +557,7 @@ impl DcShared {
                     self.host.audio_ref.0 as ARAAudioAccessControllerHostRef,
                     reader,
                 );
+                *source.failure.lock() = Some(NOT_ENOUGH_MEMORY.to_string());
                 return false;
             }
             let mut buffers = Vec::new();
@@ -589,22 +637,21 @@ impl DcShared {
             .unwrap_or(src_rate);
         let samples = if src_rate == target {
             mono
-        } else if bounded_output_len(count, src_rate, target).is_none() {
+        } else if let Err(limit) = check_load(count, src_rate, target) {
+            *source.failure.lock() = Some(limit.to_string());
             return false;
         } else {
             let samples = resample_mono_cubic(&mono, src_rate, target);
             if samples.is_empty() {
+                *source.failure.lock() = Some(NOT_ENOUGH_MEMORY.to_string());
                 return false;
             }
             samples
         };
-        let audio = Arc::new(DecodedAudio {
-            duration_sec: samples.len() as f64 / target as f64,
+        let audio = Arc::new(Take {
             waveform_peaks: compute_waveform_peaks(&samples, 240),
-            samples,
+            samples: Arc::new(samples),
             sample_rate: target,
-            source_sample_rate: src_rate,
-            source_channels: channels,
         });
         *source.audio.lock() = Some(audio.clone());
         let mods: Vec<Arc<AudioModification>> = source
@@ -1039,6 +1086,7 @@ unsafe extern "C" fn create_audio_source(
             reported: AtomicU32::new(SOURCE_EMPTY),
             progress: Arc::new(AnalysisProgress::default()),
             reader: Mutex::new(None),
+            failure: Mutex::new(None),
             audio: Mutex::new(None),
             analysis: Mutex::new(None),
             modifications: Mutex::new(Vec::new()),
@@ -1184,6 +1232,7 @@ fn new_modification(
         engine: Arc::new(Shared::new(CantoEngine::new(rate as f32))),
         doc: Mutex::new(None),
         restored: Mutex::new(None),
+        install_error: Mutex::new(None),
         generation: AtomicU64::new(1),
         dirty: AtomicBool::new(false),
         regions: Mutex::new(Vec::new()),
@@ -1689,17 +1738,28 @@ impl BindingShared {
             .or_else(|| self.regions.lock().first().cloned())
     }
 
-    /// Reading / analysis state of the focused region's take, for the editor.
-    pub fn focus_status(&self) -> Option<(String, Option<f32>, bool)> {
+    /// Reading / analysis state of the focused region's take, for the editor:
+    /// the take's name, progress while it loads, and why it failed.
+    pub fn focus_status(&self) -> Option<(String, Option<f32>, Option<String>)> {
         let region = self.focus()?;
         let src = &region.modification.source;
         let state = src.state.load(Ordering::Acquire);
         let name = src.name.lock().clone();
         let p = src.progress.permille.load(Ordering::Relaxed) as f32 / 1000.0;
+        if let Some(error) = region.modification.install_error.lock().clone() {
+            return Some((name, None, Some(error)));
+        }
         Some(match state {
-            SOURCE_READING | SOURCE_ANALYZING => (name, Some(p), false),
-            SOURCE_FAILED => (name, None, true),
-            _ => (name, None, false),
+            SOURCE_READING | SOURCE_ANALYZING => (name, Some(p), None),
+            SOURCE_FAILED => {
+                let reason = src.failure.lock().clone();
+                (
+                    name,
+                    None,
+                    Some(reason.unwrap_or_else(|| "The host's audio could not be read.".into())),
+                )
+            }
+            _ => (name, None, None),
         })
     }
 }
@@ -2278,6 +2338,59 @@ mod tests {
         }
     }
 
+    /// #356: the take is held once. A modification, and a clone of it the
+    /// host makes ("make unique"), play the source's own buffer.
+    #[test]
+    fn modifications_of_a_take_share_its_samples() {
+        unsafe {
+            let d = open();
+            let (src, m_ref, _) = add_take(&d);
+            d.i.enableAudioSourceSamplesAccess.unwrap()(d.r, src, kARATrue);
+            let m = obj::<AudioModification>(m_ref);
+            wait_ready(m);
+            let props = ARAAudioModificationProperties {
+                structSize: std::mem::size_of::<ARAAudioModificationProperties>(),
+                name: c"vocal copy".as_ptr(),
+                persistentID: c"mod-copy".as_ptr(),
+            };
+            let copy_ref = d.i.cloneAudioModification.unwrap()(d.r, m_ref, 14 as _, &props);
+            assert!(!copy_ref.is_null());
+            let copy = obj::<AudioModification>(copy_ref);
+
+            let take = m.source.audio.lock().clone().expect("the take was read");
+            let original = Arc::clone(&m.engine.lock().audio_samples);
+            let cloned = Arc::clone(&copy.engine.lock().audio_samples);
+            assert!(!original.is_empty());
+            assert!(
+                Arc::ptr_eq(&original, &take.samples),
+                "the modification copied the take"
+            );
+            assert!(
+                Arc::ptr_eq(&cloned, &take.samples),
+                "the clone copied the take"
+            );
+            assert!(copy.install_error.lock().is_none());
+            d.i.destroyDocumentController.unwrap()(d.r);
+        }
+    }
+
+    /// #356: a take that cannot be converted is refused, not installed at
+    /// its own rate (which plays at the wrong speed and pitch).
+    #[test]
+    fn a_take_is_never_installed_at_the_wrong_rate() {
+        let take = Take {
+            samples: Arc::new(vec![0.1; 4_410]),
+            sample_rate: 44_100,
+            waveform_peaks: Vec::new(),
+        };
+        let same = take_at_rate(&take, 44_100).unwrap();
+        assert!(Arc::ptr_eq(&same, &take.samples));
+        let converted = take_at_rate(&take, 48_000).unwrap();
+        assert_eq!(converted.len(), 4_800);
+        // Outside what can be converted: an error, not the 44.1 kHz buffer.
+        assert!(take_at_rate(&take, 1).is_err());
+    }
+
     fn wait_failed(src: &AudioSource) {
         let start = Instant::now();
         while src.state.load(Ordering::Acquire) != SOURCE_FAILED {
@@ -2307,6 +2420,14 @@ mod tests {
         src
     }
 
+    fn failure_of(src: ARAAudioSourceRef) -> String {
+        unsafe { obj::<AudioSource>(src) }
+            .failure
+            .lock()
+            .clone()
+            .expect("the failure has a reason")
+    }
+
     #[test]
     fn an_absurd_source_fails_instead_of_allocating() {
         unsafe {
@@ -2314,6 +2435,7 @@ mod tests {
             let src = source_with(&d, SR, i64::MAX);
             d.i.enableAudioSourceSamplesAccess.unwrap()(d.r, src, kARATrue);
             wait_failed(obj::<AudioSource>(src));
+            assert!(failure_of(src).contains("too long"), "{}", failure_of(src));
             d.i.destroyDocumentController.unwrap()(d.r);
         }
     }
@@ -2325,6 +2447,34 @@ mod tests {
             let src = source_with(&d, 1.0, 200_000);
             d.i.enableAudioSourceSamplesAccess.unwrap()(d.r, src, kARATrue);
             wait_failed(obj::<AudioSource>(src));
+            assert!(failure_of(src).contains("1 Hz"), "{}", failure_of(src));
+            d.i.destroyDocumentController.unwrap()(d.r);
+        }
+    }
+
+    /// #367: a short source above 384 kHz is refused for its rate, with a
+    /// reason, and one just over an hour for its length.
+    #[test]
+    fn a_refused_source_says_why() {
+        unsafe {
+            let d = open();
+            let fast = source_with(&d, 768_000.0, 1_000);
+            d.i.enableAudioSourceSamplesAccess.unwrap()(d.r, fast, kARATrue);
+            wait_failed(obj::<AudioSource>(fast));
+            let reason = failure_of(fast);
+            assert!(
+                reason.contains("768000 Hz") && !reason.contains("too long"),
+                "{reason}"
+            );
+
+            let long = source_with(&d, SR, (61.0 * 60.0 * SR) as i64);
+            d.i.enableAudioSourceSamplesAccess.unwrap()(d.r, long, kARATrue);
+            wait_failed(obj::<AudioSource>(long));
+            assert!(
+                failure_of(long).contains("60 minutes"),
+                "{}",
+                failure_of(long)
+            );
             d.i.destroyDocumentController.unwrap()(d.r);
         }
     }

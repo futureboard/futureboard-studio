@@ -23,39 +23,94 @@ pub const MIN_SAMPLE_RATE: u32 = 1_000;
 pub const MAX_SAMPLE_RATE: u32 = 384_000;
 /// 8 kHz up to 384 kHz. Wider ratios are refused.
 pub const MAX_UPSAMPLE: u32 = 48;
-/// One hour at 48 kHz. Past this, allocation is refused instead of aborting
-/// the process in `Vec::with_capacity`.
-pub const MAX_MONO_SAMPLES: usize = 48_000 * 60 * 60;
+/// The longest take, at any sample rate. A take needs memory in proportion
+/// to its rate; the large buffers on the way are reserved fallibly, so a
+/// machine without the memory gets an error instead of an abort.
+pub const MAX_SECONDS: u32 = 60 * 60;
 
-/// Output length of resampling `input_len` from `src_rate` to `dst_rate`.
-/// `None` when the rate or the result is outside [`MIN_SAMPLE_RATE`] /
-/// [`MAX_MONO_SAMPLES`].
+/// Frames in [`MAX_SECONDS`] at `rate`.
+pub fn max_frames(rate: u32) -> usize {
+    MAX_SECONDS as usize * rate as usize
+}
+
+/// Why audio cannot be loaded or converted. `Display` is the message a user
+/// sees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadLimit {
+    /// The audio's own sample rate is outside the supported range.
+    UnsupportedRate(u32),
+    /// The rate it would be converted to (the project's) is outside it.
+    UnsupportedProjectRate(u32),
+    /// The two rates are too far apart to convert between.
+    RatesTooFarApart { from: u32, to: u32 },
+    /// Longer than [`MAX_SECONDS`].
+    TooLong,
+}
+
+impl std::fmt::Display for LoadLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let range = format!(
+            "{} kHz to {} kHz",
+            MIN_SAMPLE_RATE / 1_000,
+            MAX_SAMPLE_RATE / 1_000
+        );
+        match self {
+            LoadLimit::UnsupportedRate(rate) => write!(
+                f,
+                "Sample rate {rate} Hz is outside the supported range ({range})"
+            ),
+            LoadLimit::UnsupportedProjectRate(rate) => write!(
+                f,
+                "Project sample rate {rate} Hz is not supported ({range})"
+            ),
+            LoadLimit::RatesTooFarApart { from, to } => {
+                write!(f, "Audio at {from} Hz cannot be converted to {to} Hz")
+            }
+            LoadLimit::TooLong => write!(
+                f,
+                "Audio is too long to load (the limit is {} minutes)",
+                MAX_SECONDS / 60
+            ),
+        }
+    }
+}
+
+/// Output length of converting `input_len` frames from `src_rate` to
+/// `dst_rate`, or why that is refused: a rate outside [`MIN_SAMPLE_RATE`] ..
+/// [`MAX_SAMPLE_RATE`], a ratio beyond [`MAX_UPSAMPLE`], or audio longer
+/// than [`MAX_SECONDS`] (the same duration at every rate).
+pub fn check_load(input_len: usize, src_rate: u32, dst_rate: u32) -> Result<usize, LoadLimit> {
+    if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&src_rate) {
+        return Err(LoadLimit::UnsupportedRate(src_rate));
+    }
+    if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&dst_rate) {
+        return Err(LoadLimit::UnsupportedProjectRate(dst_rate));
+    }
+    if input_len > max_frames(src_rate) {
+        return Err(LoadLimit::TooLong);
+    }
+    if input_len == 0 || src_rate == dst_rate {
+        return Ok(input_len);
+    }
+    if dst_rate > src_rate && dst_rate.div_ceil(src_rate) > MAX_UPSAMPLE {
+        return Err(LoadLimit::RatesTooFarApart {
+            from: src_rate,
+            to: dst_rate,
+        });
+    }
+    let out = (input_len as u128 * dst_rate as u128).div_ceil(src_rate as u128);
+    if out > max_frames(dst_rate) as u128 {
+        return Err(LoadLimit::TooLong);
+    }
+    Ok(out as usize)
+}
+
+/// [`check_load`] without the reason.
 pub fn bounded_output_len(input_len: usize, src_rate: u32, dst_rate: u32) -> Option<usize> {
     if input_len == 0 || src_rate == 0 || dst_rate == 0 {
         return Some(0);
     }
-    if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&src_rate)
-        || !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&dst_rate)
-    {
-        return None;
-    }
-    if src_rate == dst_rate {
-        return (input_len <= MAX_MONO_SAMPLES).then_some(input_len);
-    }
-    if dst_rate > src_rate {
-        let ratio = (dst_rate as u64).div_ceil(src_rate as u64);
-        if ratio > MAX_UPSAMPLE as u64 {
-            return None;
-        }
-    }
-    let out = (input_len as u128)
-        .saturating_mul(dst_rate as u128)
-        .saturating_add(src_rate as u128 - 1)
-        / src_rate as u128;
-    if out > MAX_MONO_SAMPLES as u128 {
-        return None;
-    }
-    Some(out as usize)
+    check_load(input_len, src_rate, dst_rate).ok()
 }
 
 #[derive(Debug, Clone)]
@@ -111,25 +166,22 @@ pub fn decode_audio_file_to_stereo(
             .map(|frame| frame[channel])
             .collect()
     };
-    if raw.sample_rate < MIN_SAMPLE_RATE || raw.sample_rate > MAX_SAMPLE_RATE {
-        return Err(format!(
-            "Sample rate {} Hz is outside the supported range",
-            raw.sample_rate
-        ));
-    }
     let target_sr = target_sample_rate.max(8_000);
-    if bounded_output_len(raw.frames, raw.sample_rate, target_sr).is_none() {
-        return Err("Audio is too long to load".to_string());
-    }
+    check_load(raw.frames, raw.sample_rate, target_sr).map_err(|limit| limit.to_string())?;
     let (left, right) = (
         resample_mono_cubic(&side(0), raw.sample_rate, target_sr),
         resample_mono_cubic(&side(1), raw.sample_rate, target_sr),
     );
     if left.is_empty() || right.is_empty() {
-        return Err("Audio is too long to load".to_string());
+        return Err(OUT_OF_MEMORY.to_string());
     }
-    let mut samples = Vec::with_capacity(left.len() * 2);
-    let mut louder = Vec::with_capacity(left.len());
+    let mut samples = Vec::new();
+    let mut louder = Vec::new();
+    if samples.try_reserve_exact(left.len() * 2).is_err()
+        || louder.try_reserve_exact(left.len()).is_err()
+    {
+        return Err(OUT_OF_MEMORY.to_string());
+    }
     for (&l, &r) in left.iter().zip(&right) {
         samples.extend_from_slice(&[l, r]);
         louder.push(if l.abs() >= r.abs() { l } else { r });
@@ -157,7 +209,7 @@ fn read_audio_file(path: &Path) -> Result<RawInterleavedBuffer, String> {
             .map_err(|e| format!("Failed to read '{}': {e}", path.display()))?;
         match decode_wav_bytes(&bytes) {
             Ok(buf) => Ok(buf),
-            Err(e) if e.contains("too long") || e.contains("outside the supported range") => Err(e),
+            Err(e) if is_refusal(&e) => Err(e),
             Err(_) => decode_via_symphonia_reader(Box::new(Cursor::new(bytes)), Some(ext.as_str())),
         }
     } else {
@@ -180,7 +232,7 @@ pub fn decode_audio_bytes_to_mono(
     let raw = if is_riff_wav {
         match decode_wav_bytes(bytes) {
             Ok(buf) => buf,
-            Err(e) if e.contains("too long") || e.contains("outside the supported range") => {
+            Err(e) if is_refusal(&e) => {
                 return Err(e);
             }
             Err(_) => decode_via_symphonia_reader(
@@ -210,27 +262,17 @@ fn finalize_decoded(
         return Err("Decoded audio buffer is empty".to_string());
     }
 
-    if raw.sample_rate < MIN_SAMPLE_RATE || raw.sample_rate > MAX_SAMPLE_RATE {
-        return Err(format!(
-            "Sample rate {} Hz is outside the supported range",
-            raw.sample_rate
-        ));
-    }
-    if raw.frames > MAX_MONO_SAMPLES {
-        return Err("Audio is too long to load".to_string());
-    }
-    let mono_src = downmix_to_mono(&raw.samples, raw.channels, raw.frames);
     let target_sr = target_sample_rate.max(8_000);
-    if bounded_output_len(mono_src.len(), raw.sample_rate, target_sr).is_none() {
-        return Err("Audio is too long to load".to_string());
-    }
+    check_load(raw.frames, raw.sample_rate, target_sr).map_err(|limit| limit.to_string())?;
+    let mono_src = downmix_to_mono(&raw.samples, raw.channels, raw.frames)
+        .ok_or_else(|| OUT_OF_MEMORY.to_string())?;
     let mono = if raw.sample_rate == target_sr {
         mono_src
     } else {
         resample_mono_cubic(&mono_src, raw.sample_rate, target_sr)
     };
     if mono.is_empty() {
-        return Err("Audio is too long to load".to_string());
+        return Err(OUT_OF_MEMORY.to_string());
     }
 
     let duration_sec = mono.len() as f64 / target_sr as f64;
@@ -246,17 +288,31 @@ fn finalize_decoded(
     })
 }
 
-fn downmix_to_mono(interleaved: &[f32], channels: usize, frames: usize) -> Vec<f32> {
+/// What a large buffer that could not be reserved is reported as.
+const OUT_OF_MEMORY: &str = "Not enough memory to load this audio";
+
+/// A WAV the inline parser read but refused (rate, length, memory): not a
+/// format problem the general decoder could get past.
+fn is_refusal(error: &str) -> bool {
+    error.contains("too long")
+        || error.contains("outside the supported range")
+        || error == OUT_OF_MEMORY
+}
+
+/// `None` when the buffer cannot be reserved.
+fn downmix_to_mono(interleaved: &[f32], channels: usize, frames: usize) -> Option<Vec<f32>> {
+    let mut mono = Vec::new();
+    mono.try_reserve_exact(frames).ok()?;
     if channels <= 1 {
-        return interleaved.to_vec();
+        mono.extend_from_slice(interleaved);
+        return Some(mono);
     }
-    let mut mono = Vec::with_capacity(frames);
     let inv = 1.0 / channels as f32;
     for chunk in interleaved.chunks_exact(channels) {
         let sum: f32 = chunk.iter().copied().sum();
         mono.push((sum * inv).clamp(-1.0, 1.0));
     }
-    mono
+    Some(mono)
 }
 
 /// Resamples a mono buffer from `src_rate` to `dst_rate` using 4-point Catmull-Rom cubic interpolation.
@@ -359,6 +415,10 @@ fn decode_via_symphonia_reader(
         .sample_rate
         .ok_or_else(|| "Audio track has no sample rate".to_string())?;
     let mut channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(1);
+    // Before decoding anything: a rate we cannot use is refused as such.
+    if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&sample_rate) {
+        return Err(LoadLimit::UnsupportedRate(sample_rate).to_string());
+    }
 
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
@@ -400,12 +460,12 @@ fn decode_via_symphonia_reader(
                 if let Some(buf) = &mut sample_buf {
                     buf.copy_interleaved_ref(audio_buf_ref);
                     let incoming = buf.samples();
-                    let cap = MAX_MONO_SAMPLES.saturating_mul(channels.max(1));
+                    let cap = max_frames(sample_rate).saturating_mul(channels.max(1));
                     if all_samples.len().saturating_add(incoming.len()) > cap {
-                        return Err("Audio is too long to load".to_string());
+                        return Err(LoadLimit::TooLong.to_string());
                     }
                     if all_samples.try_reserve(incoming.len()).is_err() {
-                        return Err("Audio is too long to load".to_string());
+                        return Err(OUT_OF_MEMORY.to_string());
                     }
                     all_samples.extend_from_slice(incoming);
                 }
@@ -499,13 +559,16 @@ fn decode_wav_bytes(bytes: &[u8]) -> Result<RawInterleavedBuffer, String> {
     }
 
     let frames = data_len / bytes_per_frame;
-    if frames > MAX_MONO_SAMPLES || fmt.channels > 16 {
-        return Err("Audio is too long to load".to_string());
+    if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&fmt.sample_rate) {
+        return Err(LoadLimit::UnsupportedRate(fmt.sample_rate).to_string());
+    }
+    if frames > max_frames(fmt.sample_rate) || fmt.channels > 16 {
+        return Err(LoadLimit::TooLong.to_string());
     }
     let sample_count = frames * fmt.channels;
     let mut samples = Vec::new();
     if samples.try_reserve_exact(sample_count).is_err() {
-        return Err("Audio is too long to load".to_string());
+        return Err(OUT_OF_MEMORY.to_string());
     }
 
     let mut offset = data_start;
@@ -631,6 +694,58 @@ mod tests {
         let input = vec![0.1f32; 1_000];
         assert!(resample_mono_cubic(&input, 1, 48_000).is_empty());
         assert!(bounded_output_len(input.len(), 1, 48_000).is_none());
-        assert!(bounded_output_len(MAX_MONO_SAMPLES, 48_000, 96_000).is_none());
+        assert!(bounded_output_len(max_frames(48_000) + 1, 48_000, 96_000).is_none());
+    }
+
+    /// #367: an hour at any rate; a 20-minute 192 kHz take is not "too long".
+    #[test]
+    fn the_length_limit_is_the_same_duration_at_every_rate() {
+        for rate in [44_100u32, 48_000, 96_000, 192_000, 384_000] {
+            let twenty_minutes = 20 * 60 * rate as usize;
+            assert_eq!(check_load(twenty_minutes, rate, rate), Ok(twenty_minutes));
+            assert_eq!(
+                check_load(max_frames(rate), rate, rate),
+                Ok(max_frames(rate))
+            );
+            assert_eq!(
+                check_load(max_frames(rate) + 1, rate, rate),
+                Err(LoadLimit::TooLong)
+            );
+        }
+        // An hour at 192 kHz for a 48 kHz project is an hour at 48 kHz.
+        assert_eq!(
+            check_load(max_frames(192_000), 192_000, 48_000),
+            Ok(max_frames(48_000))
+        );
+    }
+
+    /// #367: a rate we cannot use is named, not reported as too long.
+    #[test]
+    fn unsupported_rates_are_named_not_called_too_long() {
+        let file = check_load(1_000, 768_000, 48_000).unwrap_err();
+        assert_eq!(file, LoadLimit::UnsupportedRate(768_000));
+        assert!(file.to_string().contains("768000 Hz"));
+        assert!(!file.to_string().contains("too long"));
+        let project = check_load(1_000, 48_000, 768_000).unwrap_err();
+        assert_eq!(project, LoadLimit::UnsupportedProjectRate(768_000));
+        assert!(!project.to_string().contains("too long"));
+    }
+
+    #[test]
+    fn a_short_768_khz_wav_is_refused_for_its_rate() {
+        let mut bytes = encode_mono_wav_i16(&[0.2; 64], 48_000);
+        bytes[24..28].copy_from_slice(&768_000u32.to_le_bytes());
+        let err = decode_audio_bytes_to_mono(&bytes, Some("wav"), 48_000).unwrap_err();
+        assert!(
+            err.contains("768000 Hz") && err.contains("outside the supported range"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_project_rate_above_the_range_is_named() {
+        let bytes = encode_mono_wav_i16(&[0.2; 64], 48_000);
+        let err = decode_audio_bytes_to_mono(&bytes, Some("wav"), 768_000).unwrap_err();
+        assert!(err.contains("Project sample rate 768000 Hz"), "{err}");
     }
 }

@@ -422,6 +422,8 @@ impl Drop for GpuiEditorHandle {
             }
         }
 
+        // The HWND belongs to the GPUI thread, so it detaches it itself; this (the host's) thread
+        // waits for that only a bounded time and never blocks in a cross-thread send (#353).
         #[cfg(target_os = "windows")]
         {
             // The inner block drops the lock guard before the body runs; the body
@@ -430,7 +432,11 @@ impl Drop for GpuiEditorHandle {
                 let taken = self.embedded_view.lock().take();
                 taken
             } {
-                embed::detach_hwnd(hwnd);
+                embed::detach_hwnd_from_host(
+                    hwnd,
+                    |detach| host::run_on_gpui_thread(Box::new(move |_| detach())),
+                    embed::DETACH_WAIT,
+                );
             }
         }
 

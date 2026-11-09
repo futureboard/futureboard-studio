@@ -54,6 +54,13 @@ pub trait GuiContext: Send + Sync + 'static {
     /// mostly marked as unsafe for API reasons.
     unsafe fn raw_end_set_parameter(&self, param: ParamPtr);
 
+    /// Tell the host that one or more parameter names ([`Param::name()`]) changed, after renaming
+    /// them with `FloatParam::set_name()` and friends. Hosts cache parameter info, so without this
+    /// they keep showing the old names. The host is told on its main thread: VST3
+    /// `restartComponent(kParamTitlesChanged)`, CLAP `rescan(CLAP_PARAM_RESCAN_INFO)`, VST2
+    /// `audioMasterUpdateDisplay`. Call it once per batch of renames, not per parameter.
+    fn param_titles_changed(&self) {}
+
     /// Serialize the plugin's current state to a serde-serializable object. Useful for implementing
     /// preset handling within a plugin's GUI.
     fn get_state(&self) -> PluginState;

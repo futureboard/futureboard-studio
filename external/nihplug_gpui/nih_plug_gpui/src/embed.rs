@@ -463,6 +463,97 @@ pub(crate) fn detach_hwnd(child: usize) {
     }
 }
 
+/// How long the host's thread waits for the GPUI thread to take the editor's window out of the
+/// host's window. A responsive GPUI thread needs well under a frame.
+#[cfg(target_os = "windows")]
+pub(crate) const DETACH_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Take an embedded editor HWND out of the host's window when the host closes the editor, without
+/// making the host's thread wait indefinitely on the thread that owns the HWND.
+///
+/// The window belongs to the GPUI thread. Re-parenting or restyling it from the host's thread sends
+/// messages that the GPUI thread has to process, so [`detach_hwnd()`] called there blocks until it
+/// does, and for good if the GPUI thread is itself waiting on the host (a parameter gesture blocked
+/// on a lock the host holds while it closes the editor, #353). So the window is hidden without
+/// waiting, the owning thread is asked to detach it through `run_on_owner`, and that is waited for
+/// at most `wait`, still answering any message the owning thread sends this one meanwhile. An owner
+/// that stays busy longer no longer holds the host: it detaches the window when it gets to it.
+///
+/// Returns whether the window is out of the host's window on return.
+#[cfg(target_os = "windows")]
+pub(crate) fn detach_hwnd_from_host(
+    child: usize,
+    run_on_owner: impl FnOnce(Box<dyn FnOnce() + Send>) -> bool,
+    wait: std::time::Duration,
+) -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Threading::GetCurrentThreadId;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowThreadProcessId, IsWindow, ShowWindowAsync, SW_HIDE,
+    };
+
+    if child == 0 {
+        return true;
+    }
+    let hwnd = HWND(child as *mut std::ffi::c_void);
+    unsafe {
+        if !IsWindow(Some(hwnd)).as_bool() {
+            return true;
+        }
+        // Nothing to wait for on the owning thread itself
+        if GetWindowThreadProcessId(hwnd, None) == GetCurrentThreadId() {
+            detach_hwnd(child);
+            return true;
+        }
+        // Posted, not sent: the host's window stops showing the editor right away either way
+        let _ = ShowWindowAsync(hwnd, SW_HIDE);
+    }
+
+    let done = Arc::new(AtomicBool::new(false));
+    let signal = done.clone();
+    let queued = run_on_owner(Box::new(move || {
+        detach_hwnd(child);
+        signal.store(true, Ordering::Release);
+    }));
+
+    queued && wait_answering_sent_messages(&done, wait)
+}
+
+/// Wait until `done` or for `wait`, delivering messages other threads send to this one so a
+/// thread that is sending to us while we wait for it does not deadlock. Posted (queued) messages
+/// are left alone: those are the host's to dispatch.
+#[cfg(target_os = "windows")]
+fn wait_answering_sent_messages(
+    done: &std::sync::atomic::AtomicBool,
+    wait: std::time::Duration,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MsgWaitForMultipleObjects, PeekMessageW, MSG, PM_NOREMOVE, PM_QS_SENDMESSAGE,
+        QS_SENDMESSAGE,
+    };
+
+    let deadline = Instant::now() + wait;
+    loop {
+        if done.load(Ordering::Acquire) {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let slice = (deadline - now).as_millis().clamp(1, 5) as u32;
+        unsafe {
+            let _ = MsgWaitForMultipleObjects(None, false, slice, QS_SENDMESSAGE);
+            let mut msg = MSG::default();
+            let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
+        }
+    }
+}
+
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::*;
@@ -538,6 +629,189 @@ mod tests {
             // Parent can be destroyed without destroying the detached child
             let _ = DestroyWindow(parent);
             let _ = DestroyWindow(child);
+        }
+    }
+
+    type OwnerTask = Box<dyn FnOnce() + Send>;
+
+    /// A thread that owns a child window of `parent` (made on the calling thread), the way the
+    /// GPUI thread owns an editor embedded in a host window. Once `start` is released it runs the
+    /// tasks it is sent and pumps its messages until `stop`; then it destroys its window.
+    struct Owner {
+        child: usize,
+        tasks: std::sync::mpsc::Sender<OwnerTask>,
+        start: std::sync::mpsc::Sender<()>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        exited: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    fn spawn_owner(parent: HWND, class_name: windows::core::PCWSTR) -> Owner {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{mpsc, Arc};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+        };
+
+        let (task_tx, task_rx) = mpsc::channel::<OwnerTask>();
+        let (start_tx, start_rx) = mpsc::channel::<()>();
+        let (child_tx, child_rx) = mpsc::channel::<usize>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let exited = Arc::new(AtomicBool::new(false));
+        let parent_addr = parent.0 as usize;
+        let class_addr = class_name.0 as usize;
+        let (thread_stop, thread_exited) = (stop.clone(), exited.clone());
+        let thread = std::thread::spawn(move || unsafe {
+            let parent = HWND(parent_addr as *mut std::ffi::c_void);
+            // No WM_PARENTNOTIFY: that is sent to the parent's thread, which is waiting for
+            // `child` below. (The editor's window becomes a child after it is created.)
+            let child = CreateWindowExW(
+                windows::Win32::UI::WindowsAndMessaging::WS_EX_NOPARENTNOTIFY,
+                windows::core::PCWSTR(class_addr as *const u16),
+                w!("Owned child"),
+                WS_CHILD | WS_VISIBLE,
+                0,
+                0,
+                50,
+                50,
+                Some(parent),
+                None,
+                None,
+                None,
+            )
+            .expect("failed to create the owned child window");
+            child_tx.send(child.0 as usize).unwrap();
+            // Busy (as a GPUI thread blocked on the host would be) until released
+            start_rx.recv().unwrap();
+            while !thread_stop.load(Ordering::Acquire) {
+                while let Ok(task) = task_rx.try_recv() {
+                    task();
+                }
+                let mut msg = MSG::default();
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let _ = DestroyWindow(child);
+            thread_exited.store(true, Ordering::Release);
+        });
+        Owner {
+            child: child_rx.recv().unwrap(),
+            tasks: task_tx,
+            start: start_tx,
+            stop,
+            exited,
+            thread,
+        }
+    }
+
+    impl Owner {
+        /// Stop the thread, answering what it sends this one meanwhile.
+        fn finish(self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Release);
+            let _ = self.start.send(());
+            assert!(wait_answering_sent_messages(
+                &self.exited,
+                std::time::Duration::from_secs(5)
+            ));
+            self.thread.join().unwrap();
+        }
+    }
+
+    fn detached(child: usize) -> bool {
+        unsafe {
+            let child = HWND(child as *mut std::ffi::c_void);
+            GetParent(child).map_or(true, |parent| parent.0.is_null())
+        }
+    }
+
+    fn make_parent(class_name: windows::core::PCWSTR) -> HWND {
+        unsafe {
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(test_wnd_proc),
+                lpszClassName: class_name,
+                ..Default::default()
+            };
+            let _ = RegisterClassW(&wc);
+            CreateWindowExW(
+                Default::default(),
+                class_name,
+                w!("Host"),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                100,
+                100,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("failed to create parent window")
+        }
+    }
+
+    /// The host's thread closes an editor whose window another thread owns: that thread detaches
+    /// it, and the host's thread returns once it has.
+    #[test]
+    fn a_window_owned_by_another_thread_is_detached_by_that_thread() {
+        let class_name = w!("NihPlugGpuiDetachOwnerTest");
+        let parent = make_parent(class_name);
+        let owner = spawn_owner(parent, class_name);
+        owner.start.send(()).unwrap();
+        let tasks = owner.tasks.clone();
+
+        let detached_now = detach_hwnd_from_host(
+            owner.child,
+            move |task| tasks.send(task).is_ok(),
+            std::time::Duration::from_secs(5),
+        );
+        assert!(detached_now);
+        assert!(detached(owner.child));
+
+        owner.finish();
+        unsafe {
+            let _ = DestroyWindow(parent);
+        }
+    }
+
+    /// #353: the owning thread is busy (blocked on something the host's thread holds). Closing the
+    /// editor must not wait for it past the bound; it detaches once it runs again.
+    #[test]
+    fn a_busy_owner_does_not_hold_the_host() {
+        let class_name = w!("NihPlugGpuiDetachBusyTest");
+        let parent = make_parent(class_name);
+        let owner = spawn_owner(parent, class_name);
+        let tasks = owner.tasks.clone();
+
+        let started = std::time::Instant::now();
+        let detached_now = detach_hwnd_from_host(
+            owner.child,
+            move |task| tasks.send(task).is_ok(),
+            std::time::Duration::from_millis(100),
+        );
+        let waited = started.elapsed();
+        assert!(!detached_now);
+        assert!(
+            waited < std::time::Duration::from_secs(1),
+            "waited {waited:?}"
+        );
+
+        // Running again, the owner takes its window out of the host's
+        let child = owner.child;
+        owner.start.send(()).unwrap();
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !detached(child) && std::time::Instant::now() < deadline {
+            wait_answering_sent_messages(&done, std::time::Duration::from_millis(5));
+        }
+        assert!(detached(child));
+
+        owner.finish();
+        unsafe {
+            let _ = DestroyWindow(parent);
         }
     }
 }

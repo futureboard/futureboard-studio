@@ -75,6 +75,8 @@ fn load_in_background(params: &Arc<RodhareistParams>, shared: &Arc<Shared>, task
 }
 
 struct PluginEditor {
+    /// Tells the host when the MIDI titles change.
+    context: EditorContext,
     params: Arc<RodhareistParams>,
     shared: Arc<Shared>,
     window: Entity<RodhareistEditorWindow>,
@@ -121,8 +123,11 @@ impl PluginEditor {
         .detach();
 
         // A model change that arrived while this editor was closed.
-        params.wire.refresh_host_names();
+        if params.wire.refresh_host_names() {
+            context.gui_context().param_titles_changed();
+        }
         Self {
+            context,
             seen: params.wire.values(),
             answers: shared.answers(),
             params,
@@ -157,7 +162,9 @@ impl PluginEditor {
             self.seen = values;
             // Host automation of a model (the editor did not call
             // `set_from_editor`) still has to rename the MIDI titles.
-            self.params.wire.refresh_host_names();
+            if self.params.wire.refresh_host_names() {
+                self.context.gui_context().param_titles_changed();
+            }
             self.window
                 .update(cx, |window, cx| window.sync_from_mirror(cx));
         }
