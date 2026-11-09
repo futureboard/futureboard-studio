@@ -111,23 +111,92 @@ pub fn verify_file_hash(path: &Path, expected_bytes: u64, expected_sha256: &str)
     format!("{:x}", hasher.finalize()).eq_ignore_ascii_case(expected_sha256)
 }
 
-/// True when every ONNX file for `model` is present under `models_dir` and matches its pinned SHA-256 hash.
-pub fn model_installed(model: StemModel, models_dir: &Path) -> bool {
-    verify_model_installed(model, models_dir)
+/// Sidecar written next to a model file once its full SHA-256 has matched.
+fn verified_marker_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".verified");
+    PathBuf::from(name)
 }
 
-/// Verify that every ONNX file for `model` is present and matches its pinned SHA-256 hash.
+/// What the marker records: the pinned hash plus the size and modification
+/// time the file had when it was hashed. Any later rewrite of the file changes
+/// the stamp, so the marker no longer vouches for it.
+fn verified_stamp(path: &Path, expected_sha256: &str) -> Option<String> {
+    let meta = fs::metadata(path).ok()?;
+    let modified = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some(format!(
+        "{} {} {}",
+        expected_sha256.to_ascii_lowercase(),
+        meta.len(),
+        modified
+    ))
+}
+
+/// Hash `path` in full and, when it matches, record a verified marker so the
+/// cheap [`model_installed`] check can trust it until the file changes.
+fn verify_and_mark(path: &Path, expected_bytes: u64, expected_sha256: &str) -> bool {
+    let marker = verified_marker_path(path);
+    if !verify_file_hash(path, expected_bytes, expected_sha256) {
+        let _ = fs::remove_file(&marker);
+        return false;
+    }
+    if let Some(stamp) = verified_stamp(path, expected_sha256) {
+        if let Err(err) = fs::write(&marker, stamp) {
+            log::warn!(
+                "could not record verified stem model {}: {err}",
+                path.display()
+            );
+        }
+    }
+    true
+}
+
+/// Cheap installed check for UI status (no hashing): every ONNX file for
+/// `model` is present with the expected size and carries a verified marker
+/// written by a full SHA-256 check of the file as it is now (#359). A file
+/// from an older downloader, or one rewritten in place, has no matching marker
+/// and reads as not installed, so the Download action re-verifies it (and
+/// re-downloads it if the hash does not match).
+///
+/// Loading never relies on this: [`resolve_installed_model_files`] re-hashes.
+pub fn model_installed(model: StemModel, models_dir: &Path) -> bool {
+    let package = model.package();
+    package.files.iter().all(|file| {
+        let path = models_dir.join(file.file_name);
+        let size_ok = fs::metadata(&path)
+            .map(|meta| meta.is_file() && meta.len() == file.expected_bytes)
+            .unwrap_or(false);
+        size_ok
+            && match (
+                fs::read_to_string(verified_marker_path(&path)),
+                verified_stamp(&path, file.sha256),
+            ) {
+                (Ok(recorded), Some(current)) => recorded.trim() == current,
+                _ => false,
+            }
+    })
+}
+
+/// Verify that every ONNX file for `model` is present and matches its pinned
+/// SHA-256 hash (full read of every file; worker threads only).
 pub fn verify_model_installed(model: StemModel, models_dir: &Path) -> bool {
     let package = model.package();
     package.files.iter().all(|file| {
         let path = models_dir.join(file.file_name);
-        verify_file_hash(&path, file.expected_bytes, file.sha256)
+        verify_and_mark(&path, file.expected_bytes, file.sha256)
     })
 }
 
-/// Absolute paths for installed model files, or `None` if incomplete or hash verification fails.
+/// Absolute paths for installed model files, or `None` if incomplete or hash
+/// verification fails. Re-hashes every file before it is loaded (#359), so
+/// call it from a worker thread.
 pub fn resolve_installed_model_files(model: StemModel, models_dir: &Path) -> Option<Vec<PathBuf>> {
-    if !model_installed(model, models_dir) {
+    if !verify_model_installed(model, models_dir) {
         return None;
     }
     Some(
@@ -181,7 +250,7 @@ pub fn download_model(
             return Err(StemExtractError::Cancelled);
         }
         let dest = models_dir.join(file.file_name);
-        if verify_file_hash(&dest, file.expected_bytes, file.sha256) {
+        if verify_and_mark(&dest, file.expected_bytes, file.sha256) {
             let base = (file_index as f32 / file_count as f32) * 100.0;
             on_progress(StemModelDownloadProgress::new(
                 model,
@@ -391,7 +460,49 @@ mod tests {
         assert!(!verify_model_installed(StemModel::MdxNetKaraoke, &dir));
         assert!(resolve_installed_model_files(StemModel::MdxNetKaraoke, &dir).is_none());
 
+        // A stale marker cannot vouch for a file that fails its hash.
+        let file = &StemModel::MdxNetKaraoke.package().files[0];
+        let stamp = verified_stamp(&path, file.sha256).unwrap();
+        fs::write(verified_marker_path(&path), stamp).unwrap();
+        assert!(model_installed(StemModel::MdxNetKaraoke, &dir));
+        assert!(resolve_installed_model_files(StemModel::MdxNetKaraoke, &dir).is_none());
+        // ...and the failed re-hash removes it.
+        assert!(!model_installed(StemModel::MdxNetKaraoke, &dir));
+
         assert!(!model_installed(StemModel::MdxNet, &dir));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn verified_marker_tracks_the_file_it_hashed() {
+        let dir = std::env::temp_dir().join(format!(
+            "fb-stem-marker-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.onnx");
+        fs::write(&path, b"weights v1").unwrap();
+        let sha = format!("{:x}", Sha256::digest(b"weights v1"));
+        let marker = verified_marker_path(&path);
+
+        assert!(verify_and_mark(&path, 10, &sha));
+        assert_eq!(
+            fs::read_to_string(&marker).unwrap(),
+            verified_stamp(&path, &sha).unwrap()
+        );
+
+        // Rewritten in place with the same size: the stamp no longer matches.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&path, b"weights v2").unwrap();
+        assert_ne!(
+            fs::read_to_string(&marker).unwrap(),
+            verified_stamp(&path, &sha).unwrap()
+        );
+        assert!(!verify_and_mark(&path, 10, &sha));
+        assert!(!marker.exists());
         let _ = fs::remove_dir_all(dir);
     }
 
