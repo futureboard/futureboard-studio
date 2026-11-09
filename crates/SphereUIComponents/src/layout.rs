@@ -417,6 +417,7 @@ pub(crate) fn build_and_warm_audio_engine(
     engine.set_pdc_enabled(schema.playback.latency_compensation);
     engine.set_record_pdc_bypass_enabled(schema.recording.audio.bypass_pdc_while_recording);
     engine.set_dropout_protection_mode(engine_audioguard_level(schema.playback.audioguard));
+    engine.set_shared_headroom(schema.hardware.audio.shared_headroom);
     apply_audio_processing_settings(&schema.performance.audio_processing);
 
     // Open on the device the user actually chose.
@@ -3498,6 +3499,9 @@ impl StudioLayout {
             // PDC block so the (immutable) engine borrow ends before the
             // `schedule_audio_project_sync` mutable-self call below.
             engine.set_dropout_protection_mode(engine_audioguard_level(schema.playback.audioguard));
+            // Shared Headroom is one atomic the WASAPI Shared callback reads
+            // per block: live, no reopen, ignored by other backends.
+            engine.set_shared_headroom(schema.hardware.audio.shared_headroom);
 
             engine.set_record_pdc_bypass_enabled(schema.recording.audio.bypass_pdc_while_recording);
             let desired_pdc = schema.playback.latency_compensation;
@@ -3623,6 +3627,7 @@ impl StudioLayout {
             // Build new engine
             match DirectAudio::AudioEngine::new(config) {
                 Ok(mut engine) => {
+                    engine.set_shared_headroom(schema.hardware.audio.shared_headroom);
                     match engine.start() {
                         Ok(()) => {
                             let stats = engine.stats();

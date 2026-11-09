@@ -294,6 +294,26 @@ fn audio(cx: &PageCtx) -> Vec<PrefGroup> {
             cx.state,
             cx.callbacks,
         ));
+    // Only the WASAPI Shared stream feeds Windows' shared-mode mixer, and only
+    // that stream applies the setting (`OutputStage::for_backend`), so it is
+    // shown for that backend alone. Live: no reopen.
+    if driver_label == "WASAPI Shared" {
+        let up = cx.up();
+        device = device.row(PrefRow::described(
+            cx.tr("settings.field.shared-headroom"),
+            cx.tr("settings.shared-headroom.hint"),
+            &[
+                "headroom", "clip", "limit", "0 dbfs", "wasapi", "shared", "6 db",
+            ],
+            pref_switch(
+                "settings-shared-headroom-toggle",
+                s.hardware.audio.shared_headroom,
+                apply(&up, |s| {
+                    s.hardware.audio.shared_headroom = !s.hardware.audio.shared_headroom
+                }),
+            ),
+        ));
+    }
 
     // Channels the chosen devices report. With no device chosen ("Default"),
     // the first scanned device stands in, so a real scan is not reported as

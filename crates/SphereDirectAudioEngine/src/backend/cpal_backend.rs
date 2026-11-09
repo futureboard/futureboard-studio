@@ -18,13 +18,84 @@ use cpal::{BufferSize, FromSample, Sample, SampleFormat, SizedSample};
 use crossbeam_channel::{bounded, Receiver, Sender};
 
 use crate::backend::render::LocalAudioState;
-use crate::backend::DauxDeviceConfig;
+use crate::backend::{BackendKind, DauxDeviceConfig};
 use crate::command::EngineCommand;
 use crate::dsp::dither::{DitheredOutput, OutputDither};
 use crate::engine::SharedState;
 use crate::error::SphereAudioError;
 use crate::runtime::RuntimeProject;
 use crate::types::JsAudioDeviceInfo;
+
+// ── Shared Headroom ──────────────────────────────────────────────────────────
+
+/// How far Settings → Audio → Shared Headroom lowers a WASAPI Shared stream.
+///
+/// Studio itself never bounds a float device buffer (see `dsp::dither`), but
+/// Windows' shared-mode audio engine limits its mix at full scale, so a master
+/// peaking above 0 dBFS is squashed there. Lowering only what this stream hands
+/// Windows lets peaks up to +6 dBFS through untouched; the listener turns the
+/// speakers up by the same amount.
+pub const SHARED_HEADROOM_DB: f32 = 6.0;
+
+/// [`SHARED_HEADROOM_DB`] as a linear gain, `10^(-6/20)`. A constant so the
+/// callback multiplies instead of calling `powf`; a test pins it to the dB
+/// value.
+pub const SHARED_HEADROOM_GAIN: f32 = 0.501_187_2;
+
+/// Which kind of device stream a cpal callback feeds, fixed when the stream is
+/// built. Decides whether Shared Headroom applies to it at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputStage {
+    /// The device receives the render as is (ASIO, CoreAudio, ALSA, Auto, …).
+    Direct,
+    /// Windows WASAPI Shared: feeds the shared-mode mixer, which limits at
+    /// 0 dBFS.
+    WasapiShared,
+}
+
+impl OutputStage {
+    /// The stage a stream opened for `backend` runs with. Only an explicit
+    /// WASAPI Shared selection on Windows gets the shared stage.
+    pub(crate) fn for_backend(backend: &BackendKind) -> Self {
+        match backend {
+            BackendKind::WasapiShared if cfg!(target_os = "windows") => Self::WasapiShared,
+            _ => Self::Direct,
+        }
+    }
+
+    /// Gain this stream applies right before device conversion, given the
+    /// current Shared Headroom setting. Unity for every stage but WASAPI
+    /// Shared.
+    #[inline]
+    pub(crate) fn device_gain(self, shared_headroom: bool) -> f32 {
+        match self {
+            Self::WasapiShared if shared_headroom => SHARED_HEADROOM_GAIN,
+            _ => 1.0,
+        }
+    }
+}
+
+/// Convert one rendered f32 block into the device format, applying `gain`
+/// first. Realtime-safe: no allocation, no branches per sample beyond the
+/// format conversion. At unity the samples go to the converter untouched, so
+/// a stream without headroom is bit-identical to the plain conversion.
+#[inline]
+pub(crate) fn write_device_block<T: DitheredOutput>(
+    data: &mut [T],
+    rendered: &[f32],
+    gain: f32,
+    dither: &mut OutputDither,
+) {
+    if gain == 1.0 {
+        for (dst, src) in data.iter_mut().zip(rendered) {
+            *dst = T::dithered_from_f32(*src, dither);
+        }
+    } else {
+        for (dst, src) in data.iter_mut().zip(rendered) {
+            *dst = T::dithered_from_f32(*src * gain, dither);
+        }
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -117,6 +188,7 @@ pub(crate) fn open_on_host(
             .map_err(SphereAudioError::DeviceNotFound)?;
 
     let backend_name = host.id().name().to_string();
+    let stage = OutputStage::for_backend(&config.backend);
 
     // Build stream config candidates.
     let default_supported = dev
@@ -174,6 +246,7 @@ pub(crate) fn open_on_host(
             initial_runtime.clone(),
             Arc::clone(&glitch_counter),
             config.mmcss_priority,
+            stage,
         ) {
             Ok(stream) => {
                 // `callback_frames` is what the chosen candidate *predicts* the
@@ -313,6 +386,7 @@ pub(crate) fn build_typed_stream(
     initial_runtime: RuntimeProject,
     glitch_counter: Arc<AtomicU64>,
     mmcss_priority: bool,
+    stage: OutputStage,
 ) -> Result<cpal::Stream, String> {
     macro_rules! build_for {
         ($T:ty) => {
@@ -324,6 +398,7 @@ pub(crate) fn build_typed_stream(
                 initial_runtime,
                 glitch_counter,
                 mmcss_priority,
+                stage,
             )
         };
     }
@@ -351,6 +426,7 @@ fn build_stream_typed<T>(
     initial_runtime: RuntimeProject,
     glitch_counter: Arc<AtomicU64>,
     mmcss_priority: bool,
+    stage: OutputStage,
 ) -> Result<cpal::Stream, String>
 where
     T: SizedSample + Sample + FromSample<f32> + DitheredOutput,
@@ -480,9 +556,12 @@ where
                 // Integer targets are rounded with TPDF dither at their own
                 // resolution (24 valid bits for 32-bit words); floats pass
                 // through. See `dsp::dither`.
-                for (dst, src) in data.iter_mut().zip(scratch.iter()) {
-                    *dst = T::dithered_from_f32(*src, &mut dither);
-                }
+                //
+                // Shared Headroom is applied here, after the render (meters,
+                // Audioguard and recording have seen the true level) and only
+                // on a WASAPI Shared stream: one relaxed load per block.
+                let gain = stage.device_gain(shared.shared_headroom.load(Ordering::Relaxed));
+                write_device_block(data, scratch, gain, &mut dither);
                 let _ = mmcss_set; // suppress unused (non-windows)
             },
             move |err| {
@@ -840,6 +919,183 @@ fn set_mmcss_pro_audio() -> bool {
     // SAFETY: `TASK` is a NUL-terminated UTF-16 string with static lifetime.
     // The handle is kept for the thread's life (never reverted).
     unsafe { AvSetMmThreadCharacteristicsW(TASK.as_ptr(), &mut task_index) != 0 }
+}
+
+#[cfg(test)]
+mod shared_headroom_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// +3 dBFS: over full scale, as a hot master bus produces it.
+    const PLUS_3_DBFS: f32 = 1.412_537_5;
+
+    fn db(gain: f32) -> f32 {
+        20.0 * gain.log10()
+    }
+
+    /// The callback's per-block step, exactly as `build_stream_typed` runs it.
+    fn render_block<T: DitheredOutput + Copy>(
+        stage: OutputStage,
+        shared: &SharedState,
+        rendered: &[f32],
+        fill: T,
+        dither: &mut OutputDither,
+    ) -> Vec<T> {
+        let mut out = vec![fill; rendered.len()];
+        let gain = stage.device_gain(shared.shared_headroom.load(Ordering::Relaxed));
+        write_device_block(&mut out, rendered, gain, dither);
+        out
+    }
+
+    #[test]
+    fn headroom_gain_is_the_named_db_value() {
+        assert_eq!(SHARED_HEADROOM_DB, 6.0);
+        let expected = 10f32.powf(-SHARED_HEADROOM_DB / 20.0);
+        assert!(
+            (SHARED_HEADROOM_GAIN - expected).abs() < 1e-7,
+            "{SHARED_HEADROOM_GAIN} is not -{SHARED_HEADROOM_DB} dB ({expected})"
+        );
+    }
+
+    /// Recheck of the current path: an f32 device buffer on the cpal path
+    /// carries a +3 dBFS sample exactly as rendered. Studio does not clamp.
+    #[test]
+    fn f32_output_passes_over_full_scale_through_when_off() {
+        let shared = SharedState::default();
+        assert!(
+            !shared.shared_headroom.load(Ordering::Relaxed),
+            "off by default"
+        );
+        let rendered = [PLUS_3_DBFS, -PLUS_3_DBFS, 0.25];
+        for stage in [OutputStage::WasapiShared, OutputStage::Direct] {
+            let out = render_block(stage, &shared, &rendered, 0.0f32, &mut OutputDither::new());
+            assert_eq!(out, rendered, "{stage:?} changed an f32 block");
+            let out64 = render_block(stage, &shared, &rendered, 0.0f64, &mut OutputDither::new());
+            assert_eq!(out64[0], f64::from(PLUS_3_DBFS), "{stage:?} f64");
+        }
+    }
+
+    #[test]
+    fn wasapi_shared_with_headroom_comes_out_6_db_lower() {
+        let shared = SharedState::default();
+        shared.shared_headroom.store(true, Ordering::Relaxed);
+        let rendered = [PLUS_3_DBFS, -PLUS_3_DBFS];
+        let out = render_block(
+            OutputStage::WasapiShared,
+            &shared,
+            &rendered,
+            0.0f32,
+            &mut OutputDither::new(),
+        );
+        for (o, r) in out.iter().zip(rendered) {
+            let change = db(o.abs() / r.abs());
+            assert!((change + 6.0).abs() < 1e-3, "changed by {change} dB");
+        }
+        assert!(
+            out[0] < 1.0 && db(out[0]) < -2.9,
+            "+3 dBFS must reach Windows' mixer under its ceiling: {}",
+            db(out[0])
+        );
+    }
+
+    /// The toggle is read per block: flipping it changes the very next block
+    /// of an open stream, with no reopen.
+    #[test]
+    fn toggle_takes_effect_on_the_next_block() {
+        let shared = SharedState::default();
+        let rendered = [PLUS_3_DBFS];
+        let mut dither = OutputDither::new();
+        let stage = OutputStage::WasapiShared;
+        assert_eq!(
+            render_block(stage, &shared, &rendered, 0.0f32, &mut dither)[0],
+            PLUS_3_DBFS
+        );
+        shared.shared_headroom.store(true, Ordering::Relaxed);
+        let lowered = render_block(stage, &shared, &rendered, 0.0f32, &mut dither)[0];
+        assert!((lowered - PLUS_3_DBFS * SHARED_HEADROOM_GAIN).abs() < 1e-7);
+        shared.shared_headroom.store(false, Ordering::Relaxed);
+        assert_eq!(
+            render_block(stage, &shared, &rendered, 0.0f32, &mut dither)[0],
+            PLUS_3_DBFS
+        );
+    }
+
+    /// Integer formats keep dithering and clipping as before. At unity the
+    /// conversion is bit-identical to the plain per-sample path (same dither
+    /// sequence); with headroom on, an over-full-scale sample fits instead of
+    /// clipping.
+    #[test]
+    fn integer_formats_still_dither_and_clip() {
+        let rendered: Vec<f32> = (0..256)
+            .map(|i| ((i as f32) * 0.37).sin() * 1.3)
+            .chain([PLUS_3_DBFS, -PLUS_3_DBFS])
+            .collect();
+
+        let off = SharedState::default();
+        let mut reference = OutputDither::new();
+        let expected: Vec<i32> = rendered
+            .iter()
+            .map(|s| i32::dithered_from_f32(*s, &mut reference))
+            .collect();
+        let got = render_block(
+            OutputStage::WasapiShared,
+            &off,
+            &rendered,
+            0i32,
+            &mut OutputDither::new(),
+        );
+        assert_eq!(got, expected, "unity path must match the old conversion");
+
+        let mut dither = OutputDither::new();
+        let clipped = render_block(OutputStage::Direct, &off, &[PLUS_3_DBFS], 0i16, &mut dither);
+        assert_eq!(clipped[0], i16::MAX, "+3 dBFS still clips an i16 word");
+
+        let on = SharedState::default();
+        on.shared_headroom.store(true, Ordering::Relaxed);
+        let fits = render_block(
+            OutputStage::WasapiShared,
+            &on,
+            &[PLUS_3_DBFS],
+            0i16,
+            &mut dither,
+        )[0];
+        let expected = (PLUS_3_DBFS * SHARED_HEADROOM_GAIN * 32_768.0).round() as i32;
+        assert!(
+            (i32::from(fits) - expected).abs() <= 1,
+            "{fits} is not {expected} ±1 LSB of dither"
+        );
+    }
+
+    /// Only an explicit WASAPI Shared stream on Windows is affected; ASIO
+    /// (always `Direct`), WASAPI Exclusive, WDM-KS, CoreAudio, ALSA, MME and
+    /// Auto pass through unchanged even with the setting on.
+    #[test]
+    fn other_backends_ignore_the_setting() {
+        let on = SharedState::default();
+        on.shared_headroom.store(true, Ordering::Relaxed);
+        for backend in [
+            BackendKind::Auto,
+            BackendKind::WasapiExclusive,
+            BackendKind::WdmKs,
+            BackendKind::DauxDirect,
+            BackendKind::Asio,
+            BackendKind::CoreAudio,
+            BackendKind::Alsa,
+            BackendKind::MmeFallback,
+        ] {
+            let stage = OutputStage::for_backend(&backend);
+            assert_eq!(stage, OutputStage::Direct, "{backend:?}");
+            assert_eq!(stage.device_gain(true), 1.0, "{backend:?}");
+            let out = render_block(stage, &on, &[PLUS_3_DBFS], 0.0f32, &mut OutputDither::new());
+            assert_eq!(out[0], PLUS_3_DBFS, "{backend:?} changed the output");
+        }
+        let shared_stage = OutputStage::for_backend(&BackendKind::WasapiShared);
+        #[cfg(target_os = "windows")]
+        assert_eq!(shared_stage, OutputStage::WasapiShared);
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(shared_stage, OutputStage::Direct);
+        assert_eq!(OutputStage::WasapiShared.device_gain(false), 1.0);
+    }
 }
 
 #[cfg(test)]

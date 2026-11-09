@@ -32,7 +32,7 @@ use cpal::platform::{AsioDevice, AsioDriverEvent, AsioDriverEventGuard};
 use cpal::traits::{DeviceTrait, StreamTrait};
 use crossbeam_channel::{bounded, Receiver, Sender};
 
-use crate::backend::cpal_backend::build_typed_stream;
+use crate::backend::cpal_backend::{build_typed_stream, OutputStage};
 use crate::backend::{AsioChannelInfo, AsioSessionCaps, DauxDeviceConfig};
 use crate::command::EngineCommand;
 use crate::engine::{f32_store, SharedState};
@@ -472,6 +472,8 @@ pub(crate) fn open_duplex(
         initial_runtime,
         glitch_counter,
         config.mmcss_priority,
+        // ASIO reaches the driver directly: no shared mixer to leave room for.
+        OutputStage::Direct,
     )
     .map_err(|error| fail("output-open", error))?;
 

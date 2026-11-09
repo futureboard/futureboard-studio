@@ -446,6 +446,12 @@ pub fn scenes() -> Vec<Scene> {
             open: settings_experimental,
         },
         Scene {
+            name: "settings-audio-shared",
+            width: crate::components::settings_layout::SETTINGS_WINDOW_WIDTH,
+            height: crate::components::settings_layout::SETTINGS_WINDOW_HEIGHT,
+            open: settings_audio_shared,
+        },
+        Scene {
             name: "wrapsynth",
             width: plate::WINDOW_SIZE.0,
             height: plate::WINDOW_SIZE.1,
@@ -3671,10 +3677,36 @@ fn rodhareist_stereo(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHa
 /// Settings → Experimental at its defaults: every feature off. The model
 /// points at a scratch path, so nothing here can write the real settings file.
 fn settings_experimental(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
-    use crate::components::settings_dialog::{SettingsTab, SettingsWindow};
-    use crate::settings::{SettingsAudioLatencySnapshot, SettingsModel, SettingsSchema};
+    use crate::components::settings_dialog::SettingsTab;
+    settings_on(
+        SettingsTab::Experimental,
+        crate::settings::SettingsSchema::default(),
+        options,
+        cx,
+    )
+}
+
+/// The Audio page with WASAPI Shared selected and Shared Headroom on, so the
+/// backend-specific switch is drawn.
+fn settings_audio_shared(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    use crate::components::settings_dialog::SettingsTab;
+    let mut schema = crate::settings::SettingsSchema::default();
+    schema.hardware.audio.driver_type = "WASAPI Shared".to_string();
+    schema.hardware.audio.shared_headroom = true;
+    settings_on(SettingsTab::Audio, schema, options, cx)
+}
+
+/// The Preferences window on `tab`, showing `schema`.
+fn settings_on(
+    tab: crate::components::settings_dialog::SettingsTab,
+    schema: crate::settings::SettingsSchema,
+    options: WindowOptions,
+    cx: &mut App,
+) -> Result<AnyWindowHandle> {
+    use crate::components::settings_dialog::SettingsWindow;
+    use crate::settings::{SettingsAudioLatencySnapshot, SettingsModel};
     let settings = cx.new(|_| SettingsModel {
-        current: SettingsSchema::default(),
+        current: schema,
         path: std::env::temp_dir().join("futureboard-preview-settings.json"),
     });
     let handle = cx.open_window(options, move |_, cx| {
@@ -3696,7 +3728,7 @@ fn settings_experimental(options: WindowOptions, cx: &mut App) -> Result<AnyWind
                 None,
                 cx,
             );
-            window.show_tab(SettingsTab::Experimental);
+            window.show_tab(tab);
             window
         })
     })?;

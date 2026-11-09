@@ -1516,6 +1516,17 @@ impl AudioEngine {
         self.inner.set_record_pdc_bypass_enabled(enabled);
     }
 
+    /// Settings → Audio → Shared Headroom: lower the WASAPI Shared device
+    /// output by [`crate::backend::cpal_backend::SHARED_HEADROOM_DB`]. Live;
+    /// ignored by every other backend.
+    pub fn set_shared_headroom(&self, enabled: bool) {
+        self.inner.set_shared_headroom(enabled);
+    }
+
+    pub fn shared_headroom(&self) -> bool {
+        self.inner.shared_headroom()
+    }
+
     pub fn latency_graph_version(&self) -> u64 {
         self.inner.latency_graph_version()
     }

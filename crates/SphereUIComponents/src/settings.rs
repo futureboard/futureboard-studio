@@ -268,6 +268,12 @@ pub struct AudioHardwareSettings {
     pub device_out: String,
     pub active_inputs: Vec<u32>,
     pub active_outputs: Vec<u32>,
+    /// WASAPI Shared only: lower Studio's device output by
+    /// `DirectAudio::backend::cpal_backend::SHARED_HEADROOM_DB` so peaks above
+    /// 0 dBFS are not limited by Windows' shared-mode mixer. Off by default and
+    /// in settings files from before it existed.
+    #[serde(default)]
+    pub shared_headroom: bool,
 }
 
 impl Default for AudioHardwareSettings {
@@ -278,6 +284,7 @@ impl Default for AudioHardwareSettings {
             device_out: "System Default Output".to_string(),
             active_inputs: vec![0, 1],
             active_outputs: vec![0, 1],
+            shared_headroom: false,
         }
     }
 }
@@ -1617,6 +1624,27 @@ mod tests {
         let json = serde_json::to_string(&on).unwrap();
         let back: SettingsSchema = serde_json::from_str(&json).unwrap();
         assert!(back.experimental.voxtune, "the choice is saved");
+    }
+
+    #[test]
+    fn shared_headroom_is_off_by_default_and_round_trips() {
+        assert!(!SettingsSchema::default().hardware.audio.shared_headroom);
+        // An audio section saved before the option existed has no field.
+        let older: SettingsSchema = serde_json::from_str(
+            r#"{"hardware":{"audio":{"driver_type":"WASAPI Shared",
+                "device_in":"System Default Input","device_out":"Speakers",
+                "active_inputs":[0,1],"active_outputs":[0,1]}}}"#,
+        )
+        .expect("an older settings file loads");
+        assert!(!older.hardware.audio.shared_headroom);
+        assert_eq!(older.hardware.audio.device_out, "Speakers");
+
+        let mut on = SettingsSchema::default();
+        on.hardware.audio.shared_headroom = true;
+        let json = serde_json::to_string(&on).unwrap();
+        let back: SettingsSchema = serde_json::from_str(&json).unwrap();
+        assert!(back.hardware.audio.shared_headroom, "the choice is saved");
+        assert_eq!(back.hardware.audio, on.hardware.audio);
     }
 
     #[test]

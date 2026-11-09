@@ -761,6 +761,14 @@ pub struct SharedState {
     /// unplugged, default device changed, exclusive-mode timeout). Read by the
     /// control thread to surface a DeviceLost state and trigger recovery.
     pub device_lost: AtomicBool,
+    /// Settings → Audio → Shared Headroom (control → audio). While set, a
+    /// WASAPI Shared output stream lowers what it hands Windows by
+    /// [`crate::backend::cpal_backend::SHARED_HEADROOM_DB`] right before the
+    /// device-format conversion, so peaks above 0 dBFS reach the shared-mode
+    /// mixer below the ceiling it limits at. Every other stream ignores it, and
+    /// meters, recording and export never see it. Read once per block; kept
+    /// here so a device reopen keeps it.
+    pub shared_headroom: AtomicBool,
     /// Playback plugin delay compensation (Phase W). Settings → Playback.
     pub pdc_enabled: AtomicBool,
     /// Whether a take bypasses delay compensation while it records
@@ -894,6 +902,7 @@ impl Default for SharedState {
             device_xruns: AtomicU64::new(0),
             mmcss_active: AtomicBool::new(false),
             device_lost: AtomicBool::new(false),
+            shared_headroom: AtomicBool::new(false),
             pdc_enabled: AtomicBool::new(true),
             record_pdc_bypass_enabled: AtomicBool::new(true),
             record_pdc_bypass: AtomicBool::new(false),
@@ -1590,6 +1599,19 @@ impl EngineInner {
         self.shared
             .record_pdc_bypass_enabled
             .store(enabled, Ordering::Relaxed);
+    }
+
+    /// Settings → Audio → Shared Headroom. Takes effect on the next output
+    /// block of an open WASAPI Shared stream; no reopen. See
+    /// [`SharedState::shared_headroom`].
+    pub fn set_shared_headroom(&self, enabled: bool) {
+        self.shared
+            .shared_headroom
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn shared_headroom(&self) -> bool {
+        self.shared.shared_headroom.load(Ordering::Relaxed)
     }
 
     /// Monotonic generation of the realtime latency-compensation graph. Bumped
