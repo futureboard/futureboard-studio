@@ -146,15 +146,13 @@ const USAGE: &str = "usage: livestage-server [--session FILE] [--host NAME] [--i
   --web-host NAME       another name browsers reach the web UI by (a DNS name, a reverse proxy's);
                         IP addresses, localhost, this machine's name and NAME.local always work.
                         Any other name in a request is refused, which stops DNS rebinding
-  --setup-code-file FILE  the setup code (6-32 digits) a browser on another machine (or behind a
-                        reverse proxy) enters before it is let in while there are no users; with
-                        --trusted-proxy, or a --web-host other than localhost, one on this
-                        machine too. Without it, a new code is made at each start and printed here
+  --setup-code-file FILE  the setup code (6-32 digits) every browser, one on this machine too,
+                        enters before it is let in while there are no users. Without it, a new
+                        code is made at each start and printed here
   --trusted-proxy ADDR  a reverse proxy's IP address (127.0.0.1 for one on this machine) whose
                         --forwarded-header names the client: failed log-ins and connection limits
-                        then count per client. Clients it forwards always need the setup code.
-                        Without it, every client behind a proxy shares one address, and
-                        forwarding headers are ignored
+                        then count per client. Without it, every client behind a proxy shares
+                        one address, and forwarding headers are ignored
   --forwarded-header NAME  the one header a trusted proxy names the client in, and that it sets
                         itself (whatever the client sent there): x-forwarded-for (default; the
                         proxy must append the client's address, its last one is taken),
@@ -344,10 +342,7 @@ fn main() {
         }
     };
     if users.open_mode() {
-        eprintln!(
-            "[livestage] no users: every web client has full control (on the network, after the \
-             setup code)"
-        );
+        eprintln!("[livestage] no users: every web client has full control (after the setup code)");
     } else {
         eprintln!(
             "[livestage] {} users: the web UI asks for a name and PIN",
@@ -378,12 +373,12 @@ fn main() {
         ) {
             Ok(bound) => {
                 eprintln!("[livestage] web UI on http://{bound}/");
-                // Open to the network, or (on loopback) reached through a
-                // reverse proxy here: with no users yet, whoever is first
-                // there must not get the mixer (or make the first admin)
-                // without the code shown on this machine. A browser on this
-                // machine needs none (see `web::Peer`), unless the operator
-                // said browsers reach it through a name or a proxy (#351).
+                // With no users yet, whoever reaches the web UI first must
+                // not get the mixer (or make the first admin) without the
+                // code shown on this machine. A browser on this machine
+                // enters it too: on loopback, a reverse proxy, TCP proxy or
+                // SSH tunnel here can make a remote browser look like one
+                // (#386).
                 let code = match setup_code(options.setup_code_file.as_deref()) {
                     Ok(code) => code,
                     Err(error) => {
@@ -392,22 +387,10 @@ fn main() {
                     }
                 };
                 if users.open_mode() {
-                    let reached = if web::reached_from_elsewhere(
-                        &options.web_hosts,
-                        &options.trusted_proxies,
-                    ) {
-                        "--web-host or --trusted-proxy says browsers reach the web UI from \
-                         elsewhere and there are no users: every browser, this machine's too,"
-                    } else if bound.ip().is_loopback() {
-                        "the web UI listens on this machine only and there are no users: a \
-                         browser reaching it through a reverse proxy"
-                    } else {
-                        "the web UI is open to the network and there are no users: a browser \
-                         on another machine"
-                    };
                     eprintln!(
-                        "[livestage] {reached} needs the setup code {} before it gets in; \
-                         create an admin user there next",
+                        "[livestage] there are no users: every browser, this machine's too, \
+                         needs the setup code {} before it gets in; create an admin user there \
+                         next",
                         spaced_code(&code)
                     );
                 }

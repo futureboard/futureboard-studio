@@ -467,8 +467,7 @@ function takeAuth(message: AuthMessage) {
 let setupCode: string | null = null
 let setupResending = false
 
-/** Send the setup code (open mode, a server open to the network). Null, or
- *  why not. */
+/** Send the setup code (open mode). Null, or why not. */
 export async function sendSetupCode(code: string): Promise<string | null> {
   const reply = await request({ cmd: 'setup', code })
   if (!reply.ok) return explain(reply.error)

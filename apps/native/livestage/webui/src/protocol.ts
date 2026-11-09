@@ -423,8 +423,8 @@ export interface AuthUser {
 export interface AuthMessage {
   type: 'auth'
   /** `open`: no users exist, every client is an admin without a login.
-   *  `setup`: no users exist, but this page is on another machine than a
-   *  server open to the network: it sends the setup code first. */
+   *  `setup`: no users exist, but this page has not sent the setup code
+   *  yet: it sends it first. */
   mode: 'open' | 'users' | 'setup'
   users: UserSummary[]
   user: AuthUser | null

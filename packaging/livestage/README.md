@@ -253,8 +253,8 @@ does the mounting; the mixer asks it on `/run/livestage/storage.sock`.
 
 ## Users and lock
 
-Until a user exists there is no log-in, but a browser on another machine
-must first enter the **setup code**, shown on the console's home screen
+Until a user exists there is no log-in, but every browser must first
+enter the **setup code**, shown on the console's home screen
 (tty1). The code is new at each boot, kept in `/run/livestage-setup-code`
 and rate-limited like a PIN. Enter it, then make the first user straight
 away. **Setup → Users** adds users, each with a name, a PIN (4–32

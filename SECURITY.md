@@ -105,10 +105,10 @@ plain HTTP + WebSocket server:
 - **LiveStage appliance image:** the web console is **open to the network
   (`0.0.0.0:8730`) by default** and is advertised over mDNS.
 - **Authentication:** without a `users.json` the console runs in *open mode*.
-  When the server listens on a network address, a browser on another machine
-  must first enter a **setup code** (rate-limited). The code is shown on the
-  appliance's home screen, or printed by `livestage-server`. Clients on the
-  same machine (loopback) need no code. Create an admin user straight away:
+  Every browser must first enter a **setup code** (rate-limited), one on the
+  same machine too: a proxy or tunnel there makes a remote browser look
+  local. The code is shown on the appliance's home screen, or printed by
+  `livestage-server`. Create an admin user straight away:
   once a user exists, clients sign in with a name and PIN (PBKDF2-hashed,
   rate-limited) and receive a session token.
 - **Host names:** requests must name the server by IP address, `localhost`,

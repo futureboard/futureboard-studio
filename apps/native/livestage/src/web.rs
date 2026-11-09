@@ -29,22 +29,20 @@
 //! [`MAX_PROTECTED_PER_PREFIX`] connections that grace protects (see
 //! [`prefix_key`]).
 //!
-//! Who a client is ([`Peer`]) is read from its request head. A connection
-//! from this machine is taken for a browser here only when it names this
-//! machine (`localhost`, a loopback address) and carries no proxy
-//! forwarding header: behind a reverse proxy on this machine every browser
-//! connects from loopback, and must not skip the setup code. Nor is any
-//! connection taken for one once the operator says browsers reach this
-//! server from elsewhere ([`reached_from_elsewhere`]): a proxy here may pass
-//! the client's own `Host` on and add no forwarding header (#351), so a
-//! browser here then needs the setup code too. A connection
+//! Who a client is ([`Peer`]) is read from its request head. No connection
+//! is taken for a browser on this machine, which could skip the setup code:
+//! a forwarder here (a reverse proxy, a TCP proxy, an SSH tunnel) connects
+//! from loopback, may pass the client's own `Host: localhost` on and need
+//! add no forwarding header (#293, #351, #386), so nothing in a request
+//! tells such a client from a browser here. Every browser enters the code,
+//! which the operator here reads off this machine. A connection
 //! from a proxy given with `--trusted-proxy` is counted (log-in failures,
 //! slots and arrivals alike) under the client address that proxy forwards
-//! in the one header `--forwarded-header` names, and is never taken for
-//! this machine; a forwarding header from anyone else, or another header
-//! from it, is not believed. Until its request head is read, a trusted
-//! proxy's connection is held to no address's limits, as this machine's
-//! are not: they are the client's to bear once it is known.
+//! in the one header `--forwarded-header` names; a forwarding header from
+//! anyone else, or another header from it, is not believed. Until its
+//! request head is read, a trusted proxy's connection is held to no
+//! address's limits, as this machine's are not: they are the client's to
+//! bear once it is known.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -93,19 +91,7 @@ pub struct Peer {
     /// Its address: the connection's, or the one a trusted proxy forwarded.
     /// `None` when it could not be read.
     pub addr: Option<IpAddr>,
-    /// A browser on this machine, which needs no setup code.
-    pub local: bool,
 }
-
-/// Request headers a proxy adds to say who it forwards for.
-const FORWARDING_HEADERS: [&str; 6] = [
-    "forwarded",
-    "x-forwarded-for",
-    "x-forwarded-host",
-    "x-forwarded-proto",
-    "x-real-ip",
-    "via",
-];
 
 /// Messages a client may have queued before it counts as stalled.
 pub const OUTBOX: usize = 256;
@@ -1062,75 +1048,19 @@ fn machine_name() -> Option<String> {
 /// notes), and whether a trusted proxy said so (the address it forwarded
 /// is then the [`Peer::addr`]).
 ///
-/// - From a proxy in `proxies`: the client its forwarding header names;
-///   never this machine, as the proxy may be anywhere. Without that header
-///   it is the proxy itself, and not taken for this machine either.
-/// - Otherwise the connection's own address; this machine only when that
-///   is loopback, the request names this machine, no forwarding header
-///   says a proxy sent it, and the server is not
-///   [`reached_from_elsewhere`] (#351).
-fn client_peer(
-    socket: Option<IpAddr>,
-    request: &Request,
-    names: &[String],
-    proxies: &Proxies,
-) -> (Peer, bool) {
+/// - From a proxy in `proxies`: the client its forwarding header names.
+///   Without that header it is the proxy itself.
+/// - Otherwise the connection's own address, whatever forwarding header
+///   the request carries.
+///
+/// Neither is ever taken for a browser on this machine (#386).
+fn client_peer(socket: Option<IpAddr>, request: &Request, proxies: &Proxies) -> (Peer, bool) {
     if proxies.trusts(socket) {
-        return match forwarded_client(request, proxies.header) {
-            Some(client) => (
-                Peer {
-                    addr: Some(client),
-                    local: false,
-                },
-                true,
-            ),
-            None => (
-                Peer {
-                    addr: socket,
-                    local: false,
-                },
-                false,
-            ),
-        };
+        if let Some(client) = forwarded_client(request, proxies.header) {
+            return (Peer { addr: Some(client) }, true);
+        }
     }
-    let proxied = FORWARDING_HEADERS
-        .iter()
-        .any(|name| request.header(name).is_some());
-    let local = !reached_from_elsewhere(names, proxies)
-        && socket.is_some_and(|s| s.to_canonical().is_loopback())
-        && !proxied
-        && request.header("host").is_some_and(names_this_machine);
-    (
-        Peer {
-            addr: socket,
-            local,
-        },
-        false,
-    )
-}
-
-/// Whether the operator said browsers reach this server from elsewhere
-/// through a name or a proxy: a `--web-host` (`names`) that does not name
-/// this machine only, or any `--trusted-proxy`. A proxy here may then pass a
-/// remote client's `Host: localhost` on with no forwarding header, so no
-/// connection is taken for a browser on this machine, and every browser
-/// needs the setup code while there are no users (#351).
-pub fn reached_from_elsewhere(names: &[String], proxies: &Proxies) -> bool {
-    !proxies.addrs.is_empty() || names.iter().any(|name| !names_this_machine(name))
-}
-
-/// Whether a `Host` names this machine only: `localhost` (or a name under
-/// it) or a loopback address. A reverse proxy passes on the name the
-/// browser used, which is the proxy's.
-fn names_this_machine(host: &str) -> bool {
-    let Some(host) = host_name(host) else {
-        return false;
-    };
-    host == "localhost"
-        || host.ends_with(".localhost")
-        || host
-            .parse::<IpAddr>()
-            .is_ok_and(|ip| ip.to_canonical().is_loopback())
+    (Peer { addr: socket }, false)
 }
 
 /// The client a proxy forwarded `request` for, from `header` only (see
@@ -1209,7 +1139,7 @@ fn connection(
         return;
     }
     let socket = stream.peer_addr().ok().map(|a| a.ip());
-    let (peer, through_proxy) = client_peer(socket, &request, &config.names, &config.proxies);
+    let (peer, through_proxy) = client_peer(socket, &request, &config.proxies);
     if let (true, Some(client)) = (through_proxy, peer.addr) {
         let arrival = forwarded(limits, id, client, Instant::now());
         if let Some((code, reason, body)) = arrival.refusal() {
@@ -2919,107 +2849,47 @@ mod tests {
 
     /// The peer `client_peer` makes of a request head from `socket`.
     fn peer_of(socket: &str, head: &str, proxies: &Proxies) -> (Peer, bool) {
-        client_peer(Some(ip(socket)), &request(head), &[], proxies)
+        client_peer(Some(ip(socket)), &request(head), proxies)
     }
 
-    fn peer_of_with_names(
-        socket: &str,
-        head: &str,
-        names: &[String],
-        proxies: &Proxies,
-    ) -> (Peer, bool) {
-        client_peer(Some(ip(socket)), &request(head), names, proxies)
-    }
-
-    /// #293: behind a reverse proxy on this machine every browser connects
-    /// from loopback; only one that names this machine, with no forwarding
-    /// header, is taken for a browser here.
+    /// #293, #386: with no trusted proxy, a client is the connection's own
+    /// address, whatever its request says: a browser here and a remote one
+    /// a header-less forwarder here (an SSH tunnel, a TCP proxy) passes on
+    /// look the same, so `Peer` has nothing that could let either skip the
+    /// setup code.
     #[test]
-    fn a_browser_behind_a_proxy_here_is_not_this_machine() {
-        let here = |socket: &str, head: &str| {
+    fn without_a_trusted_proxy_a_client_is_its_connection() {
+        let peer = |socket: &str, head: &str| {
             let (peer, through_proxy) = peer_of(socket, head, &Proxies::default());
             assert!(!through_proxy, "{head}");
             assert_eq!(peer.addr, Some(ip(socket)), "{head}");
-            peer.local
         };
-        for host in [
-            "localhost",
-            "localhost:8730",
-            "127.0.0.1:8730",
-            "[::1]:8730",
-        ] {
-            let head = format!("GET /ws HTTP/1.1\r\nHost: {host}\r\n");
-            assert!(here("127.0.0.1", &head), "{host}");
-            assert!(here("::ffff:127.0.0.1", &head), "{host}");
-            assert!(here("::1", &head), "{host}");
+        for socket in ["127.0.0.1", "::ffff:127.0.0.1", "::1", "10.0.0.7"] {
+            for host in [
+                "localhost",
+                "localhost:8730",
+                "[::1]:8730",
+                "mixer.example.org",
+            ] {
+                peer(socket, &format!("GET /ws HTTP/1.1\r\nHost: {host}\r\n"));
+            }
+            peer(socket, "GET /ws HTTP/1.1\r\n");
+            // Forwarding headers from a proxy nobody said to trust.
+            for header in [
+                "X-Forwarded-For: 203.0.113.7",
+                "Forwarded: for=203.0.113.7",
+                "X-Real-IP: 203.0.113.7",
+            ] {
+                peer(
+                    socket,
+                    &format!("GET /ws HTTP/1.1\r\nHost: localhost\r\n{header}\r\n"),
+                );
+            }
         }
-        // The proxy passes on the name the browser used.
-        assert!(!here(
-            "127.0.0.1",
-            "GET /ws HTTP/1.1\r\nHost: mixer.example.org\r\n"
-        ));
-        // No Host: no browser, and no way to tell.
-        assert!(!here("127.0.0.1", "GET /ws HTTP/1.1\r\n"));
-        // A proxy that says so, whatever name it passes on.
-        for header in [
-            "X-Forwarded-For: 203.0.113.7",
-            "Forwarded: for=203.0.113.7",
-            "X-Real-IP: 203.0.113.7",
-            "X-Forwarded-Host: localhost",
-            "X-Forwarded-Proto: https",
-            "Via: 1.1 proxy",
-        ] {
-            let head = format!("GET /ws HTTP/1.1\r\nHost: localhost\r\n{header}\r\n");
-            assert!(!here("127.0.0.1", &head), "{header}");
-        }
-        // Another machine naming this one's loopback is still another.
-        assert!(!here("10.0.0.7", "GET /ws HTTP/1.1\r\nHost: localhost\r\n"));
-
-        // #351: what counts as being reached from elsewhere.
-        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let none = Proxies::default();
-        assert!(!reached_from_elsewhere(&[], &none));
-        assert!(!reached_from_elsewhere(
-            &names(&["localhost", "127.0.0.1"]),
-            &none
-        ));
-        assert!(reached_from_elsewhere(
-            &names(&["mixer.example.org"]),
-            &none
-        ));
-        let proxy = Proxies {
-            addrs: vec![ip("127.0.0.1")],
-            header: ForwardedHeader::XForwardedFor,
-        };
-        assert!(reached_from_elsewhere(&[], &proxy));
-
-        // #351: when a public web host or trusted proxy is configured, no connection
-        // (even from loopback naming localhost without forwarding headers) is treated as local.
-        let public_names = vec!["mixer.example.org".to_string()];
-        let (peer, _) = peer_of_with_names(
-            "127.0.0.1",
-            "GET /ws HTTP/1.1\r\nHost: localhost\r\n",
-            &public_names,
-            &Proxies::default(),
-        );
-        assert!(!peer.local);
-
-        let trusted_proxies = Proxies {
-            addrs: vec![ip("10.0.0.1")],
-            header: ForwardedHeader::XForwardedFor,
-        };
-        let (peer, _) = peer_of_with_names(
-            "127.0.0.1",
-            "GET /ws HTTP/1.1\r\nHost: localhost\r\n",
-            &[],
-            &trusted_proxies,
-        );
-        assert!(!peer.local);
     }
 
     /// #293: a proxy given with `--trusted-proxy` names the client, in the
-    /// one header `--forwarded-header` says; nobody else does, and what it
-    /// forwards is never this machine.
+    /// one header `--forwarded-header` says; nobody else does.
     #[test]
     fn a_trusted_proxy_names_the_client() {
         use ForwardedHeader::*;
@@ -3030,7 +2900,6 @@ mod tests {
         let forwarded_for = |socket: &str, header: &str, kind: ForwardedHeader| {
             let head = format!("GET /ws HTTP/1.1\r\nHost: mixer.example.org\r\n{header}\r\n");
             let (peer, through_proxy) = peer_of(socket, &head, &proxies(kind));
-            assert!(!peer.local, "{header}");
             through_proxy.then_some(peer.addr).flatten()
         };
         // The last address is the one the proxy added; before it, what the
@@ -3086,7 +2955,7 @@ mod tests {
             Some(ip("203.0.113.9"))
         );
         // A loopback client a proxy names is the proxy's own machine, or a
-        // lie: not this machine either way (asserted in `forwarded_for`).
+        // lie: an address like any other.
         assert_eq!(
             forwarded_for("127.0.0.1", "X-Forwarded-For: 127.0.0.1", XForwardedFor),
             Some(ip("127.0.0.1"))
@@ -3094,7 +2963,7 @@ mod tests {
         assert_eq!(ForwardedHeader::parse("X-Real-IP"), Some(XRealIp));
         assert_eq!(ForwardedHeader::parse("forwarded"), Some(Forwarded));
         assert_eq!(ForwardedHeader::parse("via"), None);
-        // Nothing usable: the proxy itself, not a browser here.
+        // Nothing usable: the proxy itself.
         for header in [
             "X-Forwarded-For: unknown",
             "Forwarded: for=_hidden",
@@ -3102,7 +2971,7 @@ mod tests {
         ] {
             let head = format!("GET /ws HTTP/1.1\r\nHost: localhost\r\n{header}\r\n");
             let (peer, through_proxy) = peer_of("127.0.0.1", &head, &proxies(XForwardedFor));
-            assert!(!through_proxy && !peer.local, "{header}");
+            assert!(!through_proxy, "{header}");
             assert_eq!(peer.addr, Some(ip("127.0.0.1")));
         }
     }
@@ -3274,16 +3143,20 @@ mod tests {
             }
         };
         let lo = Some(ip("127.0.0.1"));
-        // A browser here without public web host or trusted proxy.
-        assert_eq!(
-            joined(Vec::new(), Vec::new(), "localhost:8730", ""),
-            Peer {
-                addr: lo,
-                local: true
-            }
-        );
-        // #351: with a public web host configured, a request naming localhost
-        // over loopback is NOT treated as this machine.
+        // #386: loopback, `Host: localhost`, no forwarding header, and
+        // neither --web-host nor --trusted-proxy: a browser here, or a
+        // remote one through an SSH tunnel here. Either way it is just its
+        // address, and waits at the setup-code screen while there are no
+        // users.
+        let here = joined(Vec::new(), Vec::new(), "localhost:8730", "");
+        assert_eq!(here, Peer { addr: lo });
+        let mut users = crate::users::Users::in_memory(1);
+        users.require_setup_code("12345678".to_string());
+        users.join_as(1, here);
+        assert!(users.open_mode());
+        assert!(!users.admitted(1));
+        assert_eq!(users.auth_message(1)["mode"], "setup");
+        // #351: the same with a public web host.
         assert_eq!(
             joined(
                 vec!["mixer.example.org".to_string()],
@@ -3291,18 +3164,11 @@ mod tests {
                 "localhost:8730",
                 ""
             ),
-            Peer {
-                addr: lo,
-                local: false
-            }
+            Peer { addr: lo }
         );
-        // Through a proxy here that is not trusted: one shared address,
-        // and not this machine.
+        // Through a proxy here that is not trusted: one shared address.
         let proxied = "X-Forwarded-For: 203.0.113.7\r\n";
-        let untrusted = Peer {
-            addr: lo,
-            local: false,
-        };
+        let untrusted = Peer { addr: lo };
         assert_eq!(
             joined(
                 vec!["mixer.example.org".to_string()],
@@ -3330,8 +3196,7 @@ mod tests {
                 proxied
             ),
             Peer {
-                addr: Some(ip("203.0.113.7")),
-                local: false
+                addr: Some(ip("203.0.113.7"))
             }
         );
     }

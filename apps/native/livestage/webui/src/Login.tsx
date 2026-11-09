@@ -122,9 +122,8 @@ export function PinPad(props: {
   )
 }
 
-/** No users yet, and this page is on another machine than a server open to
- *  the network: the setup code shown on the LiveStage machine (its screen,
- *  or the server's log) lets it in, to make the first admin. */
+/** No users yet: the setup code shown on the LiveStage machine (its screen,
+ *  or the server's log) lets this page in, to make the first admin. */
 export function SetupCodeScreen() {
   const connection = useStore((s) => s.connection)
   const [code, setCode] = useState('')

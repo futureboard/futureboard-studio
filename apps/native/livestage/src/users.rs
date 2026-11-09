@@ -6,12 +6,12 @@
 //! must be an admin; from then on a web client sees nothing but `auth`
 //! messages until it logs in (or resumes a token). stdin is always an admin.
 //!
-//! A server whose web UI is open to the network also has a **setup code**
-//! (see [`Users::require_setup_code`]): in open mode a client on another
-//! machine is let in only after it sends that code, so whoever is first on
-//! the network cannot take the mixer, or make the first admin, without it.
-//! Browsers on this machine need no code (see `web::Peer`: one reached
-//! through a reverse proxy is not taken for this machine).
+//! A server with a web UI also has a **setup code** (see
+//! [`Users::require_setup_code`]): in open mode a web client is let in only
+//! after it sends that code, so whoever is first to reach the web UI cannot
+//! take the mixer, or make the first admin, without it. Browsers on this
+//! machine need it too: a forwarder here (a reverse proxy, an SSH tunnel)
+//! makes a remote browser look like one (#386).
 //!
 //! PINs are kept as PBKDF2-HMAC-SHA256 hashes with a random salt, checked
 //! in constant time, and never sent back. Failed log-ins and unlocks are
@@ -116,8 +116,6 @@ struct Token {
 
 struct Client {
     peer: Option<IpAddr>,
-    /// A browser on this machine (see [`crate::web::Peer::local`]).
-    local: bool,
     token: Option<String>,
     /// The `auth` message this client was last sent.
     sent: Option<Value>,
@@ -196,7 +194,7 @@ pub struct Users {
     clients: HashMap<ClientId, Client>,
     failures: HashMap<Key, Vec<Instant>>,
     rounds: u32,
-    /// What a client on another machine sends before open mode lets it in.
+    /// What a web client sends before open mode lets it in.
     setup_code: Option<String>,
 }
 
@@ -231,23 +229,20 @@ impl Users {
         }
     }
 
-    /// From now on, while there are no users, a client that is not on this
-    /// machine must send `code` (`{"cmd":"setup","code":…}`) before it is
-    /// let in. Set when the web UI listens on the network.
+    /// From now on, while there are no users, every client must send `code`
+    /// (`{"cmd":"setup","code":…}`) before it is let in, one on this machine
+    /// too (#386). Set whenever the web UI is served.
     pub fn require_setup_code(&mut self, code: String) {
         self.setup_code = Some(code);
     }
 
-    /// Open mode, a setup code, and `client` is elsewhere and has not sent
-    /// it: it waits at the setup-code screen.
+    /// Open mode, a setup code, and `client` has not sent it: it waits at
+    /// the setup-code screen.
     fn setup_pending(&self, client: ClientId) -> bool {
         if !self.open_mode() || self.setup_code.is_none() {
             return false;
         }
-        match self.clients.get(&client) {
-            Some(c) => !c.setup && !c.local,
-            None => true,
-        }
+        !self.clients.get(&client).is_some_and(|c| c.setup)
     }
 
     pub fn path(&self) -> Option<&Path> {
@@ -268,26 +263,19 @@ impl Users {
             .find(|u| u.name.eq_ignore_ascii_case(name))
     }
 
-    /// A client from `peer` that is no browser on this machine (tests).
+    /// A client from `peer` (tests).
     #[cfg(test)]
     pub fn join(&mut self, client: ClientId, peer: Option<IpAddr>) {
-        self.join_as(
-            client,
-            crate::web::Peer {
-                addr: peer,
-                local: false,
-            },
-        );
+        self.join_as(client, crate::web::Peer { addr: peer });
     }
 
     /// A client that connected as `peer`: failed log-ins count against its
-    /// address, and one on this machine needs no setup code.
+    /// address.
     pub fn join_as(&mut self, client: ClientId, peer: crate::web::Peer) {
         self.clients.insert(
             client,
             Client {
                 peer: peer.addr,
-                local: peer.local,
                 token: None,
                 sent: None,
                 admitted: false,
@@ -1266,20 +1254,16 @@ mod tests {
     }
 
     #[test]
-    fn a_setup_code_keeps_other_machines_out_of_open_mode_until_sent() {
+    fn a_setup_code_keeps_every_client_out_of_open_mode_until_sent() {
         let now = Instant::now();
         let mut u = users();
         u.require_setup_code("12345678".to_string());
-        let here = |addr: &str| crate::web::Peer {
-            addr: Some(addr.parse().unwrap()),
-            local: true,
-        };
         u.join(1, Some("10.0.0.7".parse().unwrap()));
-        u.join_as(2, here("127.0.0.1"));
-        u.join_as(3, here("::ffff:127.0.0.1"));
+        u.join(2, Some("::1".parse().unwrap()));
+        u.join(3, Some("::ffff:127.0.0.1".parse().unwrap()));
         u.join(4, None);
-        // #293: a browser behind a reverse proxy on this machine connects
-        // from loopback, but is not on this machine.
+        // #293, #386: loopback is a browser here, or one elsewhere behind a
+        // proxy or tunnel here; nothing tells them apart.
         u.join(6, Some("127.0.0.1".parse().unwrap()));
         // Another machine: nothing but the setup screen.
         assert!(u.open_mode());
@@ -1292,13 +1276,14 @@ mod tests {
         assert!(!ok(&u
             .command(Some(1), "lock", &json!({"pin": "9999"}), now)
             .unwrap()));
-        // No peer address at all is not taken for this machine.
-        assert!(!u.admitted(4));
-        assert!(!u.admitted(6));
-        assert_eq!(u.auth_message(6)["mode"], "setup");
-        // This machine needs no code.
-        assert!(u.admitted(2) && u.admitted(3));
-        assert_eq!(u.auth_message(2)["mode"], "open");
+        // No peer address at all, and loopback, need it all the same.
+        for client in [2, 3, 4, 6] {
+            assert!(!u.admitted(client), "{client}");
+            assert_eq!(u.auth_message(client)["mode"], "setup", "{client}");
+            assert!(!ok(&u
+                .command(Some(client), "user_add", &add, now)
+                .unwrap()));
+        }
 
         let wrong = u
             .command(Some(1), "setup", &json!({"code": "87654321"}), now)
