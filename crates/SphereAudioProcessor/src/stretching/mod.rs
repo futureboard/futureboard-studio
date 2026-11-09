@@ -35,7 +35,7 @@ pub fn render_stretch_interleaved(
         return Ok(samples.to_vec());
     }
 
-    let mut bounce_params = params.clone();
+    let mut bounce_params = params;
     if bounce_params.mode == StretchMode::Off {
         bounce_params.mode = StretchMode::Manual;
         bounce_params.algorithm = if bounce_params.preserve_pitch {
@@ -66,7 +66,7 @@ pub fn render_stretch_interleaved(
         }
     } else {
         let mut processor =
-            create_stretch_processor(backend, sample_rate.max(1) as f32, 2, bounce_params.clone())?;
+            create_stretch_processor(backend, sample_rate.max(1) as f32, 2, bounce_params)?;
         processor.reset();
         processor.process_stereo(&left, &right, &mut out_l, &mut out_r)?;
     }
