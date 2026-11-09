@@ -244,10 +244,6 @@ pub fn render_project_sample(
         if !muted {
             let master = &mut runtime.tracks[m_idx];
             for insert in &mut master.inserts {
-                if insert.kind_tag != crate::runtime::RuntimeInsertKind::NativePlugin {
-                    let plugin_id = canonical_plugin_id(&insert.kind);
-                    insert.dsp.refresh_process_params(plugin_id, &insert.params);
-                }
                 let (l, r) = apply_insert(out_l, out_r, insert);
                 out_l = l;
                 out_r = r;
@@ -3533,8 +3529,6 @@ pub fn apply_insert_block(
         return;
     }
     if insert.kind_tag != crate::runtime::RuntimeInsertKind::NativePlugin {
-        let plugin_id = canonical_plugin_id(&insert.kind);
-        insert.dsp.refresh_process_params(plugin_id, &insert.params);
         for i in 0..block_l.len().min(block_r.len()) {
             let (l, r) = apply_insert(block_l[i], block_r[i], insert);
             block_l[i] = l;
