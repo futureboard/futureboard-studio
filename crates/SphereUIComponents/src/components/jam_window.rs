@@ -30,7 +30,7 @@ use crate::components::controls::{
     fb_button, fb_checkbox, fb_segment, fb_segmented_track, FbButtonKind, FbSegment,
 };
 use crate::components::text_input::{
-    bind_mouse_selection, text_field_with_callbacks, TextInputState,
+    bind_mouse_selection, text_field_with_callbacks_and_ime, TextInputState,
 };
 use crate::components::title_bar::external_window_titlebar;
 use sphere_jam_client::protocol::ParticipantSummary;
@@ -403,10 +403,17 @@ impl JamWindow {
     }
 }
 
+// Typed and pasted text and IME composition (CJK, Thai) reach the link field
+// through the platform input handler, registered by the field while it holds
+// focus; the root's key handler steers the caret, selection and deletion.
+crate::impl_single_input_window_ime!(JamWindow, link_input);
+
 impl Render for JamWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.state.clone();
         let typing = self.link_input.is_focused(window);
+        // The link field is drawn only until a jam is joined (`start_cards`).
+        let field_shown = !state.connected;
         div()
             .size_full()
             .flex()
@@ -415,10 +422,10 @@ impl Render for JamWindow {
             .text_color(Colors::text_primary())
             .font(theme::ui_font())
             .track_focus(&self.focus_handle)
-            // While the link field has focus it owns the keyboard, and only
-            // the two keys that mean something to the field itself are taken
-            // here — Escape closing the window mid-paste would be the worst
-            // possible reading of "cancel".
+            // While the link field has focus it owns the keyboard: Enter joins,
+            // Escape leaves the field, and every other key edits it — Escape
+            // closing the window mid-paste would be the worst possible
+            // reading of "cancel".
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                 match (event.keystroke.key.as_str(), typing) {
                     ("enter", true) => {
@@ -432,6 +439,21 @@ impl Render for JamWindow {
                         cx.notify();
                     }
                     ("escape", false) => window.remove_window(),
+                    ("tab", true) => {
+                        // Handled, so it is never typed into the link.
+                        cx.stop_propagation();
+                    }
+                    // Everything else edits the field, which changes only
+                    // when its owner routes keys to it: caret, selection,
+                    // deletion and clipboard here, printable text and IME
+                    // composition through the platform input handler above.
+                    // Character keys keep propagating — on Windows a handled
+                    // KeyDown is never translated into the WM_CHAR that
+                    // carries the text.
+                    (_, true) if field_shown => {
+                        let _ = this.link_input.handle_key_ime(event, Some(cx));
+                        cx.notify();
+                    }
                     _ => {}
                 }
             }))
@@ -713,10 +735,11 @@ impl JamWindow {
                     div()
                         .flex_1()
                         .min_w(px(0.0))
-                        .child(text_field_with_callbacks(
+                        .child(text_field_with_callbacks_and_ime(
                             &self.link_input,
                             self.link_input.is_focused(window),
                             bind_mouse_selection(cx.entity().clone(), |this| &mut this.link_input),
+                            cx.entity(),
                         )),
                 )
                 .child(div().flex_none().child(fb_button(

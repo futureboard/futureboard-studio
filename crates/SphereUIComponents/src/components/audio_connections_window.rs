@@ -35,7 +35,7 @@ use crate::components::audio_connections_panel::{
 use crate::components::combo_box::{combo_box_icon_menu, MenuGlyph, MenuItem};
 use crate::components::controls::{fb_button, FbButtonKind};
 use crate::components::text_input::{
-    bind_mouse_selection, text_field_with_callbacks, TextInputState,
+    bind_mouse_selection, text_field_with_callbacks_and_ime, TextInputAction, TextInputState,
 };
 use crate::components::title_bar::{external_window_titlebar, TITLEBAR_HEIGHT};
 use crate::theme::{elevation, radius, size, space, state, typography, Colors};
@@ -790,7 +790,8 @@ impl AudioConnectionsWindow {
     }
 
     /// The Bus Name cell: text until a rename is open, then the shared Studio
-    /// text field.
+    /// text field, bridged to the platform input handler so typed text and
+    /// IME composition reach it.
     fn name_cell(
         &self,
         row: &ConnectionRow,
@@ -810,10 +811,11 @@ impl AudioConnectionsWindow {
                 .w(px(width))
                 .flex_none()
                 .px(px(CELL_INSET))
-                .child(text_field_with_callbacks(
+                .child(text_field_with_callbacks_and_ime(
                     &self.name_input,
                     self.name_input.is_focused(window),
                     bind_mouse_selection(cx.entity().clone(), |this| &mut this.name_input),
+                    cx.entity(),
                 ))
                 .into_any_element();
         }
@@ -899,25 +901,37 @@ impl AudioConnectionsWindow {
 
     /// Root key handling for the table.
     ///
-    /// While an inline editor is open only Enter and Escape are consumed here —
-    /// every other key belongs to the text field, which is why global transport
-    /// shortcuts cannot fire mid-rename.
+    /// While an inline editor is open every key belongs to the text field:
+    /// Enter commits, Escape cancels, Tab stays put, and the rest edit the
+    /// name — which is also why the table's own keys cannot fire mid-rename.
     fn on_key(&mut self, event: &gpui::KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         let editing = self.panel.inline_edit.is_some();
 
         if editing {
-            match key {
-                "enter" => {
+            if key == "tab" {
+                // Handled, so it is never typed into the name as a character.
+                cx.stop_propagation();
+                return;
+            }
+            // The field is a passive buffer: it edits only when its owner
+            // routes keys to it. Caret, selection, deletion and clipboard keys
+            // are applied here; printable text and IME composition arrive
+            // through the platform input handler (`EntityInputHandler`
+            // below). Character keys must keep propagating — on Windows a
+            // handled KeyDown is never translated into the WM_CHAR that
+            // carries the text.
+            match self.name_input.handle_key_ime(event, Some(cx)) {
+                TextInputAction::Submit => {
                     cx.stop_propagation();
                     self.commit_rename(window, cx);
                 }
-                "escape" => {
+                TextInputAction::Cancel => {
                     cx.stop_propagation();
                     self.panel.cancel_rename();
                     cx.notify();
                 }
-                _ => {}
+                TextInputAction::Consumed | TextInputAction::Pass => cx.notify(),
             }
             return;
         }
@@ -1504,6 +1518,11 @@ impl AudioConnectionsWindow {
         )
     }
 }
+
+// Typed text and IME composition (CJK, Thai) reach the Bus Name editor
+// through the platform input handler, registered by the field while it holds
+// focus; `on_key` steers the caret, selection and deletion alongside it.
+crate::impl_single_input_window_ime!(AudioConnectionsWindow, name_input);
 
 impl Render for AudioConnectionsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
