@@ -18,8 +18,8 @@ pub mod flac;
 pub mod mp3;
 
 pub use format::{
-    AudioEncodeOptions, AudioEncodeSpec, AudioEncodeSummary, AudioEncoder, AudioFileFormat,
-    AudioSampleFormat, EncodeError, FlacEncodeOptions, Mp3Bitrate, Mp3EncodeOptions,
-    WavEncodeOptions, create_encoder, flac_available, mp3_available,
+    AudioDither, AudioEncodeOptions, AudioEncodeSpec, AudioEncodeSummary, AudioEncoder,
+    AudioFileFormat, AudioSampleFormat, EncodeError, FlacEncodeOptions, Mp3Bitrate,
+    Mp3EncodeOptions, WavEncodeOptions, create_encoder, flac_available, mp3_available,
 };
 pub use metadata::AudioMetadata;

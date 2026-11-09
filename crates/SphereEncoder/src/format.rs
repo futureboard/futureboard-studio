@@ -192,10 +192,30 @@ impl Default for Mp3EncodeOptions {
     }
 }
 
+/// Word-length reduction used when samples are written at 16 or 24 bits.
+///
+/// Float and 32-bit integer containers are never dithered: their resolution
+/// exceeds the mix's, so there is no truncation distortion to decorrelate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AudioDither {
+    /// Round to nearest with no dither. Quiet fades and reverb tails then
+    /// carry correlated quantization distortion. The default, so callers such
+    /// as LiveStage's recorder keep writing exactly what they are given.
+    #[default]
+    Off,
+    /// One triangular-PDF dither sample of ±1 LSB at the target depth, then
+    /// round to nearest — the same treatment Studio's live device output gets.
+    /// Studio's arrangement export selects it.
+    Tpdf,
+}
+
 /// Bundle of every per-format option plus metadata.
 #[derive(Debug, Clone, Default)]
 pub struct AudioEncodeOptions {
     pub format: AudioFileFormat,
+    /// Dither applied when float samples are quantized to a 16- or 24-bit
+    /// integer stream (WAV, FLAC, and the 16-bit PCM fed to the MP3 encoder).
+    pub dither: AudioDither,
     pub wav: WavEncodeOptions,
     pub flac: FlacEncodeOptions,
     pub mp3: Mp3EncodeOptions,
@@ -310,11 +330,9 @@ pub fn create_encoder(
     spec.validate()?;
     let path = path.as_ref();
     match options.format {
-        AudioFileFormat::Wav => Ok(Box::new(crate::wav::WavEncoder::create(
-            path,
-            spec,
-            options.wav,
-        )?)),
+        AudioFileFormat::Wav => Ok(Box::new(
+            crate::wav::WavEncoder::create(path, spec, options.wav)?.with_dither(options.dither),
+        )),
         AudioFileFormat::Rauf => Ok(Box::new(crate::rauf::RaufEncoder::create(path, spec)?)),
         AudioFileFormat::Flac => create_flac_encoder(path, spec, options),
         AudioFileFormat::Mp3 => create_mp3_encoder(path, spec, options),
@@ -327,12 +345,10 @@ fn create_flac_encoder(
     spec: AudioEncodeSpec,
     options: AudioEncodeOptions,
 ) -> Result<Box<dyn AudioEncoder>, EncodeError> {
-    Ok(Box::new(crate::flac::FlacEncoder::create(
-        path,
-        spec,
-        options.flac,
-        options.metadata,
-    )?))
+    Ok(Box::new(
+        crate::flac::FlacEncoder::create(path, spec, options.flac, options.metadata)?
+            .with_dither(options.dither),
+    ))
 }
 
 #[cfg(not(feature = "flac"))]
@@ -353,12 +369,10 @@ fn create_mp3_encoder(
     spec: AudioEncodeSpec,
     options: AudioEncodeOptions,
 ) -> Result<Box<dyn AudioEncoder>, EncodeError> {
-    Ok(Box::new(crate::mp3::Mp3Encoder::create(
-        path,
-        spec,
-        options.mp3,
-        options.metadata,
-    )?))
+    Ok(Box::new(
+        crate::mp3::Mp3Encoder::create(path, spec, options.mp3, options.metadata)?
+            .with_dither(options.dither),
+    ))
 }
 
 #[cfg(not(feature = "mp3-lame"))]
@@ -391,27 +405,187 @@ pub(crate) fn check_interleaved_len(len: usize, channels: u16) -> Result<(), Enc
     Ok(())
 }
 
-/// Full-scale `[-1, 1]` float to signed 32-bit. Clamps; no dither (first pass).
+/// Full-scale `[-1, 1]` float to signed 32-bit. Clamps; never dithered (see
+/// [`AudioDither`]).
 #[inline]
 pub(crate) fn f32_to_i32(x: f32) -> i32 {
     let v = (x.clamp(-1.0, 1.0) as f64) * (i32::MAX as f64);
     v.round() as i32
 }
 
-#[inline]
-pub(crate) fn f32_to_i16(x: f32) -> i16 {
-    let v = (x.clamp(-1.0, 1.0) as f64) * (i16::MAX as f64);
-    v.round() as i16
+/// Seed of every encoder's dither generator. Fixed, so the same input always
+/// encodes to the same file (reproducible bounces and tests).
+const DITHER_SEED: u32 = 0x9E37_79B9;
+
+/// Float / 32-bit integer to 16- or 24-bit integer conversion, with the
+/// encoder's [`AudioDither`]. One per encoder, advanced sample by sample, so
+/// successive samples never share noise. No allocation, no locks.
+#[derive(Debug, Clone)]
+pub(crate) struct Quantizer {
+    dither: AudioDither,
+    state: u32,
 }
 
-/// Float to signed 24-bit value stored in the low bytes of an `i32`.
-#[inline]
-pub(crate) fn f32_to_i24(x: f32) -> i32 {
-    let v = (x.clamp(-1.0, 1.0) as f64) * 8_388_607.0;
-    v.round() as i32
+impl Quantizer {
+    pub(crate) fn new(dither: AudioDither) -> Self {
+        Self {
+            dither,
+            state: DITHER_SEED,
+        }
+    }
+
+    /// Uniform noise in `[0, 1)` from a 32-bit xorshift.
+    #[inline]
+    fn uniform(&mut self) -> f64 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.state = x;
+        f64::from(x >> 8) * (1.0 / 16_777_216.0)
+    }
+
+    /// One triangular-PDF dither sample in `(-1, 1)` LSB.
+    #[inline]
+    fn tpdf(&mut self) -> f64 {
+        self.uniform() - self.uniform()
+    }
+
+    /// Full-scale `[-1, 1]` float to a signed integer whose positive full
+    /// scale is `max`. Clamps; NaN becomes 0.
+    #[inline]
+    fn from_f32(&mut self, x: f32, max: f64) -> i32 {
+        let scaled = f64::from(x.clamp(-1.0, 1.0)) * max;
+        match self.dither {
+            AudioDither::Off => scaled.round() as i32,
+            AudioDither::Tpdf => (scaled + self.tpdf()).round().clamp(-max - 1.0, max) as i32,
+        }
+    }
+
+    /// Full-scale signed 32-bit to `bits` bits (`bits < 32`).
+    #[inline]
+    fn from_i32(&mut self, x: i32, bits: u32) -> i32 {
+        let shift = 32 - bits;
+        match self.dither {
+            AudioDither::Off => x >> shift,
+            AudioDither::Tpdf => {
+                let max = f64::from((1u32 << (bits - 1)) - 1);
+                let scaled = f64::from(x) / f64::from(1u32 << shift);
+                (scaled + self.tpdf()).round().clamp(-max - 1.0, max) as i32
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn f32_to_i16(&mut self, x: f32) -> i16 {
+        self.from_f32(x, f64::from(i16::MAX)) as i16
+    }
+
+    /// Float to signed 24-bit value stored in the low bytes of an `i32`.
+    #[inline]
+    pub(crate) fn f32_to_i24(&mut self, x: f32) -> i32 {
+        self.from_f32(x, 8_388_607.0)
+    }
+
+    #[inline]
+    pub(crate) fn i32_to_i16(&mut self, x: i32) -> i16 {
+        self.from_i32(x, 16) as i16
+    }
+
+    #[inline]
+    pub(crate) fn i32_to_i24(&mut self, x: i32) -> i32 {
+        self.from_i32(x, 24)
+    }
 }
 
 #[inline]
 pub(crate) fn i32_to_f32(x: i32) -> f32 {
     (x as f64 / (i32::MAX as f64 + 1.0)) as f32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn undithered_conversion_rounds_and_clamps_as_before() {
+        let mut q = Quantizer::new(AudioDither::Off);
+        assert_eq!(q.f32_to_i16(1.0), i16::MAX);
+        assert_eq!(q.f32_to_i16(-1.0), -i16::MAX);
+        assert_eq!(q.f32_to_i16(2.0), i16::MAX);
+        assert_eq!(q.f32_to_i16(0.5), 16_384); // 16383.5 rounds away from zero
+        assert_eq!(q.f32_to_i16(f32::NAN), 0);
+        assert_eq!(q.f32_to_i24(1.0), 8_388_607);
+        assert_eq!(q.i32_to_i16(i32::MAX), i16::MAX);
+        assert_eq!(q.i32_to_i24(-256), -1);
+    }
+
+    #[test]
+    fn tpdf_silence_stays_within_one_lsb_and_is_unbiased() {
+        let mut q = Quantizer::new(AudioDither::Tpdf);
+        let (mut sum, mut moved) = (0i64, 0);
+        for _ in 0..100_000 {
+            let s = q.f32_to_i16(0.0);
+            assert!((-1..=1).contains(&s), "silence quantized to {s}");
+            sum += i64::from(s);
+            moved += usize::from(s != 0);
+        }
+        assert!(sum.abs() < 500, "dither carries a DC bias: {sum}");
+        assert!(moved > 10_000, "dither should move silence: {moved}");
+    }
+
+    /// The point of dither: a signal below half an LSB, which plain rounding
+    /// erases, survives on average instead of truncating to zero.
+    #[test]
+    fn tpdf_preserves_sub_lsb_signal_on_average() {
+        let value = 0.3 / 32_767.0;
+        let mut off = Quantizer::new(AudioDither::Off);
+        assert_eq!(off.f32_to_i16(value), 0);
+        let mut q = Quantizer::new(AudioDither::Tpdf);
+        let n = 200_000;
+        let mean = (0..n).map(|_| f64::from(q.f32_to_i16(value))).sum::<f64>() / n as f64;
+        assert!(
+            (mean - 0.3).abs() < 0.02,
+            "mean {mean} should track 0.3 LSB"
+        );
+
+        let value24 = 0.3 / 8_388_607.0;
+        let mean24 = (0..n)
+            .map(|_| f64::from(q.f32_to_i24(value24)))
+            .sum::<f64>()
+            / n as f64;
+        assert!((mean24 - 0.3).abs() < 0.02, "24-bit mean {mean24}");
+        let mean_i32 = (0..n).map(|_| f64::from(q.i32_to_i16(19_661))).sum::<f64>() / n as f64;
+        assert!((mean_i32 - 0.3).abs() < 0.02, "i32 input mean {mean_i32}");
+    }
+
+    #[test]
+    fn tpdf_clips_full_scale_without_wrapping() {
+        let mut q = Quantizer::new(AudioDither::Tpdf);
+        for _ in 0..10_000 {
+            assert!(q.f32_to_i16(1.0) >= i16::MAX - 1);
+            assert!(q.f32_to_i16(-1.0) <= -i16::MAX + 1);
+            assert!((-8_388_608..=8_388_607).contains(&q.f32_to_i24(1.5)));
+            assert!((-8_388_608..=8_388_607).contains(&q.f32_to_i24(-1.5)));
+            assert_eq!(q.f32_to_i16(f32::NAN), 0);
+            assert!(q.i32_to_i16(i32::MIN) <= i16::MIN + 1);
+        }
+    }
+
+    #[test]
+    fn tpdf_is_seeded_so_encodes_are_reproducible() {
+        let mut a = Quantizer::new(AudioDither::Tpdf);
+        let mut b = Quantizer::new(AudioDither::Tpdf);
+        for n in 0..10_000 {
+            let x = (n as f32 * 0.001).sin() * 1e-3;
+            assert_eq!(a.f32_to_i16(x), b.f32_to_i16(x));
+        }
+    }
+
+    /// Dither is opt-in: the shared default (LiveStage's recorder, bounces,
+    /// the stem extractor) does not dither; Studio's export selects TPDF.
+    #[test]
+    fn the_shared_default_does_not_dither() {
+        assert_eq!(AudioEncodeOptions::default().dither, AudioDither::Off);
+    }
 }

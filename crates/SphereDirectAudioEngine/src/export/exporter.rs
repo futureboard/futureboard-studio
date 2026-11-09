@@ -1425,4 +1425,78 @@ mod tests {
         assert!(bytes.len() > 9, "new export should be larger than the stub");
         let _ = std::fs::remove_file(out);
     }
+
+    /// #322: a 16-bit export with TPDF selected (as Studio's export settings
+    /// build it) is dithered — the silent render lands as ±1 LSB noise rather
+    /// than truncated — and with dither off it is exact digital silence.
+    #[test]
+    fn integer_exports_are_dithered_unless_turned_off() {
+        let snapshot = silence_snapshot(48_000);
+        let export = |dither: sphere_encoder::AudioDither| {
+            let out = temp_path("dither");
+            let mut req = wav_request(out.clone(), 4_000);
+            req.sample_format = AudioSampleFormat::I16;
+            req.encode_options.dither = dither;
+            export_arrangement(&snapshot, &req, &ExportCancelToken::new(), |_p| {}).unwrap();
+            let bytes = std::fs::read(&out).unwrap();
+            let _ = std::fs::remove_file(out);
+            bytes[44..]
+                .chunks(2)
+                .map(|b| i16::from_le_bytes([b[0], b[1]]))
+                .collect::<Vec<_>>()
+        };
+        let dithered = export(sphere_encoder::AudioDither::Tpdf);
+        assert_eq!(dithered.len(), 8_000);
+        assert!(dithered.iter().all(|s| (-1..=1).contains(s)));
+        assert!(
+            dithered.iter().any(|&s| s != 0),
+            "the export was not dithered"
+        );
+        let plain = export(sphere_encoder::AudioDither::Off);
+        assert!(plain.iter().all(|&s| s == 0));
+    }
+
+    /// #302: FLAC stems stream through the single-pass export — several
+    /// files open at once, each longer than one encoder batch — and the same
+    /// render encodes to the same bytes.
+    #[test]
+    fn flac_stems_stream_from_one_pass() {
+        let outputs = [temp_path("flac-stem-a"), temp_path("flac-stem-b")];
+        let targets: Vec<TrackExportTarget> = outputs
+            .iter()
+            .map(|output| {
+                let mut request = wav_request(output.clone(), 150_000);
+                request.format = AudioFileFormat::Flac;
+                request.sample_format = AudioSampleFormat::I24;
+                request.encode_options.format = AudioFileFormat::Flac;
+                TrackExportTarget {
+                    track_id: "track-1".to_string(),
+                    request,
+                }
+            })
+            .collect();
+        let summaries = export_tracks_single_pass(
+            &silence_snapshot(48_000),
+            &targets,
+            &ExportCancelToken::new(),
+            |_progress| {},
+        )
+        .unwrap();
+        assert_eq!(summaries.len(), 2);
+        assert!(summaries.iter().all(|s| s.frames_written == 150_000));
+        let files: Vec<Vec<u8>> = outputs
+            .iter()
+            .map(|output| std::fs::read(output).unwrap())
+            .collect();
+        assert_eq!(&files[0][..4], b"fLaC");
+        // STREAMINFO was patched on finalize with the true sample count.
+        let total = (u64::from(files[0][21] & 0x0F) << 32)
+            | u64::from(u32::from_be_bytes(files[0][22..26].try_into().unwrap()));
+        assert_eq!(total, 150_000);
+        assert_eq!(files[0], files[1], "the same render encodes identically");
+        for output in outputs {
+            assert!(!partial_path_for(&output).exists());
+            let _ = std::fs::remove_file(output);
+        }
+    }
 }

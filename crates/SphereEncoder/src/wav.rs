@@ -3,8 +3,8 @@ use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::format::{
-    AudioEncodeSpec, AudioEncodeSummary, AudioEncoder, AudioFileFormat, AudioSampleFormat,
-    EncodeError, WavEncodeOptions, check_interleaved_len, f32_to_i16, f32_to_i24, f32_to_i32,
+    AudioDither, AudioEncodeSpec, AudioEncodeSummary, AudioEncoder, AudioFileFormat,
+    AudioSampleFormat, EncodeError, Quantizer, WavEncodeOptions, check_interleaved_len, f32_to_i32,
     i32_to_f32,
 };
 use crate::rauf::{RAUF_FLAG_FINALIZED, RaufError, RaufReader, RaufSampleFormat};
@@ -229,6 +229,9 @@ pub struct WavEncoder {
     rf64: bool,
     finalized: bool,
     scratch: Vec<u8>,
+    /// 16/24-bit conversion; [`AudioDither::Off`] unless set by
+    /// [`with_dither`](Self::with_dither).
+    quantizer: Quantizer,
 }
 
 impl WavEncoder {
@@ -248,7 +251,15 @@ impl WavEncoder {
             rf64: options.rf64,
             finalized: false,
             scratch: Vec::new(),
+            quantizer: Quantizer::new(AudioDither::Off),
         })
+    }
+
+    /// Dither 16- and 24-bit PCM with `dither`. Float and 32-bit PCM are
+    /// never dithered.
+    pub fn with_dither(mut self, dither: AudioDither) -> Self {
+        self.quantizer = Quantizer::new(dither);
+        self
     }
 
     fn frames_written(&self) -> u64 {
@@ -269,12 +280,18 @@ impl WavEncoder {
         Ok(())
     }
 
-    fn push_sample_bytes(
+    /// Encode `samples` into the reused scratch buffer and write them.
+    fn push_samples<T: Copy>(
         &mut self,
-        encode: impl Fn(&mut Vec<u8>),
+        samples: &[T],
+        wrap: impl Fn(T) -> SampleIn,
     ) -> std::result::Result<(), EncodeError> {
+        let fmt = self.spec.sample_format;
         self.scratch.clear();
-        encode(&mut self.scratch);
+        self.scratch.reserve(samples.len() * fmt.bytes_per_sample());
+        for &x in samples {
+            encode_one(&mut self.scratch, fmt, wrap(x), &mut self.quantizer);
+        }
         self.writer.write_all(&self.scratch)?;
         self.data_bytes += self.scratch.len() as u64;
         Ok(())
@@ -387,11 +404,7 @@ impl AudioEncoder for WavEncoder {
             ));
         }
         check_interleaved_len(frames.len(), self.spec.channels)?;
-        let fmt = self.spec.sample_format;
-        for &x in frames {
-            self.push_sample_bytes(|buf| encode_one(buf, fmt, SampleIn::F32(x)))?;
-        }
-        Ok(())
+        self.push_samples(frames, SampleIn::F32)
     }
 
     fn write_interleaved_i32(&mut self, frames: &[i32]) -> std::result::Result<(), EncodeError> {
@@ -401,11 +414,7 @@ impl AudioEncoder for WavEncoder {
             ));
         }
         check_interleaved_len(frames.len(), self.spec.channels)?;
-        let fmt = self.spec.sample_format;
-        for &x in frames {
-            self.push_sample_bytes(|buf| encode_one(buf, fmt, SampleIn::I32(x)))?;
-        }
-        Ok(())
+        self.push_samples(frames, SampleIn::I32)
     }
 
     fn finalize(&mut self) -> std::result::Result<AudioEncodeSummary, EncodeError> {
@@ -448,7 +457,12 @@ enum SampleIn {
     I32(i32),
 }
 
-fn encode_one(buf: &mut Vec<u8>, fmt: AudioSampleFormat, sample: SampleIn) {
+fn encode_one(
+    buf: &mut Vec<u8>,
+    fmt: AudioSampleFormat,
+    sample: SampleIn,
+    quantizer: &mut Quantizer,
+) {
     match fmt {
         AudioSampleFormat::F32 => {
             let v = match sample {
@@ -466,15 +480,15 @@ fn encode_one(buf: &mut Vec<u8>, fmt: AudioSampleFormat, sample: SampleIn) {
         }
         AudioSampleFormat::I16 => {
             let v = match sample {
-                SampleIn::F32(x) => f32_to_i16(x),
-                SampleIn::I32(x) => (x >> 16) as i16,
+                SampleIn::F32(x) => quantizer.f32_to_i16(x),
+                SampleIn::I32(x) => quantizer.i32_to_i16(x),
             };
             buf.extend_from_slice(&v.to_le_bytes());
         }
         AudioSampleFormat::I24 => {
             let v = match sample {
-                SampleIn::F32(x) => f32_to_i24(x),
-                SampleIn::I32(x) => x >> 8,
+                SampleIn::F32(x) => quantizer.f32_to_i24(x),
+                SampleIn::I32(x) => quantizer.i32_to_i24(x),
             };
             let bytes = v.to_le_bytes();
             buf.extend_from_slice(&bytes[0..3]);
@@ -825,5 +839,66 @@ mod encoder_tests {
             Err(EncodeError::FinalizeFailed(_))
         ));
         let _ = std::fs::remove_file(path);
+    }
+
+    /// #322: through the factory with TPDF selected (what Studio's export
+    /// does) 16- and 24-bit PCM is dithered — digital silence becomes ±1 LSB
+    /// noise — float and 32-bit stay bit-exact, and the shared default does
+    /// not dither.
+    #[test]
+    fn factory_dithers_integer_pcm_but_never_float() {
+        let samples = [0.0f32; 2_000];
+        let write = |fmt: AudioSampleFormat, dither: AudioDither| {
+            let path = temp_path("factory-dither");
+            let mut enc = crate::format::create_encoder(
+                &path,
+                spec(1, fmt),
+                crate::format::AudioEncodeOptions {
+                    dither,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            enc.write_interleaved_f32(&samples).unwrap();
+            enc.finalize().unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            let _ = std::fs::remove_file(path);
+            bytes[44..].to_vec()
+        };
+        let pcm16: Vec<i16> = write(AudioSampleFormat::I16, AudioDither::Tpdf)
+            .chunks(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        assert!(pcm16.iter().all(|s| (-1..=1).contains(s)));
+        assert!(
+            pcm16.iter().any(|&s| s != 0),
+            "16-bit export was not dithered"
+        );
+        let pcm24 = write(AudioSampleFormat::I24, AudioDither::Tpdf);
+        assert!(
+            pcm24.iter().any(|&b| b != 0),
+            "24-bit export was not dithered"
+        );
+        assert!(
+            write(AudioSampleFormat::I16, AudioDither::Off)
+                .iter()
+                .all(|&b| b == 0)
+        );
+        assert!(
+            write(AudioSampleFormat::I24, AudioDither::default())
+                .iter()
+                .all(|&b| b == 0),
+            "the shared default must not dither"
+        );
+        assert!(
+            write(AudioSampleFormat::F32, AudioDither::Tpdf)
+                .iter()
+                .all(|&b| b == 0)
+        );
+        assert!(
+            write(AudioSampleFormat::I32, AudioDither::Tpdf)
+                .iter()
+                .all(|&b| b == 0)
+        );
     }
 }
