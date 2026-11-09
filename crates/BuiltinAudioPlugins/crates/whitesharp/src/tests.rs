@@ -1041,3 +1041,24 @@ fn humanize_relaxes_held_notes_without_leaving_them_off() {
         "a 5-cent drift corrected by {held}"
     );
 }
+
+#[test]
+fn nan_then_valid_input_correction_resumes() {
+    let mut params = default_params();
+    params.retune_ms = 0.0;
+    let mut dsp = dsp_with(params);
+
+    // Feed non-finite samples (NaN and Infinity)
+    let (l, r) = dsp.process_stereo(f32::NAN, f32::NAN);
+    assert!(l.is_finite() && r.is_finite());
+    let (l, r) = dsp.process_stereo(f32::INFINITY, f32::NEG_INFINITY);
+    assert!(l.is_finite() && r.is_finite());
+
+    // Next voiced note: sang 69.3, should be pulled onto pitch 69.0
+    let out = sing(&mut dsp, 1.0, |_| hz_of(69.3));
+    let heard = pitch_of(&out, 0.5, 1.0);
+    assert!(
+        (heard - 69.0).abs() < 0.05,
+        "after NaN, expected pitch correction to resume near 69.0, heard {heard}"
+    );
+}

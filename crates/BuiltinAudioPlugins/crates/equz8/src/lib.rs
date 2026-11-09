@@ -767,18 +767,31 @@ impl Dsp {
     /// Build the audition bandpass for the soloed band, if any.
     fn rebuild_solo(&mut self) {
         let index = self.params.solo_band;
-        let filter = if index >= 0 && (index as usize) < BAND_COUNT {
+        if index >= 0 && (index as usize) < BAND_COUNT {
             let band = self.params.bands[index as usize];
             let q = match band.band_type {
                 BandType::Bell | BandType::Notch => band.q,
                 _ => SOLO_WIDE_Q,
             };
-            design("bandpass", band.freq, 0.0, q, self.sample_rate).map(Filter::new)
+            if let Some(coeffs) = design("bandpass", band.freq, 0.0, q, self.sample_rate) {
+                if let Some(filter) = self.solo_left.as_mut() {
+                    filter.update_coefficients(coeffs);
+                } else {
+                    self.solo_left = Some(Filter::new(coeffs));
+                }
+                if let Some(filter) = self.solo_right.as_mut() {
+                    filter.update_coefficients(coeffs);
+                } else {
+                    self.solo_right = Some(Filter::new(coeffs));
+                }
+            } else {
+                self.solo_left = None;
+                self.solo_right = None;
+            }
         } else {
-            None
-        };
-        self.solo_left = filter;
-        self.solo_right = filter;
+            self.solo_left = None;
+            self.solo_right = None;
+        }
     }
 
     fn rebuild_band(&mut self, index: usize) {
@@ -789,32 +802,65 @@ impl Dsp {
             self.right[index] = EMPTY_CASCADE;
             self.sections[index] = 0;
             self.detector[index] = None;
+            self.dyn_state[index].offset_db = 0.0;
+            self.dyn_state[index].level_db = telemetry::SILENT_DB;
+            self.dyn_state[index].envelope = 0.0;
             return;
         }
-        let applied = band.gain_db;
+        let applied = if band.dynamic && band.band_type.has_gain() && band.range_db.abs() > 1.0e-6 {
+            band.gain_db + self.dyn_state[index].offset_db
+        } else {
+            band.gain_db
+        };
         let count = section_count(&band);
         self.sections[index] = count as u8;
         for section in 0..MAX_SECTIONS {
-            let filter = if section < count {
-                section_coefficients(&band, section, applied, self.sample_rate).map(Filter::new)
+            if section < count {
+                if let Some(coeffs) =
+                    section_coefficients(&band, section, applied, self.sample_rate)
+                {
+                    if let Some(filter) = self.left[index][section].as_mut() {
+                        filter.update_coefficients(coeffs);
+                    } else {
+                        self.left[index][section] = Some(Filter::new(coeffs));
+                    }
+                    if let Some(filter) = self.right[index][section].as_mut() {
+                        filter.update_coefficients(coeffs);
+                    } else {
+                        self.right[index][section] = Some(Filter::new(coeffs));
+                    }
+                } else {
+                    self.left[index][section] = None;
+                    self.right[index][section] = None;
+                }
             } else {
-                None
-            };
-            self.left[index][section] = filter;
-            self.right[index][section] = filter;
+                self.left[index][section] = None;
+                self.right[index][section] = None;
+            }
         }
         self.dyn_state[index].last_applied_db = applied;
 
         let wants_detector = band.dynamic && band.band_type.has_gain();
-        self.detector[index] = if wants_detector {
+        if wants_detector {
             let q = match band.band_type {
                 BandType::Bell => band.q,
                 _ => SOLO_WIDE_Q,
             };
-            design("bandpass", band.freq, 0.0, q, self.sample_rate).map(Filter::new)
+            if let Some(coeffs) = design("bandpass", band.freq, 0.0, q, self.sample_rate) {
+                if let Some(filter) = self.detector[index].as_mut() {
+                    filter.update_coefficients(coeffs);
+                } else {
+                    self.detector[index] = Some(Filter::new(coeffs));
+                }
+            } else {
+                self.detector[index] = None;
+            }
         } else {
-            None
-        };
+            self.detector[index] = None;
+            self.dyn_state[index].offset_db = 0.0;
+            self.dyn_state[index].level_db = telemetry::SILENT_DB;
+            self.dyn_state[index].envelope = 0.0;
+        }
     }
 
     /// Retunes a dynamic band to a new applied gain. Only gain-bearing shapes
@@ -1576,5 +1622,113 @@ mod tests {
         let (l, _) = dsp.process_stereo(0.5, 0.5);
         let expected = 0.5 * 0.5 + 0.5 * 0.5 * db_to_linear(-12.0);
         assert!((l - expected).abs() < 1.0e-6, "{l} vs {expected}");
+    }
+
+    #[test]
+    fn dragging_band_freq_does_not_click() {
+        let mut dsp = shaping();
+        let wire = ipc::BAND_BASE_INDEX + 2 * ipc::BAND_STRIDE + ipc::BAND_FREQ;
+        let jump = drag(&mut dsp, 375, |dsp, block| {
+            let freq = sweep(80.0, 200.0, block, 375);
+            assert!(dsp.apply_wire_param(wire, freq));
+        });
+        assert!(jump < 4.0, "band freq drag jump x {jump}");
+    }
+
+    #[test]
+    fn dragging_steep_cut_freq_does_not_click() {
+        let mut params = default_params();
+        params.bands[0].active = true;
+        params.bands[0].band_type = BandType::HighPass;
+        params.bands[0].freq = 80.0;
+        params.bands[0].slope = 48.0;
+        let mut dsp = Dsp::new(48_000.0);
+        dsp.set_params(params);
+        let wire = ipc::BAND_BASE_INDEX + ipc::BAND_FREQ;
+        let jump = drag(&mut dsp, 375, |dsp, block| {
+            let freq = sweep(60.0, 160.0, block, 375);
+            assert!(dsp.apply_wire_param(wire, freq));
+        });
+        assert!(jump < 4.0, "steep cut freq drag jump x {jump}");
+    }
+
+    #[test]
+    fn dragging_soloed_band_freq_does_not_click() {
+        let mut dsp = shaping();
+        assert!(dsp.apply_wire_param(ipc::SOLO_INDEX, 2.0));
+        let wire = ipc::BAND_BASE_INDEX + 2 * ipc::BAND_STRIDE + ipc::BAND_FREQ;
+        let jump = drag(&mut dsp, 375, |dsp, block| {
+            let freq = sweep(80.0, 200.0, block, 375);
+            assert!(dsp.apply_wire_param(wire, freq));
+        });
+        assert!(jump < 4.0, "soloed band freq drag jump x {jump}");
+    }
+
+    /// Editing a dynamic band used to rebuild it at the static gain (a 0 dB
+    /// bell is a wire) and clear its history, so the next sample jumped from
+    /// the engaged cut to the dry input. Offset continuity alone does not
+    /// catch that: the old code never cleared `offset_db`.
+    #[test]
+    fn editing_dynamic_band_does_not_jump_to_static_gain() {
+        let freq = 1_000.0_f32;
+        let mut params = default_params();
+        params.bands[2] = BandParams {
+            active: true,
+            band_type: BandType::Bell,
+            freq,
+            q: 2.0,
+            gain_db: 0.0,
+            dynamic: true,
+            threshold_db: -40.0,
+            range_db: -12.0,
+            attack_ms: 0.1,
+            release_ms: 50.0,
+            ratio: 4.0,
+            ..params.bands[2]
+        };
+        let mut dsp = Dsp::new(48_000.0);
+        dsp.set_params(params);
+
+        let step = std::f32::consts::TAU * freq / 48_000.0;
+        let amp = 0.5_f32;
+        let mut phase = 0.0_f32;
+        for _ in 0..24_000 {
+            let x = phase.sin() * amp;
+            let _ = dsp.process_stereo(x, x);
+            phase = (phase + step) % std::f32::consts::TAU;
+        }
+        let offset = dsp.telemetry()[telemetry::GAIN_BASE + 2];
+        assert!(offset < -6.0, "dynamic cut did not engage: {offset}");
+
+        let mut last_in = 0.0_f32;
+        let mut last_out = 0.0_f32;
+        let mut found_peak = false;
+        for _ in 0..4_000 {
+            let x = phase.sin() * amp;
+            phase = (phase + step) % std::f32::consts::TAU;
+            if phase.sin() > 0.985 {
+                last_in = x;
+                last_out = dsp.process_stereo(x, x).0;
+                found_peak = true;
+                break;
+            }
+            let _ = dsp.process_stereo(x, x);
+        }
+        assert!(found_peak, "sine never reached a peak");
+        let static_gap = (last_in - last_out).abs();
+        assert!(
+            static_gap > 0.1,
+            "fixture did not separate dynamic and static gain: in {last_in} out {last_out}"
+        );
+
+        let wire = ipc::BAND_BASE_INDEX + 2 * ipc::BAND_STRIDE + ipc::BAND_FREQ;
+        assert!(dsp.apply_wire_param(wire, freq + 8.0));
+        let after_in = phase.sin() * amp;
+        let after_out = dsp.process_stereo(after_in, after_in).0;
+        let jump = (after_out - last_out).abs();
+        assert!(
+            jump < static_gap * 0.25,
+            "one-sample jump toward static gain: {last_out} -> {after_out}, dry {after_in}"
+        );
     }
 }

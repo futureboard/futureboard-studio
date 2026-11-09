@@ -232,9 +232,28 @@ impl Detector {
     /// `threshold` is the YIN dip a frame must reach to count as voiced.
     #[inline]
     pub fn push(&mut self, sample: f32, threshold: f32) -> Option<Estimate> {
+        let sample = if sample.is_finite() { sample } else { 0.0 };
         let first = self.filters[0].run(sample);
-        let filtered = builtin_dsp_core::flush_denormal(self.filters[1].run(first));
+        let first = if first.is_finite() {
+            first
+        } else {
+            self.filters[0].reset_state();
+            0.0
+        };
+        let second = self.filters[1].run(first);
+        let filtered = if second.is_finite() {
+            builtin_dsp_core::flush_denormal(second)
+        } else {
+            self.filters[1].reset_state();
+            0.0
+        };
         let k = self.power_step;
+        if !self.power_all.is_finite() {
+            self.power_all = 0.0;
+        }
+        if !self.power_low.is_finite() {
+            self.power_low = 0.0;
+        }
         self.power_all = builtin_dsp_core::flush_denormal(
             self.power_all + (sample * sample - self.power_all) * k,
         );
