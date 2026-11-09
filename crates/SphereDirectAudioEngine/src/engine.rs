@@ -780,6 +780,12 @@ pub struct SharedState {
     /// Monotonic generation of the latency-compensation graph (bumped on PDC
     /// toggle). Stamped into the offline-export snapshot for graph-version parity.
     pub latency_graph_version: AtomicU64,
+    /// Bridge handshake period, frames: the device buffer size the open stream
+    /// was configured with (control → audio), the value delay compensation
+    /// and the latency report charge each bridged insert for its one-block
+    /// handshake. 0 until a stream reports one; read it through
+    /// [`SharedState::bridge_period_frames_for_block`].
+    pub bridge_period_frames: AtomicU32,
     /// Monotonic id of the newest Browser sample-preview request (control →
     /// audio). Decodes run off the realtime thread and finish out of order, so
     /// both the decode worker and the callback compare against this before a
@@ -907,6 +913,7 @@ impl Default for SharedState {
             record_pdc_bypass_enabled: AtomicBool::new(true),
             record_pdc_bypass: AtomicBool::new(false),
             latency_graph_version: AtomicU64::new(1),
+            bridge_period_frames: AtomicU32::new(0),
             audition_request_token: AtomicU64::new(0),
             audition_position_us: AtomicU64::new(AUDITION_POSITION_IDLE),
             jam_bus: crate::jam_bus::JamAudioBus::new(),
@@ -915,6 +922,34 @@ impl Default for SharedState {
 }
 
 impl SharedState {
+    /// The bridge handshake period for a callback rendering `block_frames`.
+    ///
+    /// This is the configured period the control thread published with the
+    /// open stream, whatever size this particular callback is. A stream that
+    /// reported none (a device-default buffer size the backend cannot read
+    /// back) takes the first block it renders as its period, once: from then
+    /// on the period stays put, so the per-callback frame count never reaches
+    /// delay compensation. The latency report reads the same value.
+    ///
+    /// One relaxed load per callback, and one compare-exchange the first time
+    /// only. Realtime-safe.
+    #[inline]
+    pub fn bridge_period_frames_for_block(&self, block_frames: u32) -> u32 {
+        let period = self.bridge_period_frames.load(Ordering::Relaxed);
+        if period != 0 || block_frames == 0 {
+            return period;
+        }
+        match self.bridge_period_frames.compare_exchange(
+            0,
+            block_frames,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => block_frames,
+            Err(current) => current,
+        }
+    }
+
     /// Note the transport block the output callback is about to advance past.
     /// Three atomic stores and a clock read; realtime-safe.
     #[inline]
@@ -1819,6 +1854,11 @@ impl EngineInner {
         st.running = false;
         st.sample_rate = sample_rate;
         st.buffer_size = buffer_size;
+        // Bridged-insert compensation follows the configured period, not the
+        // size of each callback; 0 lets the stream resolve it on its first block.
+        self.shared
+            .bridge_period_frames
+            .store(buffer_size, Ordering::Relaxed);
         st.output_device = Some(dev_name);
         st.last_error = None;
 
@@ -6224,6 +6264,9 @@ impl EngineInner {
         };
         let to_ms = |samples: u32| samples as f64 / sample_rate as f64 * 1000.0;
         let pdc_enabled = self.pdc_enabled();
+        // The period delay compensation charges each bridged insert, so the
+        // report and the plan agree (`bridged_insert_latency_samples`).
+        let bridge_period_frames = self.shared.bridge_period_frames.load(Ordering::Relaxed);
 
         let max_path_samples = runtime.latency_graph.max_path_latency_samples;
         let mut tracks = Vec::new();
@@ -6241,11 +6284,13 @@ impl EngineInner {
                     }
                 } else if insert.kind.eq_ignore_ascii_case("external-bridge-plugin") {
                     // Bridged plugin: the host-reported plugin latency plus the
-                    // one-block bridge handshake (the engine reads each block one
-                    // late). Reporting only — PDC compensation of this is a
-                    // dedicated follow-up (needs a graph rebuild on report).
+                    // one-block bridge handshake at the configured period, the
+                    // same figure delay compensation plans with.
                     if let Some(sink) = runtime.plugin_bridge_sinks.get(&insert.id) {
-                        samples += sink.reported_latency_samples() as i64 + buffer_frames as i64;
+                        samples += crate::plugin_bridge::bridged_insert_latency_samples(
+                            sink.reported_latency_samples(),
+                            bridge_period_frames,
+                        ) as i64;
                     }
                 }
             }
@@ -6524,6 +6569,11 @@ impl EngineInner {
         st.running = false;
         st.sample_rate = sr;
         st.buffer_size = bs;
+        // Bridged-insert compensation follows the configured period, not the
+        // size of each callback; 0 lets the stream resolve it on its first block.
+        self.shared
+            .bridge_period_frames
+            .store(bs, Ordering::Relaxed);
         st.output_device = Some(device_name);
         st.last_error = None;
         eprintln!("[audio-engine] active_sample_rate={sr} block_size={bs}");
@@ -7581,7 +7631,11 @@ where
                         block_scratch.resize(scratch_len, 0.0);
                     }
                     let scratch = &mut block_scratch[..scratch_len];
-                    let _ = frames_needed;
+                    // Bridged-insert compensation follows the configured
+                    // period, not this callback's size (#377).
+                    runtime.bridge_period_frames = shared.bridge_period_frames_for_block(
+                        frames_needed.min(u32::MAX as usize) as u32,
+                    );
                     frames = render_project_block_interleaved(
                         &mut runtime,
                         base_sample,
@@ -8892,6 +8946,99 @@ mod bridge_insert_tests {
             // A dry track waits for it.
             assert_eq!(lg.track_pdc_delay[2], instrument, "block {block}");
         }
+    }
+
+    /// #377: a bridged insert's handshake is charged one *configured* period,
+    /// so callbacks whose size varies (WASAPI shared/event mode, partial
+    /// renders) neither replan compensation nor move the dry track's delay.
+    /// Charged at the callback size, this probe replanned 7 times and the dry
+    /// delay followed the block size (544 → 96 → 512 → 544 …).
+    #[test]
+    fn variable_callback_sizes_keep_bridged_compensation_fixed() {
+        const PERIOD: u32 = 480;
+        const REPORTED: u32 = 64;
+        let mut dry = bridge_effect_track(1.0);
+        dry.id = "dry".to_string();
+        dry.inserts.clear();
+        let mut bridged = bridge_effect_track(1.0);
+        bridged.id = "bridged".to_string();
+        bridged.inserts[0].id = "bridged-insert".to_string();
+        let tracks = vec![dry, bridged];
+        let audio_graph = crate::audio_graph::plan_runtime_audio_graph(&tracks).unwrap();
+        let mut p = RuntimeProject {
+            spatial: Default::default(),
+            sample_rate: 48_000,
+            tracks,
+            audio_graph,
+            pdc_enabled: true,
+            ..Default::default()
+        };
+        p.plugin_bridge_sinks.insert(
+            "bridged-insert".to_string(),
+            Arc::new(WetEffectSink {
+                done_seq: AtomicU64::new(1),
+                requests: AtomicU64::new(0),
+                latency_samples: REPORTED,
+            }),
+        );
+        p.resolve_indices();
+        p.plan_latency_and_pdc();
+        p.reserve_track_blocks(PERIOD as usize);
+
+        // The device callback path: the stream was opened at PERIOD frames.
+        let shared = Arc::new(SharedState::default());
+        shared.sample_rate.store(48_000, Ordering::Relaxed);
+        shared
+            .engine_state
+            .store(AudioEngineState::Running as u8, Ordering::Relaxed);
+        shared.bridge_period_frames.store(PERIOD, Ordering::Relaxed);
+        let mut local = crate::backend::render::LocalAudioState::new(48_000.0);
+        local.playing_local = true;
+        let mut data = vec![0.0f32; PERIOD as usize * 2];
+        let mut callback = |p: &mut RuntimeProject, frames: usize| {
+            crate::backend::render::fill_output_f32(
+                &mut data[..frames * 2],
+                2,
+                p,
+                &shared,
+                &mut local,
+            );
+        };
+
+        let probe = [480usize, 480, 32, 448, 480, 480, 96, 384, 480];
+        for frames in probe {
+            callback(&mut p, frames);
+            assert_eq!(
+                p.latency_graph.track_plugin_latency[1],
+                REPORTED + PERIOD,
+                "bridged strip after a {frames}-frame block"
+            );
+            assert_eq!(
+                p.latency_graph.track_pdc_delay[0],
+                REPORTED + PERIOD,
+                "dry delay after a {frames}-frame block"
+            );
+            assert_eq!(p.latency_graph.track_pdc_delay[1], 0);
+        }
+        assert_eq!(
+            p.latency_replan_count, 1,
+            "the plan is computed once, when the bridged latency is first observed"
+        );
+
+        // A real change still replans, once: the device reopened at 256.
+        shared.bridge_period_frames.store(256, Ordering::Relaxed);
+        for frames in probe.map(|frames| frames.min(256)) {
+            callback(&mut p, frames);
+            assert_eq!(p.latency_graph.track_pdc_delay[0], REPORTED + 256);
+        }
+        assert_eq!(p.latency_replan_count, 2);
+
+        // A stream that reported no buffer size takes its first block as the
+        // period, and keeps it.
+        let unconfigured = SharedState::default();
+        assert_eq!(unconfigured.bridge_period_frames_for_block(480), 480);
+        assert_eq!(unconfigured.bridge_period_frames_for_block(32), 480);
+        assert_eq!(unconfigured.bridge_period_frames_for_block(0), 480);
     }
 
     #[test]

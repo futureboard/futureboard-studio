@@ -497,7 +497,9 @@ fn render_offline_impl(
     // plugin may report a different latency after `setState` (e.g. a linear-phase
     // / oversampling mode toggled on). The realtime callback refreshes per block;
     // we refresh once up front so the warmup below reflects the real latency.
-    runtime.refresh_runtime_latency_graph(block as u32);
+    // Every export block is `block` frames, so that is the bridge period.
+    runtime.bridge_period_frames = block as u32;
+    runtime.refresh_runtime_latency_graph(runtime.bridge_period_frames);
 
     // Pre-roll / warmup: when Global Latency Sync (PDC) is on, the realtime graph
     // delays every path to the master bus by `max_path_latency` (+ master insert

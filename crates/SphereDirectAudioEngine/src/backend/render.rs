@@ -1553,6 +1553,11 @@ fn fill_output_f32_inner(
     }
 
     let frames_in_block = data.len().checked_div(channels).unwrap_or(0) as u64;
+    // Bridged-insert compensation is planned on the stream's configured period,
+    // whatever size this callback is (#377). Unchanged on every block but the
+    // first after a stream open or a graph swap.
+    runtime.bridge_period_frames =
+        shared.bridge_period_frames_for_block(frames_in_block.min(u32::MAX as u64) as u32);
     // Diagnostics only. Nothing below gates rendering on these any more: the
     // graph runs every block the engine renders, so a preview note, a live
     // input, an open editor or a decaying reverb tail cannot be missed by a

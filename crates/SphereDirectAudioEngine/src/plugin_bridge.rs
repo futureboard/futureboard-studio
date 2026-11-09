@@ -20,6 +20,26 @@ use std::sync::Arc;
 /// `sphere-plugin-host` asserts its own `MAX_BLOCK_FRAMES` matches this.
 pub const MAX_BRIDGE_BLOCK_FRAMES: usize = 2048;
 
+/// Latency a bridged insert adds to its track: what the plug-in reports plus
+/// the bridge's one-block handshake.
+///
+/// The engine hands the host a block and plays back the block the host
+/// finished one exchange earlier, so the handshake costs one *configured*
+/// period: the device buffer size the stream was opened with (see
+/// [`crate::engine::SharedState::bridge_period_frames_for_block`]). It is not
+/// the frame count of the callback being rendered. Variable-size callbacks
+/// (WASAPI shared/event mode, variable-period drivers, partial renders) would
+/// otherwise turn every block-size change into an apparent plug-in latency
+/// change and replan compensation on the audio thread, moving every dry
+/// track's delay with the block size.
+///
+/// Delay compensation and the user-facing latency report both go through
+/// this, so the two cannot disagree.
+#[inline]
+pub fn bridged_insert_latency_samples(reported_samples: u32, bridge_period_frames: u32) -> u32 {
+    reported_samples.saturating_add(bridge_period_frames)
+}
+
 /// How long a sink may wait for the host's block while Audioguard renders
 /// ahead, nanoseconds; `0` outside a render-ahead.
 ///

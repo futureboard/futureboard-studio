@@ -2717,6 +2717,15 @@ pub struct RuntimeProject {
     pub latency_graph: RuntimeLatencyGraph,
     /// Effective playback PDC flag used when this runtime graph was built.
     pub pdc_enabled: bool,
+    /// Bridge handshake period, frames: the configured device buffer size each
+    /// bridged insert's one-block handshake is charged at
+    /// ([`crate::plugin_bridge::bridged_insert_latency_samples`]). The live
+    /// callback sets it from [`crate::engine::SharedState::bridge_period_frames_for_block`];
+    /// 0 means not set yet, and the render pass then takes its first block.
+    pub bridge_period_frames: u32,
+    /// Times the audio thread has recomputed the compensation plan
+    /// ([`Self::refresh_runtime_latency_graph`]). Diagnostics only.
+    pub latency_replan_count: u64,
     /// When set, the render path ramps track/master fader gains across each block
     /// toward their target. Playback and offline export enable this so fader
     /// automation follows the same envelope. See `apply_fader`.
@@ -3238,15 +3247,15 @@ impl RuntimeProject {
     }
 
     /// Latency the track's own strip contributes, observed from the live
-    /// processors (bridged inserts add the one-block handshake on top of what
-    /// the host reports).
+    /// processors (bridged inserts add the one-block handshake at the
+    /// configured `bridge_period_frames` on top of what the host reports).
     ///
     /// Reads nothing but `track`, so the refresh path can call it while holding
     /// a mutable borrow of `self.tracks` — that is what lets the observed values
     /// be written straight back into each track instead of through a scratch
     /// `Vec` allocated on the audio thread.
     #[inline]
-    fn track_insert_latency_samples(track: &RuntimeTrack, bridge_block_frames: u32) -> u32 {
+    fn track_insert_latency_samples(track: &RuntimeTrack, bridge_period_frames: u32) -> u32 {
         // The built-in Soundfont Player sits ahead of the inserts, so its
         // decimation delay is part of the track's path either way.
         let instrument = track
@@ -3258,19 +3267,22 @@ impl RuntimeProject {
             return track.plugin_latency_samples.max(instrument);
         }
         track.inserts.iter().fold(instrument, |samples, insert| {
-            samples.saturating_add(Self::insert_latency_samples(insert, bridge_block_frames))
+            samples.saturating_add(Self::insert_latency_samples(insert, bridge_period_frames))
         })
     }
 
     /// Latency one insert adds to its track, or 0 while it is disabled.
     #[inline]
-    fn insert_latency_samples(insert: &RuntimeInsert, bridge_block_frames: u32) -> u32 {
+    fn insert_latency_samples(insert: &RuntimeInsert, bridge_period_frames: u32) -> u32 {
         if !insert.enabled {
             return 0;
         }
         if insert.kind_tag == RuntimeInsertKind::ExternalBridge {
             return insert.bridge_sink.as_ref().map_or(0, |sink| {
-                bridge_block_frames.saturating_add(sink.reported_latency_samples())
+                crate::plugin_bridge::bridged_insert_latency_samples(
+                    sink.reported_latency_samples(),
+                    bridge_period_frames,
+                )
             });
         }
         insert
@@ -3283,15 +3295,16 @@ impl RuntimeProject {
     /// [`Self::track_insert_latency_samples`], also recording on every insert
     /// the latency up to and including it, which is where a multi-out
     /// instrument's child strips are fed from.
-    fn observe_track_latency_samples(track: &mut RuntimeTrack, bridge_block_frames: u32) -> u32 {
-        let total = Self::track_insert_latency_samples(track, bridge_block_frames);
+    fn observe_track_latency_samples(track: &mut RuntimeTrack, bridge_period_frames: u32) -> u32 {
+        let total = Self::track_insert_latency_samples(track, bridge_period_frames);
         let mut chain = track
             .soundfont_player
             .as_ref()
             .map(RuntimeSoundfontPlayer::latency_samples)
             .unwrap_or(0);
         for insert in &mut track.inserts {
-            chain = chain.saturating_add(Self::insert_latency_samples(insert, bridge_block_frames));
+            chain =
+                chain.saturating_add(Self::insert_latency_samples(insert, bridge_period_frames));
             insert.chain_latency_samples = chain;
         }
         total
@@ -3499,7 +3512,16 @@ impl RuntimeProject {
     /// bridged plugin whose reported latency tracks something live (a network
     /// jitter buffer, say) re-entered it as often as its latency moved, and every
     /// visit was an allocation and an environment lock inside the callback.
-    pub fn refresh_runtime_latency_graph(&mut self, bridge_block_frames: u32) -> bool {
+    ///
+    /// `bridge_period_frames` is the *configured* bridge period
+    /// ([`Self::bridge_period_frames`]), never the frame count of the callback
+    /// being rendered (#377). Charged at the callback size, every change in
+    /// block size — WASAPI shared/event mode, variable-period drivers, partial
+    /// renders — read as a bridged plug-in's latency changing: the plan was
+    /// recomputed and every dry track's delay jumped with the block size. A
+    /// replan now happens only when a plug-in reports a new latency, the
+    /// configured period changes, or a graph swap brings new tracks.
+    pub fn refresh_runtime_latency_graph(&mut self, bridge_period_frames: u32) -> bool {
         const TRACKS_PER_CALLBACK: usize = 64;
         let track_count = self.tracks.len();
         if track_count == 0 {
@@ -3512,7 +3534,7 @@ impl RuntimeProject {
         for offset in 0..scan_count {
             let idx = (scan_start + offset) % track_count;
             let observed =
-                Self::track_insert_latency_samples(&self.tracks[idx], bridge_block_frames);
+                Self::track_insert_latency_samples(&self.tracks[idx], bridge_period_frames);
             changed = self
                 .latency_graph
                 .track_plugin_latency
@@ -3532,7 +3554,7 @@ impl RuntimeProject {
 
         for track in &mut self.tracks {
             track.plugin_latency_samples =
-                Self::observe_track_latency_samples(track, bridge_block_frames);
+                Self::observe_track_latency_samples(track, bridge_period_frames);
         }
         recompute_runtime_latency_graph(
             &mut self.latency_graph,
@@ -3540,6 +3562,7 @@ impl RuntimeProject {
             &self.audio_graph,
             self.pdc_enabled,
         );
+        self.latency_replan_count = self.latency_replan_count.wrapping_add(1);
         let refitted = self.fit_pdc_delay_capacity_realtime();
 
         if pdc_debug_enabled() {
@@ -4186,6 +4209,10 @@ impl RuntimeProject {
             audio_graph,
             latency_graph,
             pdc_enabled: pdc_active,
+            // Set by whoever renders the graph: the live callback from the
+            // open stream, the exporter from its block size.
+            bridge_period_frames: 0,
+            latency_replan_count: 0,
             // Realtime default: smooth fader/pan drags. The offline exporter
             // overrides this to `false` right after `build()` for a deterministic,
             // byte-identical bounce.

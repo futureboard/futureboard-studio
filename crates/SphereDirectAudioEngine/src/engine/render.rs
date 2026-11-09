@@ -1543,7 +1543,15 @@ fn render_project_block_interleaved_core(
     // offline exporter runs the same graph but never consumes these buffers, so
     // clearing them costs a memset over an empty (unallocated) scratch there.
     runtime.monitor.begin_block(frames);
-    runtime.refresh_runtime_latency_graph(frames as u32);
+    // Bridged inserts are charged one *configured* period for their handshake,
+    // never this callback's frame count: a callback whose size varies would
+    // otherwise replan compensation and move every dry track's delay with it
+    // (#377). The live callback sets the period from the open stream; a graph
+    // rendered without one (tests, a bare render) takes its first block.
+    if runtime.bridge_period_frames == 0 {
+        runtime.bridge_period_frames = frames as u32;
+    }
+    runtime.refresh_runtime_latency_graph(runtime.bridge_period_frames);
     let block_beat = sample_to_beat(runtime, base_sample);
     // Real transport ProcessContext for every plugin processed this block —
     // tempo from the map at this position, time signature from the engine,
