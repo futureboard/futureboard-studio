@@ -259,6 +259,21 @@ impl RuntimeTempoMapSnapshot {
         let seconds = samples as f64 / sample_rate.max(1.0);
         self.beat_at_seconds(seconds)
     }
+
+    /// Beats spanned by `samples` of audio ending at `beat`.
+    ///
+    /// Recording latency is a duration at the take. Mapping that sample count
+    /// with [`Self::beat_at_samples`] from sample 0 uses the tempo at the start
+    /// of the song, so a take recorded after a tempo change lands early or late.
+    pub fn beats_for_sample_span(&self, beat: f64, samples: u64, sample_rate: f64) -> f64 {
+        if samples == 0 {
+            return 0.0;
+        }
+        let at = self.samples_at_beat(beat.max(0.0), sample_rate);
+        let earlier = at.saturating_sub(samples);
+        (self.beat_at_samples(at, sample_rate) - self.beat_at_samples(earlier, sample_rate))
+            .max(0.0)
+    }
 }
 
 /// Project tempo map: the markers, and the segments they resolve to.
@@ -526,6 +541,41 @@ fn clamp_bpm(bpm: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn latency_samples_span_beats_at_the_take() {
+        let sr = 48_000.0;
+        let samples = 4_800u64; // 100 ms
+        let flat = TempoMap::static_tempo(120.0).into_snapshot();
+        let from_origin = flat.beat_at_samples(samples, sr);
+        let at_take = flat.beats_for_sample_span(20.0, samples, sr);
+        assert!((from_origin - 0.2).abs() < 1e-9, "{from_origin}");
+        assert!(
+            (at_take - from_origin).abs() < 1e-9,
+            "constant tempo must not depend on where the take is: {at_take} vs {from_origin}"
+        );
+
+        // 60 BPM from bar 1, 180 BPM from bar 9 (beat 32 in 4/4). 100 ms is
+        // 0.1 beats at the start and 0.3 beats where a take around bar 20 sits.
+        // Converting the sample count from beat 0 leaves the take late by
+        // two thirds of the latency.
+        let mapped =
+            TempoMap::from_points(60.0, vec![TempoPoint::hold(32.0, 180.0)]).into_snapshot();
+        let at_start = mapped.beats_for_sample_span(1.0, samples, sr);
+        let at_bar_20 = mapped.beats_for_sample_span(76.0, samples, sr);
+        let as_song_start = mapped.beat_at_samples(samples, sr);
+        assert!((at_start - 0.1).abs() < 1e-6, "{at_start}");
+        assert!((as_song_start - 0.1).abs() < 1e-6, "{as_song_start}");
+        assert!((at_bar_20 - 0.3).abs() < 1e-4, "{at_bar_20}");
+
+        // The window crosses the tempo change, so neither tempo alone is the
+        // span: 80 ms ending 40 ms into the 240 BPM section starts in the
+        // 60 BPM section.
+        let crossing =
+            TempoMap::from_points(60.0, vec![TempoPoint::hold(4.0, 240.0)]).into_snapshot();
+        let span = crossing.beats_for_sample_span(4.16, 3_840, sr);
+        assert!((span - 0.20).abs() < 1e-4, "{span}");
+    }
 
     #[test]
     fn static_tempo_conversions() {
