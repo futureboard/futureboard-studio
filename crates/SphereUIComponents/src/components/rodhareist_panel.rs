@@ -1819,6 +1819,34 @@ fn bank_row(
         .into_any_element()
 }
 
+fn preset_button(
+    id: &'static str,
+    label: &'static str,
+    tip: &'static str,
+    s: f32,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    div()
+        .id(id)
+        .flex()
+        .flex_1()
+        .items_center()
+        .justify_center()
+        .h(px(32.0 * s))
+        .min_w(px(0.0))
+        .px(px(6.0 * s))
+        .rounded(px(3.0 * s))
+        .border(px(1.0))
+        .border_color(color(0x454545))
+        .bg(color(0x2a2a2a))
+        .cursor(gpui::CursorStyle::PointingHand)
+        .hover(|style| style.bg(color(0x2e2e2e)))
+        .child(words(label, 12.5, WHITE, s))
+        .tooltip(fb_tooltip(tip))
+        .on_click(on_click)
+        .into_any_element()
+}
+
 /// The window's preset name field, in its row cell. Enter saves a `.pst`.
 fn preset_name_field(field: AnyElement, s: f32) -> AnyElement {
     div()
@@ -2023,7 +2051,7 @@ fn home(
             let user_list = if user_rows.is_empty() {
                 vec![
                     words("No saved presets yet.", 12.5, SOFT, s).into_any_element(),
-                    words("Name the rig above and press Save.", 12.0, FAINT, s).into_any_element(),
+                    words("Save the rig, or import a .pst.", 12.0, FAINT, s).into_any_element(),
                 ]
             } else {
                 user_rows
@@ -2031,27 +2059,35 @@ fn home(
             list.child(
                 div()
                     .flex()
-                    .flex_row()
-                    .items_center()
+                    .flex_col()
                     .gap(px(6.0 * s))
                     .child(preset_name_field(name_field, s))
                     .child(
                         div()
-                            .id("rodhareist-save-preset")
                             .flex()
-                            .items_center()
-                            .justify_center()
-                            .h(px(32.0 * s))
-                            .px(px(10.0 * s))
-                            .rounded(px(3.0 * s))
-                            .border(px(1.0))
-                            .border_color(color(0x454545))
-                            .bg(color(0x2a2a2a))
-                            .cursor(gpui::CursorStyle::PointingHand)
-                            .hover(|style| style.bg(color(0x2e2e2e)))
-                            .child(words("Save", 13.0, WHITE, s))
-                            .tooltip(fb_tooltip("Writes a .pst under the name in the field"))
-                            .on_click(w.save_user_preset_cb(cx)),
+                            .flex_row()
+                            .gap(px(6.0 * s))
+                            .child(preset_button(
+                                "rodhareist-save-preset",
+                                "Save",
+                                "Writes a .pst under the name in the field",
+                                s,
+                                w.save_user_preset_cb(cx),
+                            ))
+                            .child(preset_button(
+                                "rodhareist-rename-preset",
+                                "Rename",
+                                "Renames the loaded user preset to the name in the field",
+                                s,
+                                w.rename_user_preset_cb(cx),
+                            ))
+                            .child(preset_button(
+                                "rodhareist-import-preset",
+                                "Import",
+                                "Copies a .pst into your presets and loads it",
+                                s,
+                                w.import_user_preset_cb(cx),
+                            )),
                     ),
             )
             .child(
