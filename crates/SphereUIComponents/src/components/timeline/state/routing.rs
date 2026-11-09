@@ -652,13 +652,14 @@ impl TimelineState {
             .find(|t| t.id == target_track_id && is_project_routing_track(t))
             .map(|target| (target.id.clone(), target.name.clone()))?;
 
-        let track = self.tracks.iter_mut().find(|t| t.id == track_id)?;
+        let track = self.tracks.iter().find(|t| t.id == track_id)?;
         // Allow bus/return → bus/return chains; engine rejects cycles at plan time.
         // VSTi multi-out children remain send sources as before.
         if track.sends.iter().any(|s| s.target_track_id == target_id) {
             return None;
         }
-        let send_id = format!("send-{}-{}", track.id, track.sends.len() + 1);
+        let send_id = self.next_send_id_for(track_id);
+        let track = self.tracks.iter_mut().find(|t| t.id == track_id)?;
         track.sends.push(SendSlotState {
             id: send_id.clone(),
             target_track_id: target_id.clone(),
@@ -676,6 +677,33 @@ impl TimelineState {
             );
         }
         Some(send_id)
+    }
+
+    /// A send id no send in the project holds and none removed this session
+    /// ever held.
+    ///
+    /// Counting from the track's current number of sends handed a new send
+    /// the id of one that was still there once an earlier send had gone, and
+    /// everything that addresses a send by id (the wet/dry/wet split, send
+    /// level and on/off automation, the engine's live level) then reached the
+    /// wrong one. Same scheme as insert ids: a process-wide counter, so a
+    /// removed id is never regenerated, and a check against every send, since
+    /// the counter restarts with the process while a loaded project keeps the
+    /// ids it was saved with.
+    fn next_send_id_for(&self, track_id: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_SEND_SEQ: AtomicU64 = AtomicU64::new(1);
+        loop {
+            let seq = NEXT_SEND_SEQ.fetch_add(1, Ordering::Relaxed);
+            let candidate = format!("send-{track_id}-{seq}");
+            let taken = self
+                .tracks
+                .iter()
+                .any(|track| track.sends.iter().any(|send| send.id == candidate));
+            if !taken {
+                return candidate;
+            }
+        }
     }
 
     pub fn create_return_and_send(&mut self, track_id: &str) -> Option<(String, String)> {
@@ -1570,5 +1598,111 @@ mod tests {
         );
         assert!(state.set_insert_signal_bus(&audio, &vst, InsertSignalBus::Main));
         assert!(!state.set_insert_signal_bus(&audio, &slot_id, InsertSignalBus::Wdw));
+    }
+
+    /// #334: a new send never takes the id of a send that is still there,
+    /// nor of one removed earlier in the session.
+    #[test]
+    fn send_ids_are_never_reused() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let audio = create_track(&mut state, TrackType::Audio, "Guitar");
+        let a = create_track(&mut state, TrackType::Return, "A");
+        let b = create_track(&mut state, TrackType::Return, "B");
+        let c = create_track(&mut state, TrackType::Return, "C");
+
+        let first = state.add_send_to_target(&audio, &a).expect("send a");
+        let second = state.add_send_to_target(&audio, &b).expect("send b");
+        assert_ne!(first, second);
+        state.remove_send(&audio, &first);
+        let third = state.add_send_to_target(&audio, &c).expect("send c");
+        assert_ne!(third, second, "a live send keeps its id to itself");
+        assert_ne!(third, first, "a removed send's id is not handed out again");
+        state.remove_send(&audio, &third);
+        let fourth = state.add_send_to_target(&audio, &c).expect("send c again");
+        assert_ne!(fourth, third);
+        assert_ne!(fourth, second);
+
+        // A project saved with counted ids loads them as they are, and a new
+        // send steps around them.
+        let saved = format!("send-{audio}-1");
+        if let Some(track) = state.tracks.iter_mut().find(|track| track.id == audio) {
+            track.sends.retain(|send| send.id != fourth);
+            track.sends[0].id = saved.clone();
+        }
+        let fifth = state
+            .add_send_to_target(&audio, &c)
+            .expect("send c, loaded ids");
+        let ids: Vec<&str> = state
+            .find_track(&audio)
+            .unwrap()
+            .sends
+            .iter()
+            .map(|send| send.id.as_str())
+            .collect();
+        assert_eq!(ids, vec![saved.as_str(), fifth.as_str()]);
+    }
+
+    /// #334: turning wet/dry/wet off and on again never takes over a user's
+    /// send, and turning it off again never removes the user's return.
+    #[cfg(feature = "builtin-plugin-editor")]
+    #[test]
+    fn wdw_toggle_never_takes_over_a_user_send() {
+        fn set_wdw(state: &mut TimelineState, track_id: &str, slot_id: &str, on: bool) {
+            let slot = state
+                .tracks
+                .iter_mut()
+                .find(|track| track.id == track_id)
+                .and_then(|track| track.inserts.iter_mut().find(|slot| slot.id == slot_id))
+                .expect("slot");
+            slot.vst3_state = Some(rodhareist_json(on));
+        }
+
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let audio = create_track(&mut state, TrackType::Audio, "Guitar");
+        let hall = create_track(&mut state, TrackType::Return, "Hall");
+        let rig = install_rodhareist(&mut state, &audio, true);
+        assert!(state.sync_wdw_split(&audio));
+        let hall_send = state.add_send_to_target(&audio, &hall).expect("hall send");
+        assert!(state.set_send_gain_db(&audio, &hall_send, -12.0));
+        if let Some(send) = state
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == audio)
+            .and_then(|track| track.sends.iter_mut().find(|send| send.id == hall_send))
+        {
+            send.pre_fader = true;
+        }
+
+        for _ in 0..3 {
+            set_wdw(&mut state, &audio, &rig, false);
+            assert!(state.sync_wdw_split(&audio));
+            set_wdw(&mut state, &audio, &rig, true);
+            assert!(state.sync_wdw_split(&audio));
+
+            let track = state.find_track(&audio).unwrap();
+            let hall_slot = track
+                .sends
+                .iter()
+                .find(|send| send.id == hall_send)
+                .expect("the Hall send stays");
+            assert!(!hall_slot.wdw, "the Hall send is not the split send");
+            assert_eq!(hall_slot.target_track_id, hall);
+            assert!(hall_slot.pre_fader);
+            assert!((hall_slot.gain_db + 12.0).abs() < 1.0e-4);
+            let split = wdw_sends(&state, &audio);
+            assert_eq!(split.len(), 1);
+            assert_ne!(split[0].id, hall_send);
+            assert_ne!(split[0].target_track_id, hall);
+        }
+
+        set_wdw(&mut state, &audio, &rig, false);
+        assert!(state.sync_wdw_split(&audio));
+        assert!(state.find_track(&hall).is_some(), "the Hall return stays");
+        let track = state.find_track(&audio).unwrap();
+        assert_eq!(track.sends.len(), 1);
+        assert_eq!(track.sends[0].id, hall_send);
+        assert!(track.sends[0].enabled);
     }
 }
