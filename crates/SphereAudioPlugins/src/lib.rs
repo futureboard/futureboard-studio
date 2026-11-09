@@ -47,8 +47,8 @@ pub struct AudioPluginDspState {
     sample_rate: u32,
     eq_l: Vec<Biquad>,
     eq_r: Vec<Biquad>,
-    /// Cached process-path params (refreshed on rebuild / once per block).
-    /// Avoids string-keyed HashMap lookups and allocations on the sample loop.
+    /// Cached process-path params. Resolved when the insert is built or a
+    /// parameter changes — never from the sample loop.
     power: bool,
     is_eq: bool,
     drive: f32,
@@ -104,8 +104,11 @@ impl AudioPluginDspState {
         }
     }
 
-    /// Resolve sample-path scalars from the live param map. Call from the control
-    /// thread (rebuild) or once per audio block before the sample loop.
+    /// Resolve sample-path scalars from the live param map.
+    ///
+    /// Call when the insert is built, the sample rate changes, or a parameter
+    /// edit lands. The audio block reads the cached scalars and does not look
+    /// parameters up by name.
     pub fn refresh_process_params(&mut self, plugin_id: &str, params: &PluginParams) {
         self.power = param_bool(params, "power", true);
         self.is_eq = is_eq_plugin(plugin_id);
@@ -232,9 +235,9 @@ impl Biquad {
 
 /// Process one stereo sample through a plugin insert.
 ///
-/// This function is allocation-free for the realtime path. Any plugin that
-/// needs prepared coefficients must keep them inside `AudioPluginDspState` and
-/// rebuild from the control thread when parameters change.
+/// Allocation-free. Coefficients and scalars live in `AudioPluginDspState`;
+/// refresh them when parameters change, not from this function. `plugin_id`
+/// and `params` stay in the signature for existing callers.
 #[inline]
 pub fn process_stereo_sample(
     plugin_id: &str,
@@ -244,8 +247,6 @@ pub fn process_stereo_sample(
     l: f32,
     r: f32,
 ) -> (f32, f32) {
-    // Keep params usable for callers that mutate the map without rebuild —
-    // refresh is cheap vs HashMap lookups *per sample*.
     let _ = plugin_id;
     let _ = params;
     if !enabled || !state.power {
@@ -344,9 +345,12 @@ pub fn canonical_plugin_id(kind: &str) -> &str {
         || kind.eq_ignore_ascii_case("sphere.drive")
     {
         "sphere.drive"
+    } else if kind.eq_ignore_ascii_case("limiter") || kind.eq_ignore_ascii_case("sphere.limit") {
+        // Distinct from the compressor: the sample path uses this id to pick
+        // the 10:1 ratio. Folding it into `sphere.comp` compressed at 3:1.
+        "sphere.limit"
     } else if kind.eq_ignore_ascii_case("comp")
         || kind.eq_ignore_ascii_case("compressor")
-        || kind.eq_ignore_ascii_case("limiter")
         || kind.eq_ignore_ascii_case("sphere.comp")
     {
         "sphere.comp"
@@ -524,5 +528,65 @@ mod tests {
             // +6 dB at its centre: about twice the 0.25 input.
             assert!(peak > 0.4, "{bad}: the EQ stayed silent (peak {peak})");
         }
+    }
+
+    fn compressing(kind: &str, peak_reduction: f32) -> (PluginParams, AudioPluginDspState) {
+        let mut params = PluginParams::new();
+        params.insert("peakReduction".to_string(), Value::from(peak_reduction));
+        let id = canonical_plugin_id(kind);
+        let state = AudioPluginDspState::new(id, &params, 48_000);
+        (params, state)
+    }
+
+    /// Full-scale into 100% peak reduction. Threshold is 0.08; the overshoot
+    /// is divided by the ratio.
+    #[test]
+    fn limiter_compresses_at_ten_to_one_and_the_compressor_at_three_to_one() {
+        assert_eq!(canonical_plugin_id("limiter"), "sphere.limit");
+        assert_eq!(canonical_plugin_id("comp"), "sphere.comp");
+
+        let (params, mut limiter) = compressing("limiter", 100.0);
+        let (l, r) = process_stereo_sample(
+            canonical_plugin_id("limiter"),
+            true,
+            &params,
+            &mut limiter,
+            1.0,
+            -1.0,
+        );
+        let limited = soft_knee_compress(1.0, 0.08, 10.0);
+        assert!((l - limited).abs() < 1.0e-5, "limiter left {l}");
+        assert!((r + limited).abs() < 1.0e-5, "limiter right {r}");
+
+        let (params, mut comp) = compressing("compressor", 100.0);
+        let (l, _) = process_stereo_sample(
+            canonical_plugin_id("compressor"),
+            true,
+            &params,
+            &mut comp,
+            1.0,
+            1.0,
+        );
+        let compressed = soft_knee_compress(1.0, 0.08, 3.0);
+        assert!((l - compressed).abs() < 1.0e-5, "compressor {l}");
+        assert!((limited - compressed).abs() > 0.1);
+    }
+
+    /// Editing the param map must not change the sample path until a refresh.
+    /// That is what keeps name lookups off the audio block.
+    #[test]
+    fn the_sample_path_uses_cached_params_not_the_name_map() {
+        let (mut params, mut state) = compressing("limiter", 100.0);
+        let id = canonical_plugin_id("limiter");
+        let (before, _) = process_stereo_sample(id, true, &params, &mut state, 1.0, 1.0);
+        params.insert("peakReduction".to_string(), Value::from(0.0));
+        let (during, _) = process_stereo_sample(id, true, &params, &mut state, 1.0, 1.0);
+        assert_eq!(before, during);
+        state.refresh_process_params(id, &params);
+        let (after, _) = process_stereo_sample(id, true, &params, &mut state, 1.0, 1.0);
+        assert!(
+            (after - 1.0).abs() < 1.0e-5,
+            "refresh did not release the limiter: {after}"
+        );
     }
 }

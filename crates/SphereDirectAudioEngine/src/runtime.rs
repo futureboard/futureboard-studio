@@ -5674,7 +5674,9 @@ impl RuntimeProject {
             }
         }
 
-        // Built-in plugin insert: update params map and rebuild DSP state if needed.
+        // Built-in plugin insert: update the param map and the cached DSP
+        // scalars here. The audio block reads those scalars and does not look
+        // parameters up by name.
         insert
             .params
             .insert(param_id.to_string(), Value::from(value as f64));
@@ -5683,6 +5685,8 @@ impl RuntimeProject {
             insert
                 .dsp
                 .rebuild(plugin_id, &insert.params, self.sample_rate);
+        } else {
+            insert.dsp.refresh_process_params(plugin_id, &insert.params);
         }
     }
 
