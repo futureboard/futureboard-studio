@@ -286,7 +286,8 @@ mod state_mirror {
             quicksampler::ui::UI_ORIGIN => quicksampler::ui_param_id(wire_index).is_some(),
             slicer::ui::UI_ORIGIN => slicer::ui_param_id(wire_index).is_some(),
             zcomp::ui::UI_ORIGIN => zcomp::ui_param_id(wire_index).is_some(),
-            mixstation::ui::UI_ORIGIN => mixstation::ui_param_id(wire_index).is_some(),
+            // Its editor sends the rack as one wire-only rack-order edit.
+            mixstation::ui::UI_ORIGIN => mixstation::ipc::is_wire_index(wire_index),
             compresser::ui::UI_ORIGIN => compresser::ui_param_id(wire_index).is_some(),
             _ => false,
         };

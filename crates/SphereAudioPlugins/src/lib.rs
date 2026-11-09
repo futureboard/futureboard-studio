@@ -131,6 +131,40 @@ impl AudioPluginDspState {
         self.output_gain = db_to_linear(db);
         self.mix = param_f32(params, "mix", 100.0).clamp(0.0, 100.0) / 100.0;
     }
+
+    /// Take `next`'s settings — scalars and filter coefficients — while this
+    /// state keeps its running filter memory. Realtime-safe: it neither
+    /// allocates nor frees.
+    ///
+    /// A parameter edit is prepared on the control thread, whose copy of the
+    /// state never processes audio, so its filters sit at rest. Swapping that
+    /// copy in reset the running EQ on every edit, even of Output or Mix, and
+    /// clicked (#366). Only when the edit changes how many bands run do the
+    /// filter lists trade places: the old list goes back in `next` (for the
+    /// caller to free off the audio thread) and the new bands start from rest.
+    pub fn adopt_settings(&mut self, next: &mut Self) {
+        self.sample_rate = next.sample_rate;
+        self.power = next.power;
+        self.is_eq = next.is_eq;
+        self.drive = next.drive;
+        self.peak_reduction = next.peak_reduction;
+        self.compress_ratio = next.compress_ratio;
+        self.output_gain = next.output_gain;
+        self.mix = next.mix;
+        if self.eq_l.len() == next.eq_l.len() && self.eq_r.len() == next.eq_r.len() {
+            for (running, settings) in self
+                .eq_l
+                .iter_mut()
+                .zip(&next.eq_l)
+                .chain(self.eq_r.iter_mut().zip(&next.eq_r))
+            {
+                running.take_coefficients(settings);
+            }
+        } else {
+            std::mem::swap(&mut self.eq_l, &mut next.eq_l);
+            std::mem::swap(&mut self.eq_r, &mut next.eq_r);
+        }
+    }
 }
 
 impl Default for AudioPluginDspState {
@@ -213,6 +247,16 @@ impl Biquad {
             z1: 0.0,
             z2: 0.0,
         })
+    }
+
+    /// New coefficients; the filter memory (`z1`, `z2`) carries on.
+    #[inline]
+    fn take_coefficients(&mut self, other: &Self) {
+        self.b0 = other.b0;
+        self.b1 = other.b1;
+        self.b2 = other.b2;
+        self.a1 = other.a1;
+        self.a2 = other.a2;
     }
 
     #[inline]
@@ -528,6 +572,63 @@ mod tests {
             // +6 dB at its centre: about twice the 0.25 input.
             assert!(peak > 0.4, "{bad}: the EQ stayed silent (peak {peak})");
         }
+    }
+
+    /// #366: an edit prepared on the control thread arrives as a fresh state
+    /// whose filters are at rest. Adopting it must keep the running EQ's
+    /// filter memory, so a running EQ carries on exactly as one that simply
+    /// refreshed its scalars (Output, Mix) or took new coefficients (a band
+    /// gain) in place; only a change of band count starts the new bands.
+    #[test]
+    fn adopting_an_edit_keeps_the_running_filter_memory() {
+        let id = "sphere.eq8";
+        let sine = |n: usize| (n as f32 * std::f32::consts::TAU * 80.0 / 48_000.0).sin() * 0.5;
+        let params = eq_with_one_band();
+        let mut running = AudioPluginDspState::new(id, &params, 48_000);
+        for n in 0..4_800 {
+            let _ = process_stereo_sample(id, true, &params, &mut running, sine(n), sine(n));
+        }
+        assert!(running.eq_l[0].z1 != 0.0);
+
+        // Output and Mix: only the scalars move.
+        let mut edited = params.clone();
+        edited.insert("outputDb".to_string(), Value::from(-3.0));
+        edited.insert("mix".to_string(), Value::from(80.0));
+        let mut expected = running.clone();
+        expected.refresh_process_params(id, &edited);
+        let mut prepared = AudioPluginDspState::new(id, &edited, 48_000);
+        running.adopt_settings(&mut prepared);
+        for n in 4_800..4_900 {
+            let got = process_stereo_sample(id, true, &edited, &mut running, sine(n), sine(n));
+            let want = process_stereo_sample(id, true, &edited, &mut expected, sine(n), sine(n));
+            assert_eq!(got, want, "sample {n} after an Output/Mix edit");
+        }
+
+        // A band gain: new coefficients, same memory.
+        edited.insert("band1Gain".to_string(), Value::from(9.0));
+        let mut prepared = AudioPluginDspState::new(id, &edited, 48_000);
+        let mut expected = running.clone();
+        for (e, p) in expected.eq_l.iter_mut().zip(&prepared.eq_l) {
+            e.take_coefficients(p);
+        }
+        for (e, p) in expected.eq_r.iter_mut().zip(&prepared.eq_r) {
+            e.take_coefficients(p);
+        }
+        let z1 = running.eq_l[0].z1;
+        running.adopt_settings(&mut prepared);
+        assert_eq!(running.eq_l[0].z1, z1);
+        assert_eq!(running.eq_l[0].b0, prepared.eq_l[0].b0);
+        let got = process_stereo_sample(id, true, &edited, &mut running, 0.1, 0.1);
+        let want = process_stereo_sample(id, true, &edited, &mut expected, 0.1, 0.1);
+        assert_eq!(got, want);
+
+        // A second band switched on: the lists trade places, the old one goes
+        // back to the caller to be freed off the audio thread.
+        edited.insert("band2Active".to_string(), Value::Bool(true));
+        let mut prepared = AudioPluginDspState::new(id, &edited, 48_000);
+        running.adopt_settings(&mut prepared);
+        assert_eq!(running.eq_l.len(), 2);
+        assert_eq!(prepared.eq_l.len(), 1);
     }
 
     fn compressing(kind: &str, peak_reduction: f32) -> (PluginParams, AudioPluginDspState) {

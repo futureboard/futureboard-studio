@@ -184,7 +184,8 @@ impl KitModel for MixStationPlate {
     }
 
     fn wire_values(self, params: &Params) -> Vec<(u32, f32)> {
-        model::wire_values(params)
+        // The rack goes out as one edit, never slot by slot (#354).
+        model::editor_wire_values(params)
     }
 
     fn with(self, params: &Params, id: &str, value: f32) -> Params {

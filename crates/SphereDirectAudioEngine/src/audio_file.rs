@@ -1658,6 +1658,53 @@ mod audition_tests {
 }
 
 #[cfg(test)]
+mod flac_roundtrip_tests {
+    use super::*;
+    use sphere_encoder::flac::FlacEncoder;
+    use sphere_encoder::{
+        AudioEncodeSpec, AudioEncoder, AudioMetadata, AudioSampleFormat, FlacEncodeOptions,
+    };
+
+    /// #352: a FLAC export whose length is not a multiple of the 4096-frame
+    /// block size — almost every real export, including one whose last block
+    /// is under 16 frames — probes and loads back through the import path.
+    #[test]
+    fn exported_flac_of_any_length_imports_back() {
+        for frames in [4_096 * 3 + 1, 4_096 * 2 + 1_000, 4_096, 300] {
+            let path = std::env::temp_dir().join(format!(
+                "fb_flac_roundtrip_{}_{frames}.flac",
+                std::process::id()
+            ));
+            let mut enc = FlacEncoder::create(
+                &path,
+                AudioEncodeSpec {
+                    sample_rate: 48_000,
+                    channels: 2,
+                    sample_format: AudioSampleFormat::I16,
+                },
+                FlacEncodeOptions::default(),
+                AudioMetadata::default(),
+            )
+            .unwrap();
+            let input: Vec<f32> = (0..frames * 2)
+                .map(|i| ((i / 2) as f32 * 0.01).sin() * 0.5)
+                .collect();
+            enc.write_interleaved_f32(&input).unwrap();
+            enc.finalize().unwrap();
+
+            let info = probe_audio_file(&path);
+            let loaded = load_audio_file(path.to_str().unwrap());
+            let _ = std::fs::remove_file(&path);
+            let info = info.unwrap_or_else(|e| panic!("{frames} frames: probe: {e}"));
+            assert_eq!(info.total_frames, frames as u64, "{frames} frames");
+            let loaded = loaded.unwrap_or_else(|e| panic!("{frames} frames: load: {e}"));
+            assert_eq!(loaded.channels, 2);
+            assert_eq!(loaded.samples.len(), frames * 2, "{frames} frames");
+        }
+    }
+}
+
+#[cfg(test)]
 mod peak_tests {
     use super::*;
     use sphere_encoder::rauf::{RaufConfig, RaufSampleFormat, RaufWriter};

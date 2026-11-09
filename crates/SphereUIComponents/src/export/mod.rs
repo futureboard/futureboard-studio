@@ -292,6 +292,27 @@ mod tests {
         assert_eq!(req.render.channels, 2);
     }
 
+    /// #362: dither is TPDF unless turned off, and the choice reaches the
+    /// encoder; it only matters for integer output.
+    #[test]
+    fn the_dither_choice_reaches_the_encoder() {
+        use sphere_encoder::{AudioDither, AudioSampleFormat};
+        let snapshot = snapshot_with_content(4.0);
+        let mut s = valid_wav();
+        assert_eq!(s.dither, AudioDither::Tpdf);
+        let req = s.to_request(&snapshot, &defaults()).unwrap();
+        assert_eq!(req.encode_options.dither, AudioDither::Tpdf);
+        s.dither = AudioDither::Off;
+        let req = s.to_request(&snapshot, &defaults()).unwrap();
+        assert_eq!(req.encode_options.dither, AudioDither::Off);
+
+        assert!(s.dither_applies(), "24-bit WAV");
+        s.wav_sample_format = AudioSampleFormat::F32;
+        assert!(!s.dither_applies(), "float WAV");
+        s.format = sphere_encoder::AudioFileFormat::Flac;
+        assert!(s.dither_applies(), "FLAC");
+    }
+
     #[test]
     fn empty_arrangement_reports_no_content() {
         let snapshot = snapshot_with_content(0.0);

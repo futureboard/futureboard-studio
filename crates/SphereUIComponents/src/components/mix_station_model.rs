@@ -115,6 +115,22 @@ pub fn wire_values(params: &Params) -> Vec<(u32, f32)> {
         .collect()
 }
 
+/// What the editor sends: every param in wire order, except that the six
+/// rack slots travel as one rack-order edit in slot 1's place. Sent slot by
+/// slot, a reorder could reach the DSP half-applied and drop a module for a
+/// moment, then restart it from rest (#354).
+pub fn editor_wire_values(params: &Params) -> Vec<(u32, f32)> {
+    use mixstation::ipc::{rack_order_value, RACK_ORDER_INDEX, SLOT_1_INDEX, SLOT_6_INDEX};
+    wire_values(params)
+        .into_iter()
+        .filter_map(|(index, value)| match index {
+            SLOT_1_INDEX => Some((RACK_ORDER_INDEX, rack_order_value(params))),
+            index if index > SLOT_1_INDEX && index <= SLOT_6_INDEX => None,
+            _ => Some((index, value)),
+        })
+        .collect()
+}
+
 /// Applies one edit by id the way the DSP will, a slot's de-duplication
 /// included.
 pub fn with(params: &Params, id: &str, value: f32) -> Params {
@@ -254,6 +270,41 @@ mod tests {
                         landed = with(&landed, mixstation::ui_param_id(index).unwrap(), value);
                     }
                 }
+                assert!(same(&landed, &target), "{from:?} → {to:?}");
+            }
+        }
+    }
+
+    /// #354: what the editor sends for any reorder is one rack-order edit
+    /// and no slot edits, and replaying it through the DSP's wire table lands
+    /// on the target.
+    #[test]
+    fn a_reorder_goes_out_as_one_rack_edit() {
+        use mixstation::ipc::{apply_wire_param, RACK_ORDER_INDEX, SLOT_1_INDEX, SLOT_6_INDEX};
+        let base = presets()[1].params.clone();
+        let orders: [&[u8]; 5] = [&[6, 5, 4, 3, 2, 1], &[2, 1], &[3], &[], &[4, 1, 6, 2, 5, 3]];
+        for from in orders {
+            for to in orders {
+                let start = with_order(&base, from);
+                let target = with_order(&start, to);
+                let before = editor_wire_values(&start);
+                let edits: Vec<(u32, f32)> = editor_wire_values(&target)
+                    .into_iter()
+                    .filter(|edit| !before.contains(edit))
+                    .collect();
+                assert!(
+                    edits
+                        .iter()
+                        .all(|(index, _)| !(SLOT_1_INDEX..=SLOT_6_INDEX).contains(index)),
+                    "{from:?} → {to:?}: slot edits {edits:?}"
+                );
+                let rack_edits = edits.iter().filter(|(i, _)| *i == RACK_ORDER_INDEX).count();
+                assert_eq!(rack_edits, usize::from(from != to), "{from:?} → {to:?}");
+                let mut landed = start.clone();
+                for (index, value) in edits {
+                    assert!(apply_wire_param(&mut landed, index, value));
+                }
+                assert_eq!(order(&landed), to, "{from:?} → {to:?}");
                 assert!(same(&landed, &target), "{from:?} → {to:?}");
             }
         }

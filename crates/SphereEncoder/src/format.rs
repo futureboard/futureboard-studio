@@ -413,9 +413,28 @@ pub(crate) fn f32_to_i32(x: f32) -> i32 {
     v.round() as i32
 }
 
-/// Seed of every encoder's dither generator. Fixed, so the same input always
-/// encodes to the same file (reproducible bounces and tests).
+/// Base of the dither generators' seeds.
 const DITHER_SEED: u32 = 0x9E37_79B9;
+
+/// The dither seed for an encoder writing `path`: a hash of the path.
+///
+/// Every encoder used to start from the same seed, so a stem export gave the
+/// mixdown and every stem byte-identical dither noise: summed later, it added
+/// up coherently (about 16 dB over independent dither with 40 stems), and
+/// silent stems became identical noise files (#362). Seeding from the file
+/// path gives each file its own noise, while the same render written to the
+/// same file still encodes to the same bytes.
+pub(crate) fn dither_seed_for(path: &Path) -> u32 {
+    // FNV-1a over the path bytes, folded into the base seed.
+    let hash = path
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .fold(0x811C_9DC5u32 ^ DITHER_SEED, |hash, &byte| {
+            (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+        });
+    if hash == 0 { DITHER_SEED } else { hash }
+}
 
 /// Float / 32-bit integer to 16- or 24-bit integer conversion, with the
 /// encoder's [`AudioDither`]. One per encoder, advanced sample by sample, so
@@ -423,6 +442,8 @@ const DITHER_SEED: u32 = 0x9E37_79B9;
 #[derive(Debug, Clone)]
 pub(crate) struct Quantizer {
     dither: AudioDither,
+    /// Where the noise sequence starts; never zero (xorshift would stick).
+    seed: u32,
     state: u32,
 }
 
@@ -430,7 +451,28 @@ impl Quantizer {
     pub(crate) fn new(dither: AudioDither) -> Self {
         Self {
             dither,
+            seed: DITHER_SEED,
             state: DITHER_SEED,
+        }
+    }
+
+    /// An undithered quantizer whose dither, once switched on with
+    /// [`Self::with_dither`], is seeded for the file at `path`.
+    pub(crate) fn for_file(path: &Path) -> Self {
+        let seed = dither_seed_for(path);
+        Self {
+            dither: AudioDither::Off,
+            seed,
+            state: seed,
+        }
+    }
+
+    /// This quantizer's seed with `dither`, from the start of its sequence.
+    pub(crate) fn with_dither(&self, dither: AudioDither) -> Self {
+        Self {
+            dither,
+            seed: self.seed,
+            state: self.seed,
         }
     }
 
@@ -580,6 +622,41 @@ mod tests {
             let x = (n as f32 * 0.001).sin() * 1e-3;
             assert_eq!(a.f32_to_i16(x), b.f32_to_i16(x));
         }
+    }
+
+    /// #362: each file's dither is its own. Stems of one export get distinct
+    /// seeds and uncorrelated noise (silence through two of them is not the
+    /// same file), while one path always gets the same seed.
+    #[test]
+    fn every_file_gets_its_own_dither() {
+        let dir = std::path::Path::new("C:/Exports/Song");
+        let paths: Vec<std::path::PathBuf> = ["Song.wav", "Song - Bass.wav", "Song - Drums.wav"]
+            .iter()
+            .map(|name| dir.join(format!("{name}.partial")))
+            .collect();
+        let seeds: Vec<u32> = paths.iter().map(|p| dither_seed_for(p)).collect();
+        assert_eq!(seeds[0], dither_seed_for(&paths[0]), "stable per path");
+        assert!(seeds.iter().all(|&s| s != 0));
+        assert!(seeds[0] != seeds[1] && seeds[1] != seeds[2] && seeds[0] != seeds[2]);
+
+        let noise = |path: &std::path::Path| -> Vec<i16> {
+            let mut q = Quantizer::for_file(path).with_dither(AudioDither::Tpdf);
+            (0..48_000).map(|_| q.f32_to_i16(0.0)).collect()
+        };
+        let (a, b) = (noise(&paths[1]), noise(&paths[2]));
+        assert_ne!(a, b, "silent stems must not be identical noise");
+        assert_eq!(a, noise(&paths[1]), "the same file encodes the same");
+        // Coherent noise would correlate fully; independent noise near zero.
+        let dot: i64 = a
+            .iter()
+            .zip(&b)
+            .map(|(&x, &y)| i64::from(x) * i64::from(y))
+            .sum();
+        let power: i64 = a.iter().map(|&x| i64::from(x) * i64::from(x)).sum();
+        assert!(
+            (dot as f64).abs() < 0.05 * power as f64,
+            "stem noise correlates: {dot} of {power}"
+        );
     }
 
     /// Dither is opt-in: the shared default (LiveStage's recorder, bounces,

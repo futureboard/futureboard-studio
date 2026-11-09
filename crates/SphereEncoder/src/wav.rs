@@ -241,6 +241,7 @@ impl WavEncoder {
         options: WavEncodeOptions,
     ) -> std::result::Result<Self, EncodeError> {
         spec.validate()?;
+        let quantizer = Quantizer::for_file(path.as_ref());
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
         write_stream_header_placeholder(&mut writer, &spec, options.rf64)?;
@@ -251,14 +252,14 @@ impl WavEncoder {
             rf64: options.rf64,
             finalized: false,
             scratch: Vec::new(),
-            quantizer: Quantizer::new(AudioDither::Off),
+            quantizer,
         })
     }
 
-    /// Dither 16- and 24-bit PCM with `dither`. Float and 32-bit PCM are
-    /// never dithered.
+    /// Dither 16- and 24-bit PCM with `dither`, seeded for this file. Float
+    /// and 32-bit PCM are never dithered.
     pub fn with_dither(mut self, dither: AudioDither) -> Self {
-        self.quantizer = Quantizer::new(dither);
+        self.quantizer = self.quantizer.with_dither(dither);
         self
     }
 

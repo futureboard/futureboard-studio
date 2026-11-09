@@ -186,6 +186,10 @@ pub struct ExportSettings {
     pub mp3_bitrate_kbps: u16,
     pub normalize: ExportNormalizeChoice,
     pub tail: ExportTailChoice,
+    /// Dither for 16/24-bit output (and the 16-bit PCM an MP3 is made from):
+    /// TPDF by default, like the live device output (#322), or off. Float
+    /// output is never dithered.
+    pub dither: AudioDither,
     /// Write the stereo mixdown (the master).
     pub include_mixdown: bool,
     /// Mixer channels to write a file each for, by id. Any mix of these and
@@ -210,6 +214,7 @@ impl Default for ExportSettings {
             // Capture reverb/delay/instrument-release tails past the last content
             // by default so exports don't hard-cut the decay.
             tail: ExportTailChoice::FixedSeconds(TAIL_FIXED_SECONDS),
+            dither: AudioDither::Tpdf,
             include_mixdown: true,
             selected_tracks: Vec::new(),
             render_mode: ExportRenderMode::Offline,
@@ -433,6 +438,15 @@ impl ExportSettings {
             .collect();
     }
 
+    /// Whether the output is quantized to integers, so the dither choice
+    /// matters: WAV at 16 or 24 bits, FLAC, MP3.
+    pub fn dither_applies(&self) -> bool {
+        matches!(
+            self.sample_format(),
+            AudioSampleFormat::I16 | AudioSampleFormat::I24
+        )
+    }
+
     fn sample_format(&self) -> AudioSampleFormat {
         match self.format {
             AudioFileFormat::Wav => self.wav_sample_format,
@@ -602,9 +616,9 @@ impl ExportSettings {
 
         let mut encode_options = AudioEncodeOptions {
             format: self.format,
-            // Studio exports dither 16/24-bit output like the live device
-            // output does (#322). Float and 32-bit output is never dithered.
-            dither: AudioDither::Tpdf,
+            // TPDF unless turned off (#322, #362). Float and 32-bit output is
+            // never dithered whatever this says.
+            dither: self.dither,
             ..Default::default()
         };
         encode_options.flac = FlacEncodeOptions {

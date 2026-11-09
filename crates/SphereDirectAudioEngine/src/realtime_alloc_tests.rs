@@ -835,6 +835,113 @@ fn moving_builtin_eq_parameter_rebuilds_dsp_is_realtime_clean() {
     );
 }
 
+fn drive_insert(id: &str, drive: f64) -> crate::types::EngineInsertSnapshot {
+    let mut params = HashMap::new();
+    params.insert("drive".to_string(), serde_json::Value::from(drive));
+    crate::types::EngineInsertSnapshot {
+        id: id.to_string(),
+        kind: "sphere.drive".to_string(),
+        enabled: true,
+        params,
+        state: None,
+    }
+}
+
+fn drive_of(runtime: &RuntimeProject, insert_id: &str) -> Option<f64> {
+    runtime.tracks[0]
+        .inserts
+        .iter()
+        .find(|insert| insert.id == insert_id)
+        .and_then(|insert| insert.params.get("drive"))
+        .and_then(|value| value.as_f64())
+}
+
+/// #365: the UI takes a snapshot that removes the insert ahead of the one
+/// being dragged, the drag moves the knob again, and only then does the sync
+/// swap the graph. The edit goes to the old graph at the index it has there,
+/// and the new graph — built from the older snapshot — still carries it.
+#[test]
+fn a_parameter_edit_made_while_a_sync_is_in_flight_survives_the_swap() {
+    let engine = EngineInner::new();
+    let mut proj = snapshot(Vec::new());
+    proj.tracks[0].inserts.push(drive_insert("drive-a", 0.1));
+    proj.tracks[0].inserts.push(drive_insert("drive-b", 0.2));
+    engine.load_project(proj.clone()).unwrap();
+    let (rx, mut runtime) = engine.open_test_stream(SR);
+    let shared = Arc::clone(&engine.shared);
+    let mut local = LocalAudioState::new(SR as f64);
+    drain_commands(&rx, &mut runtime, &shared, &mut local, SR);
+
+    let as_of = engine.insert_param_revision();
+    let mut next = proj.clone();
+    next.tracks[0].inserts.remove(0);
+
+    engine
+        .set_insert_param(
+            TRACK.to_string(),
+            "drive-b".to_string(),
+            "drive".to_string(),
+            0.8,
+        )
+        .unwrap();
+    // The edit is queued against the old graph, where drive-b is second.
+    match rx.try_recv().expect("insert param command") {
+        EngineCommand::SetInsertParam { insert_index, .. } => assert_eq!(insert_index, 1),
+        _ => panic!("expected SetInsertParam"),
+    }
+
+    engine.load_project_as_of(next, as_of).unwrap();
+    drain_commands(&rx, &mut runtime, &shared, &mut local, SR);
+
+    assert_eq!(runtime.tracks[0].inserts.len(), 1);
+    assert_eq!(drive_of(&runtime, "drive-b"), Some(0.8f32 as f64));
+    // The next edit resolves against the new graph, where drive-b is first.
+    engine
+        .set_insert_param(
+            TRACK.to_string(),
+            "drive-b".to_string(),
+            "drive".to_string(),
+            0.9,
+        )
+        .unwrap();
+    match rx.try_recv().expect("insert param command") {
+        EngineCommand::SetInsertParam { insert_index, .. } => assert_eq!(insert_index, 0),
+        _ => panic!("expected SetInsertParam"),
+    }
+}
+
+/// #365: an edit the snapshot already holds is not replayed over it, so a
+/// later sync that sets another value (a preset, an undo) wins.
+#[test]
+fn a_snapshot_newer_than_an_edit_keeps_its_own_value() {
+    let engine = EngineInner::new();
+    let mut proj = snapshot(Vec::new());
+    proj.tracks[0].inserts.push(drive_insert("drive-a", 0.1));
+    proj.tracks[0].inserts.push(drive_insert("drive-b", 0.2));
+    engine.load_project(proj.clone()).unwrap();
+    let (rx, mut runtime) = engine.open_test_stream(SR);
+    let shared = Arc::clone(&engine.shared);
+    let mut local = LocalAudioState::new(SR as f64);
+    drain_commands(&rx, &mut runtime, &shared, &mut local, SR);
+
+    engine
+        .set_insert_param(
+            TRACK.to_string(),
+            "drive-b".to_string(),
+            "drive".to_string(),
+            0.8,
+        )
+        .unwrap();
+    let as_of = engine.insert_param_revision();
+    let mut next = proj.clone();
+    next.tracks[0].inserts.remove(0);
+    next.tracks[0].inserts[0] = drive_insert("drive-b", 0.3);
+    engine.load_project_as_of(next, as_of).unwrap();
+    drain_commands(&rx, &mut runtime, &shared, &mut local, SR);
+
+    assert_eq!(drive_of(&runtime, "drive-b"), Some(0.3));
+}
+
 #[test]
 fn toggling_insert_bypass_is_realtime_clean() {
     let engine = EngineInner::new();

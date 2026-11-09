@@ -139,7 +139,7 @@ impl FlacEncoder {
             next_frame: 0,
             sink: ByteSink::new(),
             frame_bytes: 0,
-            quantizer: Quantizer::new(AudioDither::Off),
+            quantizer: Quantizer::for_file(path.as_ref()),
             metadata,
             finalized: false,
         };
@@ -148,9 +148,9 @@ impl FlacEncoder {
         Ok(encoder)
     }
 
-    /// Dither the 16/24-bit samples with `dither`.
+    /// Dither the 16/24-bit samples with `dither`, seeded for this file.
     pub fn with_dither(mut self, dither: AudioDither) -> Self {
-        self.quantizer = Quantizer::new(dither);
+        self.quantizer = self.quantizer.with_dither(dither);
         self
     }
 
@@ -344,6 +344,15 @@ impl AudioEncoder for FlacEncoder {
         let total_samples = self.context.total_samples();
         self.stream_info.set_md5_digest(&self.context.md5_digest());
         self.stream_info.set_total_samples(total_samples);
+        // `update_frame_info` folded the last, shorter block into the minimum
+        // block size. The format excludes the last block from it, and
+        // decoders (Studio's own among them) read min != max as a
+        // variable-block-size stream and refuse it — or, for a last block
+        // under 16 samples, an invalid one (#352). Every block but the last
+        // is `block_size`, so both bounds are `block_size`, as libFLAC writes.
+        self.stream_info
+            .set_block_sizes(self.block_size, self.block_size)
+            .map_err(|err| flac_error("STREAMINFO block size", err))?;
 
         // Patch the placeholder STREAMINFO in place.
         self.writer.flush()?;
@@ -535,7 +544,11 @@ mod tests {
                     }
                 })
                 .collect();
-            let expected = whole_stream_flac(&ints, channels as usize, bits, 256);
+            let mut expected = whole_stream_flac(&ints, channels as usize, bits, 256);
+            // The one intended difference (#352): `flacenc` records the short
+            // last block as the minimum block size; the format excludes the
+            // last block, so the streaming encoder writes `block_size`.
+            expected[8..10].copy_from_slice(&256u16.to_be_bytes());
             let bytes = std::fs::read(&path).unwrap();
             assert_eq!(summary.bytes_written, bytes.len() as u64);
             assert!(
@@ -572,23 +585,68 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    /// #322: dither is deterministic per encoder (the same render encodes to
-    /// the same file) and does change a quiet signal's samples.
+    /// #352: STREAMINFO's minimum block size excludes the last block, so a
+    /// render whose length is not a multiple of the block size still reads
+    /// as a fixed-block-size stream (min == max), even when the last block
+    /// is shorter than the 16-sample minimum a block size may declare.
+    #[test]
+    fn short_last_block_keeps_a_fixed_block_size_streaminfo() {
+        for frames in [4_096 * 3 + 1, 4_096 * 2 + 1_000, 4_096, 300] {
+            let path = temp_path("short-last-block");
+            let input = signal(frames, 2);
+            let mut enc = encode_streaming(
+                &path,
+                AudioSampleFormat::I16,
+                2,
+                4_096,
+                AudioDither::Off,
+                &input,
+                1_024,
+            );
+            let summary = enc.finalize().unwrap();
+            assert_eq!(summary.frames_written, frames as u64);
+            let bytes = std::fs::read(&path).unwrap();
+            let _ = std::fs::remove_file(&path);
+            let min_block = u16::from_be_bytes([bytes[8], bytes[9]]);
+            let max_block = u16::from_be_bytes([bytes[10], bytes[11]]);
+            assert_eq!(
+                (min_block, max_block),
+                (4_096, 4_096),
+                "{frames} frames: STREAMINFO block sizes"
+            );
+            let total = (u64::from(bytes[21] & 0x0F) << 32)
+                | u64::from(u32::from_be_bytes(bytes[22..26].try_into().unwrap()));
+            assert_eq!(total, frames as u64);
+        }
+    }
+
+    /// #322: dither is deterministic per file (the same render encodes to the
+    /// same file) and does change a quiet signal's samples. #362: another
+    /// file gets other noise.
     #[test]
     fn dithered_flac_is_reproducible_and_differs_from_undithered() {
         let input: Vec<f32> = signal(6_000, 2).iter().map(|x| x * 1e-4).collect();
-        let encode = |dither| {
-            let path = temp_path("dither");
+        let (path, other) = (temp_path("dither"), temp_path("dither-other"));
+        let encode = |path: &Path, dither| {
             let mut enc =
-                encode_streaming(&path, AudioSampleFormat::I16, 2, 4096, dither, &input, 512);
+                encode_streaming(path, AudioSampleFormat::I16, 2, 4096, dither, &input, 512);
             enc.finalize().unwrap();
-            let bytes = std::fs::read(&path).unwrap();
+            let bytes = std::fs::read(path).unwrap();
             let _ = std::fs::remove_file(path);
             bytes
         };
-        let dithered = encode(AudioDither::Tpdf);
-        assert_eq!(dithered, encode(AudioDither::Tpdf), "dither must be seeded");
-        assert_ne!(dithered, encode(AudioDither::Off));
+        let dithered = encode(&path, AudioDither::Tpdf);
+        assert_eq!(
+            dithered,
+            encode(&path, AudioDither::Tpdf),
+            "dither must be seeded"
+        );
+        assert_ne!(dithered, encode(&path, AudioDither::Off));
+        assert_ne!(
+            dithered,
+            encode(&other, AudioDither::Tpdf),
+            "each file gets its own dither"
+        );
     }
 
     /// LiveStage's recorder builds its options as `..AudioEncodeOptions::

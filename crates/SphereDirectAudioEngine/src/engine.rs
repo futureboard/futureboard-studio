@@ -1130,6 +1130,157 @@ struct LiveInputHandle {
     tap: crate::capture_tap::CaptureTapControl,
 }
 
+/// Plug-in parameter edits since the snapshots that may still be loading.
+///
+/// A project sync builds its graph from a snapshot taken on the UI thread,
+/// then swaps it in from a background thread. A parameter edit made in
+/// between already went to the running graph, but the new graph — built from
+/// the older snapshot — would drop it again (#365). Each edit is recorded
+/// here with a revision; the UI reads [`EngineInner::insert_param_revision`]
+/// as it takes a snapshot, and `load_project_as_of` replays every newer edit
+/// into the new graph before it is swapped in.
+#[derive(Debug, Default)]
+struct InsertParamJournal {
+    revision: u64,
+    /// The newest edit of each `(track, insert, param)`.
+    edits: Vec<JournaledInsertParam>,
+}
+
+#[derive(Debug)]
+struct JournaledInsertParam {
+    revision: u64,
+    track_id: String,
+    insert_id: String,
+    param_id: String,
+    value: f32,
+}
+
+impl InsertParamJournal {
+    /// Edits kept between project syncs. Each key holds one entry, so this is
+    /// only reached by a session touching that many distinct parameters with
+    /// no sync between; the oldest edit then goes first.
+    const MAX_EDITS: usize = 1024;
+
+    fn record(&mut self, track_id: &str, insert_id: &str, param_id: &str, value: f32) {
+        self.revision += 1;
+        let revision = self.revision;
+        if let Some(edit) = self.edits.iter_mut().find(|edit| {
+            edit.param_id == param_id && edit.insert_id == insert_id && edit.track_id == track_id
+        }) {
+            edit.revision = revision;
+            edit.value = value;
+            return;
+        }
+        if self.edits.len() >= Self::MAX_EDITS {
+            if let Some(oldest) = self
+                .edits
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, edit)| edit.revision)
+                .map(|(index, _)| index)
+            {
+                self.edits.swap_remove(oldest);
+            }
+        }
+        self.edits.push(JournaledInsertParam {
+            revision,
+            track_id: track_id.to_string(),
+            insert_id: insert_id.to_string(),
+            param_id: param_id.to_string(),
+            value,
+        });
+    }
+
+    /// Apply every edit newer than `as_of` to a graph built from a snapshot
+    /// taken at `as_of`, then forget the edits that snapshot already holds.
+    fn replay_into(&mut self, runtime: &mut RuntimeProject, as_of: u64, sample_rate: u32) {
+        for edit in self.edits.iter().filter(|edit| edit.revision > as_of) {
+            let insert = runtime
+                .tracks
+                .iter_mut()
+                .find(|track| track.id == edit.track_id)
+                .and_then(|track| {
+                    track
+                        .inserts
+                        .iter_mut()
+                        .find(|insert| insert.id == edit.insert_id)
+                });
+            if let Some(insert) = insert {
+                // The whole graph is about to be swapped in: its own state is
+                // the change, so the prepared command half is not needed.
+                let _ = stage_insert_param(insert, &edit.param_id, edit.value, sample_rate);
+            }
+        }
+        self.edits.retain(|edit| edit.revision > as_of);
+    }
+}
+
+/// Apply a parameter edit to a control-thread copy of an insert and prepare
+/// what the audio thread needs to apply the same edit to its own copy.
+fn stage_insert_param(
+    insert: &mut RuntimeInsert,
+    param_id: &str,
+    value: f32,
+    sample_rate: u32,
+) -> (
+    crate::command::ResolvedParamId,
+    Option<Box<crate::command::InsertParamChange>>,
+) {
+    if param_id == "enabled" {
+        insert.enabled = value >= 0.5;
+        let mut new_params = (*insert.params).clone();
+        new_params.insert("enabled".to_string(), serde_json::Value::from(value as f64));
+        insert.params = std::sync::Arc::new(new_params);
+        (crate::command::ResolvedParamId::Bypass, None)
+    } else if insert.kind_tag == crate::runtime::RuntimeInsertKind::ExternalBridge {
+        let wire_id = param_id.parse::<u32>().ok();
+        let mut new_params = (*insert.params).clone();
+        new_params.insert(param_id.to_string(), serde_json::Value::from(value as f64));
+        insert.params = std::sync::Arc::new(new_params);
+        let resolved = wire_id
+            .map(crate::command::ResolvedParamId::Numeric)
+            .unwrap_or_else(|| {
+                crate::command::ResolvedParamId::Named(crate::command::ParamKey::new(param_id))
+            });
+        (resolved, None)
+    } else if insert.vst3.is_some() {
+        let vst3_id = param_id.parse::<u32>().ok();
+        let mut new_params = (*insert.params).clone();
+        new_params.insert(param_id.to_string(), serde_json::Value::from(value as f64));
+        insert.params = std::sync::Arc::new(new_params);
+        let resolved = vst3_id
+            .map(crate::command::ResolvedParamId::Numeric)
+            .unwrap_or_else(|| {
+                crate::command::ResolvedParamId::Named(crate::command::ParamKey::new(param_id))
+            });
+        (resolved, None)
+    } else {
+        let mut new_params = (*insert.params).clone();
+        new_params.insert(param_id.to_string(), serde_json::Value::from(value as f64));
+        let plugin_id = sphere_audio_plugins::canonical_plugin_id(&insert.kind);
+        if sphere_audio_plugins::should_rebuild_state(plugin_id, param_id) {
+            insert.dsp.rebuild(plugin_id, &new_params, sample_rate);
+        } else {
+            insert.dsp.refresh_process_params(plugin_id, &new_params);
+        }
+        let new_params_arc = std::sync::Arc::new(new_params);
+        insert.params = std::sync::Arc::clone(&new_params_arc);
+        let new_dsp = insert.dsp.clone();
+        let resolved = if let Ok(id) = param_id.parse::<u32>() {
+            crate::command::ResolvedParamId::Numeric(id)
+        } else {
+            crate::command::ResolvedParamId::Named(crate::command::ParamKey::new(param_id))
+        };
+        (
+            resolved,
+            Some(Box::new(crate::command::InsertParamChange {
+                params: Some(new_params_arc),
+                dsp: Some(new_dsp),
+            })),
+        )
+    }
+}
+
 pub struct EngineInner {
     // Shared atomic state
     pub shared: Arc<SharedState>,
@@ -1157,6 +1308,10 @@ pub struct EngineInner {
     // while its graph was being prepared, then serializes the command ordering
     // under `project` so stale graph loads cannot overwrite that edit.
     input_state_revision: AtomicU64,
+    /// Plug-in parameter edits a loading snapshot may not hold yet, and the
+    /// lock that orders `set_insert_param` against a graph swap (#365).
+    /// Lock order: `project`, then this, then `runtime`.
+    insert_param_journal: Mutex<InsertParamJournal>,
 
     // Prepared render graph shared with new streams and pushed to callbacks.
     runtime: Mutex<RuntimeProject>,
@@ -1381,6 +1536,7 @@ impl EngineInner {
             master: Mutex::new(MasterState::default()),
             project: Mutex::new(None),
             input_state_revision: AtomicU64::new(0),
+            insert_param_journal: Mutex::new(InsertParamJournal::default()),
             runtime: Mutex::new(RuntimeProject::default()),
             structure_key: Mutex::new(None),
             last_sent_tempo_map: Mutex::new(default_tempo_map),
@@ -2060,6 +2216,14 @@ impl EngineInner {
         param_id: String,
         value: f32,
     ) -> Result<(), SphereAudioError> {
+        // Held until the command is queued. A project sync replays the
+        // journal, stores its graph in the mirror and queues it under this
+        // same lock, so the indices resolved below always name the graph that
+        // is ahead of this command on the audio thread, and an edit the
+        // sync's (older) snapshot lacks is carried into its graph (#365).
+        let mut journal = self.insert_param_journal.lock();
+        journal.record(&track_id, &insert_id, &param_id, value);
+
         let mut runtime = self.runtime.lock();
         let Some(track_index) = runtime.tracks.iter().position(|t| t.id == track_id) else {
             return Ok(());
@@ -2071,75 +2235,34 @@ impl EngineInner {
         else {
             return Ok(());
         };
-
-        let insert = &mut runtime.tracks[track_index].inserts[insert_index];
-        let (resolved, change) = if param_id == "enabled" {
-            insert.enabled = value >= 0.5;
-            let mut new_params = (*insert.params).clone();
-            new_params.insert("enabled".to_string(), serde_json::Value::from(value as f64));
-            insert.params = std::sync::Arc::new(new_params);
-            (crate::command::ResolvedParamId::Bypass, None)
-        } else if insert.kind_tag == crate::runtime::RuntimeInsertKind::ExternalBridge {
-            let wire_id = param_id.parse::<u32>().ok();
-            let mut new_params = (*insert.params).clone();
-            new_params.insert(param_id.clone(), serde_json::Value::from(value as f64));
-            insert.params = std::sync::Arc::new(new_params);
-            let resolved = wire_id
-                .map(crate::command::ResolvedParamId::Numeric)
-                .unwrap_or_else(|| {
-                    crate::command::ResolvedParamId::Named(crate::command::ParamKey::new(&param_id))
-                });
-            (resolved, None)
-        } else if insert.vst3.is_some() {
-            let vst3_id = param_id.parse::<u32>().ok();
-            let mut new_params = (*insert.params).clone();
-            new_params.insert(param_id.clone(), serde_json::Value::from(value as f64));
-            insert.params = std::sync::Arc::new(new_params);
-            let resolved = vst3_id
-                .map(crate::command::ResolvedParamId::Numeric)
-                .unwrap_or_else(|| {
-                    crate::command::ResolvedParamId::Named(crate::command::ParamKey::new(&param_id))
-                });
-            (resolved, None)
-        } else {
-            let mut new_params = (*insert.params).clone();
-            new_params.insert(param_id.clone(), serde_json::Value::from(value as f64));
-            let plugin_id = sphere_audio_plugins::canonical_plugin_id(&insert.kind);
-            let sample_rate = self.shared.sample_rate.load(Ordering::Relaxed).max(1);
-            if sphere_audio_plugins::should_rebuild_state(plugin_id, &param_id) {
-                insert.dsp.rebuild(plugin_id, &new_params, sample_rate);
-            } else {
-                insert.dsp.refresh_process_params(plugin_id, &new_params);
-            }
-            let new_params_arc = std::sync::Arc::new(new_params);
-            insert.params = std::sync::Arc::clone(&new_params_arc);
-            let new_dsp = insert.dsp.clone();
-            let resolved = if let Ok(id) = param_id.parse::<u32>() {
-                crate::command::ResolvedParamId::Numeric(id)
-            } else {
-                crate::command::ResolvedParamId::Named(crate::command::ParamKey::new(&param_id))
-            };
-            (
-                resolved,
-                Some(Box::new(crate::command::InsertParamChange {
-                    params: Some(new_params_arc),
-                    dsp: Some(new_dsp),
-                })),
-            )
-        };
+        let sample_rate = self.shared.sample_rate.load(Ordering::Relaxed).max(1);
+        let (resolved, change) = stage_insert_param(
+            &mut runtime.tracks[track_index].inserts[insert_index],
+            &param_id,
+            value,
+            sample_rate,
+        );
         drop(runtime);
 
         if change.is_some() {
             crate::graveyard::prime();
         }
 
-        self.send_command(EngineCommand::SetInsertParam {
+        let result = self.send_command(EngineCommand::SetInsertParam {
             track_index,
             insert_index,
             param_id: resolved,
             value,
             change,
-        })
+        });
+        drop(journal);
+        result
+    }
+
+    /// The revision of the newest plug-in parameter edit. Read it as a
+    /// project snapshot is taken and pass it to [`Self::load_project_as_of`].
+    pub fn insert_param_revision(&self) -> u64 {
+        self.insert_param_journal.lock().revision
     }
 
     /// Stage 3b: install (or clear, with `None`) the realtime sink for
@@ -3986,9 +4109,18 @@ impl EngineInner {
         }
     }
 
-    pub fn load_project(
+    pub fn load_project(&self, snapshot: EngineProjectSnapshot) -> Result<(), SphereAudioError> {
+        let insert_param_revision = self.insert_param_revision();
+        self.load_project_as_of(snapshot, insert_param_revision)
+    }
+
+    /// [`Self::load_project`] for a snapshot taken when the plug-in parameter
+    /// journal stood at `insert_param_revision`: every parameter edit made
+    /// after that is carried into the new graph (#365).
+    pub fn load_project_as_of(
         &self,
         mut snapshot: EngineProjectSnapshot,
+        insert_param_revision: u64,
     ) -> Result<(), SphereAudioError> {
         let input_state_revision_at_start = self.input_state_revision.load(Ordering::Acquire);
         let old_state = AudioEngineState::from_u8(
@@ -4292,12 +4424,20 @@ impl EngineInner {
         // callback does not grow them on the first blocks after the swap.
         let device_block = self.status.lock().buffer_size as usize;
         runtime.reserve_track_blocks(device_block.max(1024));
+        // Plug-in parameter edits made since the snapshot was taken went to
+        // the running graph; carry them into this one. The journal lock is
+        // held until the graph is queued, so a concurrent edit either lands
+        // before the replay (queued against the old graph, replayed into this
+        // one) or after the swap (resolved against this graph) (#365).
+        let mut param_journal = self.insert_param_journal.lock();
+        param_journal.replay_into(&mut runtime, insert_param_revision, output_sample_rate);
         *self.runtime.lock() = runtime.clone();
         // The metronome's copy of the tempo map travels with the graph, so the
         // swap hands it over instead of cloning it on the audio thread.
         runtime.metronome_tempo_map = Some(runtime.tempo_map.clone());
         *current_project = Some(snapshot.clone());
         let load_result = self.send_command(EngineCommand::LoadProject(Box::new(runtime)));
+        drop(param_journal);
         if matches!(load_result, Ok(()) | Err(SphereAudioError::EngineNotOpen)) {
             *self.structure_key.lock() = structure_key;
         }
@@ -4357,8 +4497,9 @@ impl EngineInner {
     // ── Debug info ─────────────────────────────────────────────────────────
 
     pub fn get_debug_info(&self) -> JsEngineDebugInfo {
-        let runtime = self.runtime.lock();
+        // `project` before `runtime`, the order `load_project` takes them in.
         let project = self.project.lock();
+        let runtime = self.runtime.lock();
         let sample_rate = self.shared.sample_rate.load(Ordering::Relaxed).max(1);
 
         let ready_clips = runtime

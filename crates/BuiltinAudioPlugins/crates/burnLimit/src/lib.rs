@@ -6,7 +6,7 @@
 use builtin_dsp_core::delay::{Smoothed, smoothing_step};
 use builtin_dsp_core::{
     ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, clamp, db_to_linear,
-    linear_to_db, mix, time_constant,
+    flush_denormal, linear_to_db, mix, time_constant,
 };
 use serde::{Deserialize, Serialize};
 
@@ -340,36 +340,42 @@ impl Meters {
 
     #[inline]
     fn push_stereo(&mut self, in_l: f32, in_r: f32, out_l: f32, out_r: f32) {
+        // Peak holds and the RMS windows decay geometrically in silence and
+        // would otherwise settle in the denormal range, where every multiply
+        // takes the slow path on a host thread without flush-to-zero. Below
+        // the shared floor a stored state is silence and snaps to zero.
         for (peak, sample) in self
             .channel_peaks
             .iter_mut()
             .zip([in_l, in_r, out_l, out_r])
         {
             let level = sample.abs();
-            *peak = if level > *peak {
+            *peak = flush_denormal(if level > *peak {
                 level
             } else {
                 *peak * self.peak_coeff
-            };
+            });
         }
         let in_abs = in_l.abs().max(in_r.abs());
         let out_abs = out_l.abs().max(out_r.abs());
 
-        self.in_peak = if in_abs > self.in_peak {
+        self.in_peak = flush_denormal(if in_abs > self.in_peak {
             in_abs
         } else {
             self.in_peak * self.peak_coeff
-        };
-        self.out_peak = if out_abs > self.out_peak {
+        });
+        self.out_peak = flush_denormal(if out_abs > self.out_peak {
             out_abs
         } else {
             self.out_peak * self.peak_coeff
-        };
+        });
 
         let input_ms = (in_l * in_l + in_r * in_r) * 0.5;
         let output_ms = (out_l * out_l + out_r * out_r) * 0.5;
-        self.in_ms = self.rms_coeff * self.in_ms + (1.0 - self.rms_coeff) * input_ms;
-        self.out_ms = self.rms_coeff * self.out_ms + (1.0 - self.rms_coeff) * output_ms;
+        self.in_ms =
+            flush_denormal(self.rms_coeff * self.in_ms + (1.0 - self.rms_coeff) * input_ms);
+        self.out_ms =
+            flush_denormal(self.rms_coeff * self.out_ms + (1.0 - self.rms_coeff) * output_ms);
 
         if in_abs >= CLIP_THRESHOLD {
             self.in_clip = true;
@@ -1682,6 +1688,39 @@ mod tests {
     const BLOCK: usize = 128;
     /// About a second of blocks: one drag across a range and back.
     const DRAG_BLOCKS: usize = 375;
+
+    /// #361: the meters' peak falls and RMS windows decay geometrically in
+    /// silence. Unflushed they settle in the denormal range; flushed, every
+    /// stored level reaches exactly zero and a denormal input cannot re-seed
+    /// one.
+    #[test]
+    fn silent_meters_flush_to_zero() {
+        let mut meters = Meters::new(48_000.0);
+        for _ in 0..4_800 {
+            meters.push_stereo(0.9, -0.7, 0.8, -0.6);
+        }
+        assert!(meters.in_peak > 0.5 && meters.out_ms > 0.1);
+        // 30 s: about 23 s of 0.4 s peak fall takes 0.9 under the floor.
+        for _ in 0..48_000 * 30 {
+            meters.push_stereo(0.0, 0.0, 0.0, 0.0);
+        }
+        let levels = |m: &Meters| {
+            let mut all = vec![m.in_peak, m.out_peak, m.in_ms, m.out_ms];
+            all.extend(m.channel_peaks);
+            all
+        };
+        assert!(
+            levels(&meters).iter().all(|&x| x == 0.0),
+            "{:?}",
+            levels(&meters)
+        );
+        meters.push_stereo(1.0e-40, -1.0e-40, 1.0e-40, -1.0e-40);
+        assert!(
+            levels(&meters).iter().all(|&x| x == 0.0),
+            "{:?}",
+            levels(&meters)
+        );
+    }
 
     /// Two low tones: smooth, so a gain that steps shows as a kink.
     fn tone(n: usize) -> (f32, f32) {

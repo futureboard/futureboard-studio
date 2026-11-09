@@ -1154,6 +1154,24 @@ impl AudioEngine {
         self.inner.load_project(snapshot)
     }
 
+    /// Like [`Self::load_project`], for a snapshot taken when
+    /// [`Self::insert_param_revision`] read `insert_param_revision`: plug-in
+    /// parameter edits made after that survive the graph swap.
+    pub fn load_project_as_of(
+        &self,
+        snapshot: EngineProjectSnapshot,
+        insert_param_revision: u64,
+    ) -> Result<(), SphereAudioError> {
+        self.inner
+            .load_project_as_of(snapshot, insert_param_revision)
+    }
+
+    /// Revision of the newest plug-in parameter edit; read it as a project
+    /// snapshot is taken.
+    pub fn insert_param_revision(&self) -> u64 {
+        self.inner.insert_param_revision()
+    }
+
     pub fn start_recording(&self, config: JsStartRecordingConfig) -> Result<(), SphereAudioError> {
         self.inner.start_recording(config)
     }

@@ -53,6 +53,69 @@ pub const LIMITER_TRIM_INDEX: u32 = 38;
 
 pub const PARAM_COUNT: usize = 39;
 
+/// Wire-only, not a parameter: the whole rack assignment in one edit, the
+/// six slot codes packed as base-7 digits, slot 1 lowest. A reorder sent as
+/// one wire edit per slot could reach the DSP half-applied — a block between
+/// the edits faded to a rack missing a module, then faded again and restarted
+/// that module from rest (#354). This lands the whole order at once.
+///
+/// Kept clear of the append-only parameter indices. Never listed, automated
+/// or stored: the slot params remain the state.
+pub const RACK_ORDER_INDEX: u32 = 1024;
+const RACK_CODES: u32 = 7;
+const RACK_ORDER_MAX: u32 = 117_648; // 7^6 - 1
+
+/// Whether `index` is something the wire carries: a parameter or the rack
+/// order.
+pub fn is_wire_index(index: u32) -> bool {
+    (index as usize) < PARAM_COUNT || index == RACK_ORDER_INDEX
+}
+
+/// The rack assignment as a [`RACK_ORDER_INDEX`] value. Exact in `f32`.
+pub fn rack_order_value(params: &Params) -> f32 {
+    [
+        params.slot1_module,
+        params.slot2_module,
+        params.slot3_module,
+        params.slot4_module,
+        params.slot5_module,
+        params.slot6_module,
+    ]
+    .iter()
+    .rev()
+    .fold(0u32, |packed, &code| {
+        packed * RACK_CODES + u32::from(code).min(RACK_CODES - 1)
+    }) as f32
+}
+
+/// Set all six slots from a [`RACK_ORDER_INDEX`] value. A module listed twice
+/// keeps its first slot, as [`sanitize_params`] does.
+fn apply_rack_order(params: &mut Params, input: f32) -> bool {
+    if !(0.0..=RACK_ORDER_MAX as f32).contains(&input) || input.fract() != 0.0 {
+        return false;
+    }
+    let mut packed = input as u32;
+    let mut seen = [false; RACK_CODES as usize];
+    for slot in [
+        &mut params.slot1_module,
+        &mut params.slot2_module,
+        &mut params.slot3_module,
+        &mut params.slot4_module,
+        &mut params.slot5_module,
+        &mut params.slot6_module,
+    ] {
+        let code = (packed % RACK_CODES) as usize;
+        packed /= RACK_CODES;
+        *slot = if code != 0 && !seen[code] {
+            seen[code] = true;
+            code as u8
+        } else {
+            0
+        };
+    }
+    true
+}
+
 pub const UI_PARAM_IDS: [&str; PARAM_COUNT] = [
     "power",
     "inputTrimDb",
@@ -255,6 +318,9 @@ pub fn sanitize_params(params: &mut Params) {
 }
 
 pub fn apply_wire_param(params: &mut Params, index: u32, input: f32) -> bool {
+    if index == RACK_ORDER_INDEX {
+        return apply_rack_order(params, input);
+    }
     if !input.is_finite() || index as usize >= PARAM_COUNT {
         return false;
     }
@@ -423,5 +489,50 @@ mod tests {
         assert!(apply_wire_param(&mut params, SLOT_4_INDEX, 3.0));
         assert_eq!(params.slot1_module, 0);
         assert_eq!(params.slot4_module, 3);
+    }
+
+    /// #354: the rack order carries all six slots in one exact value, keeps
+    /// a module unique, and rejects anything that is not an order.
+    #[test]
+    fn the_rack_order_sets_every_slot_at_once() {
+        let mut target = default_params();
+        [
+            target.slot1_module,
+            target.slot2_module,
+            target.slot3_module,
+            target.slot4_module,
+            target.slot5_module,
+            target.slot6_module,
+        ] = [6, 5, 4, 3, 2, 1];
+        let value = rack_order_value(&target);
+        let mut params = default_params();
+        params.slot1_module = 1;
+        assert!(apply_wire_param(&mut params, RACK_ORDER_INDEX, value));
+        assert_eq!(
+            ui_values(&params)[SLOT_1_INDEX as usize..=SLOT_6_INDEX as usize],
+            [6.0, 5.0, 4.0, 3.0, 2.0, 1.0]
+        );
+        assert_eq!(rack_order_value(&params), value);
+
+        // [3, 3, 0, ...]: the second 3 is dropped.
+        assert!(apply_wire_param(
+            &mut params,
+            RACK_ORDER_INDEX,
+            3.0 + 3.0 * 7.0
+        ));
+        assert_eq!((params.slot1_module, params.slot2_module), (3, 0));
+        assert_eq!(params.slot6_module, 0);
+
+        let before = params.clone();
+        for bad in [-1.0, 0.5, 117_649.0, f32::NAN, f32::INFINITY] {
+            assert!(
+                !apply_wire_param(&mut params, RACK_ORDER_INDEX, bad),
+                "{bad}"
+            );
+        }
+        assert_eq!(rack_order_value(&params), rack_order_value(&before));
+        assert!(is_wire_index(RACK_ORDER_INDEX));
+        assert!(!is_wire_index(PARAM_COUNT as u32));
+        assert_eq!(ui_param_id(RACK_ORDER_INDEX), None);
     }
 }

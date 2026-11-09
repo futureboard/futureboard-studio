@@ -610,6 +610,9 @@ pub struct TimelineMidiImportPrompt {
     pub summary: crate::components::timeline::midi_import::MidiImportSummary,
     pub drop_x: f32,
     pub drop_y: f32,
+    /// The file as read and parsed (once, off the UI thread) on drop; the
+    /// import the dialog confirms uses it rather than reading the file again.
+    pub tracks: std::sync::Arc<Vec<crate::components::timeline::midi_import::ImportedMidiTrack>>,
 }
 
 pub type TimelineMidiImportPromptCb =
