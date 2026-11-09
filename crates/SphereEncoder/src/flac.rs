@@ -344,6 +344,15 @@ impl AudioEncoder for FlacEncoder {
         let total_samples = self.context.total_samples();
         self.stream_info.set_md5_digest(&self.context.md5_digest());
         self.stream_info.set_total_samples(total_samples);
+        // `update_frame_info` folded the last, shorter block into the minimum
+        // block size. The format excludes the last block from it, and
+        // decoders (Studio's own among them) read min != max as a
+        // variable-block-size stream and refuse it — or, for a last block
+        // under 16 samples, an invalid one (#352). Every block but the last
+        // is `block_size`, so both bounds are `block_size`, as libFLAC writes.
+        self.stream_info
+            .set_block_sizes(self.block_size, self.block_size)
+            .map_err(|err| flac_error("STREAMINFO block size", err))?;
 
         // Patch the placeholder STREAMINFO in place.
         self.writer.flush()?;
@@ -535,7 +544,11 @@ mod tests {
                     }
                 })
                 .collect();
-            let expected = whole_stream_flac(&ints, channels as usize, bits, 256);
+            let mut expected = whole_stream_flac(&ints, channels as usize, bits, 256);
+            // The one intended difference (#352): `flacenc` records the short
+            // last block as the minimum block size; the format excludes the
+            // last block, so the streaming encoder writes `block_size`.
+            expected[8..10].copy_from_slice(&256u16.to_be_bytes());
             let bytes = std::fs::read(&path).unwrap();
             assert_eq!(summary.bytes_written, bytes.len() as u64);
             assert!(
@@ -570,6 +583,41 @@ mod tests {
         let summary = enc.finalize().unwrap();
         assert_eq!(summary.frames_written, 800 * 4_096);
         let _ = std::fs::remove_file(path);
+    }
+
+    /// #352: STREAMINFO's minimum block size excludes the last block, so a
+    /// render whose length is not a multiple of the block size still reads
+    /// as a fixed-block-size stream (min == max), even when the last block
+    /// is shorter than the 16-sample minimum a block size may declare.
+    #[test]
+    fn short_last_block_keeps_a_fixed_block_size_streaminfo() {
+        for frames in [4_096 * 3 + 1, 4_096 * 2 + 1_000, 4_096, 300] {
+            let path = temp_path("short-last-block");
+            let input = signal(frames, 2);
+            let mut enc = encode_streaming(
+                &path,
+                AudioSampleFormat::I16,
+                2,
+                4_096,
+                AudioDither::Off,
+                &input,
+                1_024,
+            );
+            let summary = enc.finalize().unwrap();
+            assert_eq!(summary.frames_written, frames as u64);
+            let bytes = std::fs::read(&path).unwrap();
+            let _ = std::fs::remove_file(&path);
+            let min_block = u16::from_be_bytes([bytes[8], bytes[9]]);
+            let max_block = u16::from_be_bytes([bytes[10], bytes[11]]);
+            assert_eq!(
+                (min_block, max_block),
+                (4_096, 4_096),
+                "{frames} frames: STREAMINFO block sizes"
+            );
+            let total = (u64::from(bytes[21] & 0x0F) << 32)
+                | u64::from(u32::from_be_bytes(bytes[22..26].try_into().unwrap()));
+            assert_eq!(total, frames as u64);
+        }
     }
 
     /// #322: dither is deterministic per encoder (the same render encodes to
