@@ -269,6 +269,14 @@ fn signature_asset(release: &GithubRelease, asset: &GithubAsset) -> Option<Githu
 /// Binding the asset name (which carries the version and platform) means a
 /// genuine signature for one installer cannot vouch for a different one — an
 /// older build or another platform's — published under this name.
+///
+/// Note on signature format and channel/version verification:
+/// The version is already cryptographically bound into this payload via `<asset name>`,
+/// which is validated against the offered version by [`asset_carries_offered_version`].
+/// Altering the signature payload format (e.g. to explicitly prepend channel or min-version)
+/// would break verification of all existing released `.sig` signatures. We preserve the
+/// format to maintain compatibility with existing signatures, while enforcing that only
+/// strictly newer versions (`version > *current`) are offered across all channels.
 fn signed_message(asset_name: &str, sha256: &[u8; 32]) -> Vec<u8> {
     let mut message = Vec::with_capacity(SIGNATURE_CONTEXT.len() + asset_name.len() + 1 + 32);
     message.extend_from_slice(SIGNATURE_CONTEXT);
@@ -392,12 +400,10 @@ fn choose_release(
             if version_from_asset_name(&asset.name).as_ref() != Some(&version) {
                 return None;
             }
-            let available = match channel {
-                // A user explicitly opting into nightly may move from the same
-                // stable base to its prerelease build.
-                UpdateChannel::Nightly => version != *current,
-                UpdateChannel::Beta | UpdateChannel::Stable => version > *current,
-            };
+            // Never offer older or equal versions: updates must be strictly newer
+            // across all channels to prevent downgrading (e.g. when moving between
+            // channels or when a moving nightly tag points to an older release).
+            let available = version > *current;
             available.then(|| AvailableUpdate {
                 version,
                 channel,
@@ -1248,5 +1254,35 @@ mod tests {
         let beta = choose_release(releases, UpdateChannel::Beta, &current).unwrap();
         assert_eq!(stable.version, Version::parse("2026.8.2").unwrap());
         assert_eq!(beta.version, Version::parse("2026.8.3-beta.1").unwrap());
+    }
+
+    #[test]
+    fn nightly_channel_only_offers_strictly_newer_versions_never_downgrades() {
+        let nightly_old = versioned_release("nightly", "Nightly", "2026.8.3-nightly");
+        let nightly_new = versioned_release("nightly", "Nightly", "2026.8.5-nightly");
+
+        // When current is newer than nightly tag, it must NOT offer a downgrade.
+        let newer_current = Version::parse("2026.8.4").unwrap();
+        assert!(choose_release(
+            vec![nightly_old.clone()],
+            UpdateChannel::Nightly,
+            &newer_current
+        )
+        .is_none());
+
+        // When current is equal to nightly tag, it offers nothing.
+        let same_current = Version::parse("2026.8.3-nightly").unwrap();
+        assert!(choose_release(
+            vec![nightly_old.clone()],
+            UpdateChannel::Nightly,
+            &same_current
+        )
+        .is_none());
+
+        // When nightly is strictly newer, it is offered.
+        let older_current = Version::parse("2026.8.4").unwrap();
+        let update =
+            choose_release(vec![nightly_new], UpdateChannel::Nightly, &older_current).unwrap();
+        assert_eq!(update.version, Version::parse("2026.8.5-nightly").unwrap());
     }
 }
