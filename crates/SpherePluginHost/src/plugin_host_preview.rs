@@ -11,6 +11,10 @@ use DirectAudio::vst3_processor::{
 
 use crate::audio_bridge::{SharedMidiEvent, MAX_CHANNELS, MIDI_RING_CAP};
 
+/// Whether MIDI forensic traces are on. The first call reads the environment
+/// (`var_os` allocates), so it must not happen on the audio producer:
+/// [`VoiceShared::default`] makes it when a voice is created, before the
+/// producer can render one, and every later call is a plain load.
 fn forensic_trace_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| {
@@ -227,6 +231,10 @@ struct VoiceShared {
 
 impl Default for VoiceShared {
     fn default() -> Self {
+        // Resolve the trace flag here, off the audio thread: the producer's
+        // MIDI translation checks it per event, and its first check would
+        // otherwise read the environment (allocating) on the first block.
+        let _ = forensic_trace_enabled();
         Self {
             events: Mutex::new(VoiceMidiState::default()),
             render: Mutex::new(Vec::with_capacity(VOICE_BLOCK_EVENT_CAPACITY)),
