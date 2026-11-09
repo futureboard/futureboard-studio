@@ -147,8 +147,9 @@ const USAGE: &str = "usage: livestage-server [--session FILE] [--host NAME] [--i
                         IP addresses, localhost, this machine's name and NAME.local always work.
                         Any other name in a request is refused, which stops DNS rebinding
   --setup-code-file FILE  the setup code (6-32 digits) a browser on another machine (or behind a
-                        reverse proxy) enters before it is let in while there are no users;
-                        without it, a new code is made at each start and printed here
+                        reverse proxy) enters before it is let in while there are no users; with
+                        --trusted-proxy, or a --web-host other than localhost, one on this
+                        machine too. Without it, a new code is made at each start and printed here
   --trusted-proxy ADDR  a reverse proxy's IP address (127.0.0.1 for one on this machine) whose
                         --forwarded-header names the client: failed log-ins and connection limits
                         then count per client. Clients it forwards always need the setup code.
@@ -381,7 +382,8 @@ fn main() {
                 // reverse proxy here: with no users yet, whoever is first
                 // there must not get the mixer (or make the first admin)
                 // without the code shown on this machine. A browser on this
-                // machine needs none (see `web::Peer`).
+                // machine needs none (see `web::Peer`), unless the operator
+                // said browsers reach it through a name or a proxy (#351).
                 let code = match setup_code(options.setup_code_file.as_deref()) {
                     Ok(code) => code,
                     Err(error) => {
@@ -390,7 +392,13 @@ fn main() {
                     }
                 };
                 if users.open_mode() {
-                    let reached = if bound.ip().is_loopback() {
+                    let reached = if web::reached_from_elsewhere(
+                        &options.web_hosts,
+                        &options.trusted_proxies,
+                    ) {
+                        "--web-host or --trusted-proxy says browsers reach the web UI from \
+                         elsewhere and there are no users: every browser, this machine's too,"
+                    } else if bound.ip().is_loopback() {
                         "the web UI listens on this machine only and there are no users: a \
                          browser reaching it through a reverse proxy"
                     } else {

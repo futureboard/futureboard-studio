@@ -304,13 +304,14 @@ impl JamWindow {
 
     /// Follow the jam link that arrived from outside Studio, now that the user
     /// has said so. `send` false joins to listen, publishing nothing.
-    fn accept_link_request(&mut self, send: bool, cx: &mut Context<Self>) {
+    fn accept_link_request(&mut self, code: &str, send: bool, cx: &mut Context<Self>) {
         self.set_status("Joining…");
+        let code = code.to_string();
         cx.background_executor()
             .spawn(async move {
-                if let Err(error) =
-                    jam::run_action(|controller| controller.accept_link_request(send))
-                {
+                if let Err(error) = jam::run_action(move |controller| {
+                    controller.accept_link_request_for(&code, send)
+                }) {
                     eprintln!("[jam] join failed: {}", error.user_message());
                 }
             })
@@ -318,10 +319,11 @@ impl JamWindow {
     }
 
     /// Drop the waiting jam link. A lock and a field write, so it runs here.
-    fn dismiss_link_request(&mut self, cx: &mut Context<Self>) {
+    fn dismiss_link_request(&mut self, code: &str, cx: &mut Context<Self>) {
         self.state.link_request = None;
-        if let Err(error) = jam::with_controller(|controller| {
-            controller.dismiss_link_request();
+        let code = code.to_string();
+        if let Err(error) = jam::with_controller(move |controller| {
+            controller.dismiss_link_request_for(&code);
             Ok(())
         }) {
             eprintln!("[jam] {}", error.user_message());
@@ -745,6 +747,10 @@ impl JamWindow {
         state: &JamUiState,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let code = request.code.clone();
+        let cancel_code = code.clone();
+        let listen_code = code.clone();
+        let join_code = code;
         let room = match request.jam_name.as_deref() {
             Some(name) => format!("{name} · code {}", request.code),
             None => format!("Room code {}", request.code),
@@ -798,8 +804,8 @@ impl JamWindow {
                             "Cancel",
                             FbButtonKind::Default,
                             true,
-                            cx.listener(|this, _event, _window, cx| {
-                                this.dismiss_link_request(cx);
+                            cx.listener(move |this, _event, _window, cx| {
+                                this.dismiss_link_request(&cancel_code, cx);
                             }),
                         ))
                         .child(fb_button(
@@ -807,8 +813,8 @@ impl JamWindow {
                             "Listen Only",
                             FbButtonKind::Default,
                             can_join,
-                            cx.listener(|this, _event, _window, cx| {
-                                this.accept_link_request(false, cx);
+                            cx.listener(move |this, _event, _window, cx| {
+                                this.accept_link_request(&listen_code, false, cx);
                                 cx.notify();
                             }),
                         ))
@@ -817,8 +823,8 @@ impl JamWindow {
                             "Join",
                             FbButtonKind::Primary,
                             can_join,
-                            cx.listener(|this, _event, _window, cx| {
-                                this.accept_link_request(true, cx);
+                            cx.listener(move |this, _event, _window, cx| {
+                                this.accept_link_request(&join_code, true, cx);
                                 cx.notify();
                             }),
                         )),

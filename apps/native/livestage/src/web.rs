@@ -21,14 +21,23 @@
 //! then the slot table ([`Slots`]). A connection that never logs in is
 //! closed at its deadline, and may be closed earlier to make room: once past
 //! its [`LOGIN_GRACE`], or at once when its address holds another connection
-//! that grace protects (one per address); one let in never is. An address is
-//! an IPv4 address, or an IPv6 `/64` (see [`peer_key`]).
+//! that grace protects (one per address); one let in never is. An address
+//! is an IPv4 address or a whole IPv6 address (see [`peer_key`]), so devices
+//! sharing a LAN's `/64` are limited one by one. On top of that, all the
+//! addresses of one IPv6 `/64`, which one machine can fill with as many as
+//! it likes, share a rate of new connections and at most
+//! [`MAX_PROTECTED_PER_PREFIX`] connections that grace protects (see
+//! [`prefix_key`]).
 //!
 //! Who a client is ([`Peer`]) is read from its request head. A connection
 //! from this machine is taken for a browser here only when it names this
 //! machine (`localhost`, a loopback address) and carries no proxy
 //! forwarding header: behind a reverse proxy on this machine every browser
-//! connects from loopback, and must not skip the setup code. A connection
+//! connects from loopback, and must not skip the setup code. Nor is any
+//! connection taken for one once the operator says browsers reach this
+//! server from elsewhere ([`reached_from_elsewhere`]): a proxy here may pass
+//! the client's own `Host` on and add no forwarding header (#351), so a
+//! browser here then needs the setup code too. A connection
 //! from a proxy given with `--trusted-proxy` is counted (log-in failures,
 //! slots and arrivals alike) under the client address that proxy forwards
 //! in the one header `--forwarded-header` names, and is never taken for
@@ -111,8 +120,10 @@ const MAX_HEAD: usize = 16 * 1024;
 const MAX_CONNECTIONS: usize = 64;
 /// Connections never let in from one address at once (this machine's own
 /// excepted), so one client cannot take every slot. Those let in are not
-/// counted: devices logged in behind one address (or on one IPv6 `/64`)
-/// are not turned away.
+/// counted: devices logged in behind one address are not turned away. An
+/// IPv6 address counts on its own, not with the rest of its `/64`: those
+/// that are evictable cannot keep anyone out (see
+/// [`MAX_PROTECTED_PER_PREFIX`]).
 const MAX_PER_PEER: usize = 16;
 /// How long a connection may take to send its whole request head. A read
 /// timeout alone is per read: a client sending a byte at a time would keep
@@ -142,9 +153,27 @@ const LOGIN_GRACE: Duration = Duration::from_secs(30);
 const ARRIVAL_BURST: f64 = 20.0;
 /// After a burst, one more new connection per address this often.
 const ARRIVAL_REFILL: Duration = Duration::from_secs(2);
-/// Addresses whose new connections are counted at once. Past this, those
-/// that have not connected for a while (their count is back to a full
-/// burst) are forgotten first; the memory stays bounded either way.
+/// New connections all the addresses of one IPv6 `/64` may open in a
+/// burst, on top of each address's own [`ARRIVAL_BURST`]: sixteen page
+/// loads at once, so a room of tablets on one LAN loading the console
+/// together pass, while one machine taking a new address for every
+/// connection gets no more than this.
+const PREFIX_ARRIVAL_BURST: f64 = 4.0 * ARRIVAL_BURST;
+/// After a burst, one more new connection per IPv6 `/64` this often: four
+/// times an address's rate, so a few devices reconnecting at once share it
+/// and one device on its own never runs it dry.
+const PREFIX_ARRIVAL_REFILL: Duration = Duration::from_millis(500);
+/// Connections that grace protects at once in one IPv6 `/64`, one per
+/// address (see [`Slots::make_room`]): its longest waiting addresses' only.
+/// Enough for the operators of one LAN to log in together; one machine
+/// taking a new address for every connection pins no more slots than this.
+/// The `/64`'s other connections never let in may be closed to make room,
+/// as an address's extra ones may.
+const MAX_PROTECTED_PER_PREFIX: usize = 8;
+/// Addresses (and, apart, IPv6 `/64`s) whose new connections are counted at
+/// once. Past this, those that have not connected for a while (their count
+/// is back to a full burst) are forgotten first; the memory stays bounded
+/// either way.
 const MAX_TRACKED_ADDRESSES: usize = 1024;
 /// The largest WebSocket message (and frame) taken. Commands are small
 /// JSON; nothing the page sends comes near this.
@@ -367,15 +396,25 @@ impl Admission {
 }
 
 /// The address limits count by: an IPv4-mapped address is its IPv4
-/// address, and an IPv6 address (but loopback) its `/64`, which one machine
-/// can fill with as many addresses as it likes.
+/// address, and an IPv6 address is itself, so devices sharing a LAN's `/64`
+/// do not share one address's limits (#338). What one machine gains by
+/// taking many addresses in its `/64` is bounded by [`prefix_key`]'s limits.
 fn peer_key(peer: IpAddr) -> IpAddr {
+    peer.to_canonical()
+}
+
+/// The IPv6 `/64` an address is in, whose addresses share a rate of new
+/// connections ([`PREFIX_ARRIVAL_BURST`]) and [`MAX_PROTECTED_PER_PREFIX`]
+/// on top of each address's own limits: one machine can take as many
+/// addresses in its `/64` as it likes (#266). `None` for IPv4 (and
+/// IPv4-mapped) and loopback, which have no such level.
+fn prefix_key(peer: IpAddr) -> Option<Ipv6Addr> {
     match peer.to_canonical() {
         IpAddr::V6(v6) if !v6.is_loopback() => {
             let [a, b, c, d, ..] = v6.segments();
-            IpAddr::V6(Ipv6Addr::new(a, b, c, d, 0, 0, 0, 0))
+            Some(Ipv6Addr::new(a, b, c, d, 0, 0, 0, 0))
         }
-        other => other,
+        _ => None,
     }
 }
 
@@ -514,7 +553,10 @@ impl Slots {
     ///   pushed out however many connections arrive. An address's others
     ///   are not protected, so a few addresses holding many connections
     ///   cannot keep the pool full: only as many addresses as there are
-    ///   slots, each holding one, turn newcomers away.
+    ///   slots, each holding one, turn newcomers away. An IPv6 `/64` keeps
+    ///   that protection for its [`MAX_PROTECTED_PER_PREFIX`] longest
+    ///   waiting addresses only (see [`prefix_key`]): one machine taking
+    ///   a new address for each connection pins no more than that.
     /// - When `peer` itself holds connections past their grace, its own
     ///   longest waiting is the one replaced: reconnecting from one address
     ///   never pushes out somebody else's.
@@ -539,6 +581,23 @@ impl Slots {
                 *first = (*first).min((grace, slot.id));
             }
         }
+        // Per IPv6 /64, only its longest waiting addresses' keep it. At
+        // most one entry per open slot, so this stays as small as the pool.
+        let mut by_prefix: Vec<(Ipv6Addr, Instant, ClientId, IpAddr)> = protected
+            .iter()
+            .filter_map(|(&key, &(grace, id))| Some((prefix_key(key)?, grace, id, key)))
+            .collect();
+        by_prefix.sort_unstable();
+        let (mut last, mut count) = (None, 0);
+        for (prefix, _, _, key) in by_prefix {
+            if last != Some(prefix) {
+                (last, count) = (Some(prefix), 0);
+            }
+            count += 1;
+            if count > MAX_PROTECTED_PER_PREFIX {
+                protected.remove(&key);
+            }
+        }
         // (index, own and past its grace, held by its address, grace since,
         // unprotected)
         let mut candidates: Vec<(usize, bool, usize, Instant, bool)> = self
@@ -547,10 +606,12 @@ impl Slots {
             .enumerate()
             .filter_map(|(i, slot)| {
                 let grace = slot.admission.grace_since()?;
+                // Inside its grace, but not the one its address (or /64)
+                // keeps protected.
                 let unprotected = in_grace(grace)
-                    && grouped(slot.peer)
-                        .and_then(|key| protected.get(&key))
-                        .is_some_and(|&(_, first)| first != slot.id);
+                    && grouped(slot.peer).is_some_and(|key| {
+                        protected.get(&key).map(|&(_, first)| first) != Some(slot.id)
+                    });
                 if in_grace(grace) && !unprotected {
                     return None;
                 }
@@ -614,13 +675,37 @@ impl Slots {
 }
 
 /// How fast each address opens new connections: a token bucket per address
-/// ([`ARRIVAL_BURST`], one more every [`ARRIVAL_REFILL`]), for at most
-/// [`MAX_TRACKED_ADDRESSES`] addresses. This machine is never limited (a
-/// browser here, or a proxy in front). Only the accept thread uses it.
+/// ([`ARRIVAL_BURST`], one more every [`ARRIVAL_REFILL`]) and, on top, one
+/// per IPv6 `/64` for all its addresses together ([`PREFIX_ARRIVAL_BURST`],
+/// one more every [`PREFIX_ARRIVAL_REFILL`]); a new connection needs a
+/// token from both. At most [`MAX_TRACKED_ADDRESSES`] of each are kept.
+/// This machine is never limited (a browser here, or a proxy in front).
+/// Only the accept thread uses it.
 #[derive(Default)]
 struct Arrivals {
+    /// Per address, as [`peer_key`] gives it.
     buckets: HashMap<Option<IpAddr>, Bucket>,
+    /// Per IPv6 `/64`, as [`prefix_key`] gives it.
+    prefixes: HashMap<Ipv6Addr, Bucket>,
 }
+
+/// How full a [`Bucket`] gets, and how fast it fills.
+#[derive(Clone, Copy)]
+struct Rate {
+    burst: f64,
+    refill: Duration,
+}
+
+/// An address's own rate.
+const ADDRESS_RATE: Rate = Rate {
+    burst: ARRIVAL_BURST,
+    refill: ARRIVAL_REFILL,
+};
+/// An IPv6 `/64`'s, all its addresses together.
+const PREFIX_RATE: Rate = Rate {
+    burst: PREFIX_ARRIVAL_BURST,
+    refill: PREFIX_ARRIVAL_REFILL,
+};
 
 #[derive(Clone, Copy)]
 struct Bucket {
@@ -629,54 +714,74 @@ struct Bucket {
 }
 
 impl Bucket {
-    fn level(&self, now: Instant) -> f64 {
+    fn level(&self, now: Instant, rate: Rate) -> f64 {
         let refilled =
-            now.saturating_duration_since(self.at).as_secs_f64() / ARRIVAL_REFILL.as_secs_f64();
-        (self.tokens + refilled).min(ARRIVAL_BURST)
+            now.saturating_duration_since(self.at).as_secs_f64() / rate.refill.as_secs_f64();
+        (self.tokens + refilled).min(rate.burst)
+    }
+
+    /// Bring it up to `now`; how many tokens it holds.
+    fn settle(&mut self, now: Instant, rate: Rate) -> f64 {
+        self.tokens = self.level(now, rate);
+        self.at = now.max(self.at);
+        self.tokens
     }
 }
 
+/// `key`'s bucket in `buckets`, a full one when it has none; making room
+/// for it first when [`MAX_TRACKED_ADDRESSES`] are kept already: those whose
+/// bucket is full again (the same as never seen) are forgotten; failing
+/// that, the one with the most left, which is the closest to it. One being
+/// limited is the last one forgotten.
+fn bucket<K: Copy + Eq + std::hash::Hash>(
+    buckets: &mut HashMap<K, Bucket>,
+    key: K,
+    rate: Rate,
+    now: Instant,
+) -> &mut Bucket {
+    if !buckets.contains_key(&key) && buckets.len() >= MAX_TRACKED_ADDRESSES {
+        buckets.retain(|_, b| b.level(now, rate) < rate.burst);
+        if buckets.len() >= MAX_TRACKED_ADDRESSES {
+            let fullest = buckets
+                .iter()
+                .max_by(|a, b| a.1.level(now, rate).total_cmp(&b.1.level(now, rate)))
+                .map(|(key, _)| *key);
+            if let Some(fullest) = fullest {
+                buckets.remove(&fullest);
+            }
+        }
+    }
+    buckets.entry(key).or_insert(Bucket {
+        tokens: rate.burst,
+        at: now,
+    })
+}
+
 impl Arrivals {
-    /// Count a new connection from `peer` (see [`peer_key`]); `false`: too many
-    /// lately, turn it away. A turned-away attempt counts too.
+    /// Count a new connection from `peer` (see [`peer_key`]); `false`: too
+    /// many lately, from it or from its IPv6 `/64`, turn it away. It takes
+    /// a token from both or from neither: one level turning it away does not
+    /// spend the other's.
     fn allow(&mut self, peer: Option<IpAddr>, now: Instant) -> bool {
         if peer.is_some_and(|p| p.is_loopback()) {
             return true;
         }
-        if !self.buckets.contains_key(&peer) && self.buckets.len() >= MAX_TRACKED_ADDRESSES {
-            self.forget(now);
+        let own = bucket(&mut self.buckets, peer, ADDRESS_RATE, now);
+        let mut room = own.settle(now, ADDRESS_RATE) >= 1.0;
+        let mut shared = peer
+            .and_then(prefix_key)
+            .map(|prefix| bucket(&mut self.prefixes, prefix, PREFIX_RATE, now));
+        if let Some(shared) = shared.as_deref_mut() {
+            room &= shared.settle(now, PREFIX_RATE) >= 1.0;
         }
-        let bucket = self.buckets.entry(peer).or_insert(Bucket {
-            tokens: ARRIVAL_BURST,
-            at: now,
-        });
-        let level = bucket.level(now);
-        bucket.at = now.max(bucket.at);
-        if level < 1.0 {
-            bucket.tokens = level;
+        if !room {
             return false;
         }
-        bucket.tokens = level - 1.0;
+        own.tokens -= 1.0;
+        if let Some(shared) = shared {
+            shared.tokens -= 1.0;
+        }
         true
-    }
-
-    /// Make room to count one more address: forget those whose bucket is
-    /// full again (the same as never seen); failing that, the one with the
-    /// most left, which is the closest to it. An address being limited is
-    /// the last one forgotten.
-    fn forget(&mut self, now: Instant) {
-        self.buckets.retain(|_, b| b.level(now) < ARRIVAL_BURST);
-        if self.buckets.len() < MAX_TRACKED_ADDRESSES {
-            return;
-        }
-        let fullest = self
-            .buckets
-            .iter()
-            .max_by(|a, b| a.1.level(now).total_cmp(&b.1.level(now)))
-            .map(|(peer, _)| *peer);
-        if let Some(peer) = fullest {
-            self.buckets.remove(&peer);
-        }
     }
 }
 
@@ -961,9 +1066,15 @@ fn machine_name() -> Option<String> {
 ///   never this machine, as the proxy may be anywhere. Without that header
 ///   it is the proxy itself, and not taken for this machine either.
 /// - Otherwise the connection's own address; this machine only when that
-///   is loopback, the request names this machine, and no forwarding header
-///   says a proxy sent it.
-fn client_peer(socket: Option<IpAddr>, request: &Request, proxies: &Proxies) -> (Peer, bool) {
+///   is loopback, the request names this machine, no forwarding header
+///   says a proxy sent it, and the server is not
+///   [`reached_from_elsewhere`] (#351).
+fn client_peer(
+    socket: Option<IpAddr>,
+    request: &Request,
+    names: &[String],
+    proxies: &Proxies,
+) -> (Peer, bool) {
     if proxies.trusts(socket) {
         return match forwarded_client(request, proxies.header) {
             Some(client) => (
@@ -985,7 +1096,8 @@ fn client_peer(socket: Option<IpAddr>, request: &Request, proxies: &Proxies) -> 
     let proxied = FORWARDING_HEADERS
         .iter()
         .any(|name| request.header(name).is_some());
-    let local = socket.is_some_and(|s| s.to_canonical().is_loopback())
+    let local = !reached_from_elsewhere(names, proxies)
+        && socket.is_some_and(|s| s.to_canonical().is_loopback())
         && !proxied
         && request.header("host").is_some_and(names_this_machine);
     (
@@ -995,6 +1107,16 @@ fn client_peer(socket: Option<IpAddr>, request: &Request, proxies: &Proxies) -> 
         },
         false,
     )
+}
+
+/// Whether the operator said browsers reach this server from elsewhere
+/// through a name or a proxy: a `--web-host` (`names`) that does not name
+/// this machine only, or any `--trusted-proxy`. A proxy here may then pass a
+/// remote client's `Host: localhost` on with no forwarding header, so no
+/// connection is taken for a browser on this machine, and every browser
+/// needs the setup code while there are no users (#351).
+pub fn reached_from_elsewhere(names: &[String], proxies: &Proxies) -> bool {
+    !proxies.addrs.is_empty() || names.iter().any(|name| !names_this_machine(name))
 }
 
 /// Whether a `Host` names this machine only: `localhost` (or a name under
@@ -1087,7 +1209,7 @@ fn connection(
         return;
     }
     let socket = stream.peer_addr().ok().map(|a| a.ip());
-    let (peer, through_proxy) = client_peer(socket, &request, &config.proxies);
+    let (peer, through_proxy) = client_peer(socket, &request, &config.names, &config.proxies);
     if let (true, Some(client)) = (through_proxy, peer.addr) {
         let arrival = forwarded(limits, id, client, Instant::now());
         if let Some((code, reason, body)) = arrival.refusal() {
@@ -2401,16 +2523,29 @@ mod tests {
         assert_eq!(back.grace_since(), Some(at));
     }
 
-    /// #266: an IPv6 `/64` is one address to every limit: one machine can
-    /// take as many addresses in it as it likes.
+    /// #338: an IPv6 address is one address to the per-address limits, so
+    /// devices sharing a LAN's `/64` do not share them; the `/64` is what
+    /// the limits on top count by (#266). IPv4 and loopback have no `/64`.
     #[test]
-    fn ipv6_addresses_count_by_their_64() {
+    fn ipv6_addresses_count_individually() {
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
-        assert_eq!(peer_key(ip("2001:db8:1:2:a:b:c:d")), ip("2001:db8:1:2::"));
-        assert_eq!(peer_key(ip("fe80::1234")), ip("fe80::"));
+        let v6 = |s: &str| s.parse::<Ipv6Addr>().unwrap();
+        assert_eq!(
+            peer_key(ip("2001:db8:1:2:a:b:c:d")),
+            ip("2001:db8:1:2:a:b:c:d")
+        );
+        assert_eq!(peer_key(ip("fe80::1234")), ip("fe80::1234"));
         assert_eq!(peer_key(ip("::ffff:10.0.0.7")), ip("10.0.0.7"));
         assert_eq!(peer_key(ip("10.0.0.7")), ip("10.0.0.7"));
         assert_eq!(peer_key(ip("::1")), ip("::1"));
+        assert_eq!(
+            prefix_key(ip("2001:db8:1:2:a:b:c:d")),
+            Some(v6("2001:db8:1:2::"))
+        );
+        assert_eq!(prefix_key(ip("fe80::1234")), Some(v6("fe80::")));
+        assert_eq!(prefix_key(ip("::ffff:10.0.0.7")), None);
+        assert_eq!(prefix_key(ip("10.0.0.7")), None);
+        assert_eq!(prefix_key(ip("::1")), None);
 
         let slots: SharedSlots = Arc::default();
         let mut arrivals = Arrivals::default();
@@ -2426,23 +2561,308 @@ mod tests {
                 None,
             )
         };
-        // At most MAX_PER_PEER waiting from one /64, whatever the address.
+        // Device 1 fills its own per-peer allocation.
         for n in 0..MAX_PER_PEER as u32 {
-            let peer = format!("2001:db8:1:2::{:x}", n + 1);
-            assert_eq!(attempt(n, &peer), Arrival::Taken, "{peer}");
+            assert_eq!(attempt(n, "2001:db8:1:2::1"), Arrival::Taken);
         }
-        let mut n = MAX_PER_PEER as u32;
-        assert_eq!(attempt(n, "2001:db8:1:2:ffff::1"), Arrival::Busy);
-        n += 1;
-        // Another /64 is another address.
-        assert_eq!(attempt(n, "2001:db8:1:3::1"), Arrival::Taken);
-        n += 1;
-        // And one bucket of new connections for the whole /64.
-        while (n as usize) < ARRIVAL_BURST as usize + 1 {
-            assert_eq!(attempt(n, "2001:db8:1:2:dead::1"), Arrival::Busy);
+        // Device 1 is now at capacity.
+        assert_eq!(
+            attempt(MAX_PER_PEER as u32, "2001:db8:1:2::1"),
+            Arrival::Busy
+        );
+
+        // Device 2 on the same /64 is NOT locked out by Device 1.
+        let mut id = MAX_PER_PEER as u32 + 1;
+        assert_eq!(attempt(id, "2001:db8:1:2::2"), Arrival::Taken);
+        id += 1;
+
+        // Link-local addresses in fe80:: also count individually.
+        for _ in 0..MAX_PER_PEER {
+            assert_eq!(attempt(id, "fe80::1"), Arrival::Taken);
+            id += 1;
+        }
+        assert_eq!(attempt(id, "fe80::1"), Arrival::Busy);
+        id += 1;
+        assert_eq!(attempt(id, "fe80::2"), Arrival::Taken);
+    }
+
+    /// Address `n` of one IPv6 `/64`, `2001:db8:1:2::/64`.
+    fn on_64(n: usize) -> IpAddr {
+        IpAddr::V6(Ipv6Addr::new(
+            0x2001,
+            0xdb8,
+            1,
+            2,
+            0,
+            0,
+            1,
+            0x1000 + n as u16,
+        ))
+    }
+
+    /// #338: one device on an IPv6 LAN opening a connection about once a
+    /// second, never logging in, does not keep another device on the same
+    /// `/64` out: its connection is taken, and grace protects it while
+    /// newcomers from elsewhere fill the pool. Several devices on one `/64`
+    /// loading the console at once all get in.
+    #[test]
+    fn devices_sharing_an_ipv6_64_do_not_lock_each_other_out() {
+        let slots: SharedSlots = Arc::default();
+        let mut arrivals = Arrivals::default();
+        let start = Instant::now();
+        let busy = on_64(0);
+        let mut next: ClientId = 1;
+        let mut held: Vec<(ClientId, Admission)> = Vec::new();
+        let mut busy_taken = 0usize;
+        for s in 0..120u64 {
+            let at = start + Duration::from_secs(s);
+            held.retain(|(id, admission)| {
+                let ended = admission.should_close(at);
+                if ended {
+                    slots.lock().unwrap().close(*id, at);
+                }
+                !ended
+            });
+            let admission = Admission::new(at);
+            let arrival = admit(
+                &slots,
+                &mut arrivals,
+                next,
+                Some(busy),
+                at,
+                admission.clone(),
+                None,
+            );
+            if arrival == Arrival::Taken {
+                held.push((next, admission));
+                busy_taken += 1;
+            }
+            next += 1;
+        }
+        // It really was limited, by its own limits.
+        assert_eq!(held.len(), MAX_PER_PEER);
+        assert!(busy_taken < 120, "{busy_taken}");
+
+        let at = start + Duration::from_secs(120);
+        let second = Admission::new(at);
+        let arrival = admit(
+            &slots,
+            &mut arrivals,
+            next,
+            Some(on_64(1)),
+            at,
+            second.clone(),
+            None,
+        );
+        assert_eq!(arrival, Arrival::Taken);
+        next += 1;
+        // Newcomers from elsewhere close the busy device's connections (its
+        // wait is long past its grace), then are turned away: never the
+        // second device's.
+        let mut newcomers = 0;
+        while slots.lock().unwrap().open(
+            next,
+            Some(address(newcomers)),
+            at,
+            Admission::new(at),
+            None,
+        ) {
+            next += 1;
+            newcomers += 1;
+            assert!(newcomers <= MAX_CONNECTIONS);
+        }
+        assert_eq!(newcomers, MAX_CONNECTIONS - 1);
+        assert!(held.iter().all(|(_, a)| evicted(a)));
+        assert!(!evicted(&second) && !second.should_close(at));
+
+        // A dozen devices on one /64 loading the page at once (five
+        // connections each) all get in.
+        let slots: SharedSlots = Arc::default();
+        let mut arrivals = Arrivals::default();
+        for device in 0..12 {
+            for load in 0..5 {
+                let arrival = admit(
+                    &slots,
+                    &mut arrivals,
+                    (100 * device + load) as ClientId,
+                    Some(on_64(100 + device)),
+                    start,
+                    Admission::new(start),
+                    None,
+                );
+                assert_eq!(arrival, Arrival::Taken, "device {device}, load {load}");
+            }
+        }
+    }
+
+    /// #266, with #338's per-address limits: one machine taking a new
+    /// address in its `/64` for every connection pins at most
+    /// [`MAX_PROTECTED_PER_PREFIX`] slots and opens new connections no
+    /// faster than its `/64`'s rate, so operators from elsewhere still get
+    /// a slot and keep it until they log in.
+    #[test]
+    fn many_addresses_in_one_ipv6_64_cannot_hold_the_pool() {
+        let start = Instant::now();
+        // Every slot held, each by its own address of one /64, all inside
+        // their grace: newcomers from elsewhere still get in, as all but
+        // MAX_PROTECTED_PER_PREFIX of them may be closed.
+        let mut slots = Slots::default();
+        let mut rotating = Vec::new();
+        for n in 0..MAX_CONNECTIONS {
+            let peer = on_64(n).to_string();
+            rotating.extend(fill(&mut slots, 1 + n as ClientId, 1, &peer, start));
+        }
+        let at = start + Duration::from_secs(1);
+        let mut operators = Vec::new();
+        for n in 0..MAX_CONNECTIONS - MAX_PROTECTED_PER_PREFIX {
+            let admission = Admission::new(at);
+            let id = 1000 + n as ClientId;
+            assert!(
+                slots.open(id, Some(address(n)), at, admission.clone(), None),
+                "newcomer {n}"
+            );
+            operators.push(admission);
+        }
+        assert!(!slots.open(2000, Some(address(999)), at, Admission::new(at), None));
+        let kept = rotating.iter().filter(|a| !evicted(a)).count();
+        assert_eq!(kept, MAX_PROTECTED_PER_PREFIX);
+        assert!(operators.iter().all(|a| !evicted(a)));
+
+        // New connections: one burst for the whole /64, whatever the
+        // address, then one every PREFIX_ARRIVAL_REFILL. Another /64, and
+        // IPv4, are not held up by it.
+        let mut arrivals = Arrivals::default();
+        let mut n = 0;
+        while arrivals.allow(Some(on_64(n)), start) {
             n += 1;
+            assert!(n <= 1000);
         }
-        assert_eq!(attempt(n, "2001:db8:1:2:beef::1"), Arrival::TooFast);
+        assert_eq!(n, PREFIX_ARRIVAL_BURST as usize);
+        assert!(!arrivals.allow(Some(on_64(5000)), start));
+        assert!(arrivals.allow(Some("2001:db8:1:3::1".parse().unwrap()), start));
+        assert!(arrivals.allow(Some(address(1)), start));
+        let minute = Duration::from_secs(60);
+        let step = Duration::from_millis(100);
+        let mut allowed = 0usize;
+        for k in 1..=(minute.as_millis() / step.as_millis()) as u32 {
+            while arrivals.allow(Some(on_64(n)), start + step * k) {
+                n += 1;
+                allowed += 1;
+            }
+        }
+        let most = (minute.as_secs_f64() / PREFIX_ARRIVAL_REFILL.as_secs_f64()) as usize;
+        assert!(
+            allowed <= most && allowed + 2 >= most,
+            "{allowed} of {most}"
+        );
+
+        // As a flood: the machine keeps the pool full, replacing each of
+        // its connections from a new address once its grace is over, and
+        // opening more as fast as it is let. Operators come one by one,
+        // from an IPv4 address or another /64, and log in five seconds
+        // later; each gets a slot at once and keeps it.
+        let slots: SharedSlots = Arc::default();
+        let mut arrivals = Arrivals::default();
+        let tick = Duration::from_millis(250);
+        let mut held: Vec<(ClientId, Admission, Instant)> = Vec::new();
+        let mut next: ClientId = 10_000;
+        let mut next_address = 0usize;
+        let mut flood_taken = 0usize;
+        let mut operators: Vec<(Admission, Instant)> = Vec::new();
+        let mut full_tries = 0usize;
+        let steps = 4 * 180u32;
+        let close = |id: ClientId, at: Instant| slots.lock().unwrap().close(id, at);
+        for step in 0..steps {
+            let at = start + tick * step;
+            let mut open = |arrivals: &mut Arrivals| {
+                let id = next;
+                next += 1;
+                let peer = on_64(next_address);
+                next_address += 1;
+                let admission = Admission::new(at);
+                let arrival = admit(
+                    &slots,
+                    arrivals,
+                    id,
+                    Some(peer),
+                    at,
+                    admission.clone(),
+                    None,
+                );
+                (arrival == Arrival::Taken).then_some((id, admission, at))
+            };
+            held.retain(|(id, admission, _)| {
+                let ended = admission.should_close(at);
+                if ended {
+                    close(*id, at);
+                }
+                !ended
+            });
+            let mut kept = Vec::new();
+            for (id, admission, opened) in std::mem::take(&mut held) {
+                if at - opened < LOGIN_GRACE {
+                    kept.push((id, admission, opened));
+                    continue;
+                }
+                match open(&mut arrivals) {
+                    Some(new) => {
+                        flood_taken += 1;
+                        close(id, at);
+                        kept.push(new);
+                    }
+                    None => kept.push((id, admission, opened)),
+                }
+            }
+            held = kept;
+            while let Some(new) = open(&mut arrivals) {
+                flood_taken += 1;
+                held.push(new);
+            }
+            if step % 40 == 20 {
+                let k = operators.len();
+                let peer = if k % 2 == 0 {
+                    IpAddr::from([10, 9, 9, k as u8 + 1])
+                } else {
+                    IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 9, k as u16, 0, 0, 0, 1))
+                };
+                if slots.lock().unwrap().open.len() == MAX_CONNECTIONS {
+                    full_tries += 1;
+                }
+                let admission = Admission::new(at);
+                let arrival = admit(
+                    &slots,
+                    &mut arrivals,
+                    next,
+                    Some(peer),
+                    at,
+                    admission.clone(),
+                    None,
+                );
+                next += 1;
+                assert_eq!(arrival, Arrival::Taken, "operator {k} at {:?}", at - start);
+                operators.push((admission, at));
+            }
+            for (admission, since) in &operators {
+                assert!(!admission.should_close(at), "operator closed");
+                if at - *since >= Duration::from_secs(5) {
+                    admission.set(true);
+                }
+            }
+            assert!(slots.lock().unwrap().open.len() <= MAX_CONNECTIONS);
+        }
+        assert_eq!(operators.len(), (steps / 40) as usize);
+        // The flood was real, and held to its /64's rate.
+        let elapsed = tick * steps;
+        let most = PREFIX_ARRIVAL_BURST as usize
+            + (elapsed.as_secs_f64() / PREFIX_ARRIVAL_REFILL.as_secs_f64()) as usize
+            + 1;
+        assert!(flood_taken <= most, "{flood_taken} of {most}");
+        assert!(flood_taken > 200, "{flood_taken}");
+        assert!(
+            full_tries + 2 >= operators.len(),
+            "{full_tries} of {} tries met a full pool",
+            operators.len()
+        );
     }
 
     /// #267: every answer says only this server's own scripts may run, and
@@ -2499,7 +2919,16 @@ mod tests {
 
     /// The peer `client_peer` makes of a request head from `socket`.
     fn peer_of(socket: &str, head: &str, proxies: &Proxies) -> (Peer, bool) {
-        client_peer(Some(ip(socket)), &request(head), proxies)
+        client_peer(Some(ip(socket)), &request(head), &[], proxies)
+    }
+
+    fn peer_of_with_names(
+        socket: &str,
+        head: &str,
+        names: &[String],
+        proxies: &Proxies,
+    ) -> (Peer, bool) {
+        client_peer(Some(ip(socket)), &request(head), names, proxies)
     }
 
     /// #293: behind a reverse proxy on this machine every browser connects
@@ -2545,6 +2974,47 @@ mod tests {
         }
         // Another machine naming this one's loopback is still another.
         assert!(!here("10.0.0.7", "GET /ws HTTP/1.1\r\nHost: localhost\r\n"));
+
+        // #351: what counts as being reached from elsewhere.
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let none = Proxies::default();
+        assert!(!reached_from_elsewhere(&[], &none));
+        assert!(!reached_from_elsewhere(
+            &names(&["localhost", "127.0.0.1"]),
+            &none
+        ));
+        assert!(reached_from_elsewhere(
+            &names(&["mixer.example.org"]),
+            &none
+        ));
+        let proxy = Proxies {
+            addrs: vec![ip("127.0.0.1")],
+            header: ForwardedHeader::XForwardedFor,
+        };
+        assert!(reached_from_elsewhere(&[], &proxy));
+
+        // #351: when a public web host or trusted proxy is configured, no connection
+        // (even from loopback naming localhost without forwarding headers) is treated as local.
+        let public_names = vec!["mixer.example.org".to_string()];
+        let (peer, _) = peer_of_with_names(
+            "127.0.0.1",
+            "GET /ws HTTP/1.1\r\nHost: localhost\r\n",
+            &public_names,
+            &Proxies::default(),
+        );
+        assert!(!peer.local);
+
+        let trusted_proxies = Proxies {
+            addrs: vec![ip("10.0.0.1")],
+            header: ForwardedHeader::XForwardedFor,
+        };
+        let (peer, _) = peer_of_with_names(
+            "127.0.0.1",
+            "GET /ws HTTP/1.1\r\nHost: localhost\r\n",
+            &[],
+            &trusted_proxies,
+        );
+        assert!(!peer.local);
     }
 
     /// #293: a proxy given with `--trusted-proxy` names the client, in the
@@ -2776,12 +3246,12 @@ mod tests {
     /// client, directly and through a proxy here, trusted or not.
     #[test]
     fn the_command_loop_learns_who_a_web_client_is() {
-        let joined = |addrs: Vec<IpAddr>, host: &str, extra: &str| -> Peer {
+        let joined = |names: Vec<String>, addrs: Vec<IpAddr>, host: &str, extra: &str| -> Peer {
             let (tx, rx) = std::sync::mpsc::channel();
             let bound = serve(
                 "127.0.0.1:0".parse().unwrap(),
                 tx,
-                vec!["mixer.example.org".to_string()],
+                names,
                 Proxies {
                     addrs,
                     header: ForwardedHeader::XForwardedFor,
@@ -2804,12 +3274,26 @@ mod tests {
             }
         };
         let lo = Some(ip("127.0.0.1"));
-        // A browser here.
+        // A browser here without public web host or trusted proxy.
         assert_eq!(
-            joined(Vec::new(), "localhost:8730", ""),
+            joined(Vec::new(), Vec::new(), "localhost:8730", ""),
             Peer {
                 addr: lo,
                 local: true
+            }
+        );
+        // #351: with a public web host configured, a request naming localhost
+        // over loopback is NOT treated as this machine.
+        assert_eq!(
+            joined(
+                vec!["mixer.example.org".to_string()],
+                Vec::new(),
+                "localhost:8730",
+                ""
+            ),
+            Peer {
+                addr: lo,
+                local: false
             }
         );
         // Through a proxy here that is not trusted: one shared address,
@@ -2819,11 +3303,32 @@ mod tests {
             addr: lo,
             local: false,
         };
-        assert_eq!(joined(Vec::new(), "mixer.example.org", ""), untrusted);
-        assert_eq!(joined(Vec::new(), "mixer.example.org", proxied), untrusted);
+        assert_eq!(
+            joined(
+                vec!["mixer.example.org".to_string()],
+                Vec::new(),
+                "mixer.example.org",
+                ""
+            ),
+            untrusted
+        );
+        assert_eq!(
+            joined(
+                vec!["mixer.example.org".to_string()],
+                Vec::new(),
+                "mixer.example.org",
+                proxied
+            ),
+            untrusted
+        );
         // Trusted: the client it forwards for.
         assert_eq!(
-            joined(vec![ip("127.0.0.1")], "mixer.example.org", proxied),
+            joined(
+                vec!["mixer.example.org".to_string()],
+                vec![ip("127.0.0.1")],
+                "mixer.example.org",
+                proxied
+            ),
             Peer {
                 addr: Some(ip("203.0.113.7")),
                 local: false
