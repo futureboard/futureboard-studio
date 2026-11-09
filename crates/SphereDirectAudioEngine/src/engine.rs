@@ -4945,10 +4945,14 @@ impl EngineInner {
                 round_trip_buffer as u64
             };
             let offset_samples = round_trip.saturating_add(path_samples as u64);
-            let offset_beats = runtime
-                .tempo_map
-                .beat_at_samples(offset_samples, sample_rate);
-            result.start_beat = (result.start_beat + capture_offset_beats - offset_beats).max(0.0);
+            // A duration at the take. `beat_at_samples(offset)` alone would
+            // convert it at the tempo of beat 0.
+            let place_beat = result.start_beat + capture_offset_beats;
+            let offset_beats =
+                runtime
+                    .tempo_map
+                    .beats_for_sample_span(place_beat, offset_samples, sample_rate);
+            result.start_beat = (place_beat - offset_beats).max(0.0);
         }
         drop(runtime);
 
@@ -9457,7 +9461,7 @@ mod routing_tests {
         p.tracks[0].block_l[..frames].fill(1.0);
         p.tracks[0].block_r[..frames].fill(-2.0);
 
-        accumulate_sends(&mut p, 0, frames, false, 0.0);
+        accumulate_sends(&mut p, 0, frames, false, 0.0, false);
 
         assert!(p.tracks[1].recv_l[..frames]
             .iter()
@@ -9486,7 +9490,7 @@ mod routing_tests {
         p.update_track_send_level(9, 0, 1.0);
         p.tracks[0].block_l[..frames].fill(1.0);
 
-        accumulate_sends(&mut p, 0, frames, false, 0.0);
+        accumulate_sends(&mut p, 0, frames, false, 0.0, false);
 
         assert!(p.tracks[1].recv_l[..frames]
             .iter()
@@ -9512,11 +9516,11 @@ mod routing_tests {
         p.tracks[0].block_l[..frames].fill(1.0);
 
         // Post-fader phase: the pre-fader send must NOT route.
-        accumulate_sends(&mut p, 0, frames, false, 0.0);
+        accumulate_sends(&mut p, 0, frames, false, 0.0, false);
         assert!(p.tracks[1].recv_l[..frames].iter().all(|&v| v == 0.0));
 
         // Pre-fader phase: now it routes.
-        accumulate_sends(&mut p, 0, frames, true, 0.0);
+        accumulate_sends(&mut p, 0, frames, true, 0.0, false);
         assert!(p.tracks[1].recv_l[..frames]
             .iter()
             .all(|&v| (v - 1.0).abs() < 1e-6));
@@ -9535,7 +9539,7 @@ mod routing_tests {
         };
         p.resolve_indices();
         p.tracks[0].block_l[..frames].fill(1.0);
-        accumulate_sends(&mut p, 0, frames, false, 0.0);
+        accumulate_sends(&mut p, 0, frames, false, 0.0, false);
         // Target is a normal audio track → not a valid send destination.
         assert!(p.tracks[1].recv_l[..frames].iter().all(|&v| v == 0.0));
     }
@@ -9556,7 +9560,7 @@ mod routing_tests {
         p.resolve_indices();
         p.tracks[1].block_l[..frames].fill(1.0);
 
-        accumulate_sends(&mut p, 1, frames, false, 0.0);
+        accumulate_sends(&mut p, 1, frames, false, 0.0, false);
 
         assert!(p.tracks[0].recv_l[..frames]
             .iter()
@@ -9581,8 +9585,8 @@ mod routing_tests {
         p.tracks[0].block_l[..frames].fill(1.0);
         p.tracks[1].block_l[..frames].fill(1.0);
 
-        accumulate_sends(&mut p, 0, frames, false, 0.0);
-        accumulate_sends(&mut p, 1, frames, false, 0.0);
+        accumulate_sends(&mut p, 0, frames, false, 0.0, false);
+        accumulate_sends(&mut p, 1, frames, false, 0.0, false);
 
         // Both directions accumulate at the raw accumulate_sends layer (indices
         // resolve); the planner is what keeps cycles out of a built project.

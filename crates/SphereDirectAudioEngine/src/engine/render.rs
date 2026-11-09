@@ -479,6 +479,52 @@ pub(crate) fn effective_track_muted(track: &RuntimeTrack, beat: f64) -> bool {
         .unwrap_or(track.muted)
 }
 
+/// Source-track silence: its own mute (including mute automation), or another
+/// track's solo. Routing tracks are not silenced by solo; see
+/// [`routing_output_silenced`].
+#[inline]
+fn source_output_silenced(runtime: &RuntimeProject, track_index: usize, beat: f64) -> bool {
+    effective_track_muted(&runtime.tracks[track_index], beat)
+        || (runtime.has_solo
+            && !runtime.tracks[track_index].solo
+            && !solo_keeps_source_audible(runtime, track_index))
+}
+
+/// Bus / return / group silence. Solo does not apply, except to a VSTi
+/// multi-out strip, which is that instrument's own channel.
+#[inline]
+fn routing_output_silenced(runtime: &RuntimeProject, track_index: usize, beat: f64) -> bool {
+    if effective_track_muted(&runtime.tracks[track_index], beat) {
+        return true;
+    }
+    runtime.has_solo
+        && is_vsti_output_child_track_id(&runtime.tracks[track_index].id)
+        && !runtime.tracks[track_index].solo
+        && !has_soloed_vsti_output_parent(runtime, track_index)
+}
+
+/// True when this channel's compensation delay, or one of its send-alignment
+/// delays, is in the signal path. Those rings have to keep moving while the
+/// channel is silent; a channel with nothing to delay can stay skipped.
+#[inline]
+fn compensation_delay_running(runtime: &RuntimeProject, track_index: usize) -> bool {
+    if runtime
+        .latency_graph
+        .track_pdc_delay
+        .get(track_index)
+        .copied()
+        .unwrap_or(0)
+        > 0
+    {
+        return true;
+    }
+    runtime
+        .latency_graph
+        .send_pdc_delay
+        .get(track_index)
+        .is_some_and(|row| row.iter().any(|delay| *delay > 0))
+}
+
 /// Apply a track's fader (volume / pan / preview mode) to its `block_*`
 /// (which already holds the post-insert signal), write the post-fader result
 /// back into `block_*`, and accumulate the track meter. Does **not** sum to any
@@ -829,6 +875,11 @@ fn capture_monitor_taps(
 /// meter, monitor taps, PDC and routing. The chain itself runs first, in
 /// [`run_track_chains`], so that independent channels can process it in
 /// parallel while this part keeps its fixed order on the audio thread.
+///
+/// `emit` is false while mute or solo is holding the channel out of the mix.
+/// The compensation and send delay lines still advance on the live signal —
+/// stopping them replays the audio they held at the moment of silence — and
+/// nothing is summed, metered, or monitored.
 fn finish_track_block(
     runtime: &mut RuntimeProject,
     track_index: usize,
@@ -836,28 +887,35 @@ fn finish_track_block(
     output: &mut [f32],
     channels: usize,
     beat: f64,
+    emit: bool,
 ) {
     // Multi-out: demux this track's bridged-instrument output channels into the
     // child "Out Ch" tracks' receive buffers (no-op unless the insert defines
     // child routes). Runs before pass 2, where the child routing tracks consume
-    // their `recv_*`.
-    scatter_vsti_output_children(runtime, track_index, frames, output, channels);
+    // their `recv_*`. A silenced parent does not feed its children.
+    if emit {
+        scatter_vsti_output_children(runtime, track_index, frames, output, channels);
+    }
     // Pre-fader sends tap the post-insert signal currently in block_*.
-    accumulate_sends(runtime, track_index, frames, true, beat);
+    accumulate_sends(runtime, track_index, frames, true, beat, !emit);
     // PFL and a TrackPreFader monitor source tap the same point the pre-fader
     // sends do: after this channel's inserts, before its fader.
-    capture_monitor_taps(runtime, track_index, frames, TapStage::PreFader);
+    if emit {
+        capture_monitor_taps(runtime, track_index, frames, TapStage::PreFader);
+    }
     let smooth = runtime.fader_smoothing;
     apply_fader(&mut runtime.tracks[track_index], frames, beat, smooth);
-    accumulate_block_meter(&mut runtime.tracks[track_index], frames);
-    // AFL, a TrackAfterFader source, and a Bus source tap after the fader and
-    // channel processing, before PDC — matching the post-fader send tap so
-    // every monitoring path stays time-aligned with the sends.
-    capture_monitor_taps(runtime, track_index, frames, TapStage::PostFader);
+    if emit {
+        accumulate_block_meter(&mut runtime.tracks[track_index], frames);
+        // AFL, a TrackAfterFader source, and a Bus source tap after the fader and
+        // channel processing, before PDC — matching the post-fader send tap so
+        // every monitoring path stays time-aligned with the sends.
+        capture_monitor_taps(runtime, track_index, frames, TapStage::PostFader);
+    }
     // Post-fader sends tap *before* PDC so return FX latency can be compensated
     // on the dry/main path without also delaying the send feed (which would
     // push wet further behind dry).
-    accumulate_sends(runtime, track_index, frames, false, beat);
+    accumulate_sends(runtime, track_index, frames, false, beat, !emit);
     let pdc_delay = runtime
         .latency_graph
         .track_pdc_delay
@@ -876,6 +934,15 @@ fn finish_track_block(
             frames,
         );
     }
+    if !emit {
+        // The delay lines already hold this block. Drop it so the mix, the
+        // export taps, and a loopback reader hear silence rather than the
+        // delayed signal or a frozen earlier block.
+        let track = &mut runtime.tracks[track_index];
+        track.block_l[..frames].fill(0.0);
+        track.block_r[..frames].fill(0.0);
+        return;
+    }
     // Route the post-fader (and PDC-aligned) signal to master or the track's output bus.
     route_main_output(runtime, track_index, frames, output, channels);
 }
@@ -893,8 +960,10 @@ fn finish_track_block(
 /// mid-phrase instead of restarting or staying silent.
 ///
 /// Tracks with no instrument route hold no note state, so they stay skipped and
-/// cost nothing. The pass queues an inaudible instrument's chain with the
-/// others ([`ChainJob::audible`] `false`) and clears its block afterwards.
+/// cost nothing — unless a compensation or send delay is running, in which case
+/// the pass keeps rendering them and [`finish_track_block`] advances those
+/// rings without emitting. The pass queues an inaudible instrument's chain with
+/// the others ([`ChainJob::audible`] `false`) and clears its block afterwards.
 #[inline]
 fn hosts_instrument(track: &RuntimeTrack) -> bool {
     track.midi_instrument_insert_ix.is_some()
@@ -1000,8 +1069,9 @@ fn feeds_track(tracks: &[RuntimeTrack], from: usize, to: usize) -> bool {
 ///
 /// A send with a planned PDC delay (`send_pdc_delay`) feeds the return through
 /// its own delay ring, so sources with different plug-in latency meet aligned
-/// at the return. That ring keeps running while the send is off or at zero, so
-/// switching it back on does not replay stale audio.
+/// at the return. That ring keeps running while the send is off, at zero, or
+/// `silent` because the source track is muted or solo-silenced, so switching
+/// it back on does not replay stale audio.
 #[inline]
 pub(crate) fn accumulate_sends(
     runtime: &mut RuntimeProject,
@@ -1009,6 +1079,7 @@ pub(crate) fn accumulate_sends(
     frames: usize,
     pre_fader: bool,
     beat: f64,
+    silent: bool,
 ) {
     let send_count = runtime.tracks[src_index].sends.len();
     if send_count == 0 {
@@ -1032,7 +1103,7 @@ pub(crate) fn accumulate_sends(
             .and_then(|row| row.get(s))
             .copied()
             .unwrap_or(0);
-        let audible = enabled && level != 0.0;
+        let audible = !silent && enabled && level != 0.0;
         if !audible && delay == 0 {
             continue;
         }
@@ -1703,10 +1774,11 @@ fn render_project_block_interleaved_core(
         let Some(track_index) = clip_track_index.filter(|&ti| ti < runtime.tracks.len()) else {
             continue;
         };
-        if effective_track_muted(&runtime.tracks[track_index], block_beat)
-            || (runtime.has_solo
-                && !runtime.tracks[track_index].solo
-                && !solo_keeps_source_audible(runtime, track_index))
+        // A silenced track's clips still have to render when a compensation
+        // or send delay is running. Otherwise those rings stop, and un-muting
+        // or un-soloing replays the audio they held when the track went silent.
+        if source_output_silenced(runtime, track_index, block_beat)
+            && !compensation_delay_running(runtime, track_index)
         {
             continue;
         }
@@ -1867,11 +1939,8 @@ fn render_project_block_interleaved_core(
             if !source_active {
                 continue;
             }
-            if effective_track_muted(&runtime.tracks[track_index], block_beat)
-                || (runtime.has_solo
-                    && !runtime.tracks[track_index].solo
-                    && !solo_keeps_source_audible(runtime, track_index))
-            {
+            let silenced = source_output_silenced(runtime, track_index, block_beat);
+            if silenced && !compensation_delay_running(runtime, track_index) {
                 if hosts_instrument(&runtime.tracks[track_index]) {
                     jobs.push(ChainJob {
                         track_index,
@@ -1880,7 +1949,8 @@ fn render_project_block_interleaved_core(
                 }
                 continue;
             }
-            if callback_debug_enabled()
+            if !silenced
+                && callback_debug_enabled()
                 && !runtime.tracks[track_index].inserts.is_empty()
                 && !runtime.tracks[track_index].callback_clip_route_log_done
             {
@@ -1950,7 +2020,16 @@ fn render_project_block_interleaved_core(
                 track.block_r[..frames].fill(0.0);
                 continue;
             }
-            finish_track_block(runtime, track_index, frames, output, channels, block_beat);
+            let emit = !source_output_silenced(runtime, track_index, block_beat);
+            finish_track_block(
+                runtime,
+                track_index,
+                frames,
+                output,
+                channels,
+                block_beat,
+                emit,
+            );
             if let Some(tap) = track_taps
                 .as_deref_mut()
                 .and_then(|taps| taps.get_mut(track_index))
@@ -1996,18 +2075,11 @@ fn render_project_block_interleaved_core(
                 break;
             }
             cursor += 1;
-            if effective_track_muted(&runtime.tracks[track_index], block_beat) {
-                continue;
-            }
-            // VSTi multi-out child strips are the only routing tracks that obey
-            // solo: they are the instrument's own channels, not a shared bus. A
-            // channel sounds when it is soloed itself (listen to one drum pad in
-            // isolation) or when its parent instrument track is soloed (solo the
-            // VSTi from the main track and hear all of its channels).
-            if runtime.has_solo
-                && is_vsti_output_child_track_id(&runtime.tracks[track_index].id)
-                && !runtime.tracks[track_index].solo
-                && !has_soloed_vsti_output_parent(runtime, track_index)
+            // A silenced bus still has to run when it is delay-compensated, so
+            // its ring keeps the signal it will emit on unmute. VSTi multi-out
+            // strips are the routing tracks that also obey solo.
+            if routing_output_silenced(runtime, track_index, block_beat)
+                && !compensation_delay_running(runtime, track_index)
             {
                 continue;
             }
@@ -2024,7 +2096,16 @@ fn render_project_block_interleaved_core(
         run_track_chains(&mut runtime.tracks, &jobs, frames, transport);
         for job in &jobs {
             let track_index = job.track_index;
-            finish_track_block(runtime, track_index, frames, output, channels, block_beat);
+            let emit = !routing_output_silenced(runtime, track_index, block_beat);
+            finish_track_block(
+                runtime,
+                track_index,
+                frames,
+                output,
+                channels,
+                block_beat,
+                emit,
+            );
             if let Some(tap) = track_taps
                 .as_deref_mut()
                 .and_then(|taps| taps.get_mut(track_index))
@@ -6016,5 +6097,401 @@ mod spatial_mix_tests {
         );
         let (out, _) = render(&mut rt, 2);
         assert!(energy(&out, 2, 0) > energy(&out, 2, 1) * 1.5);
+    }
+}
+
+/// Mute, solo, and mute automation used to freeze a track's compensation and
+/// send delay lines. Un-muting then played the audio those rings held at the
+/// moment of silence, for about the compensation length, and jumped to live.
+#[cfg(test)]
+mod compensation_silence_tests {
+    use super::render_project_block_interleaved;
+    use crate::audio_file::AudioFileBuffer;
+    use crate::audio_source::ClipAudioSource;
+    use crate::runtime::{
+        RuntimeAutomationCurve, RuntimeAutomationLane, RuntimeAutomationPoint,
+        RuntimeAutomationTarget, RuntimeProject,
+    };
+    use crate::types::{
+        EngineClipSnapshot, EngineProjectSnapshot, EngineRoutingSnapshot, EngineSendSnapshot,
+        EngineTrackSnapshot,
+    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    const SR: u32 = 48_000;
+    const BLOCK: usize = 64;
+    const DELAY: u32 = 256;
+    const BLOCKS: usize = 28;
+    /// Long enough that the delay ring is full of the live signal before silence.
+    const GAP_AT: usize = 12;
+
+    fn track(id: &str, track_type: &str) -> EngineTrackSnapshot {
+        EngineTrackSnapshot {
+            midi_programs: Vec::new(),
+            id: id.to_string(),
+            track_type: track_type.to_string(),
+            volume: 1.0,
+            pan: 0.0,
+            muted: false,
+            solo: false,
+            armed: false,
+            input_monitor: false,
+            input_source: Default::default(),
+            preview_mode: "stereo".to_string(),
+            output_track_id: None,
+            inserts: Vec::new(),
+            sends: Vec::new(),
+            automation_lanes: Vec::new(),
+            builtin_soundfont_player: false,
+            soundfont_path: None,
+            soundfont_preset_bank: None,
+            soundfont_preset_patch: None,
+            soundfont_volume: 1.0,
+            soundfont_reverb_chorus: true,
+            soundfont_polyphony: 64,
+            soundfont_envelope: Default::default(),
+            soundfont_quality: Default::default(),
+            soundfont_mode: Default::default(),
+            soundfont_channels: Default::default(),
+            solfege_engine: None,
+        }
+    }
+
+    fn ramp_cache() -> HashMap<String, Arc<ClipAudioSource>> {
+        let frames = SR as usize;
+        let samples: Vec<f32> = (0..frames)
+            .flat_map(|i| {
+                let v = (i as f32 + 1.0) * 1.0e-5;
+                [v, v]
+            })
+            .collect();
+        let mut cache = HashMap::new();
+        cache.insert(
+            "ramp.wav".to_string(),
+            Arc::new(ClipAudioSource::InMemory(Arc::new(AudioFileBuffer {
+                sample_rate: SR,
+                channels: 2,
+                frames,
+                samples,
+            }))),
+        );
+        cache
+    }
+
+    fn clip_on(track_id: &str) -> EngineClipSnapshot {
+        EngineClipSnapshot {
+            id: format!("{track_id}-clip"),
+            track_id: track_id.to_string(),
+            asset_id: "ramp".to_string(),
+            media_path: Some("ramp.wav".to_string()),
+            start_beat: 0.0,
+            duration_beats: 2.0,
+            offset_seconds: 0.0,
+            gain: 1.0,
+            muted: false,
+            ara_rendered: false,
+            fades: None,
+            stretch: Default::default(),
+            audio_process: None,
+        }
+    }
+
+    fn project(
+        tracks: Vec<EngineTrackSnapshot>,
+        clips: Vec<EngineClipSnapshot>,
+    ) -> EngineProjectSnapshot {
+        EngineProjectSnapshot {
+            spatial: Default::default(),
+            project_id: "pdc-silence".to_string(),
+            project_root: None,
+            preferred_input_device: None,
+            bpm: 120.0,
+            tempo_points: Vec::new(),
+            time_signature: [4, 4],
+            sample_rate: SR,
+            tracks,
+            clips,
+            midi_clips: Vec::new(),
+            pdc_enabled: true,
+            latency_graph_version: 1,
+            routing: EngineRoutingSnapshot {
+                master_output_device: None,
+                sample_rate: SR,
+                buffer_size: 256,
+            },
+        }
+    }
+
+    fn build(
+        tracks: Vec<EngineTrackSnapshot>,
+        clips: Vec<EngineClipSnapshot>,
+        cache: &mut HashMap<String, Arc<ClipAudioSource>>,
+    ) -> RuntimeProject {
+        let snapshot = project(tracks, clips);
+        let mut runtime = RuntimeProject::build(&snapshot, SR, cache, None, true).expect("runtime");
+        runtime.fader_smoothing = false;
+        runtime
+    }
+
+    fn hold_track(runtime: &mut RuntimeProject, index: usize, delay: u32) {
+        let cap = delay as usize + BLOCK;
+        let track = &mut runtime.tracks[index];
+        track.pdc_delay_l = vec![0.0; cap];
+        track.pdc_delay_r = vec![0.0; cap];
+        track.pdc_write_pos = 0;
+        runtime.latency_graph.track_pdc_delay[index] = delay;
+    }
+
+    fn hold_send(runtime: &mut RuntimeProject, index: usize, slot: usize, delay: u32) {
+        let cap = delay as usize + BLOCK;
+        let line = &mut runtime.tracks[index].sends[slot].pdc;
+        line.l = vec![0.0; cap];
+        line.r = vec![0.0; cap];
+        line.write_pos = 0;
+        runtime.latency_graph.send_pdc_delay[index][slot] = delay;
+    }
+
+    fn render_left(
+        runtime: &mut RuntimeProject,
+        mut each: impl FnMut(usize, &mut RuntimeProject),
+    ) -> Vec<f32> {
+        let mut output = vec![0.0f32; BLOCK * 2];
+        let mut left = Vec::with_capacity(BLOCKS * BLOCK);
+        for block in 0..BLOCKS {
+            each(block, runtime);
+            render_project_block_interleaved(
+                runtime,
+                (block * BLOCK) as u64,
+                1.0,
+                &mut output,
+                2,
+                true,
+                4,
+                4,
+                None,
+            );
+            left.extend(output.iter().step_by(2).copied());
+        }
+        left
+    }
+
+    /// The compensation ring is what this exercises. An undelayed mute/unmute
+    /// would resume in time too, and would not catch the stale-audio bug.
+    fn assert_output_is_delayed(rendered: &[f32]) {
+        let delay = DELAY as usize;
+        let lead = rendered[..delay]
+            .iter()
+            .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+        assert!(
+            lead < 1.0e-6,
+            "the delay line should start empty, peak {lead}"
+        );
+        let at = delay + 800;
+        let delayed = (at - delay + 1) as f32 * 1.0e-5;
+        let undelayed = (at + 1) as f32 * 1.0e-5;
+        assert!(
+            (rendered[at] - delayed).abs() < 1.0e-5,
+            "sample {at} is {} ; delayed {delayed} undelayed {undelayed}",
+            rendered[at]
+        );
+        assert!(
+            (rendered[at] - undelayed).abs() > 1.0e-3,
+            "sample {at} was not held back by the compensation delay"
+        );
+    }
+
+    fn assert_resumes_in_time(reference: &[f32], silenced: &[f32], gap_blocks: usize) {
+        assert_output_is_delayed(reference);
+        let gap_start = GAP_AT * BLOCK;
+        let gap_end = gap_start + gap_blocks * BLOCK;
+        let silent_peak = silenced[gap_start..gap_end]
+            .iter()
+            .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+        let live_peak = reference[gap_start..gap_end]
+            .iter()
+            .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+        assert!(
+            silent_peak < 1.0e-5,
+            "the silenced stretch must stay silent, peak {silent_peak}"
+        );
+        assert!(
+            live_peak > 1.0e-3,
+            "the reference must still be playing through the gap, peak {live_peak}"
+        );
+        let mut worst = 0.0f32;
+        let mut at = gap_end;
+        for (i, (got, expected)) in silenced[gap_end..]
+            .iter()
+            .zip(&reference[gap_end..])
+            .enumerate()
+        {
+            let err = (got - expected).abs();
+            if err > worst {
+                worst = err;
+                at = gap_end + i;
+            }
+        }
+        assert!(
+            worst < 1.0e-5,
+            "audio after the gap diverged by {worst} at sample {at} (got {}, expected {})",
+            silenced[at],
+            reference[at]
+        );
+    }
+
+    fn pair(
+        make: impl Fn(&mut HashMap<String, Arc<ClipAudioSource>>) -> RuntimeProject,
+    ) -> (RuntimeProject, RuntimeProject) {
+        let mut cache = ramp_cache();
+        let reference = make(&mut cache);
+        let subject = make(&mut cache);
+        (reference, subject)
+    }
+
+    fn compensated_source() -> (Vec<EngineTrackSnapshot>, Vec<EngineClipSnapshot>) {
+        (
+            vec![
+                track("audio", "audio"),
+                track("other", "audio"),
+                track("master", "master"),
+            ],
+            vec![clip_on("audio")],
+        )
+    }
+
+    #[test]
+    fn a_muted_compensated_track_resumes_in_time() {
+        // Longer than the delay, so a ring that merely filled with silence
+        // would still be empty when the mute lifts.
+        let gap = 8;
+        let (mut reference, mut subject) = pair(|cache| {
+            let (tracks, clips) = compensated_source();
+            let mut runtime = build(tracks, clips, cache);
+            hold_track(&mut runtime, 0, DELAY);
+            runtime
+        });
+        let expected = render_left(&mut reference, |_, _| {});
+        let got = render_left(&mut subject, |block, runtime| {
+            runtime.update_track_mute_at(0, (GAP_AT..GAP_AT + gap).contains(&block));
+        });
+        assert_resumes_in_time(&expected, &got, gap);
+    }
+
+    #[test]
+    fn a_short_mute_does_not_replay_the_delay_line() {
+        // Shorter than the delay. Freezing the ring leaves pre-mute audio in
+        // it; writing silence through the mute leaves a hole afterwards. The
+        // live signal has to keep moving the whole time.
+        let gap = 1;
+        assert!(gap * BLOCK < DELAY as usize);
+        let (mut reference, mut subject) = pair(|cache| {
+            let (tracks, clips) = compensated_source();
+            let mut runtime = build(tracks, clips, cache);
+            hold_track(&mut runtime, 0, DELAY);
+            runtime
+        });
+        let expected = render_left(&mut reference, |_, _| {});
+        let got = render_left(&mut subject, |block, runtime| {
+            runtime.update_track_mute_at(0, (GAP_AT..GAP_AT + gap).contains(&block));
+        });
+        assert_resumes_in_time(&expected, &got, gap);
+    }
+
+    #[test]
+    fn unsoloing_brings_compensated_tracks_back_in_time() {
+        let gap = 6;
+        let (mut reference, mut subject) = pair(|cache| {
+            let (tracks, clips) = compensated_source();
+            let mut runtime = build(tracks, clips, cache);
+            hold_track(&mut runtime, 0, DELAY);
+            runtime
+        });
+        let expected = render_left(&mut reference, |_, _| {});
+        let got = render_left(&mut subject, |block, runtime| {
+            runtime.update_track_solo_at(1, (GAP_AT..GAP_AT + gap).contains(&block));
+        });
+        assert_resumes_in_time(&expected, &got, gap);
+    }
+
+    #[test]
+    fn mute_automation_does_not_freeze_compensation() {
+        let gap = 4;
+        let (mut reference, mut subject) = pair(|cache| {
+            let (tracks, clips) = compensated_source();
+            let mut runtime = build(tracks, clips, cache);
+            hold_track(&mut runtime, 0, DELAY);
+            runtime.tracks[0]
+                .automation_lanes
+                .push(RuntimeAutomationLane {
+                    id: "mute".to_string(),
+                    name: "Mute".to_string(),
+                    target: RuntimeAutomationTarget::TrackMute,
+                    enabled: true,
+                    points: vec![RuntimeAutomationPoint {
+                        beat: 0.0,
+                        value: 0.0,
+                        curve: RuntimeAutomationCurve::Hold,
+                        tension: 0.0,
+                    }],
+                });
+            runtime
+        });
+        let expected = render_left(&mut reference, |_, _| {});
+        let got = render_left(&mut subject, |block, runtime| {
+            let muted = (GAP_AT..GAP_AT + gap).contains(&block);
+            runtime.tracks[0].automation_lanes[0].points[0].value = if muted { 1.0 } else { 0.0 };
+        });
+        assert_resumes_in_time(&expected, &got, gap);
+    }
+
+    #[test]
+    fn a_muted_tracks_delayed_send_resumes_in_time() {
+        let gap = 6;
+        let (mut reference, mut subject) = pair(|cache| {
+            let mut src = track("src", "audio");
+            src.sends = vec![EngineSendSnapshot {
+                id: "s".to_string(),
+                return_track_id: "verb".to_string(),
+                level: 1.0,
+                enabled: true,
+                pre_fader: true,
+            }];
+            let mut runtime = build(
+                vec![src, track("verb", "return"), track("master", "master")],
+                vec![clip_on("src")],
+                cache,
+            );
+            // Dry path closed, so the master is only the delayed pre-fader send.
+            runtime.tracks[0].volume = 0.0;
+            hold_send(&mut runtime, 0, 0, DELAY);
+            runtime
+        });
+        let expected = render_left(&mut reference, |_, _| {});
+        let got = render_left(&mut subject, |block, runtime| {
+            runtime.update_track_mute_at(0, (GAP_AT..GAP_AT + gap).contains(&block));
+        });
+        assert_resumes_in_time(&expected, &got, gap);
+    }
+
+    #[test]
+    fn a_muted_compensated_bus_resumes_in_time() {
+        let gap = 6;
+        let (mut reference, mut subject) = pair(|cache| {
+            let mut src = track("src", "audio");
+            src.output_track_id = Some("bus".to_string());
+            let mut runtime = build(
+                vec![src, track("bus", "bus"), track("master", "master")],
+                vec![clip_on("src")],
+                cache,
+            );
+            hold_track(&mut runtime, 1, DELAY);
+            runtime
+        });
+        let expected = render_left(&mut reference, |_, _| {});
+        let got = render_left(&mut subject, |block, runtime| {
+            runtime.update_track_mute_at(1, (GAP_AT..GAP_AT + gap).contains(&block));
+        });
+        assert_resumes_in_time(&expected, &got, gap);
     }
 }
