@@ -1,15 +1,15 @@
 # Maintainer: Arizkami <arizkami@users.noreply.github.com>
 #
-# Futureboard Studio is a native Rust/GPUI application (no Electron/Chromium
-# runtime). The AppImage this package extracts is built by
-# packaging/linux/bundle-appimage.sh and published on every nightly release.
+# Futureboard Studio is a native Rust/GPUI application. The AppImage this
+# package extracts is the versioned Linux release asset, built by
+# packaging/linux/bundle-appimage.sh.
 pkgname=futureboard-studio-bin
 pkgver=2026.11.1_beta2.0.0
 _appver=2026.11.1-beta2.0.0
 pkgrel=1
 pkgdesc="Futureboard Studio — native Digital Audio Workstation"
 arch=('x86_64')
-url="https://github.com/arizkami/Futureboard"
+url="https://github.com/futureboard/futureboard-studio"
 license=('LicenseRef-proprietary')
 depends=(
   'alsa-lib'
@@ -28,15 +28,30 @@ conflicts=('futureboard-studio')
 options=('!strip' '!debug')
 install=futureboard-studio-bin.install
 
-# The release asset carries the exact version (hyphen and all); AUR pkgver
-# cannot, so `_appver` is synced alongside it by scripts/sync-version.mjs.
+# `_appver` is both the release tag and the asset version. AUR pkgver cannot
+# contain `-`, so it stays separate. Release tags are bare versions; for a
+# `v`-prefixed tag the URL below would not resolve, so the release workflow
+# skips the AUR bump when the tag is not exactly `_appver`. The asset is that immutable tag on the
+# canonical repository — not the `nightly` tag, which is deleted and recreated
+# every day and whose files are named with the build date.
 _appimage="Futureboard.Studio-${_appver}-x86_64.AppImage"
-source_x86_64=("${_appimage}::https://github.com/arizkami/Futureboard/releases/download/nightly/${_appimage}")
-sha256sums_x86_64=('SKIP')
+source_x86_64=("${_appimage}::https://github.com/futureboard/futureboard-studio/releases/download/${_appver}/${_appimage}")
+# The desktop release workflow replaces this with the sha256 of the AppImage
+# it just uploaded. It is never SKIP.
+sha256sums_x86_64=('0000000000000000000000000000000000000000000000000000000000000000')
 
 prepare() {
-  chmod +x "${srcdir}/${_appimage}"
-  "${srcdir}/${_appimage}" --appimage-extract
+  cd "${srcdir}" || exit 1
+  local sum="${sha256sums_x86_64[0]}"
+  if [[ ! "${sum}" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "error: sha256sums_x86_64 is not a SHA-256 of ${_appimage}" >&2
+    exit 1
+  fi
+  # makepkg checks this before prepare(). Check again so the image is never
+  # executed when checksums were skipped.
+  echo "${sum}  ${_appimage}" | sha256sum -c - || exit 1
+  chmod +x "${_appimage}"
+  "./${_appimage}" --appimage-extract
 }
 
 package() {

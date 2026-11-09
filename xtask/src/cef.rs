@@ -29,7 +29,11 @@ pub const LOCALES_DIR: &str = "locales";
 
 /// Dev-only or loader artifacts in `Release/` that must never ship.
 const SKIP_EXTENSIONS: &[&str] = &["lib", "exp", "pdb", "ilk"];
-const SKIP_NAMES: &[&str] = &["bootstrap.exe", "bootstrapc.exe"];
+const SKIP_NAMES: &[&str] = &[
+    "bootstrap.exe",
+    "bootstrapc.exe",
+    sphere_webview::INSTALL_MANIFEST,
+];
 
 /// Result of staging the CEF runtime.
 #[derive(Debug, Clone, Default)]
@@ -156,6 +160,35 @@ fn promote_duplicated_distribution(canonical: &Path, duplicated: &Path) -> Resul
         canonical.display()
     );
     Ok(())
+}
+
+/// Refuse to package a CEF tree that is not byte-for-byte the pinned install.
+///
+/// Only the versioned `build/cef/<version>/<platform>` layout written by
+/// `install_cef` carries the install manifest, so only it can be checked file
+/// by file. The legacy flat `build/cef` fallback has no such record and is
+/// refused rather than packaged unchecked.
+pub fn verify_dist_for_packaging(workspace_root: &Path, dist: &Path, triple: &str) -> Result<()> {
+    let target = CefTarget::from_target_triple(triple)
+        .with_context(|| format!("no pinned CEF distribution for `{triple}`"))?;
+    let canonical = sphere_webview::cef_path(workspace_root, target);
+    if dist != canonical {
+        bail!(
+            "CEF at {} is not the verified install layout ({}). Packaging does not \
+             ship an unchecked runtime; run `cargo run -p SphereWebView --example \
+             install_cef --features installer` (add `--target {triple}` when cross \
+             packaging), or pass --no-cef",
+            dist.display(),
+            canonical.display()
+        );
+    }
+    sphere_webview::verify_installed_distribution(dist, target).with_context(|| {
+        format!(
+            "CEF at {} does not match the pinned install; reinstall it with \
+             `cargo run -p SphereWebView --example install_cef --features installer -- --force`",
+            dist.display()
+        )
+    })
 }
 
 fn platform_dir(triple: &str) -> Option<&'static str> {

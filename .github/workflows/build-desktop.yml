@@ -13,10 +13,15 @@ on:
     tags:
       - "[0-9]+.[0-9]+.[0-9]+*"
       - "v[0-9]+.[0-9]+.[0-9]+*"
+  # Build only. A manual run never publishes, even from a tag (see `release`).
   workflow_dispatch:
   # Called by `release.yml` so the release build uses these exact steps instead
-  # of a third copy of them. The `release` job below stays skipped for callers
-  # because `github.ref` is then the caller's branch, not a tag.
+  # of a third copy of them. The `release` job below does not publish for
+  # callers: dispatching Release Build with the workflow ref set to the tag
+  # makes `github.ref` a tag, and publishing here used to flip that release
+  # to public (`draft: false`) before the caller could honor its visibility
+  # input. Callers that want this job opt in with `publish-release`.
+  # release.yml does not.
   workflow_call:
     inputs:
       app-version:
@@ -24,6 +29,11 @@ on:
         type: string
         required: false
         default: ""
+      publish-release:
+        description: Also run the tag publish job. Release Build leaves this false so a draft stays a draft.
+        type: boolean
+        required: false
+        default: false
     outputs:
       app-version:
         description: Version the artifacts were built with.
@@ -171,13 +181,16 @@ jobs:
         shell: bash
         run: bash .github/workflows/set-cef-path.sh
 
+      # Always run, including when `build/cef` was restored from cache.
+      # install_cef re-hashes the unpacked runtime against the pin; skipping
+      # on the presence of archive.json shipped whatever the cache held.
       - name: Install pinned CEF SDK and runtime
-        if: matrix.os != 'macos-latest' && hashFiles('build/cef/150.0.11/**/archive.json') == ''
+        if: matrix.os != 'macos-latest'
         run: cargo run -p SphereWebView --example install_cef --features installer
 
       # CEF publishes macosx64 and macosarm64 as separate distributions — there
-      # is no universal one — so a universal app needs both staged here. The
-      # installer keeps an already-valid distribution, so the cache still wins.
+      # is no universal one — so a universal app needs both staged here. A
+      # cached tree is kept only when its runtime still matches the pin.
       - name: Install pinned CEF SDKs (macOS x86_64 + arm64)
         if: matrix.os == 'macos-latest'
         run: cargo run -p SphereWebView --example install_cef --features installer -- --target universal-macos
@@ -337,7 +350,22 @@ jobs:
     name: Publish Release
     needs: [version, build]
     runs-on: ubuntu-24.04
-    if: startsWith(github.ref, 'refs/tags/')
+    # Publishes only for:
+    # - a tag push of this workflow itself. In a called workflow the github
+    #   context is the caller's, so `workflow_ref` names build-desktop.yml
+    #   only when this file is the top-level run;
+    # - a workflow_call that sets `publish-release: true`. release.yml passes
+    #   false: its `visibility` input decides draft vs public, and this job's
+    #   `draft: false` must not run first (#304).
+    # A direct workflow_dispatch, even from a tag, builds but never publishes:
+    # it has no `publish-release` input (null), and releasing by hand goes
+    # through Release Build. Compare with `== true` only: Actions coerces null
+    # and false both to 0, so `!= false` cannot tell them apart.
+    if: >-
+      startsWith(github.ref, 'refs/tags/') &&
+      ((github.event_name == 'push' &&
+        contains(github.workflow_ref, '/.github/workflows/build-desktop.yml@')) ||
+       inputs.publish-release == true)
     permissions:
       contents: write
 
@@ -380,7 +408,46 @@ jobs:
           BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
+          # The PKGBUILD downloads releases/download/<_appver>/. A `v`-prefixed
+          # (or otherwise different) tag would leave the AUR package pointing at
+          # a tag that does not exist, so do not bump it from such a release.
+          if [ "${GITHUB_REF_NAME}" != "${VERSION}" ]; then
+            echo "::warning::Tag ${GITHUB_REF_NAME} is not the bare version ${VERSION}; AUR PKGBUILD not bumped."
+            exit 0
+          fi
           node scripts/sync-version.mjs --version "${VERSION}"
+          python3 - <<'PY'
+          import hashlib, pathlib, re, sys
+          matches = sorted(pathlib.Path("dist").glob("*x86_64*.AppImage"))
+          if len(matches) != 1:
+              sys.exit(f"expected one x86_64 AppImage in dist/, found {len(matches)}: {matches}")
+          digest = hashlib.sha256(matches[0].read_bytes()).hexdigest()
+          pkgbuild = pathlib.Path("packaging/aur/PKGBUILD")
+          srcinfo = pathlib.Path("packaging/aur/.SRCINFO")
+          pkg_text = pkgbuild.read_text()
+          pkg_next, pkg_count = re.subn(
+              r"^sha256sums_x86_64=\('.*'\)$",
+              f"sha256sums_x86_64=('{digest}')",
+              pkg_text,
+              count=1,
+              flags=re.M,
+          )
+          if pkg_count != 1:
+              sys.exit("PKGBUILD is missing sha256sums_x86_64")
+          pkgbuild.write_text(pkg_next)
+          info_text = srcinfo.read_text()
+          info_next, info_count = re.subn(
+              "^[ \t]*sha256sums_x86_64 = .*$",
+              f"\tsha256sums_x86_64 = {digest}",
+              info_text,
+              count=1,
+              flags=re.M,
+          )
+          if info_count != 1:
+              sys.exit(".SRCINFO is missing sha256sums_x86_64")
+          srcinfo.write_text(info_next)
+          print(f"AUR sha256 {digest} ({matches[0].name})")
+          PY
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add packaging/aur/PKGBUILD packaging/aur/.SRCINFO

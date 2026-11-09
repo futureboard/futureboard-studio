@@ -26,7 +26,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use cargo_metadata::{Artifact, Message};
 
 use crate::platform::{Edition, dynamic_library_extension, host_target};
-use crate::{jobs, toolchain};
+use crate::{crashpad, jobs, toolchain};
 
 /// The Futureboard workspace root (xtask lives at `<root>/xtask`).
 fn workspace_root() -> PathBuf {
@@ -81,6 +81,9 @@ pub struct BuildOutput {
     pub sidecar_executables: Vec<PathBuf>,
     /// Dedicated CEF subprocess entry point, built only for macOS packages.
     pub cef_helper_executable: Option<PathBuf>,
+    /// The SHA-256-verified Crashpad prebuilt this build linked, for targets
+    /// that use one. Packaging checks the staged handler against it.
+    pub crashpad_prebuilt: Option<crashpad::Prebuilt>,
 }
 
 /// Build the application and its sidecars for the requested profile / target /
@@ -121,6 +124,20 @@ pub fn build(
         .arg("--target-dir")
         .arg(&target_dir);
     jobs::apply(&mut command, Some(profile), &[]);
+
+    // Seed crashpad-rs-sys's cache with the SHA-256-verified prebuilt so its
+    // build script links that instead of downloading an unchecked archive.
+    let profile_dir_name = if profile == "dev" { "debug" } else { profile };
+    let profile_dir = match target {
+        Some(triple) => target_dir.join(triple).join(profile_dir_name),
+        None => target_dir.join(profile_dir_name),
+    };
+    remove_staged_onnxruntime(&profile_dir, &target_triple)?;
+    let crashpad_prebuilt = crashpad::prepare(&workspace, &target_triple)?;
+    if let Some(prebuilt) = &crashpad_prebuilt {
+        crashpad::reset_stale_build_state(&profile_dir, prebuilt)?;
+        command.env("CRASHPAD_CACHE_DIR", &prebuilt.cache_root);
+    }
 
     if target_triple.contains("windows") && target_triple.contains("msvc") {
         // The pinned CEF SDK defaults its wrapper to /MT, while the prebuilt
@@ -257,6 +274,7 @@ pub fn build(
         engine_library,
         sidecar_executables,
         cef_helper_executable,
+        crashpad_prebuilt,
     })
 }
 
@@ -391,6 +409,31 @@ fn reset_stale_crashpad_wrapper(
         .context("failed to reset the stale Crashpad wrapper build")?;
     if !status.success() {
         bail!("cargo clean for the stale Crashpad wrapper failed with {status}");
+    }
+    Ok(())
+}
+
+/// Remove the ONNX Runtime library the app's build script staged beside the
+/// binary. `target/` may be a restored cache; the build script watches this
+/// file, so removing it makes the script run again, re-hash its kept archive
+/// against the pin and re-extract the library before it is packaged.
+fn remove_staged_onnxruntime(profile_dir: &Path, target_triple: &str) -> Result<()> {
+    let name = if target_triple.contains("windows") {
+        "onnxruntime.dll"
+    } else if target_triple.contains("apple") {
+        "libonnxruntime.dylib"
+    } else {
+        "libonnxruntime.so"
+    };
+    for file in [name.to_owned(), format!("{name}.version")] {
+        let path = profile_dir.join(file);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("cannot remove {}", path.display()));
+            }
+        }
     }
     Ok(())
 }

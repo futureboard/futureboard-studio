@@ -254,9 +254,20 @@ jobs:
         shell: bash
         run: bash .github/workflows/set-cef-path.sh
 
+      # Always run so a restored CEF cache is re-checked against the pin.
       - name: Install pinned CEF SDK and runtime
-        if: hashFiles('build/cef/150.0.11/**/archive.json') == ''
         run: cargo run -p SphereWebView --example install_cef --features installer
+
+      # crashpad-rs-sys downloads and links its prebuilt without a digest
+      # check. xtask downloads the pinned archive, checks its SHA-256 and
+      # extracts it into a private cache; CRASHPAD_CACHE_DIR makes the build
+      # script use that instead (#288).
+      - name: Verify pinned Crashpad prebuilt
+        shell: bash
+        run: |
+          set -euo pipefail
+          cache_dir="$(cargo run -q -p xtask -- crashpad-prebuilt --target-dir target/community)"
+          echo "CRASHPAD_CACHE_DIR=$cache_dir" >> "$GITHUB_ENV"
 
       - name: cargo clippy (Community Edition)
         run: cargo clippy-ce --all-targets -- -D warnings

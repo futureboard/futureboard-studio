@@ -20,6 +20,7 @@ required-features = ["cef-runtime"]
 [dependencies]
 cef = { workspace = true, optional = true }
 download-cef = { workspace = true, optional = true }
+sha2.workspace = true
 thiserror.workspace = true
 log.workspace = true
 tempfile = { workspace = true, optional = true }

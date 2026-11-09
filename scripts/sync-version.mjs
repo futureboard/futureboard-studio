@@ -18,8 +18,10 @@
  * - .github/workflows/release.yml: the release tag the dispatch form is
  *   prefilled with.
  * - packaging/aur/PKGBUILD and .SRCINFO: `pkgver` (AUR forbids `-`, so a
- *   pre-release such as `2026.9.1-beta1.2` becomes `2026.9.1_beta1.2`) and
- *   `_appver` (the exact release asset name).
+ *   pre-release such as `2026.9.1-beta1.2` becomes `2026.9.1_beta1.2`),
+ *   `_appver` (the exact release asset name), and the .SRCINFO source URL
+ *   (canonical repo, versioned tag — not the moving nightly release).
+ *   The sha256 stays put; the release workflow writes it from the AppImage.
  * - packaging/native/Info.plist: CFBundleShortVersionString / CFBundleVersion
  *   (Apple accepts numeric dot-separated components only, so the pre-release
  *   suffix is dropped there; the full version stays in the binary).
@@ -421,11 +423,15 @@ const targets = [
         "pkgver",
         ".SRCINFO",
       );
-      // The generated source line embeds the asset name too.
-      const text = r.text.replace(
-        new RegExp(`Futureboard\\.Studio-${escapeRe(r.from)}-`, "g"),
-        `Futureboard.Studio-${version}-`,
-      );
+      // Expand the versioned asset URL. Matching the previous pkgver string
+      // missed this line whenever the filename still used hyphens (AUR pkgver
+      // stores the same version with `_`) or still pointed at nightly.
+      const asset = `Futureboard.Studio-${version}-x86_64.AppImage`;
+      const source = `\tsource_x86_64 = ${asset}::https://github.com/futureboard/futureboard-studio/releases/download/${version}/${asset}`;
+      if (!/^\tsource_x86_64 = /m.test(r.text)) {
+        throw new Error(".SRCINFO is missing source_x86_64");
+      }
+      const text = r.text.replace(/^\tsource_x86_64 = .*$/m, source);
       return { text, from: r.from, to: aurPkgver };
     },
   },

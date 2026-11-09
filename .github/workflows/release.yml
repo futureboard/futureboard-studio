@@ -74,6 +74,11 @@ jobs:
       contents: write
     with:
       app-version: ${{ inputs.app-version }}
+      # Do not let the reusable workflow publish. Running this workflow with
+      # the ref set to the release tag makes github.ref a tag, and build-desktop
+      # would otherwise publish that release as non-draft before `visibility`
+      # is applied. This job attaches the assets and honors draft vs publish.
+      publish-release: false
 
   publish:
     name: Attach Release Assets

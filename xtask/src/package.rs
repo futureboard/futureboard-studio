@@ -7,12 +7,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use cargo_metadata::MetadataCommand;
 
 use crate::cargo_build::{self, APP_PACKAGE};
-use crate::cef;
 use crate::metadata::{BuildInfo, MetadataInputs};
 use crate::platform::{Edition, host_target, platform_folder};
 use crate::plugins;
 use crate::staging::{self, StagingPlan};
 use crate::validation::{self, ValidationInputs};
+use crate::{cef, crashpad};
 
 /// Which Built-in Plugins to build and stage.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +108,11 @@ pub fn run(options: &PackageOptions) -> Result<PathBuf> {
     };
     let cef_dist = cef::prepare_cef_dist(&workspace, &target_triple)
         .context("failed to prepare the CEF distribution")?;
+    if options.stage_cef {
+        if let Some(dist) = &cef_dist {
+            cef::verify_dist_for_packaging(&workspace, dist, &target_triple)?;
+        }
+    }
     if options.stage_cef && cef_dist.is_none() {
         let checked = cef::cef_dist_candidates(&workspace, &target_triple)
             .into_iter()
@@ -174,6 +179,9 @@ pub fn run(options: &PackageOptions) -> Result<PathBuf> {
             staging::stage_crashpad_handler(&plan.staging_dir, executable, &target_triple)?;
         debug_assert_eq!(crashpad_handler, handler_name);
         eprintln!("[xtask] staged Crashpad handler: {crashpad_handler}");
+        if let Some(prebuilt) = &build.crashpad_prebuilt {
+            crashpad::verify_staged_handler(prebuilt, &plan.staging_dir.join(&crashpad_handler))?;
+        }
     } else {
         eprintln!("[xtask] Crashpad external handler not staged for target `{target_triple}`");
     }

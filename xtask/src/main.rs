@@ -18,6 +18,7 @@
 
 mod cargo_build;
 mod cef;
+mod crashpad;
 mod jam;
 mod jobs;
 mod metadata;
@@ -73,6 +74,19 @@ enum XtaskCommand {
 
     /// Build and stage the standalone Audio Jam client (`FutureboardJam`).
     Jam(JamArgs),
+
+    /// Download the pinned Crashpad prebuilt, check its SHA-256, extract it
+    /// into this checkout's private cache and print that cache root, the value
+    /// for `CRASHPAD_CACHE_DIR` in builds xtask does not run itself (CI).
+    CrashpadPrebuilt {
+        /// Cargo target triple (defaults to the host target).
+        #[arg(long)]
+        target: Option<String>,
+        /// Target directory the following Cargo build uses; crashpad-rs-sys
+        /// build state there that links another cache is dropped.
+        #[arg(long, default_value = "target")]
+        target_dir: PathBuf,
+    },
 
     /// Bundle a standalone plug-in. The plug-in workspace is not a member of
     /// this one; the arguments are forwarded to its own xtask. For WhiteSharp:
@@ -160,6 +174,9 @@ fn main() -> ExitCode {
         }
         Some(XtaskCommand::Jam(args)) => run_jam(args),
         Some(XtaskCommand::Bundle { args }) => run_plugin_bundle(&args),
+        Some(XtaskCommand::CrashpadPrebuilt { target, target_dir }) => {
+            run_crashpad_prebuilt(target.as_deref(), &target_dir)
+        }
         None => run_package(cli.package),
     }
 }
@@ -206,6 +223,36 @@ fn run_plugin_bundle(args: &[String]) -> ExitCode {
         }
         Err(error) => {
             eprintln!("[xtask] failed to spawn `{cargo}`: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_crashpad_prebuilt(target: Option<&str>, target_dir: &Path) -> ExitCode {
+    // The plain parent (no `/..`) so the printed path is the one Cargo builds
+    // record, identical to the path `cargo xtask package` uses.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("xtask must live under the workspace root");
+    let target_dir = if target_dir.is_absolute() {
+        target_dir.to_path_buf()
+    } else {
+        root.join(target_dir)
+    };
+    match crashpad::seed_for_target_dir(root, target, &target_dir) {
+        Ok(Some(prebuilt)) => {
+            // stdout carries only the value, for `>> $GITHUB_ENV`.
+            println!("{}", prebuilt.cache_root.display());
+            ExitCode::SUCCESS
+        }
+        Ok(None) => {
+            eprintln!(
+                "error: no pinned Crashpad prebuilt for this target; it builds Crashpad from source"
+            );
+            ExitCode::FAILURE
+        }
+        Err(error) => {
+            eprintln!("error: {error:#}");
             ExitCode::FAILURE
         }
     }
@@ -316,7 +363,23 @@ fn run_cargo_alias(alias: &str, forwarded: &[String]) -> Result<(), ExitCode> {
         "build-professional-win" | "check-professional-win" => Some("target/professional"),
         _ => None,
     } {
-        command.env("CARGO_TARGET_DIR", Path::new(root).join(target_dir));
+        let target_dir = Path::new(root).join(target_dir);
+        // Link the SHA-256-verified Crashpad prebuilt, not crashpad-rs-sys's
+        // own unchecked download.
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask must live under the workspace root");
+        match crashpad::seed_for_target_dir(workspace, requested_target(forwarded), &target_dir) {
+            Ok(Some(prebuilt)) => {
+                command.env("CRASHPAD_CACHE_DIR", &prebuilt.cache_root);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("[xtask] {error:#}");
+                return Err(ExitCode::FAILURE);
+            }
+        }
+        command.env("CARGO_TARGET_DIR", target_dir);
     }
 
     // The professional aliases compile `asio-sys`, so they need the same SDK and

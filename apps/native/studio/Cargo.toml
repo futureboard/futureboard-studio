@@ -157,7 +157,9 @@ professional = [
 embed-resource.workspace = true
 crashpad-handler-bundler.workspace = true
 # Build-time ONNX Runtime download (feature = "stem-onnx"): fetch + extract the
-# platform library next to the built binary.
+# platform library next to the built binary. sha2 checks the archive against
+# the pin before anything is written beside the binary.
+sha2.workspace = true
 ureq.workspace = true
 zip.workspace = true
 flate2.workspace = true
