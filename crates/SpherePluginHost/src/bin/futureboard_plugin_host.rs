@@ -35,8 +35,10 @@ use SpherePluginHost::audio_bridge::{
 use SpherePluginHost::ipc::{self, EditorChromeCommand, HostCommand, HostEvent, PROTOCOL_VERSION};
 use SpherePluginHost::native_editor::{self, EmbedRegion};
 use SpherePluginHost::plugin_host_preview::{
-    try_start_preview_output, BridgeAudioShared, PluginHostPreviewEngine, SharedPluginHostPreview,
+    try_start_preview_output, BridgeAudioShared, BridgeVoice, PluginHostPreviewEngine,
+    SharedPluginHostPreview, VoiceBlockResult,
 };
+use SpherePluginHost::rt_handoff::{plan_handoff, PlanConsumer, PlanPublisher};
 use SpherePluginHost::spectrum::{SpectrumAnalyzer, SPECTRUM_BINS};
 
 fn debug_enabled() -> bool {
@@ -1765,8 +1767,8 @@ fn builtin_output_buses(stem: &str) -> Vec<u32> {
 type SharedBuiltinProcessors = Arc<Mutex<Arc<HashMap<String, Arc<BuiltinHostProcessor>>>>>;
 
 /// Live Audio Unit instances, keyed by insert `plugin_instance_id`. Same
-/// copy-on-write shape as the built-in map: the producer clones the outer `Arc`
-/// once per wake, and load/unload rebuild through `Arc::make_mut`.
+/// shape as the built-in map. Main thread only: the producer is handed the
+/// instances it serves through its [`ProducerPlan`].
 type SharedAuProcessors = Arc<Mutex<Arc<HashMap<String, Arc<AuHostProcessor>>>>>;
 
 /// Resolve an instance id to its Audio Unit, if that is the runtime hosting it.
@@ -3338,8 +3340,12 @@ fn shutdown_host(
     loaded: &mut LoadedRegistry,
     pending: &mut PendingPrepareRegistry,
     preview: &SharedPluginHostPreview,
+    plans: &mut PlanPublisher<ProducerPlan>,
     reason: &str,
 ) {
+    // Take every instance out of the producer's hands first, so what it held
+    // is released here rather than on the audio thread (or not at all).
+    retire_producer_plan(plans);
     let editor_count = registry.len();
     eprintln!("[plugin-host] closing editors count={editor_count} reason={reason}");
     {
@@ -3363,8 +3369,7 @@ fn shutdown_host(
 /// engine reads whatever the host last produced (one-block latency).
 ///
 /// Runs on the dedicated audio producer thread (`run_audio_producer`), woken
-/// by the engine's kick event per requested block. Removing the
-/// `render_single_voice` Vec allocs is a remaining refinement.
+/// by the engine's kick event per requested block.
 /// Which runtime owns the instance whose block is being produced.
 ///
 /// Resolved once per block at the producer's call site so the branches below
@@ -3374,8 +3379,9 @@ fn shutdown_host(
 /// and latency.
 #[derive(Copy, Clone)]
 enum BlockRuntime<'a> {
-    /// Hosted by `BridgeAudioShared`, looked up by instance id.
-    Vst3,
+    /// A VST3 voice of the preview engine, resolved when the plan was built;
+    /// `None` while the region has no loaded voice (yet, or anymore).
+    Vst3(Option<&'a BridgeVoice>),
     /// A Futureboard built-in DSP owned by this process.
     Builtin(&'a BuiltinHostProcessor),
     /// A macOS Audio Unit owned by this process.
@@ -3405,23 +3411,31 @@ fn service_audio_bridge(
     // insert instance, so events are routed to that voice only — never
     // broadcast to every loaded plugin.
     let mut midi_count = 0u32;
-    while let Some(ev) = bridge.midi.try_pop() {
-        match runtime {
-            BlockRuntime::Builtin(builtin) => builtin.apply_midi(ev),
-            BlockRuntime::Vst3 => dsp.apply_shared_midi(plugin_instance_id, ev),
-            // Audio Units schedule events inside the slice, so the ring's
-            // `sample_offset` survives the hop (the built-in path drops it).
-            BlockRuntime::Au(au) => au.apply_midi(ev),
+    match runtime {
+        BlockRuntime::Builtin(builtin) => {
+            while let Some(ev) = bridge.midi.try_pop() {
+                builtin.apply_midi(ev);
+                midi_count += 1;
+            }
         }
-        midi_count += 1;
-    }
-    // stderr is a pipe to the parent process — writing it from the producer
-    // thread per block can stall block production if the parent is slow to
-    // drain it, so consume traces only exist under the debug flag.
-    if midi_count > 0 && debug_enabled() {
-        eprintln!(
-            "[plugin-host-midi-consume] seq={req} instance={plugin_instance_id} events={midi_count}"
-        );
+        // Audio Units schedule events inside the slice, so the ring's
+        // `sample_offset` survives the hop (the built-in path drops it).
+        BlockRuntime::Au(au) => {
+            while let Some(ev) = bridge.midi.try_pop() {
+                au.apply_midi(ev);
+                midi_count += 1;
+            }
+        }
+        // A VST3 voice takes its ring straight into its preallocated block
+        // buffer when it renders, below.
+        BlockRuntime::Vst3(Some(_)) => {}
+        // No voice loaded for this region (yet, or anymore): its events are
+        // dropped, as they always were.
+        BlockRuntime::Vst3(None) => {
+            while bridge.midi.try_pop().is_some() {
+                midi_count += 1;
+            }
+        }
     }
     // Drain engine-pushed parameter automation into this voice (queued for the
     // process() below). Per-instance ring, like MIDI — never broadcast.
@@ -3432,7 +3446,8 @@ fn service_audio_bridge(
             // index resolves to an `apply_ui_param` id). `sample_offset` is
             // intentionally ignored.
             BlockRuntime::Builtin(b) => b.apply_param(ev.param_id, ev.value),
-            BlockRuntime::Vst3 => dsp.apply_shared_param(plugin_instance_id, ev.param_id, ev.value),
+            BlockRuntime::Vst3(Some(voice)) => voice.apply_param(ev.param_id, ev.value),
+            BlockRuntime::Vst3(None) => {}
             // Normalized 0..1 like VST3; the AU layer denormalizes through the
             // parameter's own plain min/max.
             BlockRuntime::Au(au) => au.apply_param(ev.param_id, ev.value),
@@ -3464,8 +3479,8 @@ fn service_audio_bridge(
     }
     let output_channels = match runtime {
         BlockRuntime::Builtin(builtin) => builtin.output_channels().min(MAX_CHANNELS),
-        BlockRuntime::Vst3 => dsp
-            .main_audio_output_channel_count_for_instance(plugin_instance_id)
+        BlockRuntime::Vst3(voice) => voice
+            .map(BridgeVoice::main_audio_output_channel_count)
             .unwrap_or_else(|| bridge.plugin_output_channels())
             .max(1)
             .min(MAX_CHANNELS as u32) as usize,
@@ -3486,7 +3501,7 @@ fn service_audio_bridge(
             );
             output_channels
         }
-        BlockRuntime::Vst3 => {
+        BlockRuntime::Vst3(voice) => {
             // Real transport ProcessContext published by the engine for this block.
             let bt = bridge.load_transport();
             let transport = DirectAudio::RuntimeTransportContext {
@@ -3501,19 +3516,24 @@ fn service_audio_bridge(
             };
             let mut midi_out =
                 [DirectAudio::vst3_processor::PluginMidiOutEvent::default(); OUTPUT_MIDI_PER_BLOCK];
-            let (produced, midi_count) = dsp.render_single_voice_interleaved(
-                plugin_instance_id,
-                frames,
-                &in_l[..frames],
-                &in_r[..frames],
-                &mut interleaved[..len],
-                output_channels,
-                transport,
-                &mut midi_out,
-            );
-            forward_output_midi(bridge, &midi_out[..midi_count], midi_out_event);
-            if produced > 0 {
-                produced.min(output_channels)
+            let block = match voice {
+                Some(voice) => voice.render_bridge_block(
+                    dsp.dsp_ready(),
+                    &mut || bridge.midi.try_pop(),
+                    frames,
+                    &in_l[..frames],
+                    &in_r[..frames],
+                    &mut interleaved[..len],
+                    output_channels,
+                    transport,
+                    &mut midi_out,
+                ),
+                None => VoiceBlockResult::default(),
+            };
+            midi_count += block.midi_in;
+            forward_output_midi(bridge, &midi_out[..block.midi_out], midi_out_event);
+            if block.channels > 0 {
+                block.channels.min(output_channels)
             } else {
                 // Missing instances and VST3 process failures are not valid wet
                 // blocks. Preserve the track's dry signal instead of publishing
@@ -3567,6 +3587,14 @@ fn service_audio_bridge(
             }
         }
     };
+    // stderr is a pipe to the parent process — writing it from the producer
+    // thread per block can stall block production if the parent is slow to
+    // drain it, so consume traces only exist under the debug flag.
+    if midi_count > 0 && debug_enabled() {
+        eprintln!(
+            "[plugin-host-midi-consume] seq={req} instance={plugin_instance_id} events={midi_count}"
+        );
+    }
     let mut peak_l = 0.0f32;
     let mut peak_r = 0.0f32;
     for i in 0..frames {
@@ -3583,7 +3611,7 @@ fn service_audio_bridge(
     let dsp_ready = match runtime {
         // Both are live the moment their instance is published to the producer.
         BlockRuntime::Builtin(_) | BlockRuntime::Au(_) => true,
-        BlockRuntime::Vst3 => {
+        BlockRuntime::Vst3(_) => {
             dsp.dsp_ready() && (dsp.has_loaded_instances() || dsp.continuous_mode())
         }
     };
@@ -3632,7 +3660,7 @@ fn service_audio_bridge(
             // A loaded NAM capture's receptive field is the built-in chain's
             // only latency contributor today.
             BlockRuntime::Builtin(b) => Some(b.latency_samples().min(i32::MAX as usize) as i32),
-            BlockRuntime::Vst3 => dsp.voice_latency_samples(plugin_instance_id),
+            BlockRuntime::Vst3(voice) => voice.map(BridgeVoice::latency_samples),
             // `kAudioUnitProperty_Latency`, read on the same 64-block cadence.
             BlockRuntime::Au(au) => Some(au.latency_samples().min(i32::MAX as u32) as i32),
         };
@@ -3662,13 +3690,130 @@ fn service_audio_bridge(
 }
 
 /// All mapped shared-audio regions, keyed by insert `plugin_instance_id`.
-/// All mapped shared-audio regions, keyed by insert `plugin_instance_id`.
 ///
-/// Inner `Arc<HashMap>` (copy-on-write): the producer thread clones the outer
-/// `Arc` once per wake (a refcount bump) instead of deep-cloning the whole map
-/// (with its `String` keys) every block. The map only changes on
-/// attach/unload, which rebuild it via `Arc::make_mut`.
+/// Main thread only: the producer never locks this (or the built-in / AU
+/// maps). It serves the [`ProducerPlan`] the main thread resolves from them.
 type SharedAudioRegions = Arc<Mutex<Arc<HashMap<String, Arc<SharedAudioRegion>>>>>;
+
+/// The runtime behind one planned region, resolved off the audio thread.
+enum PlanRuntime {
+    Builtin(Arc<BuiltinHostProcessor>),
+    Au(Arc<AuHostProcessor>),
+    Vst3(Option<BridgeVoice>),
+}
+
+/// One insert the producer serves: its region and runtime, already resolved.
+struct PlanEntry {
+    instance_id: String,
+    region: Arc<SharedAudioRegion>,
+    runtime: PlanRuntime,
+}
+
+/// Everything the audio producer serves, built by the main thread whenever an
+/// insert is loaded, attached or removed, and handed over through
+/// [`SpherePluginHost::rt_handoff`]. The block path walks it by index: no
+/// lock, no map, no name comparison, no allocation. The producer never frees
+/// a plan — replaced plans go back to the main thread, so the last handle on a
+/// removed insert (built-in DSP buffers and models, an Audio Unit, a VST3
+/// voice's `terminate`, the region's mapping) is released there.
+#[derive(Default)]
+struct ProducerPlan {
+    entries: Vec<PlanEntry>,
+}
+
+/// What a plan was built from — region and runtime identities in service
+/// order — so the main thread republishes only when something changed.
+type ProducerPlanKey = Vec<(usize, usize)>;
+
+/// Main thread: the plan for the current maps, as `(key, entries in service
+/// order)`. `build` is false to compute the key alone.
+fn resolve_producer_plan(
+    regions: &SharedAudioRegions,
+    builtins: &SharedBuiltinProcessors,
+    audio_units: &SharedAuProcessors,
+    dsp: &BridgeAudioShared,
+    build: bool,
+) -> (ProducerPlanKey, Option<ProducerPlan>) {
+    let regions = regions
+        .lock()
+        .map(|map| Arc::clone(&map))
+        .unwrap_or_default();
+    let builtins = builtins
+        .lock()
+        .map(|map| Arc::clone(&map))
+        .unwrap_or_default();
+    let audio_units = audio_units
+        .lock()
+        .map(|map| Arc::clone(&map))
+        .unwrap_or_default();
+    let mut ids: Vec<&String> = regions.keys().collect();
+    ids.sort();
+    let mut key = Vec::with_capacity(ids.len());
+    let mut entries = Vec::new();
+    for instance_id in ids {
+        let region = &regions[instance_id];
+        // One instance id belongs to exactly one runtime: the load command
+        // decided which map it went into.
+        let runtime = match (builtins.get(instance_id), audio_units.get(instance_id)) {
+            (Some(builtin), _) => PlanRuntime::Builtin(builtin.clone()),
+            (None, Some(au)) => PlanRuntime::Au(au.clone()),
+            (None, None) => PlanRuntime::Vst3(dsp.voice_for(instance_id)),
+        };
+        let runtime_identity = match &runtime {
+            PlanRuntime::Builtin(builtin) => Arc::as_ptr(builtin) as usize,
+            PlanRuntime::Au(au) => Arc::as_ptr(au) as usize,
+            PlanRuntime::Vst3(voice) => voice.as_ref().map_or(0, BridgeVoice::identity),
+        };
+        key.push((Arc::as_ptr(region) as usize, runtime_identity));
+        if build {
+            entries.push(PlanEntry {
+                instance_id: instance_id.clone(),
+                region: region.clone(),
+                runtime,
+            });
+        }
+    }
+    (key, build.then_some(ProducerPlan { entries }))
+}
+
+/// Main thread, once per loop: free the plans the producer let go of, and
+/// hand it a new one if an insert was loaded, attached or removed since.
+fn sync_producer_plan(
+    plans: &mut PlanPublisher<ProducerPlan>,
+    published: &mut ProducerPlanKey,
+    regions: &SharedAudioRegions,
+    builtins: &SharedBuiltinProcessors,
+    audio_units: &SharedAuProcessors,
+    dsp: &BridgeAudioShared,
+) {
+    plans.collect_retired();
+    let (key, _) = resolve_producer_plan(regions, builtins, audio_units, dsp, false);
+    if key == *published {
+        return;
+    }
+    let (key, plan) = resolve_producer_plan(regions, builtins, audio_units, dsp, true);
+    if let Some(plan) = plan {
+        plans.publish(plan);
+    }
+    *published = key;
+}
+
+/// Main thread, at shutdown: hand the producer an empty plan and free what
+/// it gives back. Bounded: if the producer does not take it in time, the
+/// process exits with those instances unreleased rather than release them on
+/// the audio thread.
+fn retire_producer_plan(plans: &mut PlanPublisher<ProducerPlan>) {
+    plans.publish(ProducerPlan::default());
+    let deadline = Instant::now() + Duration::from_millis(250);
+    while !plans.is_adopted() && Instant::now() < deadline {
+        plans.collect_retired();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // The producer retires the plan it replaces right after taking the new
+    // one; give that hand-back a moment to land.
+    std::thread::sleep(Duration::from_millis(2));
+    plans.collect_retired();
+}
 
 /// Raise this thread to pro-audio scheduling before it produces blocks.
 ///
@@ -3846,10 +3991,11 @@ impl ProducerDiagnostics {
 }
 
 /// Dedicated host audio producer thread. VST3 `process()` runs only here (the
-/// editor stays on the STA main thread); the per-voice MIDI mutex inside
-/// `BridgeAudioShared` serializes it against IPC MIDI so there is never a
-/// concurrent `process()` — without coupling block production to the engine
-/// mutex held across plugin load / editor attach.
+/// editor stays on the STA main thread); each voice's render lock, which the
+/// producer only ever try-locks, keeps a suspended voice out of `process()` —
+/// without coupling block production to the engine mutex held across plugin
+/// load / editor attach. What it serves comes from its [`ProducerPlan`]; it
+/// takes no lock and resolves no name per block.
 ///
 /// Cadence: event-driven. The engine signals `kick` after every `request_seq`
 /// bump (see `SharedRegionSink::request_block`), so the producer wakes within
@@ -3899,9 +4045,7 @@ fn forward_output_midi(
 }
 
 fn run_audio_producer(
-    regions: SharedAudioRegions,
-    builtins: SharedBuiltinProcessors,
-    audio_units: SharedAuProcessors,
+    mut plan: PlanConsumer<ProducerPlan>,
     dsp: Arc<BridgeAudioShared>,
     shutdown: Arc<AtomicBool>,
     kick: Option<BridgeKickEvent>,
@@ -3913,14 +4057,12 @@ fn run_audio_producer(
         if shutdown.load(Ordering::SeqCst) {
             break;
         }
-        let snapshot = regions
-            .lock()
-            .map(|map| Arc::clone(&map))
-            .unwrap_or_default();
-        if snapshot.is_empty() {
+        // Adopt the newest plan, if the main thread published one; the plan
+        // it replaces goes back to the main thread to be freed.
+        let entries = &plan.refresh().entries;
+        if entries.is_empty() {
             // With no mapped plug-in audio regions there is no work to poll.
-            // Wait longer and avoid locking/cloning the runtime registries at
-            // audio cadence. The first engine request signals `kick`; the
+            // Wait longer. The first engine request signals `kick`; the
             // fallback path wakes within 10 ms when no event is available.
             match &kick {
                 Some(kick) => {
@@ -3930,41 +4072,25 @@ fn run_audio_producer(
             }
             continue;
         }
-        let builtin_snapshot = builtins
-            .lock()
-            .map(|map| Arc::clone(&map))
-            .unwrap_or_default();
-        let au_snapshot = audio_units
-            .lock()
-            .map(|map| Arc::clone(&map))
-            .unwrap_or_default();
-        for (instance_id, region) in snapshot.iter() {
+        for entry in entries {
+            let region = entry.region.as_ref();
             let before = region.bridge().done_seq.load(Ordering::Relaxed);
-            // One instance id belongs to exactly one runtime: the load command
-            // decided which map it went into.
-            let runtime = match (
-                builtin_snapshot.get(instance_id),
-                au_snapshot.get(instance_id),
-            ) {
-                (Some(builtin), _) => BlockRuntime::Builtin(builtin.as_ref()),
-                (None, Some(au)) => BlockRuntime::Au(au.as_ref()),
-                (None, None) => BlockRuntime::Vst3,
+            let runtime = match &entry.runtime {
+                PlanRuntime::Builtin(builtin) => BlockRuntime::Builtin(builtin.as_ref()),
+                PlanRuntime::Au(au) => BlockRuntime::Au(au.as_ref()),
+                PlanRuntime::Vst3(voice) => BlockRuntime::Vst3(voice.as_ref()),
             };
             service_audio_bridge(
-                region.as_ref(),
+                region,
                 &dsp,
                 runtime,
-                instance_id,
+                &entry.instance_id,
                 midi_out_event.as_ref(),
             );
             if region.bridge().done_seq.load(Ordering::Relaxed) != before {
                 diagnostics.record(region.bridge());
             }
         }
-        // Acknowledge the latest voice-snapshot publish now that any snapshot
-        // borrowed for this block has been dropped (lets unload hand the final
-        // processor release back to the IPC thread).
-        dsp.mark_snapshot_observed();
         match &kick {
             // Wakes immediately on the engine's request signal. A request
             // bumped after the region scan above leaves the auto-reset event
@@ -4039,11 +4165,11 @@ fn run_ipc_loop(mut out: IpcOut, shutdown: Arc<AtomicBool>) {
     let builtin_processors: SharedBuiltinProcessors =
         Arc::new(Mutex::new(Arc::new(HashMap::new())));
     let au_processors: SharedAuProcessors = Arc::new(Mutex::new(Arc::new(HashMap::new())));
+    let bridge_dsp = preview.lock().bridge_shared();
+    let (mut producer_plans, producer_plan) = plan_handoff::<ProducerPlan>();
+    let mut published_plan_key = ProducerPlanKey::new();
     {
-        let slots = region_slots.clone();
-        let builtins = builtin_processors.clone();
-        let audio_units = au_processors.clone();
-        let dsp = preview.lock().bridge_shared();
+        let dsp = bridge_dsp.clone();
         let shutdown = shutdown.clone();
         // Producer wake event, shared with the engine-side sink. Keyed by the
         // engine/host pid pair — both sides derive the same name without any
@@ -4086,17 +4212,7 @@ fn run_ipc_loop(mut out: IpcOut, shutdown: Arc<AtomicBool>) {
             // thread entry, aborting the whole host process before any plugin
             // was even loaded. Ask for a stack that is not a coincidence.
             .stack_size(AUDIO_PRODUCER_STACK_BYTES)
-            .spawn(move || {
-                run_audio_producer(
-                    slots,
-                    builtins,
-                    audio_units,
-                    dsp,
-                    shutdown,
-                    kick,
-                    midi_out_event,
-                )
-            })
+            .spawn(move || run_audio_producer(producer_plan, dsp, shutdown, kick, midi_out_event))
             .expect("spawn plugin-host audio producer");
     }
 
@@ -4129,6 +4245,7 @@ fn run_ipc_loop(mut out: IpcOut, shutdown: Arc<AtomicBool>) {
                 &mut loaded,
                 &mut pending_prepare,
                 &preview,
+                &mut producer_plans,
                 "parent_watchdog",
             );
             return;
@@ -4163,6 +4280,7 @@ fn run_ipc_loop(mut out: IpcOut, shutdown: Arc<AtomicBool>) {
                             &mut loaded,
                             &mut pending_prepare,
                             &preview,
+                            &mut producer_plans,
                             "ipc_shutdown",
                         );
                         return;
@@ -4197,6 +4315,7 @@ fn run_ipc_loop(mut out: IpcOut, shutdown: Arc<AtomicBool>) {
                         &mut loaded,
                         &mut pending_prepare,
                         &preview,
+                        &mut producer_plans,
                         "stdin_disconnect",
                     );
                     return;
@@ -4213,6 +4332,19 @@ fn run_ipc_loop(mut out: IpcOut, shutdown: Arc<AtomicBool>) {
                 &mut out,
             );
             expire_plugin_load_requests(&mut pending_plugin_loads, &load_result_rx, &mut out);
+        });
+
+        // 1a. Hand the audio producer a new plan if an insert was loaded,
+        //     attached or removed above, and free the plans it let go of.
+        timed_section!("producer_plan", {
+            sync_producer_plan(
+                &mut producer_plans,
+                &mut published_plan_key,
+                &region_slots,
+                &builtin_processors,
+                &au_processors,
+                &bridge_dsp,
+            );
         });
 
         timed_section!("editor_attach_results", {
@@ -6245,6 +6377,133 @@ fn take_pending_load_for_result(
         return None;
     }
     pending_plugin_loads.remove(plugin_instance_id)
+}
+
+#[cfg(test)]
+mod producer_plan_tests {
+    use super::*;
+
+    fn maps() -> (
+        SharedAudioRegions,
+        SharedBuiltinProcessors,
+        SharedAuProcessors,
+        Arc<BridgeAudioShared>,
+    ) {
+        (
+            Arc::new(Mutex::new(Arc::new(HashMap::new()))),
+            Arc::new(Mutex::new(Arc::new(HashMap::new()))),
+            Arc::new(Mutex::new(Arc::new(HashMap::new()))),
+            PluginHostPreviewEngine::new(48_000, 256).bridge_shared(),
+        )
+    }
+
+    fn insert<T>(map: &Arc<Mutex<Arc<HashMap<String, Arc<T>>>>>, id: &str, value: Arc<T>) {
+        Arc::make_mut(&mut map.lock().unwrap()).insert(id.to_string(), value);
+    }
+
+    fn remove<T>(map: &Arc<Mutex<Arc<HashMap<String, Arc<T>>>>>, id: &str) {
+        Arc::make_mut(&mut map.lock().unwrap()).remove(id);
+    }
+
+    /// #318: names are resolved once, when the plan is built — the producer
+    /// gets each region with its runtime already attached.
+    #[test]
+    fn each_region_is_resolved_to_its_runtime_in_a_stable_order() {
+        let (regions, builtins, audio_units, dsp) = maps();
+        insert(
+            &regions,
+            "vst",
+            Arc::new(SharedAudioRegion::new_in_process()),
+        );
+        insert(
+            &regions,
+            "eq",
+            Arc::new(SharedAudioRegion::new_in_process()),
+        );
+        insert(
+            &builtins,
+            "eq",
+            Arc::new(BuiltinHostProcessor::new("equz8", 48_000, None).expect("hosted")),
+        );
+        let (key, plan) = resolve_producer_plan(&regions, &builtins, &audio_units, &dsp, true);
+        let plan = plan.expect("built");
+        let ids: Vec<&str> = plan
+            .entries
+            .iter()
+            .map(|e| e.instance_id.as_str())
+            .collect();
+        assert_eq!(ids, ["eq", "vst"]);
+        assert!(matches!(plan.entries[0].runtime, PlanRuntime::Builtin(_)));
+        assert!(matches!(plan.entries[1].runtime, PlanRuntime::Vst3(None)));
+        // Nothing changed: the same key, so no republish.
+        let (again, none) = resolve_producer_plan(&regions, &builtins, &audio_units, &dsp, false);
+        assert_eq!(again, key);
+        assert!(none.is_none());
+        remove(&builtins, "eq");
+        remove(&regions, "eq");
+        let (after, _) = resolve_producer_plan(&regions, &builtins, &audio_units, &dsp, false);
+        assert_ne!(after, key);
+    }
+
+    /// #295: a built-in removed while the producer is using it is released
+    /// by the main thread when it collects the producer's old plan — the
+    /// producer only ever hands it back.
+    #[test]
+    fn a_removed_builtin_is_released_by_the_main_thread() {
+        let (regions, builtins, audio_units, dsp) = maps();
+        let (mut plans, mut consumer) = plan_handoff::<ProducerPlan>();
+        let mut published = ProducerPlanKey::new();
+        let processor = Arc::new(BuiltinHostProcessor::new("equz8", 48_000, None).expect("hosted"));
+        let watch = Arc::downgrade(&processor);
+        insert(
+            &regions,
+            "eq",
+            Arc::new(SharedAudioRegion::new_in_process()),
+        );
+        insert(&builtins, "eq", processor);
+        sync_producer_plan(
+            &mut plans,
+            &mut published,
+            &regions,
+            &builtins,
+            &audio_units,
+            &dsp,
+        );
+        assert_eq!(consumer.refresh().entries.len(), 1);
+
+        // Unload: the main thread lets go of every handle it has.
+        remove(&builtins, "eq");
+        remove(&regions, "eq");
+        sync_producer_plan(
+            &mut plans,
+            &mut published,
+            &regions,
+            &builtins,
+            &audio_units,
+            &dsp,
+        );
+        assert!(watch.upgrade().is_some(), "still in the producer's plan");
+        let consumer = std::thread::spawn(move || {
+            assert!(consumer.refresh().entries.is_empty());
+            consumer
+        })
+        .join()
+        .unwrap();
+        assert!(
+            watch.upgrade().is_some(),
+            "the producer released the built-in itself"
+        );
+        sync_producer_plan(
+            &mut plans,
+            &mut published,
+            &regions,
+            &builtins,
+            &audio_units,
+            &dsp,
+        );
+        assert!(watch.upgrade().is_none(), "released on the main thread");
+        drop(consumer);
+    }
 }
 
 #[cfg(test)]

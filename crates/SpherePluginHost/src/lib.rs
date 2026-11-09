@@ -49,12 +49,17 @@ pub mod preset;
 /// Central plugin-host process manager for the DAW session.
 pub mod process_manager;
 pub mod registry;
+/// Hands the audio producer its block plan and takes replaced plans back, so
+/// nothing a plan holds is freed on the realtime thread.
+pub mod rt_handoff;
 pub mod scan;
 mod scanner;
 pub mod spectrum;
 /// Which hosted plug-ins may have changed their own state, and when the host
 /// reports it to the studio (`HostEvent::PluginStateTouched`).
 pub mod state_touch;
+#[cfg(test)]
+mod test_alloc;
 mod types;
 
 pub use builtin::{
