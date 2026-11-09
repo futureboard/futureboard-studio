@@ -139,7 +139,7 @@ impl FlacEncoder {
             next_frame: 0,
             sink: ByteSink::new(),
             frame_bytes: 0,
-            quantizer: Quantizer::new(AudioDither::Off),
+            quantizer: Quantizer::for_file(path.as_ref()),
             metadata,
             finalized: false,
         };
@@ -148,9 +148,9 @@ impl FlacEncoder {
         Ok(encoder)
     }
 
-    /// Dither the 16/24-bit samples with `dither`.
+    /// Dither the 16/24-bit samples with `dither`, seeded for this file.
     pub fn with_dither(mut self, dither: AudioDither) -> Self {
-        self.quantizer = Quantizer::new(dither);
+        self.quantizer = self.quantizer.with_dither(dither);
         self
     }
 
@@ -620,23 +620,33 @@ mod tests {
         }
     }
 
-    /// #322: dither is deterministic per encoder (the same render encodes to
-    /// the same file) and does change a quiet signal's samples.
+    /// #322: dither is deterministic per file (the same render encodes to the
+    /// same file) and does change a quiet signal's samples. #362: another
+    /// file gets other noise.
     #[test]
     fn dithered_flac_is_reproducible_and_differs_from_undithered() {
         let input: Vec<f32> = signal(6_000, 2).iter().map(|x| x * 1e-4).collect();
-        let encode = |dither| {
-            let path = temp_path("dither");
+        let (path, other) = (temp_path("dither"), temp_path("dither-other"));
+        let encode = |path: &Path, dither| {
             let mut enc =
-                encode_streaming(&path, AudioSampleFormat::I16, 2, 4096, dither, &input, 512);
+                encode_streaming(path, AudioSampleFormat::I16, 2, 4096, dither, &input, 512);
             enc.finalize().unwrap();
-            let bytes = std::fs::read(&path).unwrap();
+            let bytes = std::fs::read(path).unwrap();
             let _ = std::fs::remove_file(path);
             bytes
         };
-        let dithered = encode(AudioDither::Tpdf);
-        assert_eq!(dithered, encode(AudioDither::Tpdf), "dither must be seeded");
-        assert_ne!(dithered, encode(AudioDither::Off));
+        let dithered = encode(&path, AudioDither::Tpdf);
+        assert_eq!(
+            dithered,
+            encode(&path, AudioDither::Tpdf),
+            "dither must be seeded"
+        );
+        assert_ne!(dithered, encode(&path, AudioDither::Off));
+        assert_ne!(
+            dithered,
+            encode(&other, AudioDither::Tpdf),
+            "each file gets its own dither"
+        );
     }
 
     /// LiveStage's recorder builds its options as `..AudioEncodeOptions::

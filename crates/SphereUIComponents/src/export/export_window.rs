@@ -106,6 +106,7 @@ enum SelectField {
     Range,
     SampleRate,
     Normalize,
+    Dither,
     Tail,
 }
 
@@ -1128,6 +1129,42 @@ impl ExportArrangementWindow {
             ));
         }
 
+        // Dither only exists where samples are cut to integers; float output
+        // keeps its choice greyed with the reason rather than hiding the row.
+        let dither_block = (!self.settings.dither_applies()).then(|| {
+            i18n.tr_or(
+                "export.hint.dither-float",
+                "Float output is never dithered.",
+            )
+        });
+        let dither_options = [
+            ("tpdf", i18n.tr_or("export.dither.tpdf", "TPDF")),
+            ("off", i18n.tr_or("export.dither.off", "Off")),
+        ]
+        .into_iter()
+        .map(|(id, label)| {
+            let option = SelectOption::new(id, label);
+            match &dither_block {
+                Some(reason) => option.disabled(true).description(reason.clone()),
+                None => option,
+            }
+        })
+        .collect();
+        rows.push(form_row(
+            i18n.tr_or("export.field.dither", "Dither"),
+            self.dropdown(
+                SelectField::Dither,
+                "export-dither",
+                match self.settings.dither {
+                    sphere_encoder::AudioDither::Tpdf => "tpdf",
+                    sphere_encoder::AudioDither::Off => "off",
+                }
+                .to_string(),
+                dither_options,
+                target,
+            ),
+        ));
+
         if self.settings.format == AudioFileFormat::Flac {
             let level = self.settings.flac_compression_level.unwrap_or(5);
             let options = (FLAC_COMPRESSION_RANGE.0..=FLAC_COMPRESSION_RANGE.1)
@@ -1627,6 +1664,12 @@ impl ExportArrangementWindow {
                 }
                 AudioFileFormat::Rauf => {}
             },
+            SelectField::Dither => {
+                self.settings.dither = match value {
+                    "off" => sphere_encoder::AudioDither::Off,
+                    _ => sphere_encoder::AudioDither::Tpdf,
+                };
+            }
             SelectField::FlacCompression => {
                 if let Ok(level) = value.parse::<u8>() {
                     self.settings.flac_compression_level =

@@ -127,6 +127,7 @@ impl Mp3Encoder {
             .build()
             .map_err(|e| EncodeError::FinalizeFailed(format!("LAME build failed: {e:?}")))?;
 
+        let quantizer = Quantizer::for_file(path.as_ref());
         let writer = BufWriter::new(File::create(path)?);
         Ok(Self {
             encoder,
@@ -137,13 +138,14 @@ impl Mp3Encoder {
             finalized: false,
             pcm: Vec::new(),
             out: Vec::new(),
-            quantizer: Quantizer::new(AudioDither::Off),
+            quantizer,
         })
     }
 
-    /// Dither the 16-bit PCM handed to LAME with `dither`.
+    /// Dither the 16-bit PCM handed to LAME with `dither`, seeded for this
+    /// file.
     pub fn with_dither(mut self, dither: AudioDither) -> Self {
-        self.quantizer = Quantizer::new(dither);
+        self.quantizer = self.quantizer.with_dither(dither);
         self
     }
 
