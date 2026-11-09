@@ -3,12 +3,15 @@
 //! A dual-envelope detector separates the fast (attack) and slow (body)
 //! portions of the signal. Attack and Sustain knobs boost or cut each region
 //! independently, with Speed scaling the envelope times and Mix blending wet
-//! into dry. Allocation-free after construction.
+//! into dry. Followers and meters flush to zero in silence, and the linked
+//! detector and both channel detectors keep running so a Stereo Link toggle
+//! cannot read a cold envelope as a new attack. Allocation-free after
+//! construction.
 
 use builtin_dsp_core::delay::{Smoothed, smoothing_step};
 use builtin_dsp_core::{
     ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, clamp, db_to_linear,
-    linear_to_db, mix, time_constant,
+    flush_denormal, linear_to_db, mix, time_constant,
 };
 use serde::{Deserialize, Serialize};
 
@@ -165,19 +168,24 @@ impl Meters {
         let in_abs = input.abs();
         let out_abs = output.abs();
 
-        self.in_peak = if in_abs > self.in_peak {
+        // Peak hold and the RMS window decay geometrically in silence and
+        // would otherwise settle in the denormal range. The same floor the
+        // envelope followers use snaps each stored state to zero there.
+        self.in_peak = flush_denormal(if in_abs > self.in_peak {
             in_abs
         } else {
             self.in_peak * self.peak_coeff
-        };
-        self.out_peak = if out_abs > self.out_peak {
+        });
+        self.out_peak = flush_denormal(if out_abs > self.out_peak {
             out_abs
         } else {
             self.out_peak * self.peak_coeff
-        };
+        });
 
-        self.in_ms = self.rms_coeff * self.in_ms + (1.0 - self.rms_coeff) * input * input;
-        self.out_ms = self.rms_coeff * self.out_ms + (1.0 - self.rms_coeff) * output * output;
+        self.in_ms =
+            flush_denormal(self.rms_coeff * self.in_ms + (1.0 - self.rms_coeff) * input * input);
+        self.out_ms =
+            flush_denormal(self.rms_coeff * self.out_ms + (1.0 - self.rms_coeff) * output * output);
 
         if in_abs >= CLIP_THRESHOLD {
             self.in_clip = true;
@@ -202,16 +210,21 @@ impl EnvelopePair {
 
     #[inline]
     fn push(&mut self, level: f32, fast_a: f32, fast_r: f32, slow_a: f32, slow_r: f32) {
-        self.fast = if level > self.fast {
+        // A release toward silence decays geometrically and would otherwise
+        // settle in the denormal range, where it sticks and stalls the audio
+        // thread. The floor is silence, so the input and the new state snap
+        // to zero there.
+        let level = flush_denormal(level);
+        self.fast = flush_denormal(if level > self.fast {
             level + fast_a * (self.fast - level)
         } else {
             level + fast_r * (self.fast - level)
-        };
-        self.slow = if level > self.slow {
+        });
+        self.slow = flush_denormal(if level > self.slow {
             level + slow_a * (self.slow - level)
         } else {
             level + slow_r * (self.slow - level)
-        };
+        });
     }
 }
 
@@ -515,32 +528,25 @@ impl StereoEffect for Dsp {
         let sustain_amt = self.sustain_amt.next(step);
         let mix_amount = self.mix_amount.next(step);
 
+        let abs_l = left.abs();
+        let abs_r = right.abs();
+        let fast_a = self.fast_attack;
+        let fast_r = self.fast_release;
+        let slow_a = self.slow_attack;
+        let slow_r = self.slow_release;
+        // Every detector follows the input, including the one Stereo Link is
+        // not reading. A detector left at zero treats the ongoing signal as a
+        // new attack: the fast envelope rises in a fraction of a millisecond
+        // while the slow one is still down, and that false attack bursts the level.
+        self.left.push(abs_l, fast_a, fast_r, slow_a, slow_r);
+        self.right.push(abs_r, fast_a, fast_r, slow_a, slow_r);
+        self.linked
+            .push(abs_l.max(abs_r), fast_a, fast_r, slow_a, slow_r);
+
         let (gain_l, gain_r) = if self.params.stereo_link {
-            let level = left.abs().max(right.abs());
-            self.linked.push(
-                level,
-                self.fast_attack,
-                self.fast_release,
-                self.slow_attack,
-                self.slow_release,
-            );
             let gain = Self::shape_gain(&self.linked, attack_amt, sustain_amt);
             (gain, gain)
         } else {
-            self.left.push(
-                left.abs(),
-                self.fast_attack,
-                self.fast_release,
-                self.slow_attack,
-                self.slow_release,
-            );
-            self.right.push(
-                right.abs(),
-                self.fast_attack,
-                self.fast_release,
-                self.slow_attack,
-                self.slow_release,
-            );
             (
                 Self::shape_gain(&self.left, attack_amt, sustain_amt),
                 Self::shape_gain(&self.right, attack_amt, sustain_amt),
@@ -805,5 +811,113 @@ mod tests {
         let _ = dsp.process_stereo(0.1, 0.1);
         assert!(dsp.apply_wire_param(ipc::SUSTAIN_INDEX, 0.0));
         assert_eq!(dsp.sustain_amt.outer.value, 0.4);
+    }
+
+    /// Samples for the slow release (200 ms at unity speed) to fall from full
+    /// scale through the normal range. Past this, an unflushed follower is a
+    /// denormal rather than zero.
+    const SILENCE_SAMPLES: usize = 700_000;
+
+    /// Samples for the peak meter (400 ms fall) to drop from well above full
+    /// scale through the denormal floor at 48 kHz. The RMS window is shorter,
+    /// so this also clears both mean-square states. An unflushed meter is a
+    /// subnormal after about 35 s, which is past this count.
+    const METER_SILENCE_SAMPLES: usize = 1_200_000;
+
+    #[test]
+    fn silence_flushes_envelope_state_to_zero() {
+        let sr = 48_000.0;
+        let mut env = EnvelopePair {
+            fast: 1.0,
+            slow: 1.0,
+        };
+        let fast_a = time_constant(sr, FAST_ATTACK_SEC);
+        let fast_r = time_constant(sr, FAST_RELEASE_BASE_SEC);
+        let slow_a = time_constant(sr, SLOW_ATTACK_BASE_SEC);
+        let slow_r = time_constant(sr, SLOW_RELEASE_BASE_SEC);
+        for _ in 0..SILENCE_SAMPLES {
+            env.push(0.0, fast_a, fast_r, slow_a, slow_r);
+        }
+        assert_eq!(env.fast, 0.0);
+        assert_eq!(env.slow, 0.0);
+        // A denormal sample must not re-seed the state.
+        env.push(1.0e-40, fast_a, fast_r, slow_a, slow_r);
+        assert_eq!((env.fast, env.slow), (0.0, 0.0));
+
+        let mut dsp = shaping();
+        for _ in 0..256 {
+            let _ = dsp.process_stereo(0.8, 0.5);
+        }
+        assert!(dsp.linked.slow > 0.1);
+        assert!(dsp.meters.in_peak > 0.1);
+        assert!(dsp.meters.out_peak > 0.1);
+        assert!(dsp.meters.in_ms > 1.0e-4);
+        assert!(dsp.meters.out_ms > 1.0e-4);
+        for _ in 0..METER_SILENCE_SAMPLES {
+            let _ = dsp.process_stereo(0.0, 0.0);
+        }
+        assert_eq!(dsp.linked.fast, 0.0);
+        assert_eq!(dsp.linked.slow, 0.0);
+        assert_eq!(dsp.left.fast, 0.0);
+        assert_eq!(dsp.left.slow, 0.0);
+        assert_eq!(dsp.right.fast, 0.0);
+        assert_eq!(dsp.right.slow, 0.0);
+        assert_eq!(dsp.meters.in_peak, 0.0);
+        assert_eq!(dsp.meters.out_peak, 0.0);
+        assert_eq!(dsp.meters.in_ms, 0.0);
+        assert_eq!(dsp.meters.out_ms, 0.0);
+        // A denormal sample must not re-seed the meters.
+        let _ = dsp.process_stereo(1.0e-40, 1.0e-40);
+        assert_eq!(
+            (
+                dsp.meters.in_peak,
+                dsp.meters.out_peak,
+                dsp.meters.in_ms,
+                dsp.meters.out_ms
+            ),
+            (0.0, 0.0, 0.0, 0.0)
+        );
+    }
+
+    /// Output after a Stereo Link toggle, against a shaper that was already
+    /// in the destination mode. A cold detector reads the ongoing tone as a
+    /// new attack and the two diverge for the slow envelope's rise.
+    #[test]
+    fn toggling_stereo_link_matches_the_settled_detector() {
+        const SETTLE: usize = 48_000;
+        const TAIL: usize = 4_800;
+
+        let render = |start_linked: bool, toggle_to: Option<bool>| -> Vec<(f32, f32)> {
+            let mut dsp = shaping();
+            assert!(dsp.apply_ui_param("stereoLink", f32::from(start_linked)));
+            let mut out = Vec::with_capacity(TAIL);
+            for n in 0..SETTLE + TAIL {
+                if n == SETTLE {
+                    if let Some(linked) = toggle_to {
+                        assert!(dsp.apply_ui_param("stereoLink", f32::from(linked)));
+                    }
+                }
+                let (l, r) = tone(n);
+                let y = dsp.process_stereo(l, r);
+                if n >= SETTLE {
+                    out.push(y);
+                }
+            }
+            out
+        };
+
+        let compare = |label: &str, a: &[(f32, f32)], b: &[(f32, f32)]| {
+            let mut worst = 0.0f32;
+            for (x, y) in a.iter().zip(b.iter()) {
+                worst = worst.max((x.0 - y.0).abs()).max((x.1 - y.1).abs());
+            }
+            assert!(
+                worst < 1.0e-5,
+                "{label}: output diverged by {worst} after the toggle"
+            );
+        };
+
+        compare("unlink", &render(false, None), &render(true, Some(false)));
+        compare("link", &render(true, None), &render(false, Some(true)));
     }
 }
