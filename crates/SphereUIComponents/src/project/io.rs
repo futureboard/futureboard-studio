@@ -222,9 +222,20 @@ pub fn save_project_with_report_from(
             Ok(ProjectSaveReport { offline_media })
         }
         Err(error) => {
-            let _ = fs::remove_file(&tmp_path);
-            project_save_log(format_args!("save failed: {error}"));
-            Err(ProjectError::Io(error))
+            // The temp file is a complete, synced save. Keep it so the user
+            // can recover the new state, and say where it is.
+            project_save_log(format_args!(
+                "save failed: {error}; new save kept at {}",
+                tmp_path.display()
+            ));
+            Err(ProjectError::Io(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "{error}. {} was left unchanged; the new save was kept at {}",
+                    path.display(),
+                    tmp_path.display()
+                ),
+            )))
         }
     }
 }
@@ -387,20 +398,41 @@ fn archive_stores_uncompressed(path: &Path) -> bool {
 }
 
 /// Move a finished temp file over `path`. `rename` replaces the target
-/// atomically on macOS and Linux, so the target is never removed first: a
-/// failed rename leaves the previous project in place instead of no project
-/// at all. Windows can refuse to replace a file that is open elsewhere, so only
-/// there does a failed rename remove the target and try once more.
+/// atomically (on Windows through `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` /
+/// a POSIX-semantics rename), so the target is never removed first: a failed
+/// replace leaves the previous file in place instead of no file at all.
+///
+/// Windows refuses the replace while another program (a sync client,
+/// antivirus, an indexer) briefly holds the target open, so only there is a
+/// sharing failure retried a few times, with a short bounded backoff. The
+/// caller decides what to do with `tmp_path` when this still fails.
 fn replace_project_file(tmp_path: &Path, path: &Path) -> std::io::Result<()> {
-    match fs::rename(tmp_path, path) {
-        Ok(()) => Ok(()),
-        #[cfg(windows)]
-        Err(_) if path.exists() => {
-            let _ = fs::remove_file(path);
-            fs::rename(tmp_path, path)
+    #[cfg(windows)]
+    {
+        const RETRY_DELAYS_MS: [u64; 4] = [25, 50, 100, 200];
+        let mut delays = RETRY_DELAYS_MS.iter();
+        loop {
+            match fs::rename(tmp_path, path) {
+                Ok(()) => return Ok(()),
+                Err(error) if is_windows_sharing_error(&error) => match delays.next() {
+                    Some(&delay) => std::thread::sleep(std::time::Duration::from_millis(delay)),
+                    None => return Err(error),
+                },
+                Err(error) => return Err(error),
+            }
         }
-        Err(error) => Err(error),
     }
+    #[cfg(not(windows))]
+    {
+        fs::rename(tmp_path, path)
+    }
+}
+
+/// `ERROR_ACCESS_DENIED` (5), `ERROR_SHARING_VIOLATION` (32) and
+/// `ERROR_LOCK_VIOLATION` (33): the target is held open by someone else.
+#[cfg(windows)]
+fn is_windows_sharing_error(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(5 | 32 | 33))
 }
 
 /// Load a project from disk, optionally allowing old versions.
@@ -2194,6 +2226,91 @@ mod tests {
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(ext);
         let _ = fs::remove_dir_all(ext2);
+    }
+
+    /// #308: another program holding the project open must not cost the
+    /// user either file. The existing project stays as it was and the new,
+    /// complete save is kept on disk at the path the error names.
+    #[cfg(windows)]
+    #[test]
+    fn failed_replace_keeps_the_existing_project_and_the_new_save() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 1;
+
+        let dir = temp_dir("held-open-save");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Held.fbproj");
+        save_project(&mut FutureboardProject::new("Before"), &path).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        // Read sharing only: rename over it and deletion are both refused,
+        // as with a sync client or antivirus scan holding the file.
+        let holder = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&path)
+            .unwrap();
+        let error = save_project(&mut FutureboardProject::new("After"), &path).unwrap_err();
+        drop(holder);
+
+        assert_eq!(fs::read(&path).unwrap(), before, "existing project kept");
+        let kept: Vec<PathBuf> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "tmp"))
+            .collect();
+        assert_eq!(kept.len(), 1, "new save kept: {kept:?}");
+        assert!(
+            error
+                .technical_detail()
+                .contains(&kept[0].display().to_string()),
+            "error names the kept save: {}",
+            error.technical_detail()
+        );
+        let recovered = load_project(&kept[0], false).unwrap();
+        assert_eq!(recovered.name, "After");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// #308, as in the report: a holder that allows deletion (the sharing a
+    /// sync client uses). Whatever Windows lets the replace do, the project
+    /// path must end up holding either the new save or the old project with
+    /// the new save kept beside it; never nothing.
+    #[cfg(windows)]
+    #[test]
+    fn save_over_a_file_held_open_with_delete_sharing_loses_nothing() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 1;
+        const FILE_SHARE_DELETE: u32 = 4;
+
+        let dir = temp_dir("held-open-delete-save");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Held.fbproj");
+        save_project(&mut FutureboardProject::new("Before"), &path).unwrap();
+
+        let holder = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+            .open(&path)
+            .unwrap();
+        let saved = save_project(&mut FutureboardProject::new("After"), &path);
+        drop(holder);
+
+        let on_disk = load_project(&path, false).expect("project file still there");
+        if saved.is_ok() {
+            assert_eq!(on_disk.name, "After");
+        } else {
+            assert_eq!(on_disk.name, "Before");
+            let kept = fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.path())
+                .find(|p| p.extension().is_some_and(|ext| ext == "tmp"))
+                .expect("new save kept");
+            assert_eq!(load_project(&kept, false).unwrap().name, "After");
+        }
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

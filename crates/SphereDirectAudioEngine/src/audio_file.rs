@@ -1326,7 +1326,7 @@ fn read_wav_header(file: &mut File) -> Result<(WavFmt, u64, u64), String> {
                     return Err("invalid fmt chunk".to_string());
                 }
                 fmt = Some(WavFmt {
-                    audio_format: u16::from_le_bytes([buf[0], buf[1]]),
+                    audio_format: wav_format_code(&buf),
                     channels: u16::from_le_bytes([buf[2], buf[3]]) as usize,
                     sample_rate: u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
                     bits_per_sample: u16::from_le_bytes([buf[14], buf[15]]),
@@ -1367,6 +1367,36 @@ pub(crate) struct WavFmt {
     pub bits_per_sample: u16,
 }
 
+/// `WAVE_FORMAT_EXTENSIBLE`: the real sample format is the subformat GUID.
+const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
+
+/// The `KSDATAFORMAT_SUBTYPE_*` GUID bytes after its leading 16-bit format
+/// code: `xxxx0000-0000-0010-8000-00aa00389b71`, as stored little-endian.
+const KSDATAFORMAT_SUBTYPE_SUFFIX: [u8; 14] = [
+    0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
+];
+
+/// The format code a `fmt ` chunk body (at least 16 bytes) decodes as.
+///
+/// `WAVE_FORMAT_EXTENSIBLE` (the usual tag for 24/32-bit and multichannel
+/// files) names the real format in its subformat GUID, at byte 24 of the
+/// 40-byte body; a PCM or IEEE-float subformat resolves to `1` or `3`, so it
+/// decodes exactly like the same audio under the plain tag. An extensible
+/// header whose subformat is missing or not a standard `KSDATAFORMAT_SUBTYPE`
+/// keeps `0xFFFE`, which the decoder reports as unsupported.
+fn wav_format_code(fmt_body: &[u8]) -> u16 {
+    let tag = u16::from_le_bytes([fmt_body[0], fmt_body[1]]);
+    if tag != WAVE_FORMAT_EXTENSIBLE {
+        return tag;
+    }
+    match fmt_body.get(24..40) {
+        Some(guid) if guid[2..] == KSDATAFORMAT_SUBTYPE_SUFFIX => {
+            u16::from_le_bytes([guid[0], guid[1]])
+        }
+        _ => tag,
+    }
+}
+
 /// Parse RIFF/WAVE layout from bytes without decoding PCM.
 pub(crate) fn wav_data_layout(bytes: &[u8]) -> Result<(WavFmt, usize, usize), String> {
     if bytes.len() < 44 {
@@ -1395,7 +1425,7 @@ pub(crate) fn wav_data_layout(bytes: &[u8]) -> Result<(WavFmt, usize, usize), St
                     return Err("invalid fmt chunk".to_string());
                 }
                 fmt = Some(WavFmt {
-                    audio_format: read_u16_le(bytes, body)?,
+                    audio_format: wav_format_code(&bytes[body..end]),
                     channels: read_u16_le(bytes, body + 2)? as usize,
                     sample_rate: read_u32_le(bytes, body + 4)?,
                     bits_per_sample: read_u16_le(bytes, body + 14)?,
@@ -1750,6 +1780,97 @@ mod peak_tests {
         assert_eq!(loaded.channels, 2);
         assert_eq!(loaded.frames, data_bytes as usize / 4);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A `WAVE_FORMAT_EXTENSIBLE` WAV (40-byte fmt chunk) with `subformat`
+    /// as its `KSDATAFORMAT_SUBTYPE` code, holding `data`.
+    fn extensible_wav(
+        subformat: u16,
+        bits: u16,
+        channels: u16,
+        valid_bits: u16,
+        data: &[u8],
+    ) -> Vec<u8> {
+        let sample_rate = 48_000u32;
+        let block_align = channels * bits / 8;
+        let mut out = Vec::new();
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&((4 + 8 + 40 + 8 + data.len()) as u32).to_le_bytes());
+        out.extend_from_slice(b"WAVEfmt ");
+        out.extend_from_slice(&40u32.to_le_bytes());
+        out.extend_from_slice(&WAVE_FORMAT_EXTENSIBLE.to_le_bytes());
+        out.extend_from_slice(&channels.to_le_bytes());
+        out.extend_from_slice(&sample_rate.to_le_bytes());
+        out.extend_from_slice(&(sample_rate * block_align as u32).to_le_bytes());
+        out.extend_from_slice(&block_align.to_le_bytes());
+        out.extend_from_slice(&bits.to_le_bytes());
+        out.extend_from_slice(&22u16.to_le_bytes()); // cbSize
+        out.extend_from_slice(&valid_bits.to_le_bytes());
+        out.extend_from_slice(&3u32.to_le_bytes()); // front left | front right
+        out.extend_from_slice(&subformat.to_le_bytes());
+        out.extend_from_slice(&KSDATAFORMAT_SUBTYPE_SUFFIX);
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(data);
+        out
+    }
+
+    /// #286: a small (in-memory path) EXTENSIBLE file with a PCM or float
+    /// subformat loads for playback, for edits and for peaks, exactly like
+    /// the plain-tag file, instead of "unsupported WAV format code: 65534".
+    #[test]
+    fn extensible_wavs_decode_on_the_small_file_paths() {
+        // 24-bit PCM stereo: two frames, [0.5, -0.5], [0.25, 0].
+        let mut pcm24 = Vec::new();
+        for value in [4_194_304i32, -4_194_304, 2_097_152, 0] {
+            pcm24.extend_from_slice(&value.to_le_bytes()[..3]);
+        }
+        // 32-bit float stereo, with headroom above 0 dBFS.
+        let mut float32 = Vec::new();
+        for value in [0.5f32, -1.5, 0.25, 0.0] {
+            float32.extend_from_slice(&value.to_le_bytes());
+        }
+        let cases = [
+            (
+                "ext-pcm24",
+                extensible_wav(1, 24, 2, 24, &pcm24),
+                [0.5, -0.5, 0.25, 0.0],
+            ),
+            (
+                "ext-f32",
+                extensible_wav(3, 32, 2, 32, &float32),
+                [0.5, -1.5, 0.25, 0.0],
+            ),
+        ];
+        for (label, bytes, expected) in cases {
+            let path = temp_path(label).with_extension("wav");
+            std::fs::write(&path, &bytes).unwrap();
+            let path_str = path.to_str().unwrap();
+
+            let played = load_audio_file(path_str).unwrap();
+            assert_eq!((played.channels, played.frames), (2, 2), "{label}");
+            assert_eq!(played.samples, expected.to_vec(), "{label}");
+            let edited = load_audio_file_for_edit(path_str).unwrap();
+            assert_eq!(edited.samples, expected.to_vec(), "{label}");
+            let source = crate::audio_source::open_clip_audio_source(path_str).unwrap();
+            drop(source);
+            let peaks = generate_audio_peaks(&path).unwrap();
+            assert_eq!(peaks.total_frames, 2, "{label}");
+            let info = probe_audio_file(&path).unwrap();
+            assert_eq!(info.total_frames, 2, "{label}");
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// An EXTENSIBLE subformat that is not PCM or float is still refused.
+    #[test]
+    fn extensible_wav_with_unknown_subformat_is_refused() {
+        let bytes = extensible_wav(0x0055, 16, 2, 16, &[0; 8]);
+        let path = temp_path("ext-mp3").with_extension("wav");
+        std::fs::write(&path, &bytes).unwrap();
+        let result = load_audio_file(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        assert!(result.unwrap_err().contains("unsupported WAV format code"));
     }
 
     /// A crafted WAV whose `fmt ` chunk claims ~4 GiB must be rejected by the
