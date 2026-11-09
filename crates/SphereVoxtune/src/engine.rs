@@ -679,12 +679,20 @@ impl CantoEngine {
     }
 
     fn swap_audio(&mut self, decoded: DecodedAudio) {
+        self.swap_samples(
+            Arc::new(decoded.samples),
+            decoded.duration_sec,
+            decoded.waveform_peaks,
+        );
+    }
+
+    fn swap_samples(&mut self, samples: Arc<Vec<f32>>, duration_sec: f64, peaks: Vec<f32>) {
         self.playing = false;
         self.playhead_sec = 0.0;
         self.correct_amount = 0.0;
-        self.audio_samples = Arc::new(decoded.samples);
-        self.duration_sec = decoded.duration_sec;
-        self.waveform_peaks = decoded.waveform_peaks;
+        self.audio_samples = samples;
+        self.duration_sec = duration_sec;
+        self.waveform_peaks = peaks;
         self.shifter.reset();
         self.compressor.reset();
         self.clear_audition();
@@ -760,6 +768,20 @@ impl CantoEngine {
         analysis: Analysis,
     ) -> CantoAnalysisResult {
         self.swap_audio(decoded);
+        self.adopt(analysis)
+    }
+
+    /// Like [`Self::install_analyzed`], sharing `samples` (at this engine's
+    /// rate) instead of taking a copy: several engines playing one take hold
+    /// one buffer.
+    pub fn install_analyzed_shared(
+        &mut self,
+        samples: Arc<Vec<f32>>,
+        waveform_peaks: Vec<f32>,
+        analysis: Analysis,
+    ) -> CantoAnalysisResult {
+        let duration_sec = samples.len() as f64 / self.sample_rate as f64;
+        self.swap_samples(samples, duration_sec, waveform_peaks);
         self.adopt(analysis)
     }
 
