@@ -84,6 +84,35 @@ pub fn resolve_latency_routing_indices(tracks: &mut [RuntimeTrack]) {
             send.return_track_index = id_to_index.get(&send.return_track_id).copied();
         }
     }
+    for src in 0..tracks.len() {
+        let ret = wdw_return_for(tracks, src);
+        tracks[src].wdw_return_index = ret;
+    }
+}
+
+/// The return `src`'s wet/dry/wet inserts run on: the target of its first
+/// enabled wet/dry/wet send that resolves to another routing track, provided
+/// `src` is the source that return runs inserts for (the first track with
+/// such a send to it, as the render pass picks). `None` leaves them in the
+/// track's own chain. Reads resolved send indices only.
+fn wdw_return_for(tracks: &[RuntimeTrack], src: usize) -> Option<usize> {
+    let feeds_wdw = |track: &RuntimeTrack, ret: usize| {
+        track
+            .sends
+            .iter()
+            .any(|send| send.wdw && send.enabled && send.return_track_index == Some(ret))
+    };
+    tracks[src]
+        .sends
+        .iter()
+        .filter(|send| send.wdw && send.enabled)
+        .filter_map(|send| send.return_track_index)
+        .find(|&ret| {
+            ret != src
+                && ret < tracks.len()
+                && is_routing_track_type(&tracks[ret].track_type)
+                && tracks.iter().position(|track| feeds_wdw(track, ret)) == Some(src)
+        })
 }
 
 /// The track a main output feeds, or `None` when it reaches the master sum
@@ -543,6 +572,7 @@ mod tests {
             plugin_latency_samples: plugin_latency,
             smoothed_gain_l: 1.0,
             smoothed_gain_r: 1.0,
+            wdw_return_index: None,
         }
     }
 

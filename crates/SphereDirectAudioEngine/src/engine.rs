@@ -8174,6 +8174,7 @@ mod bridge_insert_tests {
             pdc_write_pos: 0,
             smoothed_gain_l: 1.0,
             smoothed_gain_r: 1.0,
+            wdw_return_index: None,
         }
     }
 
@@ -8762,6 +8763,7 @@ mod bridge_insert_tests {
             pdc_write_pos: 0,
             smoothed_gain_l: 1.0,
             smoothed_gain_r: 1.0,
+            wdw_return_index: None,
         };
         // Pre-seed previous-cycle wet so the first read applies A×2 then B×3.
         let sink_a = Arc::new(MultSink {
@@ -8913,6 +8915,7 @@ mod bridge_insert_tests {
             pdc_write_pos: 0,
             smoothed_gain_l: 1.0,
             smoothed_gain_r: 1.0,
+            wdw_return_index: None,
         };
         let sink_a = Arc::new(MultSink {
             mult: 2.0,
@@ -9013,6 +9016,7 @@ mod routing_tests {
             pdc_write_pos: 0,
             smoothed_gain_l: 1.0,
             smoothed_gain_r: 1.0,
+            wdw_return_index: None,
         }
     }
 

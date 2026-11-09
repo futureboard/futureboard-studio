@@ -901,8 +901,12 @@ fn insert_chip(
                 .block_mouse_except_scroll(),
         ))
         .child(div().flex_1().min_w(px(0.0)).truncate().child(display))
+        // Shown while the split is live, and for an insert still stored on
+        // the W bus after it went away (it runs on Main then), so the user
+        // can see that and move it back.
         .when(
-            wdw_live && slot.plugin_format == Some(InsertPluginFormat::Vst3),
+            slot.plugin_format == Some(InsertPluginFormat::Vst3)
+                && (wdw_live || slot.signal_bus == InsertSignalBus::Wdw),
             |row| {
                 let on_bus = callbacks.on_set_insert_bus.clone();
                 let track_id = bus_track.clone();
@@ -911,6 +915,16 @@ fn insert_chip(
                 let next = match current {
                     InsertSignalBus::Main => InsertSignalBus::Wdw,
                     InsertSignalBus::Wdw => InsertSignalBus::Main,
+                };
+                let tooltip = if wdw_live {
+                    format!("Bus: {} — click for {}", current.label(), next.label())
+                } else {
+                    format!(
+                        "Bus: {} — the wet/dry/wet split is off, so this runs on Main. \
+                         Click for {}",
+                        current.label(),
+                        next.label()
+                    )
                 };
                 row.child(forward_drops(
                     div()
@@ -923,16 +937,12 @@ fn insert_chip(
                         .h_full()
                         .text_size(px(type_scale::LABEL))
                         .font_weight(gpui::FontWeight::BOLD)
-                        .text_color(if current == InsertSignalBus::Wdw {
+                        .text_color(if current == InsertSignalBus::Wdw && wdw_live {
                             Colors::state_monitor()
                         } else {
                             Colors::text_faint()
                         })
-                        .tooltip(crate::components::controls::fb_tooltip(format!(
-                            "Bus: {} — click for {}",
-                            current.label(),
-                            next.label()
-                        )))
+                        .tooltip(crate::components::controls::fb_tooltip(tooltip))
                         .child(if current == InsertSignalBus::Wdw {
                             "W"
                         } else {

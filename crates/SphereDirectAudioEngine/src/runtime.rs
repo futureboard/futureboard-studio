@@ -989,6 +989,14 @@ pub struct RuntimeTrack {
     /// [`RuntimeProject::fader_smoothing`] is off, the target applies directly.
     pub smoothed_gain_l: f32,
     pub smoothed_gain_r: f32,
+    /// The return this track's wet/dry/wet inserts
+    /// ([`RuntimeInsert::signal_bus`] = [`SIGNAL_BUS_WDW`]) run on, or `None`
+    /// while the split is not live: no enabled wet/dry/wet send, or its
+    /// return is gone. Those inserts then run in this track's own chain, so a
+    /// plug-in left on the W bus is never silenced. Resolved with the other
+    /// routing indices ([`crate::latency_graph::resolve_latency_routing_indices`]),
+    /// so the render pass and delay compensation read one answer.
+    pub wdw_return_index: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3940,6 +3948,7 @@ impl RuntimeProject {
                 pdc_write_pos: 0,
                 smoothed_gain_l: init_volume * init_pan_l,
                 smoothed_gain_r: init_volume * init_pan_r,
+                wdw_return_index: None,
             });
         }
         let has_solo = tracks.iter().any(|t| t.solo);
@@ -9101,6 +9110,7 @@ mod midi_tests {
             pdc_write_pos: 0,
             smoothed_gain_l: 1.0,
             smoothed_gain_r: 1.0,
+            wdw_return_index: None,
         }
     }
 

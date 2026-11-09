@@ -2683,11 +2683,16 @@ pub fn apply_track_chain_block(
 
     let instrument_ix = track.midi_instrument_insert_ix;
     let midi_events = &track.midi_block_events;
+    // Resolved with the routing indices, never searched here.
+    let wdw_live = track.wdw_return_index.is_some();
     for (ix, insert) in track.inserts.iter_mut().enumerate() {
         // Wet/dry/wet inserts stay owned by this track (params, host, editor)
         // and run later, on the split's return. Skipping them here is what
-        // takes them out of the main chain.
-        if insert.signal_bus == crate::runtime::SIGNAL_BUS_WDW {
+        // takes them out of the main chain -- only while that return is live.
+        // With the split gone (its send off or removed, its return deleted)
+        // they stay in this chain: a plug-in left on the W bus keeps playing
+        // instead of going silent.
+        if wdw_live && insert.signal_bus == crate::runtime::SIGNAL_BUS_WDW {
             continue;
         }
         let midi = instrument_ix
@@ -2744,16 +2749,14 @@ fn process_chain_insert(
     }
 }
 
-/// Source index of the enabled wet/dry/wet send that feeds `return_index`.
-/// A scan of the send list, no allocation and no id lookup: the return index
-/// was resolved when the graph was built.
+/// The track whose wet/dry/wet inserts run on `return_index`. A scan of a
+/// resolved index per track, no allocation and no id lookup: the same
+/// [`RuntimeTrack::wdw_return_index`] that takes them out of that track's
+/// own chain, so an insert runs in exactly one place.
 fn wdw_source_index(tracks: &[RuntimeTrack], return_index: usize) -> Option<usize> {
-    tracks.iter().position(|track| {
-        track
-            .sends
-            .iter()
-            .any(|send| send.wdw && send.enabled && send.return_track_index == Some(return_index))
-    })
+    tracks
+        .iter()
+        .position(|track| track.wdw_return_index == Some(return_index))
 }
 
 /// Run the source track's wet/dry/wet inserts on the return's block.

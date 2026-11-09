@@ -282,6 +282,20 @@ fn routed_output_peak(target: Option<(&str, &str)>, from_clip: bool) -> f32 {
 /// itself is the split in both cases, so the only thing that moves is
 /// which buffer the gain processes.
 fn wdw_bus_peaks(on_wdw_bus: bool) -> (f32, f32, f32) {
+    wdw_bus_peaks_with(on_wdw_bus, WdwSplit::Live)
+}
+
+/// What is left of the wet/dry/wet split the source's gain was put on.
+#[derive(Clone, Copy, Debug)]
+enum WdwSplit {
+    Live,
+    /// The split send is still there, switched off.
+    SendOff,
+    /// The send still names the return, which has been deleted.
+    ReturnGone,
+}
+
+fn wdw_bus_peaks_with(on_wdw_bus: bool, split: WdwSplit) -> (f32, f32, f32) {
     let mut source = track("audio-0", "audio");
     let mut insert = gain_insert("gain", -20.0);
     if on_wdw_bus {
@@ -294,10 +308,14 @@ fn wdw_bus_peaks(on_wdw_bus: bool) -> (f32, f32, f32) {
         id: "send-wdw".to_string(),
         return_track_id: "wdw".to_string(),
         level: 1.0,
-        enabled: true,
+        enabled: !matches!(split, WdwSplit::SendOff),
         pre_fader: false,
         wdw: true,
     }];
+    let tracks = match split {
+        WdwSplit::ReturnGone => vec![source, track("master", "master")],
+        _ => vec![source, track("wdw", "return"), track("master", "master")],
+    };
     let snapshot = EngineProjectSnapshot {
         spatial: Default::default(),
         project_id: "wdw-bus".to_string(),
@@ -307,7 +325,7 @@ fn wdw_bus_peaks(on_wdw_bus: bool) -> (f32, f32, f32) {
         tempo_points: Vec::new(),
         time_signature: [4, 4],
         sample_rate: SAMPLE_RATE,
-        tracks: vec![source, track("wdw", "return"), track("master", "master")],
+        tracks,
         clips: Vec::new(),
         midi_clips: Vec::new(),
         pdc_enabled: true,
@@ -379,6 +397,27 @@ fn a_wdw_insert_is_summed_on_the_return_and_a_main_insert_stays_on_the_source() 
         (master - 0.55).abs() < 1e-3,
         "dry source plus the gained return should sum near 0.55, got {master}"
     );
+}
+
+/// #335: a plug-in left on the W bus after the split is gone runs in its own
+/// track's chain again instead of going silent with nowhere to run.
+#[test]
+fn a_wdw_insert_without_a_live_split_stays_in_the_source_chain() {
+    for split in [WdwSplit::SendOff, WdwSplit::ReturnGone] {
+        let (source, ret, master) = wdw_bus_peaks_with(true, split);
+        assert!(
+            (source - 0.05).abs() < 1e-3,
+            "{split:?}: the W-bus gain must still process on the source: source={source}"
+        );
+        assert!(
+            ret < 1e-6,
+            "{split:?}: nothing reaches a split that is off or gone: return={ret}"
+        );
+        assert!(
+            (master - 0.05).abs() < 1e-3,
+            "{split:?}: only the gained source reaches master, got {master}"
+        );
+    }
 }
 
 #[test]
