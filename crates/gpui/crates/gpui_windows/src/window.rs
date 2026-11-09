@@ -99,7 +99,10 @@ pub(crate) struct WindowsWindowInner {
     pub(crate) validation_number: usize,
     pub(crate) main_receiver: PriorityQueueReceiver<RunnableVariant>,
     pub(crate) platform_window_handle: HWND,
-    pub(crate) parent_hwnd: Option<HWND>,
+    /// The window this modal dialog holds disabled, if it is one. Plain owned
+    /// windows (`Floating`) leave this `None`: owning a window is not the same
+    /// as blocking it, and only a modal may re-enable its owner on destroy.
+    pub(crate) modal_owner: Option<HWND>,
 }
 
 impl WindowsWindowState {
@@ -290,7 +293,7 @@ impl WindowsWindowInner {
             main_receiver: context.main_receiver.clone(),
             platform_window_handle: context.platform_window_handle,
             system_settings: WindowsSystemSettings::new(),
-            parent_hwnd: context.parent_hwnd,
+            modal_owner: context.modal_owner,
         }))
     }
 
@@ -464,7 +467,7 @@ struct WindowCreateContext {
     disable_direct_composition: bool,
     directx_devices: DirectXDevices,
     invalidate_devices: Arc<AtomicBool>,
-    parent_hwnd: Option<HWND>,
+    modal_owner: Option<HWND>,
 }
 
 impl WindowsWindow {
@@ -487,25 +490,33 @@ impl WindowsWindow {
             invalidate_devices,
         } = creation_info;
         register_window_class(icon);
-        let parent_hwnd = if params.kind == WindowKind::Dialog && params.dialog_parenting {
-            let parent_window = unsafe { GetActiveWindow() };
-            if parent_window.is_invalid() {
-                None
+        // `parent_hwnd` is the Win32 owner; `modal_owner` is the window this
+        // dialog holds disabled. They are deliberately separate: a `Floating`
+        // window is owned but blocks nothing, so its destruction must never
+        // re-enable or activate its owner.
+        let (parent_hwnd, modal_owner) =
+            if params.kind == WindowKind::Dialog && params.dialog_parenting {
+                match modal_owner_window() {
+                    Some(owner) => {
+                        // Disable the owner to make this dialog modal.
+                        let was_disabled = unsafe { EnableWindow(owner, false) }.as_bool();
+                        // Ours to re-enable on destroy only if this dialog
+                        // disabled it, or another modal of ours already holds
+                        // it (the last of them re-enables it). An owner disabled
+                        // by something else stays that something's business.
+                        let holds_owner = !was_disabled || owner_held_by_modal_dialog(owner, None);
+                        (Some(owner), holds_owner.then_some(owner))
+                    }
+                    None => (None, None),
+                }
+            } else if params.kind == WindowKind::Floating {
+                // Floating = above its application, not above every application.
+                // An *owned* window is exactly that on Win32: it stays above its
+                // owner, hides when the owner minimizes and is destroyed with it.
+                (floating_owner_window(), None)
             } else {
-                // Disable the parent window to make this dialog modal
-                unsafe {
-                    EnableWindow(parent_window, false).as_bool();
-                };
-                Some(parent_window)
-            }
-        } else if params.kind == WindowKind::Floating {
-            // Floating = above its application, not above every application.
-            // An *owned* window is exactly that on Win32: it stays above its
-            // owner, hides when the owner minimizes and is destroyed with it.
-            floating_owner_window()
-        } else {
-            None
-        };
+                (None, None)
+            };
         let hide_title_bar = params
             .titlebar
             .as_ref()
@@ -595,7 +606,7 @@ impl WindowsWindow {
             disable_direct_composition,
             directx_devices,
             invalidate_devices,
-            parent_hwnd,
+            modal_owner,
         };
         let creation_result = if params.kind == WindowKind::Dialog {
             let template = NativeDialogTemplate::new(dwstyle, dwexstyle);
@@ -629,9 +640,29 @@ impl WindowsWindow {
 
         // Failure to create a `WindowsWindowState` can cause window creation to fail,
         // so check the inner result first.
-        let this = context.inner.take().transpose()?;
-        let hwnd = creation_result?;
+        let created = context
+            .inner
+            .take()
+            .transpose()
+            .and_then(|this| Ok((this, creation_result?)));
+        let (this, hwnd) = match created {
+            Ok(created) => created,
+            Err(error) => {
+                // No dialog will ever release the owner disabled above.
+                if let Some(owner) = modal_owner
+                    && !owner_held_by_modal_dialog(owner, None)
+                {
+                    unsafe {
+                        let _ = EnableWindow(owner, true);
+                    }
+                }
+                return Err(error);
+            }
+        };
         let this = this.unwrap();
+        if let Some(owner) = modal_owner {
+            register_modal_dialog(hwnd, owner);
+        }
 
         if params.kind == WindowKind::Dialog {
             unsafe { SetWindowTextW(hwnd, &window_name).log_err() };
@@ -1536,6 +1567,68 @@ impl NativeDialogTemplate {
 
     fn as_ptr(&self) -> *const DLGTEMPLATE {
         self.words.as_ptr().cast()
+    }
+}
+
+thread_local! {
+    /// Live modal dialogs of this UI thread, as `(dialog, owner it holds
+    /// disabled)`. Several modals may hold the same owner (a dialog opened from
+    /// a floating editor while Settings is up); only the last one to close may
+    /// re-enable it.
+    static MODAL_DIALOGS: RefCell<Vec<(HWND, HWND)>> = const { RefCell::new(Vec::new()) };
+}
+
+fn register_modal_dialog(dialog: HWND, owner: HWND) {
+    MODAL_DIALOGS.with_borrow_mut(|dialogs| dialogs.push((dialog, owner)));
+}
+
+fn is_modal_dialog(hwnd: HWND) -> bool {
+    MODAL_DIALOGS.with_borrow(|dialogs| {
+        dialogs
+            .iter()
+            .any(|&(dialog, _)| dialog == hwnd && unsafe { IsWindow(Some(dialog)) }.as_bool())
+    })
+}
+
+/// Whether a live modal dialog other than `except` holds `owner` disabled.
+fn owner_held_by_modal_dialog(owner: HWND, except: Option<HWND>) -> bool {
+    MODAL_DIALOGS.with_borrow(|dialogs| {
+        dialogs.iter().any(|&(dialog, held)| {
+            held == owner && Some(dialog) != except && unsafe { IsWindow(Some(dialog)) }.as_bool()
+        })
+    })
+}
+
+/// Forget a destroyed modal dialog. Returns `true` when no other modal still
+/// holds `owner`, i.e. when the caller should re-enable it.
+pub(crate) fn end_modal_dialog(dialog: HWND, owner: HWND) -> bool {
+    MODAL_DIALOGS.with_borrow_mut(|dialogs| {
+        dialogs.retain(|&(live, _)| live != dialog && unsafe { IsWindow(Some(live)) }.as_bool())
+    });
+    !owner_held_by_modal_dialog(owner, Some(dialog))
+}
+
+/// The window a new modal `Dialog` is owned by and disables.
+///
+/// Walks the owner chain of the active window up to the first window a modal
+/// may block: another live modal dialog (so nested modals stack and the outer
+/// one is blocked too), or the unowned top-level window at the root — the
+/// application's main window. A floating tool window (plug-in editor, virtual
+/// keyboard, MIDI editor, ...) is never chosen: disabling only it would leave
+/// the main window usable, and Windows would destroy the dialog with it.
+fn modal_owner_window() -> Option<HWND> {
+    let mut hwnd = unsafe { GetActiveWindow() };
+    if hwnd.is_invalid() {
+        return None;
+    }
+    loop {
+        if is_modal_dialog(hwnd) {
+            return Some(hwnd);
+        }
+        match unsafe { GetWindow(hwnd, GW_OWNER) } {
+            Ok(owner) if !owner.is_invalid() => hwnd = owner,
+            _ => return Some(hwnd),
+        }
     }
 }
 

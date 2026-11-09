@@ -331,11 +331,17 @@ impl WindowsWindowInner {
 
     fn handle_destroy_msg(&self, handle: HWND) -> Option<isize> {
         let callback = { self.state.callbacks.close.take() };
-        // Re-enable parent window if this was a modal dialog
-        if let Some(parent_hwnd) = self.parent_hwnd {
+        // Only a modal dialog releases (re-enables and activates) its owner, and
+        // only once no other modal still holds it. A plain owned window — a
+        // floating plug-in editor or tool window — must do neither: re-enabling
+        // would unblock the main window behind an open modal, and activating
+        // would pull Studio to the front on every close.
+        if let Some(owner) = self.modal_owner
+            && end_modal_dialog(handle, owner)
+        {
             unsafe {
-                let _ = EnableWindow(parent_hwnd, true);
-                let _ = SetForegroundWindow(parent_hwnd);
+                let _ = EnableWindow(owner, true);
+                let _ = SetForegroundWindow(owner);
             }
         }
 
