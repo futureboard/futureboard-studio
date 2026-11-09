@@ -55,8 +55,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use builtin_ui_embed::EmbeddedUiAssetTable;
-use tungstenite::protocol::WebSocketConfig;
 use tungstenite::Message;
+use tungstenite::protocol::WebSocketConfig;
 
 mod assets {
     include!(concat!(env!("OUT_DIR"), "/embedded_ui_assets.rs"));
@@ -836,11 +836,7 @@ fn forwarded(limits: Limits<'_>, id: ClientId, client: IpAddr, now: Instant) -> 
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .forwarded(id, client, now);
-    if kept {
-        Arrival::Taken
-    } else {
-        Arrival::Busy
-    }
+    if kept { Arrival::Taken } else { Arrival::Busy }
 }
 
 /// Admit a new connection: its address's rate first, then a slot.
@@ -861,11 +857,7 @@ fn admit(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .open(id, peer, now, admission, stream);
-    if taken {
-        Arrival::Taken
-    } else {
-        Arrival::Busy
-    }
+    if taken { Arrival::Taken } else { Arrival::Busy }
 }
 
 /// Admit a new connection from a trusted proxy: held to no address's
@@ -883,11 +875,7 @@ fn admit_proxied(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .open(id, None, now, admission, stream);
-    if taken {
-        Arrival::Taken
-    } else {
-        Arrival::Busy
-    }
+    if taken { Arrival::Taken } else { Arrival::Busy }
 }
 
 /// Admit a new connection from `socket` on the accept thread: as

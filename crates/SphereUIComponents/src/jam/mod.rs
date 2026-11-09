@@ -925,11 +925,7 @@ impl JamController {
     /// displayed. If another link arrived in the meantime, confirming the card
     /// joins the jam the user actually consented to (#358).
     pub fn accept_link_request_for(&mut self, code: &str, send: bool) -> Result<()> {
-        let Some(pos) = self
-            .link_requests
-            .iter()
-            .rposition(|(_, r)| r.code.eq_ignore_ascii_case(code))
-        else {
+        let Some(pos) = self.link_requests.iter().rposition(|(_, r)| r.code == code) else {
             return Err(JamError::Session(
                 "that jam link is no longer waiting — confirm the new link".to_string(),
             ));
@@ -941,8 +937,7 @@ impl JamController {
 
     /// Drop the waiting link for the given room code.
     pub fn dismiss_link_request_for(&mut self, code: &str) {
-        self.link_requests
-            .retain(|(_, r)| !r.code.eq_ignore_ascii_case(code));
+        self.link_requests.retain(|(_, r)| r.code != code);
         self.publish_ui_state();
     }
 
@@ -2747,5 +2742,37 @@ mod link_request_tests {
             .unwrap_err();
         assert!(matches!(err, JamError::Auth(_)));
         assert!(controller.link_request().is_none());
+    }
+
+    /// #358: codes that differ only in case are kept as different links, so
+    /// confirming one must never pick up the other.
+    #[test]
+    fn confirming_a_link_matches_its_code_exactly() {
+        let mut controller = offline_controller();
+        controller
+            .request_join_from_link("fbrd://jam/j/ABCDEF#secretA")
+            .expect("held");
+        controller
+            .request_join_from_link("fbrd://jam/j/abcdef#secretB")
+            .expect("held");
+        if controller.link_request().map(|r| r.code.as_str()) != Some("abcdef") {
+            // Codes are normalised on arrival: the newer link replaced the
+            // older one, so there is nothing left to confuse.
+            return;
+        }
+
+        controller.dismiss_link_request_for("ABCDEF");
+        assert_eq!(
+            controller.link_request().map(|r| r.code.as_str()),
+            Some("abcdef")
+        );
+        let err = controller
+            .accept_link_request_for("ABCDEF", false)
+            .unwrap_err();
+        assert!(err.to_string().contains("no longer waiting"));
+        assert_eq!(
+            controller.link_request().map(|r| r.code.as_str()),
+            Some("abcdef")
+        );
     }
 }
