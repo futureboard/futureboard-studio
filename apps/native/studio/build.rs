@@ -92,11 +92,15 @@ const ORT_DEFAULT_VERSION: &str = "1.23.2";
 /// can load it at runtime (`{appdir}/onnxruntime.dll` · `libonnxruntime.so` ·
 /// `libonnxruntime.dylib`).
 ///
-/// Only runs with `--features stem-onnx`. Failures are non-fatal: the app still
-/// builds and simply falls back to the spectral stub at runtime. Set
-/// `FUTUREBOARD_ORT_SKIP_DOWNLOAD=1` to skip (e.g. offline / air-gapped builds).
+/// Only runs with `--features stem-onnx`. The archive must match a SHA-256
+/// pinned in this file (or `FUTUREBOARD_ORT_SHA256` when the version is
+/// overridden). A failed or unverified download fails the build. Set
+/// `FUTUREBOARD_ORT_SKIP_DOWNLOAD=1` to skip, which is what the Nix build does
+/// after `fetchurl` has already checked the same archive.
 fn download_onnxruntime() {
+    let started = std::time::SystemTime::now();
     println!("cargo:rerun-if-env-changed=FUTUREBOARD_ORT_VERSION");
+    println!("cargo:rerun-if-env-changed=FUTUREBOARD_ORT_SHA256");
     println!("cargo:rerun-if-env-changed=FUTUREBOARD_ORT_SKIP_DOWNLOAD");
 
     if std::env::var_os("CARGO_FEATURE_STEM_ONNX").is_none() {
@@ -110,10 +114,26 @@ fn download_onnxruntime() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let cuda = std::env::var_os("CARGO_FEATURE_STEM_CUDA").is_some();
-    let directml = std::env::var_os("CARGO_FEATURE_STEM_DIRECTML").is_some();
+    // DirectML builds are published as NuGet packages, not as a GitHub release
+    // asset we can pin. The CPU archive below is what this build will stage.
+    if std::env::var_os("CARGO_FEATURE_STEM_DIRECTML").is_some() {
+        println!(
+            "cargo:warning=stem-directml has no pinned ONNX Runtime archive; staging the pinned CPU build"
+        );
+    }
 
     let version = std::env::var("FUTUREBOARD_ORT_VERSION")
         .unwrap_or_else(|_| ORT_DEFAULT_VERSION.to_string());
+    let override_sha256 = std::env::var("FUTUREBOARD_ORT_SHA256")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if version != ORT_DEFAULT_VERSION && override_sha256.is_none() {
+        panic!(
+            "FUTUREBOARD_ORT_VERSION={version} has no pinned SHA-256. Set \
+             FUTUREBOARD_ORT_SHA256 to the archive digest, or use {ORT_DEFAULT_VERSION}."
+        );
+    }
 
     // Where the binary ends up: OUT_DIR is target/<profile>/build/<pkg>/out.
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo"));
@@ -134,13 +154,7 @@ fn download_onnxruntime() {
     };
     let dest = profile_dir.join(dest_name);
     let version_marker = profile_dir.join(format!("{dest_name}.version"));
-    if dest.is_file()
-        && std::fs::read_to_string(&version_marker)
-            .map(|cached| cached.trim() == version)
-            .unwrap_or(false)
-    {
-        return; // Cached from a previous build of this exact runtime version.
-    }
+    let archive_cache = profile_dir.join(".onnxruntime-archives");
 
     let (platform, ext) = match (target_os.as_str(), target_arch.as_str()) {
         ("windows", "x86_64") => ("win-x64", "zip"),
@@ -158,27 +172,60 @@ fn download_onnxruntime() {
     };
     // Preferred assets in priority order. DirectML/GPU packages only exist for
     // x64 desktop; a CPU package is always the final fallback. GitHub currently
-    // ships DirectML only via NuGet, so the DirectML candidate typically 404s
-    // and we fall back to CPU (the DirectML EP then degrades to CPU at runtime).
+    // ships DirectML only via NuGet, so that candidate is not pinned and is
+    // not downloaded (the DirectML EP degrades to the pinned CPU build).
     let mut assets: Vec<String> = Vec::new();
-    if directml && platform == "win-x64" {
-        assets.push(format!("onnxruntime-{platform}-directml-{version}.{ext}"));
-    }
     if cuda && matches!(platform, "win-x64" | "linux-x64") {
         assets.push(format!("onnxruntime-{platform}-gpu-{version}.{ext}"));
     }
     assets.push(format!("onnxruntime-{platform}-{version}.{ext}"));
 
+    let mut skipped_unpinned = Vec::new();
     for asset in &assets {
-        let url = format!(
-            "https://github.com/microsoft/onnxruntime/releases/download/v{version}/{asset}"
-        );
-        println!("cargo:warning=Downloading ONNX Runtime {version} ({asset})...");
-        let bytes = match http_get(&url) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                println!("cargo:warning=  {asset} unavailable ({err})");
-                continue;
+        let Some(expected) = ort_archive_sha256(asset).map(str::to_owned).or_else(|| {
+            if version == ORT_DEFAULT_VERSION {
+                None
+            } else {
+                override_sha256.clone()
+            }
+        }) else {
+            skipped_unpinned.push(asset.clone());
+            continue;
+        };
+        // A staged library or marker is never trusted: `target/` is restored
+        // from CI caches. The archive is kept, re-hashed against the pin on
+        // every run, and the library is re-extracted from it.
+        let cached_archive = archive_cache.join(asset);
+        let cached = std::fs::read(&cached_archive)
+            .ok()
+            .filter(|bytes| sha256_hex(bytes) == expected);
+        let bytes = match cached {
+            Some(bytes) => bytes,
+            None => {
+                let url = format!(
+                    "https://github.com/microsoft/onnxruntime/releases/download/v{version}/{asset}"
+                );
+                println!("cargo:warning=Downloading ONNX Runtime {version} ({asset})...");
+                let bytes = match http_get(&url) {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        println!("cargo:warning=  {asset} unavailable ({err})");
+                        continue;
+                    }
+                };
+                let actual = sha256_hex(&bytes);
+                if actual != expected {
+                    panic!(
+                        "ONNX Runtime archive {asset} SHA-256 mismatch: expected {expected}, got {actual}"
+                    );
+                }
+                std::fs::create_dir_all(&archive_cache).unwrap_or_else(|err| {
+                    panic!("could not create {}: {err}", archive_cache.display())
+                });
+                std::fs::write(&cached_archive, &bytes).unwrap_or_else(|err| {
+                    panic!("could not write {}: {err}", cached_archive.display())
+                });
+                bytes
             }
         };
         let extracted = if ext == "zip" {
@@ -186,23 +233,91 @@ fn download_onnxruntime() {
         } else {
             extract_lib_from_tgz(&bytes, lib_name)
         };
-        match extracted {
-            Some(lib) => match std::fs::write(&dest, lib) {
-                Ok(()) => {
-                    let _ = std::fs::write(&version_marker, &version);
-                    println!("cargo:warning=ONNX Runtime staged at {}", dest.display());
-                    return;
-                }
-                Err(err) => println!("cargo:warning=Could not write {}: {err}", dest.display()),
-            },
-            None => println!("cargo:warning=  {lib_name} not found inside {asset}"),
+        let Some(lib) = extracted else {
+            panic!("ONNX Runtime archive {asset} does not contain {lib_name}");
+        };
+        std::fs::write(&dest, lib)
+            .unwrap_or_else(|err| panic!("could not write {}: {err}", dest.display()));
+        std::fs::write(&version_marker, format!("{version}\n{expected}"))
+            .unwrap_or_else(|err| panic!("could not write {}: {err}", version_marker.display()));
+        // Rerun when the staged library is replaced or removed (xtask removes
+        // it before a package build). Cargo compares against the time this run
+        // started, so date the file just written before that, or every build
+        // would rerun this script.
+        for path in [&dest, &version_marker] {
+            backdate(path, started);
+            println!("cargo:rerun-if-changed={}", path.display());
         }
+        println!("cargo:warning=ONNX Runtime staged at {}", dest.display());
+        return;
     }
 
-    println!(
-        "cargo:warning=ONNX Runtime not staged; Stem Extractor will use the spectral stub. \
-         Place {dest_name} beside the app or set ORT_DYLIB_PATH to enable real MDX-NET."
+    let skipped = if skipped_unpinned.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Unpinned assets were not downloaded: {}.",
+            skipped_unpinned.join(", ")
+        )
+    };
+    panic!(
+        "ONNX Runtime {version} was not installed for {target_os}/{target_arch}.{skipped} \
+         Stem Extractor refuses to ship without a verified runtime. Set \
+         FUTUREBOARD_ORT_SKIP_DOWNLOAD=1 only when a verified {dest_name} is already \
+         staged (the Nix build does this)."
     );
+}
+
+/// SHA-256 of the ONNX Runtime 1.23.2 release assets this build is willing to
+/// fetch. Same digests as `nix/sources.nix` for the Linux CPU archive.
+fn ort_archive_sha256(asset: &str) -> Option<&'static str> {
+    match asset {
+        "onnxruntime-win-x64-1.23.2.zip" => {
+            Some("0b38df9af21834e41e73d602d90db5cb06dbd1ca618948b8f1d66d607ac9f3cd")
+        }
+        "onnxruntime-win-arm64-1.23.2.zip" => {
+            Some("1cfe88b6435df3b5fb0e9f6bd7d6f5df1e887b6174de7f6e2a47bab956f3f168")
+        }
+        "onnxruntime-win-x64-gpu-1.23.2.zip" => {
+            Some("e77afdbbc2b8cb6da4e5a50d89841b48c44f3e47dce4fb87b15a2743786d0bb9")
+        }
+        "onnxruntime-linux-x64-1.23.2.tgz" => {
+            Some("1fa4dcaef22f6f7d5cd81b28c2800414350c10116f5fdd46a2160082551c5f9b")
+        }
+        "onnxruntime-linux-x64-gpu-1.23.2.tgz" => {
+            Some("2083e361072a79ce16a90dcd5f5cb3ab92574a82a3ce0ac01e5cfa3158176f53")
+        }
+        "onnxruntime-linux-aarch64-1.23.2.tgz" => {
+            Some("7c63c73560ed76b1fac6cff8204ffe34fe180e70d6582b5332ec094810241e5c")
+        }
+        "onnxruntime-osx-universal2-1.23.2.tgz" => {
+            Some("49ae8e3a66ccb18d98ad3fe7f5906b6d7887df8a5edd40f49eb2b14e20885809")
+        }
+        _ => None,
+    }
+}
+
+/// Set `path`'s mtime a minute before `started`, so a file this run wrote does
+/// not look changed to Cargo's `rerun-if-changed` check on the next build.
+fn backdate(path: &Path, started: std::time::SystemTime) {
+    let earlier = started
+        .checked_sub(std::time::Duration::from_secs(60))
+        .unwrap_or(started);
+    let result = std::fs::File::options()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.set_modified(earlier));
+    if let Err(err) = result {
+        panic!("could not set the mtime of {}: {err}", path.display());
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// GET `url` into memory, following redirects (GitHub → object storage).

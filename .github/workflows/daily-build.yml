@@ -145,13 +145,14 @@ jobs:
         shell: bash
         run: bash .github/workflows/set-cef-path.sh
 
+      # Always run so a restored CEF cache is re-checked against the pin.
       - name: Install pinned CEF SDK and runtime
-        if: matrix.os != 'macos-latest' && hashFiles('build/cef/150.0.11/**/archive.json') == ''
+        if: matrix.os != 'macos-latest'
         run: cargo run -p SphereWebView --example install_cef --features installer
 
       # CEF publishes macosx64 and macosarm64 as separate distributions — there
       # is no universal one — so a universal app needs both staged here. The
-      # installer keeps an already-valid distribution, so the cache still wins.
+      # cached tree is kept only when its runtime still matches the pin.
       - name: Install pinned CEF SDKs (macOS x86_64 + arm64)
         if: matrix.os == 'macos-latest'
         run: cargo run -p SphereWebView --example install_cef --features installer -- --target universal-macos
