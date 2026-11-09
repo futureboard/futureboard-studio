@@ -118,11 +118,15 @@ struct Options {
     /// Where the setup code is read from (`--setup-code-file`); `None`: a
     /// new one each start.
     setup_code_file: Option<PathBuf>,
+    /// Reverse proxies whose forwarding header says who a web client is
+    /// (`--trusted-proxy`), and which header (`--forwarded-header`).
+    trusted_proxies: web::Proxies,
 }
 
 const USAGE: &str = "usage: livestage-server [--session FILE] [--host NAME] [--input DEVICE] \
 [--output DEVICE] [--rate HZ] [--buffer FRAMES] [--record-dir DIR] [--http ADDR:PORT | --no-http] \
 [--library FILE] [--users FILE] [--remote FILE] [--web-host NAME]... [--setup-code-file FILE] \
+[--trusted-proxy ADDR]... [--forwarded-header NAME] \
 [--autosave-seconds N] [--daemon] [--no-autosave] [--list-devices]
 
   --session FILE        the show: loaded at start, saved atomically (FILE.bak keeps the one before)
@@ -142,9 +146,18 @@ const USAGE: &str = "usage: livestage-server [--session FILE] [--host NAME] [--i
   --web-host NAME       another name browsers reach the web UI by (a DNS name, a reverse proxy's);
                         IP addresses, localhost, this machine's name and NAME.local always work.
                         Any other name in a request is refused, which stops DNS rebinding
-  --setup-code-file FILE  the setup code (6-32 digits) a browser on another machine enters before
-                        it is let in while there are no users; without it, a new code is made at
-                        each start and printed here. Only used when --http is not loopback
+  --setup-code-file FILE  the setup code (6-32 digits) a browser on another machine (or behind a
+                        reverse proxy) enters before it is let in while there are no users;
+                        without it, a new code is made at each start and printed here
+  --trusted-proxy ADDR  a reverse proxy's IP address (127.0.0.1 for one on this machine) whose
+                        --forwarded-header names the client: failed log-ins and connection limits
+                        then count per client. Clients it forwards always need the setup code.
+                        Without it, every client behind a proxy shares one address, and
+                        forwarding headers are ignored
+  --forwarded-header NAME  the one header a trusted proxy names the client in, and that it sets
+                        itself (whatever the client sent there): x-forwarded-for (default; the
+                        proxy must append the client's address, its last one is taken),
+                        forwarded (the last element's for=) or x-real-ip. Any other is ignored
   --daemon              no stdin; stop with SIGINT or SIGTERM";
 
 fn parse_args() -> Result<Options, String> {
@@ -166,6 +179,7 @@ fn parse_args() -> Result<Options, String> {
         remote: None,
         web_hosts: Vec::new(),
         setup_code_file: None,
+        trusted_proxies: web::Proxies::default(),
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -218,6 +232,16 @@ fn parse_args() -> Result<Options, String> {
             }
             "--setup-code-file" => {
                 options.setup_code_file = Some(PathBuf::from(value("--setup-code-file")?))
+            }
+            "--trusted-proxy" => options.trusted_proxies.addrs.push(
+                value("--trusted-proxy")?
+                    .parse()
+                    .map_err(|_| "--trusted-proxy needs an IP address like 127.0.0.1")?,
+            ),
+            "--forwarded-header" => {
+                options.trusted_proxies.header =
+                    web::ForwardedHeader::parse(&value("--forwarded-header")?)
+                        .ok_or("--forwarded-header is x-forwarded-for, forwarded or x-real-ip")?
             }
             "-h" | "--help" => return Err(USAGE.to_string()),
             other => return Err(format!("unknown argument {other}\n{USAGE}")),
@@ -345,30 +369,41 @@ fn main() {
         spawn_stdin_reader(inbound_tx.clone());
     }
     if let Some(addr) = options.http {
-        match web::serve(addr, inbound_tx.clone(), options.web_hosts.clone()) {
+        match web::serve(
+            addr,
+            inbound_tx.clone(),
+            options.web_hosts.clone(),
+            options.trusted_proxies.clone(),
+        ) {
             Ok(bound) => {
                 eprintln!("[livestage] web UI on http://{bound}/");
-                if !bound.ip().is_loopback() {
-                    // Open to the network: with no users yet, whoever is
-                    // first there must not get the mixer (or make the first
-                    // admin) without the code shown on this machine.
-                    let code = match setup_code(options.setup_code_file.as_deref()) {
-                        Ok(code) => code,
-                        Err(error) => {
-                            eprintln!("[livestage] {error}");
-                            std::process::exit(1);
-                        }
-                    };
-                    if users.open_mode() {
-                        eprintln!(
-                            "[livestage] the web UI is open to the network and there are no \
-                             users: a browser on another machine needs the setup code {} \
-                             before it gets in; create an admin user there next",
-                            spaced_code(&code)
-                        );
+                // Open to the network, or (on loopback) reached through a
+                // reverse proxy here: with no users yet, whoever is first
+                // there must not get the mixer (or make the first admin)
+                // without the code shown on this machine. A browser on this
+                // machine needs none (see `web::Peer`).
+                let code = match setup_code(options.setup_code_file.as_deref()) {
+                    Ok(code) => code,
+                    Err(error) => {
+                        eprintln!("[livestage] {error}");
+                        std::process::exit(1);
                     }
-                    users.require_setup_code(code);
+                };
+                if users.open_mode() {
+                    let reached = if bound.ip().is_loopback() {
+                        "the web UI listens on this machine only and there are no users: a \
+                         browser reaching it through a reverse proxy"
+                    } else {
+                        "the web UI is open to the network and there are no users: a browser \
+                         on another machine"
+                    };
+                    eprintln!(
+                        "[livestage] {reached} needs the setup code {} before it gets in; \
+                         create an admin user there next",
+                        spaced_code(&code)
+                    );
                 }
+                users.require_setup_code(code);
                 if !web::has_assets() {
                     eprintln!("[livestage] (this build has no web UI page; /ws still works)");
                 }
@@ -535,7 +570,7 @@ fn main() {
                 // Its `auth`, then — when it needs no log-in — the rest.
                 server.clients.push((id, outbox));
                 server.admissions.insert(id, admission);
-                server.users.join(id, peer);
+                server.users.join_as(id, peer);
                 server.refresh_auth(&engine);
             }
             Ok(Inbound::Left(id)) => {
@@ -1914,6 +1949,7 @@ mod tests {
             remote: None,
             web_hosts: Vec::new(),
             setup_code_file: None,
+            trusted_proxies: web::Proxies::default(),
         }
     }
 

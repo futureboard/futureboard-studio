@@ -10,7 +10,8 @@
 //! (see [`Users::require_setup_code`]): in open mode a client on another
 //! machine is let in only after it sends that code, so whoever is first on
 //! the network cannot take the mixer, or make the first admin, without it.
-//! Clients on this machine (loopback) need no code.
+//! Browsers on this machine need no code (see `web::Peer`: one reached
+//! through a reverse proxy is not taken for this machine).
 //!
 //! PINs are kept as PBKDF2-HMAC-SHA256 hashes with a random salt, checked
 //! in constant time, and never sent back. Failed log-ins and unlocks are
@@ -115,6 +116,8 @@ struct Token {
 
 struct Client {
     peer: Option<IpAddr>,
+    /// A browser on this machine (see [`crate::web::Peer::local`]).
+    local: bool,
     token: Option<String>,
     /// The `auth` message this client was last sent.
     sent: Option<Value>,
@@ -242,7 +245,7 @@ impl Users {
             return false;
         }
         match self.clients.get(&client) {
-            Some(c) => !c.setup && !c.peer.is_some_and(|p| p.to_canonical().is_loopback()),
+            Some(c) => !c.setup && !c.local,
             None => true,
         }
     }
@@ -265,11 +268,26 @@ impl Users {
             .find(|u| u.name.eq_ignore_ascii_case(name))
     }
 
+    /// A client from `peer` that is no browser on this machine (tests).
+    #[cfg(test)]
     pub fn join(&mut self, client: ClientId, peer: Option<IpAddr>) {
+        self.join_as(
+            client,
+            crate::web::Peer {
+                addr: peer,
+                local: false,
+            },
+        );
+    }
+
+    /// A client that connected as `peer`: failed log-ins count against its
+    /// address, and one on this machine needs no setup code.
+    pub fn join_as(&mut self, client: ClientId, peer: crate::web::Peer) {
         self.clients.insert(
             client,
             Client {
-                peer,
+                peer: peer.addr,
+                local: peer.local,
                 token: None,
                 sent: None,
                 admitted: false,
@@ -1252,10 +1270,17 @@ mod tests {
         let now = Instant::now();
         let mut u = users();
         u.require_setup_code("12345678".to_string());
+        let here = |addr: &str| crate::web::Peer {
+            addr: Some(addr.parse().unwrap()),
+            local: true,
+        };
         u.join(1, Some("10.0.0.7".parse().unwrap()));
-        u.join(2, Some("127.0.0.1".parse().unwrap()));
-        u.join(3, Some("::ffff:127.0.0.1".parse().unwrap()));
+        u.join_as(2, here("127.0.0.1"));
+        u.join_as(3, here("::ffff:127.0.0.1"));
         u.join(4, None);
+        // #293: a browser behind a reverse proxy on this machine connects
+        // from loopback, but is not on this machine.
+        u.join(6, Some("127.0.0.1".parse().unwrap()));
         // Another machine: nothing but the setup screen.
         assert!(u.open_mode());
         assert!(u.principal(1).is_none());
@@ -1269,6 +1294,8 @@ mod tests {
             .unwrap()));
         // No peer address at all is not taken for this machine.
         assert!(!u.admitted(4));
+        assert!(!u.admitted(6));
+        assert_eq!(u.auth_message(6)["mode"], "setup");
         // This machine needs no code.
         assert!(u.admitted(2) && u.admitted(3));
         assert_eq!(u.auth_message(2)["mode"], "open");
