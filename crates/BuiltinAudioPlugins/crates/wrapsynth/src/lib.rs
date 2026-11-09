@@ -446,6 +446,8 @@ struct PendingNote {
     start_pitch: f32,
     /// The key went up before the note could start.
     released: bool,
+    /// Released while the sustain pedal was down: it ends when the pedal does.
+    sustained: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -969,6 +971,7 @@ impl Dsp {
                 voice.gate_off();
                 if let Some(pending) = voice.pending.as_mut() {
                     pending.released = true;
+                    pending.sustained = false;
                 }
             }
         }
@@ -1052,6 +1055,14 @@ impl Dsp {
             }
             voice.gate_off();
         }
+        for voice in &mut self.voices {
+            if let Some(pending) = voice.pending.as_mut() {
+                if pending.sustained {
+                    pending.sustained = false;
+                    pending.released = true;
+                }
+            }
+        }
     }
 
     fn next_seed(&mut self) -> u32 {
@@ -1114,6 +1125,7 @@ impl Dsp {
                     velocity,
                     start_pitch,
                     released: false,
+                    sustained: false,
                 },
                 age,
                 seed,
@@ -1152,6 +1164,7 @@ impl Dsp {
             velocity,
             start_pitch,
             released: false,
+            sustained: false,
         });
     }
 
@@ -1192,6 +1205,7 @@ impl Dsp {
                 velocity,
                 start_pitch,
                 released: false,
+                sustained: false,
             },
             age,
             seed,
@@ -1208,7 +1222,11 @@ impl Dsp {
         for voice in self.voices.iter_mut().filter(|voice| voice.active) {
             if let Some(pending) = voice.pending.as_mut() {
                 if pending.note == note {
-                    pending.released = true;
+                    if pedal {
+                        pending.sustained = true;
+                    } else {
+                        pending.released = true;
+                    }
                 }
             }
             if voice.note == note && voice.gate && !voice.fading {
@@ -1389,7 +1407,9 @@ fn start_voice(voice: &mut Voice, start: &StartContext, note: PendingNote, age: 
         voice.osc_b[i] = b;
     }
     voice.gate_on();
-    if note.released {
+    if note.sustained {
+        voice.sustained = true;
+    } else if note.released {
         voice.gate_off();
     }
 }

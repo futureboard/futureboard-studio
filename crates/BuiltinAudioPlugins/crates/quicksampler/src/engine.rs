@@ -425,22 +425,30 @@ impl QuickSampler {
             64 => {
                 let down = value >= 64;
                 if self.pedal[channel] && !down {
-                    let release_samples = self.derived.release_samples;
-                    for voice in self.voices.iter_mut() {
-                        if voice.active() && voice.sustained && voice.channel as usize == channel {
-                            voice.sustained = false;
-                            release(voice, release_samples);
-                        }
-                    }
+                    self.release_sustained(channel);
                 }
                 self.pedal[channel] = down;
             }
             120 => self.all_notes_off(true),
             121 => {
                 self.bend[channel] = 0.0;
+                if self.pedal[channel] {
+                    self.release_sustained(channel);
+                }
+                self.pedal[channel] = false;
             }
             123 => self.all_notes_off(false),
             _ => {}
+        }
+    }
+
+    fn release_sustained(&mut self, channel: usize) {
+        let release_samples = self.derived.release_samples;
+        for voice in self.voices.iter_mut() {
+            if voice.active() && voice.sustained && voice.channel as usize == channel {
+                voice.sustained = false;
+                release(voice, release_samples);
+            }
         }
     }
 
