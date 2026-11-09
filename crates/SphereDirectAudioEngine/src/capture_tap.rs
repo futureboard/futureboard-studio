@@ -254,6 +254,30 @@ impl CaptureTapCallback {
         let Some(sink) = self.active.as_mut() else {
             return;
         };
+        sink.capture(data, channels, shared, || shared.render_position_now());
+    }
+}
+
+impl RecordSink {
+    /// Fan one interleaved block out to this take: preview bins, the record
+    /// peak, and the disk writer.
+    ///
+    /// `position` is the transport sample the block starts at. It is asked for
+    /// only on the take's first captured block, which stamps where the audio
+    /// really begins. A capture stream passes the render position it is
+    /// running against; the render callback's loopback tap passes the block it
+    /// just rendered, which is exact.
+    ///
+    /// Realtime-safe: bounded `try_send`/`try_recv` and arithmetic, nothing
+    /// else.
+    pub(crate) fn capture(
+        &mut self,
+        data: &[f32],
+        channels: usize,
+        shared: &SharedState,
+        position: impl FnOnce() -> u64,
+    ) {
+        let sink = self;
         let channels = channels.max(1);
         let capturing = sink.active.load(Ordering::Relaxed)
             && (!sink.capture_on_transport || shared.playing.load(Ordering::Relaxed));
@@ -269,12 +293,14 @@ impl CaptureTapCallback {
         }
 
         // The first block that is really captured stamps the take's true start.
-        let _ = sink.first_capture_sample.compare_exchange(
-            u64::MAX,
-            shared.render_position_now(),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
+        if sink.first_capture_sample.load(Ordering::Relaxed) == u64::MAX {
+            let _ = sink.first_capture_sample.compare_exchange(
+                u64::MAX,
+                position(),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
 
         let samples_per_bin = sink.samples_per_bin.max(1);
         let mut record_peak = 0.0f32;

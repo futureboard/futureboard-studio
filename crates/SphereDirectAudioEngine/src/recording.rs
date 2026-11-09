@@ -93,6 +93,12 @@ pub(crate) enum CaptureSource {
     /// finalization.
     #[cfg(all(target_os = "windows", feature = "asio"))]
     AsioSessionTap,
+    /// The render callback feeds the take from the tracks it has just rendered
+    /// — every armed track's input is another track
+    /// ([`crate::loopback::LoopbackRecorder`]). No capture device is involved
+    /// at all. The engine removes the recorder from the graph; the writer exits
+    /// on `stop_flag`.
+    LoopbackTap,
 }
 
 pub struct RecordingSession {
@@ -135,6 +141,12 @@ impl RecordingSession {
     /// Whether this take taps the persistent cpal live input stream.
     pub fn is_live_stream_tap(&self) -> bool {
         matches!(self.capture, CaptureSource::LiveStreamTap)
+    }
+
+    /// Whether this take records loopback-routed tracks from the render
+    /// callback rather than a capture device.
+    pub fn is_loopback_tap(&self) -> bool {
+        matches!(self.capture, CaptureSource::LoopbackTap)
     }
 
     /// Whether the take owns the capture device for its duration.
@@ -1342,6 +1354,143 @@ pub(crate) fn start_recording_live_tap(
     ))
 }
 
+/// Map a loopback take's tracks onto the recorder's lanes: track `k` becomes
+/// lane `k`, interleaved channels `2k` (L) and `2k + 1` (R). A track bound to
+/// one channel of its source (a mono bus) records that one channel, which the
+/// recorder has already folded onto both sides of the lane.
+pub(crate) fn assign_loopback_lanes(
+    tracks: &mut [crate::types::JsRecordingTrackConfig],
+) -> Result<(), SphereAudioError> {
+    for (lane, track) in tracks.iter_mut().enumerate() {
+        let left = (lane * 2) as u32;
+        track.input_channels = match track.input_channels.len() {
+            0 => {
+                return Err(SphereAudioError::NativeError(format!(
+                    "{} has no input channels selected",
+                    track.name
+                )))
+            }
+            1 => vec![left],
+            _ => vec![left, left + 1],
+        };
+    }
+    Ok(())
+}
+
+/// Begin a take of tracks whose input is another track.
+///
+/// Builds the same writers and disk pipeline every take uses, and returns the
+/// [`crate::loopback::LoopbackRecorder`] the engine installs into the graph so
+/// the render callback feeds it. Nothing here opens, or needs, a capture
+/// device: `sample_rate` is the output stream's.
+///
+/// The input ring and monitor flags are untouched — they describe a hardware
+/// capture stream this take has nothing to do with.
+pub(crate) fn start_recording_loopback_tap(
+    mut config: JsStartRecordingConfig,
+    shared: Arc<crate::engine::SharedState>,
+    sample_rate: u32,
+) -> Result<(RecordingSession, crate::loopback::LoopbackRecorder), SphereAudioError> {
+    let lanes = config.tracks.len();
+    assign_loopback_lanes(&mut config.tracks)?;
+    let input_ch = crate::loopback::LoopbackRecorder::channels_for(lanes);
+    let track_writers = build_track_writers(&config, &shared, input_ch, sample_rate)?;
+    let track_count = track_writers.len();
+
+    // The recorder hands over at most its scratch length per call, so blocks
+    // need not be sized for a capture driver's worst case.
+    let pipeline = spawn_recording_pipeline(
+        track_writers,
+        sample_rate,
+        input_ch,
+        config.start_beat,
+        input_ch.saturating_mul(4096).max(1),
+        256,
+    );
+
+    let recording_active = Arc::new(AtomicBool::new(true));
+    let dropped_blocks = Arc::new(AtomicU64::new(0));
+    shared.recording_active.store(true, Ordering::Relaxed);
+    shared
+        .record_peak
+        .store(crate::engine::f32_store(0.0), Ordering::Relaxed);
+    // Monitoring a loopback track is the track's own business (its input is
+    // mixed by the graph); there is no capture ring to mix.
+    shared.recording_monitor_mix.store(false, Ordering::Relaxed);
+
+    const PREVIEW_PEAKS_PER_SEC: u32 = 150;
+    let samples_per_bin = (sample_rate / PREVIEW_PEAKS_PER_SEC).max(1) as usize;
+    let start_sample = shared.playback_position();
+
+    shared.preview_ring.reset();
+    let preview_tracks = preview_tracks_for(&config.tracks, input_ch);
+    {
+        let mut ids = shared.recording_preview_track_ids.lock();
+        ids.clear();
+        for (slot, (track_id, _, _)) in preview_tracks.iter().enumerate() {
+            shared.preview_rings[slot].reset();
+            ids.push(track_id.clone());
+        }
+    }
+    shared.recording_preview_id.fetch_add(1, Ordering::Relaxed);
+    shared
+        .recording_preview_start_sample
+        .store(start_sample, Ordering::Relaxed);
+    shared
+        .recording_preview_sample_rate
+        .store(sample_rate, Ordering::Relaxed);
+    shared
+        .recording_preview_channels
+        .store(2, Ordering::Relaxed);
+    shared
+        .recording_preview_peaks_per_sec
+        .store(PREVIEW_PEAKS_PER_SEC, Ordering::Relaxed);
+    shared
+        .recording_preview_active
+        .store(true, Ordering::Relaxed);
+
+    let first_capture_sample = Arc::new(AtomicU64::new(u64::MAX));
+    let sink = crate::capture_tap::RecordSink {
+        audio_tx: pipeline.audio_tx,
+        free_rx: pipeline.free_rx,
+        free_tx: pipeline.free_tx,
+        samples_per_bin,
+        capture_on_transport: config.capture_on_transport.unwrap_or(false),
+        dropped_blocks: Arc::clone(&dropped_blocks),
+        active: Arc::clone(&recording_active),
+        first_capture_sample: Arc::clone(&first_capture_sample),
+        // The global preview follows the first lane.
+        monitor: crate::capture_tap::PreviewAccum::new(0, 1),
+        tracks: preview_tracks
+            .iter()
+            .map(|&(_, l, r)| crate::capture_tap::PreviewAccum::new(l, r))
+            .collect(),
+        gap_frames: 0,
+    };
+
+    eprintln!(
+        "[SphereAudio] Recording started (track loopback): {track_count} track(s) @ {sample_rate} Hz"
+    );
+
+    Ok((
+        RecordingSession {
+            capture: CaptureSource::LoopbackTap,
+            results_rx: pipeline.finalize_rx,
+            stop_flag: pipeline.stop_flag,
+            start_beat: config.start_beat,
+            sample_rate,
+            track_count,
+            recording_active,
+            dropped_blocks,
+            started_at: std::time::Instant::now(),
+            shared,
+            armed_start_sample: start_sample,
+            first_capture_sample,
+        },
+        crate::loopback::LoopbackRecorder::new(sink, lanes),
+    ))
+}
+
 /// Begin a take that taps the persistent ASIO session input instead of opening
 /// a stream. Builds the writers + disk pipeline and returns the session along
 /// with the [`RecordSink`] the engine must install into the session's input
@@ -1722,6 +1871,7 @@ mod preview_track_tests {
             track_id: id.to_string(),
             input_channels: channels.to_vec(),
             name: id.to_string(),
+            loopback_source_track_id: None,
         }
     }
 

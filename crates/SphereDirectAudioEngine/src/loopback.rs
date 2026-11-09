@@ -56,6 +56,165 @@ pub fn is_loopback_device(device_id: &str) -> bool {
     loopback_track_id(device_id).is_some()
 }
 
+/// A lane with no destination in the current graph: it records silence.
+const NO_TRACK: u32 = u32::MAX;
+
+/// Frames the interleaving scratch holds. A longer callback is recorded in
+/// chunks of this size, so the scratch never grows on the audio thread.
+const SCRATCH_FRAMES: usize = 2048;
+
+/// A take recording armed tracks whose input is another track.
+///
+/// ```txt
+/// render callback ──▶ source post-fader block ──▶ lane k ──▶ RecordSink ──▶ disk writer
+/// ```
+///
+/// There is no capture stream to tap: the signal is produced by the render
+/// callback itself, so that is where it is recorded. That is also why a
+/// loopback take needs no audio interface at all — only an output stream that
+/// runs the graph.
+///
+/// Lane `k` records interleaved channels `2k` and `2k + 1` of the take, which
+/// is what the take's track configs point at. Each lane names its
+/// **destination** track; the source and channel mode come from that track's
+/// resolved [`crate::runtime::RuntimeTrackInputSource::Loopback`] route, so
+/// the recording is always exactly what the destination monitors.
+///
+/// Unlike monitoring, which reads the previous callback's block, the recorder
+/// runs after the graph and takes the block the source rendered in *this*
+/// callback, so the take carries no loopback delay.
+///
+/// # Realtime contract
+///
+/// The callback only reads atomics, copies into a scratch preallocated on the
+/// control thread, and hands blocks to the take's bounded pipeline. The state
+/// sits behind a mutex the control thread never takes while the recorder is
+/// installed; the callback only ever `try_lock`s it, so it cannot wait.
+pub struct LoopbackRecorder {
+    /// Destination track index per lane, rewritten on the control thread for
+    /// every graph it builds while the take runs.
+    destinations: Box<[std::sync::atomic::AtomicU32]>,
+    state: parking_lot::Mutex<LoopbackRecordState>,
+}
+
+struct LoopbackRecordState {
+    sink: crate::capture_tap::RecordSink,
+    /// Interleaved, `lanes × 2` channels wide, [`SCRATCH_FRAMES`] long.
+    scratch: Vec<f32>,
+}
+
+impl std::fmt::Debug for LoopbackRecorder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoopbackRecorder")
+            .field("lanes", &self.destinations.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl LoopbackRecorder {
+    /// A recorder of `lanes` stereo lanes feeding `sink`. Allocates; control
+    /// thread only.
+    pub(crate) fn new(sink: crate::capture_tap::RecordSink, lanes: usize) -> Self {
+        Self {
+            destinations: (0..lanes)
+                .map(|_| std::sync::atomic::AtomicU32::new(NO_TRACK))
+                .collect(),
+            state: parking_lot::Mutex::new(LoopbackRecordState {
+                sink,
+                scratch: vec![0.0; lanes.max(1) * 2 * SCRATCH_FRAMES],
+            }),
+        }
+    }
+
+    /// Interleaved channels a take recorded by `lanes` lanes carries.
+    pub fn channels_for(lanes: usize) -> usize {
+        lanes * 2
+    }
+
+    pub fn lanes(&self) -> usize {
+        self.destinations.len()
+    }
+
+    /// Point lane `k` at `track_indices[k]`. A lane whose track is not in the
+    /// graph records silence. Control thread.
+    pub fn map_destinations(&self, track_indices: &[Option<usize>]) {
+        use std::sync::atomic::Ordering;
+        for (lane, slot) in self.destinations.iter().enumerate() {
+            let index = track_indices
+                .get(lane)
+                .copied()
+                .flatten()
+                .and_then(|index| u32::try_from(index).ok())
+                .unwrap_or(NO_TRACK);
+            slot.store(index, Ordering::Release);
+        }
+    }
+
+    /// Record one rendered block. Audio thread, after the graph has run.
+    ///
+    /// `base_sample` is the transport sample the block starts at.
+    pub fn capture_block(
+        &self,
+        tracks: &[crate::runtime::RuntimeTrack],
+        frames: usize,
+        base_sample: u64,
+        shared: &crate::engine::SharedState,
+    ) {
+        use std::sync::atomic::Ordering;
+        // Never contended: the control thread does not take this lock while
+        // the recorder is installed, and one graph renders one block at a time.
+        let Some(mut guard) = self.state.try_lock() else {
+            return;
+        };
+        let LoopbackRecordState { sink, scratch } = &mut *guard;
+        let channels = Self::channels_for(self.destinations.len());
+        if channels == 0 {
+            return;
+        }
+        let chunk = scratch.len() / channels;
+        let mut done = 0usize;
+        while done < frames && chunk > 0 {
+            let n = (frames - done).min(chunk);
+            for (lane, destination) in self.destinations.iter().enumerate() {
+                let source = tracks
+                    .get(destination.load(Ordering::Acquire) as usize)
+                    .and_then(|track| match track.input_source {
+                        crate::runtime::RuntimeTrackInputSource::Loopback {
+                            source_index,
+                            mode,
+                        } => Some((source_index as usize, mode)),
+                        _ => None,
+                    })
+                    .and_then(|(index, mode)| {
+                        tracks
+                            .get(index)
+                            .filter(|source| {
+                                source.loopback_publish
+                                    && source.loopback_out_l.len() >= done + n
+                                    && source.loopback_out_r.len() >= done + n
+                            })
+                            .map(|source| (source, mode))
+                    });
+                for frame in 0..n {
+                    let (l, r) = match source {
+                        Some((source, mode)) => mode.apply(
+                            source.loopback_out_l[done + frame],
+                            source.loopback_out_r[done + frame],
+                        ),
+                        None => (0.0, 0.0),
+                    };
+                    let at = frame * channels + lane * 2;
+                    scratch[at] = l;
+                    scratch[at + 1] = r;
+                }
+            }
+            let start = base_sample + done as u64;
+            sink.capture(&scratch[..n * channels], channels, shared, || start);
+            done += n;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

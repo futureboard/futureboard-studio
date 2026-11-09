@@ -590,7 +590,15 @@ impl StudioLayout {
                 (devices, routes)
             };
             match resolve(cached_recording_input_devices()) {
-                (devices, Ok(routes)) if !devices.is_empty() || routes.tracks.is_empty() => {
+                // A take of track loopbacks needs no input device, so an empty
+                // inventory is no reason to enumerate the hardware again.
+                (devices, Ok(routes))
+                    if !devices.is_empty()
+                        || routes
+                            .tracks
+                            .iter()
+                            .all(|track| track.loopback_source_track_id.is_some()) =>
+                {
                     (devices, Ok(routes))
                 }
                 _ => resolve(live_recording_input_devices(engine)),
@@ -1815,6 +1823,9 @@ struct RecordingInputDevice {
 struct RecordingInputRoute {
     device_id: Option<String>,
     channels: Vec<u32>,
+    /// The track whose output this track records, for a track loopback
+    /// input (`trk:<id>`). No hardware device is involved then.
+    loopback_source: Option<String>,
 }
 
 /// What a take records from: one engine track config per armed audio track,
@@ -1835,11 +1846,45 @@ fn resolve_recording_routes(
     let mut explicit_device_id: Option<String> = None;
     let mut monitor_channels = Vec::new();
     let mut configs = Vec::new();
+    // Whether this take records track loopbacks (`Some(true)`) or hardware
+    // inputs (`Some(false)`), once the first armed track has decided it.
+    let mut loopback_take: Option<bool> = None;
     for track in tracks
         .iter()
         .filter(|t| t.armed && t.track_type == TrackType::Audio)
     {
         let route = recording_input_channels_checked(track, connections, devices, selected_device)?;
+        if route.loopback_source.is_some() {
+            // The engine refuses a feedback route and would record silence;
+            // say why before the take starts instead.
+            if let Some(refusal) = track
+                .routing
+                .audio_input_connection_id
+                .as_ref()
+                .and_then(|id| connections.get(id))
+                .and_then(|connection| {
+                    crate::input_routing::loopback_refusal(
+                        tracks,
+                        connections,
+                        &track.id,
+                        connection,
+                    )
+                })
+            {
+                return Err(refusal.detail);
+            }
+        }
+        // A take is recorded either from one capture device or from the
+        // engine's graph (track loopback); the two run on different clocks.
+        match (route.loopback_source.is_some(), loopback_take) {
+            (is_loopback, Some(take_is_loopback)) if is_loopback != take_is_loopback => {
+                return Err(
+                    "armed tracks mix hardware inputs and track inputs; record them in separate takes"
+                        .to_string(),
+                );
+            }
+            (is_loopback, _) => loopback_take = Some(is_loopback),
+        }
         if let Some(device_id) = route.device_id.clone() {
             match explicit_device_id.as_ref() {
                 Some(existing) if existing != &device_id => {
@@ -1852,13 +1897,19 @@ fn resolve_recording_routes(
                 _ => {}
             }
         }
-        if monitor_channels.is_empty() && track.input_monitor.is_active(track.armed) {
+        // Monitor channels select the hardware capture pair; a loopback track
+        // is monitored by the graph itself.
+        if monitor_channels.is_empty()
+            && route.loopback_source.is_none()
+            && track.input_monitor.is_active(track.armed)
+        {
             monitor_channels = route.channels.clone();
         }
         configs.push(JsRecordingTrackConfig {
             track_id: track.id.clone(),
             input_channels: route.channels,
             name: track.name.clone(),
+            loopback_source_track_id: route.loopback_source,
         });
     }
     Ok(RecordingRoutes {
@@ -1971,12 +2022,24 @@ fn recording_input_channels_checked(
         _ => {}
     }
 
+    // A track loopback is another track's output, recorded from the engine's
+    // own graph: there is no input device to find, and needing one is what
+    // made a WDW-return bus unrecordable with no interface selected (#394).
+    if let Some(source) = DirectAudio::loopback::loopback_track_id(device_id) {
+        return Ok(RecordingInputRoute {
+            device_id: None,
+            channels,
+            loopback_source: Some(source.to_string()),
+        });
+    }
+
     let device = find_recording_input_device(devices, device_id)
         .ok_or_else(|| format!("{} input device is unavailable: {}", track.name, device_id))?;
     validate_channels(&track.name, device, &channels)?;
     Ok(RecordingInputRoute {
         device_id: Some(device.id.clone()),
         channels,
+        loopback_source: None,
     })
 }
 
@@ -2141,6 +2204,114 @@ mod tests {
                 device_id: "Keystation".to_string()
             }
         );
+    }
+
+    /// Bind a stereo input bus to `source`'s output (a track loopback) and
+    /// point `track_id` at it, the way Audio Connections and the Inspector do.
+    fn assign_loopback(timeline: &mut TimelineState, track_id: &str, source: &str) {
+        use crate::audio_connections::{
+            AudioConnection, AudioConnectionDirection, AudioConnectionStatus, AvailablePort,
+            ChannelLayout,
+        };
+        let device_id = DirectAudio::loopback::loopback_device_id(source);
+        let loopback_ports = AvailablePorts {
+            ports: (0..2u32)
+                .map(|index| AvailablePort {
+                    device_id: device_id.clone(),
+                    device_name: source.to_string(),
+                    port_name: if index == 0 { "L" } else { "R" }.to_string(),
+                    port_index: index,
+                    direction: AudioConnectionDirection::Input,
+                })
+                .collect(),
+            ..AvailablePorts::default()
+        };
+        let id = timeline.audio_connections.add(
+            AudioConnection::new(
+                "Loopback",
+                AudioConnectionDirection::Input,
+                ChannelLayout::Stereo,
+            )
+            .bind_consecutive(device_id, 0, |index| {
+                if index == 0 { "L" } else { "R" }.to_string()
+            }),
+        );
+        timeline
+            .audio_connections
+            .revalidate(&ports(2).merge(loopback_ports));
+        assert_eq!(
+            timeline.audio_connections.get(&id).unwrap().status,
+            AudioConnectionStatus::Active
+        );
+        timeline.set_track_audio_input_connection(track_id, Some(id));
+    }
+
+    /// Issue #394: a track whose input is another track's output records with
+    /// no input device at all — the inventory is empty, as it is with Input
+    /// Device "None" — and the take says which track it records.
+    #[test]
+    fn a_loopback_input_records_without_any_input_device() {
+        let mut timeline = TimelineState::default();
+        let source = timeline.create_audio_track();
+        let bounce = timeline.create_audio_track();
+        assign_loopback(&mut timeline, &bounce, &source);
+        timeline.set_track_armed(&bounce, true);
+
+        let routes =
+            resolve_recording_routes(&timeline.tracks, &timeline.audio_connections, &[], "")
+                .expect("a loopback route needs no input device");
+        assert_eq!(routes.tracks.len(), 1);
+        assert_eq!(routes.tracks[0].track_id, bounce);
+        assert_eq!(
+            routes.tracks[0].loopback_source_track_id.as_deref(),
+            Some(source.as_str())
+        );
+        assert_eq!(routes.tracks[0].input_channels, vec![0, 1]);
+        assert!(routes.explicit_device_id.is_none(), "no capture device");
+        assert!(routes.monitor_channels.is_empty(), "no capture pair");
+    }
+
+    /// One take is one clock: a hardware track and a loopback track armed
+    /// together are refused with the reason, not half-recorded.
+    #[test]
+    fn hardware_and_loopback_inputs_are_not_mixed_in_one_take() {
+        let mut timeline = TimelineState::default();
+        let source = timeline.create_audio_track();
+        let bounce = timeline.create_audio_track();
+        let vocal = timeline.create_audio_track();
+        // Hardware first: `assign` revalidates against the interface alone,
+        // `assign_loopback` against the interface and the loopback ports.
+        assign(&mut timeline, &vocal, vec![0, 1], 2);
+        assign_loopback(&mut timeline, &bounce, &source);
+        timeline.set_track_armed(&bounce, true);
+        timeline.set_track_armed(&vocal, true);
+
+        let device = input_device(2);
+        let error = resolve_recording_routes(
+            &timeline.tracks,
+            &timeline.audio_connections,
+            std::slice::from_ref(&device),
+            "",
+        )
+        .err()
+        .expect("a mixed take is refused");
+        assert!(error.contains("separate takes"), "{error}");
+    }
+
+    /// Recording a track's own output into itself is feedback; the take is
+    /// refused with that reason rather than recording silence.
+    #[test]
+    fn a_loopback_of_the_track_itself_is_refused_before_the_take() {
+        let mut timeline = TimelineState::default();
+        let bounce = timeline.create_audio_track();
+        assign_loopback(&mut timeline, &bounce, &bounce);
+        timeline.set_track_armed(&bounce, true);
+
+        let error =
+            resolve_recording_routes(&timeline.tracks, &timeline.audio_connections, &[], "")
+                .err()
+                .expect("feedback is refused");
+        assert!(error.contains("feedback"), "{error}");
     }
 
     /// Clearing the audio input must not disturb MIDI, and vice versa.

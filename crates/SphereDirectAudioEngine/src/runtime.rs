@@ -2754,6 +2754,10 @@ pub struct RuntimeProject {
     /// The realtime render being recorded, if one is. Set on the control
     /// thread for every graph it builds while a capture is active.
     pub render_capture: Option<Arc<crate::render_capture::RenderCapture>>,
+    /// The take recording loopback-routed tracks, if one is running. Set on the
+    /// control thread for every graph it builds while the take runs, like
+    /// `render_capture`; see [`crate::loopback::LoopbackRecorder`].
+    pub loopback_record: Option<Arc<crate::loopback::LoopbackRecorder>>,
     /// The spatial mix: format, room, the multichannel bus spatialised
     /// channels sum into, and how a surround bus reaches a stereo device.
     pub spatial: RuntimeSpatial,
@@ -2843,6 +2847,25 @@ impl RuntimeProject {
         for track in self.tracks.iter_mut() {
             track.loopback_publish = false;
         }
+        let position_of = |id: &str| {
+            snapshot
+                .tracks
+                .iter()
+                .position(|candidate| candidate.id == id)
+        };
+        // Every loopback route in the project as `(source, destination)`, so a
+        // route can be checked against the others as well as against outputs
+        // and sends. Read from the snapshot because the loop below rewrites the
+        // runtime routes as it goes.
+        let loopback_edges: Vec<(usize, usize)> = snapshot
+            .tracks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, track)| {
+                let source = position_of(track.input_source.loopback_track_id()?)?;
+                Some((source, index))
+            })
+            .collect();
         let mut sources: Vec<usize> = Vec::new();
         for (index, track) in snapshot.tracks.iter().enumerate() {
             if index >= self.tracks.len() {
@@ -2851,11 +2874,16 @@ impl RuntimeProject {
             let Some(source_id) = track.input_source.loopback_track_id() else {
                 continue;
             };
-            let source_index = snapshot
-                .tracks
-                .iter()
-                .position(|candidate| candidate.id == source_id)
-                .filter(|source| *source != index && *source < self.tracks.len());
+            // A source the destination already feeds — through its output, a
+            // send, a multi-out child or another loopback — closes a loop: the
+            // destination would hear its own output a block later, forever.
+            // With monitoring on that is runaway feedback, so the route
+            // resolves to nothing, exactly like a route to itself.
+            let source_index = position_of(source_id).filter(|source| {
+                *source != index
+                    && *source < self.tracks.len()
+                    && !self.audio_reaches(index, *source, &loopback_edges)
+            });
             self.tracks[index].input_source = match source_index {
                 Some(source) => {
                     sources.push(source);
@@ -2872,6 +2900,46 @@ impl RuntimeProject {
         for source in sources {
             self.tracks[source].loopback_publish = true;
         }
+    }
+
+    /// Whether audio leaving track `from` arrives at track `to`: through an
+    /// output, a send, a VSTi multi-out child, or a loopback route in
+    /// `loopback_edges` (`(source, destination)` pairs). Control thread only;
+    /// it allocates.
+    fn audio_reaches(&self, from: usize, to: usize, loopback_edges: &[(usize, usize)]) -> bool {
+        let mut seen = vec![false; self.tracks.len()];
+        let mut stack = vec![from];
+        while let Some(at) = stack.pop() {
+            if at == to {
+                return true;
+            }
+            if at >= self.tracks.len() || std::mem::replace(&mut seen[at], true) {
+                continue;
+            }
+            let track = &self.tracks[at];
+            stack.extend(track.output_track_index);
+            stack.extend(
+                track
+                    .sends
+                    .iter()
+                    .filter_map(|send| send.return_track_index),
+            );
+            for insert in &track.inserts {
+                stack.extend(
+                    insert
+                        .vsti_output_children
+                        .iter()
+                        .filter_map(|child| child.dest_track_index),
+                );
+            }
+            stack.extend(
+                loopback_edges
+                    .iter()
+                    .filter(|(source, _)| *source == at)
+                    .map(|(_, destination)| *destination),
+            );
+        }
+        false
     }
 
     /// Resolve every cross-entity id reference (clip→track, send→track,
@@ -3897,8 +3965,10 @@ impl RuntimeProject {
                 // access to; the live engine fills it in through
                 // `resolve_jam_inputs` right after this. Leaving it unroutable
                 // until then is what stops a jam track from picking up the
-                // hardware channels its route happens to name.
-                input_source: if t.input_source.is_jam() {
+                // hardware channels its route happens to name. A loopback
+                // route is the same: `resolve_loopback_inputs` resolves it once
+                // the whole track list is known.
+                input_source: if t.input_source.is_jam() || t.input_source.is_loopback() {
                     RuntimeTrackInputSource::None
                 } else {
                     RuntimeTrackInputSource::from_channels(&t.input_source.channels)
@@ -4239,6 +4309,7 @@ impl RuntimeProject {
                 })
                 .collect(),
             render_capture: None,
+            loopback_record: None,
             spatial: RuntimeSpatial::from_snapshot(&snapshot.spatial, output_sample_rate),
         };
         // Resolve cross-entity indices once, on this worker thread, so the
@@ -9664,6 +9735,63 @@ mod loopback_resolve_tests {
             RuntimeTrackInputSource::None
         );
         assert!(runtime.tracks.iter().all(|track| !track.loopback_publish));
+    }
+
+    /// A return (the WDW return Rodhareist's wet/dry/wet split creates is one)
+    /// is a source like any other: a fresh audio track can record it.
+    #[test]
+    fn a_return_track_is_a_loopback_source() {
+        let mut snapshot = snapshot_with_route("wdw", "audio-1");
+        snapshot.tracks.insert(2, track("wdw", "return"));
+        let runtime = resolved(&snapshot);
+
+        assert_eq!(
+            runtime.tracks[1].input_source,
+            RuntimeTrackInputSource::Loopback {
+                source_index: 2,
+                mode: crate::jam_bus::JamChannelMode::Stereo,
+            }
+        );
+        assert!(runtime.tracks[2].loopback_publish);
+    }
+
+    /// A track that already feeds the source — here through its output into
+    /// the return — would hear its own output a block later, forever. That is
+    /// feedback, and it is refused just like a route to itself.
+    #[test]
+    fn a_track_cannot_loop_back_a_bus_it_feeds() {
+        let mut snapshot = snapshot_with_route("wdw", "audio-1");
+        snapshot.tracks.insert(2, track("wdw", "return"));
+        snapshot.tracks[1].output_track_id = Some("wdw".to_string());
+        let runtime = resolved(&snapshot);
+
+        assert_eq!(runtime.tracks[1].output_track_index, Some(2));
+        assert_eq!(
+            runtime.tracks[1].input_source,
+            RuntimeTrackInputSource::None
+        );
+        assert!(runtime.tracks.iter().all(|track| !track.loopback_publish));
+    }
+
+    /// Two tracks reading each other are a loop too, even with no bus between
+    /// them: each would carry the other's output back into itself.
+    #[test]
+    fn two_tracks_cannot_loop_back_each_other() {
+        let mut snapshot = snapshot_with_route("piano", "audio-1");
+        snapshot.tracks[0].input_source = crate::types::EngineTrackInputSourceSnapshot {
+            device_id: Some(crate::loopback::loopback_device_id("audio-1")),
+            channels: vec![0, 1],
+        };
+        let runtime = resolved(&snapshot);
+
+        assert_eq!(
+            runtime.tracks[0].input_source,
+            RuntimeTrackInputSource::None
+        );
+        assert_eq!(
+            runtime.tracks[1].input_source,
+            RuntimeTrackInputSource::None
+        );
     }
 
     /// Re-resolving after the route is dropped has to stop the source

@@ -1166,6 +1166,16 @@ impl StudioLayout {
                         });
                         return;
                     }
+                    // Listed so the menu can say why; choosing it changes
+                    // nothing and reports the reason.
+                    TrackInputSelection::Refused(reason) => {
+                        let reason = reason.clone();
+                        StudioLayout::defer_update(&owner, cx, move |this, cx| {
+                            this.audio_bridge.last_error = Some(reason);
+                            cx.notify();
+                        });
+                        return;
+                    }
                     TrackInputSelection::NoInput => None,
                     TrackInputSelection::Connection(connection_id) => Some(connection_id.clone()),
                 };

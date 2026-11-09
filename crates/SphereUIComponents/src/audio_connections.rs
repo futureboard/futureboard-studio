@@ -919,6 +919,12 @@ impl AudioConnectionRegistry {
                 None,
             );
         }
+        // A track loopback whose track is gone is missing, full stop. Standing
+        // in with the hardware device at the same port numbers would record
+        // the microphone under the name of the track the user picked.
+        if DirectAudio::loopback::is_loopback_device(device_id) {
+            return (AudioConnectionStatus::DeviceMissing, None);
+        }
         let Some(stand_in) = ports.stand_in(connection.direction) else {
             return (AudioConnectionStatus::DeviceMissing, None);
         };
@@ -1475,6 +1481,34 @@ mod tests {
         assert_eq!(connection.status, AudioConnectionStatus::DeviceMissing);
         assert_eq!(connection.stand_in_device, None);
         assert_eq!(registry.resolved_ports(&stereo, &ports), None);
+    }
+
+    /// A track loopback bus whose track was deleted must not run on the
+    /// interface at the same port numbers: that would record the microphone
+    /// under the name of the track the user chose.
+    #[test]
+    fn a_loopback_bus_never_stands_in_on_hardware() {
+        let ports = usb_selected(2);
+        let mut registry = AudioConnectionRegistry::new();
+        let id = registry.add(
+            AudioConnection::new(
+                "WDW In",
+                AudioConnectionDirection::Input,
+                ChannelLayout::Stereo,
+            )
+            .bind_consecutive(
+                DirectAudio::loopback::loopback_device_id("deleted"),
+                0,
+                |i| if i == 0 { "L" } else { "R" }.to_string(),
+            ),
+        );
+
+        registry.revalidate(&ports);
+
+        let connection = registry.get(&id).unwrap();
+        assert_eq!(connection.status, AudioConnectionStatus::DeviceMissing);
+        assert_eq!(connection.stand_in_device, None);
+        assert_eq!(registry.resolved_ports(&id, &ports), None);
     }
 
     #[test]

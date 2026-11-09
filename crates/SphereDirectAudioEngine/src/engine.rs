@@ -1390,6 +1390,11 @@ pub struct EngineInner {
     /// so every graph built while it runs is mapped to it. Also the control
     /// thread's own reference to the capture (see `SetRenderCapture`).
     render_capture: Mutex<Option<(Arc<crate::render_capture::RenderCapture>, Vec<String>)>>,
+    /// The take recording loopback-routed tracks and the destination track id
+    /// of each lane, so every graph built while it runs is mapped to it. Also
+    /// the control thread's own reference (see `SetLoopbackRecord`), kept
+    /// until the take has finalized.
+    loopback_record: Mutex<Option<(Arc<crate::loopback::LoopbackRecorder>, Vec<String>)>>,
     /// The Control Room configuration as last set, applied to every graph a
     /// project sync builds (see [`MonitorMirror`]).
     monitor_mirror: Mutex<MonitorMirror>,
@@ -1446,6 +1451,10 @@ struct AuditionRequests {
 /// poll that collects it.
 struct PendingStopContext {
     pending: recording::PendingRecordingStop,
+    /// A loopback take's recorder, held until its files are closed so the
+    /// audio thread is never the one to drop it.
+    #[allow(dead_code)] // a keep-alive: dropped with the context, never read
+    loopback_recorder: Option<Arc<crate::loopback::LoopbackRecorder>>,
     placement: TakePlacement,
 }
 
@@ -1467,6 +1476,9 @@ struct TakePlacement {
     armed_start_sample: u64,
     first_capture_sample: u64,
     live_tap: bool,
+    /// The take recorded loopback-routed tracks from the render callback:
+    /// there was no converter in the path, so no round trip to take back.
+    loopback_tap: bool,
     /// The take recorded with delay compensation bypassed, so the mix the
     /// performer played to was not held back behind the slowest path.
     pdc_bypassed: bool,
@@ -1589,6 +1601,7 @@ impl EngineInner {
             ara_renderers: Mutex::new(HashMap::new()),
             ara_lent: AtomicBool::new(false),
             render_capture: Mutex::new(None),
+            loopback_record: Mutex::new(None),
             monitor_mirror: Mutex::new(MonitorMirror::default()),
             audio_cache: Mutex::new(HashMap::new()),
             inactive_audio_cache_lru: Mutex::new(VecDeque::new()),
@@ -3602,8 +3615,10 @@ impl EngineInner {
                 input_source.channels[0].saturating_add(1)
             )));
         }
+        // A jam or loopback route names no driver channel, so there is nothing
+        // to validate against one — and a `trk:` id is never the ASIO driver.
         #[cfg(all(target_os = "windows", feature = "asio"))]
-        if !input_source.is_jam() {
+        if !input_source.is_internal() {
             if let Some(caps) = self.asio_caps.lock().clone() {
                 self.validate_asio_input_source(track_id, &input_source, &caps)?;
             }
@@ -4441,6 +4456,10 @@ impl EngineInner {
                         ),
                     );
                 }
+                // `from_channels` read a loopback route as the hardware
+                // channels it carries; resolve those against the track list
+                // again, as the build did.
+                runtime.resolve_loopback_inputs(&snapshot);
             }
         }
         if let Err(error) = self.sync_live_input_stream(&snapshot) {
@@ -4490,6 +4509,12 @@ impl EngineInner {
         if let Some((capture, track_ids)) = self.render_capture.lock().as_ref() {
             capture.map_tracks(&render_capture_indices(&snapshot, track_ids));
             runtime.render_capture = Some(capture.clone());
+        }
+        // So does a loopback take: a project sync mid-take (the auto-save
+        // before Record is enough for one) must not drop it.
+        if let Some((recorder, track_ids)) = self.loopback_record.lock().as_ref() {
+            recorder.map_destinations(&render_capture_indices(&snapshot, track_ids));
+            runtime.loopback_record = Some(recorder.clone());
         }
         // The callback applies this graph's tempo map wholesale, so record it as
         // sent: the trailing `set_tempo_map` below then costs nothing instead of
@@ -4798,6 +4823,29 @@ impl EngineInner {
         }
         let monitor_mix = config.monitor_mix;
 
+        // Tracks whose input is another track are recorded from the render
+        // callback, not from a capture device, so they take neither the ASIO
+        // nor the capture-stream path below — and work with no interface open.
+        // One take is one source family: the two run on different callbacks
+        // with different clocks, and one writer cannot interleave them.
+        let loopback_tracks = config
+            .tracks
+            .iter()
+            .filter(|track| track.loopback_source_track_id.is_some())
+            .count();
+        if loopback_tracks > 0 {
+            if loopback_tracks != config.tracks.len() {
+                return Err(SphereAudioError::InvalidConfig(
+                    "armed tracks mix hardware inputs and track inputs; record them in separate takes"
+                        .to_string(),
+                ));
+            }
+            self.start_recording_loopback(config, &mut guard)?;
+            drop(guard);
+            self.warm_output_for_monitoring();
+            return Ok(());
+        }
+
         #[cfg(all(target_os = "windows", feature = "asio"))]
         if self.daux_config.lock().backend == BackendKind::Asio {
             return self.start_recording_asio(config, monitor_mix, &mut guard);
@@ -4868,6 +4916,98 @@ impl EngineInner {
                 Err(e)
             }
         }
+    }
+
+    /// Start a take of tracks whose input is another track (`trk:` routes).
+    ///
+    /// The recorder goes into the graph the render callback runs, which needs
+    /// an output stream and nothing else. Each destination must actually be
+    /// resolved to its source in this graph: a route the engine refused (the
+    /// source is gone, or the destination already feeds it) would record
+    /// silence, so it is refused here with the reason instead.
+    fn start_recording_loopback(
+        &self,
+        config: JsStartRecordingConfig,
+        guard: &mut Option<RecordingSession>,
+    ) -> Result<(), SphereAudioError> {
+        let sample_rate = self.shared.sample_rate.load(Ordering::Relaxed);
+        if sample_rate == 0 {
+            return Err(SphereAudioError::NativeError(
+                "recording a track's output needs a running audio output; open an audio device first"
+                    .to_string(),
+            ));
+        }
+        let track_ids: Vec<String> = config
+            .tracks
+            .iter()
+            .map(|track| track.track_id.clone())
+            .collect();
+        let indices = {
+            let project = self.project.lock();
+            let snapshot = project.as_ref().ok_or_else(|| {
+                SphereAudioError::InvalidConfig("no project is loaded".to_string())
+            })?;
+            for track in &config.tracks {
+                let routed = snapshot
+                    .tracks
+                    .iter()
+                    .find(|candidate| candidate.id == track.track_id)
+                    .and_then(|candidate| candidate.input_source.loopback_track_id());
+                if routed != track.loopback_source_track_id.as_deref() {
+                    return Err(SphereAudioError::InvalidConfig(format!(
+                        "{}: the engine has not applied this track's input yet; re-arm the track",
+                        track.name
+                    )));
+                }
+            }
+            render_capture_indices(snapshot, &track_ids)
+        };
+        {
+            let runtime = self.runtime.lock();
+            for (track, index) in config.tracks.iter().zip(&indices) {
+                let resolved = index
+                    .and_then(|index| runtime.tracks.get(index))
+                    .is_some_and(|candidate| candidate.input_source.is_loopback());
+                if !resolved {
+                    return Err(SphereAudioError::InvalidConfig(format!(
+                        "{}: its input track cannot be recorded — it no longer exists, or {} \
+                         already feeds it, which would be a feedback loop",
+                        track.name, track.name
+                    )));
+                }
+            }
+        }
+
+        let (session, recorder) =
+            recording::start_recording_loopback_tap(config, Arc::clone(&self.shared), sample_rate)?;
+        let recorder = Arc::new(recorder);
+        recorder.map_destinations(&indices);
+        // Registered before it is sent, so a project sync from here on builds
+        // its graph with the recorder in it.
+        *self.loopback_record.lock() = Some((recorder.clone(), track_ids));
+        self.runtime.lock().loopback_record = Some(recorder.clone());
+        if let Err(error) = self.send_command(EngineCommand::SetLoopbackRecord(Some(recorder))) {
+            self.runtime.lock().loopback_record = None;
+            let recorder = self.loopback_record.lock().take();
+            // Unwind the armed pipeline; the take never ran.
+            let _ = recording::stop_recording(session);
+            drop(recorder);
+            return Err(match error {
+                SphereAudioError::EngineNotOpen => SphereAudioError::NativeError(
+                    "recording a track's output needs a running audio output; open an audio device first"
+                        .to_string(),
+                ),
+                other => other,
+            });
+        }
+        if recording_debug_enabled() {
+            eprintln!(
+                "[recording] session started on the track loopback tap tracks={} start_beat={:.3}",
+                session.track_count, session.start_beat
+            );
+        }
+        *guard = Some(session);
+        Ok(())
     }
 
     /// Try to run the take on the live input stream that is already open.
@@ -5090,6 +5230,20 @@ impl EngineInner {
             }
         }
 
+        // Loopback take: take the recorder out of the graph. Its `active` flag
+        // (the session's) is already down, so it records nothing more; the
+        // control thread keeps its reference until the files are closed, so
+        // the callback never drops the last one.
+        let loopback_tap = session.is_loopback_tap();
+        let loopback_recorder = if loopback_tap {
+            let recorder = self.loopback_record.lock().take();
+            self.runtime.lock().loopback_record = None;
+            let _ = self.send_command(EngineCommand::SetLoopbackRecord(None));
+            recorder.map(|(recorder, _)| recorder)
+        } else {
+            None
+        };
+
         // How far after its declared start the take really began capturing.
         // Read before the session is consumed.
         let armed_start_sample = session.armed_start_sample;
@@ -5098,10 +5252,12 @@ impl EngineInner {
         let pending = recording::begin_stop_recording(session);
         *self.pending_stop.lock() = Some(PendingStopContext {
             pending,
+            loopback_recorder,
             placement: TakePlacement {
                 armed_start_sample,
                 first_capture_sample,
                 live_tap,
+                loopback_tap,
                 pdc_bypassed,
                 #[cfg(all(target_os = "windows", feature = "asio"))]
                 asio_tap,
@@ -5223,7 +5379,16 @@ impl EngineInner {
         // does not depend on the armed track: subtracting only the armed
         // track's own plug-in latency put a take recorded while playing late
         // by the rest of the compensation.
-        let path_samples = if placement.pdc_bypassed {
+        let path_samples = if placement.loopback_tap {
+            // A loopback take is the source's post-fader block, taken before
+            // the master inserts: compensated, it is held back by the graph's
+            // own delay and no more; bypassed, by nothing the graph adds.
+            if placement.pdc_bypassed {
+                0
+            } else {
+                crate::backend::render::metronome_graph_max_latency_samples(&runtime)
+            }
+        } else if placement.pdc_bypassed {
             runtime.latency_graph.master_plugin_latency
         } else {
             crate::backend::render::metronome_compensation_delay_samples(&runtime)
@@ -5237,7 +5402,12 @@ impl EngineInner {
                 continue;
             }
             let measured_round_trip = (result.latency_seconds * sample_rate).round() as u64;
-            let round_trip = if measured_round_trip > 0 {
+            // Nothing went out through a converter and back in: the take was
+            // recorded from the graph itself.
+            let round_trip = if placement.loopback_tap {
+                result.latency_seconds = 0.0;
+                0
+            } else if measured_round_trip > 0 {
                 measured_round_trip
             } else {
                 round_trip_buffer as u64
@@ -5651,15 +5821,19 @@ impl EngineInner {
             }
             return Ok(());
         }
-        // Jam-routed tracks are excluded throughout: they take no hardware
-        // input, so they must not open a capture stream, must not pin a device,
-        // and must not count as a conflicting route against a track that does.
+        // Jam- and loopback-routed tracks are excluded throughout: they take no
+        // hardware input, so they must not open a capture stream, must not pin
+        // a device, and must not count as a conflicting route against a track
+        // that does. A loopback route used to be let through here, so arming
+        // or monitoring a track fed by another track tried to open an input
+        // device called `trk:<id>` — which fails, and the failure rolled the
+        // Input choice back (#394).
         let mut monitored_route: Option<(&str, &EngineTrackInputSourceSnapshot)> = None;
         for track in snapshot.tracks.iter().filter(|track| {
             track.track_type == "audio"
                 && track.input_monitor
                 && !track.input_source.channels.is_empty()
-                && !track.input_source.is_jam()
+                && !track.input_source.is_internal()
         }) {
             if let Some((other_track_id, other_source)) = monitored_route {
                 if other_source.device_id != track.input_source.device_id
@@ -5701,7 +5875,7 @@ impl EngineInner {
             track.track_type == "audio"
                 && (track.armed || track.input_monitor)
                 && !track.input_source.channels.is_empty()
-                && !track.input_source.is_jam()
+                && !track.input_source.is_internal()
         });
 
         // A jam send bound to the Live Input pair is a request for the interface,
@@ -5719,7 +5893,7 @@ impl EngineInner {
             track.track_type == "audio"
                 && track.input_monitor
                 && !track.input_source.channels.is_empty()
-                && !track.input_source.is_jam()
+                && !track.input_source.is_internal()
         });
         self.shared
             .monitor_enabled_any
@@ -5998,7 +6172,7 @@ impl EngineInner {
                 track.track_type == "audio"
                     && (track.armed || track.input_monitor)
                     && !track.input_source.channels.is_empty()
-                    && !track.input_source.is_jam()
+                    && !track.input_source.is_internal()
             })
         };
         for track in active_tracks() {
@@ -6019,7 +6193,7 @@ impl EngineInner {
             track.track_type == "audio"
                 && track.input_monitor
                 && !track.input_source.channels.is_empty()
-                && !track.input_source.is_jam()
+                && !track.input_source.is_internal()
         });
         self.shared
             .monitor_enabled_any
@@ -6605,6 +6779,7 @@ impl EngineInner {
                 EngineCommand::SetTrackJamPublish { .. } => "SetTrackJamPublish",
                 EngineCommand::SetJamMultitrackPairs { .. } => "SetJamMultitrackPairs",
                 EngineCommand::SetRenderCapture(_) => "SetRenderCapture",
+                EngineCommand::SetLoopbackRecord(_) => "SetLoopbackRecord",
                 EngineCommand::SetTrackPreviewMode { .. } => "SetTrackPreviewMode",
                 EngineCommand::SetSoundfontChannels { .. } => "SetSoundfontChannels",
                 EngineCommand::SetInsertParam { .. } => "SetInsertParam",
@@ -7435,6 +7610,10 @@ where
                         // reference so the capture is released in step.
                         EngineCommand::SetRenderCapture(capture) => {
                             runtime.render_capture = capture;
+                        }
+                        // Nor a loopback take: same reference rule.
+                        EngineCommand::SetLoopbackRecord(recorder) => {
+                            runtime.loopback_record = recorder;
                         }
                         EngineCommand::SetTrackPreviewMode { track_id, value } => {
                             runtime.update_track_preview_mode(&track_id, RuntimePreviewMode::from_code(value));

@@ -590,6 +590,14 @@ impl EngineTrackInputSourceSnapshot {
             .is_some_and(crate::loopback::is_loopback_device)
     }
 
+    /// Whether this route takes nothing from a hardware capture device: a jam
+    /// stream or another track. Such a route must never open, pin or conflict
+    /// with a capture stream, and never be validated against a driver's
+    /// channel count.
+    pub fn is_internal(&self) -> bool {
+        self.is_jam() || self.is_loopback()
+    }
+
     /// The source track this route names, if any.
     pub fn loopback_track_id(&self) -> Option<&str> {
         self.device_id
@@ -828,6 +836,11 @@ pub struct JsRecordingTrackConfig {
     pub input_channels: Vec<u32>,
     /// Human-readable track name — used to derive the output filename.
     pub name: String,
+    /// The track whose output this take records, when the track's input is a
+    /// track loopback (`trk:<id>`) rather than a hardware device. Such a take
+    /// is recorded from the render callback, needs no capture device, and
+    /// `input_channels` then names the loopback pair (0 = L, 1 = R).
+    pub loopback_source_track_id: Option<String>,
 }
 
 /// Full config passed to `startRecording()`.

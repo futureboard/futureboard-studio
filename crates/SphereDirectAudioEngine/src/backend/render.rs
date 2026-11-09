@@ -1212,6 +1212,10 @@ pub fn drain_commands(
                 // its own until this command has been drained.
                 runtime.render_capture = capture;
             }
+            EngineCommand::SetLoopbackRecord(recorder) => {
+                // As above: the control thread outlives this reference.
+                runtime.loopback_record = recorder;
+            }
             EngineCommand::SetTrackPreviewMode { track_id, value } => {
                 runtime.update_track_preview_mode(&track_id, RuntimePreviewMode::from_code(value));
             }
@@ -1654,6 +1658,13 @@ fn fill_output_f32_inner(
                     capture.stage_master_interleaved(data, channels, rendered as usize);
                     capture.commit_block();
                 }
+            }
+            // A take of loopback-routed tracks records the sources' blocks the
+            // graph just rendered. It needs no capture stream, which is why it
+            // runs here and works with no audio interface at all. One `Option`
+            // check when no such take is running.
+            if let Some(recorder) = runtime.loopback_record.as_deref() {
+                recorder.capture_block(&runtime.tracks, rendered as usize, base_sample, shared);
             }
             rendered
         };

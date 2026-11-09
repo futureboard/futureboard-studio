@@ -683,6 +683,7 @@ impl StudioLayout {
                 detected_midi_inputs,
                 detected_midi_outputs,
                 plugin_midi_sources,
+                &tracks,
             )
             .into_any_element(),
         )

@@ -1472,6 +1472,9 @@ pub(crate) fn inspector_routing_combo_overlay(
     // Tracks whose plug-in MIDI this track may take as input, as
     // `(track_id, label)`; see `TimelineState::plugin_midi_sources_for`.
     plugin_midi_sources: Vec<(String, String)>,
+    // Every track in the project, so the audio Input menu can say which track
+    // loopback would feed this track its own output.
+    all_tracks: &[TrackState],
 ) -> impl IntoElement {
     let position =
         inspector_combo_menu_position(anchor, INSPECTOR_WIDTH, ROUTING_COMBO_MENU_HEIGHT, window);
@@ -1501,10 +1504,20 @@ pub(crate) fn inspector_routing_combo_overlay(
             // are never enumerated here — the footer action opens the window
             // where hardware mapping actually lives.
             let _ = &available_ports;
-            let routing_options = crate::input_routing::track_input_options(
+            // An entry this track cannot take — a track loopback it already
+            // feeds, a bus wider than the track — stays listed with the reason.
+            let routing_options = crate::input_routing::track_input_options_for(
                 connections,
                 track.routing.audio_format.channel_count(),
                 track.routing.audio_input_connection_id.as_ref(),
+                |connection| {
+                    crate::input_routing::loopback_refusal(
+                        all_tracks,
+                        connections,
+                        &track.id,
+                        connection,
+                    )
+                },
             );
             let selected = audio_input_combo_label(track, connections);
             let labels: Vec<String> = routing_options

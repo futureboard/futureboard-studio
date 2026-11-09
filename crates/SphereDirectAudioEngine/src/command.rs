@@ -187,6 +187,10 @@ pub enum EngineCommand {
     /// keeps its own reference until the callback has taken this one, so the
     /// callback only ever drops a reference, never the capture itself.
     SetRenderCapture(Option<std::sync::Arc<crate::render_capture::RenderCapture>>),
+    /// Install (or remove) the take recording loopback-routed tracks. Same
+    /// ownership rule as `SetRenderCapture`: the control thread holds its own
+    /// reference until the take has finalized.
+    SetLoopbackRecord(Option<std::sync::Arc<crate::loopback::LoopbackRecorder>>),
     /// Set non-destructive stereo/mono/mid/side monitoring preview.
     SetTrackPreviewMode { track_id: String, value: f32 },
     /// Set the sixteen parts of a multitimbral built-in Soundfont Player.
