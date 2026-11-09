@@ -128,6 +128,20 @@ fn grid_cc_samples(
 
 const CC_POINT_MERGE_EPS: f32 = 1.0e-3;
 
+/// Points with `lo <= beat <= hi`. `points` is stored in beat order.
+fn controller_points_in_beat_range(
+    points: &[MidiControllerPoint],
+    lo: f32,
+    hi: f32,
+) -> &[MidiControllerPoint] {
+    if points.is_empty() || !(lo <= hi) {
+        return &[];
+    }
+    let start = points.partition_point(|point| point.beat < lo);
+    let end = start + points[start..].partition_point(|point| point.beat <= hi);
+    &points[start..end]
+}
+
 /// Radius of a CC point handle, in lane pixels. Kept under [`CC_HIT_R`] so a
 /// handle is never larger than the area that grabs it.
 const HANDLE_R: f32 = 4.0;
@@ -146,9 +160,12 @@ const CC_HIT_R: f32 = 8.0;
 /// "exactly min / max" rather than a one-pixel target.
 const CC_VALUE_PAD: f32 = 5.0;
 
-/// Keep a controller lane single-valued at each beat. Freehand painting can
-/// revisit the same x range many times, and retaining near-identical points
-/// makes the renderer draw narrow vertical spikes when the lane is sorted.
+/// Keep one paint stroke's points single-valued at each beat. Freehand
+/// painting can revisit the same x range many times, and retaining
+/// near-identical points makes the renderer draw narrow vertical spikes.
+///
+/// Only ever applied to the points a stroke writes: an imported high-PPQ lane
+/// keeps one point per tick, closer together than [`CC_POINT_MERGE_EPS`].
 fn compact_cc_points(mut points: Vec<MidiControllerPoint>) -> Vec<MidiControllerPoint> {
     points.sort_by(|a, b| {
         a.beat
@@ -175,32 +192,57 @@ fn compact_cc_points(mut points: Vec<MidiControllerPoint>) -> Vec<MidiController
 /// important distinction between a CC brush and an append-only point list:
 /// dragging back over an earlier segment paints over it instead of building a
 /// second envelope that later turns into a comb of almost-vertical lines.
+///
+/// Only the stroke's own beat range (`epsilon` either side) is replaced and
+/// compacted. Every point outside it is copied through untouched: compacting
+/// the whole lane collapsed a dense imported ramp the first time anything was
+/// painted anywhere in it. `existing` is the lane in beat order, as the
+/// timeline stores it.
 fn replace_cc_paint_segment(
-    existing: Vec<MidiControllerPoint>,
+    existing: &[MidiControllerPoint],
     edits: &[(f32, f32)],
     erase: bool,
     epsilon: f32,
 ) -> Vec<MidiControllerPoint> {
     let Some(first) = edits.first() else {
-        return existing;
+        return existing.to_vec();
     };
     let last = edits.last().unwrap_or(first);
     let lo = first.0.min(last.0);
     let hi = first.0.max(last.0);
+    // At least the merge window, so no kept point sits within merge distance
+    // of a painted one and the lane stays single-valued at each beat.
     let epsilon = epsilon.max(CC_POINT_MERGE_EPS);
 
-    let mut points: Vec<MidiControllerPoint> = existing
-        .into_iter()
-        .filter(|point| point.beat < lo - epsilon || point.beat > hi + epsilon)
-        .collect();
-    if !erase {
-        points.extend(
+    // The lane is kept in beat order; sorting here only covers a lane that
+    // somehow is not, and never runs on the normal paint path.
+    let sorted;
+    let existing = if existing.is_sorted_by(|a, b| a.beat <= b.beat) {
+        existing
+    } else {
+        let mut copy = existing.to_vec();
+        copy.sort_by(|a, b| a.beat.total_cmp(&b.beat));
+        sorted = copy;
+        &sorted[..]
+    };
+    let start = existing.partition_point(|point| point.beat < lo - epsilon);
+    let end = start + existing[start..].partition_point(|point| point.beat <= hi + epsilon);
+
+    let painted = if erase {
+        Vec::new()
+    } else {
+        compact_cc_points(
             edits
                 .iter()
-                .map(|(beat, value)| MidiControllerPoint::new(*beat, *value)),
-        );
-    }
-    compact_cc_points(points)
+                .map(|(beat, value)| MidiControllerPoint::new(*beat, *value))
+                .collect(),
+        )
+    };
+    let mut points = Vec::with_capacity(existing.len() - (end - start) + painted.len());
+    points.extend_from_slice(&existing[..start]);
+    points.extend(painted);
+    points.extend_from_slice(&existing[end..]);
+    points
 }
 
 impl PianoRoll {
@@ -395,15 +437,20 @@ impl PianoRoll {
             controller_display_value(kind, cursor_value),
         ));
 
-        let existing = self
-            .timeline
-            .read(cx)
-            .state
-            .controller_points_snapshot(&clip_id, kind);
         // The stroke owns every tick it crosses; half a tick either side lets
         // a vertical brush replace the point directly under the cursor.
         let replace_epsilon = 0.5 / CC_DRAW_TICKS_PER_BEAT;
-        let points = replace_cc_paint_segment(existing, &edits, erase, replace_epsilon);
+        let points = replace_cc_paint_segment(
+            self.timeline
+                .read(cx)
+                .state
+                .controller_lane_points(&clip_id, kind)
+                .map(|points| points.as_slice())
+                .unwrap_or(&[]),
+            &edits,
+            erase,
+            replace_epsilon,
+        );
 
         self.timeline.update(cx, |tl, tcx| {
             tl.state.set_controller_lane_points(&clip_id, kind, points);
@@ -413,6 +460,12 @@ impl PianoRoll {
         if let PianoDrag::CcPaint { last, .. } = &mut self.drag {
             *last = Some((lx, ly));
         }
+    }
+
+    /// Clip beat under `local_x`, without the project-beat clamp. Hit testing
+    /// uses the same scale as [`Self::clip_beat_to_x`], including x left of 0.
+    fn clip_x_to_beat_unclamped(&self, local_x: f32) -> f32 {
+        (local_x + self.scroll_x) / self.ppb.max(0.0001) - self.edit_origin()
     }
 
     /// Hit-test the active lane's points: the id of the point **nearest** the
@@ -432,8 +485,12 @@ impl PianoRoll {
         let kind = self.active_cc;
         let tl = self.timeline.read(cx);
         let points = tl.state.controller_lane_points(clip_id, kind)?;
+        let ppb = self.ppb.max(0.0001);
+        let cursor_beat = self.clip_x_to_beat_unclamped(lx);
+        let radius = (CC_HIT_R + 1.0) / ppb;
         let mut best: Option<(u64, f32)> = None;
-        for p in points {
+        for p in controller_points_in_beat_range(points, cursor_beat - radius, cursor_beat + radius)
+        {
             let dx = lx - self.clip_beat_to_x(p.beat);
             if dx.abs() > CC_HIT_R {
                 continue;
@@ -631,7 +688,12 @@ impl PianoRoll {
             .state
             .controller_lane_points(&clip_id, kind)
             .map(|points| {
-                points
+                let visible = controller_points_in_beat_range(
+                    points,
+                    self.clip_x_to_beat_unclamped(rect.0),
+                    self.clip_x_to_beat_unclamped(rect.2),
+                );
+                visible
                     .iter()
                     .filter(|point| {
                         let x = self.clip_beat_to_x(point.beat);
@@ -1119,12 +1181,18 @@ impl PianoRoll {
             let points = timeline
                 .state
                 .controller_lane_points(clip_id, kind)
-                .map(|points| compact_cc_points(points.clone()))
-                .unwrap_or_default();
+                .map(|points| points.as_slice())
+                .unwrap_or(&[]);
 
-            // Columns advance left-to-right and points are kept sorted by beat,
-            // so one cursor over the points serves every column.
-            let mut cursor = 0usize;
+            // Points stay in beat order. Sample them in place. Cloning and
+            // re-sorting the lane on every frame, then merging anything within
+            // 1e-3 beats, froze a dense import and deleted ticks a high-PPQ
+            // file can tell apart. The cursor starts at the left edge so a
+            // zoomed-in view does not walk the ticks scrolled off to the left.
+            let first_beat = self.x_to_clip_beat(0.0);
+            let mut cursor = points
+                .partition_point(|point| point.beat < first_beat)
+                .saturating_sub(1);
             for col in 0..=num_cols {
                 let beat = self.x_to_clip_beat(col as f32).max(0.0);
                 let value = if points.is_empty() {
@@ -1156,7 +1224,12 @@ impl PianoRoll {
             // line, not a bead chain; a selected point is always shown, and
             // hit-testing still sees every point.
             let mut last_drawn_x = f32::NEG_INFINITY;
-            for p in &points {
+            let visible = controller_points_in_beat_range(
+                points,
+                self.clip_x_to_beat_unclamped(-HANDLE_R),
+                self.clip_x_to_beat_unclamped(view_w + HANDLE_R),
+            );
+            for p in visible {
                 let x = self.clip_beat_to_x(p.beat);
                 if x < -HANDLE_R || x > view_w + HANDLE_R {
                     continue;
@@ -1643,7 +1716,7 @@ mod tests {
             MidiControllerPoint::new(0.75, 0.4),
         ];
         let points = replace_cc_paint_segment(
-            existing,
+            &existing,
             &[(0.75, 0.9), (0.5, 0.8)],
             false,
             CC_POINT_MERGE_EPS,
@@ -1657,6 +1730,32 @@ mod tests {
         assert!(points
             .windows(2)
             .all(|pair| (pair[1].beat - pair[0].beat) > CC_POINT_MERGE_EPS));
+    }
+
+    #[test]
+    fn paint_leaves_a_dense_lane_outside_the_stroke_untouched() {
+        // One beat at 3840 PPQ: every tick is ~0.00026 beats from the next,
+        // well inside the 1e-3 paint merge window.
+        const PPQ: f32 = 3840.0;
+        let existing: Vec<MidiControllerPoint> = (0..3840u32)
+            .map(|tick| MidiControllerPoint::new(tick as f32 / PPQ, (tick % 128) as f32 / 127.0))
+            .collect();
+        let points = replace_cc_paint_segment(
+            &existing,
+            &[(2.0, 0.5), (2.25, 0.75)],
+            false,
+            0.5 / CC_DRAW_TICKS_PER_BEAT,
+        );
+
+        assert_eq!(points.len(), existing.len() + 2);
+        assert_eq!(&points[..existing.len()], &existing[..]);
+        assert_eq!(points[existing.len()].beat, 2.0);
+        assert_eq!(points[existing.len() + 1].beat, 2.25);
+        assert_eq!(points[existing.len() + 1].value, 0.75);
+
+        // Erasing elsewhere keeps the ramp too.
+        let erased = replace_cc_paint_segment(&points, &[(2.0, 0.0), (2.5, 0.0)], true, 0.0);
+        assert_eq!(erased, existing);
     }
 
     #[test]
@@ -1688,7 +1787,7 @@ mod tests {
             MidiControllerPoint::new(0.75, 0.4),
         ];
         let points = replace_cc_paint_segment(
-            existing,
+            &existing,
             &[(0.75, 0.0), (0.5, 0.0)],
             true,
             CC_POINT_MERGE_EPS,

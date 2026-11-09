@@ -138,6 +138,31 @@ fn y_from_value(value: f32, height: f32) -> f32 {
     (1.0 - value.clamp(0.0, 1.0)) * usable + 4.0
 }
 
+/// Value of a beat-sorted controller lane at `beat`, advancing `cursor`.
+///
+/// Before the first point and after the last, the nearest value holds. Between
+/// two points the value is linear, matching the piano-roll lane.
+fn sample_controller_value(points: &[MidiControllerPoint], beat: f32, cursor: &mut usize) -> f32 {
+    if points.is_empty() {
+        return 0.0;
+    }
+    while *cursor + 1 < points.len() && points[*cursor + 1].beat <= beat {
+        *cursor += 1;
+    }
+    let a = &points[*cursor];
+    if beat <= a.beat || *cursor + 1 >= points.len() {
+        return a.value;
+    }
+    let b = &points[*cursor + 1];
+    let span = b.beat - a.beat;
+    if span <= f32::EPSILON {
+        b.value
+    } else {
+        let t = (beat - a.beat) / span;
+        a.value + (b.value - a.value) * t
+    }
+}
+
 impl SolfegeEditorPanel {
     /// Visible lanes for the current track, resolved against the instrument's
     /// capability table. Ids the instrument no longer exposes are skipped for
@@ -242,8 +267,8 @@ impl SolfegeEditorPanel {
                 .midi_clip_notes(&ctx.clip_id)
                 .is_none_or(|notes| notes.iter().all(|note| note.accent.is_none())),
             LaneSource::Controller(kind) => state
-                .controller_points_snapshot(&ctx.clip_id, kind)
-                .is_empty(),
+                .controller_lane_points(&ctx.clip_id, kind)
+                .is_none_or(|points| points.is_empty()),
         }
     }
 
@@ -990,30 +1015,74 @@ impl SolfegeEditorPanel {
     }
 
     /// A continuous controller lane, sampled once per column so cost is
-    /// `O(width + points)` regardless of how dense the lane gets.
+    /// `O(width + points in view)` regardless of how dense the lane gets.
+    ///
+    /// The points stay on the timeline. Copying the whole lane into the paint
+    /// closure, then drawing a quad per point, froze the UI after a dense
+    /// controller import: a high-PPQ ramp is hundreds of thousands of events,
+    /// most of them on top of each other at arrangement zoom.
     fn render_controller_lane(
         &self,
         ctx: &SolfegeEditContext,
         kind: MidiControllerKind,
         viewport: PianoRollViewport,
         height: f32,
-        cx: &Context<Self>,
+        _cx: &Context<Self>,
     ) -> gpui::AnyElement {
-        let points = self
-            .timeline
-            .read(cx)
-            .state
-            .controller_points_snapshot(&ctx.clip_id, kind);
         let line_color = Colors::accent_cyan();
         let handle_color = Colors::accent_primary();
         let baseline_color = Colors::with_alpha(Colors::border_subtle(), 0.8);
-        let ppb = viewport.ppb;
+        let ppb = viewport.ppb.max(0.0001);
         let scroll_x = viewport.scroll_x;
+        let timeline = self.timeline.clone();
+        let clip_id = ctx.clip_id.clone();
         canvas(
             |_bounds, _window, _cx| {},
-            move |bounds: Bounds<Pixels>, (), window, _cx| {
+            move |bounds: Bounds<Pixels>, (), window, cx| {
                 let origin = bounds.origin;
                 let view_w = f32::from(bounds.size.width).max(1.0);
+                let columns = view_w.ceil() as usize;
+                let (samples, handles) = {
+                    let timeline = timeline.read(cx);
+                    let points = timeline
+                        .state
+                        .controller_lane_points(&clip_id, kind)
+                        .map(|points| points.as_slice())
+                        .unwrap_or(&[]);
+                    if points.is_empty() {
+                        (Vec::new(), Vec::new())
+                    } else {
+                        let first_beat = (scroll_x / ppb).max(0.0);
+                        let mut cursor = points
+                            .partition_point(|point| point.beat < first_beat)
+                            .saturating_sub(1);
+                        let mut samples = Vec::with_capacity(columns + 1);
+                        for col in 0..=columns {
+                            let beat = ((col as f32 + scroll_x) / ppb).max(0.0);
+                            samples.push(y_from_value(
+                                sample_controller_value(points, beat, &mut cursor),
+                                height,
+                            ));
+                        }
+                        // One handle per 8 px. A recorded ramp has a point per
+                        // tick, far closer than a handle is wide.
+                        let lo = ((scroll_x - 4.0) / ppb).max(0.0);
+                        let hi = (view_w + scroll_x + 4.0) / ppb;
+                        let start = points.partition_point(|point| point.beat < lo);
+                        let end = start + points[start..].partition_point(|point| point.beat <= hi);
+                        let mut handles = Vec::new();
+                        let mut last_x = f32::NEG_INFINITY;
+                        for point in &points[start..end] {
+                            let x = point.beat * ppb - scroll_x;
+                            if x < -3.0 || x > view_w + 3.0 || x - last_x < 8.0 {
+                                continue;
+                            }
+                            last_x = x;
+                            handles.push((x, y_from_value(point.value, height)));
+                        }
+                        (samples, handles)
+                    }
+                };
                 window.paint_quad(fill(
                     Bounds::new(
                         origin + point(px(0.0), px(height * 0.5)),
@@ -1021,47 +1090,21 @@ impl SolfegeEditorPanel {
                     ),
                     baseline_color,
                 ));
-                if points.is_empty() {
-                    return;
-                }
-                let value_at = |beat: f32| -> f32 {
-                    match points.binary_search_by(|p| p.beat.total_cmp(&beat)) {
-                        Ok(hit) => points[hit].value,
-                        Err(0) => points[0].value,
-                        Err(insert) if insert >= points.len() => points[points.len() - 1].value,
-                        Err(insert) => {
-                            let a = &points[insert - 1];
-                            let b = &points[insert];
-                            let span = b.beat - a.beat;
-                            if span <= f32::EPSILON {
-                                b.value
-                            } else {
-                                a.value + (b.value - a.value) * ((beat - a.beat) / span)
-                            }
+                if samples.len() >= 2 {
+                    let mut path = gpui::PathBuilder::stroke(px(1.4));
+                    for (col, y) in samples.iter().enumerate() {
+                        let at = origin + point(px(col as f32), px(*y));
+                        if col == 0 {
+                            path.move_to(at);
+                        } else {
+                            path.line_to(at);
                         }
                     }
-                };
-                let columns = view_w.ceil() as usize;
-                let mut path = gpui::PathBuilder::stroke(px(1.4));
-                for col in 0..=columns {
-                    let beat = ((col as f32 + scroll_x) / ppb).max(0.0);
-                    let y = y_from_value(value_at(beat), height);
-                    let at = origin + point(px(col as f32), px(y));
-                    if col == 0 {
-                        path.move_to(at);
-                    } else {
-                        path.line_to(at);
+                    if let Ok(path) = path.build() {
+                        window.paint_path(path, line_color);
                     }
                 }
-                if let Ok(path) = path.build() {
-                    window.paint_path(path, line_color);
-                }
-                for p in &points {
-                    let x = p.beat * ppb - scroll_x;
-                    if x < -3.0 || x > view_w + 3.0 {
-                        continue;
-                    }
-                    let y = y_from_value(p.value, height);
+                for (x, y) in handles {
                     window.paint_quad(fill(
                         Bounds::new(
                             origin + point(px(x - 2.0), px(y - 2.0)),
@@ -1431,6 +1474,19 @@ pub(super) const SUPPORT_LANE_HEIGHT: f32 = DEFAULT_LANE_HEIGHT;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_dense_lane_samples_each_tick_instead_of_collapsing_it() {
+        let points: Vec<MidiControllerPoint> = (0..32)
+            .map(|tick| MidiControllerPoint::new(tick as f32 / 9600.0, tick as f32 / 31.0))
+            .collect();
+        let mut cursor = 0usize;
+        let early = sample_controller_value(&points, points[1].beat, &mut cursor);
+        assert!((early - points[1].value).abs() < 1.0e-4);
+        let late = sample_controller_value(&points, points[31].beat, &mut cursor);
+        assert!((late - points[31].value).abs() < 1.0e-4);
+        assert!(points.windows(2).all(|pair| pair[1].beat > pair[0].beat));
+    }
 
     #[test]
     fn value_mapping_round_trips() {

@@ -1428,7 +1428,13 @@ impl StudioLayout {
         }
         {
             let target = cx.entity().clone();
+            let notice_target = target.clone();
             let _ = timeline.update(cx, |timeline, _cx| {
+                timeline.set_edit_notice_callback(Some(Arc::new(move |message, cx| {
+                    StudioLayout::defer_update(&notice_target, cx, move |this, cx| {
+                        this.show_edit_notice(message, cx);
+                    });
+                })));
                 timeline.set_midi_import_prompt_callback(Some(Arc::new(
                     move |request, window, cx| {
                         // Deferred for the same nested-update reason as the

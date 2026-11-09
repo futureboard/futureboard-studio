@@ -266,6 +266,7 @@ impl Timeline {
             on_plugin_drag_drop: None,
             plugin_drop_hint: None,
             on_midi_import_prompt: None,
+            on_edit_notice: None,
             last_drag_position: None,
             file_drop_hint: None,
             clip_clone_hint: None,
@@ -372,6 +373,7 @@ impl Timeline {
             on_plugin_drag_drop: None,
             plugin_drop_hint: None,
             on_midi_import_prompt: None,
+            on_edit_notice: None,
             last_drag_position: None,
             file_drop_hint: None,
             clip_clone_hint: None,
@@ -1516,6 +1518,19 @@ impl Timeline {
         callback: Option<TimelineMidiImportPromptCb>,
     ) {
         self.on_midi_import_prompt = callback;
+    }
+
+    pub fn set_edit_notice_callback(&mut self, callback: Option<super::TimelineEditNoticeCb>) {
+        self.on_edit_notice = callback;
+    }
+
+    /// Tell the shell, and the log, why an edit produced nothing.
+    fn report_edit_notice(&self, message: impl Into<String>, cx: &mut gpui::App) {
+        let message = message.into();
+        eprintln!("[MidiImport] {message}");
+        if let Some(callback) = &self.on_edit_notice {
+            callback(message, cx);
+        }
     }
 
     pub fn set_project_changed_callback(&mut self, callback: Option<TimelineProjectChangedCb>) {
@@ -4383,8 +4398,12 @@ impl Timeline {
         if !is_supported_midi_ext(path) {
             return false;
         }
-        let Some(imported_tracks) = read_and_parse_midi_file(path) else {
-            return false;
+        let imported_tracks = match read_and_parse_midi_file(path) {
+            Ok(tracks) => tracks,
+            Err(message) => {
+                self.report_edit_notice(message, cx);
+                return false;
+            }
         };
         let (drop_x, drop_y) = self.drop_position_or_new_track(force_new_track);
 
@@ -4429,8 +4448,12 @@ impl Timeline {
         drop_y: f32,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(imported_tracks) = read_and_parse_midi_file(path) else {
-            return false;
+        let imported_tracks = match read_and_parse_midi_file(path) {
+            Ok(tracks) => tracks,
+            Err(message) => {
+                self.report_edit_notice(message, cx);
+                return false;
+            }
         };
         self.apply_midi_import(path, imported_tracks, options, drop_x, drop_y, cx)
     }
@@ -4544,31 +4567,15 @@ impl Timeline {
     }
 }
 
-/// Read and parse a Standard MIDI File, reporting the failing stage. `None`
-/// means nothing was imported — the caller falls through to the next handler.
+/// Read and parse a Standard MIDI File. The `Err` string is a status-bar
+/// sentence: a drop that fails has to say why, not only write to the log.
 fn read_and_parse_midi_file(
     path: &std::path::Path,
-) -> Option<Vec<crate::components::timeline::midi_import::ImportedMidiTrack>> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            eprintln!(
-                "[MidiImport] read failed path={} err={error}",
-                path.display()
-            );
-            return None;
-        }
-    };
-    match crate::components::timeline::midi_import::parse_smf_tracks(&bytes) {
-        Ok(imported) => Some(imported),
-        Err(error) => {
-            eprintln!(
-                "[MidiImport] parse failed path={} err={error}",
-                path.display()
-            );
-            None
-        }
-    }
+) -> Result<Vec<crate::components::timeline::midi_import::ImportedMidiTrack>, String> {
+    let name = midi_import_display_name(path);
+    let bytes = std::fs::read(path).map_err(|error| format!("Could not read {name}: {error}"))?;
+    crate::components::timeline::midi_import::parse_smf_tracks(&bytes)
+        .map_err(|error| format!("Could not import {name}: {error}"))
 }
 
 /// File stem used both as the imported clip's base name and as the dialog's

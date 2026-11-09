@@ -187,15 +187,22 @@ pub fn parse_smf_tracks(data: &[u8]) -> Result<Vec<ImportedMidiTrack>, MidiImpor
     r.skip(header_len - 6)?;
 
     let mut imported_tracks = Vec::new();
-    for _ in 0..track_count {
+    let mut tracks_read = 0u16;
+    while tracks_read < track_count {
         if r.remaining() < 8 {
             break;
         }
-        if r.read_exact(4)? != b"MTrk" {
-            return Err(MidiImportError::InvalidHeader);
-        }
+        let chunk_type = r.read_exact(4)?;
         let len = r.read_u32()? as usize;
+        // SMF readers skip a chunk they do not recognize and keep going. A
+        // sequencer-specific chunk before or between tracks is not a broken
+        // file, and rejecting it used to fail the drop with no status text.
+        if chunk_type != b"MTrk" {
+            r.skip(len)?;
+            continue;
+        }
         let track_data = r.read_exact(len)?;
+        tracks_read = tracks_read.saturating_add(1);
         let mut clip = empty_imported_clip();
         let mut channel_lanes = ChannelControllerLanes::new();
         let mut track_name = None;
@@ -210,7 +217,7 @@ pub fn parse_smf_tracks(data: &[u8]) -> Result<Vec<ImportedMidiTrack>, MidiImpor
             &mut max_tick,
             &mut track_name,
         )?;
-        clip.duration_beats = max_tick as f32 / ticks_per_beat as f32;
+        clip.duration_beats = ticks_to_beats(max_tick, ticks_per_beat) as f32;
         let track_name = track_name.filter(|name| !name.is_empty());
         imported_tracks.extend(split_imported_track_by_channel(
             track_name,
@@ -273,7 +280,7 @@ impl ChannelControllerLanes {
         }
     }
 
-    fn push(&mut self, channel: u8, kind: MidiControllerKind, beat: f32, value: f32) {
+    fn push(&mut self, channel: u8, kind: MidiControllerKind, beat: f64, value: f32) {
         let lanes = &mut self.per_channel[(channel & 0x0f) as usize];
         push_controller_point(lanes, kind, beat, value);
     }
@@ -364,10 +371,49 @@ fn split_imported_track_by_channel(
 
 fn merge_controller_lanes(target: &mut Vec<MidiControllerLane>, lanes: Vec<MidiControllerLane>) {
     for lane in lanes {
-        for point in lane.points {
-            push_controller_point(target, lane.kind, point.beat, point.value);
+        if lane.points.is_empty() {
+            continue;
+        }
+        if let Some(existing) = target.iter_mut().find(|item| item.kind == lane.kind) {
+            existing.points =
+                merge_sorted_points(std::mem::take(&mut existing.points), lane.points);
+        } else {
+            target.push(lane);
         }
     }
+}
+
+/// Merge two beat-sorted lanes in one pass. The same beat keeps the incoming
+/// point, which is what a later track's event used to do when it overwrote.
+fn merge_sorted_points(
+    left: Vec<MidiControllerPoint>,
+    right: Vec<MidiControllerPoint>,
+) -> Vec<MidiControllerPoint> {
+    let mut merged = Vec::with_capacity(left.len() + right.len());
+    let mut left = left.into_iter().peekable();
+    let mut right = right.into_iter().peekable();
+    loop {
+        match (left.peek(), right.peek()) {
+            (None, None) => break,
+            (Some(_), None) => {
+                merged.extend(left);
+                break;
+            }
+            (None, Some(_)) => {
+                merged.extend(right);
+                break;
+            }
+            (Some(a), Some(b)) => match a.beat.total_cmp(&b.beat) {
+                std::cmp::Ordering::Less => merged.push(left.next().expect("peeked")),
+                std::cmp::Ordering::Greater => merged.push(right.next().expect("peeked")),
+                std::cmp::Ordering::Equal => {
+                    left.next();
+                    merged.push(right.next().expect("peeked"));
+                }
+            },
+        }
+    }
+    merged
 }
 
 fn parse_track(
@@ -478,7 +524,7 @@ fn parse_track(
                     markers.push(ImportedMidiMarker {
                         text: decode_midi_text(payload),
                         absolute_tick: tick,
-                        beat: ticks_to_beats(tick, ticks_per_beat),
+                        beat: ticks_to_beats(tick, ticks_per_beat) as f32,
                     });
                 }
                 if meta_type == 0x2f {
@@ -496,7 +542,7 @@ fn parse_track(
                         ImportedSysExKind::Escaped
                     },
                     absolute_tick: tick,
-                    beat: ticks_to_beats(tick, ticks_per_beat),
+                    beat: ticks_to_beats(tick, ticks_per_beat) as f32,
                     data: payload.to_vec(),
                 });
             }
@@ -511,16 +557,28 @@ fn decode_midi_text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).trim().to_string()
 }
 
-fn ticks_to_beats(tick: u64, ticks_per_beat: u32) -> f32 {
-    tick as f32 / ticks_per_beat.max(1) as f32
+fn ticks_to_beats(tick: u64, ticks_per_beat: u32) -> f64 {
+    // Divide in f64 so the quotient is exact before it is stored. Stored
+    // beats are still `f32`, so this does not keep every tick apart: at 9600
+    // ticks per quarter, neighbouring ticks round to the same f32 beat beyond
+    // about beat 1024 and then merge. Keeping them apart there needs a wider
+    // stored type, which is a separate project-format change.
+    tick as f64 / f64::from(ticks_per_beat.max(1))
 }
 
+/// Append one controller event. Track data is in tick order, so this is
+/// amortized O(1): replace the last point when this tick lands on the same
+/// stored (`f32`) beat, otherwise push. A fixed 1e-3-beat window used to merge
+/// neighboring ticks in high-PPQ files, and sorting the whole lane on every
+/// event froze the UI on a dense controller stream.
 fn push_controller_point(
     lanes: &mut Vec<MidiControllerLane>,
     kind: MidiControllerKind,
-    beat: f32,
+    beat: f64,
     value: f32,
 ) {
+    let beat = beat.max(0.0) as f32;
+    let value = value.clamp(0.0, 1.0);
     let Some(lane) = lanes.iter_mut().find(|lane| lane.kind == kind) else {
         lanes.push(MidiControllerLane {
             kind,
@@ -531,19 +589,33 @@ fn push_controller_point(
         });
         return;
     };
-    if let Some(point) = lane
-        .points
-        .iter_mut()
-        .find(|point| (point.beat - beat).abs() < 1.0e-3)
-    {
-        point.value = value.clamp(0.0, 1.0);
-    } else {
-        lane.points.push(MidiControllerPoint::new(beat, value));
-        lane.points.sort_by(|a, b| {
-            a.beat
-                .partial_cmp(&b.beat)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+    enum Place {
+        Replace,
+        Append,
+        Insert,
+    }
+    let place = match lane.points.last() {
+        Some(last) if last.beat == beat => Place::Replace,
+        Some(last) if last.beat < beat => Place::Append,
+        None => Place::Append,
+        Some(_) => Place::Insert,
+    };
+    match place {
+        Place::Replace => {
+            if let Some(last) = lane.points.last_mut() {
+                last.value = value;
+            }
+        }
+        Place::Append => lane.points.push(MidiControllerPoint::new(beat, value)),
+        Place::Insert => {
+            let index = lane.points.partition_point(|point| point.beat < beat);
+            if index < lane.points.len() && lane.points[index].beat == beat {
+                lane.points[index].value = value;
+            } else {
+                lane.points
+                    .insert(index, MidiControllerPoint::new(beat, value));
+            }
+        }
     }
 }
 
@@ -645,10 +717,14 @@ mod tests {
     }
 
     fn smf_format(format: u16, tracks: &[&[u8]]) -> Vec<u8> {
+        smf_division(format, 480, tracks)
+    }
+
+    fn smf_division(format: u16, division: u16, tracks: &[&[u8]]) -> Vec<u8> {
         let mut data = vec![b'M', b'T', b'h', b'd', 0, 0, 0, 6];
         data.extend_from_slice(&format.to_be_bytes());
         data.extend_from_slice(&(tracks.len() as u16).to_be_bytes());
-        data.extend_from_slice(&480u16.to_be_bytes());
+        data.extend_from_slice(&division.to_be_bytes());
         for track in tracks {
             data.extend_from_slice(b"MTrk");
             data.extend_from_slice(&(track.len() as u32).to_be_bytes());
@@ -834,6 +910,130 @@ mod tests {
         let data = smf(&[0, 0x90, 60, 100, 0x83, 0x60, 0x80, 60, 0, 0, 0xff, 0x2f, 0]);
         let tracks = parse_smf_tracks(&data).unwrap();
         assert!(!MidiImportSummary::of(&tracks).has_optional_payload());
+    }
+
+    #[test]
+    fn an_unrecognized_chunk_before_the_track_still_imports() {
+        let track = [0, 0x90, 60, 100, 0x83, 0x60, 0x80, 60, 0, 0, 0xff, 0x2f, 0];
+        // Format 0, one track, 480 PPQ, then a private chunk, then the track.
+        let mut data = vec![b'M', b'T', b'h', b'd', 0, 0, 0, 6, 0, 0, 0, 1, 0x01, 0xE0];
+        data.extend_from_slice(b"XFIH");
+        data.extend_from_slice(&4u32.to_be_bytes());
+        data.extend_from_slice(&[9, 8, 7, 6]);
+        data.extend_from_slice(b"MTrk");
+        data.extend_from_slice(&(track.len() as u32).to_be_bytes());
+        data.extend_from_slice(&track);
+
+        let imported = parse_smf_notes(&data).expect("foreign chunk is skipped");
+        assert_eq!(imported.notes.len(), 1);
+        assert_eq!(imported.notes[0].pitch, 60);
+    }
+
+    #[test]
+    fn an_unrecognized_chunk_between_tracks_is_skipped() {
+        let track_a = [0, 0x90, 60, 80, 0x83, 0x60, 0x80, 60, 0, 0, 0xff, 0x2f, 0];
+        let track_b = [0, 0x91, 48, 90, 0x83, 0x60, 0x81, 48, 0, 0, 0xff, 0x2f, 0];
+        let mut data = smf_format(1, &[&track_a]);
+        // The helper wrote a track count of 1. This file has two tracks.
+        data[10] = 0;
+        data[11] = 2;
+        data.extend_from_slice(b"SEQ ");
+        data.extend_from_slice(&2u32.to_be_bytes());
+        data.extend_from_slice(&[0, 1]);
+        data.extend_from_slice(b"MTrk");
+        data.extend_from_slice(&(track_b.len() as u32).to_be_bytes());
+        data.extend_from_slice(&track_b);
+
+        let tracks = parse_smf_tracks(&data).expect("chunk between tracks");
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].clip.notes[0].pitch, 60);
+        assert_eq!(tracks[1].clip.notes[0].pitch, 48);
+    }
+
+    #[test]
+    fn a_file_that_is_not_midi_still_fails() {
+        let err = parse_smf_tracks(b"RIFF not a midi file").unwrap_err();
+        assert_eq!(err, MidiImportError::InvalidHeader);
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn high_ppq_keeps_one_controller_point_per_tick() {
+        // 9600 ticks per quarter. One tick is ~0.000104 beats, inside the old
+        // 1e-3 merge window, which collapsed this ramp to a handful of points.
+        let mut track = Vec::new();
+        for tick in 0..64u32 {
+            track.push(if tick == 0 { 0 } else { 1 });
+            track.extend_from_slice(&[0xb0, 1, (tick % 128) as u8]);
+        }
+        track.extend_from_slice(&[0, 0xff, 0x2f, 0]);
+        let data = smf_division(0, 9600, &[&track]);
+        let imported = parse_smf_notes(&data).unwrap();
+        let cc = imported
+            .controller_lanes
+            .iter()
+            .find(|lane| lane.kind == MidiControllerKind::CC(1))
+            .unwrap();
+        assert_eq!(cc.points.len(), 64);
+        assert!(cc.points.windows(2).all(|pair| pair[1].beat > pair[0].beat));
+        assert!((cc.points[63].value - 63.0 / 127.0).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn the_same_tick_keeps_the_latest_controller_value() {
+        let data = smf(&[0, 0xb0, 1, 10, 0, 0xb0, 1, 80, 0, 0xff, 0x2f, 0]);
+        let imported = parse_smf_notes(&data).unwrap();
+        let cc = imported
+            .controller_lanes
+            .iter()
+            .find(|lane| lane.kind == MidiControllerKind::CC(1))
+            .unwrap();
+        assert_eq!(cc.points.len(), 1);
+        assert!((cc.points[0].value - 80.0 / 127.0).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn merged_tracks_keep_controller_points_in_beat_order() {
+        let track_a = [0, 0xb0, 1, 10, 0x83, 0x60, 0xb0, 1, 40, 0, 0xff, 0x2f, 0];
+        // Tick 240 is half a beat at 480 PPQ, between the two events above.
+        let track_b = [0x81, 0x70, 0xb0, 1, 20, 0, 0xff, 0x2f, 0];
+        let data = smf_format(1, &[&track_a, &track_b]);
+        let imported = parse_smf_notes(&data).unwrap();
+        let cc = imported
+            .controller_lanes
+            .iter()
+            .find(|lane| lane.kind == MidiControllerKind::CC(1))
+            .unwrap();
+        assert_eq!(cc.points.len(), 3);
+        let values: Vec<u8> = cc
+            .points
+            .iter()
+            .map(|point| (point.value * 127.0).round() as u8)
+            .collect();
+        assert_eq!(values, vec![10, 20, 40]);
+        assert!(cc.points.windows(2).all(|pair| pair[1].beat > pair[0].beat));
+    }
+
+    #[test]
+    fn a_dense_controller_lane_keeps_every_tick() {
+        let count = 4_000u32;
+        let mut track = Vec::with_capacity(count as usize * 4);
+        for tick in 0..count {
+            track.push(if tick == 0 { 0 } else { 1 });
+            track.extend_from_slice(&[0xe0, (tick & 0x7f) as u8, ((tick >> 7) & 0x7f) as u8]);
+        }
+        track.extend_from_slice(&[0, 0xff, 0x2f, 0]);
+        let imported = parse_smf_notes(&smf(&track)).unwrap();
+        let bend = imported
+            .controller_lanes
+            .iter()
+            .find(|lane| lane.kind == MidiControllerKind::PitchBend)
+            .unwrap();
+        assert_eq!(bend.points.len(), count as usize);
+        assert!(bend
+            .points
+            .windows(2)
+            .all(|pair| pair[1].beat > pair[0].beat));
     }
 
     #[test]
