@@ -16,6 +16,7 @@ serde.workspace = true
 thiserror.workspace = true
 ureq.workspace = true
 log.workspace = true
+sha2.workspace = true
 
 # Real MDX-NET ONNX inference (optional, feature = "onnx").
 ort = { workspace = true, optional = true }

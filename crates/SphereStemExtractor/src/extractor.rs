@@ -130,12 +130,34 @@ mod tests {
     fn extract_mdx_net_uses_the_current_platform_runtime() {
         let input = StemExtractInput::new(48_000, 2, vec![0.1; 48_000 * 2]);
         let params = StemExtractParams::mdx_net_cpu();
-        let result =
-            extract_stems(&input, &params, &StemExtractCancelToken::new(), |_| {}).unwrap();
-        assert_eq!(result.model, StemModel::MdxNet);
-        assert_eq!(result.runtime, StemPlatformRuntime::CoreMl);
-        assert_eq!(result.device, InferDevice::Gpu);
-        assert_eq!(result.stems.len(), 4);
+        #[cfg(target_os = "linux")]
+        {
+            let err =
+                extract_stems(&input, &params, &StemExtractCancelToken::new(), |_| {}).unwrap_err();
+            assert_eq!(
+                err,
+                StemExtractError::UnsupportedPlatform {
+                    platform: crate::device::StemPlatform::Linux,
+                }
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let result =
+                extract_stems(&input, &params, &StemExtractCancelToken::new(), |_| {}).unwrap();
+            assert_eq!(result.model, StemModel::MdxNet);
+            #[cfg(target_os = "macos")]
+            {
+                assert_eq!(result.runtime, StemPlatformRuntime::CoreMl);
+                assert_eq!(result.device, InferDevice::Gpu);
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                assert_eq!(result.runtime, StemPlatformRuntime::OnnxCpu);
+                assert_eq!(result.device, InferDevice::Cpu);
+            }
+            assert_eq!(result.stems.len(), 4);
+        }
     }
 
     #[test]

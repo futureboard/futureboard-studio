@@ -114,18 +114,26 @@ impl StemModel {
                 files: &[
                     StemModelFile {
                         file_name: "kuielab_a_vocals.onnx",
+                        expected_bytes: 29_703_204,
+                        sha256: "daba83c2ee1afee9139766ad64c9b6808d6b6f092fff04bed3338be50baac721",
                     },
                     StemModelFile {
                         file_name: "kuielab_a_drums.onnx",
+                        expected_bytes: 29_703_204,
+                        sha256: "40f586b7091934dd6f5563f0cba8f14bad57ce88440da1098bf388ea716c2901",
                     },
                     StemModelFile {
                         file_name: "kuielab_a_bass.onnx",
+                        expected_bytes: 29_703_204,
+                        sha256: "0c3e77b9963185b1ea6bb46a4b8924137d9370fc1ccdefec7b1b416ef550dcaa",
                     },
                     StemModelFile {
                         file_name: "kuielab_a_other.onnx",
+                        expected_bytes: 29_703_204,
+                        sha256: "7b67a1dcb5f232153528c59960b4c7bf8dc736b8114de360af0e719633f53358",
                     },
                 ],
-                approx_bytes: 116_000_000,
+                approx_bytes: 118_812_816,
                 source_label: "UVR / Kuielab A",
             },
             Self::MdxNetKaraoke => StemModelPackage {
@@ -133,8 +141,10 @@ impl StemModel {
                 base_url: UVR_MODEL_RELEASE_BASE,
                 files: &[StemModelFile {
                     file_name: "UVR_MDXNET_KARA.onnx",
+                    expected_bytes: 29_704_436,
+                    sha256: "e3167c87333a48548413e972a286bf40bf5694001d2853861eb1435953f02d63",
                 }],
-                approx_bytes: 29_700_000,
+                approx_bytes: 29_704_436,
                 source_label: "UVR MDX-NET Karaoke",
             },
             Self::MdxNetMain => StemModelPackage {
@@ -142,8 +152,10 @@ impl StemModel {
                 base_url: UVR_MODEL_RELEASE_BASE,
                 files: &[StemModelFile {
                     file_name: "UVR_MDXNET_Main.onnx",
+                    expected_bytes: 66_759_214,
+                    sha256: "8289784cda38543ff431add4070662813311a8cccfc0112ca82f76d9dba2b4ca",
                 }],
-                approx_bytes: 66_800_000,
+                approx_bytes: 66_759_214,
                 source_label: "UVR MDX-NET Main",
             },
             Self::MdxNetVocFt => StemModelPackage {
@@ -151,8 +163,10 @@ impl StemModel {
                 base_url: UVR_MODEL_RELEASE_BASE,
                 files: &[StemModelFile {
                     file_name: "UVR-MDX-NET-Voc_FT.onnx",
+                    expected_bytes: 66_762_490,
+                    sha256: "534b2070fcc7df514b13ef660dc8cbb328679c2374d04354a5c42bb14ecce111",
                 }],
-                approx_bytes: 66_800_000,
+                approx_bytes: 66_762_490,
                 source_label: "UVR MDX-NET Voc FT",
             },
             Self::MdxNetInstHq => StemModelPackage {
@@ -160,8 +174,10 @@ impl StemModel {
                 base_url: UVR_MODEL_RELEASE_BASE,
                 files: &[StemModelFile {
                     file_name: "UVR-MDX-NET-Inst_HQ_3.onnx",
+                    expected_bytes: 66_759_214,
+                    sha256: "317554b07fe1ea5279a77f2b1520a41ea4b93432560c4ffd08792c30fddf9adc",
                 }],
-                approx_bytes: 66_800_000,
+                approx_bytes: 66_759_214,
                 source_label: "UVR MDX-NET Inst HQ 3",
             },
             Self::KimVocal => StemModelPackage {
@@ -169,8 +185,10 @@ impl StemModel {
                 base_url: UVR_MODEL_RELEASE_BASE,
                 files: &[StemModelFile {
                     file_name: "Kim_Vocal_2.onnx",
+                    expected_bytes: 66_759_214,
+                    sha256: "ce74ef3b6a6024ce44211a07be9cf8bc6d87728cc852a68ab34eb8e58cde9c8b",
                 }],
-                approx_bytes: 66_800_000,
+                approx_bytes: 66_759_214,
                 source_label: "Kim Vocal 2",
             },
             Self::KimInst => StemModelPackage {
@@ -178,8 +196,10 @@ impl StemModel {
                 base_url: UVR_MODEL_RELEASE_BASE,
                 files: &[StemModelFile {
                     file_name: "Kim_Inst.onnx",
+                    expected_bytes: 66_759_214,
+                    sha256: "86b1940e7122fbdd2beadc65507cbff6c352d79012a8a7e60d56db98532af5f7",
                 }],
-                approx_bytes: 66_800_000,
+                approx_bytes: 66_759_214,
                 source_label: "Kim Instrumental",
             },
             Self::HtDemucs => StemModelPackage {
@@ -187,8 +207,10 @@ impl StemModel {
                 base_url: HTDEMUCS_MODEL_BASE,
                 files: &[StemModelFile {
                     file_name: "htdemucs.onnx",
+                    expected_bytes: 316_446_953,
+                    sha256: "68d0bf16428ef66e692cdff8a9ccf28f1ef3f69440d57e58605a4cc55fcc5e74",
                 }],
-                approx_bytes: 316_000_000,
+                approx_bytes: 316_446_953,
                 source_label: "StemSplit HT-Demucs (Hugging Face)",
             },
         }
@@ -199,6 +221,8 @@ impl StemModel {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StemModelFile {
     pub file_name: &'static str,
+    pub expected_bytes: u64,
+    pub sha256: &'static str,
 }
 
 /// Downloadable model package metadata.
@@ -216,6 +240,10 @@ pub struct StemModelPackage {
 impl StemModelPackage {
     pub fn file_count(self) -> usize {
         self.files.len()
+    }
+
+    pub fn total_bytes(self) -> u64 {
+        self.files.iter().map(|f| f.expected_bytes).sum()
     }
 
     pub fn approx_size_label(self) -> String {
@@ -316,5 +344,28 @@ mod tests {
         let package = StemModel::HtDemucs.package();
         assert_eq!(package.file_count(), 1);
         assert!(package.base_url.contains("huggingface.co"));
+        assert!(
+            package
+                .base_url
+                .contains("d54ed9eb60e258ea82131c6ee14578628816456a")
+        );
+        assert_eq!(package.files[0].expected_bytes, 316_446_953);
+        assert_eq!(
+            package.files[0].sha256,
+            "68d0bf16428ef66e692cdff8a9ccf28f1ef3f69440d57e58605a4cc55fcc5e74"
+        );
+    }
+
+    #[test]
+    fn all_models_have_pinned_hashes_and_sizes() {
+        for info in STEM_MODELS {
+            let pkg = info.model.package();
+            assert!(!pkg.files.is_empty());
+            for file in pkg.files {
+                assert!(file.expected_bytes > 0);
+                assert_eq!(file.sha256.len(), 64);
+                assert!(file.sha256.chars().all(|c| c.is_ascii_hexdigit()));
+            }
+        }
     }
 }
