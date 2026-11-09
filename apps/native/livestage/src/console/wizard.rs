@@ -1005,6 +1005,7 @@ impl Wizard {
             // The drives page saves its choice itself, straight away.
             record_storage: self.original.record_storage.clone(),
             record_storage_label: self.original.record_storage_label.clone(),
+            record_storage_drive: self.original.record_storage_drive.clone(),
         }
     }
 

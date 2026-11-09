@@ -178,6 +178,9 @@ pub struct BlockDisk {
     pub bus_path: String,
     /// `major:minor`.
     pub dev: String,
+    /// The hardware's serial number, when the kernel shows one (see
+    /// [`hardware_serial`]).
+    pub serial: Option<String>,
     pub parts: Vec<BlockPart>,
 }
 
@@ -253,13 +256,15 @@ pub fn read_disks(system: &System) -> Vec<BlockDisk> {
                 })
                 .collect();
             parts.sort_by_key(|p| p.number);
+            let bus_path = std::fs::canonicalize(&dir)
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
             Some(BlockDisk {
                 model: text(dir.join("device/model")).filter(|m| !m.is_empty()),
                 removable: text(dir.join("removable")).is_some_and(|r| r == "1"),
                 read_only: text(dir.join("ro")).is_some_and(|r| r == "1"),
-                bus_path: std::fs::canonicalize(&dir)
-                    .map(|p| p.to_string_lossy().replace('\\', "/"))
-                    .unwrap_or_default(),
+                serial: hardware_serial(&bus_path),
+                bus_path,
                 dev: text(dir.join("dev")).unwrap_or_default(),
                 size_bytes,
                 parts,
@@ -269,6 +274,32 @@ pub fn read_disks(system: &System) -> Vec<BlockDisk> {
         .collect();
     disks.sort_by(|a, b| a.name.cmp(&b.name));
     disks
+}
+
+/// The serial number of the hardware a disk is on: the USB device's (a
+/// stick, a USB disk), the NVMe controller's, the SD card's. Looked for
+/// from the disk's place under /sys/devices upwards, no higher than the USB
+/// device itself (above it is the hub's, which is not the disk's).
+fn hardware_serial(bus_path: &str) -> Option<String> {
+    let mut dir = std::path::Path::new(bus_path);
+    for _ in 0..16 {
+        dir = dir.parent()?;
+        if !dir
+            .to_string_lossy()
+            .replace('\\', "/")
+            .contains("/sys/devices/")
+        {
+            return None;
+        }
+        if let Ok(serial) = std::fs::read_to_string(dir.join("serial")) {
+            let serial = printable(&serial);
+            return (!serial.is_empty()).then_some(serial);
+        }
+        if dir.join("idVendor").exists() {
+            return None;
+        }
+    }
+    None
 }
 
 pub fn root_dev(system: &System) -> Option<String> {

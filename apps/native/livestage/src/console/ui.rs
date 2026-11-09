@@ -1012,6 +1012,7 @@ impl Applying {
                 if let Some(saved) = system.load_config() {
                     config.record_storage = saved.record_storage;
                     config.record_storage_label = saved.record_storage_label;
+                    config.record_storage_drive = saved.record_storage_drive;
                 }
                 system.save_config(&config)
             }

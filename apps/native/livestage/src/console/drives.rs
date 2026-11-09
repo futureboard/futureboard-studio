@@ -47,6 +47,16 @@ pub fn recordings_summary(state: &StorageState) -> Vec<Span<'static>> {
 
 /// Why recordings are not going to the drive chosen for them.
 pub fn fallback_reason(state: &StorageState) -> String {
+    if let Some(reason) = state
+        .volumes
+        .iter()
+        .filter(|v| v.id == state.target.id)
+        .find_map(|v| v.refused.as_deref())
+    {
+        // Up to the `;`: what to do about it is in the drive's details.
+        let reason = reason.split(';').next().unwrap_or(reason);
+        return format!("{} {reason}", state.target.label);
+    }
     match state.volume(&state.target.id) {
         Some(volume) if volume.ejected => format!("{} is ejected", state.target.label),
         Some(_) => format!("{} cannot be written to", state.target.label),
@@ -161,6 +171,8 @@ impl DriveRow {
                     ("ejected", DIM)
                 } else if !volume.supported {
                     ("unsupported", DIM)
+                } else if volume.refused.is_some() {
+                    ("refused", BAD)
                 } else if volume.id == state.target.id {
                     // Chosen, plugged in, but not mounted to write.
                     ("not mounted", BAD)
@@ -241,6 +253,8 @@ impl DriveRow {
                 let device = format!("/dev/{}, {place}", volume.device);
                 if volume.ejected {
                     format!("{device}. Ejected: unplug it, or Record here to use it again.")
+                } else if let Some(reason) = &volume.refused {
+                    format!("{device}. This drive {reason}.")
                 } else if !volume.supported {
                     format!(
                         "{device}. LiveStage records to exFAT, FAT32, NTFS and ext4; \

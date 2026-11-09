@@ -708,6 +708,12 @@ export interface StorageVolume {
   /** Can be a recording target. */
   supported: boolean
   ejected: boolean
+  /**
+   * Why it is kept from being recorded to as it is, said of the drive ("has
+   * the same volume ID as another drive plugged in; ..."). Absent when
+   * nothing is wrong.
+   */
+  refused?: string
 }
 
 export interface StorageDisk {

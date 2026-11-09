@@ -27,6 +27,13 @@
 //! - `format`'s `label` may be left out: [`DEFAULT_LABEL`].
 //! - Ejecting an unplugged or unknown volume, or using an unsupported one,
 //!   is an `ok:false` reply with the reason.
+//! - A UUID can be copied onto any drive. Two volumes plugged in with the
+//!   same one: neither is mounted anew (one already mounted at its folder
+//!   keeps that mount), the others carry `Volume::refused`, and `use` of
+//!   that UUID is refused. A volume with the target's UUID that is not the
+//!   drive chosen (serial number, model, size, filesystem) is refused too
+//!   and only mounted read-only, until it is chosen with `use`. Ejecting a
+//!   UUID ejects every volume that has it.
 
 #![allow(dead_code)]
 
@@ -161,6 +168,11 @@ pub struct Volume {
     pub supported: bool,
     /// Ejected, and not mounted again until it is unplugged.
     pub ejected: bool,
+    /// Why LiveStage keeps this volume from being recorded to as it is: a
+    /// phrase about the drive, for a person ("has the same volume ID as
+    /// another drive plugged in; ..."). Left out when nothing is wrong.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

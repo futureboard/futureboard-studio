@@ -575,6 +575,7 @@ pub(crate) mod tests {
             read_only: false,
             bus_path: String::new(),
             dev: dev.into(),
+            serial: None,
             parts: vec![blocks::BlockPart {
                 name: part.0.into(),
                 number: 1,

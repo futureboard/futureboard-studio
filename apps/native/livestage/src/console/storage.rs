@@ -51,6 +51,14 @@ const REPROBE: Duration = Duration::from_secs(60);
 /// How long an action waits for another one (a format) to finish.
 const LOCK_WAIT: Duration = Duration::from_secs(20);
 
+/// Why a volume is refused (`Volume::refused`), said of the drive.
+const SAME_ID: &str =
+    "has the same volume ID as another drive plugged in; unplug the one not to record to";
+const NOT_THE_DRIVE: &str =
+    "has the recording drive's volume ID but is another drive; choose Record here to record to it";
+const NOT_A_FOLDER: &str =
+    "has a \"LiveStage Recordings\" that is not a folder on it; rename or remove it on a computer";
+
 // ── What is read ────────────────────────────────────────────────────────────
 
 /// What the machine has, read at one moment.
@@ -192,12 +200,72 @@ fn is_media_folder(path: &str) -> bool {
         .is_some_and(|name| !name.is_empty() && !name.contains('/'))
 }
 
+/// What identifies a volume besides its UUID, which anyone can write onto
+/// another drive: its filesystem, its size, and its drive's model and
+/// serial number (`-` when the kernel shows none). Saved with the target
+/// (`RECORD_STORAGE_DRIVE`); only letters, digits and `-._/`. `""` for a
+/// device that is not there.
+pub fn drive_key(inventory: &Inventory, device: &str) -> String {
+    let found = inventory.disks.iter().find_map(|d| {
+        if d.name == device {
+            Some((d, d.size_bytes))
+        } else {
+            d.parts
+                .iter()
+                .find(|p| p.name == device)
+                .map(|p| (d, p.size_bytes))
+        }
+    });
+    let Some((disk, size)) = found else {
+        return String::new();
+    };
+    let field = |text: Option<&str>| -> String {
+        let text: String = text
+            .unwrap_or("")
+            .chars()
+            .take(64)
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '-' | '.') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        if text.is_empty() { "-".into() } else { text }
+    };
+    format!(
+        "{}/{size}/{}/{}",
+        field(inventory.probes.get(device).map(|p| p.fs.as_str())),
+        field(disk.model.as_deref()),
+        field(disk.serial.as_deref())
+    )
+}
+
+/// The UUIDs more than one volume plugged in has.
+fn shared_ids(volumes: &[Volume]) -> BTreeSet<&str> {
+    let mut seen = BTreeSet::new();
+    volumes
+        .iter()
+        .filter(|v| !v.id.is_empty() && v.id != api::INTERNAL)
+        .filter(|v| !seen.insert(v.id.as_str()))
+        .map(|v| v.id.as_str())
+        .collect()
+}
+
+/// Mounted at its own folder, `/media/<its UUID>`.
+fn at_its_folder(volume: &Volume) -> bool {
+    volume.mount_path.as_deref() == Some(api::mount_dir(&volume.id).as_str())
+}
+
 /// The state: the volumes, the disks and where recordings go. `free` gives
-/// the free bytes of a mounted path.
+/// the free bytes of a mounted path. `target_drive` is what the target was
+/// saved with besides its UUID ([`drive_key`]; `""` when nothing was).
 pub fn build_state(
     inventory: &Inventory,
     target: &str,
     target_label: &str,
+    target_drive: &str,
     ejected: &Ejected,
     free: &dyn Fn(&str) -> Option<u64>,
 ) -> State {
@@ -229,6 +297,7 @@ pub fn build_state(
         mount_path: data_mount.map(|_| DATA_MOUNT.to_string()),
         supported: true,
         ejected: false,
+        refused: None,
     });
 
     for disk in &inventory.disks {
@@ -270,8 +339,28 @@ pub fn build_state(
                 free_bytes: mount.and_then(|m| free(&m.path)),
                 mounted: mount.map(|m| if m.rw { Mount::Rw } else { Mount::Ro }),
                 mount_path: mount.map(|m| m.path.clone()),
+                refused: None,
                 id,
             });
+        }
+    }
+
+    // One UUID on two volumes: which is which cannot be told from it. One
+    // already mounted at the folder keeps it; the others are refused. A
+    // volume with the target's UUID that is another drive than the one
+    // chosen is refused too.
+    let shared: BTreeSet<String> = shared_ids(&volumes)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    for volume in volumes.iter_mut().filter(|v| v.id != api::INTERNAL) {
+        if shared.contains(&volume.id) && !at_its_folder(volume) {
+            volume.refused = Some(SAME_ID.to_string());
+        } else if !target_drive.is_empty()
+            && volume.id == target
+            && drive_key(inventory, &volume.device) != target_drive
+        {
+            volume.refused = Some(NOT_THE_DRIVE.to_string());
         }
     }
 
@@ -300,16 +389,22 @@ fn target_of(id: &str, saved_label: &str, volumes: &[Volume]) -> Target {
     if id == api::INTERNAL || !api::valid_id(id) {
         return Target::default();
     }
-    let volume = volumes.iter().find(|v| v.id == id);
+    // The one mounted at the folder, when several have the UUID.
+    let volume = volumes
+        .iter()
+        .find(|v| v.id == id && at_its_folder(v))
+        .or_else(|| volumes.iter().find(|v| v.id == id));
     let available = volume.is_some_and(|v| {
         v.supported
             && !v.ejected
+            && v.refused.is_none()
             && v.mounted == Some(Mount::Rw)
-            && v.mount_path.as_deref() == Some(api::mount_dir(id).as_str())
+            && at_its_folder(v)
     });
     Target {
         id: id.to_string(),
         label: volume
+            .filter(|v| v.refused.is_none())
             .map(|v| v.label.clone())
             .filter(|l| !l.is_empty())
             .or_else(|| (!saved_label.is_empty()).then(|| saved_label.to_string()))
@@ -392,13 +487,23 @@ pub fn plan(state: &State, inventory: &Inventory, media: &[String]) -> Vec<Step>
             steps.push(Step::RemoveDir { path });
         }
     }
+    let shared = shared_ids(&state.volumes);
     for volume in &state.volumes {
         if volume.id == api::INTERNAL || !volume.supported || volume.ejected {
             continue;
         }
-        let rw = volume.id == state.target.id;
+        // A UUID more than one volume has: none is mounted anew, and one
+        // already mounted at the folder is left as it is, until one of
+        // them is unplugged.
+        if shared.contains(volume.id.as_str()) {
+            continue;
+        }
+        // Read-write only for the drive chosen, not one with its UUID.
+        let rw = volume.id == state.target.id && volume.refused.as_deref() != Some(NOT_THE_DRIVE);
         let folder = api::mount_dir(&volume.id);
         match (volume.mounted, volume.mount_path.as_deref()) {
+            // Another device still holds the folder (detached first).
+            (None, _) if mounted.contains(folder.as_str()) => {}
             (None, _) => steps.push(Step::Mount {
                 device: volume.device.clone(),
                 id: volume.id.clone(),
@@ -516,19 +621,44 @@ impl Storage {
         }
     }
 
-    /// `RECORD_STORAGE` and the label saved with it.
-    fn target(system: &System) -> (String, String) {
+    /// `RECORD_STORAGE`, and the label and drive saved with it.
+    fn target(system: &System) -> (String, String, String) {
         system
             .load_config()
-            .map(|c| (c.record_storage, c.record_storage_label))
-            .unwrap_or_else(|| (api::INTERNAL.to_string(), String::new()))
+            .map(|c| {
+                (
+                    c.record_storage,
+                    c.record_storage_label,
+                    c.record_storage_drive,
+                )
+            })
+            .unwrap_or_else(|| (api::INTERNAL.to_string(), String::new(), String::new()))
     }
 
     fn state_of(system: &System, inventory: &Inventory) -> State {
         let ejected = parse_ejected(&system.read(EJECTED).unwrap_or_default());
         let free = |path: &str| system.space(path).map(|(free, _)| free);
-        let (target, label) = Self::target(system);
-        build_state(inventory, &target, &label, &ejected, &free)
+        let (target, label, drive) = Self::target(system);
+        let mut state = build_state(inventory, &target, &label, &drive, &ejected, &free);
+        // Its recordings folder must be a folder on it, not a link to
+        // somewhere else (nor a file): else recordings go to the internal
+        // folder.
+        if state.target.available {
+            let id = state.target.id.clone();
+            let mount = system.path(&api::mount_dir(&id));
+            if folder_problem(&mount, &system.path(&api::recordings_dir(&id))) {
+                state.target.available = false;
+                state.target.recordings_dir = api::INTERNAL_RECORDINGS.to_string();
+                if let Some(volume) = state
+                    .volumes
+                    .iter_mut()
+                    .find(|v| v.id == id && at_its_folder(v))
+                {
+                    volume.refused = Some(NOT_A_FOLDER.to_string());
+                }
+            }
+        }
+        state
     }
 
     /// The state as it is now (nothing is changed).
@@ -616,21 +746,42 @@ impl Storage {
                 }
             }
         }
-        // The target's name as last seen, kept for when it is missing.
-        let (target, saved_label) = Self::target(system);
-        if let Some(volume) = state.volume(&target)
-            && target != api::INTERNAL
-            && !volume.label.is_empty()
-            && volume.label != saved_label
-            && let Err(error) = system.set_record_storage(&target, &volume.label)
+        // The target's name as last seen, kept for when it is missing; and
+        // what else identifies it when nothing was saved yet (a setting
+        // from before that was kept), taken from the one volume with its
+        // UUID.
+        let (target, saved_label, saved_drive) = Self::target(system);
+        if target != api::INTERNAL
+            && !shared_ids(&state.volumes).contains(target.as_str())
+            && let Some(volume) = state
+                .volumes
+                .iter()
+                .find(|v| v.id == target && v.refused.is_none())
         {
-            log.push(error);
+            let label = if volume.label.is_empty() {
+                saved_label.clone()
+            } else {
+                volume.label.clone()
+            };
+            let drive = if saved_drive.is_empty() {
+                drive_key(&inventory, &volume.device)
+            } else {
+                saved_drive.clone()
+            };
+            if (label != saved_label || drive != saved_drive)
+                && let Err(error) = system.set_record_storage(&target, &label, &drive)
+            {
+                log.push(error);
+            }
         }
         // The target's folder, whenever it is mounted read-write.
         if state.target.id != api::INTERNAL {
             let state = self.state(system);
             if state.target.available
-                && let Some(volume) = state.volume(&state.target.id)
+                && let Some(volume) = state
+                    .volumes
+                    .iter()
+                    .find(|v| v.id == state.target.id && at_its_folder(v))
             {
                 let _ = recordings_folder(system, volume);
             }
@@ -651,26 +802,16 @@ impl Storage {
             return Err(format!("{device}: not a volume that can be mounted"));
         }
         let folder = api::mount_dir(id);
+        // Never a second drive over one mounted there (one with the same
+        // UUID, or a stale mount not detached yet).
+        let mounts = parse_mounts(&system.read("/proc/mounts").unwrap_or_default());
+        if mounts.iter().any(|m| m.path == folder) {
+            return Err(format!(
+                "Could not mount {device}: another drive is mounted at {folder}."
+            ));
+        }
+        let options = mount_options(fs, rw, service_ids(system))?;
         media_folder(system, &folder)?;
-        let mut options = vec![if rw { "rw" } else { "ro" }.to_string(), "noatime".into()];
-        if matches!(fs, "exfat" | "vfat" | "ntfs") {
-            // No owners on these: the service account gets the files.
-            match service_ids(system) {
-                Some((uid, gid)) => {
-                    options.push(format!("uid={uid},gid={gid},dmask=0027,fmask=0137"))
-                }
-                None if rw => {
-                    return Err(
-                        "There is no livestage account on this machine to give the drive to."
-                            .to_string(),
-                    );
-                }
-                None => {}
-            }
-        }
-        if matches!(fs, "exfat" | "vfat") {
-            options.push("iocharset=utf8".into());
-        }
         let fstype = if fs == "ntfs" { "ntfs3" } else { fs };
         let result = system.run(
             "mount",
@@ -678,7 +819,7 @@ impl Storage {
                 "-t",
                 fstype,
                 "-o",
-                &options.join(","),
+                &options,
                 &format!("/dev/{device}"),
                 &folder,
             ],
@@ -727,12 +868,19 @@ impl Storage {
         }
         let _lock = Self::locked(system)?;
         let mut label = String::new();
+        let mut drive = String::new();
         if id != api::INTERNAL {
-            let state = self.state(system);
+            let inventory = self.inventory(system);
+            let state = Self::state_of(system, &inventory);
             let volume = state
                 .volume(id)
                 .ok_or("That drive is not plugged in.")?
                 .clone();
+            if shared_ids(&state.volumes).contains(id) {
+                return Err(format!(
+                    "More than one drive plugged in has the volume ID {id}; unplug the one not to record to."
+                ));
+            }
             if !volume.supported {
                 return Err(format!(
                     "{} cannot be recorded to: LiveStage writes exFAT, FAT32, NTFS and ext4 drives. Format it to use it.",
@@ -768,8 +916,10 @@ impl Storage {
             }
             recordings_folder(system, &volume)?;
             label = volume.label.clone();
+            // This drive from now on, not just any with its UUID.
+            drive = drive_key(&inventory, &volume.device);
         }
-        system.set_record_storage(id, &label)?;
+        system.set_record_storage(id, &label, &drive)?;
         // The previous target goes back to read-only.
         self.reconcile(system);
         Ok(())
@@ -783,24 +933,32 @@ impl Storage {
         }
         let _lock = Self::locked(system)?;
         let state = self.state(system);
-        let volume = state
-            .volume(id)
-            .ok_or("That drive is not plugged in.")?
-            .clone();
-        if let Some(path) = &volume.mount_path {
-            let _ = system.run("sync", &[]);
-            system.run("umount", &[path]).map_err(|error| {
-                format!(
-                    "{} is in use and cannot be ejected now ({error}).",
-                    describe(&volume)
-                )
-            })?;
-            if is_media_folder(path) {
-                let _ = std::fs::remove_dir(system.path(path));
-            }
+        // Every volume with the UUID: which one is meant cannot be told.
+        let volumes: Vec<Volume> = state
+            .volumes
+            .iter()
+            .filter(|v| !id.is_empty() && v.id == id)
+            .cloned()
+            .collect();
+        if volumes.is_empty() {
+            return Err("That drive is not plugged in.".to_string());
         }
         let mut ejected = parse_ejected(&system.read(EJECTED).unwrap_or_default());
-        ejected.insert((volume.device.clone(), volume.id.clone()));
+        for volume in &volumes {
+            if let Some(path) = &volume.mount_path {
+                let _ = system.run("sync", &[]);
+                system.run("umount", &[path]).map_err(|error| {
+                    format!(
+                        "{} is in use and cannot be ejected now ({error}).",
+                        describe(volume)
+                    )
+                })?;
+                if is_media_folder(path) {
+                    let _ = std::fs::remove_dir(system.path(path));
+                }
+            }
+            ejected.insert((volume.device.clone(), volume.id.clone()));
+        }
         system.write(EJECTED, &ejected_file(&ejected))?;
         Ok(())
     }
@@ -904,7 +1062,7 @@ impl Storage {
             if let Some(volume) = state.volume(&id) {
                 recordings_folder(system, volume)?;
             }
-            system.set_record_storage(&id, label)?;
+            system.set_record_storage(&id, label, &drive_key(&inventory, &partition))?;
         }
         self.reconcile(system);
         Ok(())
@@ -919,9 +1077,22 @@ impl Storage {
             self.reconcile(system);
         }
         let state = self.state(system);
-        let dir = state.target.recordings_dir;
-        if let Err(error) = std::fs::create_dir_all(system.path(&dir)) {
-            eprintln!("livestage-setup: {dir}: {error}");
+        let mut dir = state.target.recordings_dir.clone();
+        let made = match state
+            .volumes
+            .iter()
+            .find(|v| state.target.available && v.id == state.target.id && at_its_folder(v))
+        {
+            // On the drive: made there only, never through a link.
+            Some(volume) if volume.id != api::INTERNAL => recordings_folder(system, volume),
+            _ => std::fs::create_dir_all(system.path(&dir)).map_err(|e| format!("{dir}: {e}")),
+        };
+        if let Err(error) = made {
+            eprintln!("livestage-setup: {error}");
+            if dir != api::INTERNAL_RECORDINGS {
+                dir = api::INTERNAL_RECORDINGS.to_string();
+                let _ = std::fs::create_dir_all(system.path(&dir));
+            }
         }
         drop(lock);
         dir
@@ -941,28 +1112,141 @@ fn describe(volume: &Volume) -> String {
     }
 }
 
+/// What every external volume is mounted with besides `ro`/`rw`: nothing on
+/// it runs, no set-user-ID file gives its owner's rights, no device node on
+/// it opens a device. (Read-only stops none of that.)
+const SAFE_OPTIONS: [&str; 4] = ["nosuid", "nodev", "noexec", "noatime"];
+
+/// `mount -o` for an external volume of filesystem `fs`. `owner` is the
+/// service account's uid and gid, given the files on filesystems with no
+/// owners of their own (needed to write to one).
+fn mount_options(fs: &str, rw: bool, owner: Option<(u32, u32)>) -> Result<String, String> {
+    let mut options = vec![if rw { "rw" } else { "ro" }.to_string()];
+    options.extend(SAFE_OPTIONS.iter().map(|o| o.to_string()));
+    if matches!(fs, "exfat" | "vfat" | "ntfs") {
+        match owner {
+            Some((uid, gid)) => options.push(format!("uid={uid},gid={gid},dmask=0027,fmask=0137")),
+            None if rw => {
+                return Err(
+                    "There is no livestage account on this machine to give the drive to."
+                        .to_string(),
+                );
+            }
+            None => {}
+        }
+    }
+    if matches!(fs, "exfat" | "vfat") {
+        options.push("iocharset=utf8".into());
+    }
+    Ok(options.join(","))
+}
+
+/// `mount -o` to switch a mounted external volume between `ro` and `rw`.
+/// The safe options are given again: a remount may otherwise drop them.
+fn remount_options(rw: bool) -> String {
+    let mut options = vec!["remount", if rw { "rw" } else { "ro" }];
+    options.extend(SAFE_OPTIONS);
+    options.join(",")
+}
+
 fn remount(system: &System, path: &str, rw: bool) -> Result<(), String> {
-    let options = if rw { "remount,rw" } else { "remount,ro" };
     system
-        .run("mount", &["-o", options, path])
+        .run("mount", &["-o", &remount_options(rw), path])
         .map(|_| ())
         .map_err(|error| format!("Could not remount {path}: {error}"))
 }
 
-/// The recordings folder on an external volume, the service's on ext4.
+/// The recordings folder on an external volume (mounted at its folder), the
+/// service's on ext4.
 fn recordings_folder(system: &System, volume: &Volume) -> Result<(), String> {
     let dir = api::recordings_dir(&volume.id);
-    let path = system.path(&dir);
-    std::fs::create_dir_all(&path).map_err(|e| format!("Could not make {dir}: {e}"))?;
-    #[cfg(unix)]
-    if system.is_live()
-        && volume.fs.as_deref() == Some("ext4")
-        && let Some((uid, gid)) = service_ids(system)
-    {
-        std::os::unix::fs::chown(&path, Some(uid), Some(gid))
-            .map_err(|e| format!("Could not give {dir} to livestage: {e}"))?;
+    let owner = if system.is_live() && volume.fs.as_deref() == Some("ext4") {
+        service_ids(system)
+    } else {
+        None
+    };
+    make_folder(
+        &system.path(&api::mount_dir(&volume.id)),
+        &system.path(&dir),
+        owner,
+    )
+    .map_err(|e| format!("Could not make {dir}: {e}"))
+}
+
+/// Makes `path`, a folder right under `mount` (a volume's mount point, which
+/// is root's), and gives it to `owner`. What is on the drive is not trusted:
+/// a link there is never followed, and anything but a folder of that same
+/// filesystem is refused. The owner is changed on the folder as opened, not
+/// on its name looked up again.
+fn make_folder(
+    mount: &std::path::Path,
+    path: &std::path::Path,
+    owner: Option<(u32, u32)>,
+) -> Result<(), String> {
+    match std::fs::create_dir(path) {
+        Ok(()) => {}
+        // Made before, or something else is there (a link is not followed:
+        // mkdir does not).
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.to_string()),
     }
-    Ok(())
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let not_a_folder = || format!("the drive {NOT_A_FOLDER}");
+        // O_NOFOLLOW: a link fails here (ELOOP); O_DIRECTORY: so does a file.
+        let folder = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(path)
+            .map_err(|error| match error.raw_os_error() {
+                Some(libc::ELOOP) | Some(libc::ENOTDIR) => not_a_folder(),
+                _ => error.to_string(),
+            })?;
+        let opened = folder.metadata().map_err(|e| e.to_string())?;
+        let volume = std::fs::symlink_metadata(mount).map_err(|e| e.to_string())?;
+        if !volume.is_dir() || !opened.is_dir() || opened.dev() != volume.dev() {
+            return Err(not_a_folder());
+        }
+        if let Some((uid, gid)) = owner {
+            std::os::unix::fs::fchown(&folder, Some(uid), Some(gid))
+                .map_err(|e| format!("could not give it to livestage: {e}"))?;
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Off the appliance (a tree under --root): checked by name; no
+        // owner is changed.
+        let _ = owner;
+        if folder_problem(mount, path) {
+            return Err(format!("the drive {NOT_A_FOLDER}"));
+        }
+        Ok(())
+    }
+}
+
+/// `path` (the recordings folder of the volume mounted at `mount`) is there
+/// but is not a folder of that volume: a link (to anywhere), a file, or
+/// another filesystem. Not there is no problem: it is made when needed.
+fn folder_problem(mount: &std::path::Path, path: &std::path::Path) -> bool {
+    let Ok(entry) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    // symlink_metadata: a link is a link here, never a folder.
+    if !entry.is_dir() {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(mount).map_or(true, |m| m.dev() != entry.dev())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mount;
+        false
+    }
 }
 
 /// Makes /media/<id>. /media is on the read-only system: when nothing is
@@ -1447,7 +1731,7 @@ pub(crate) mod tests {
 
         // Recording internally: every supported volume read-only; the stale
         // mount and the empty folder go.
-        let state = build_state(&inventory, "internal", "", &Ejected::new(), &free);
+        let state = build_state(&inventory, "internal", "", "", &Ejected::new(), &free);
         let steps = plan(&state, &inventory, &media);
         assert_eq!(
             steps,
@@ -1477,7 +1761,7 @@ pub(crate) mod tests {
         );
 
         // The stick is the target: read-write. Ejected: left alone.
-        let state = build_state(&inventory, "1A2B-3C4D", "", &Ejected::new(), &free);
+        let state = build_state(&inventory, "1A2B-3C4D", "", "", &Ejected::new(), &free);
         assert!(!state.target.available);
         assert_eq!(state.target.label, "SHOW \"A\"");
         assert_eq!(state.target.recordings_dir, api::INTERNAL_RECORDINGS);
@@ -1486,7 +1770,7 @@ pub(crate) mod tests {
             rw: true
         }));
         let ejected: Ejected = [("sdd".to_string(), "AAAA-BBBB".to_string())].into();
-        let state = build_state(&inventory, "1A2B-3C4D", "", &ejected, &free);
+        let state = build_state(&inventory, "1A2B-3C4D", "", "", &ejected, &free);
         assert!(state.volume("AAAA-BBBB").unwrap().ejected);
         assert!(
             !plan(&state, &inventory, &[])
@@ -1497,7 +1781,7 @@ pub(crate) mod tests {
         // Once it is read-write, it is where recordings go.
         let mut mounted = inventory.clone();
         mounted.mounts[3].rw = true;
-        let state = build_state(&mounted, "1A2B-3C4D", "", &Ejected::new(), &free);
+        let state = build_state(&mounted, "1A2B-3C4D", "", "", &Ejected::new(), &free);
         assert!(state.target.available);
         assert_eq!(
             state.target.recordings_dir,
@@ -1507,12 +1791,12 @@ pub(crate) mod tests {
         // Another drive took sdb's name: the old mount is stale.
         let mut swapped = mounted.clone();
         swapped.probes.get_mut("sdb1").unwrap().uuid = "5555-6666".into();
-        let state = build_state(&swapped, "1A2B-3C4D", "", &Ejected::new(), &free);
+        let state = build_state(&swapped, "1A2B-3C4D", "", "", &Ejected::new(), &free);
         assert!(state.falling_back());
         // No name ever known for it: its UUID.
         assert_eq!(state.target.label, "1A2B-3C4D");
         // Its name as saved when it was last seen.
-        let state = build_state(&swapped, "1A2B-3C4D", "SHOW", &Ejected::new(), &free);
+        let state = build_state(&swapped, "1A2B-3C4D", "SHOW", "", &Ejected::new(), &free);
         assert_eq!(state.target.label, "SHOW");
         assert!(state.falling_back());
         let steps = plan(&state, &swapped, &[]);
@@ -1653,13 +1937,23 @@ pub(crate) mod tests {
             },
         );
         assert!(reply.ok, "{:?}", reply.error);
+        // What else identifies it is saved with it.
+        let drive = system.load_config().unwrap().record_storage_drive;
+        assert_eq!(drive, "exfat/64000000000/SanDisk_Ultra/-");
         // Renamed on a computer since: the new name is kept once seen.
-        system.set_record_storage("1A2B-3C4D", "OLD NAME").unwrap();
+        system
+            .set_record_storage("1A2B-3C4D", "OLD NAME", &drive)
+            .unwrap();
         storage.poll(&system);
         assert_eq!(
             system.load_config().unwrap().record_storage_label,
             "SHOW \"A\""
         );
+        // A setting from before the drive was saved: taken from the one
+        // volume with the UUID when it is seen.
+        system.set_record_storage("1A2B-3C4D", "SHOW", "").unwrap();
+        storage.poll(&system);
+        assert_eq!(system.load_config().unwrap().record_storage_drive, drive);
         // Unplugged: gone from sysfs, blkid and the mounts.
         std::fs::remove_dir_all(root.join("sys/block/sdb")).unwrap();
         std::fs::remove_dir_all(root.join("sys/class/block/sdb1")).unwrap();
@@ -1683,12 +1977,295 @@ pub(crate) mod tests {
     #[test]
     fn the_path_falls_back_to_the_internal_folder() {
         let (system, root) = machine("path");
-        system.set_record_storage("1A2B-3C4D", "SHOW").unwrap();
+        system.set_record_storage("1A2B-3C4D", "SHOW", "").unwrap();
         let storage = Storage::new();
         // Plugged in but not mounted read-write (nothing runs under --root).
         assert_eq!(storage.recordings_path(&system), api::INTERNAL_RECORDINGS);
         assert!(root.join("data/livestage/recordings").is_dir());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn external_volumes_never_run_anything_from_the_drive() {
+        for fs in ["exfat", "vfat", "ntfs", "ext4"] {
+            for rw in [false, true] {
+                let options = mount_options(fs, rw, Some((100, 101))).unwrap();
+                let options: Vec<&str> = options.split(',').collect();
+                for safe in ["nosuid", "nodev", "noexec", "noatime"] {
+                    assert!(options.contains(&safe), "{fs} {rw}: {options:?}");
+                }
+                assert_eq!(options[0], if rw { "rw" } else { "ro" });
+            }
+        }
+        assert!(
+            mount_options("exfat", true, Some((100, 101)))
+                .unwrap()
+                .contains("uid=100,gid=101")
+        );
+        assert!(
+            !mount_options("ext4", true, Some((100, 101)))
+                .unwrap()
+                .contains("uid=")
+        );
+        // No account to give a FAT drive to: read-only only.
+        assert!(mount_options("exfat", true, None).is_err());
+        assert!(mount_options("exfat", false, None).is_ok());
+        assert_eq!(
+            remount_options(true),
+            "remount,rw,nosuid,nodev,noexec,noatime"
+        );
+        assert_eq!(
+            remount_options(false),
+            "remount,ro,nosuid,nodev,noexec,noatime"
+        );
+    }
+
+    /// `inventory` with one more stick, sdg, its one volume `uuid`.
+    fn with_stick(inventory: &Inventory, uuid: &str, model: &str) -> Inventory {
+        let mut inventory = inventory.clone();
+        inventory.disks.push(BlockDisk {
+            name: "sdg".into(),
+            model: Some(model.into()),
+            size_bytes: 64_000_000_000,
+            removable: true,
+            read_only: false,
+            bus_path: String::new(),
+            dev: "8:96".into(),
+            serial: None,
+            parts: vec![BlockPart {
+                name: "sdg1".into(),
+                number: 1,
+                size_bytes: 64_000_000_000,
+                dev: "8:97".into(),
+            }],
+        });
+        inventory.probes.insert(
+            "sdg1".into(),
+            Probe {
+                label: "SHOW \"A\"".into(),
+                uuid: uuid.into(),
+                fs: "exfat".into(),
+            },
+        );
+        inventory
+    }
+
+    fn touches(steps: &[Step], device: &str, folder: &str) -> bool {
+        steps.iter().any(|s| match s {
+            Step::Mount { device: d, .. } => d == device,
+            Step::Remount { path, .. } => path == folder,
+            _ => false,
+        })
+    }
+
+    /// A second drive with the target's UUID is never mounted over it, nor
+    /// made the target (#372).
+    #[test]
+    fn a_second_drive_with_the_same_uuid_is_refused() {
+        let (system, root) = machine("same-uuid");
+        let inventory = Storage::new().inventory(&system);
+        let free = |_: &str| None;
+        let folder = "/media/1A2B-3C4D";
+        let drive = drive_key(&inventory, "sdb1");
+        assert_eq!(drive, "exfat/64000000000/SanDisk_Ultra/-");
+
+        // The target (sdb1) mounted read-write, recording; sdg1 comes with
+        // its UUID: sdg1 is refused and not mounted, sdb1 is left as it is.
+        let mut mounted = inventory.clone();
+        mounted.mounts[3].rw = true;
+        let both = with_stick(&mounted, "1A2B-3C4D", "SanDisk Ultra");
+        let state = build_state(&both, "1A2B-3C4D", "", &drive, &Ejected::new(), &free);
+        let sdg = state.volumes.iter().find(|v| v.device == "sdg1").unwrap();
+        let sdb = state.volumes.iter().find(|v| v.device == "sdb1").unwrap();
+        assert_eq!(sdg.refused.as_deref(), Some(SAME_ID));
+        assert_eq!(sdg.mounted, None);
+        assert_eq!(sdb.refused, None);
+        assert!(state.target.available);
+        assert_eq!(
+            state.target.recordings_dir,
+            api::recordings_dir("1A2B-3C4D")
+        );
+        let steps = plan(&state, &both, &[]);
+        assert!(!touches(&steps, "sdg1", folder), "{steps:?}");
+        assert!(!steps.contains(&Step::Detach {
+            path: folder.into()
+        }));
+
+        // The same with no drive saved (a setting from before): still
+        // refused, by the UUID alone.
+        let state = build_state(&both, "1A2B-3C4D", "", "", &Ejected::new(), &free);
+        assert!(state.target.available);
+        assert!(!touches(&plan(&state, &both, &[]), "sdg1", folder));
+
+        // Both plugged in, neither mounted (a start): neither is mounted,
+        // nothing is recorded to either.
+        let mut cold = both.clone();
+        cold.mounts.retain(|m| m.path != folder);
+        let state = build_state(&cold, "1A2B-3C4D", "", &drive, &Ejected::new(), &free);
+        assert!(
+            state
+                .volumes
+                .iter()
+                .filter(|v| v.id == "1A2B-3C4D")
+                .all(|v| v.refused.as_deref() == Some(SAME_ID))
+        );
+        assert!(!state.target.available);
+        assert_eq!(state.target.recordings_dir, api::INTERNAL_RECORDINGS);
+        let steps = plan(&state, &cold, &[]);
+        assert!(!touches(&steps, "sdb1", folder) && !touches(&steps, "sdg1", folder));
+
+        // Not the target either: one already mounted keeps its mount, the
+        // newcomer is not mounted.
+        let state = build_state(&both, "internal", "", "", &Ejected::new(), &free);
+        assert!(!touches(&plan(&state, &both, &[]), "sdg1", folder));
+
+        // Asked for by its UUID: refused, the drive is not changed.
+        disk(
+            &root,
+            "sdg",
+            "SanDisk Ultra",
+            64,
+            true,
+            &[("sdg1", 1, 64_000)],
+        );
+        let blkid = format!("{BLKID}/dev/sdg1: LABEL=\"X\" UUID=\"1A2B-3C4D\" TYPE=\"exfat\"\n");
+        put(&root, BLKID_SAMPLE, &blkid);
+        let storage = Storage::new();
+        let reply = storage.handle(
+            &system,
+            &Request::Use {
+                id: "1A2B-3C4D".into(),
+            },
+        );
+        assert!(!reply.ok);
+        assert!(
+            reply.error.unwrap().contains("More than one drive"),
+            "refused for the shared UUID"
+        );
+        assert_eq!(system.load_config().map(|c| c.record_storage), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// With the target unplugged, another drive with its UUID does not
+    /// become the target: it is only mounted read-only (#372).
+    #[test]
+    fn a_lookalike_of_the_target_is_not_written_to() {
+        let (system, root) = machine("lookalike");
+        let inventory = Storage::new().inventory(&system);
+        let free = |_: &str| None;
+        let drive = drive_key(&inventory, "sdb1");
+        // sdb is gone; sdg has its UUID, label and size, another model.
+        let mut gone = inventory.clone();
+        gone.disks.retain(|d| d.name != "sdb");
+        gone.probes.remove("sdb1");
+        gone.mounts.retain(|m| m.device() != Some("sdb1"));
+        let other = with_stick(&gone, "1A2B-3C4D", "Kingston DataTraveler");
+        let state = build_state(&other, "1A2B-3C4D", "SHOW", &drive, &Ejected::new(), &free);
+        let sdg = state.volume("1A2B-3C4D").unwrap();
+        assert_eq!(sdg.refused.as_deref(), Some(NOT_THE_DRIVE));
+        assert!(!state.target.available);
+        assert_eq!(state.target.label, "SHOW");
+        assert!(plan(&state, &other, &[]).contains(&Step::Mount {
+            device: "sdg1".into(),
+            id: "1A2B-3C4D".into(),
+            fs: "exfat".into(),
+            rw: false
+        }));
+        // Mounted read-write before (by hand): back to read-only.
+        let mut rw = other.clone();
+        rw.mounts.push(MountEntry {
+            source: "/dev/sdg1".into(),
+            path: "/media/1A2B-3C4D".into(),
+            fs: "exfat".into(),
+            rw: true,
+        });
+        let state = build_state(&rw, "1A2B-3C4D", "SHOW", &drive, &Ejected::new(), &free);
+        assert!(!state.target.available);
+        assert!(plan(&state, &rw, &[]).contains(&Step::Remount {
+            path: "/media/1A2B-3C4D".into(),
+            rw: false
+        }));
+        // The same drive again (same model, size, filesystem): the target.
+        let same = with_stick(&gone, "1A2B-3C4D", "SanDisk Ultra");
+        let state = build_state(&same, "1A2B-3C4D", "SHOW", &drive, &Ejected::new(), &free);
+        assert_eq!(state.volume("1A2B-3C4D").unwrap().refused, None);
+        assert!(plan(&state, &same, &[]).contains(&Step::Mount {
+            device: "sdg1".into(),
+            id: "1A2B-3C4D".into(),
+            fs: "exfat".into(),
+            rw: true
+        }));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The recordings folder is used only when it is a folder on the drive
+    /// (#369).
+    #[test]
+    fn a_recordings_folder_that_is_not_a_folder_is_refused() {
+        let (system, root) = machine("folder");
+        // The stick is the target, mounted read-write.
+        let mounts = std::fs::read_to_string(root.join("proc/mounts"))
+            .unwrap()
+            .replace("/media/1A2B-3C4D exfat ro", "/media/1A2B-3C4D exfat rw");
+        put(&root, "/proc/mounts", &mounts);
+        system.set_record_storage("1A2B-3C4D", "SHOW", "").unwrap();
+        let storage = Storage::new();
+        assert!(storage.state(&system).target.available);
+        // A file where the folder goes.
+        put(&root, "/media/1A2B-3C4D/LiveStage Recordings", "");
+        let state = storage.state(&system);
+        assert!(!state.target.available);
+        assert_eq!(state.target.recordings_dir, api::INTERNAL_RECORDINGS);
+        assert_eq!(
+            state.volume("1A2B-3C4D").unwrap().refused.as_deref(),
+            Some(NOT_A_FOLDER)
+        );
+        let volume = state.volume("1A2B-3C4D").unwrap();
+        assert!(recordings_folder(&system, volume).is_err());
+        assert_eq!(storage.recordings_path(&system), api::INTERNAL_RECORDINGS);
+        // The target stays mounted read-write: nothing flips back and forth.
+        let inventory = storage.inventory(&system);
+        assert!(!touches(
+            &plan(&state, &inventory, &[]),
+            "sdb1",
+            "/media/1A2B-3C4D"
+        ));
+        // A real folder: used.
+        std::fs::remove_file(root.join("media/1A2B-3C4D/LiveStage Recordings")).unwrap();
+        assert_eq!(
+            storage.recordings_path(&system),
+            api::recordings_dir("1A2B-3C4D")
+        );
+        assert!(root.join("media/1A2B-3C4D/LiveStage Recordings").is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A link on the drive to a folder of the machine is never followed:
+    /// not made through, not given to anyone (#369).
+    #[cfg(unix)]
+    #[test]
+    fn a_recordings_folder_link_is_not_followed() {
+        let base = std::env::temp_dir().join(format!("livestage-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let mount = base.join("media/1A2B-3C4D");
+        let host = base.join("var/lib/livestage");
+        std::fs::create_dir_all(&mount).unwrap();
+        std::fs::create_dir_all(&host).unwrap();
+        let link = mount.join(api::RECORDINGS_FOLDER);
+        std::os::unix::fs::symlink(&host, &link).unwrap();
+        assert!(folder_problem(&mount, &link));
+        let error = make_folder(&mount, &link, None).unwrap_err();
+        assert!(error.contains("not a folder"), "{error}");
+        // A dangling one is not made through either.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(base.join("elsewhere"), &link).unwrap();
+        assert!(make_folder(&mount, &link, None).is_err());
+        assert!(!base.join("elsewhere").exists());
+        // A real one is fine.
+        std::fs::remove_file(&link).unwrap();
+        make_folder(&mount, &link, None).unwrap();
+        assert!(!folder_problem(&mount, &link));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

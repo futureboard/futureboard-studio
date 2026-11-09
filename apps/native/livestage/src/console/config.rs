@@ -46,6 +46,10 @@ pub struct SetupConfig {
     /// The name of that volume when it was last seen (`RECORD_STORAGE_LABEL`),
     /// for saying which drive is missing; empty when none was known.
     pub record_storage_label: String,
+    /// What else identifies that volume (`RECORD_STORAGE_DRIVE`: its
+    /// drive's serial number and model, its size and filesystem), since a
+    /// UUID can be copied onto any drive; empty when none was known.
+    pub record_storage_drive: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +103,7 @@ impl Default for SetupConfig {
             audio: AudioChoice::default(),
             record_storage: storage_api::INTERNAL.to_string(),
             record_storage_label: String::new(),
+            record_storage_drive: String::new(),
         }
     }
 }
@@ -156,6 +161,7 @@ impl SetupConfig {
                 }
                 "RECORD_STORAGE" => config.record_storage = parse_record_storage(&value),
                 "RECORD_STORAGE_LABEL" => config.record_storage_label = parse_storage_label(&value),
+                "RECORD_STORAGE_DRIVE" => config.record_storage_drive = parse_storage_drive(&value),
                 _ => {}
             }
         }
@@ -224,6 +230,7 @@ impl SetupConfig {
         put("AUDIO_BUFFER", &self.audio.buffer.to_string());
         put("RECORD_STORAGE", &self.record_storage);
         put("RECORD_STORAGE_LABEL", &self.record_storage_label);
+        put("RECORD_STORAGE_DRIVE", &self.record_storage_drive);
         out
     }
 
@@ -270,6 +277,21 @@ pub fn parse_record_storage(value: &str) -> String {
 pub fn parse_storage_label(value: &str) -> String {
     let value = value.trim();
     if value.chars().count() <= 64 && !value.chars().any(char::is_control) {
+        value.to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// `RECORD_STORAGE_DRIVE`: what the storage service wrote (letters, digits
+/// and `-._/`, at most 256 of them); anything else is none.
+pub fn parse_storage_drive(value: &str) -> String {
+    let value = value.trim();
+    if value.len() <= 256
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '/'))
+    {
         value.to_string()
     } else {
         String::new()
@@ -603,6 +625,7 @@ mod tests {
             },
             record_storage: "1A2B-3C4D".into(),
             record_storage_label: "Show \"$1\"".into(),
+            record_storage_drive: "exfat/64000000000/SanDisk_Ultra/4C5300012305".into(),
         };
         let file = config.to_file();
         assert!(file.contains("NET_ADDRESS=\"10.0.0.20/16\""));
@@ -651,6 +674,15 @@ mod tests {
         assert_eq!(
             SetupConfig::parse(&format!("RECORD_STORAGE_LABEL={}\n", "x".repeat(65)))
                 .record_storage_label,
+            ""
+        );
+        assert_eq!(
+            SetupConfig::parse("RECORD_STORAGE_DRIVE=\"ext4/8000000000/Odd/-\"\n")
+                .record_storage_drive,
+            "ext4/8000000000/Odd/-"
+        );
+        assert_eq!(
+            SetupConfig::parse("RECORD_STORAGE_DRIVE=\"a b$(reboot)\"\n").record_storage_drive,
             ""
         );
     }

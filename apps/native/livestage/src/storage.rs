@@ -465,6 +465,7 @@ mod tests {
             mount_path: Some(format!("/media/{id}")),
             supported: true,
             ejected: false,
+            refused: None,
         }
     }
 

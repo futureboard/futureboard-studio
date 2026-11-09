@@ -196,12 +196,14 @@ impl System {
         self.save_settings(&config.to_file())
     }
 
-    /// Sets `RECORD_STORAGE` and `RECORD_STORAGE_LABEL` (the volume's name,
-    /// for when it is missing) in the settings, leaving the rest as it is.
-    pub fn set_record_storage(&self, id: &str, label: &str) -> Result<(), String> {
+    /// Sets `RECORD_STORAGE`, `RECORD_STORAGE_LABEL` (the volume's name,
+    /// for when it is missing) and `RECORD_STORAGE_DRIVE` (what else
+    /// identifies it) in the settings, leaving the rest as it is.
+    pub fn set_record_storage(&self, id: &str, label: &str, drive: &str) -> Result<(), String> {
         let text = self.read(SETUP_CONF).unwrap_or_default();
         let text = config::set_variable(&text, "RECORD_STORAGE", id);
         let text = config::set_variable(&text, "RECORD_STORAGE_LABEL", label);
+        let text = config::set_variable(&text, "RECORD_STORAGE_DRIVE", drive);
         self.save_settings(&text)
     }
 

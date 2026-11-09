@@ -142,6 +142,12 @@ function VolumeState(props: { volume: StorageVolume }) {
   const { volume } = props
   if (!volume.supported) return <span className="volume-state off">Unsupported{volume.fs ? ` · ${volume.fs}` : ''}</span>
   if (volume.ejected) return <span className="volume-state off">Ejected</span>
+  if (volume.refused)
+    return (
+      <span className="volume-state off" title={`This drive ${volume.refused}.`}>
+        Refused
+      </span>
+    )
   if (volume.mounted === 'rw') return <span className="volume-state rw">Read-write</span>
   if (volume.mounted === 'ro') return <span className="volume-state">Read-only</span>
   return <span className="volume-state off">Not mounted</span>
@@ -349,6 +355,11 @@ export function StorageCard(props: { session: Session; recording: boolean; messa
             <span>
               <strong>{target.label} is ejected</strong> — recording to Internal. Choose Record here on it, or plug it
               in again, to record to it.
+            </span>
+          ) : storage.volumes.some((v) => v.id === target.id && v.refused) ? (
+            <span>
+              <strong>A drive with {target.label}'s volume ID</strong>{' '}
+              {storage.volumes.find((v) => v.id === target.id && v.refused)?.refused} — recording to Internal.
             </span>
           ) : storage.volumes.some((v) => v.id === target.id) ? (
             <span>
