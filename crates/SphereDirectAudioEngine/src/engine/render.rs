@@ -6522,6 +6522,7 @@ mod compensation_silence_tests {
                 level: 1.0,
                 enabled: true,
                 pre_fader: true,
+                wdw: false,
             }];
             let mut runtime = build(
                 vec![src, track("verb", "return"), track("master", "master")],
