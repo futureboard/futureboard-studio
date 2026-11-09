@@ -72,7 +72,7 @@ impl VoxDocument {
     /// The document an engine holds (after a host loaded a take into it).
     pub fn from_engine(engine: &crate::engine::CantoEngine) -> Self {
         Self {
-            notes: engine.notes.clone(),
+            notes: engine.notes.as_ref().clone(),
             key: engine.key % 12,
             scale: engine.scale,
             correct: engine.correct_amount,
@@ -377,10 +377,7 @@ impl VoxSession {
         let Some(note) = self.doc.notes.get(index).cloned() else {
             return;
         };
-        let mut engine = self.shared.lock();
-        if let Some(slot) = engine.notes.get_mut(index) {
-            *slot = note;
-        }
+        self.shared.lock().replace_note(index, note);
     }
 
     // ---- Edits -----------------------------------------------------------
@@ -610,6 +607,19 @@ mod tests {
         s.begin("tool:pitch");
         s.commit();
         assert_eq!(s.history().len(), 2);
+    }
+
+    #[test]
+    fn a_playback_fork_hears_a_later_edit() {
+        let mut s = session_with_notes();
+        let fork = s.shared().fork_playback();
+        s.begin("tool:pitch");
+        s.note_mut(0).unwrap().pitch = 63.0;
+        s.sync_note(0);
+        s.commit();
+        let mut out = vec![0.0f32; 32];
+        fork.render_following(0.0, false, &mut out);
+        assert!((fork.lock().notes[0].pitch - 63.0).abs() < 1e-4);
     }
 
     #[test]

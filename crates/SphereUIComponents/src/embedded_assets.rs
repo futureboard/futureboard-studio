@@ -247,3 +247,26 @@ impl AssetSource for EmbeddedAssets {
         Ok(list)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every Futureboard icon is what the asset source hands out for its path,
+    /// so no call site can still be drawing the glyph it replaced.
+    #[test]
+    fn every_futureboard_icon_is_served_for_its_path() {
+        let source = EmbeddedAssets::new();
+        for (path, svg) in crate::assets::FUTUREBOARD_ICONS {
+            let served = source
+                .load(path)
+                .expect("load")
+                .unwrap_or_else(|| panic!("{path} is not served"));
+            assert_eq!(
+                served.as_ref(),
+                svg.as_bytes(),
+                "{path} serves another glyph"
+            );
+        }
+    }
+}

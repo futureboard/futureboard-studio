@@ -131,16 +131,18 @@ impl Plugin for Voxtune {
     ) -> bool {
         let rate = buffer_config.sample_rate.round() as u32;
         self.instance.host_rate.store(rate, Ordering::Relaxed);
-        let _ = ara::HOST_RATE.compare_exchange(0, rate, Ordering::Relaxed, Ordering::Relaxed);
         self.scratch = vec![0.0; buffer_config.max_buffer_size as usize * 2];
         // A saved take (or a rate change) loads it at the host's rate.
+        // The transport rate matches this one, so `process` does not reload:
+        // loading allocates and takes the take lock.
         if !self.instance.ara_bound() {
             let take = self.params.take.read().clone();
             if let Some(take) = take {
                 let key = (take.path.clone(), rate);
                 if self.loaded.as_ref() != Some(&key) {
                     self.loaded = Some(key);
-                    self.instance.load_take(take.path, take.offset_sec, take.doc);
+                    self.instance
+                        .load_take(take.path, take.offset_sec, take.doc);
                 }
             }
         }
@@ -162,7 +164,7 @@ impl Plugin for Voxtune {
             .unwrap_or(0.0);
         self.instance.publish_transport(playing, pos);
         let frames = buffer.samples();
-        if frames == 0 || self.scratch.len() < frames * 2 {
+        if frames == 0 || !(rate.is_finite() && rate > 0.0) || self.scratch.len() < frames * 2 {
             return ProcessStatus::Normal;
         }
 
@@ -192,14 +194,17 @@ impl Plugin for Voxtune {
             }
         }
         let len = self.instance.take_len();
-        if len <= 0.0 || (self.engine.sample_rate() - rate).abs() > 0.5 {
+        if len <= 0.0 {
             return ProcessStatus::Normal;
         }
         let take_sec = pos - self.instance.offset();
         let block = frames as f64 / rate as f64;
         let in_take = playing && take_sec + block > 0.0 && take_sec < len;
         let out = &mut self.scratch[..frames * 2];
-        if !self.engine.render_following(take_sec, in_take, out) {
+        if !self
+            .engine
+            .render_following_host(take_sec, in_take, rate, out)
+        {
             return ProcessStatus::Normal;
         }
         let channels = buffer.as_slice();
@@ -222,10 +227,8 @@ impl Plugin for Voxtune {
 
 impl Vst3Plugin for Voxtune {
     const VST3_CLASS_ID: [u8; 16] = *b"FbSolfVoxtune001";
-    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[
-        Vst3SubCategory::Fx,
-        Vst3SubCategory::PitchShift,
-    ];
+    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] =
+        &[Vst3SubCategory::Fx, Vst3SubCategory::PitchShift];
     const VST3_ARA_FACTORY_CLASS_ID: Option<[u8; 16]> = Some(*b"FbSolfVoxtuneARA");
 
     fn ara_factory() -> *const std::ffi::c_void {

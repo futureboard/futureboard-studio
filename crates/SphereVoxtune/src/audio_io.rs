@@ -16,6 +16,48 @@ use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
+/// Rates below this are treated as a broken header. Resampling 1 Hz audio up
+/// to a project rate allocates tens of thousands of samples per input sample.
+pub const MIN_SAMPLE_RATE: u32 = 1_000;
+/// Upper bound for a file or a project rate we will resample.
+pub const MAX_SAMPLE_RATE: u32 = 384_000;
+/// 8 kHz up to 384 kHz. Wider ratios are refused.
+pub const MAX_UPSAMPLE: u32 = 48;
+/// One hour at 48 kHz. Past this, allocation is refused instead of aborting
+/// the process in `Vec::with_capacity`.
+pub const MAX_MONO_SAMPLES: usize = 48_000 * 60 * 60;
+
+/// Output length of resampling `input_len` from `src_rate` to `dst_rate`.
+/// `None` when the rate or the result is outside [`MIN_SAMPLE_RATE`] /
+/// [`MAX_MONO_SAMPLES`].
+pub fn bounded_output_len(input_len: usize, src_rate: u32, dst_rate: u32) -> Option<usize> {
+    if input_len == 0 || src_rate == 0 || dst_rate == 0 {
+        return Some(0);
+    }
+    if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&src_rate)
+        || !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&dst_rate)
+    {
+        return None;
+    }
+    if src_rate == dst_rate {
+        return (input_len <= MAX_MONO_SAMPLES).then_some(input_len);
+    }
+    if dst_rate > src_rate {
+        let ratio = (dst_rate as u64).div_ceil(src_rate as u64);
+        if ratio > MAX_UPSAMPLE as u64 {
+            return None;
+        }
+    }
+    let out = (input_len as u128)
+        .saturating_mul(dst_rate as u128)
+        .saturating_add(src_rate as u128 - 1)
+        / src_rate as u128;
+    if out > MAX_MONO_SAMPLES as u128 {
+        return None;
+    }
+    Some(out as usize)
+}
+
 #[derive(Debug, Clone)]
 pub struct DecodedAudio {
     /// Mono samples normalized to `-1.0..=1.0`, resampled to `sample_rate`.
@@ -69,11 +111,23 @@ pub fn decode_audio_file_to_stereo(
             .map(|frame| frame[channel])
             .collect()
     };
+    if raw.sample_rate < MIN_SAMPLE_RATE || raw.sample_rate > MAX_SAMPLE_RATE {
+        return Err(format!(
+            "Sample rate {} Hz is outside the supported range",
+            raw.sample_rate
+        ));
+    }
     let target_sr = target_sample_rate.max(8_000);
+    if bounded_output_len(raw.frames, raw.sample_rate, target_sr).is_none() {
+        return Err("Audio is too long to load".to_string());
+    }
     let (left, right) = (
         resample_mono_cubic(&side(0), raw.sample_rate, target_sr),
         resample_mono_cubic(&side(1), raw.sample_rate, target_sr),
     );
+    if left.is_empty() || right.is_empty() {
+        return Err("Audio is too long to load".to_string());
+    }
     let mut samples = Vec::with_capacity(left.len() * 2);
     let mut louder = Vec::with_capacity(left.len());
     for (&l, &r) in left.iter().zip(&right) {
@@ -103,6 +157,7 @@ fn read_audio_file(path: &Path) -> Result<RawInterleavedBuffer, String> {
             .map_err(|e| format!("Failed to read '{}': {e}", path.display()))?;
         match decode_wav_bytes(&bytes) {
             Ok(buf) => Ok(buf),
+            Err(e) if e.contains("too long") || e.contains("outside the supported range") => Err(e),
             Err(_) => decode_via_symphonia_reader(Box::new(Cursor::new(bytes)), Some(ext.as_str())),
         }
     } else {
@@ -125,6 +180,9 @@ pub fn decode_audio_bytes_to_mono(
     let raw = if is_riff_wav {
         match decode_wav_bytes(bytes) {
             Ok(buf) => buf,
+            Err(e) if e.contains("too long") || e.contains("outside the supported range") => {
+                return Err(e);
+            }
             Err(_) => decode_via_symphonia_reader(
                 Box::new(Cursor::new(bytes.to_vec())),
                 ext_hint.or(Some("wav")),
@@ -152,13 +210,28 @@ fn finalize_decoded(
         return Err("Decoded audio buffer is empty".to_string());
     }
 
+    if raw.sample_rate < MIN_SAMPLE_RATE || raw.sample_rate > MAX_SAMPLE_RATE {
+        return Err(format!(
+            "Sample rate {} Hz is outside the supported range",
+            raw.sample_rate
+        ));
+    }
+    if raw.frames > MAX_MONO_SAMPLES {
+        return Err("Audio is too long to load".to_string());
+    }
     let mono_src = downmix_to_mono(&raw.samples, raw.channels, raw.frames);
     let target_sr = target_sample_rate.max(8_000);
+    if bounded_output_len(mono_src.len(), raw.sample_rate, target_sr).is_none() {
+        return Err("Audio is too long to load".to_string());
+    }
     let mono = if raw.sample_rate == target_sr {
         mono_src
     } else {
         resample_mono_cubic(&mono_src, raw.sample_rate, target_sr)
     };
+    if mono.is_empty() {
+        return Err("Audio is too long to load".to_string());
+    }
 
     let duration_sec = mono.len() as f64 / target_sr as f64;
     let waveform_peaks = compute_waveform_peaks(&mono, 240);
@@ -194,9 +267,14 @@ pub fn resample_mono_cubic(input: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f
     if src_rate == dst_rate {
         return input.to_vec();
     }
+    let Some(out_len) = bounded_output_len(input.len(), src_rate, dst_rate) else {
+        return Vec::new();
+    };
     let ratio = src_rate as f64 / dst_rate as f64;
-    let out_len = ((input.len() as f64) / ratio).ceil() as usize;
-    let mut out = Vec::with_capacity(out_len);
+    let mut out = Vec::new();
+    if out.try_reserve_exact(out_len).is_err() {
+        return Vec::new();
+    }
     let max_idx = input.len().saturating_sub(1);
 
     for i in 0..out_len {
@@ -321,7 +399,15 @@ fn decode_via_symphonia_reader(
                 }
                 if let Some(buf) = &mut sample_buf {
                     buf.copy_interleaved_ref(audio_buf_ref);
-                    all_samples.extend_from_slice(buf.samples());
+                    let incoming = buf.samples();
+                    let cap = MAX_MONO_SAMPLES.saturating_mul(channels.max(1));
+                    if all_samples.len().saturating_add(incoming.len()) > cap {
+                        return Err("Audio is too long to load".to_string());
+                    }
+                    if all_samples.try_reserve(incoming.len()).is_err() {
+                        return Err("Audio is too long to load".to_string());
+                    }
+                    all_samples.extend_from_slice(incoming);
                 }
             }
             Err(SymphoniaError::IoError(_)) | Err(SymphoniaError::DecodeError(_)) => continue,
@@ -413,8 +499,14 @@ fn decode_wav_bytes(bytes: &[u8]) -> Result<RawInterleavedBuffer, String> {
     }
 
     let frames = data_len / bytes_per_frame;
+    if frames > MAX_MONO_SAMPLES || fmt.channels > 16 {
+        return Err("Audio is too long to load".to_string());
+    }
     let sample_count = frames * fmt.channels;
-    let mut samples = Vec::with_capacity(sample_count);
+    let mut samples = Vec::new();
+    if samples.try_reserve_exact(sample_count).is_err() {
+        return Err("Audio is too long to load".to_string());
+    }
 
     let mut offset = data_start;
     for _ in 0..sample_count {
@@ -508,4 +600,37 @@ pub fn encode_mono_wav_i16(samples: &[f32], sample_rate: u32) -> Vec<u8> {
         out.extend_from_slice(&pcm.to_le_bytes());
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_one_hertz_wav_is_refused() {
+        let mut bytes = encode_mono_wav_i16(&[0.2, -0.2, 0.2, -0.2], 8_000);
+        bytes[24..28].copy_from_slice(&1u32.to_le_bytes());
+        let err = decode_audio_bytes_to_mono(&bytes, Some("wav"), 48_000).unwrap_err();
+        assert!(
+            err.contains("outside the supported range") || err.contains("too long"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_eight_kilohertz_wav_still_decodes() {
+        let bytes = encode_mono_wav_i16(&[0.25, -0.25, 0.25, -0.25], 8_000);
+        let audio = decode_audio_bytes_to_mono(&bytes, Some("wav"), 48_000).unwrap();
+        assert_eq!(audio.sample_rate, 48_000);
+        assert!(audio.samples.len() > 4);
+        assert!(audio.samples.len() < 64);
+    }
+
+    #[test]
+    fn resampling_refuses_a_runaway_ratio() {
+        let input = vec![0.1f32; 1_000];
+        assert!(resample_mono_cubic(&input, 1, 48_000).is_empty());
+        assert!(bounded_output_len(input.len(), 1, 48_000).is_none());
+        assert!(bounded_output_len(MAX_MONO_SAMPLES, 48_000, 96_000).is_none());
+    }
 }
