@@ -88,8 +88,38 @@ class StudioController extends ChangeNotifier {
     if (_audioTrackStarted && pcmBytes.isNotEmpty) {
       _audioChannel.invokeMethod('writePcm', {'pcm': pcmBytes}).catchError((_) {});
     }
-    telemetry = TelemetryModel.fromJson(_ffi.getTelemetryMap());
+    if (_applyTelemetry(TelemetryModel.fromJson(_ffi.getTelemetryMap()))) {
+      project = ProjectModel.fromJson(_ffi.getSnapshotMap());
+    }
     notifyListeners();
+  }
+
+  /// Stores fresh engine telemetry and surfaces engine faults reported by it.
+  /// Returns true when the engine changed project state on its own (a take was
+  /// committed at the recording length limit) and the snapshot must be re-read.
+  bool _applyTelemetry(TelemetryModel next) {
+    final prev = telemetry;
+    telemetry = next;
+    if (next.renderFaults > prev.renderFaults) {
+      statusBanner =
+          'Audio Engine Error • Render fault recovered (${next.renderFaults}), output muted for the faulty block';
+    }
+    if (next.recordingDroppedFrames > prev.recordingDroppedFrames) {
+      statusBanner =
+          'Recording Input Overrun • ${next.recordingDroppedFrames} frames dropped from this take';
+    }
+    if (next.recordingStoppedAtLimit && !prev.recordingStoppedAtLimit) {
+      statusBanner =
+          'Recording Stopped at the ${_formatTakeLimit(next.recordingLimitSeconds)} Take Limit • Take Saved';
+      return true;
+    }
+    return false;
+  }
+
+  static String _formatTakeLimit(int seconds) {
+    final m = seconds ~/ 60;
+    final s = (seconds % 60).toString().padLeft(2, '0');
+    return '$m:$s';
   }
 
   /// Manually renders one block (useful in unit/widget tests when timer pump is disabled).
@@ -101,7 +131,9 @@ class StudioController extends ChangeNotifier {
   void refreshSnapshot() {
     if (_disposed || !_ffi.isLoaded) return;
     project = ProjectModel.fromJson(_ffi.getSnapshotMap());
-    telemetry = TelemetryModel.fromJson(_ffi.getTelemetryMap());
+    if (_applyTelemetry(TelemetryModel.fromJson(_ffi.getTelemetryMap()))) {
+      project = ProjectModel.fromJson(_ffi.getSnapshotMap());
+    }
     notifyListeners();
   }
 
@@ -243,10 +275,18 @@ class StudioController extends ChangeNotifier {
   void toggleRecord() {
     final next = !project.isRecording;
     _ffi.setRecording(next);
+    final limit = telemetry.recordingLimitSeconds;
     statusBanner = next
-        ? 'Recording Live Input to Armed Track...'
+        ? (limit > 0
+            ? 'Recording Live Input to Armed Track (max ${_formatTakeLimit(limit)})...'
+            : 'Recording Live Input to Armed Track...')
         : 'Recording Committed to Audio Clip';
     refreshSnapshot();
+    if (!next && telemetry.recordingDroppedFrames > 0) {
+      statusBanner =
+          'Recording Committed • ${telemetry.recordingDroppedFrames} frames dropped (input overrun)';
+      notifyListeners();
+    }
   }
 
   void seekBeats(double beats) {
