@@ -49,7 +49,7 @@ use crate::components::native_plugin_shell::{
 };
 use crate::components::plate;
 use crate::components::rodhareist_panel::{
-    chain_frame, rodhareist_panel, tapped_interval, ChainFocus, Page, RodFields, RodUi,
+    chain_frame, rodhareist_panel, tapped_interval, ChainFocus, Page, PresetTab, RodFields, RodUi,
 };
 use crate::components::text_input::{
     bind_mouse_selection, text_field_with_callbacks_and_ime, TextInputAction, TextInputState,
@@ -243,11 +243,58 @@ fn save_needs_confirm(
     exists && loaded != Some(stem) && confirmed != Some(stem)
 }
 
+/// A free `.pst` stem. `wanted` is used as-is when nothing has it; otherwise
+/// `wanted 2`, `wanted 3`, and so on.
+fn free_preset_stem(wanted: &str, taken: impl Fn(&str) -> bool) -> String {
+    let base = preset_file_stem(wanted);
+    if !taken(&base) {
+        return base;
+    }
+    for n in 2..1_000 {
+        let candidate = format!("{base} {n}");
+        if !taken(&candidate) {
+            return candidate;
+        }
+    }
+    format!("{base} 1000")
+}
+
 fn display_name(file_name: &str) -> String {
     std::path::Path::new(file_name)
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
         .unwrap_or_else(|| file_name.to_string())
+}
+
+/// Copies a Rodhareist `.pst` into the user folder under a free name and
+/// returns that name with the params it carries. A file already in the
+/// folder is left where it is. Background-thread only (filesystem I/O).
+fn import_preset_file(source: &std::path::Path) -> Result<(String, Params), String> {
+    let (plugin_id, bytes) = SpherePluginHost::preset::read_state_preset(source)?;
+    if !preset_state_is_builtin(&plugin_id, &bytes) {
+        return Err("This file is not a Rodhareist preset.".to_string());
+    }
+    let json = std::str::from_utf8(&bytes).map_err(|_| "preset state is not text".to_string())?;
+    let state = rodharerist::RodhareistState::from_json(json).map_err(|e| e.to_string())?;
+    let dir = user_preset_dir();
+    let source_name = source
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("Imported");
+    if source.parent() == Some(dir.as_path()) {
+        return Ok((source_name.to_string(), state.params));
+    }
+    let stem = free_preset_stem(source_name, |name| dir.join(format!("{name}.pst")).exists());
+    let dest = dir.join(format!("{stem}.pst"));
+    SpherePluginHost::preset::write_state_preset(
+        &dest,
+        &SpherePluginHost::preset::StatePreset {
+            plugin_id: rodharerist::PLUGIN_ID.to_string(),
+            plugin_name: PRESET_PLUGIN_NAME.to_string(),
+            state: bytes,
+        },
+    )?;
+    Ok((stem, state.params))
 }
 
 /// Reads a picked capture or IR and keeps a copy in Rodhareist's folder,
@@ -664,6 +711,35 @@ impl RodhareistEditorWindow {
     }
 
     /// Click handler that stores the current rig as a `.pst`.
+    pub(crate) fn rename_user_preset_cb(
+        &self,
+        cx: &Context<Self>,
+    ) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static {
+        let entity = cx.entity().clone();
+        move |_event, window, app: &mut App| {
+            let _ = entity.update(app, |this, cx| {
+                this.release_text_focus(window, cx);
+                this.preset_note = this.rename_user_preset().err();
+                cx.notify();
+            });
+        }
+    }
+
+    /// Click handler that copies a `.pst` into the user folder and loads it.
+    pub(crate) fn import_user_preset_cb(
+        &self,
+        cx: &Context<Self>,
+    ) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static {
+        let entity = cx.entity().clone();
+        move |_event, window, app: &mut App| {
+            let _ = entity.update(app, |this, cx| {
+                this.release_text_focus(window, cx);
+                this.start_preset_import(window, cx);
+            });
+        }
+    }
+
+    /// Click handler that stores the current rig as a `.pst`.
     pub(crate) fn save_user_preset_cb(
         &self,
         cx: &Context<Self>,
@@ -743,17 +819,7 @@ impl RodhareistEditorWindow {
             ));
         }
         self.replace_confirm = None;
-        let json = rodharerist::RodhareistState::new(self.params.clone())
-            .to_json()
-            .map_err(|e| e.to_string())?;
-        SpherePluginHost::preset::write_state_preset(
-            &path,
-            &SpherePluginHost::preset::StatePreset {
-                plugin_id: rodharerist::PLUGIN_ID.to_string(),
-                plugin_name: PRESET_PLUGIN_NAME.to_string(),
-                state: json.into_bytes(),
-            },
-        )?;
+        self.write_preset_file(&path)?;
         self.preset = None;
         self.user_preset = Some(LoadedUserPreset {
             name: stem.clone(),
@@ -762,6 +828,120 @@ impl RodhareistEditorWindow {
         self.preset_name.set_value(stem);
         self.refresh_user_presets();
         Ok(())
+    }
+
+    /// Renames the loaded user preset to the name in the field, and stores
+    /// the rig that is loaded now under that name. The previous file is
+    /// removed. A factory preset has no file to rename.
+    fn rename_user_preset(&mut self) -> Result<(), String> {
+        let Some(loaded) = self.user_preset.as_ref() else {
+            return Err("Load a user preset before renaming it.".to_string());
+        };
+        let loaded_name = loaded.name.clone();
+        let typed = self.preset_name.value.trim();
+        if typed.is_empty() {
+            return Err("Type a name, then press Rename.".to_string());
+        }
+        let stem = preset_file_stem(typed);
+        if stem == loaded_name {
+            self.replace_confirm = None;
+            return Ok(());
+        }
+        let dir = user_preset_dir();
+        let from = dir.join(format!("{loaded_name}.pst"));
+        let to = dir.join(format!("{stem}.pst"));
+        if to.exists() && !preset_file_is_ours(&to) {
+            return Err(format!(
+                "A preset named {stem} belongs to another Rodhareist and was left unchanged"
+            ));
+        }
+        if save_needs_confirm(
+            &stem,
+            to.exists(),
+            Some(loaded_name.as_str()),
+            self.replace_confirm.as_deref(),
+        ) {
+            self.replace_confirm = Some(stem.clone());
+            return Err(format!(
+                "A preset named {stem} is already saved. Press Rename again to replace it."
+            ));
+        }
+        self.replace_confirm = None;
+        self.write_preset_file(&to)?;
+        if from != to && preset_file_is_ours(&from) {
+            let _ = std::fs::remove_file(&from);
+        }
+        self.preset = None;
+        self.user_preset = Some(LoadedUserPreset {
+            name: stem.clone(),
+            params: self.params.clone(),
+        });
+        self.preset_name.set_value(stem);
+        self.refresh_user_presets();
+        Ok(())
+    }
+
+    fn write_preset_file(&self, path: &std::path::Path) -> Result<(), String> {
+        let json = rodharerist::RodhareistState::new(self.params.clone())
+            .to_json()
+            .map_err(|e| e.to_string())?;
+        SpherePluginHost::preset::write_state_preset(
+            path,
+            &SpherePluginHost::preset::StatePreset {
+                plugin_id: rodharerist::PLUGIN_ID.to_string(),
+                plugin_name: PRESET_PLUGIN_NAME.to_string(),
+                state: json.into_bytes(),
+            },
+        )
+    }
+
+    /// Asks for a `.pst`, copies it into the user folder, and loads it.
+    fn start_preset_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(feature = "native-dialogs")]
+        {
+            let dialog = rfd::AsyncFileDialog::new()
+                .set_title("Import Preset")
+                .add_filter("Futureboard Preset", &["pst"])
+                .set_parent(window);
+            cx.spawn(async move |this, cx| {
+                let Some(handle) = dialog.pick_file().await else {
+                    return;
+                };
+                let path = handle.path().to_path_buf();
+                let stored = cx
+                    .background_spawn(async move { import_preset_file(&path) })
+                    .await;
+                let _ = this.update(cx, |this, cx| match stored {
+                    Ok((name, saved)) => {
+                        let next = preset_applied(&this.params, &saved);
+                        this.preset = None;
+                        this.user_preset = Some(LoadedUserPreset {
+                            name: name.clone(),
+                            params: next.clone(),
+                        });
+                        this.preset_name.set_value(name);
+                        this.preset_note = None;
+                        this.replace_confirm = None;
+                        this.ui.preset_tab = PresetTab::Users;
+                        this.chain_focus = None;
+                        this.refresh_user_presets();
+                        this.set_params(next, cx);
+                    }
+                    Err(error) => {
+                        this.preset_note = Some(error);
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
+        #[cfg(not(feature = "native-dialogs"))]
+        {
+            let _ = window;
+            self.preset_note =
+                Some("Native file dialogs are unavailable in this build.".to_string());
+            cx.notify();
+        }
     }
 
     fn read_user_preset(&self, path: &std::path::Path) -> Result<Params, String> {
@@ -1432,6 +1612,20 @@ mod tests {
         after.stage_order[0] = Some(rodharerist::StageKind::Wah);
         let diff = wire_diff(&before, &after);
         assert!(!diff.is_empty());
+    }
+
+    #[test]
+    fn import_picks_a_free_stem_when_the_name_is_taken() {
+        assert_eq!(free_preset_stem("Crunch", |_| false), "Crunch");
+        assert_eq!(
+            free_preset_stem("Crunch", |name| name == "Crunch"),
+            "Crunch 2"
+        );
+        assert_eq!(
+            free_preset_stem("Crunch", |name| name == "Crunch" || name == "Crunch 2"),
+            "Crunch 3"
+        );
+        assert_eq!(free_preset_stem("a/b", |_| false), "a_b");
     }
 
     /// Issue #195: saving a loaded preset under a new name writes a new file
