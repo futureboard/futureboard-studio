@@ -25,10 +25,10 @@
 //! overshoot the anti-alias filter puts back), and the dry/wet mix blends in
 //! the latency-aligned input.
 
-use builtin_dsp_core::delay::{Smoothed, smoothing_step};
+use builtin_dsp_core::delay::{smoothing_step, Smoothed};
 use builtin_dsp_core::{
-    ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, clamp, db_to_linear,
-    linear_to_db, mix, time_constant,
+    clamp, db_to_linear, linear_to_db, mix, time_constant, ParamDescriptor, PluginCategory,
+    PluginDescriptor, StereoEffect,
 };
 use serde::{Deserialize, Serialize};
 
@@ -37,11 +37,11 @@ mod oversample;
 pub mod presets;
 pub mod ui;
 
-pub use ipc::{UI_PARAM_IDS, ui_param_id, ui_param_index};
+pub use ipc::{ui_param_id, ui_param_index, UI_PARAM_IDS};
 pub use oversample::TAPS_PER_PHASE;
-pub use presets::{FactoryPreset, factory_presets};
+pub use presets::{factory_presets, FactoryPreset};
 
-use oversample::{AntiAlias, Lookahead, MAX_FACTOR, Ring};
+use oversample::{AntiAlias, Lookahead, Ring, MAX_FACTOR};
 
 pub const PLUGIN_ID: &str = "futureboard.clipper67";
 
@@ -809,7 +809,11 @@ impl Path {
     /// The gain a peak of `peak` needs to sit at `target`.
     #[inline]
     fn needed(peak: f32, target: f32) -> f32 {
-        if peak > target { target / peak } else { 1.0 }
+        if peak > target {
+            target / peak
+        } else {
+            1.0
+        }
     }
 
     /// One (oversampled) sample pair through the mode's shaper. Returns the
@@ -1233,6 +1237,8 @@ impl StereoEffect for Dsp {
     }
 
     fn process_stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
+        let left = if left.is_finite() { left } else { 0.0 };
+        let right = if right.is_finite() { right } else { 0.0 };
         self.started = true;
         let in_sum = (left + right) * 0.5;
 
@@ -1293,6 +1299,38 @@ impl StereoEffect for Dsp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_non_finite_sample_does_not_stick_even_while_bypassed() {
+        let mut dsp = Dsp::new(48_000.0);
+        let before = signal_energy(&mut dsp);
+        assert!(before > 1.0e-4, "fixture produced no audio ({before})");
+        let mut params = dsp.params().clone();
+        params.power = false;
+        dsp.set_params(params.clone());
+        for _ in 0..2_000 {
+            let (l, r) = dsp.process_stereo(f32::NAN, f32::INFINITY);
+            assert!(l.is_finite() && r.is_finite());
+        }
+        params.power = true;
+        dsp.set_params(params);
+        let after = signal_energy(&mut dsp);
+        assert!(
+            after > before * 0.25,
+            "level did not recover: before {before} after {after}"
+        );
+    }
+
+    fn signal_energy(dsp: &mut Dsp) -> f32 {
+        let mut acc = 0.0f32;
+        for n in 0..4_000 {
+            let x = (n as f32 * 0.17).sin() * 0.25;
+            let (l, r) = dsp.process_stereo(x, x * 0.8);
+            assert!(l.is_finite() && r.is_finite(), "non-finite at {n}");
+            acc += l * l + r * r;
+        }
+        acc
+    }
 
     const BLOCK: usize = 128;
     /// About a second of blocks: one drag across a range and back.

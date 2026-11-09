@@ -23,10 +23,10 @@
 //! milliseconds and switches at the bottom of the dip rather than clicking.
 
 use biquad::{Biquad, Coefficients, DirectForm1};
-use builtin_dsp_core::delay::{DelayRing, Smoothed, smoothing_step};
+use builtin_dsp_core::delay::{smoothing_step, DelayRing, Smoothed};
 use builtin_dsp_core::{
-    ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, clamp, db_to_linear,
-    flush_denormal, linear_to_db, make_eq_coefficients, max_filter_frequency, time_constant,
+    clamp, db_to_linear, flush_denormal, linear_to_db, make_eq_coefficients, max_filter_frequency,
+    time_constant, ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect,
 };
 use serde::{Deserialize, Serialize};
 
@@ -34,9 +34,9 @@ pub mod ipc;
 pub mod presets;
 pub mod ui;
 
-pub use ipc::{UI_PARAM_IDS, ui_param_id, ui_param_index};
+pub use ipc::{ui_param_id, ui_param_index, UI_PARAM_IDS};
 pub use presets::{
-    DETECTOR_PRESETS, DetectorPreset, FactoryPreset, SHAPE_PRESETS, ShapePreset, factory_presets,
+    factory_presets, DetectorPreset, FactoryPreset, ShapePreset, DETECTOR_PRESETS, SHAPE_PRESETS,
 };
 
 pub const PLUGIN_ID: &str = "futureboard.duckstep";
@@ -1223,6 +1223,8 @@ impl StereoEffect for Dsp {
     }
 
     fn process_stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
+        let left = if left.is_finite() { left } else { 0.0 };
+        let right = if right.is_finite() { right } else { 0.0 };
         self.started = true;
 
         // A new mode, band or lookahead: dip, switch at the bottom, come
@@ -1312,6 +1314,31 @@ mod tests {
     use std::f32::consts::TAU;
 
     const SR: f32 = 48_000.0;
+
+    #[test]
+    fn one_infinite_sample_does_not_stick() {
+        let mut dsp = Dsp::new(SR);
+        let before = signal_energy(&mut dsp);
+        assert!(before > 1.0e-4, "fixture produced no audio ({before})");
+        let _ = dsp.process_stereo(0.2, f32::INFINITY);
+        let _ = dsp.process_stereo(f32::NEG_INFINITY, f32::NAN);
+        let after = signal_energy(&mut dsp);
+        assert!(
+            after > before * 0.25,
+            "level did not recover: before {before} after {after}"
+        );
+    }
+
+    fn signal_energy(dsp: &mut Dsp) -> f32 {
+        let mut acc = 0.0f32;
+        for n in 0..4_000 {
+            let x = (n as f32 * 0.17).sin() * 0.25;
+            let (l, r) = dsp.process_stereo(x, x * 0.8);
+            assert!(l.is_finite() && r.is_finite(), "non-finite at {n}");
+            acc += l * l + r * r;
+        }
+        acc
+    }
 
     fn run(dsp: &mut Dsp, samples: usize, mut input: impl FnMut(usize) -> f32) -> Vec<f32> {
         (0..samples)

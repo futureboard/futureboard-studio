@@ -85,6 +85,13 @@ impl SoundFont {
                 if start < 0 || end as usize >= wave_len || end <= start {
                     return false;
                 }
+                // The rate is stored unsigned and read as i32, so a value past
+                // 2^31-1 arrives negative. Zero or negative walks the
+                // oscillator backwards out of the sample. A huge positive rate
+                // still plays; the oscillator wraps a step longer than the loop.
+                if region.sample_sample_rate <= 0 {
+                    return false;
+                }
                 // Loop points are only meaningful when looping is enabled.
                 if loop_mode != LoopMode::NoLoop
                     && (start_loop < 0 || end_loop as usize >= wave_len || start_loop >= end_loop)
@@ -226,6 +233,7 @@ mod malformed_tests {
 
     const GEN_INSTRUMENT: u16 = 41;
     const GEN_SAMPLE_ID: u16 = 53;
+    const GEN_SAMPLE_MODES: u16 = 54;
     const SAMPLE_FRAMES: i32 = 256;
     /// SF2 requires 46 zero frames after each sample.
     const SAMPLE_PADDING: i32 = 46;
@@ -288,6 +296,8 @@ mod malformed_tests {
         igen: Vec<(u16, u16)>,
         /// Start and end frame of each sample.
         shdr: Vec<(i32, i32)>,
+        /// Per-sample rate. Missing entries are 44_100.
+        rates: Vec<i32>,
     }
 
     impl Tables {
@@ -301,6 +311,7 @@ mod malformed_tests {
                 ibag: vec![0, 1],
                 igen: vec![(GEN_SAMPLE_ID, 0)],
                 shdr: vec![(0, SAMPLE_FRAMES)],
+                rates: Vec::new(),
             }
         }
 
@@ -337,13 +348,20 @@ mod malformed_tests {
                 inst.extend_from_slice(&start.to_le_bytes());
             }
             let mut shdr = Vec::new();
-            for (start, end) in self.shdr.iter().chain(std::iter::once(&(0, 0))) {
+            for (index, (start, end)) in
+                self.shdr.iter().chain(std::iter::once(&(0, 0))).enumerate()
+            {
+                let rate = if index < self.shdr.len() {
+                    self.rates.get(index).copied().unwrap_or(44_100)
+                } else {
+                    44_100
+                };
                 shdr.extend_from_slice(&name());
                 shdr.extend_from_slice(&start.to_le_bytes());
                 shdr.extend_from_slice(&end.to_le_bytes());
                 shdr.extend_from_slice(&start.to_le_bytes()); // loop start
                 shdr.extend_from_slice(&(end - 1).max(0).to_le_bytes()); // loop end
-                shdr.extend_from_slice(&44_100i32.to_le_bytes());
+                shdr.extend_from_slice(&rate.to_le_bytes());
                 shdr.extend_from_slice(&[60, 0]); // original pitch, correction
                 shdr.extend_from_slice(&0u16.to_le_bytes()); // link
                 shdr.extend_from_slice(&1u16.to_le_bytes()); // mono
@@ -445,6 +463,35 @@ mod malformed_tests {
             tables.load(),
             Err(SoundFontError::InvalidInstrumentId { .. })
         ));
+    }
+
+    #[test]
+    fn a_non_positive_sample_rate_is_not_played() {
+        for rate in [0, -1, i32::MIN] {
+            let mut tables = Tables::valid();
+            tables.rates = vec![rate];
+            assert!(
+                matches!(tables.load(), Err(SoundFontError::SanityCheckFailed)),
+                "rate {rate} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_huge_sample_rate_does_not_read_past_the_sample() {
+        let mut tables = Tables::valid();
+        tables.rates = vec![50_000_000];
+        // Sample modes must precede sample id: a zone whose last generator is
+        // not the sample id is treated as a global zone.
+        tables.ibag = vec![0, 2];
+        tables.igen = vec![(GEN_SAMPLE_MODES, 1), (GEN_SAMPLE_ID, 0)];
+        let font = Arc::new(tables.load().expect("huge rate still loads"));
+        let mut synth =
+            Synthesizer::new(&font, &SynthesizerSettings::new(44_100)).expect("synthesizer");
+        synth.note_on(0, 127, 127);
+        let (mut left, mut right) = (vec![0.0f32; 4_096], vec![0.0f32; 4_096]);
+        synth.render(&mut left, &mut right);
+        assert!(left.iter().chain(&right).all(|sample| sample.is_finite()));
     }
 
     #[test]

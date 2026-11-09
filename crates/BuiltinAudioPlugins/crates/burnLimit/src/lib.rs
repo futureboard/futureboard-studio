@@ -3,10 +3,10 @@
 //! Lookahead peak limiting with style curves and a 4× cubic inter-sample peak
 //! detector. The audio path remains allocation-free and bounded.
 
-use builtin_dsp_core::delay::{Smoothed, smoothing_step};
+use builtin_dsp_core::delay::{smoothing_step, Smoothed};
 use builtin_dsp_core::{
-    ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, clamp, db_to_linear,
-    flush_denormal, linear_to_db, mix, time_constant,
+    clamp, db_to_linear, flush_denormal, linear_to_db, mix, time_constant, ParamDescriptor,
+    PluginCategory, PluginDescriptor, StereoEffect,
 };
 use serde::{Deserialize, Serialize};
 
@@ -17,8 +17,8 @@ pub mod presets;
 pub mod telemetry;
 pub mod ui;
 
-pub use ipc::{UI_PARAM_IDS, ui_param_id, ui_param_index};
-pub use presets::{FactoryPreset, factory_presets};
+pub use ipc::{ui_param_id, ui_param_index, UI_PARAM_IDS};
+pub use presets::{factory_presets, FactoryPreset};
 
 use loudness::Loudness;
 use oversample::{AntiAlias, Ring, TAPS_PER_PHASE};
@@ -1563,6 +1563,8 @@ impl StereoEffect for Dsp {
     }
 
     fn process_stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
+        let left = if left.is_finite() { left } else { 0.0 };
+        let right = if right.is_finite() { right } else { 0.0 };
         self.started = true;
         // An oversampling change fades the output out, switches, and fades
         // back in: the latency moves with it, so there is nothing to blend.
@@ -1684,6 +1686,31 @@ pub use loudness::NO_READING;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_infinite_sample_does_not_stick() {
+        let mut dsp = Dsp::new(48_000.0);
+        let before = signal_energy(&mut dsp);
+        assert!(before > 1.0e-4, "fixture produced no audio ({before})");
+        let _ = dsp.process_stereo(0.2, f32::INFINITY);
+        let _ = dsp.process_stereo(f32::NEG_INFINITY, f32::NAN);
+        let after = signal_energy(&mut dsp);
+        assert!(
+            after > before * 0.25,
+            "level did not recover: before {before} after {after}"
+        );
+    }
+
+    fn signal_energy(dsp: &mut Dsp) -> f32 {
+        let mut acc = 0.0f32;
+        for n in 0..4_000 {
+            let x = (n as f32 * 0.17).sin() * 0.25;
+            let (l, r) = dsp.process_stereo(x, x * 0.8);
+            assert!(l.is_finite() && r.is_finite(), "non-finite at {n}");
+            acc += l * l + r * r;
+        }
+        acc
+    }
 
     const BLOCK: usize = 128;
     /// About a second of blocks: one drag across a range and back.
@@ -2207,11 +2234,10 @@ mod tests {
                 .map(|n| dsp.process_stereo(if n == 0 { 0.5 } else { 0.0 }, 0.0))
                 .collect();
             assert_eq!(out[latency], (0.5, 0.0), "{os:?}");
-            assert!(
-                out.iter()
-                    .enumerate()
-                    .all(|(i, s)| i == latency || s.0 == 0.0)
-            );
+            assert!(out
+                .iter()
+                .enumerate()
+                .all(|(i, s)| i == latency || s.0 == 0.0));
 
             // Driven 18 dB into a -1 dB ceiling: bounded, finite, held.
             assert!(dsp.apply_ui_param("gainDb", 18.0));
