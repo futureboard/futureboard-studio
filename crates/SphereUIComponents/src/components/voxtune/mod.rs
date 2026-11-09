@@ -401,6 +401,7 @@ impl VoxtuneEditor {
     pub fn set_engine(&mut self, shared: Arc<Shared>, cx: &mut Context<Self>) {
         self.cancel_load(cx);
         self.stop_audition();
+        shared.lock().set_bypass(false);
         self.session = VoxSession::new(shared);
         self.peaks = Rc::new(Peaks::default());
         self.notes_cache = (u64::MAX, Rc::new(Vec::new()));
@@ -466,7 +467,7 @@ impl VoxtuneEditor {
             }
             "original" if self.has_audio() => {
                 self.bypass = !self.bypass;
-                self.session.shared().lock().bypass = self.bypass;
+                self.session.shared().lock().set_bypass(self.bypass);
                 self.end_gesture(cx);
             }
             "tune-all" | "join" | "original" => {}

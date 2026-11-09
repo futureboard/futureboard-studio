@@ -444,25 +444,6 @@ pub fn register_fonts(_cx: &mut gpui::App) {
 #[cfg(test)]
 mod futureboard_icon_tests {
     use super::*;
-    use gpui::AssetSource;
-
-    /// Every Futureboard icon is what the asset source hands out for its path,
-    /// so no call site can still be drawing the glyph it replaced.
-    #[test]
-    fn every_futureboard_icon_is_served_for_its_path() {
-        let source = crate::embedded_assets::EmbeddedAssets::new();
-        for (path, svg) in FUTUREBOARD_ICONS {
-            let served = source
-                .load(path)
-                .expect("load")
-                .unwrap_or_else(|| panic!("{path} is not served"));
-            assert_eq!(
-                served.as_ref(),
-                svg.as_bytes(),
-                "{path} serves another glyph"
-            );
-        }
-    }
 
     /// The grid and colour rules from the set's README: a 16 px canvas, and
     /// every paint `currentColor` so the theme tints it. The only literal

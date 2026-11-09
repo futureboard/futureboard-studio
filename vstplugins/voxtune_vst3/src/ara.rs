@@ -28,22 +28,23 @@
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr};
+use std::mem::MaybeUninit;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread::JoinHandle;
 
+use ara2_bridge_sys::access::read_field;
 use ara2_bridge_sys::*;
 use parking_lot::Mutex;
-use sphere_voxtune::audio_io::{compute_waveform_peaks, resample_mono_cubic, DecodedAudio};
+use sphere_voxtune::audio_io::{
+    bounded_output_len, compute_waveform_peaks, resample_mono_cubic, DecodedAudio,
+    MAX_MONO_SAMPLES, MAX_SAMPLE_RATE, MIN_SAMPLE_RATE,
+};
 use sphere_voxtune::engine::{analyze_samples, Analysis, AnalysisProgress, CantoEngine, ORN_NONE};
 use sphere_voxtune::session::VoxDocument;
 use sphere_voxtune::shared::Shared;
-
-/// Host rate, set by the first `initialize` of any instance. Engines are made
-/// at this rate so they play at the host's speed.
-pub static HOST_RATE: AtomicU32 = AtomicU32::new(0);
 
 const ARCHIVE_VERSION: u32 = 1;
 
@@ -62,6 +63,41 @@ unsafe fn c_string(s: *const c_char) -> String {
         String::new()
     } else {
         unsafe { CStr::from_ptr(s) }.to_string_lossy().into_owned()
+    }
+}
+
+/// Copies only the bytes the host declared in `structSize`.
+///
+/// ARA property structs grow at the end. Reading `size_of::<T>()` walks past
+/// a shorter host struct.
+unsafe fn read_versioned<T: Copy>(ptr: *const T) -> Option<T> {
+    if ptr.is_null() {
+        return None;
+    }
+    let declared = unsafe { read_field::<ARASize>(ptr as *const u8, 0) };
+    if declared < std::mem::size_of::<ARASize>() {
+        return None;
+    }
+    let n = declared.min(std::mem::size_of::<T>());
+    let mut out = MaybeUninit::<T>::zeroed();
+    unsafe {
+        ptr::copy_nonoverlapping(ptr as *const u8, out.as_mut_ptr() as *mut u8, n);
+    }
+    Some(unsafe { out.assume_init() })
+}
+
+fn field_included(declared: usize, offset: usize, size: usize) -> bool {
+    declared >= offset.saturating_add(size)
+}
+
+/// A host interface vtable, copied so a short `structSize` is not over-read.
+unsafe fn read_interface<T: Copy>(ptr: *const T, min: usize) -> Option<T> {
+    let v = unsafe { read_versioned(ptr)? };
+    let declared = unsafe { read_field::<ARASize>(&v as *const T as *const u8, 0) };
+    if declared < min {
+        None
+    } else {
+        Some(v)
     }
 }
 
@@ -162,6 +198,8 @@ pub struct AudioModification {
     pub generation: AtomicU64,
     /// Edited since the host was last told.
     dirty: AtomicBool,
+    /// Regions playing this modification. Weak: the controller owns the arcs.
+    regions: Mutex<Vec<Weak<PlaybackRegion>>>,
 }
 
 pub struct PlaybackRegion {
@@ -172,6 +210,16 @@ pub struct PlaybackRegion {
     start_play: AtomicU64,
     dur_play: AtomicU64,
     pub name: Mutex<String>,
+    /// Own playhead and shifter. Several regions share one modification,
+    /// and sharing one engine plays the second region from where the first
+    /// left the grains.
+    player: Mutex<Arc<Shared>>,
+    /// Same flag the player loads. The editor sets it; the audio thread
+    /// only reads it, so a selection change does not take the engine lock.
+    reports_meter: Arc<AtomicBool>,
+    /// Players swapped out by [`Self::retarget`], freed once the audio
+    /// thread has dropped them.
+    retired: Mutex<Vec<Arc<Shared>>>,
 }
 
 impl PlaybackRegion {
@@ -185,19 +233,59 @@ impl PlaybackRegion {
         f64::from_bits(self.dur_play.load(Ordering::Relaxed))
     }
 
-    unsafe fn set_props(&self, p: *const ARAPlaybackRegionProperties) {
-        if p.is_null() {
-            return;
+    pub fn player(&self) -> Arc<Shared> {
+        self.player.lock().clone()
+    }
+
+    /// `false` leaves the region as it was (null or shorter than the minimum).
+    unsafe fn set_props(&self, p: *const ARAPlaybackRegionProperties) -> bool {
+        let Some(p) = (unsafe { read_versioned(p) }) else {
+            return false;
+        };
+        let declared = p.structSize;
+        if declared < kARAPlaybackRegionPropertiesMinSize as usize {
+            return false;
         }
-        let p = unsafe { ptr::read_unaligned(p) };
         self.start_mod
             .store(p.startInModificationTime.to_bits(), Ordering::Relaxed);
         self.start_play
             .store(p.startInPlaybackTime.to_bits(), Ordering::Relaxed);
         self.dur_play
             .store(p.durationInPlaybackTime.to_bits(), Ordering::Relaxed);
-        if p.structSize > std::mem::offset_of!(ARAPlaybackRegionProperties, name) {
+        let name_at = std::mem::offset_of!(ARAPlaybackRegionProperties, name);
+        if field_included(declared, name_at, std::mem::size_of::<ARAUtf8String>()) {
             *self.name.lock() = unsafe { c_string(p.name) };
+        }
+        true
+    }
+
+    fn retarget(&self, engine: &Shared) {
+        let next = Arc::new(engine.fork_playback_with(Arc::clone(&self.reports_meter)));
+        let prev = std::mem::replace(&mut *self.player.lock(), next);
+        let mut retired = self.retired.lock();
+        retired.push(prev);
+        retired.retain(|p| Arc::strong_count(p) > 1);
+    }
+
+    /// This region drives the editor meter; the modification's other
+    /// regions stop publishing into it.
+    pub fn focus_editor_meter(&self) {
+        let live: Vec<Arc<PlaybackRegion>> = self
+            .modification
+            .regions
+            .lock()
+            .iter()
+            .filter_map(|region| region.upgrade())
+            .collect();
+        let me = self as *const PlaybackRegion;
+        let mut seen = false;
+        for region in &live {
+            let on = Arc::as_ptr(region) == me;
+            region.reports_meter.store(on, Ordering::Relaxed);
+            seen |= on;
+        }
+        if !seen {
+            self.reports_meter.store(true, Ordering::Relaxed);
         }
     }
 }
@@ -225,13 +313,67 @@ impl AudioModification {
                 None => return,
             },
         };
+        let audio = audio_at_rate(audio, self.engine.sample_rate().round() as u32);
         {
             let mut engine = self.engine.lock();
-            engine.install_analyzed(audio.clone(), analysis_doc.to_analysis());
+            engine.install_analyzed(audio, analysis_doc.to_analysis());
             analysis_doc.apply_to(&mut engine);
         }
         *self.doc.lock() = Some(analysis_doc);
         self.generation.fetch_add(1, Ordering::Release);
+        self.retarget_regions();
+    }
+
+    fn retarget_regions(&self) {
+        let live: Vec<Arc<PlaybackRegion>> = self
+            .regions
+            .lock()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect();
+        for region in live {
+            region.retarget(&self.engine);
+        }
+    }
+
+    fn bind_region(&self, region: &Arc<PlaybackRegion>) {
+        let mut regions = self.regions.lock();
+        regions.retain(|region| region.strong_count() > 0);
+        regions.push(Arc::downgrade(region));
+    }
+
+    fn prune_dead_regions(&self) {
+        self.regions
+            .lock()
+            .retain(|region| region.strong_count() > 0);
+    }
+
+    fn meter_is_taken(&self) -> bool {
+        self.regions
+            .lock()
+            .iter()
+            .filter_map(|region| region.upgrade())
+            .any(|region| region.reports_meter.load(Ordering::Relaxed))
+    }
+}
+
+/// Samples at `rate`. A take recorded at another rate is resampled so it
+/// matches the engine it is installed into.
+fn audio_at_rate(audio: &DecodedAudio, rate: u32) -> DecodedAudio {
+    if audio.sample_rate == rate || audio.samples.is_empty() || rate < 8_000 {
+        return audio.clone();
+    }
+    let samples = resample_mono_cubic(&audio.samples, audio.sample_rate, rate);
+    if samples.is_empty() {
+        return audio.clone();
+    }
+    DecodedAudio {
+        duration_sec: samples.len() as f64 / rate as f64,
+        waveform_peaks: compute_waveform_peaks(&samples, 240),
+        samples,
+        sample_rate: rate,
+        source_sample_rate: audio.source_sample_rate,
+        source_channels: audio.source_channels,
     }
 }
 
@@ -268,10 +410,11 @@ fn find<T>(list: &[Arc<T>], r: *const c_void) -> Option<Arc<T>> {
 }
 
 fn engine_rate(source_rate: f64) -> u32 {
-    match HOST_RATE.load(Ordering::Relaxed) {
-        0 => source_rate.round().max(8_000.0) as u32,
-        r => r,
+    let rate = source_rate.round();
+    if !rate.is_finite() {
+        return 48_000;
     }
+    rate.clamp(8_000.0, MAX_SAMPLE_RATE as f64) as u32
 }
 
 // =============================================================================
@@ -322,14 +465,29 @@ impl DcShared {
 
     fn read_and_analyze(&self, source: &Arc<AudioSource>, cancel: &AtomicBool) -> bool {
         let rate = *source.sample_rate.lock();
-        let channels = (*source.channels.lock()).max(1) as usize;
-        let count = (*source.sample_count.lock()).max(0) as usize;
-        if count == 0 || rate <= 0.0 {
+        let channels_i = *source.channels.lock();
+        let count_i = *source.sample_count.lock();
+        // A broken header (1 Hz, or a sample count that cannot exist) must
+        // fail before any allocation: `Vec::with_capacity` aborts the process.
+        if !rate.is_finite()
+            || rate < MIN_SAMPLE_RATE as f64
+            || rate > MAX_SAMPLE_RATE as f64
+            || !(1..=16).contains(&channels_i)
+            || count_i <= 0
+            || count_i as u64 > MAX_MONO_SAMPLES as u64
+        {
             return false;
         }
+        let channels = channels_i as usize;
+        let count = count_i as usize;
         // Read every channel and mix to mono.
         let mono = unsafe {
-            let audio = &*self.host.audio;
+            let Some(audio) = read_interface(
+                self.host.audio,
+                kARAAudioAccessControllerInterfaceMinSize as usize,
+            ) else {
+                return false;
+            };
             let (Some(create), Some(read), Some(destroy)) = (
                 audio.createAudioReaderForSource,
                 audio.readAudioSamples,
@@ -346,8 +504,34 @@ impl DcShared {
                 return false;
             }
             const CHUNK: usize = 1 << 16;
-            let mut mono = Vec::with_capacity(count);
-            let mut buffers = vec![vec![0.0f32; CHUNK]; channels];
+            let mut mono = Vec::new();
+            if mono.try_reserve_exact(count).is_err() {
+                destroy(
+                    self.host.audio_ref.0 as ARAAudioAccessControllerHostRef,
+                    reader,
+                );
+                return false;
+            }
+            let mut buffers = Vec::new();
+            if buffers.try_reserve_exact(channels).is_err() {
+                destroy(
+                    self.host.audio_ref.0 as ARAAudioAccessControllerHostRef,
+                    reader,
+                );
+                return false;
+            }
+            for _ in 0..channels {
+                let mut channel = Vec::new();
+                if channel.try_reserve_exact(CHUNK).is_err() {
+                    destroy(
+                        self.host.audio_ref.0 as ARAAudioAccessControllerHostRef,
+                        reader,
+                    );
+                    return false;
+                }
+                channel.resize(CHUNK, 0.0);
+                buffers.push(channel);
+            }
             let mut pos = 0usize;
             let mut ok = true;
             while pos < count {
@@ -376,10 +560,11 @@ impl DcShared {
                     mono.push(sum / channels as f32);
                 }
                 pos += n;
+                let permille = (pos as u64).saturating_mul(300) / count as u64;
                 source
                     .progress
                     .permille
-                    .store((pos * 300 / count) as u32, Ordering::Relaxed);
+                    .store(permille as u32, Ordering::Relaxed);
             }
             destroy(
                 self.host.audio_ref.0 as ARAAudioAccessControllerHostRef,
@@ -391,14 +576,27 @@ impl DcShared {
             mono
         };
 
-        // Resample to the engine rate, then analyse unless every
-        // modification already has restored edits.
-        let target = engine_rate(rate);
+        // Keep the engine at the rate it was built. Playback resamples to
+        // the host rate; doing it here as well would stretch the take twice.
         let src_rate = rate.round() as u32;
+        let target = source
+            .modifications
+            .lock()
+            .iter()
+            .find_map(Weak::upgrade)
+            .map(|m| m.engine.sample_rate().round() as u32)
+            .filter(|r| (8_000..=MAX_SAMPLE_RATE).contains(r))
+            .unwrap_or(src_rate);
         let samples = if src_rate == target {
             mono
+        } else if bounded_output_len(count, src_rate, target).is_none() {
+            return false;
         } else {
-            resample_mono_cubic(&mono, src_rate, target)
+            let samples = resample_mono_cubic(&mono, src_rate, target);
+            if samples.is_empty() {
+                return false;
+            }
+            samples
         };
         let audio = Arc::new(DecodedAudio {
             duration_sec: samples.len() as f64 / target as f64,
@@ -446,7 +644,12 @@ struct Archive {
 
 impl DcShared {
     unsafe fn read_archive(&self, reader: ARAArchiveReaderHostRef) -> Option<Archive> {
-        let api = unsafe { &*self.host.archive };
+        let api = unsafe {
+            read_interface(
+                self.host.archive,
+                kARAArchivingControllerInterfaceMinSize as usize,
+            )?
+        };
         let size = unsafe { api.getArchiveSize?(self.host.archive_ref.0 as _, reader) };
         if size == 0 {
             return Some(Archive::default());
@@ -471,7 +674,14 @@ impl DcShared {
         let Ok(bytes) = serde_json::to_vec(archive) else {
             return false;
         };
-        let api = unsafe { &*self.host.archive };
+        let Some(api) = (unsafe {
+            read_interface(
+                self.host.archive,
+                kARAArchivingControllerInterfaceMinSize as usize,
+            )
+        }) else {
+            return false;
+        };
         let Some(write) = api.writeBytesToArchive else {
             return false;
         };
@@ -521,7 +731,12 @@ unsafe extern "C" fn create_document_controller(
         if host.is_null() {
             return ptr::null();
         }
-        let h = ptr::read_unaligned(host);
+        let Some(h) = read_versioned(host) else {
+            return ptr::null();
+        };
+        if (h.structSize as usize) < kARADocumentControllerHostInstanceMinSize as usize {
+            return ptr::null();
+        }
         if h.audioAccessControllerInterface.is_null()
             || h.archivingControllerInterface.is_null()
             || h.modelUpdateControllerInterface.is_null()
@@ -576,7 +791,12 @@ unsafe extern "C" fn no_op(_r: ARADocumentControllerRef) {}
 unsafe extern "C" fn notify_model_updates(r: ARADocumentControllerRef) {
     guard((), || unsafe {
         let s = &dc(r).shared;
-        let api = &*s.host.update;
+        let Some(api) = read_interface(
+            s.host.update,
+            kARAModelUpdateControllerInterfaceMinSize as usize,
+        ) else {
+            return;
+        };
         let host = s.host.update_ref.0 as ARAModelUpdateControllerHostRef;
         for src in s.sources.lock().iter() {
             let state = src.state.load(Ordering::Acquire);
@@ -684,8 +904,9 @@ unsafe extern "C" fn store_objects(
         let all: Vec<_> = s.modifications.lock().clone();
         let mods = if filter.is_null() {
             all
-        } else {
-            let f = ptr::read_unaligned(filter);
+        } else if let Some(f) = read_versioned(filter)
+            .filter(|f| f.structSize >= kARAStoreObjectsFilterMinSize as usize)
+        {
             let refs: &[ARAAudioModificationRef] = if f.audioModificationRefs.is_null() {
                 &[]
             } else {
@@ -694,6 +915,9 @@ unsafe extern "C" fn store_objects(
             refs.iter()
                 .filter_map(|&r| find(&all, r as *const c_void))
                 .collect()
+        } else {
+            // Shorter than the minimum: the ref list is not there to read.
+            all
         };
         if s.write_archive(writer, &s.archive_of(&mods)) {
             kARATrue
@@ -715,8 +939,11 @@ unsafe extern "C" fn restore_objects(
         };
         // Archive ID → current ID, when the host renamed objects.
         let mut rename: HashMap<String, String> = HashMap::new();
-        if !filter.is_null() {
-            let f = ptr::read_unaligned(filter);
+        if let Some(f) = (!filter.is_null())
+            .then(|| read_versioned(filter))
+            .flatten()
+            .filter(|f| f.structSize >= kARARestoreObjectsFilterMinSize as usize)
+        {
             if !f.audioModificationArchiveIDs.is_null() && !f.audioModificationCurrentIDs.is_null()
             {
                 let n = f.audioModificationIDsCount;
@@ -780,16 +1007,19 @@ unsafe extern "C" fn destroy_musical_context(
 ) {
 }
 
-unsafe fn source_props(src: &AudioSource, p: *const ARAAudioSourceProperties) {
-    if p.is_null() {
-        return;
+unsafe fn source_props(src: &AudioSource, p: *const ARAAudioSourceProperties) -> bool {
+    let Some(p) = (unsafe { read_versioned(p) }) else {
+        return false;
+    };
+    if p.structSize < kARAAudioSourcePropertiesMinSize as usize {
+        return false;
     }
-    let p = unsafe { ptr::read_unaligned(p) };
     *src.name.lock() = unsafe { c_string(p.name) };
     *src.persistent_id.lock() = unsafe { c_string(p.persistentID) };
     *src.sample_rate.lock() = p.sampleRate;
     *src.channels.lock() = p.channelCount;
     *src.sample_count.lock() = p.sampleCount;
+    true
 }
 
 unsafe extern "C" fn create_audio_source(
@@ -813,7 +1043,9 @@ unsafe extern "C" fn create_audio_source(
             analysis: Mutex::new(None),
             modifications: Mutex::new(Vec::new()),
         });
-        source_props(&src, p);
+        if !source_props(&src, p) {
+            return ptr::null_mut();
+        }
         let handle = Arc::as_ptr(&src) as ARAAudioSourceRef;
         dc(r).shared.sources.lock().push(src);
         handle
@@ -825,7 +1057,38 @@ unsafe extern "C" fn update_audio_source_properties(
     s: ARAAudioSourceRef,
     p: *const ARAAudioSourceProperties,
 ) {
-    guard((), || unsafe { source_props(obj::<AudioSource>(s), p) })
+    guard((), || unsafe {
+        let shared = &dc(_r).shared;
+        let Some(src) = find(&shared.sources.lock(), s as *const c_void) else {
+            return;
+        };
+        let before = (
+            *src.sample_rate.lock(),
+            *src.channels.lock(),
+            *src.sample_count.lock(),
+        );
+        if !source_props(&src, p) {
+            return;
+        }
+        let after = (
+            *src.sample_rate.lock(),
+            *src.channels.lock(),
+            *src.sample_count.lock(),
+        );
+        if before != after {
+            // The cached take was read at the old shape. Drop it so the next
+            // access (or the one still enabled) reads the new one.
+            let had_reader = src.reader.lock().is_some();
+            shared.stop_reading(&src);
+            src.state.store(SOURCE_EMPTY, Ordering::Release);
+            *src.audio.lock() = None;
+            *src.analysis.lock() = None;
+            src.progress.permille.store(0, Ordering::Relaxed);
+            if had_reader {
+                shared.start_reading(&src);
+            }
+        }
+    })
 }
 
 unsafe extern "C" fn update_audio_source_content(
@@ -894,18 +1157,24 @@ unsafe extern "C" fn destroy_audio_source(r: ARADocumentControllerRef, s: ARAAud
     })
 }
 
+fn modification_identity(p: *const ARAAudioModificationProperties) -> Option<(String, String)> {
+    if p.is_null() {
+        return Some((String::new(), String::new()));
+    }
+    let p = unsafe { read_versioned(p)? };
+    if p.structSize < kARAAudioModificationPropertiesMinSize as usize {
+        return None;
+    }
+    Some(unsafe { (c_string(p.name), c_string(p.persistentID)) })
+}
+
 fn new_modification(
     source: Arc<AudioSource>,
     host_ref: ARAAudioModificationHostRef,
     p: *const ARAAudioModificationProperties,
     doc: Option<VoxDocument>,
-) -> Arc<AudioModification> {
-    let (name, id) = if p.is_null() {
-        (String::new(), String::new())
-    } else {
-        let p = unsafe { ptr::read_unaligned(p) };
-        unsafe { (c_string(p.name), c_string(p.persistentID)) }
-    };
+) -> Option<Arc<AudioModification>> {
+    let (name, id) = modification_identity(p)?;
     let rate = engine_rate(*source.sample_rate.lock());
     let m = Arc::new(AudioModification {
         host_ref: Handle(host_ref as *mut c_void),
@@ -917,6 +1186,7 @@ fn new_modification(
         restored: Mutex::new(None),
         generation: AtomicU64::new(1),
         dirty: AtomicBool::new(false),
+        regions: Mutex::new(Vec::new()),
     });
     source.modifications.lock().push(Arc::downgrade(&m));
     // A take already read: install at once (with the copied edits, if any).
@@ -925,7 +1195,7 @@ fn new_modification(
         Some(audio) => m.install(&audio, doc),
         None => *m.restored.lock() = doc,
     }
-    m
+    Some(m)
 }
 
 unsafe extern "C" fn create_audio_modification(
@@ -939,7 +1209,9 @@ unsafe extern "C" fn create_audio_modification(
         let Some(src) = find(&shared.sources.lock(), s as *const c_void) else {
             return ptr::null_mut();
         };
-        let m = new_modification(src, host_ref, p, None);
+        let Some(m) = new_modification(src, host_ref, p, None) else {
+            return ptr::null_mut();
+        };
         // During a document restore the edits arrive before the objects.
         let id = m.persistent_id.lock().clone();
         if let Some(doc) = shared
@@ -972,7 +1244,9 @@ unsafe extern "C" fn clone_audio_modification(
             .lock()
             .clone()
             .or_else(|| from.restored.lock().clone());
-        let copy = new_modification(from.source.clone(), host_ref, p, doc);
+        let Some(copy) = new_modification(from.source.clone(), host_ref, p, doc) else {
+            return ptr::null_mut();
+        };
         let handle = Arc::as_ptr(&copy) as ARAAudioModificationRef;
         shared.modifications.lock().push(copy);
         handle
@@ -985,13 +1259,15 @@ unsafe extern "C" fn update_audio_modification_properties(
     p: *const ARAAudioModificationProperties,
 ) {
     guard((), || unsafe {
+        let Some((name, id)) = modification_identity(p) else {
+            return;
+        };
         if p.is_null() {
             return;
         }
         let m = obj::<AudioModification>(m);
-        let p = ptr::read_unaligned(p);
-        *m.name.lock() = c_string(p.name);
-        *m.persistent_id.lock() = c_string(p.persistentID);
+        *m.name.lock() = name;
+        *m.persistent_id.lock() = id;
     })
 }
 
@@ -1026,15 +1302,26 @@ unsafe extern "C" fn create_playback_region(
         let Some(modification) = find(&shared.modifications.lock(), m as *const c_void) else {
             return ptr::null_mut();
         };
+        let reports_meter = Arc::new(AtomicBool::new(!modification.meter_is_taken()));
         let region = Arc::new(PlaybackRegion {
             _host_ref: Handle(host_ref as *mut c_void),
-            modification,
+            player: Mutex::new(Arc::new(
+                modification
+                    .engine
+                    .fork_playback_with(Arc::clone(&reports_meter)),
+            )),
+            reports_meter,
+            retired: Mutex::new(Vec::new()),
+            modification: modification.clone(),
             start_mod: AtomicU64::new(0f64.to_bits()),
             start_play: AtomicU64::new(0f64.to_bits()),
             dur_play: AtomicU64::new(0f64.to_bits()),
             name: Mutex::new(String::new()),
         });
-        region.set_props(p);
+        if !region.set_props(p) {
+            return ptr::null_mut();
+        }
+        modification.bind_region(&region);
         let handle = Arc::as_ptr(&region) as ARAPlaybackRegionRef;
         shared.regions.lock().push(region);
         handle
@@ -1046,7 +1333,9 @@ unsafe extern "C" fn update_playback_region_properties(
     pr: ARAPlaybackRegionRef,
     p: *const ARAPlaybackRegionProperties,
 ) {
-    guard((), || unsafe { obj::<PlaybackRegion>(pr).set_props(p) })
+    guard((), || unsafe {
+        let _ = obj::<PlaybackRegion>(pr).set_props(p);
+    })
 }
 
 unsafe extern "C" fn destroy_playback_region(
@@ -1054,11 +1343,31 @@ unsafe extern "C" fn destroy_playback_region(
     pr: ARAPlaybackRegionRef,
 ) {
     guard((), || unsafe {
-        dc(r)
-            .shared
-            .regions
-            .lock()
-            .retain(|a| Arc::as_ptr(a) as *const c_void != pr as *const c_void);
+        let removed = {
+            let mut list = dc(r).shared.regions.lock();
+            let index = list
+                .iter()
+                .position(|a| Arc::as_ptr(a) as *const c_void == pr as *const c_void);
+            index.map(|index| list.remove(index))
+        };
+        let Some(removed) = removed else {
+            return;
+        };
+        // Drop our Arc before pruning, or this region's weak still looks live.
+        let reports = removed.reports_meter.load(Ordering::Relaxed);
+        let modification = Arc::clone(&removed.modification);
+        drop(removed);
+        modification.prune_dead_regions();
+        if reports {
+            let next = modification
+                .regions
+                .lock()
+                .iter()
+                .find_map(|region| region.upgrade());
+            if let Some(next) = next {
+                next.focus_editor_meter();
+            }
+        }
     })
 }
 
@@ -1508,14 +1817,19 @@ unsafe extern "C" fn notify_selection(r: ARAEditorViewRef, selection: *const ARA
             return;
         }
         let b = binding(r as *mut c_void);
-        let s = ptr::read_unaligned(selection);
+        let Some(s) =
+            read_versioned(selection).filter(|s| s.structSize >= kARAViewSelectionMinSize as usize)
+        else {
+            return;
+        };
         if s.playbackRegionRefsCount == 0 || s.playbackRegionRefs.is_null() {
             return;
         }
         let first = *s.playbackRegionRefs;
         if let Some(region) = region_by_ref(b, first) {
-            *b.shared.focused.lock() = Some(region);
+            *b.shared.focused.lock() = Some(Arc::clone(&region));
             b.shared.focus_generation.fetch_add(1, Ordering::Release);
+            region.focus_editor_meter();
         }
     })
 }
@@ -1568,7 +1882,7 @@ static EDITOR_VIEW_INTERFACE: SyncEditorView = SyncEditorView(ARAEditorViewInter
 
 /// Renders this instance's regions at host time `pos` into `left` / `right`
 /// (cleared first), using `scratch` (2 × frames). Realtime: `try_lock` only,
-/// no allocation. A region whose engine isn't at the host rate stays silent.
+/// no allocation. A take recorded at another rate is resampled into `rate`.
 pub fn render_regions(
     shared: &BindingShared,
     pos: f64,
@@ -1582,13 +1896,16 @@ pub fn render_regions(
     if let Some(r) = right.as_deref_mut() {
         r.fill(0.0);
     }
-    if !playing {
+    if !playing || !(rate.is_finite() && rate > 0.0) {
         return;
     }
     let Some(regions) = shared.regions.try_lock() else {
         return;
     };
     let frames = left.len();
+    if scratch.len() < frames * 2 {
+        return;
+    }
     let block = frames as f64 / rate as f64;
     for region in regions.iter() {
         let start = region.start_in_playback();
@@ -1596,13 +1913,14 @@ pub fn render_regions(
         if pos + block <= start || pos >= end {
             continue;
         }
-        let engine = &region.modification.engine;
-        if (engine.sample_rate() - rate).abs() > 0.5 {
+        let Some(slot) = region.player.try_lock() else {
             continue;
-        }
+        };
+        let player = Arc::clone(&slot);
+        drop(slot);
         let out = &mut scratch[..frames * 2];
         let take_sec = region.start_in_modification() + (pos - start);
-        if !engine.render_following(take_sec, true, out) {
+        if !player.render_following_host(take_sec, true, rate, out) {
             continue;
         }
         // Past the region's end the take keeps going: keep it out.
@@ -1853,7 +2171,6 @@ mod tests {
 
     #[test]
     fn a_host_reads_analyses_plays_edits_and_restores_a_take() {
-        HOST_RATE.store(SR as u32, Ordering::Relaxed);
         unsafe {
             // Load: the host enables access, we read and analyse.
             let d = open();
@@ -1958,6 +2275,244 @@ mod tests {
                 .iter()
                 .any(|n| (n.pitch - raised).abs() < 1e-5));
             d2.i.destroyDocumentController.unwrap()(d2.r);
+        }
+    }
+
+    fn wait_failed(src: &AudioSource) {
+        let start = Instant::now();
+        while src.state.load(Ordering::Acquire) != SOURCE_FAILED {
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "source stayed in state {}",
+                src.state.load(Ordering::Acquire)
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    unsafe fn source_with(d: &Doc, sample_rate: f64, sample_count: i64) -> ARAAudioSourceRef {
+        let props = ARAAudioSourceProperties {
+            structSize: std::mem::size_of::<ARAAudioSourceProperties>(),
+            name: c"bad.wav".as_ptr(),
+            persistentID: c"src-bad".as_ptr(),
+            sampleCount: sample_count,
+            sampleRate: sample_rate,
+            channelCount: 1,
+            merits64BitSamples: kARAFalse,
+            channelArrangementDataType: 0,
+            channelArrangement: ptr::null(),
+        };
+        let src = unsafe { d.i.createAudioSource.unwrap()(d.r, 21 as _, &props) };
+        assert!(!src.is_null());
+        src
+    }
+
+    #[test]
+    fn an_absurd_source_fails_instead_of_allocating() {
+        unsafe {
+            let d = open();
+            let src = source_with(&d, SR, i64::MAX);
+            d.i.enableAudioSourceSamplesAccess.unwrap()(d.r, src, kARATrue);
+            wait_failed(obj::<AudioSource>(src));
+            d.i.destroyDocumentController.unwrap()(d.r);
+        }
+    }
+
+    #[test]
+    fn a_tiny_source_rate_fails_instead_of_resampling() {
+        unsafe {
+            let d = open();
+            let src = source_with(&d, 1.0, 200_000);
+            d.i.enableAudioSourceSamplesAccess.unwrap()(d.r, src, kARATrue);
+            wait_failed(obj::<AudioSource>(src));
+            d.i.destroyDocumentController.unwrap()(d.r);
+        }
+    }
+
+    #[test]
+    fn a_short_playback_region_keeps_fields_the_host_did_not_send() {
+        unsafe {
+            let d = open();
+            let (_src, _m, region_ref) = add_take(&d);
+            let min = kARAPlaybackRegionPropertiesMinSize as usize;
+            let mut props = ARAPlaybackRegionProperties {
+                structSize: min,
+                transformationFlags: 0,
+                startInModificationTime: 0.5,
+                durationInModificationTime: 1.0,
+                startInPlaybackTime: 4.25,
+                durationInPlaybackTime: 1.0,
+                musicalContextRef: ptr::null_mut(),
+                regionSequenceRef: ptr::null_mut(),
+                name: c"should-not-be-read".as_ptr(),
+                color: ptr::null(),
+            };
+            d.i.updatePlaybackRegionProperties.unwrap()(d.r, region_ref, &props);
+            let region = obj::<PlaybackRegion>(region_ref);
+            assert!((region.start_in_playback() - 4.25).abs() < 1e-9);
+            assert!((region.start_in_modification() - 0.5).abs() < 1e-9);
+            assert_eq!(region.name.lock().as_str(), "Verse");
+
+            #[cfg(windows)]
+            {
+                const MEM_COMMIT: u32 = 0x1000;
+                const MEM_RESERVE: u32 = 0x2000;
+                const MEM_RELEASE: u32 = 0x8000;
+                const PAGE_READWRITE: u32 = 0x04;
+                const PAGE_NOACCESS: u32 = 0x01;
+                extern "system" {
+                    fn VirtualAlloc(
+                        addr: *mut c_void,
+                        size: usize,
+                        typ: u32,
+                        protect: u32,
+                    ) -> *mut c_void;
+                    fn VirtualProtect(
+                        addr: *mut c_void,
+                        size: usize,
+                        protect: u32,
+                        old: *mut u32,
+                    ) -> i32;
+                    fn VirtualFree(addr: *mut c_void, size: usize, free_type: u32) -> i32;
+                }
+                let page = 4096usize;
+                let mem = VirtualAlloc(
+                    ptr::null_mut(),
+                    page * 2,
+                    MEM_COMMIT | MEM_RESERVE,
+                    PAGE_READWRITE,
+                );
+                assert!(!mem.is_null(), "VirtualAlloc");
+                let mut old = 0u32;
+                assert_ne!(
+                    VirtualProtect(mem.add(page), page, PAGE_NOACCESS, &mut old),
+                    0
+                );
+                props.startInPlaybackTime = 6.5;
+                let dst = mem.add(page - min);
+                ptr::copy_nonoverlapping(ptr::from_ref(&props) as *const u8, dst as *mut u8, min);
+                d.i.updatePlaybackRegionProperties.unwrap()(
+                    d.r,
+                    region_ref,
+                    dst as *const ARAPlaybackRegionProperties,
+                );
+                assert!((region.start_in_playback() - 6.5).abs() < 1e-9);
+                assert_eq!(region.name.lock().as_str(), "Verse");
+                VirtualFree(mem, 0, MEM_RELEASE);
+            }
+            d.i.destroyDocumentController.unwrap()(d.r);
+        }
+    }
+
+    #[test]
+    fn duplicated_regions_keep_their_own_playheads_at_any_host_rate() {
+        unsafe {
+            let d = open();
+            let (src, m_ref, region_ref) = add_take(&d);
+            let second_props = ARAPlaybackRegionProperties {
+                structSize: std::mem::size_of::<ARAPlaybackRegionProperties>(),
+                transformationFlags: 0,
+                startInModificationTime: 0.0,
+                durationInModificationTime: SECONDS,
+                startInPlaybackTime: 10.0,
+                durationInPlaybackTime: SECONDS,
+                musicalContextRef: ptr::null_mut(),
+                regionSequenceRef: ptr::null_mut(),
+                name: c"Verse copy".as_ptr(),
+                color: ptr::null(),
+            };
+            let region2 = d.i.createPlaybackRegion.unwrap()(d.r, m_ref, 14 as _, &second_props);
+            assert!(!region2.is_null());
+            d.i.enableAudioSourceSamplesAccess.unwrap()(d.r, src, kARATrue);
+            let m = obj::<AudioModification>(m_ref);
+            wait_ready(m);
+            let binding = bind(d.r as *mut c_void, 8, 8).unwrap();
+            let ext = ptr::read_unaligned(binding.extension() as *const ARAPlugInExtensionInstance);
+            (*ext.playbackRendererInterface).addPlaybackRegion.unwrap()(
+                ext.playbackRendererRef,
+                region_ref,
+            );
+            (*ext.playbackRendererInterface).addPlaybackRegion.unwrap()(
+                ext.playbackRendererRef,
+                region2,
+            );
+            let mut left = vec![0.0f32; 1024];
+            let mut right = vec![0.0f32; 1024];
+            let mut scratch = vec![0.0f32; 2048];
+            render_regions(
+                &binding.shared,
+                10.3,
+                true,
+                SR as f32,
+                &mut left,
+                Some(&mut right),
+                &mut scratch,
+            );
+            let step = 1024.0 / SR;
+            let a = obj::<PlaybackRegion>(region_ref).player();
+            let b = obj::<PlaybackRegion>(region2).player();
+            let pa = a.playhead();
+            let pb = b.playhead();
+            assert!((pa - (0.3 + step)).abs() < 1e-3, "first region {pa}");
+            assert!((pb - (0.3 + step)).abs() < 1e-3, "second region {pb}");
+
+            let mut peak = 0.0f32;
+            for k in 0..20 {
+                let pos = 10.3 + k as f64 * 1024.0 / 24_000.0;
+                render_regions(
+                    &binding.shared,
+                    pos,
+                    true,
+                    24_000.0,
+                    &mut left,
+                    Some(&mut right),
+                    &mut scratch,
+                );
+                peak = peak.max(left.iter().fold(0.0f32, |p, s| p.max(s.abs())));
+            }
+            assert!(peak > 0.05, "silent at 24 kHz ({peak})");
+            d.i.destroyDocumentController.unwrap()(d.r);
+        }
+    }
+
+    #[test]
+    fn destroyed_regions_drop_their_weak_entries() {
+        unsafe {
+            let d = open();
+            let (_src, m_ref, first) = add_take(&d);
+            let m = obj::<AudioModification>(m_ref);
+            assert_eq!(m.regions.lock().len(), 1);
+            assert!(obj::<PlaybackRegion>(first)
+                .reports_meter
+                .load(Ordering::Relaxed));
+            let props = ARAPlaybackRegionProperties {
+                structSize: std::mem::size_of::<ARAPlaybackRegionProperties>(),
+                transformationFlags: 0,
+                startInModificationTime: 0.0,
+                durationInModificationTime: SECONDS,
+                startInPlaybackTime: 4.0,
+                durationInPlaybackTime: SECONDS,
+                musicalContextRef: ptr::null_mut(),
+                regionSequenceRef: ptr::null_mut(),
+                name: c"second".as_ptr(),
+                color: ptr::null(),
+            };
+            let second = d.i.createPlaybackRegion.unwrap()(d.r, m_ref, 21 as _, &props);
+            assert!(!second.is_null());
+            assert_eq!(m.regions.lock().len(), 2);
+            assert!(!obj::<PlaybackRegion>(second)
+                .reports_meter
+                .load(Ordering::Relaxed));
+            d.i.destroyPlaybackRegion.unwrap()(d.r, first);
+            assert_eq!(m.regions.lock().len(), 1);
+            assert!(m.regions.lock()[0].upgrade().is_some());
+            // The region the editor was metering is gone: the one left takes it.
+            assert!(obj::<PlaybackRegion>(second)
+                .reports_meter
+                .load(Ordering::Relaxed));
+            d.i.destroyPlaybackRegion.unwrap()(d.r, second);
+            assert!(m.regions.lock().is_empty());
+            d.i.destroyDocumentController.unwrap()(d.r);
         }
     }
 }

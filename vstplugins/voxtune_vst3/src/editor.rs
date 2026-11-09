@@ -177,6 +177,7 @@ impl PluginEditor {
                 if key != self.seen {
                     self.seen = key;
                     if let Some(region) = region {
+                        region.focus_editor_meter();
                         let m = &region.modification;
                         let doc = m.doc.lock().clone();
                         let title = m.source.name.lock().clone();

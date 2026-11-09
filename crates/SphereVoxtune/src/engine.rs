@@ -5,7 +5,8 @@
 //! streams real-time TD-PSOLA pitch/formant/time/level shifted audio via `Shifter`.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, TryLockError};
 
 use serde::{Deserialize, Serialize};
 
@@ -437,6 +438,24 @@ pub fn analyze_samples(
 /// Covers every usual Android burst in one pass; longer callbacks loop.
 const I16_RENDER_CHUNK_FRAMES: usize = 1024;
 
+/// Notes and bypass published by the editor engine and read by playback forks.
+///
+/// Several regions can play one modification. Each fork has its own playhead
+/// and shifter, and pulls this list so a drag reaches every region without
+/// copying samples on the audio thread. Bypass is one atomic load per block.
+#[derive(Debug)]
+struct NoteFeed {
+    generation: AtomicU64,
+    current: Mutex<Arc<Vec<CantoNote>>>,
+    /// Previous lists the audio thread could not free. Cleared on the thread
+    /// that publishes.
+    retired: Mutex<Vec<Arc<Vec<CantoNote>>>>,
+    bypass: AtomicBool,
+    /// The editor's level meter. The source `Shared` reads this word; a
+    /// reporting playback fork writes its block peak into it.
+    editor_meter: Arc<AtomicU32>,
+}
+
 #[derive(Debug, Clone)]
 pub struct CantoEngine {
     sample_rate: f32,
@@ -446,16 +465,27 @@ pub struct CantoEngine {
     pub playing: bool,
     pub loop_enabled: bool,
     pub bypass: bool,
+    /// Playback forks set this and adopt [`NoteFeed::bypass`] every block.
+    /// The edited engine leaves it clear, so an offline render can force
+    /// bypass off without publishing that to the forks.
+    follow_shared_bypass: bool,
     pub playhead_sec: f64,
     pub correct_amount: f32,
     /// Decoded mono audio samples of the loaded vocal file (at `sample_rate`).
-    pub audio_samples: Vec<f32>,
+    /// Shared with playback forks so a second region does not copy the take.
+    pub audio_samples: Arc<Vec<f32>>,
     /// Total duration of the loaded audio in seconds.
     pub duration_sec: f64,
     /// Downsampled peak envelope for the overview waveform.
     pub waveform_peaks: Vec<f32>,
     /// Analyzed and user-edited vocal notes.
-    pub notes: Vec<CantoNote>,
+    ///
+    /// Replaced, not edited through a shared `Vec`, so a playback fork can
+    /// keep rendering the previous list until it pulls the new one.
+    pub notes: Arc<Vec<CantoNote>>,
+    note_feed: Arc<NoteFeed>,
+    /// `note_feed.generation` last applied to `notes`.
+    seen_note_gen: u64,
     /// Real-time TD-PSOLA pitch & formant shifter.
     shifter: Shifter,
     /// Spreads a note whose length was edited over its new span, before
@@ -475,6 +505,8 @@ pub struct CantoEngine {
     pub whitesharp: WhiteSharpDsp,
     control_counter: usize,
     meter_level: f32,
+    /// When set, this engine publishes its block peak to the editor meter.
+    reports_meter: Arc<AtomicBool>,
     /// Note being previewed (press-to-hear in the editor), if any.
     audition_note_index: Option<usize>,
     /// Read position in the source audio (input side of the shifter).
@@ -510,6 +542,15 @@ impl CantoEngine {
         compressor.set_curve(-16.0, 2.5, 6.0, 1.5);
         compressor.set_timing(0.008, 0.09);
 
+        let notes = Arc::new(Vec::new());
+        let note_feed = Arc::new(NoteFeed {
+            generation: AtomicU64::new(0),
+            current: Mutex::new(Arc::clone(&notes)),
+            retired: Mutex::new(Vec::with_capacity(32)),
+            bypass: AtomicBool::new(false),
+            editor_meter: Arc::new(AtomicU32::new(0)),
+        });
+
         Self {
             sample_rate: sr,
             bpm: DEFAULT_BPM,
@@ -518,12 +559,15 @@ impl CantoEngine {
             playing: false,
             loop_enabled: true,
             bypass: false,
+            follow_shared_bypass: false,
             playhead_sec: 0.0,
             correct_amount: 0.0,
-            audio_samples: Vec::new(),
+            audio_samples: Arc::new(Vec::new()),
             duration_sec: 0.0,
             waveform_peaks: Vec::new(),
-            notes: Vec::new(),
+            notes,
+            note_feed,
+            seen_note_gen: 0,
             shifter,
             stretcher: Stretcher::new(longest_period),
             splice_src: None,
@@ -534,6 +578,7 @@ impl CantoEngine {
             whitesharp: WhiteSharpDsp::new(sr),
             control_counter: 0,
             meter_level: 0.0,
+            reports_meter: Arc::new(AtomicBool::new(false)),
             audition_note_index: None,
             audition_cursor_sec: 0.0,
             audition_held: false,
@@ -563,6 +608,25 @@ impl CantoEngine {
 
     pub fn meter_level(&self) -> f32 {
         self.meter_level
+    }
+
+    /// Publishes playback bypass to every fork of this take. Forks load it
+    /// at the start of their next block; no lock on the audio thread.
+    pub fn set_bypass(&mut self, bypass: bool) {
+        self.bypass = bypass;
+        self.note_feed.bypass.store(bypass, Ordering::Release);
+    }
+
+    pub(crate) fn editor_meter(&self) -> Arc<AtomicU32> {
+        Arc::clone(&self.note_feed.editor_meter)
+    }
+
+    pub(crate) fn reports_meter_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.reports_meter)
+    }
+
+    pub(crate) fn use_meter_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.reports_meter = flag;
     }
 
     pub fn has_audio(&self) -> bool {
@@ -618,7 +682,7 @@ impl CantoEngine {
         self.playing = false;
         self.playhead_sec = 0.0;
         self.correct_amount = 0.0;
-        self.audio_samples = decoded.samples;
+        self.audio_samples = Arc::new(decoded.samples);
         self.duration_sec = decoded.duration_sec;
         self.waveform_peaks = decoded.waveform_peaks;
         self.shifter.reset();
@@ -640,14 +704,20 @@ impl CantoEngine {
         let mono = if sample_rate == target_sr {
             samples
         } else {
-            crate::audio_io::resample_mono_cubic(&samples, sample_rate, target_sr)
+            let mono = crate::audio_io::resample_mono_cubic(&samples, sample_rate, target_sr);
+            if mono.is_empty() {
+                return Err(
+                    "Audio is too long to load or its sample rate is unsupported".to_string(),
+                );
+            }
+            mono
         };
         self.playing = false;
         self.playhead_sec = 0.0;
         self.correct_amount = 0.0;
         self.duration_sec = mono.len() as f64 / self.sample_rate as f64;
         self.waveform_peaks = crate::audio_io::compute_waveform_peaks(&mono, 240);
-        self.audio_samples = mono;
+        self.audio_samples = Arc::new(mono);
         self.shifter.reset();
         self.compressor.reset();
         self.analyze_loaded_audio()
@@ -677,8 +747,9 @@ impl CantoEngine {
         self.scale = analysis.scale;
         self.bpm = analysis.bpm;
         self.correct_amount = 0.0;
-        self.notes = analysis.notes;
+        self.notes = Arc::new(analysis.notes);
         self.pitch_track = analysis.pitch;
+        self.publish_notes();
         self.analysis_result()
     }
 
@@ -701,7 +772,7 @@ impl CantoEngine {
             bpm: self.bpm,
             key: KEY_NAMES[(self.key as usize) % 12].to_string(),
             mode: self.scale.name().to_string(),
-            notes: self.notes.clone(),
+            notes: self.notes.as_ref().clone(),
             waveform_peaks: self.waveform_peaks.clone(),
             pitch: self.pitch_track.clone(),
         }
@@ -710,9 +781,12 @@ impl CantoEngine {
     pub fn set_key_and_scale(&mut self, key: u8, scale: Scale) {
         self.key = key % 12;
         self.scale = scale;
-        for note in &mut self.notes {
-            if !note.unpitched {
-                note.lyric = solfege_for_midi(note.pitch, self.key);
+        {
+            let key = self.key;
+            for note in Arc::make_mut(&mut self.notes) {
+                if !note.unpitched {
+                    note.lyric = solfege_for_midi(note.pitch, key);
+                }
             }
         }
         self.reapply_correct();
@@ -725,14 +799,16 @@ impl CantoEngine {
 
     pub fn reapply_correct(&mut self) {
         let allowed = scale_mask(self.key, self.scale) & ALL_NOTES;
-        for note in &mut self.notes {
+        let amount = self.correct_amount;
+        for note in Arc::make_mut(&mut self.notes) {
             if note.unpitched || note.pinned {
                 continue;
             }
             if let Some(target) = nearest_target(note.detected, allowed, None) {
-                note.pitch = note.detected + (target as f32 - note.detected) * self.correct_amount;
+                note.pitch = note.detected + (target as f32 - note.detected) * amount;
             }
         }
+        self.publish_notes();
     }
 
     pub fn update_note(
@@ -747,7 +823,9 @@ impl CantoEngine {
         pinned: bool,
         muted: bool,
     ) {
-        if let Some(note) = self.notes.get_mut(index) {
+        let key = self.key;
+        let notes = Arc::make_mut(&mut self.notes);
+        if let Some(note) = notes.get_mut(index) {
             // The lyric only depends on the rounded pitch; skip the String
             // rebuild while a drag keeps the note on the same semitone.
             let relabel = note.pitch.round() != pitch.round();
@@ -760,9 +838,22 @@ impl CantoEngine {
             note.pinned = pinned;
             note.muted = muted;
             if relabel && !note.unpitched {
-                note.lyric = solfege_for_midi(note.pitch, self.key);
+                note.lyric = solfege_for_midi(note.pitch, key);
             }
         }
+        self.publish_notes();
+    }
+
+    /// Replaces one note and publishes it to playback forks.
+    pub fn replace_note(&mut self, index: usize, note: CantoNote) {
+        {
+            let notes = Arc::make_mut(&mut self.notes);
+            if index >= notes.len() {
+                return;
+            }
+            notes[index] = note;
+        }
+        self.publish_notes();
     }
 
     /// Sets a note's ลูกคอ (ornament) and accent.
@@ -774,7 +865,7 @@ impl CantoEngine {
         orn_speed: f32,
         accent: f32,
     ) {
-        if let Some(note) = self.notes.get_mut(index) {
+        if let Some(note) = Arc::make_mut(&mut self.notes).get_mut(index) {
             note.orn_style = if orn_style <= ORN_FALL {
                 orn_style
             } else {
@@ -784,12 +875,13 @@ impl CantoEngine {
             note.orn_speed = clamp(orn_speed, 0.0, 1.0);
             note.accent = clamp(accent, 0.0, 1.0);
         }
+        self.publish_notes();
     }
 
     /// Replaces the note list after structural edits (cut, join) or undo.
     /// Notes must stay in time order; the UI keeps them sorted.
     pub fn set_notes(&mut self, notes: Vec<CantoNote>) {
-        self.notes = notes;
+        self.notes = Arc::new(notes);
         self.active_hint = 0;
         if self
             .audition_note_index
@@ -797,6 +889,89 @@ impl CantoEngine {
         {
             self.clear_audition();
         }
+        self.publish_notes();
+    }
+
+    fn publish_notes(&mut self) {
+        {
+            let mut slot = self
+                .note_feed
+                .current
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            *slot = Arc::clone(&self.notes);
+        }
+        let published = self.note_feed.generation.fetch_add(1, Ordering::Release) + 1;
+        self.seen_note_gen = published;
+        if let Ok(mut retired) = self.note_feed.retired.lock() {
+            retired.clear();
+        }
+    }
+
+    /// Audio thread: adopt notes published since this engine last rendered.
+    /// A list it can no longer hold is parked for the publisher to free.
+    fn pull_notes(&mut self) {
+        let published = self.note_feed.generation.load(Ordering::Acquire);
+        if published == self.seen_note_gen {
+            return;
+        }
+        let next = match self.note_feed.current.try_lock() {
+            Ok(guard) => Arc::clone(&guard),
+            Err(TryLockError::Poisoned(p)) => Arc::clone(&p.into_inner()),
+            Err(TryLockError::WouldBlock) => return,
+        };
+        if Arc::ptr_eq(&self.notes, &next) {
+            self.seen_note_gen = published;
+            return;
+        }
+        let old = std::mem::replace(&mut self.notes, Arc::clone(&next));
+        if let Err(old) = self.park_notes(old) {
+            // The feed still holds `next`, so dropping it does not free.
+            let abandoned = std::mem::replace(&mut self.notes, old);
+            drop(abandoned);
+            return;
+        }
+        self.seen_note_gen = published;
+    }
+
+    /// Parks `old` without growing the retired buffer. `Err` returns it.
+    fn park_notes(&self, old: Arc<Vec<CantoNote>>) -> Result<(), Arc<Vec<CantoNote>>> {
+        let mut retired = match self.note_feed.retired.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(TryLockError::WouldBlock) => return Err(old),
+        };
+        if retired.capacity() == 0 || retired.len() >= retired.capacity() {
+            return Err(old);
+        }
+        retired.push(old);
+        Ok(())
+    }
+
+    /// A second playback of this take: same samples and notes, its own
+    /// playhead and shifter. Called off the audio thread (the clone copies
+    /// the shifter's delay lines).
+    pub fn fork_playback(&self) -> Self {
+        let mut fork = self.clone();
+        fork.playing = false;
+        fork.playhead_sec = 0.0;
+        fork.loop_enabled = false;
+        fork.meter_level = 0.0;
+        fork.control_counter = 0;
+        fork.active_hint = 0;
+        fork.shifter.reset();
+        fork.compressor.reset();
+        fork.stretcher.reset();
+        fork.tail_stretcher.reset();
+        fork.splice_src = None;
+        fork.splice_path = None;
+        fork.splice_fade = None;
+        fork.clear_audition();
+        // The clone can race a publish. The next block pulls the current list.
+        fork.seen_note_gen = self.seen_note_gen.wrapping_sub(1);
+        fork.follow_shared_bypass = true;
+        fork.reports_meter = Arc::new(AtomicBool::new(true));
+        fork
     }
 
     /// Starts previewing a note from its beginning (press on a note).
@@ -856,6 +1031,9 @@ impl CantoEngine {
         // The export is the tuned vocal; the backing track is only a guide.
         e.backing = None;
         e.bypass = false;
+        // The clone shares the live bypass word. Follow the local value, and
+        // don't publish this forced-off state back to the forks.
+        e.follow_shared_bypass = false;
         e.loop_enabled = false;
         e.playing = true;
         e.playhead_sec = 0.0;
@@ -1069,7 +1247,7 @@ impl CantoEngine {
         if self.bypass {
             return false;
         }
-        for note in &self.notes {
+        for note in self.notes.iter() {
             if time_sec >= note.detected_start
                 && time_sec <= note.detected_start + note.detected_dur
             {
@@ -1214,6 +1392,10 @@ impl CantoEngine {
     /// Renders stereo interleaved `f32` frames (`frames = out_interleaved.len() / 2`)
     /// from the loaded audio file through the TD-PSOLA `Shifter` + `SoftKneeCompressor`.
     pub fn render_stereo_f32(&mut self, out_interleaved: &mut [f32]) -> f32 {
+        self.pull_notes();
+        if self.follow_shared_bypass {
+            self.bypass = self.note_feed.bypass.load(Ordering::Acquire);
+        }
         let frames = out_interleaved.len() / 2;
         if frames == 0 {
             return self.meter_level;
