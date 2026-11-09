@@ -265,18 +265,38 @@ pub fn read_peak_file(
     read_peak_bytes(&bytes, expected_asset_id, expected_source)
 }
 
+/// On-disk size of one LOD header: `samples_per_peak` + `peak_count`.
+const LOD_HEADER_BYTES: usize = 8;
+/// On-disk size of one peak: `min` + `max` as `f32`.
+const PEAK_BYTES: usize = 8;
+
+/// Reject a stored entry count whose entries cannot fit in the `remaining`
+/// bytes, before anything is reserved for them.
+fn check_count_fits(
+    count: usize,
+    entry_bytes: usize,
+    remaining: usize,
+) -> Result<(), PeakFileError> {
+    match count.checked_mul(entry_bytes) {
+        Some(needed) if needed <= remaining => Ok(()),
+        _ => Err(PeakFileError::InvalidPeakCount),
+    }
+}
+
 fn read_peak_bytes(
     bytes: &[u8],
     expected_asset_id: Option<&str>,
     expected_source: Option<SourceFingerprint>,
 ) -> Result<WaveformPreview, PeakFileError> {
-    let mut cursor = bytes;
-    let mut take = |n: usize, field: &'static str| -> Result<&[u8], PeakFileError> {
-        if cursor.len() < n {
+    // A `Cell` so the remaining length can be checked between `take`s.
+    let cursor = std::cell::Cell::new(bytes);
+    let take = |n: usize, field: &'static str| {
+        let rest = cursor.get();
+        if rest.len() < n {
             return Err(PeakFileError::Truncated { field });
         }
-        let (head, tail) = cursor.split_at(n);
-        cursor = tail;
+        let (head, tail) = rest.split_at(n);
+        cursor.set(tail);
         Ok(head)
     };
 
@@ -334,12 +354,17 @@ fn read_peak_bytes(
         }
     }
     let lod_count = u32::from_le_bytes(take(4, "lod_count")?.try_into().unwrap()) as usize;
+    // Counts come from the file: never reserve more entries than the bytes
+    // left could hold, or a corrupt count (0xFFFFFFFF) asks for tens of GiB
+    // before a single entry is read.
+    check_count_fits(lod_count, LOD_HEADER_BYTES, cursor.get().len())?;
 
     let mut lods = Vec::with_capacity(lod_count);
     for _ in 0..lod_count {
         let samples_per_peak =
             u32::from_le_bytes(take(4, "samples_per_peak")?.try_into().unwrap()) as usize;
         let peak_count = u32::from_le_bytes(take(4, "peak_count")?.try_into().unwrap()) as usize;
+        check_count_fits(peak_count, PEAK_BYTES, cursor.get().len())?;
         let mut peaks = Vec::with_capacity(peak_count);
         for _ in 0..peak_count {
             let min = f32::from_le_bytes(take(4, "peak_min")?.try_into().unwrap());
@@ -409,6 +434,56 @@ mod tests {
         assert_eq!(loaded.sample_rate, preview.sample_rate);
         assert_eq!(loaded.lods[0].peaks.len(), 2);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Bytes of a valid peak file for `sample_preview()` under `asset_id`.
+    fn sample_peak_bytes(label: &str, asset_id: &str) -> Vec<u8> {
+        let dir = temp_dir(label);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.peaks");
+        write_peak_file(&path, asset_id, &sample_preview(), None).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+        bytes
+    }
+
+    /// Offset of the LOD count: the fixed header (60 bytes) plus the id.
+    fn lod_count_offset(asset_id: &str) -> usize {
+        60 + asset_id.len()
+    }
+
+    #[test]
+    fn a_huge_lod_count_is_rejected_without_reserving_it() {
+        let asset_id = "Assets/Audio/loop.wav";
+        let mut bytes = sample_peak_bytes("huge_lods", asset_id);
+        let at = lod_count_offset(asset_id);
+        bytes[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let err = read_peak_bytes(&bytes, Some(asset_id), None).unwrap_err();
+        assert!(matches!(err, PeakFileError::InvalidPeakCount), "{err}");
+    }
+
+    #[test]
+    fn a_huge_peak_count_is_rejected_without_reserving_it() {
+        let asset_id = "Assets/Audio/loop.wav";
+        let mut bytes = sample_peak_bytes("huge_peaks", asset_id);
+        // LOD count, then the first LOD's samples_per_peak, then its peak count.
+        let at = lod_count_offset(asset_id) + 8;
+        assert_eq!(u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()), 2);
+        bytes[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let err = read_peak_bytes(&bytes, Some(asset_id), None).unwrap_err();
+        assert!(matches!(err, PeakFileError::InvalidPeakCount), "{err}");
+    }
+
+    #[test]
+    fn a_peak_count_one_past_the_data_is_rejected() {
+        let asset_id = "Assets/Audio/loop.wav";
+        let mut bytes = sample_peak_bytes("peaks_plus_one", asset_id);
+        let at = lod_count_offset(asset_id) + 8;
+        bytes[at..at + 4].copy_from_slice(&3u32.to_le_bytes());
+        assert!(read_peak_bytes(&bytes, Some(asset_id), None).is_err());
+        // The unmodified count still loads.
+        bytes[at..at + 4].copy_from_slice(&2u32.to_le_bytes());
+        assert!(read_peak_bytes(&bytes, Some(asset_id), None).is_ok());
     }
 
     #[test]
