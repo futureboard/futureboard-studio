@@ -912,7 +912,9 @@ impl Dsp {
             ipc::POWER_INDEX => self.power.set(power_share(self.params.power)),
             ipc::INPUT_TRIM_INDEX => self.input_gain.set_db(self.params.input_trim_db),
             ipc::OUTPUT_TRIM_INDEX => self.output_gain.set_db(self.params.output_trim_db),
-            ipc::SLOT_1_INDEX..=ipc::SLOT_6_INDEX => self.rack_pending = true,
+            ipc::SLOT_1_INDEX..=ipc::SLOT_6_INDEX | ipc::RACK_ORDER_INDEX => {
+                self.rack_pending = true
+            }
             _ => {
                 self.rack.apply_param(index, &self.params, self.sample_rate);
                 // The outgoing half of a rack fade tracks edits too, so the
@@ -1640,6 +1642,56 @@ mod tests {
             }
         }
         assert_eq!(rack_of(dsp.params()), order);
+    }
+
+    /// #354: a swap of a heavily compressing module sent as one rack-order
+    /// edit is one fade, with the compressor carrying its gain reduction
+    /// through. Sent as two slot edits with a block between, the rack first
+    /// fades to one without the compressor, then brings it back from rest —
+    /// the gap and level bump the issue reports.
+    #[test]
+    fn a_rack_order_edit_swaps_without_dropping_a_module() {
+        const FADE: usize = (SR * POWER_FADE_MS * 0.001) as usize;
+        let mut p = bypassed();
+        p.eq_enabled = true;
+        p.comp_enabled = true;
+        p.comp_threshold_db = -30.0;
+        p.comp_ratio = 8.0;
+        p.comp_attack_ms = 30.0;
+        p.comp_release_ms = 500.0;
+        let mut warm = Dsp::new(SR);
+        warm.set_params(with_rack(&p, [3, 2, 0, 0, 0, 0]));
+        for _ in 0..24_000 {
+            let _ = warm.process_stereo(0.8, 0.8);
+        }
+        let gr_before = warm.rack.compressor.gain_reduction_db();
+        assert!(gr_before > 6.0, "warm-up reduction {gr_before}");
+        let swapped = with_rack(&p, [2, 3, 0, 0, 0, 0]);
+
+        let mut atomic = warm.clone();
+        assert!(atomic.apply_wire_param(ipc::RACK_ORDER_INDEX, ipc::rack_order_value(&swapped)));
+        assert_eq!(rack_of(atomic.params()), [2, 3, 0, 0, 0, 0]);
+        let mut lowest = f32::MAX;
+        for _ in 0..FADE * 3 {
+            let _ = atomic.process_stereo(0.8, 0.8);
+            lowest = lowest.min(atomic.rack.compressor.gain_reduction_db());
+        }
+        assert!(
+            lowest > gr_before * 0.8,
+            "compressor restarted: {gr_before} dB fell to {lowest} dB"
+        );
+
+        // The split writes the editor used to send, a block apart.
+        let mut split = warm.clone();
+        assert!(split.apply_wire_param(ipc::SLOT_1_INDEX, 2.0));
+        let _ = split.process_stereo(0.8, 0.8);
+        assert!(split.apply_wire_param(ipc::SLOT_2_INDEX, 3.0));
+        let mut lowest = f32::MAX;
+        for _ in 0..FADE * 3 {
+            let _ = split.process_stereo(0.8, 0.8);
+            lowest = lowest.min(split.rack.compressor.gain_reduction_db());
+        }
+        assert!(lowest < gr_before * 0.5, "split writes kept {lowest} dB");
     }
 
     fn tone(n: usize) -> (f32, f32) {
