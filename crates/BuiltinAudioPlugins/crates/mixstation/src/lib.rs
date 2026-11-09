@@ -3,6 +3,7 @@
 //! Fixed order: input trim → HPF/LPF → four-band EQ → linked compressor →
 //! saturation → stereo width → output trim → zero-latency limiter.
 
+use builtin_dsp_core::delay::{Smoothed, smoothing_step};
 use builtin_dsp_core::{
     ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, linear_to_db, time_constant,
 };
@@ -31,6 +32,366 @@ const HPF_OPEN_HZ: f32 = 20.0;
 const LPF_OPEN_HZ: f32 = 20_000.0;
 /// Drive percentage to waveshaper amount: 100 % reaches a hard knee.
 const SATURATION_DRIVE_SCALE: f32 = 0.06;
+/// Power and rack-slot changes crossfade over about this long.
+const POWER_FADE_MS: f32 = 10.0;
+
+fn power_share(power: bool) -> f32 {
+    if power { 1.0 } else { 0.0 }
+}
+
+/// A control value that glides to a new target instead of stepping: two
+/// one-poles in series, so it leaves and lands with zero slope.
+#[derive(Debug, Clone, Copy)]
+struct Glide {
+    first: Smoothed,
+    second: Smoothed,
+    step: f32,
+}
+
+impl Glide {
+    const SNAP: f32 = 1.0e-5;
+
+    fn new(value: f32, ms: f32, sample_rate: f32) -> Self {
+        let mut glide = Self {
+            first: Smoothed::at(value),
+            second: Smoothed::at(value),
+            step: 0.0,
+        };
+        glide.set_time(ms, sample_rate);
+        glide
+    }
+
+    fn set_time(&mut self, ms: f32, sample_rate: f32) {
+        self.step = smoothing_step(ms * 0.5, sample_rate);
+    }
+
+    fn set(&mut self, target: f32) {
+        self.first.target = target;
+    }
+
+    fn is_settled(&self) -> bool {
+        self.second.value == self.first.target && self.first.value == self.first.target
+    }
+
+    fn settle(&mut self) {
+        self.first.settle();
+        self.second = Smoothed::at(self.first.target);
+    }
+
+    #[inline]
+    fn next(&mut self) -> f32 {
+        let target = self.first.target;
+        if self.is_settled() {
+            return target;
+        }
+        self.second.target = self.first.next(self.step);
+        let value = self.second.next(self.step);
+        if (value - target).abs() < Self::SNAP && (self.first.value - target).abs() < Self::SNAP {
+            self.settle();
+            return target;
+        }
+        value
+    }
+}
+
+/// Smoothstep weight of a rack crossfade `pos` samples into `len`: leaves 0
+/// and lands on 1 with zero slope, so neither end of the fade kinks.
+#[inline]
+fn rack_fade_weight(pos: u32, len: u32) -> f32 {
+    let t = (pos as f32 / len.max(1) as f32).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn rack_fade_len(sample_rate: f32) -> u32 {
+    (POWER_FADE_MS * 0.001 * sample_rate).round().max(1.0) as u32
+}
+
+/// Per-module trim in dB, indexed by module code minus one.
+const fn module_trim_db(params: &Params) -> [f32; RACK_SLOTS] {
+    [
+        params.filters_trim_db,
+        params.eq_trim_db,
+        params.comp_trim_db,
+        params.sat_trim_db,
+        params.width_trim_db,
+        params.limiter_trim_db,
+    ]
+}
+
+/// Every module's running state and resolved coefficients. Fixed-size and
+/// heap-free, so a rack change can copy it on the audio thread and render
+/// the outgoing assignment on the copy while it fades out.
+#[derive(Debug, Clone)]
+struct Rack {
+    /// Per-module output trim, indexed by module code minus one.
+    module_trim: [SmoothedGain; RACK_SLOTS],
+    filters: Filters,
+    compressor: StripCompressor,
+    saturation_drive: f32,
+    saturation_character: f32,
+    saturation: Saturator,
+    saturation_dc: DcBlocker,
+    width: f32,
+    limiter: Limiter,
+}
+
+impl Rack {
+    fn new(sample_rate: f32) -> Self {
+        Self {
+            module_trim: [SmoothedGain::new(sample_rate, 0.0); RACK_SLOTS],
+            filters: Filters::new(),
+            compressor: StripCompressor::new(sample_rate),
+            saturation_drive: 0.0,
+            saturation_character: 0.5,
+            saturation: Saturator::new(),
+            saturation_dc: DcBlocker::new(sample_rate),
+            width: 1.0,
+            limiter: Limiter::new(sample_rate),
+        }
+    }
+
+    /// Resolves all transcendental coefficient work on the control thread.
+    fn configure(&mut self, p: &Params, sample_rate: f32) {
+        configure_filters(&mut self.filters, p, sample_rate);
+        self.compressor.set_curve(
+            p.comp_threshold_db,
+            p.comp_ratio,
+            COMP_KNEE_DB,
+            p.comp_makeup_db,
+        );
+        self.compressor
+            .set_timing(p.comp_attack_ms * 0.001, p.comp_release_ms * 0.001);
+        self.saturation_drive = p.sat_drive_pct * SATURATION_DRIVE_SCALE;
+        self.saturation_character = p.sat_character_pct * 0.01;
+        self.width = p.width_pct * 0.01;
+        self.limiter.set_ceiling_db(p.limiter_ceiling_db);
+        self.limiter
+            .set_release(sample_rate, p.limiter_release_ms * 0.001);
+        for (gain, db) in self.module_trim.iter_mut().zip(module_trim_db(p)) {
+            gain.set_db(db);
+        }
+    }
+
+    /// Update only the module state one wire edit touches.
+    fn apply_param(&mut self, index: u32, p: &Params, sample_rate: f32) {
+        match index {
+            ipc::HPF_INDEX => self
+                .filters
+                .set_high_pass(sample_rate, p.hpf_hz, HPF_OPEN_HZ),
+            ipc::LPF_INDEX => self
+                .filters
+                .set_low_pass(sample_rate, p.lpf_hz, LPF_OPEN_HZ),
+            ipc::LOW_GAIN_INDEX => {
+                self.filters.eq[0].set_low_shelf(sample_rate, LOW_SHELF_HZ, p.low_gain_db);
+            }
+            ipc::LOW_MID_FREQ_INDEX | ipc::LOW_MID_GAIN_INDEX => {
+                self.filters.eq[1].set_peak(
+                    sample_rate,
+                    p.low_mid_freq_hz,
+                    p.low_mid_gain_db,
+                    proportional_q(p.low_mid_gain_db),
+                );
+            }
+            ipc::HIGH_MID_FREQ_INDEX | ipc::HIGH_MID_GAIN_INDEX => {
+                self.filters.eq[2].set_peak(
+                    sample_rate,
+                    p.high_mid_freq_hz,
+                    p.high_mid_gain_db,
+                    proportional_q(p.high_mid_gain_db),
+                );
+            }
+            ipc::HIGH_GAIN_INDEX => {
+                self.filters.eq[3].set_high_shelf(sample_rate, HIGH_SHELF_HZ, p.high_gain_db);
+            }
+            ipc::COMP_THRESHOLD_INDEX | ipc::COMP_RATIO_INDEX | ipc::COMP_MAKEUP_INDEX => {
+                self.compressor.set_curve(
+                    p.comp_threshold_db,
+                    p.comp_ratio,
+                    COMP_KNEE_DB,
+                    p.comp_makeup_db,
+                );
+            }
+            ipc::COMP_ATTACK_INDEX | ipc::COMP_RELEASE_INDEX => self
+                .compressor
+                .set_timing(p.comp_attack_ms * 0.001, p.comp_release_ms * 0.001),
+            ipc::SAT_DRIVE_INDEX => {
+                let drive = p.sat_drive_pct * SATURATION_DRIVE_SCALE;
+                if !saturation_active(self.saturation_drive) && saturation_active(drive) {
+                    self.saturation_dc.reset();
+                }
+                self.saturation_drive = drive;
+                self.saturation.recurve();
+            }
+            ipc::SAT_CHARACTER_INDEX => {
+                self.saturation_character = p.sat_character_pct * 0.01;
+                self.saturation.recurve();
+            }
+            ipc::SAT_ENABLED_INDEX => {
+                self.saturation.reset();
+                self.saturation_dc.reset();
+            }
+            ipc::WIDTH_INDEX => {
+                self.width = p.width_pct * 0.01;
+            }
+            ipc::FILTERS_TRIM_INDEX
+            | ipc::EQ_TRIM_INDEX
+            | ipc::COMP_TRIM_INDEX
+            | ipc::SAT_TRIM_INDEX
+            | ipc::WIDTH_TRIM_INDEX
+            | ipc::LIMITER_TRIM_INDEX => {
+                let slot = (index - ipc::FILTERS_TRIM_INDEX) as usize;
+                self.module_trim[slot].set_db(module_trim_db(p)[slot]);
+            }
+            ipc::LIMITER_CEILING_INDEX => self.limiter.set_ceiling_db(p.limiter_ceiling_db),
+            ipc::LIMITER_RELEASE_INDEX => self
+                .limiter
+                .set_release(sample_rate, p.limiter_release_ms * 0.001),
+            _ => {}
+        }
+    }
+
+    fn set_sample_rate(&mut self, sample_rate: f32) {
+        self.compressor.set_sample_rate(sample_rate);
+        self.saturation_dc.set_sample_rate(sample_rate);
+        for gain in &mut self.module_trim {
+            gain.set_sample_rate(sample_rate);
+        }
+    }
+
+    fn reset(&mut self, p: &Params) {
+        self.filters.reset();
+        self.compressor.reset();
+        self.saturation.reset();
+        self.saturation_dc.reset();
+        self.limiter.reset();
+        for (gain, db) in self.module_trim.iter_mut().zip(module_trim_db(p)) {
+            gain.snap_db(db);
+        }
+    }
+
+    /// Clear a module that is entering the rack from silence, so a filter,
+    /// compressor, saturator, or limiter does not resume on history from the
+    /// last time it was loaded.
+    fn reset_module(&mut self, module: u8) {
+        match module {
+            1 => {
+                for stage in &mut self.filters.high_pass {
+                    stage.reset();
+                }
+                for stage in &mut self.filters.low_pass {
+                    stage.reset();
+                }
+            }
+            2 => {
+                for band in &mut self.filters.eq {
+                    band.reset();
+                }
+            }
+            3 => self.compressor.reset(),
+            4 => {
+                self.saturation.reset();
+                self.saturation_dc.reset();
+            }
+            6 => self.limiter.reset(),
+            _ => {}
+        }
+    }
+
+    /// One module, including its output trim. `ran` stops a module that
+    /// appears in two slots from being ticked twice in the same sample.
+    /// Returns whether the limiter ran.
+    #[inline]
+    fn process_module(
+        &mut self,
+        p: &Params,
+        module: u8,
+        mut left: f32,
+        mut right: f32,
+        ran: &mut [bool; RACK_SLOTS + 1],
+    ) -> (f32, f32, bool) {
+        if module == 0 || module as usize >= ran.len() || ran[module as usize] {
+            return (left, right, false);
+        }
+        ran[module as usize] = true;
+        let mut limited = false;
+        match module {
+            1 if p.filters_enabled => {
+                left = self.filters.process_cuts(0, left);
+                right = self.filters.process_cuts(1, right);
+            }
+            2 if p.eq_enabled => {
+                for band in &mut self.filters.eq {
+                    left = band.process(0, left);
+                    right = band.process(1, right);
+                }
+            }
+            3 if p.comp_enabled => {
+                (left, right) = self.compressor.process_stereo_linked(left, right);
+            }
+            4 if p.sat_enabled && saturation_active(self.saturation_drive) => {
+                left = self.saturation_dc.process(
+                    0,
+                    self.saturation.process(
+                        0,
+                        left,
+                        self.saturation_drive,
+                        self.saturation_character,
+                    ),
+                );
+                right = self.saturation_dc.process(
+                    1,
+                    self.saturation.process(
+                        1,
+                        right,
+                        self.saturation_drive,
+                        self.saturation_character,
+                    ),
+                );
+            }
+            5 if p.width_enabled => {
+                (left, right) = stereo_width(left, right, self.width);
+            }
+            6 if p.limiter_enabled => {
+                (left, right) = self.limiter.process(left, right);
+                limited = true;
+            }
+            _ => {}
+        }
+        let trim = self.module_trim[(module as usize) - 1].next();
+        (left * trim, right * trim, limited)
+    }
+
+    /// Run `order` on one sample. Each module runs at most once. Publishes
+    /// per-slot levels to `meters` when given.
+    #[inline]
+    fn run(
+        &mut self,
+        p: &Params,
+        order: &[u8; RACK_SLOTS],
+        mut l: f32,
+        mut r: f32,
+        mut meters: Option<&mut Meters>,
+    ) -> (f32, f32) {
+        let mut ran = [false; RACK_SLOTS + 1];
+        let mut limiter_processed = false;
+        for (slot, &module) in order.iter().enumerate() {
+            // Level entering this stage, for the editor's per-row meter.
+            let stage_in = l.abs().max(r.abs());
+            let limited;
+            (l, r, limited) = self.process_module(p, module, l, r, &mut ran);
+            limiter_processed |= limited;
+            // A bypassed or empty slot still publishes its levels so the
+            // row's meter reads through rather than going dark.
+            if let Some(meters) = meters.as_deref_mut() {
+                meters.push_stage(slot, stage_in, l.abs().max(r.abs()));
+            }
+        }
+        if !limiter_processed {
+            self.limiter.reset();
+        }
+        (l, r)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -419,18 +780,25 @@ impl Meters {
 pub struct Dsp {
     sample_rate: f32,
     params: Params,
+    power: Glide,
     input_gain: SmoothedGain,
     output_gain: SmoothedGain,
-    /// Per-module output trim, indexed by module code minus one.
-    module_trim: [SmoothedGain; RACK_SLOTS],
-    filters: Filters,
-    compressor: StripCompressor,
-    saturation_drive: f32,
-    saturation_character: f32,
-    saturation: Saturator,
-    saturation_dc: DcBlocker,
-    width: f32,
-    limiter: Limiter,
+    /// The module state the rack renders `sounding` on.
+    rack: Rack,
+    /// The slot assignment `rack` renders: the rack parameters once a change
+    /// has started fading in.
+    sounding: [u8; RACK_SLOTS],
+    /// A slot edit has not been taken up by the rack yet. Edits wait while a
+    /// rack fade runs, so a burst of per-slot writes (a reorder) lands as one
+    /// fade to the final assignment.
+    rack_pending: bool,
+    /// While a rack change fades: a copy of `rack` taken when it started,
+    /// rendering the previous assignment `outgoing_order`.
+    outgoing: Rack,
+    outgoing_order: [u8; RACK_SLOTS],
+    /// Samples into the current rack fade; `None` when settled.
+    rack_fade: Option<u32>,
+    rack_fade_len: u32,
     meters: Meters,
 }
 
@@ -438,23 +806,25 @@ impl Dsp {
     pub fn new(sample_rate: f32) -> Self {
         let sample_rate = sample_rate.max(1.0);
         let params = default_params();
+        let rack = Rack::new(sample_rate);
         let mut dsp = Self {
             sample_rate,
+            power: Glide::new(power_share(params.power), POWER_FADE_MS, sample_rate),
             input_gain: SmoothedGain::new(sample_rate, params.input_trim_db),
             output_gain: SmoothedGain::new(sample_rate, params.output_trim_db),
-            module_trim: [SmoothedGain::new(sample_rate, 0.0); RACK_SLOTS],
-            filters: Filters::new(),
-            compressor: StripCompressor::new(sample_rate),
-            saturation_drive: 0.0,
-            saturation_character: 0.5,
-            saturation: Saturator::new(),
-            saturation_dc: DcBlocker::new(sample_rate),
-            width: 1.0,
-            limiter: Limiter::new(sample_rate),
+            outgoing: rack.clone(),
+            rack,
+            sounding: [0; RACK_SLOTS],
+            rack_pending: false,
+            outgoing_order: [0; RACK_SLOTS],
+            rack_fade: None,
+            rack_fade_len: rack_fade_len(sample_rate),
             meters: Meters::new(sample_rate),
             params,
         };
         dsp.apply_params();
+        dsp.power.settle();
+        dsp.snap_rack();
         dsp
     }
 
@@ -466,6 +836,10 @@ impl Dsp {
         ipc::sanitize_params(&mut params);
         self.params = params;
         self.apply_params();
+        self.power.set(power_share(self.params.power));
+        self.power.settle();
+        // A restored rack is already on its modules; it does not fade in.
+        self.snap_rack();
     }
 
     pub fn apply_wire_param(&mut self, index: u32, value: f32) -> bool {
@@ -487,13 +861,13 @@ impl Dsp {
     pub fn meter_frame(&self) -> MeterFrame {
         let compressor_gr =
             if self.params.power && self.params.comp_enabled && self.rack_contains(3) {
-                self.compressor.gain_reduction_db().max(0.0)
+                self.rack.compressor.gain_reduction_db().max(0.0)
             } else {
                 0.0
             };
         let limiter_gr =
             if self.params.power && self.params.limiter_enabled && self.rack_contains(6) {
-                -linear_to_db(self.limiter.gain()).min(0.0)
+                -linear_to_db(self.rack.limiter.gain()).min(0.0)
             } else {
                 0.0
             };
@@ -517,51 +891,16 @@ impl Dsp {
 
     /// Resolves all transcendental coefficient work on the control thread.
     fn apply_params(&mut self) {
-        let p = &self.params;
-        self.input_gain.set_db(p.input_trim_db);
-        self.output_gain.set_db(p.output_trim_db);
-        configure_filters(&mut self.filters, p, self.sample_rate);
-        self.compressor.set_curve(
-            p.comp_threshold_db,
-            p.comp_ratio,
-            COMP_KNEE_DB,
-            p.comp_makeup_db,
-        );
-        self.compressor
-            .set_timing(p.comp_attack_ms * 0.001, p.comp_release_ms * 0.001);
-        self.saturation_drive = p.sat_drive_pct * SATURATION_DRIVE_SCALE;
-        self.saturation_character = p.sat_character_pct * 0.01;
-        self.width = p.width_pct * 0.01;
-        self.limiter.set_ceiling_db(p.limiter_ceiling_db);
-        self.limiter
-            .set_release(self.sample_rate, p.limiter_release_ms * 0.001);
-        for (gain, db) in self.module_trim.iter_mut().zip(Self::module_trim_db(p)) {
-            gain.set_db(db);
+        self.input_gain.set_db(self.params.input_trim_db);
+        self.output_gain.set_db(self.params.output_trim_db);
+        self.rack.configure(&self.params, self.sample_rate);
+        if self.rack_fade.is_some() {
+            self.outgoing.configure(&self.params, self.sample_rate);
         }
     }
 
-    /// Per-module trim in dB, indexed by module code minus one.
-    const fn module_trim_db(params: &Params) -> [f32; RACK_SLOTS] {
-        [
-            params.filters_trim_db,
-            params.eq_trim_db,
-            params.comp_trim_db,
-            params.sat_trim_db,
-            params.width_trim_db,
-            params.limiter_trim_db,
-        ]
-    }
-
     fn rack_contains(&self, module: u8) -> bool {
-        [
-            self.params.slot1_module,
-            self.params.slot2_module,
-            self.params.slot3_module,
-            self.params.slot4_module,
-            self.params.slot5_module,
-            self.params.slot6_module,
-        ]
-        .contains(&module)
+        self.rack_targets().contains(&module)
     }
 
     /// Update only the resolved state affected by one wire edit. The bridge
@@ -569,230 +908,148 @@ impl Dsp {
     /// preset must not rebuild every filter and coefficient for every one of
     /// its parameter messages.
     fn apply_param_state(&mut self, index: u32) {
-        let p = &self.params;
         match index {
-            ipc::POWER_INDEX => {
-                self.filters.reset();
-                self.compressor.reset();
-                self.saturation.reset();
-                self.saturation_dc.reset();
-                self.limiter.reset();
-            }
-            ipc::INPUT_TRIM_INDEX => self.input_gain.set_db(p.input_trim_db),
-            ipc::HPF_INDEX => self
-                .filters
-                .set_high_pass(self.sample_rate, p.hpf_hz, HPF_OPEN_HZ),
-            ipc::LPF_INDEX => self
-                .filters
-                .set_low_pass(self.sample_rate, p.lpf_hz, LPF_OPEN_HZ),
-            ipc::LOW_GAIN_INDEX => {
-                self.filters.eq[0].set_low_shelf(self.sample_rate, 100.0, p.low_gain_db);
-            }
-            ipc::LOW_MID_FREQ_INDEX | ipc::LOW_MID_GAIN_INDEX => {
-                self.filters.eq[1].set_peak(
-                    self.sample_rate,
-                    p.low_mid_freq_hz,
-                    p.low_mid_gain_db,
-                    proportional_q(p.low_mid_gain_db),
-                );
-            }
-            ipc::HIGH_MID_FREQ_INDEX | ipc::HIGH_MID_GAIN_INDEX => {
-                self.filters.eq[2].set_peak(
-                    self.sample_rate,
-                    p.high_mid_freq_hz,
-                    p.high_mid_gain_db,
-                    proportional_q(p.high_mid_gain_db),
-                );
-            }
-            ipc::HIGH_GAIN_INDEX => {
-                self.filters.eq[3].set_high_shelf(self.sample_rate, 10_000.0, p.high_gain_db);
-            }
-            ipc::COMP_THRESHOLD_INDEX | ipc::COMP_RATIO_INDEX | ipc::COMP_MAKEUP_INDEX => {
-                self.compressor
-                    .set_curve(p.comp_threshold_db, p.comp_ratio, 6.0, p.comp_makeup_db);
-            }
-            ipc::COMP_ATTACK_INDEX | ipc::COMP_RELEASE_INDEX => self
-                .compressor
-                .set_timing(p.comp_attack_ms * 0.001, p.comp_release_ms * 0.001),
-            ipc::SAT_DRIVE_INDEX => {
-                let drive = p.sat_drive_pct * SATURATION_DRIVE_SCALE;
-                if !saturation_active(self.saturation_drive) && saturation_active(drive) {
-                    self.saturation_dc.reset();
+            ipc::POWER_INDEX => self.power.set(power_share(self.params.power)),
+            ipc::INPUT_TRIM_INDEX => self.input_gain.set_db(self.params.input_trim_db),
+            ipc::OUTPUT_TRIM_INDEX => self.output_gain.set_db(self.params.output_trim_db),
+            ipc::SLOT_1_INDEX..=ipc::SLOT_6_INDEX => self.rack_pending = true,
+            _ => {
+                self.rack.apply_param(index, &self.params, self.sample_rate);
+                // The outgoing half of a rack fade tracks edits too, so the
+                // module it is still sounding does not lag the controls.
+                if self.rack_fade.is_some() {
+                    self.outgoing
+                        .apply_param(index, &self.params, self.sample_rate);
                 }
-                self.saturation_drive = drive;
-                self.saturation.recurve();
             }
-            ipc::SAT_CHARACTER_INDEX => {
-                self.saturation_character = p.sat_character_pct * 0.01;
-                self.saturation.recurve();
-            }
-            ipc::SAT_ENABLED_INDEX => {
-                self.saturation.reset();
-                self.saturation_dc.reset();
-            }
-            ipc::WIDTH_INDEX => {
-                self.width = p.width_pct * 0.01;
-            }
-            ipc::OUTPUT_TRIM_INDEX => self.output_gain.set_db(p.output_trim_db),
-            ipc::FILTERS_TRIM_INDEX
-            | ipc::EQ_TRIM_INDEX
-            | ipc::COMP_TRIM_INDEX
-            | ipc::SAT_TRIM_INDEX
-            | ipc::WIDTH_TRIM_INDEX
-            | ipc::LIMITER_TRIM_INDEX => {
-                let slot = (index - ipc::FILTERS_TRIM_INDEX) as usize;
-                self.module_trim[slot].set_db(Self::module_trim_db(p)[slot]);
-            }
-            ipc::LIMITER_CEILING_INDEX => self.limiter.set_ceiling_db(p.limiter_ceiling_db),
-            ipc::LIMITER_RELEASE_INDEX => self
-                .limiter
-                .set_release(self.sample_rate, p.limiter_release_ms * 0.001),
-            ipc::SLOT_1_INDEX
-            | ipc::SLOT_2_INDEX
-            | ipc::SLOT_3_INDEX
-            | ipc::SLOT_4_INDEX
-            | ipc::SLOT_5_INDEX
-            | ipc::SLOT_6_INDEX => {
-                self.compressor.reset();
-                self.saturation.reset();
-                self.saturation_dc.reset();
-                self.limiter.reset();
-            }
-            _ => {}
         }
     }
 
-    #[inline]
-    fn process_filter_module(&mut self, channel: usize, sample: f32) -> f32 {
-        self.filters.process_cuts(channel, sample)
-    }
-
-    #[inline]
-    fn process_eq_module(&mut self, channel: usize, mut sample: f32) -> f32 {
-        for band in &mut self.filters.eq {
-            sample = band.process(channel, sample);
-        }
-        sample
-    }
-}
-
-impl StereoEffect for Dsp {
-    fn reset(&mut self) {
-        self.filters.reset();
-        self.compressor.reset();
-        self.saturation.reset();
-        self.saturation_dc.reset();
-        self.limiter.reset();
-        self.meters.reset();
-        self.input_gain.snap_db(self.params.input_trim_db);
-        self.output_gain.snap_db(self.params.output_trim_db);
-        let trims = Self::module_trim_db(&self.params);
-        for (gain, db) in self.module_trim.iter_mut().zip(trims) {
-            gain.snap_db(db);
-        }
-    }
-
-    fn set_sample_rate(&mut self, sample_rate: f32) {
-        self.sample_rate = sample_rate.max(1.0);
-        self.input_gain.set_sample_rate(self.sample_rate);
-        self.output_gain.set_sample_rate(self.sample_rate);
-        self.compressor.set_sample_rate(self.sample_rate);
-        self.saturation_dc.set_sample_rate(self.sample_rate);
-        for gain in &mut self.module_trim {
-            gain.set_sample_rate(self.sample_rate);
-        }
-        self.meters = Meters::new(self.sample_rate);
-        self.apply_params();
-    }
-
-    #[inline]
-    fn process_stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
-        if !self.params.power {
-            self.meters.push((left, right), (left, right));
-            return (left, right);
-        }
-
-        let input = (left, right);
-        let input_gain = self.input_gain.next();
-        let mut l = left * input_gain;
-        let mut r = right * input_gain;
-
-        let slots = [
+    fn rack_targets(&self) -> [u8; RACK_SLOTS] {
+        [
             self.params.slot1_module,
             self.params.slot2_module,
             self.params.slot3_module,
             self.params.slot4_module,
             self.params.slot5_module,
             self.params.slot6_module,
-        ];
-        let mut limiter_processed = false;
-        for (slot, module) in slots.into_iter().enumerate() {
-            // Level entering this stage, for the editor's per-row meter.
-            let stage_in = l.abs().max(r.abs());
-            match module {
-                1 if self.params.filters_enabled => {
-                    l = self.process_filter_module(0, l);
-                    r = self.process_filter_module(1, r);
-                }
-                2 if self.params.eq_enabled => {
-                    l = self.process_eq_module(0, l);
-                    r = self.process_eq_module(1, r);
-                }
-                3 if self.params.comp_enabled => {
-                    (l, r) = self.compressor.process_stereo_linked(l, r);
-                }
-                4 if self.params.sat_enabled && saturation_active(self.saturation_drive) => {
-                    l = self.saturation_dc.process(
-                        0,
-                        self.saturation.process(
-                            0,
-                            l,
-                            self.saturation_drive,
-                            self.saturation_character,
-                        ),
-                    );
-                    r = self.saturation_dc.process(
-                        1,
-                        self.saturation.process(
-                            1,
-                            r,
-                            self.saturation_drive,
-                            self.saturation_character,
-                        ),
-                    );
-                }
-                5 if self.params.width_enabled => {
-                    (l, r) = stereo_width(l, r, self.width);
-                }
-                6 if self.params.limiter_enabled => {
-                    (l, r) = self.limiter.process(l, r);
-                    limiter_processed = true;
-                }
-                _ => {}
+        ]
+    }
+
+    /// Land on the rack parameters with no fade (project restore, transport
+    /// reset). Module state is kept as it is.
+    fn snap_rack(&mut self) {
+        self.sounding = self.rack_targets();
+        self.rack_pending = false;
+        self.rack_fade = None;
+    }
+
+    /// Point `rack` at the rack parameters, clearing every module that enters
+    /// from silence. Returns the assignment it was rendering before.
+    fn retarget_rack(&mut self) -> [u8; RACK_SLOTS] {
+        let previous = self.sounding;
+        let target = self.rack_targets();
+        for module in target {
+            if module != 0 && !previous.contains(&module) {
+                self.rack.reset_module(module);
             }
-            // Per-module output trim, then the stage tap. A bypassed or empty
-            // slot still publishes its levels so the row's meter reads through
-            // rather than going dark.
-            if let Some(index) = module.checked_sub(1)
-                && (index as usize) < RACK_SLOTS
-            {
-                let trim = self.module_trim[index as usize].next();
-                l *= trim;
-                r *= trim;
-            }
-            self.meters.push_stage(slot, stage_in, l.abs().max(r.abs()));
         }
+        self.sounding = target;
+        self.rack_pending = false;
+        previous
+    }
+
+    /// Take up a pending slot edit by crossfading the whole rack output: the
+    /// previous assignment keeps rendering on a copy of the module state it
+    /// has now, the new one renders on `rack`, and the two outputs blend.
+    /// Modules in both assignments continue from the same state on each
+    /// side; only modules entering from silence are cleared.
+    fn begin_rack_fade(&mut self) {
+        if self.rack_targets() == self.sounding {
+            self.rack_pending = false;
+            return;
+        }
+        self.outgoing.clone_from(&self.rack);
+        self.outgoing_order = self.retarget_rack();
+        self.rack_fade = Some(0);
+    }
+}
+
+impl StereoEffect for Dsp {
+    fn reset(&mut self) {
+        self.rack.reset(&self.params);
+        self.meters.reset();
+        self.power.settle();
+        self.snap_rack();
+        self.input_gain.snap_db(self.params.input_trim_db);
+        self.output_gain.snap_db(self.params.output_trim_db);
+    }
+
+    fn set_sample_rate(&mut self, sample_rate: f32) {
+        self.sample_rate = sample_rate.max(1.0);
+        self.power.set_time(POWER_FADE_MS, self.sample_rate);
+        self.rack_fade_len = rack_fade_len(self.sample_rate);
+        self.input_gain.set_sample_rate(self.sample_rate);
+        self.output_gain.set_sample_rate(self.sample_rate);
+        self.rack.set_sample_rate(self.sample_rate);
+        self.outgoing.set_sample_rate(self.sample_rate);
+        self.meters = Meters::new(self.sample_rate);
+        self.apply_params();
+    }
+
+    #[inline]
+    fn process_stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
+        if self.power.is_settled() && !self.params.power {
+            // Nothing in the rack is heard: slot edits land at once.
+            if self.rack_pending || self.rack_fade.is_some() {
+                self.retarget_rack();
+                self.rack_fade = None;
+            }
+            self.meters.push((left, right), (left, right));
+            return (left, right);
+        }
+
+        if self.rack_pending && self.rack_fade.is_none() {
+            self.begin_rack_fade();
+        }
+
+        let on = self.power.next();
+        let input = (left, right);
+        let input_gain = self.input_gain.next();
+        let l = left * input_gain;
+        let r = right * input_gain;
+
+        let (mut l, mut r) = if let Some(pos) = self.rack_fade {
+            let (new_l, new_r) =
+                self.rack
+                    .run(&self.params, &self.sounding, l, r, Some(&mut self.meters));
+            let (old_l, old_r) = self
+                .outgoing
+                .run(&self.params, &self.outgoing_order, l, r, None);
+            let pos = pos + 1;
+            let weight = rack_fade_weight(pos, self.rack_fade_len);
+            self.rack_fade = (pos < self.rack_fade_len).then_some(pos);
+            (
+                old_l + (new_l - old_l) * weight,
+                old_r + (new_r - old_r) * weight,
+            )
+        } else {
+            self.rack
+                .run(&self.params, &self.sounding, l, r, Some(&mut self.meters))
+        };
 
         let output_gain = self.output_gain.next();
         l *= output_gain;
         r *= output_gain;
 
-        if !limiter_processed {
-            self.limiter.reset();
-        }
+        let out = if on == 1.0 {
+            (l, r)
+        } else {
+            (left + (l - left) * on, right + (r - right) * on)
+        };
 
-        self.meters.push(input, (l, r));
-        (l, r)
+        self.meters.push(input, out);
+        out
     }
 }
 
@@ -1161,5 +1418,388 @@ mod tests {
         p.limiter_ceiling_db = -1.0;
         assert!(limiter_transfer_db(&p, 6.0) <= -1.0);
         assert!((limiter_transfer_db(&p, -20.0) - -20.0).abs() < 1.0e-4);
+    }
+
+    const BLOCK: usize = 128;
+    const WARM: usize = 50;
+
+    fn edge_kink(blocks: usize, mut block: impl FnMut(usize, &mut [f32], &mut [f32])) -> f32 {
+        let mut left = [0.0f32; BLOCK];
+        let mut right = [0.0f32; BLOCK];
+        let mut n = 0usize;
+        let mut last = [(0.0f32, 0.0f32); 2];
+        let mut worst = 0.0f32;
+        for index in 0..WARM + blocks {
+            for i in 0..BLOCK {
+                let t = n as f64 / 48_000.0;
+                let tone = (std::f64::consts::TAU * 110.0 * t).sin() * 0.3
+                    + (std::f64::consts::TAU * 330.0 * t).sin() * 0.1;
+                (left[i], right[i]) = (tone as f32, (tone * 0.8) as f32);
+                n += 1;
+            }
+            block(index.saturating_sub(WARM), &mut left, &mut right);
+            let mut edge = 0.0f32;
+            let mut inside = 1.0e-7f32;
+            for i in 0..BLOCK {
+                let d2 = |a: f32, b: f32, c: f32| (c - 2.0 * b + a).abs();
+                let kink =
+                    d2(last[0].0, last[1].0, left[i]).max(d2(last[0].1, last[1].1, right[i]));
+                if i < 2 {
+                    edge = edge.max(kink);
+                } else {
+                    inside = inside.max(kink);
+                }
+                last = [last[1], (left[i], right[i])];
+            }
+            if index >= WARM {
+                worst = worst.max(edge / inside);
+            }
+        }
+        worst
+    }
+
+    fn drag(dsp: &mut Dsp, blocks: usize, mut change: impl FnMut(&mut Dsp, usize)) -> f32 {
+        let mut warm = WARM;
+        edge_kink(blocks, |index, left, right| {
+            if warm > 0 {
+                warm -= 1;
+            } else {
+                change(dsp, index);
+            }
+            for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+                (*l, *r) = dsp.process_stereo(*l, *r);
+            }
+        })
+    }
+
+    #[test]
+    fn toggling_power_crossfades_without_a_step() {
+        let mut p = bypassed();
+        p.filters_enabled = true;
+        p.slot1_module = 1;
+        p.hpf_hz = 150.0;
+        p.eq_enabled = true;
+        p.slot2_module = 2;
+        p.low_gain_db = 6.0;
+        let mut dsp = Dsp::new(SR);
+        dsp.set_params(p);
+
+        let jump = drag(&mut dsp, 300, |dsp, block| {
+            if block.is_multiple_of(30) {
+                let on = (block / 30) % 2 == 1;
+                assert!(dsp.apply_wire_param(ipc::POWER_INDEX, if on { 1.0 } else { 0.0 }));
+            }
+        });
+        assert!(jump < 4.0, "power toggle jump x {jump}");
+
+        // Settled off is the dry signal exactly.
+        assert!(dsp.apply_wire_param(ipc::POWER_INDEX, 0.0));
+        for _ in 0..4_800 {
+            let _ = dsp.process_stereo(0.1, 0.1);
+        }
+        assert_eq!(dsp.process_stereo(0.25, -0.25), (0.25, -0.25));
+    }
+
+    #[test]
+    fn changing_slot_module_does_not_reset_compressor_or_limiter() {
+        let mut p = bypassed();
+        p.comp_enabled = true;
+        p.slot3_module = 3;
+        p.comp_threshold_db = -30.0;
+        p.comp_ratio = 4.0;
+        p.comp_attack_ms = 1.0;
+        p.comp_release_ms = 200.0;
+        let mut dsp = Dsp::new(SR);
+        dsp.set_params(p);
+
+        // Run loud audio so the compressor builds up gain reduction
+        for _ in 0..4_800 {
+            let _ = dsp.process_stereo(0.8, 0.8);
+        }
+        let gr_before = dsp.meter_frame().gain_reduction_db;
+        assert!(
+            gr_before > 3.0,
+            "gain reduction before slot change: {gr_before}"
+        );
+
+        // Change an unrelated slot (slot 1 to module 1)
+        assert!(dsp.apply_wire_param(ipc::SLOT_1_INDEX, 1.0));
+
+        let gr_after = dsp.meter_frame().gain_reduction_db;
+        assert!(
+            (gr_after - gr_before).abs() < 1.0e-3,
+            "compressor reset on slot change: {gr_before} -> {gr_after}"
+        );
+    }
+
+    /// Empty↔module and module A↔module B. A hard switch of the +9 dB low
+    /// shelf steps by well over the click threshold (measured around 10³);
+    /// the slot crossfade has to land with the power toggle.
+    #[test]
+    fn changing_slot_module_crossfades_without_a_step() {
+        let mut shaped = bypassed();
+        shaped.eq_enabled = true;
+        shaped.low_gain_db = 9.0;
+        shaped.filters_enabled = true;
+        shaped.hpf_hz = 400.0;
+
+        let mut dsp = Dsp::new(SR);
+        dsp.set_params(shaped.clone());
+        let empty_eq = drag(&mut dsp, 300, |dsp, block| {
+            if block.is_multiple_of(30) {
+                let module = if (block / 30) % 2 == 1 { 2.0 } else { 0.0 };
+                assert!(dsp.apply_wire_param(ipc::SLOT_2_INDEX, module));
+            }
+        });
+        assert!(empty_eq < 4.0, "empty↔eq slot change jump x {empty_eq}");
+
+        let mut dsp = Dsp::new(SR);
+        dsp.set_params(shaped);
+        assert!(dsp.apply_wire_param(ipc::SLOT_2_INDEX, 2.0));
+        for _ in 0..4_800 {
+            let _ = dsp.process_stereo(0.1, 0.1);
+        }
+        let eq_filters = drag(&mut dsp, 300, |dsp, block| {
+            if block.is_multiple_of(30) {
+                let module = if (block / 30) % 2 == 1 { 1.0 } else { 2.0 };
+                assert!(dsp.apply_wire_param(ipc::SLOT_2_INDEX, module));
+            }
+        });
+        assert!(
+            eq_filters < 4.0,
+            "eq↔filters slot change jump x {eq_filters}"
+        );
+    }
+
+    /// A module that leaves and comes back starts from rest. The crossfade
+    /// alone would hide a compressor that still held its old gain reduction.
+    #[test]
+    fn returning_slot_module_starts_from_rest() {
+        let mut p = bypassed();
+        p.comp_enabled = true;
+        p.slot1_module = 3;
+        p.comp_threshold_db = -30.0;
+        p.comp_ratio = 8.0;
+        p.comp_attack_ms = 0.1;
+        p.comp_release_ms = 500.0;
+        let mut dsp = Dsp::new(SR);
+        dsp.set_params(p);
+        for _ in 0..8_000 {
+            let _ = dsp.process_stereo(0.8, 0.8);
+        }
+        let gr_before = dsp.meter_frame().gain_reduction_db;
+        assert!(
+            gr_before > 3.0,
+            "gain reduction before removal: {gr_before}"
+        );
+
+        assert!(dsp.apply_wire_param(ipc::SLOT_1_INDEX, 0.0));
+        for _ in 0..4_800 {
+            let _ = dsp.process_stereo(0.0, 0.0);
+        }
+        assert!(dsp.apply_wire_param(ipc::SLOT_1_INDEX, 3.0));
+        let _ = dsp.process_stereo(0.001, 0.001);
+        let gr_after = dsp.meter_frame().gain_reduction_db;
+        assert!(
+            gr_after < 0.5,
+            "compressor resumed stale reduction {gr_before} -> {gr_after}"
+        );
+    }
+
+    fn rack_of(p: &Params) -> [u8; RACK_SLOTS] {
+        [
+            p.slot1_module,
+            p.slot2_module,
+            p.slot3_module,
+            p.slot4_module,
+            p.slot5_module,
+            p.slot6_module,
+        ]
+    }
+
+    fn with_rack(p: &Params, order: [u8; RACK_SLOTS]) -> Params {
+        let mut next = p.clone();
+        [
+            next.slot1_module,
+            next.slot2_module,
+            next.slot3_module,
+            next.slot4_module,
+            next.slot5_module,
+            next.slot6_module,
+        ] = order;
+        next
+    }
+
+    /// The editor's reorder: `with_order` then `wire_diff`, so one wire edit
+    /// per changed slot, in slot order, all forwarded back to back.
+    fn write_rack_like_editor(dsp: &mut Dsp, order: [u8; RACK_SLOTS]) {
+        let before = rack_of(dsp.params());
+        for (slot, (old, new)) in before.into_iter().zip(order).enumerate() {
+            if old != new {
+                assert!(dsp.apply_wire_param(ipc::SLOT_1_INDEX + slot as u32, new as f32));
+            }
+        }
+        assert_eq!(rack_of(dsp.params()), order);
+    }
+
+    fn tone(n: usize) -> (f32, f32) {
+        let t = n as f64 / SR as f64;
+        let s = (std::f64::consts::TAU * 110.0 * t).sin() * 0.3
+            + (std::f64::consts::TAU * 330.0 * t).sin() * 0.1;
+        (s as f32, (s * 0.8) as f32)
+    }
+
+    /// EQ, compressor, and saturation, where the order is audible.
+    fn order_sensitive() -> Params {
+        let mut p = bypassed();
+        p.eq_enabled = true;
+        p.low_gain_db = 9.0;
+        p.comp_enabled = true;
+        p.comp_threshold_db = -24.0;
+        p.comp_ratio = 6.0;
+        p.comp_attack_ms = 1.0;
+        p.comp_release_ms = 80.0;
+        p.sat_enabled = true;
+        p.sat_drive_pct = 80.0;
+        p
+    }
+
+    /// A reorder sent as the editor sends it (move [EQ, Comp, Sat] → [Sat,
+    /// EQ, Comp]; swap → [Comp, EQ, Sat]) is on the new order once the fade
+    /// time has passed: the strip then matches one restored on that order
+    /// from the same state, sample for sample.
+    #[test]
+    fn rack_reorder_in_editor_write_order_lands_within_the_fade() {
+        const FADE: usize = (SR * POWER_FADE_MS * 0.001) as usize;
+        let start = [2, 3, 4, 0, 0, 0];
+        let base = with_rack(&order_sensitive(), start);
+        for (name, moved) in [("move", [4, 2, 3, 0, 0, 0]), ("swap", [3, 2, 4, 0, 0, 0])] {
+            let mut dsp = Dsp::new(SR);
+            dsp.set_params(base.clone());
+            let mut n = 0;
+            for _ in 0..9_600 {
+                let (l, r) = tone(n);
+                let _ = dsp.process_stereo(l, r);
+                n += 1;
+            }
+            let mut unchanged = dsp.clone();
+            let mut reference = dsp.clone();
+            reference.set_params(with_rack(&base, moved));
+            write_rack_like_editor(&mut dsp, moved);
+
+            let mut audible = 0.0f32;
+            let mut late = 0.0f32;
+            for i in 0..4_800 {
+                let (l, r) = tone(n);
+                n += 1;
+                let out = dsp.process_stereo(l, r);
+                let want = reference.process_stereo(l, r);
+                let old = unchanged.process_stereo(l, r);
+                audible = audible.max((want.0 - old.0).abs());
+                if i >= FADE {
+                    late = late.max((out.0 - want.0).abs().max((out.1 - want.1).abs()));
+                }
+            }
+            assert!(audible > 1.0e-2, "{name}: order not audible ({audible})");
+            assert!(
+                late < 1.0e-5,
+                "{name}: rack not on the new order after the fade (off by {late})"
+            );
+        }
+    }
+
+    /// Moves and swaps of stateful modules, replayed in the editor's write
+    /// order, crossfade without a step.
+    #[test]
+    fn rack_reorder_in_editor_write_order_does_not_step() {
+        let mut p = bypassed();
+        p.filters_enabled = true;
+        p.hpf_hz = 400.0;
+        p.eq_enabled = true;
+        p.low_gain_db = 9.0;
+        p.comp_enabled = true;
+        p.comp_threshold_db = -24.0;
+        p.comp_ratio = 2.0;
+        p.comp_attack_ms = 10.0;
+        p.comp_release_ms = 80.0;
+        let start = [1, 2, 3, 0, 0, 0];
+        for (name, moved) in [("move", [3, 1, 2, 0, 0, 0]), ("swap", [2, 1, 3, 0, 0, 0])] {
+            let mut dsp = Dsp::new(SR);
+            dsp.set_params(with_rack(&p, start));
+            let jump = drag(&mut dsp, 300, |dsp, block| {
+                if block.is_multiple_of(30) {
+                    let order = if (block / 30) % 2 == 1 { moved } else { start };
+                    write_rack_like_editor(dsp, order);
+                }
+            });
+            assert!(jump < 4.0, "{name}: reorder jump x {jump}");
+        }
+    }
+
+    /// A slot re-targeted before its fade has finished (empty → EQ →
+    /// filters → empty) never steps, however fast the edits come.
+    #[test]
+    fn retargeting_slot_mid_fade_does_not_step() {
+        let mut shaped = bypassed();
+        shaped.eq_enabled = true;
+        shaped.low_gain_db = 9.0;
+        shaped.filters_enabled = true;
+        shaped.hpf_hz = 400.0;
+        for every in [1usize, 2, 3] {
+            let mut dsp = Dsp::new(SR);
+            dsp.set_params(shaped.clone());
+            let mut step = 0usize;
+            let jump = drag(&mut dsp, 300, |dsp, block| {
+                if block.is_multiple_of(every) {
+                    step += 1;
+                    let module = [0.0, 2.0, 1.0][step % 3];
+                    assert!(dsp.apply_wire_param(ipc::SLOT_2_INDEX, module));
+                }
+            });
+            assert!(jump < 4.0, "re-target every {every} blocks: jump x {jump}");
+        }
+    }
+
+    /// Taking a module out and putting it back before the fade has finished
+    /// must not clear it while it is still being heard.
+    #[test]
+    fn reversing_slot_fade_does_not_reset_an_audible_module() {
+        let mut p = bypassed();
+        p.comp_enabled = true;
+        p.slot1_module = 3;
+        p.comp_threshold_db = -30.0;
+        p.comp_ratio = 8.0;
+        p.comp_attack_ms = 1.0;
+        p.comp_release_ms = 200.0;
+        let mut warm = Dsp::new(SR);
+        warm.set_params(p);
+        for _ in 0..8_000 {
+            let _ = warm.process_stereo(0.8, 0.8);
+        }
+        let mut worst = (0.0f32, 0);
+        for back_after in [60usize, 120, 200, 240, 290, 340, 400, 460] {
+            let mut dsp = warm.clone();
+            let mut last = dsp.process_stereo(0.8, 0.8).0;
+            assert!(dsp.apply_wire_param(ipc::SLOT_1_INDEX, 0.0));
+            for i in 0..4_800 {
+                if i == back_after {
+                    assert!(dsp.apply_wire_param(ipc::SLOT_1_INDEX, 3.0));
+                }
+                let out = dsp.process_stereo(0.8, 0.8).0;
+                let step = (out - last).abs();
+                if step > worst.0 {
+                    worst = (step, back_after);
+                }
+                last = out;
+            }
+        }
+        // A plain 10 ms fade of this level change moves about 2e-3 per
+        // sample; a reset in the signal steps by over 0.1.
+        assert!(
+            worst.0 < 0.01,
+            "reversal stepped by {} (reversed after {} samples)",
+            worst.0,
+            worst.1
+        );
     }
 }

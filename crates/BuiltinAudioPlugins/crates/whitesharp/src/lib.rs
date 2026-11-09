@@ -1092,6 +1092,8 @@ impl StereoEffect for Dsp {
     }
 
     fn process_stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
+        let left = if left.is_finite() { left } else { 0.0 };
+        let right = if right.is_finite() { right } else { 0.0 };
         if let Some(estimate) = self
             .detector
             .push((left + right) * 0.5, self.tuning.threshold)
