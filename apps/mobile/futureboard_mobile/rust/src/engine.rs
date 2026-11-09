@@ -156,6 +156,76 @@ impl MicInputRing {
     }
 }
 
+/// Shortest take that is turned into a clip.
+const MIN_TAKE_FRAMES: usize = 512;
+
+/// Raw samples of a finished take, moved out of the recorder by
+/// `StudioMobileEngine::take_finished_recording`. Needs no engine access.
+pub struct RecordedTake {
+    left: Vec<f32>,
+    right: Vec<f32>,
+    sample_rate: u32,
+    bpm: f64,
+    start_beat: f64,
+}
+
+/// A take ready to be committed with `StudioMobileEngine::commit_recorded_take`.
+pub struct PreparedTake {
+    buffer: Arc<StereoAudioBuffer>,
+    peaks: Vec<f32>,
+    start_beat: f64,
+    length_beats: f64,
+}
+
+impl RecordedTake {
+    /// O(take length) finishing work: trims the buffers to their used size (this
+    /// reallocates and copies) and computes waveform peaks. Run it without holding the
+    /// engine lock. Returns `None` for takes too short to keep.
+    pub fn prepare(self) -> Option<PreparedTake> {
+        let RecordedTake {
+            mut left,
+            mut right,
+            sample_rate,
+            bpm,
+            start_beat,
+        } = self;
+        let frames = left.len().min(right.len());
+        if frames < MIN_TAKE_FRAMES {
+            return None;
+        }
+        left.truncate(frames);
+        right.truncate(frames);
+        left.shrink_to_fit();
+        right.shrink_to_fit();
+        let duration_secs = frames as f64 / sample_rate.max(1) as f64;
+        let length_beats = (duration_secs * (bpm / 60.0)).max(0.5);
+        let peaks = audio_io::compute_stereo_peaks(&left, &right, 128);
+        Some(PreparedTake {
+            buffer: Arc::new(StereoAudioBuffer {
+                sample_rate,
+                frames,
+                left,
+                right,
+            }),
+            peaks,
+            start_beat,
+            length_beats,
+        })
+    }
+}
+
+/// Keeps at least `headroom` frames of spare capacity (bounded by the take limit) so a
+/// drain of up to one full mic ring never reallocates. Grows geometrically, so this
+/// copies the take only a few times per recording, on the writer thread.
+fn reserve_take_headroom(buf: &mut Vec<f32>, headroom: usize, max_frames: usize) {
+    let want = (buf.len() + headroom).min(max_frames);
+    if buf.capacity() >= want {
+        return;
+    }
+    let target = buf.capacity().saturating_mul(2).clamp(want, max_frames);
+    buf.reserve_exact(target - buf.len());
+}
+
 struct TakeStorage {
     left: Vec<f32>,
     right: Vec<f32>,
@@ -203,8 +273,13 @@ impl RecordingWorker {
                         continue;
                     }
                     let max_frames = guard.max_frames;
+                    let headroom = mic_ring.capacity_frames();
                     let TakeStorage { left, right, .. } = &mut *guard;
                     mic_ring.drain_into(left, right, max_frames);
+                    // Growth happens here, on the writer thread, so the final drain in
+                    // `finish_take` (under the engine lock) never copies the take.
+                    reserve_take_headroom(left, headroom, max_frames);
+                    reserve_take_headroom(right, headroom, max_frames);
                     // Sleep off the realtime thread; the ring holds MIC_RING_SECONDS of audio,
                     // so a short poll interval cannot overflow it.
                     guard = cvar
@@ -1400,35 +1475,66 @@ impl StudioMobileEngine {
     /// clip so it is not silently truncated while the UI still shows "recording".
     /// Returns true when the take was ended here.
     pub fn service_recording(&mut self) -> bool {
-        if !self.is_recording || !self.mic_ring.limit_reached() {
+        let Some(take) = self.take_recording_at_limit() else {
             return false;
+        };
+        if let Some(prepared) = take.prepare() {
+            self.commit_recorded_take(prepared);
         }
-        self.finish_recording_clip();
-        self.last_take_stopped_at_limit = true;
         true
     }
 
-    fn finish_recording_clip(&mut self) {
-        self.is_recording = false;
-        let (mut left, mut right) = self.recording_worker.finish_take(&self.mic_ring);
-        let frames = left.len().min(right.len());
-        if frames < 512 {
-            return;
+    /// Like `service_recording`, but only ends the take and hands it back so the caller
+    /// can `prepare` it without holding the engine lock (see `take_finished_recording`).
+    pub fn take_recording_at_limit(&mut self) -> Option<RecordedTake> {
+        if !self.is_recording || !self.mic_ring.limit_reached() {
+            return None;
         }
-        left.truncate(frames);
-        right.truncate(frames);
-        left.shrink_to_fit();
-        right.shrink_to_fit();
-        let duration_secs = frames as f64 / self.sample_rate as f64;
-        let length_beats = (duration_secs * (self.bpm / 60.0)).max(0.5);
+        self.last_take_stopped_at_limit = true;
+        self.take_finished_recording()
+    }
 
-        let decoded = Arc::new(StereoAudioBuffer {
-            sample_rate: self.sample_rate,
-            frames,
+    /// Ends the active take and moves its samples out of the recorder.
+    ///
+    /// This is the only part of finishing a take that needs the engine: it stops input,
+    /// drains what is left in the mic ring (the writer keeps enough spare capacity that
+    /// this never reallocates) and moves the buffers out. Trimming the buffers and
+    /// computing peaks — O(take length) — happens in `RecordedTake::prepare`, which the
+    /// FFI runs after releasing the engine lock so a long take does not stall rendering.
+    /// Returns `None` when not recording.
+    pub fn take_finished_recording(&mut self) -> Option<RecordedTake> {
+        if !self.is_recording {
+            return None;
+        }
+        self.is_recording = false;
+        let (left, right) = self.recording_worker.finish_take(&self.mic_ring);
+        Some(RecordedTake {
             left,
             right,
-        });
-        let peaks = audio_io::compute_stereo_peaks(&decoded.left, &decoded.right, 128);
+            sample_rate: self.sample_rate,
+            bpm: self.bpm,
+            start_beat: self.recording_start_beat,
+        })
+    }
+
+    fn finish_recording_clip(&mut self) {
+        if let Some(prepared) = self
+            .take_finished_recording()
+            .and_then(RecordedTake::prepare)
+        {
+            self.commit_recorded_take(prepared);
+        }
+    }
+
+    /// Adds a prepared take to the audio pool and places it on the armed (or first)
+    /// audio track. Cheap: no sample data is copied or scanned here.
+    pub fn commit_recorded_take(&mut self, take: PreparedTake) {
+        let PreparedTake {
+            buffer: decoded,
+            peaks,
+            start_beat,
+            length_beats,
+        } = take;
         let src_id = self.alloc_id("rec-src");
         let clip_id = self.alloc_id("clip-rec");
         self.audio_pool.insert(src_id.clone(), decoded);
@@ -1451,7 +1557,7 @@ impl StudioMobileEngine {
                 name: "Recorded Audio Take.wav".to_string(),
                 source_id: src_id,
                 source_path: "recorded://mic_take.wav".to_string(),
-                start_beat: self.recording_start_beat,
+                start_beat,
                 length_beats,
                 offset_beats: 0.0,
                 gain_db: 0.0,
@@ -2840,5 +2946,97 @@ mod tests {
         engine.set_recording(false);
         assert_eq!(engine.telemetry().recording_dropped_frames, sr as u64);
         assert!(!engine.telemetry().recording_stopped_at_limit);
+    }
+
+    #[test]
+    fn take_headroom_grows_geometrically_within_the_limit() {
+        let mut v: Vec<f32> = Vec::with_capacity(100);
+        v.resize(95, 0.0);
+        reserve_take_headroom(&mut v, 20, 1_000);
+        assert!(
+            v.capacity() >= 200,
+            "geometric growth, got {}",
+            v.capacity()
+        );
+        assert!(v.capacity() <= 1_000);
+
+        let mut near_limit: Vec<f32> = Vec::with_capacity(100);
+        near_limit.resize(95, 0.0);
+        reserve_take_headroom(&mut near_limit, 20, 110);
+        assert!(near_limit.capacity() >= 110 && near_limit.capacity() < 200);
+
+        let cap = near_limit.capacity();
+        reserve_take_headroom(&mut near_limit, 20, 110);
+        assert_eq!(
+            near_limit.capacity(),
+            cap,
+            "no growth once headroom is there"
+        );
+    }
+
+    /// Regression for #348: the part of stopping a recording that runs under the engine
+    /// lock must not copy or scan the take; trimming and peaks happen in `prepare`.
+    #[test]
+    fn finishing_a_long_take_under_the_engine_lock_does_not_copy_it() {
+        // 8 kHz keeps a take longer than INITIAL_TAKE_RESERVE_SECONDS small and fast.
+        let sr = 8_000usize;
+        let mut engine = StudioMobileEngine::new(sr as u32);
+        engine.set_recording(true);
+
+        let one_second = vec![0.2f32; sr * 2];
+        // Just below where plain Vec doubling (60 s -> 120 s) would leave less than one
+        // mic ring of spare capacity.
+        let seconds = 2 * INITIAL_TAKE_RESERVE_SECONDS - 5;
+        let ring_cap = engine.mic_ring.capacity_frames();
+        for s in 1..=seconds {
+            engine.push_mic_input_interleaved(&one_second, 2);
+            // Wait for the writer to drain this second (keeps the ring from overrunning),
+            // then check it kept a full ring of spare capacity so a drain under the
+            // engine lock can never reallocate.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                {
+                    let storage = lock_take(&engine.recording_worker.state.0);
+                    if storage.left.len() == s * sr && storage.right.len() == s * sr {
+                        for buf in [&storage.left, &storage.right] {
+                            assert!(
+                                buf.capacity() - buf.len() >= ring_cap,
+                                "at {s} s the writer left {} frames of headroom, ring holds {ring_cap}",
+                                buf.capacity() - buf.len()
+                            );
+                        }
+                        break;
+                    }
+                }
+                assert!(std::time::Instant::now() < deadline, "writer did not drain");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+
+        // A final burst still sitting in the ring when the user stops.
+        let tail = vec![0.2f32; sr * 4 * 2];
+        engine.push_mic_input_interleaved(&tail, 2);
+        assert_eq!(engine.mic_ring.dropped_frames(), 0);
+
+        let mut take = None;
+        let allocs = crate::alloc_counter::measure_allocs(|| {
+            take = engine.take_finished_recording();
+        });
+        assert_eq!(
+            allocs, 0,
+            "ending a take under the engine lock reallocated/copied it ({allocs} allocations)"
+        );
+        assert!(!engine.is_recording);
+
+        let take = take.expect("active take");
+        let expected_frames = (seconds + 4) * sr;
+        assert_eq!(take.left.len(), expected_frames);
+        assert_eq!(take.right.len(), expected_frames);
+
+        let prepared = take.prepare().expect("long take is kept");
+        assert_eq!(prepared.peaks.len(), 128);
+        assert_eq!(prepared.buffer.frames, expected_frames);
+        engine.commit_recorded_take(prepared);
+        assert_eq!(recorded_clip_frames(&engine), Some(expected_frames));
     }
 }

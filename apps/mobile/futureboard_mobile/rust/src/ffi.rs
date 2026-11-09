@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use serde::Deserialize;
 
-use crate::engine::{MicInputRing, StudioMobileEngine, TrackKind};
+use crate::engine::{MicInputRing, RecordedTake, StudioMobileEngine, TelemetrySnapshot, TrackKind};
 use crate::plugin_host::plugin_catalog;
 
 pub struct FbEngineHandle {
@@ -86,6 +86,55 @@ impl FbEngineHandle {
 
     fn note_render_fault(&self) {
         self.render_faults.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Finishes a take that was moved out of the engine: trims it and computes its peaks
+    /// with the engine lock released (so the render callback keeps running during a long
+    /// punch-out), then re-locks only to insert the clip.
+    fn commit_take_off_lock(&self, take: Option<RecordedTake>) {
+        if let Some(prepared) = take.and_then(RecordedTake::prepare) {
+            self.lock().commit_recorded_take(prepared);
+        }
+    }
+
+    pub fn set_playing(&self, playing: bool) {
+        let take = {
+            let mut engine = self.lock();
+            // Stopping the transport ends an active take; finish it off the lock.
+            let take = if playing {
+                None
+            } else {
+                engine.take_finished_recording()
+            };
+            engine.set_playing(playing);
+            take
+        };
+        self.commit_take_off_lock(take);
+    }
+
+    pub fn set_recording(&self, recording: bool) {
+        let take = {
+            let mut engine = self.lock();
+            if recording {
+                engine.set_recording(true);
+                None
+            } else {
+                engine.take_finished_recording()
+            }
+        };
+        self.commit_take_off_lock(take);
+    }
+
+    pub fn telemetry(&self) -> TelemetrySnapshot {
+        // The UI polls telemetry continuously, so this is where a take that reached the
+        // length limit gets ended and committed (reported as recordingStoppedAtLimit).
+        let take = self.lock().take_recording_at_limit();
+        self.commit_take_off_lock(take);
+        let mut tel = self.lock().telemetry();
+        // Handle-level realtime counters live outside the engine mutex.
+        tel.render_faults = self.render_faults();
+        tel.render_lock_misses = self.lock_misses();
+        tel
     }
 }
 
@@ -297,7 +346,7 @@ pub unsafe extern "C" fn fb_engine_set_playing(handle: *mut FbEngineHandle, play
     if handle.is_null() {
         return;
     }
-    unsafe { (*handle).lock() }.set_playing(playing);
+    unsafe { (*handle).set_playing(playing) };
 }
 
 #[unsafe(no_mangle)]
@@ -305,7 +354,7 @@ pub unsafe extern "C" fn fb_engine_set_recording(handle: *mut FbEngineHandle, re
     if handle.is_null() {
         return;
     }
-    unsafe { (*handle).lock() }.set_recording(recording);
+    unsafe { (*handle).set_recording(recording) };
 }
 
 #[unsafe(no_mangle)]
@@ -412,16 +461,7 @@ pub unsafe extern "C" fn fb_engine_get_telemetry_json(handle: *mut FbEngineHandl
     if handle.is_null() {
         return to_c_string("{}".to_string());
     }
-    let mut tel = {
-        let mut engine = unsafe { (*handle).lock() };
-        // The UI polls telemetry continuously, so this is where a take that reached the
-        // length limit gets committed and reported (recordingStoppedAtLimit).
-        engine.service_recording();
-        engine.telemetry()
-    };
-    // Handle-level realtime counters live outside the engine mutex.
-    tel.render_faults = unsafe { (*handle).render_faults() };
-    tel.render_lock_misses = unsafe { (*handle).lock_misses() };
+    let tel = unsafe { (*handle).telemetry() };
     to_c_string(serde_json::to_string(&tel).unwrap_or_else(|_| "{}".to_string()))
 }
 
