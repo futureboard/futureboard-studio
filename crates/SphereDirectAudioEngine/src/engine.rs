@@ -8556,6 +8556,101 @@ mod bridge_insert_tests {
         }
     }
 
+    /// #337: a plug-in on the wet/dry/wet bus runs on the return, so its
+    /// latency is the wet path's. Planned on the source strip, the dry path
+    /// went uncompensated (early) while the plan believed it late.
+    #[test]
+    fn wdw_bus_latency_is_compensated_on_the_wet_return() {
+        let frames = 64u32;
+        let build = |send_enabled: bool| {
+            let mut src = bridge_effect_track(1.0);
+            src.id = "src".to_string();
+            src.inserts[0].id = "src-wdw".to_string();
+            src.inserts[0].signal_bus = crate::runtime::SIGNAL_BUS_WDW;
+            src.sends = vec![crate::runtime::RuntimeSend {
+                id: "send-wdw".to_string(),
+                return_track_id: "wdw".to_string(),
+                return_track_index: None,
+                level: 1.0,
+                enabled: send_enabled,
+                pre_fader: false,
+                level_lane: None,
+                enabled_lane: None,
+                pdc: Default::default(),
+                wdw: true,
+            }];
+            let mut ret = bridge_effect_track(1.0);
+            ret.id = "wdw".to_string();
+            ret.track_type = "return".to_string();
+            ret.inserts.clear();
+            let mut reference = bridge_effect_track(1.0);
+            reference.id = "ref".to_string();
+            reference.inserts.clear();
+            let mut master = bridge_effect_track(1.0);
+            master.id = "master".to_string();
+            master.track_type = "master".to_string();
+            master.inserts.clear();
+            let tracks = vec![src, ret, reference, master];
+            let audio_graph = crate::audio_graph::plan_runtime_audio_graph(&tracks).unwrap();
+            let mut p = RuntimeProject {
+                spatial: Default::default(),
+                tracks,
+                audio_graph,
+                pdc_enabled: true,
+                ..Default::default()
+            };
+            let sink = WetEffectSink {
+                done_seq: AtomicU64::new(1),
+                requests: AtomicU64::new(0),
+                latency_samples: 960,
+            };
+            p.plugin_bridge_sinks
+                .insert("src-wdw".to_string(), Arc::new(sink));
+            p.resolve_bridge_sinks();
+            p.plan_latency_and_pdc();
+            assert!(p.refresh_runtime_latency_graph(frames));
+            assert!(
+                !p.refresh_runtime_latency_graph(frames),
+                "moving the latency to the return must not keep re-planning"
+            );
+            p
+        };
+        // 960 reported + the bridge's one-block handshake.
+        let latency = 960 + frames;
+        let (src, ret, reference) = (0, 1, 2);
+
+        let p = build(true);
+        let lg = &p.latency_graph;
+        assert_eq!(p.tracks[src].wdw_return_index, Some(ret));
+        assert_eq!(lg.track_plugin_latency[src], latency, "the strip owns it");
+        assert_eq!(
+            lg.track_block_latency[src], 0,
+            "the dry path does not run it"
+        );
+        assert_eq!(lg.track_block_latency[ret], latency, "the return runs it");
+        assert_eq!(lg.max_path_latency_samples, latency);
+        // Everything meets at master at the longest path: the dry source and
+        // the reference held back by the plug-in's latency, the wet return
+        // late by it, its feed undelayed.
+        let at_master = |idx: usize| lg.track_output_latency[idx] + lg.track_pdc_delay[idx];
+        assert_eq!(lg.track_output_latency[src], 0);
+        assert_eq!(at_master(src), latency);
+        assert_eq!(at_master(ret), latency);
+        assert_eq!(at_master(reference), latency);
+        assert_eq!(lg.track_pdc_delay[src], latency);
+        assert_eq!(lg.send_pdc_delay[src], vec![0]);
+
+        // Split off: the plug-in is back in the source chain, and so is its
+        // latency.
+        let p = build(false);
+        let lg = &p.latency_graph;
+        assert_eq!(p.tracks[src].wdw_return_index, None);
+        assert_eq!(lg.track_block_latency[src], latency);
+        assert_eq!(lg.track_block_latency[ret], 0);
+        assert_eq!(lg.track_pdc_delay[src], 0);
+        assert_eq!(lg.track_pdc_delay[reference], latency);
+    }
+
     /// A multi-out instrument's "Out Ch" strip is fed from the bridged insert,
     /// so it carries the plug-in's latency plus one block. Planned as a
     /// zero-latency bus it took the full compensation on top and played late

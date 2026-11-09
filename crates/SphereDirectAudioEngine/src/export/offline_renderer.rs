@@ -1074,6 +1074,7 @@ mod tests {
     fn a_tap_lags_by_its_own_path_not_the_mixdowns() {
         let lg = RuntimeLatencyGraph {
             track_plugin_latency: vec![512, 0, 128],
+            track_block_latency: vec![512, 0, 128],
             track_output_latency: vec![512, 0, 128],
             track_pdc_delay: vec![0, 512, 0],
             send_pdc_delay: Vec::new(),
