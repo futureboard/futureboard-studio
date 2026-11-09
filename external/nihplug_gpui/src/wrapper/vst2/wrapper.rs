@@ -76,6 +76,8 @@ const AUDIO_MASTER_AUTOMATE: i32 = 0;
 const AUDIO_MASTER_GET_TIME: i32 = 7;
 const AUDIO_MASTER_IO_CHANGED: i32 = 13;
 const AUDIO_MASTER_SIZE_WINDOW: i32 = 15;
+// "Something in the plug-in changed, update the display": hosts read parameter names again.
+const AUDIO_MASTER_UPDATE_DISPLAY: i32 = 42;
 const AUDIO_MASTER_BEGIN_EDIT: i32 = 43;
 const AUDIO_MASTER_END_EDIT: i32 = 44;
 
@@ -91,6 +93,7 @@ const PLUG_CATEG_EFFECT: i32 = 1;
 
 /// Bits of [`Inner::pending_notifications`]: host callbacks waiting for the main thread.
 const NOTIFY_LATENCY: u32 = 1 << 0;
+const NOTIFY_TITLES: u32 = 1 << 1;
 
 /// Host callback. `extern "C"` matches the VST2 cdecl calling convention.
 pub type HostCallback = unsafe extern "C" fn(
@@ -456,6 +459,10 @@ impl<P: Vst2Plugin> Wrapper<P> {
         self.request_host_notification(NOTIFY_LATENCY);
     }
 
+    pub(super) fn param_titles_changed(&self) {
+        self.request_host_notification(NOTIFY_TITLES);
+    }
+
     /// Whether this is the thread the instance was created on. Hosts make their non-realtime
     /// calls there.
     fn on_main_thread(&self) -> bool {
@@ -525,6 +532,9 @@ impl<P: Vst2Plugin> Wrapper<P> {
                     (*self.effect_ptr()).initial_delay = samples as i32;
                 }
                 self.host_callback(AUDIO_MASTER_IO_CHANGED, 0, 0, 0.0);
+            }
+            if pending & NOTIFY_TITLES != 0 {
+                self.host_callback(AUDIO_MASTER_UPDATE_DISPLAY, 0, 0, 0.0);
             }
         }
         self.inner.flushing.store(false, Ordering::Release);

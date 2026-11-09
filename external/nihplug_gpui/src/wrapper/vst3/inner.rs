@@ -536,6 +536,14 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         }
     }
 
+    /// Ask the host to read the parameter titles again, on its UI thread.
+    pub fn param_titles_changed(&self) {
+        let task_posted = self.schedule_gui(Task::TriggerRestart(
+            RestartFlags::kParamTitlesChanged as i32,
+        ));
+        nih_debug_assert!(task_posted, "The task queue is full, dropping task...");
+    }
+
     /// Immediately set the plugin state. Returns `false` if the deserialization failed. The plugin
     /// state is set from a couple places, so this function aims to deduplicate that. Includes
     /// `permit_alloc()`s around the deserialization and initialization for the use case where

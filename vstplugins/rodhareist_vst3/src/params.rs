@@ -8,7 +8,7 @@
 //! automation and saved sessions use the names Studio's projects use.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use nih_plug::params::persist::PersistentField;
 use nih_plug::prelude::*;
@@ -136,7 +136,9 @@ impl RodhareistParams {
         entry.param.end(&setter);
         // The title a host shows for MIDI learn follows the selected stomp.
         // This runs on the editor thread; the audio thread must not rename.
-        self.wire.refresh_host_names();
+        if self.wire.refresh_host_names() {
+            context.gui_context().param_titles_changed();
+        }
     }
 }
 
@@ -161,6 +163,16 @@ pub struct WireEntry {
     pub id: &'static str,
     pub kind: EntryKind,
     pub param: WireParam,
+    /// How the host title is made, worked out once.
+    title: Title,
+}
+
+/// The shape of a host title.
+enum Title {
+    /// Never changes (global trims, lanes, the signal path).
+    Fixed,
+    /// `"{stomp} {label}"`: follows the model selected in `kind`'s block.
+    Stomp { kind: StageKind, label: String },
 }
 
 /// Every wire parameter, in `UI_PARAM_IDS` order (minus `clear_clip`).
@@ -169,13 +181,17 @@ pub struct WireEntry {
 /// [`Params::param_map`]), so the entries must not move.
 pub struct WireParams {
     entries: Box<[WireEntry]>,
+    /// Entries that select a model: the only values a title depends on.
+    title_sources: Box<[usize]>,
+    /// `title_sources`' values the current titles were made from.
+    titled_from: Mutex<Vec<f32>>,
 }
 
 impl WireParams {
     fn new() -> Self {
         let defaults = rodharerist::ui_values(&rodharerist::default_params());
         let specs = block_specs();
-        let entries = UI_PARAM_IDS
+        let entries: Box<[WireEntry]> = UI_PARAM_IDS
             .iter()
             .filter(|id| **id != CLEAR_CLIP)
             .map(|&id| {
@@ -187,7 +203,23 @@ impl WireParams {
                 build_entry(id, default, &specs)
             })
             .collect();
-        Self { entries }
+        let selectors = model_selectors();
+        let title_sources: Box<[usize]> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| selectors.contains(&e.id))
+            .map(|(i, _)| i)
+            .collect();
+        // The entries were named from these (default) values.
+        let titled_from = title_sources
+            .iter()
+            .map(|&i| entries[i].param.plain())
+            .collect();
+        Self {
+            entries,
+            title_sources,
+            titled_from: Mutex::new(titled_from),
+        }
     }
 
     pub fn entries(&self) -> &[WireEntry] {
@@ -231,21 +263,58 @@ impl WireParams {
         p
     }
 
-    /// Republish each parameter title from the live stomp names.
+    /// Republish each parameter title from the live stomp names. Returns
+    /// whether any title changed; the caller then tells the host
+    /// (`param_titles_changed`), which reads them again.
     ///
-    /// A host that asks again (`getParameterInfo`) sees the new title. The
-    /// VST3 unit id is assigned once, when the parameter map is built, and
-    /// stays the block category. Call this from the editor or from
-    /// `initialize`, never from the audio thread: a rename allocates.
-    pub fn refresh_host_names(&self) {
+    /// Only a model selector changes a title, so this is a comparison of a
+    /// few values unless one of them moved. The VST3 unit id is assigned once,
+    /// when the parameter map is built, and stays the block category. Call
+    /// this from the editor or from `initialize`, never from the audio
+    /// thread: it locks, and a rename allocates.
+    pub fn refresh_host_names(&self) -> bool {
+        let mut titled_from = self.titled_from.lock().unwrap_or_else(|e| e.into_inner());
+        let unchanged = self
+            .title_sources
+            .iter()
+            .zip(titled_from.iter())
+            .all(|(&i, &value)| self.entries[i].param.plain() == value);
+        if unchanged {
+            return false;
+        }
+        for (slot, &i) in titled_from.iter_mut().zip(self.title_sources.iter()) {
+            *slot = self.entries[i].param.plain();
+        }
+
         let params = self.to_core_params();
-        let specs = block_specs();
+        let stomps: Vec<String> = StageKind::ALL
+            .iter()
+            .map(|&kind| stomp_title(&params, kind))
+            .collect();
+        let mut changed = false;
         for entry in self.entries.iter() {
-            entry
-                .param
-                .set_display_name(&display_name(&params, entry.id, &specs));
+            if let Title::Stomp { kind, label } = &entry.title {
+                let name = format!("{} {label}", stomps[kind.index() as usize]);
+                changed |= entry.param.set_display_name(&name);
+            }
+        }
+        changed
+    }
+}
+
+/// Wire ids that select a block's model (and the amp's engine): what
+/// [`stomp_title`] reads.
+fn model_selectors() -> Vec<&'static str> {
+    let defaults = rodharerist::default_params();
+    let mut ids: Vec<&'static str> = Vec::new();
+    for &kind in StageKind::ALL {
+        for choice in blocks::models(&defaults, kind).0 {
+            if !choice.wire_id.is_empty() && !ids.contains(&choice.wire_id) {
+                ids.push(choice.wire_id);
+            }
         }
     }
+    ids
 }
 
 unsafe impl Params for WireParams {
@@ -309,17 +378,17 @@ impl WireParam {
         }
     }
 
-    /// Replace the host-visible title when it changed. Unchanged names are
-    /// left alone so a poll does not leak a new string every frame.
-    fn set_display_name(&self, name: &str) {
+    /// Replace the host-visible title. Returns whether it changed.
+    fn set_display_name(&self, name: &str) -> bool {
         if self.display_name() == name {
-            return;
+            return false;
         }
         match self {
             WireParam::Float(p) => p.set_name(name),
             WireParam::Int(p) => p.set_name(name),
             WireParam::Bool(p) => p.set_name(name),
         }
+        true
     }
 }
 
@@ -598,6 +667,7 @@ fn build_entry(id: &'static str, default: f32, specs: &[(StageKind, ParamSpec)])
             id,
             kind: EntryKind::PathSlot(slot),
             param: WireParam::Int(param),
+            title: Title::Fixed,
         };
     }
 
@@ -661,6 +731,19 @@ fn build_entry(id: &'static str, default: f32, specs: &[(StageKind, ParamSpec)])
         id,
         kind: EntryKind::Value,
         param,
+        title: title_of(id, specs),
+    }
+}
+
+/// How [`display_name`] builds `id`'s title, without the model it names.
+fn title_of(id: &str, specs: &[(StageKind, ParamSpec)]) -> Title {
+    let (group, label) = describe(id);
+    if matches!(group.as_str(), "Global" | "Lanes" | "Signal Path") {
+        return Title::Fixed;
+    }
+    match kind_owning(id, specs) {
+        Some(kind) => Title::Stomp { kind, label },
+        None => Title::Fixed,
     }
 }
 
@@ -761,7 +844,8 @@ mod tests {
             wire.get("drive_gain").unwrap().param.display_name(),
             "Green Screamer Drive"
         );
-        wire.refresh_host_names();
+        // Nothing selects another stomp: no title changes, no host notice.
+        assert!(!wire.refresh_host_names());
         assert_eq!(
             wire.get("drive_gain").unwrap().param.display_name(),
             "Green Screamer Drive"

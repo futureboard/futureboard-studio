@@ -46,6 +46,10 @@ impl<P: Vst2Plugin> InitContext<P> for WrapperInitContext<P> {
         unsafe { (*self.wrapper).set_latency_samples(samples) };
     }
 
+    fn param_titles_changed(&self) {
+        unsafe { (*self.wrapper).param_titles_changed() };
+    }
+
     fn set_current_voice_capacity(&self, _capacity: u32) {}
 }
 
@@ -87,6 +91,10 @@ impl<P: Vst2Plugin> GuiContext for WrapperGuiContext<P> {
 
     fn request_resize(&self) -> bool {
         unsafe { (*self.wrapper).request_resize() }
+    }
+
+    fn param_titles_changed(&self) {
+        unsafe { (*self.wrapper).param_titles_changed() };
     }
 
     unsafe fn raw_begin_set_parameter(&self, param: ParamPtr) {

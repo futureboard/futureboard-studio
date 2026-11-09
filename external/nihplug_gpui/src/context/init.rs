@@ -27,6 +27,12 @@ pub trait InitContext<P: Plugin> {
     /// this may cause audio playback to be restarted.
     fn set_latency_samples(&self, samples: u32);
 
+    /// Tell the host that one or more parameter names changed, for example because the state that
+    /// was just loaded selects different models. See
+    /// [`GuiContext::param_titles_changed()`][crate::prelude::GuiContext::param_titles_changed()].
+    /// The host is told after initialization returns.
+    fn param_titles_changed(&self) {}
+
     /// Set the current voice **capacity** for this plugin (so not the number of currently active
     /// voices). This may only be called if
     /// [`ClapPlugin::CLAP_POLY_MODULATION_CONFIG`][crate::prelude::ClapPlugin::CLAP_POLY_MODULATION_CONFIG]

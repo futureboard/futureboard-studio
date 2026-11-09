@@ -35,7 +35,7 @@ use clap_sys::ext::params::{
     clap_host_params, clap_param_info, clap_plugin_params, CLAP_EXT_PARAMS,
     CLAP_PARAM_IS_AUTOMATABLE, CLAP_PARAM_IS_BYPASS, CLAP_PARAM_IS_HIDDEN,
     CLAP_PARAM_IS_MODULATABLE, CLAP_PARAM_IS_MODULATABLE_PER_NOTE_ID, CLAP_PARAM_IS_READONLY,
-    CLAP_PARAM_IS_STEPPED, CLAP_PARAM_RESCAN_VALUES,
+    CLAP_PARAM_IS_STEPPED, CLAP_PARAM_RESCAN_INFO, CLAP_PARAM_RESCAN_VALUES,
 };
 use clap_sys::ext::remote_controls::{
     clap_plugin_remote_controls, clap_remote_controls_page, CLAP_EXT_REMOTE_CONTROLS,
@@ -279,6 +279,8 @@ pub enum Task<P: Plugin> {
     VoiceInfoChanged,
     /// Tell the host that it should rescan the current parameter values.
     RescanParamValues,
+    /// Tell the host that parameter names changed.
+    RescanParamInfo,
 }
 
 /// The types of CLAP parameter updates for events.
@@ -416,6 +418,14 @@ impl<P: ClapPlugin> MainThreadExecutor<Task<P>> for Wrapper<P> {
                 Some(host_params) => {
                     nih_debug_assert!(is_gui_thread);
                     unsafe_clap_call! { host_params=>rescan(&*self.host_callback, CLAP_PARAM_RESCAN_VALUES) };
+                }
+                None => nih_debug_assert_failure!("The host does not support parameters? What?"),
+            },
+            Task::RescanParamInfo => match &*self.host_params.borrow() {
+                Some(host_params) => {
+                    nih_debug_assert!(is_gui_thread);
+                    // A name change is info, which CLAP allows rescanning at any time
+                    unsafe_clap_call! { host_params=>rescan(&*self.host_callback, CLAP_PARAM_RESCAN_INFO) };
                 }
                 None => nih_debug_assert_failure!("The host does not support parameters? What?"),
             },
@@ -1743,6 +1753,12 @@ impl<P: ClapPlugin> Wrapper<P> {
             let task_posted = self.schedule_gui(Task::LatencyChanged);
             nih_debug_assert!(task_posted, "The task queue is full, dropping task...");
         }
+    }
+
+    /// Ask the host to read the parameter names again, on its main thread.
+    pub fn param_titles_changed(&self) {
+        let task_posted = self.schedule_gui(Task::RescanParamInfo);
+        nih_debug_assert!(task_posted, "The task queue is full, dropping task...");
     }
 
     pub fn set_current_voice_capacity(&self, capacity: u32) {
