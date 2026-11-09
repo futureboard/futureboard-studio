@@ -726,6 +726,12 @@ fn default_true() -> bool {
     true
 }
 
+/// Most plug-ins one chain or track preset may list. A chain has no cap of
+/// its own in Studio, but nothing practical comes near this (eight inserts
+/// was the long-standing UI limit); the bound keeps a crafted file from
+/// declaring an unbounded number of slots.
+pub const MAX_BUNDLE_SLOTS: usize = 1024;
+
 /// Writes a chain or track preset to `path`, creating parent directories.
 pub fn write_bundle_preset(path: &Path, preset: &BundlePreset) -> Result<(), String> {
     if preset.slots.is_empty() && preset.kind == BundleKind::Chain {
@@ -748,6 +754,11 @@ pub fn write_bundle_preset(path: &Path, preset: &BundlePreset) -> Result<(), Str
 }
 
 fn build_bundle_binary(preset: &BundlePreset) -> Result<Vec<u8>, String> {
+    if preset.slots.len() > MAX_BUNDLE_SLOTS {
+        return Err(format!(
+            "a preset holds at most {MAX_BUNDLE_SLOTS} plug-ins"
+        ));
+    }
     let mut states = Vec::new();
     let mut slots = Vec::with_capacity(preset.slots.len());
     for slot in &preset.slots {
@@ -816,6 +827,23 @@ pub fn read_bundle_preset(path: &Path) -> Result<BundlePreset, String> {
     let metadata: BundleMetadata =
         serde_json::from_slice(&bytes[24..meta_end]).map_err(|e| e.to_string())?;
     let states = &bytes[meta_end..state_end];
+    if metadata.slots.len() > MAX_BUNDLE_SLOTS {
+        return Err(format!(
+            "Preset lists {} plug-ins (at most {MAX_BUNDLE_SLOTS})",
+            metadata.slots.len()
+        ));
+    }
+    // Every slot's state is copied out on its own, so slots that share or
+    // overlap a range would multiply the blob. The writer lays the states
+    // back to back; requiring the declared lengths to fit in the blob keeps
+    // the total copied no larger than the file.
+    let mut declared_state_bytes: u64 = 0;
+    for slot in &metadata.slots {
+        declared_state_bytes = declared_state_bytes
+            .checked_add(slot.state_length)
+            .filter(|total| *total <= states.len() as u64)
+            .ok_or_else(|| "Preset slot states overlap or exceed the file".to_string())?;
+    }
     let mut slots = Vec::with_capacity(metadata.slots.len());
     for slot in metadata.slots {
         let start = usize::try_from(slot.state_offset).map_err(|_| "state offset".to_string())?;
@@ -973,6 +1001,88 @@ mod tests {
         assert!(is_state_preset_file(&path), "user work, even with no state");
         assert_eq!(clear_pst_files_recursive(&dir).unwrap(), 0);
         assert!(path.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A chain bundle whose metadata lists `slots` (offset, length) pairs
+    /// over a `blob_len`-byte state blob, written to `path`.
+    fn write_raw_bundle(path: &Path, slots: &[(u64, u64)], blob_len: usize) {
+        let slots: Vec<serde_json::Value> = slots
+            .iter()
+            .map(|(offset, length)| {
+                serde_json::json!({
+                    "id": "vst3:abc",
+                    "stateOffset": offset,
+                    "stateLength": length,
+                })
+            })
+            .collect();
+        let meta = serde_json::to_vec(&serde_json::json!({
+            "presetFormat": "Futureboard preset",
+            "version": VERSION_BUNDLE,
+            "kind": BundleKind::Chain,
+            "pluginMetadata": { "name": "Crafted" },
+            "slots": slots,
+        }))
+        .unwrap();
+        let mut bytes = preset_header(VERSION_BUNDLE, meta.len(), blob_len).to_vec();
+        bytes.extend_from_slice(&meta);
+        bytes.resize(bytes.len() + blob_len, 0xAB);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, &bytes).unwrap();
+    }
+
+    /// Thousands of slots that all point at the whole blob would each copy
+    /// it; the file is refused instead (#373).
+    #[test]
+    fn a_bundle_whose_slots_share_one_range_is_refused() {
+        let dir = std::env::temp_dir().join("fb-preset-bundle-overlap");
+        let _ = fs::remove_dir_all(&dir);
+        let blob = 64 * 1024;
+
+        let path = dir.join("many.pst");
+        write_raw_bundle(&path, &vec![(0, blob as u64); 1000], blob);
+        assert!(read_bundle_preset(&path).is_err());
+
+        // Even two slots sharing the blob declare more than it holds.
+        let path = dir.join("two.pst");
+        write_raw_bundle(&path, &[(0, blob as u64), (0, blob as u64)], blob);
+        assert!(read_bundle_preset(&path).is_err());
+
+        // Back-to-back ranges that exactly fill the blob still load.
+        let path = dir.join("tiled.pst");
+        let half = (blob / 2) as u64;
+        write_raw_bundle(&path, &[(0, half), (half, half)], blob);
+        let preset = read_bundle_preset(&path).expect("tiled bundle loads");
+        assert_eq!(preset.slots.len(), 2);
+        assert!(preset.slots.iter().all(|s| s.state.len() == blob / 2));
+
+        // Lengths whose sum overflows u64 are refused, not wrapped.
+        let path = dir.join("overflow.pst");
+        write_raw_bundle(&path, &[(0, u64::MAX), (0, 2)], blob);
+        assert!(read_bundle_preset(&path).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// More slots than any preset may list is refused even when every slot
+    /// is stateless; at the limit it still loads.
+    #[test]
+    fn a_bundle_listing_too_many_slots_is_refused() {
+        let dir = std::env::temp_dir().join("fb-preset-bundle-slot-cap");
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("too-many.pst");
+        write_raw_bundle(&path, &vec![(0, 0); MAX_BUNDLE_SLOTS + 1], 0);
+        assert!(read_bundle_preset(&path).is_err());
+        let path = dir.join("at-cap.pst");
+        write_raw_bundle(&path, &vec![(0, 0); MAX_BUNDLE_SLOTS], 0);
+        assert_eq!(
+            read_bundle_preset(&path).expect("at cap").slots.len(),
+            MAX_BUNDLE_SLOTS
+        );
+
+        let mut oversized = bundle(BundleKind::Chain);
+        oversized.slots = vec![oversized.slots[0].clone(); MAX_BUNDLE_SLOTS + 1];
+        assert!(write_bundle_preset(&dir.join("write.pst"), &oversized).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 
