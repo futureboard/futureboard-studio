@@ -121,6 +121,10 @@ pub(crate) struct WrapperInner<P: Vst3Plugin> {
 
     /// The keys from `param_map` in a stable order.
     pub param_hashes: Vec<u32>,
+    /// The edit controller's value of each parameter while it differs from the processor's: an
+    /// edit made while audio is processing reaches the parameter only once the host passes it back
+    /// through `process()`. See [`Self::hold_controller_value()`].
+    controller_values: HashMap<u32, ControllerValue>,
     /// A mapping from parameter ID hashes (obtained from the string parameter IDs) to pointers to
     /// parameters belonging to the plugin. These addresses will remain stable as long as the
     /// `params` object does not get deallocated.
@@ -137,6 +141,15 @@ pub(crate) struct WrapperInner<P: Vst3Plugin> {
     /// having to add a setter function to the parameter (or even worse, have it be completely
     /// untyped).
     pub param_ptr_to_hash: HashMap<ParamPtr, u32>,
+}
+
+/// One parameter's value on the edit controller's side, while it is ahead of the processor's.
+#[derive(Default)]
+struct ControllerValue {
+    /// The normalized value, as `f32` bits.
+    normalized: AtomicU32,
+    /// Whether `normalized` is the value to report instead of the parameter's own.
+    pending: AtomicBool,
 }
 
 /// Tasks that can be sent from the plugin to be executed on the main thread in a non-blocking
@@ -157,6 +170,12 @@ pub enum Task<P: Plugin> {
     /// Request the editor to be resized according to its current size. Right now there is no way to
     /// handle "denied resize" requests yet.
     RequestResize,
+    /// `IComponentHandler::beginEdit()` for the parameter with this hash, from the editor.
+    BeginEdit(u32),
+    /// `IComponentHandler::performEdit()` with this hash and normalized value, from the editor.
+    PerformEdit(u32, f64),
+    /// `IComponentHandler::endEdit()` for the parameter with this hash, from the editor.
+    EndEdit(u32),
 }
 
 /// VST3 makes audio processing pretty complicated. In order to support both block splitting for
@@ -247,9 +266,13 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             }
         }
 
-        let param_hashes = param_id_hashes_ptrs_groups
+        let param_hashes: Vec<u32> = param_id_hashes_ptrs_groups
             .iter()
             .map(|(_, hash, _, _)| *hash)
+            .collect();
+        let controller_values = param_hashes
+            .iter()
+            .map(|hash| (*hash, ControllerValue::default()))
             .collect();
         let param_by_hash = param_id_hashes_ptrs_groups
             .iter()
@@ -313,6 +336,7 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             updated_state_receiver,
 
             param_hashes,
+            controller_values,
             param_by_hash,
             param_id_by_hash,
             param_units,
@@ -420,6 +444,37 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         }
     }
 
+    /// Remember `normalized` as the edit controller's value of `hash` until the processor receives
+    /// a value for it.
+    ///
+    /// While audio is processing, an edit is not written to the parameter: the host passes it back
+    /// through `process()`. Until then the controller has to report the edited value. Cubase asks
+    /// the controller for it (`getParamNormalized()`) after `performEdit()` and sends the processor
+    /// what it reads, so reporting the parameter's own (old) value there undid every edit made in
+    /// the editor.
+    pub fn hold_controller_value(&self, hash: u32, normalized: f32) {
+        if let Some(held) = self.controller_values.get(&hash) {
+            held.normalized
+                .store(normalized.to_bits(), Ordering::Relaxed);
+            held.pending.store(true, Ordering::Release);
+        }
+    }
+
+    /// The edit controller's value of `hash`, when it is ahead of the parameter's own.
+    pub fn controller_value(&self, hash: u32) -> Option<f32> {
+        let held = self.controller_values.get(&hash)?;
+        held.pending
+            .load(Ordering::Acquire)
+            .then(|| f32::from_bits(held.normalized.load(Ordering::Relaxed)))
+    }
+
+    /// A state load replaces every value, edits still on their way included.
+    fn clear_controller_values(&self) {
+        for held in self.controller_values.values() {
+            held.pending.store(false, Ordering::Release);
+        }
+    }
+
     /// Get a parameter's ID based on a `ParamPtr`. Used in the `GuiContext` implementation for the
     /// gesture checks.
     #[allow(unused)]
@@ -443,6 +498,11 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         normalized_value: f32,
         sample_rate: Option<f32>,
     ) -> tresult {
+        // The parameter now has the value the host meant: the controller agrees with it again
+        if let Some(held) = self.controller_values.get(&hash) {
+            held.pending.store(false, Ordering::Release);
+        }
+
         match self.param_by_hash.get(&hash) {
             Some(param_ptr) => {
                 if unsafe { param_ptr.set_normalized_value(normalized_value) } {
@@ -576,6 +636,7 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             nih_debug_assert_failure!("Deserializing plugin state from a state object failed");
             return false;
         }
+        self.clear_controller_values();
 
         // If the plugin was already initialized then it needs to be reinitialized
         if let Some(buffer_config) = buffer_config {
@@ -655,6 +716,26 @@ impl<P: Vst3Plugin> MainThreadExecutor<Task<P>> for WrapperInner<P> {
                     nih_debug_assert!(success, "Failed requesting a window resize");
                 },
                 None => nih_debug_assert_failure!("Can't resize a closed editor"),
+            },
+            // The editor's gestures, on the host's UI thread: `IComponentHandler` is a UI-thread
+            // interface, and the GPUI editor runs on a thread of its own.
+            Task::BeginEdit(hash) => match &*self.component_handler.borrow() {
+                Some(handler) => unsafe {
+                    handler.begin_edit(hash);
+                },
+                None => nih_debug_assert_failure!("Component handler not yet set"),
+            },
+            Task::PerformEdit(hash, normalized) => match &*self.component_handler.borrow() {
+                Some(handler) => unsafe {
+                    handler.perform_edit(hash, normalized);
+                },
+                None => nih_debug_assert_failure!("Component handler not yet set"),
+            },
+            Task::EndEdit(hash) => match &*self.component_handler.borrow() {
+                Some(handler) => unsafe {
+                    handler.end_edit(hash);
+                },
+                None => nih_debug_assert_failure!("Component handler not yet set"),
             },
         }
     }

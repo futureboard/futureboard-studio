@@ -3,7 +3,6 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use vst3_sys::vst::IComponentHandler;
 
 use crate::prelude::{
     GuiContext, InitContext, ParamPtr, PluginApi, PluginNoteEvent, PluginState, ProcessContext,
@@ -146,17 +145,16 @@ impl<P: Vst3Plugin> GuiContext for WrapperGuiContext<P> {
         self.inner.param_titles_changed();
     }
 
-    // All of these functions are supposed to be called from the main thread, so we'll put some
-    // trust in the caller and assume that this is indeed the case
+    // The host hears about a gesture on its UI thread, where `IComponentHandler` is to be called:
+    // `schedule_gui` runs the call right away there, and queues it in order from anywhere else. An
+    // editor may run on its own thread (GPUI does).
     unsafe fn raw_begin_set_parameter(&self, param: ParamPtr) {
-        match &*self.inner.component_handler.borrow() {
-            Some(handler) => match self.inner.param_ptr_to_hash.get(&param) {
-                Some(hash) => {
-                    handler.begin_edit(*hash);
-                }
-                None => nih_debug_assert_failure!("Unknown parameter: {:?}", param),
-            },
-            None => nih_debug_assert_failure!("Component handler not yet set"),
+        match self.inner.param_ptr_to_hash.get(&param) {
+            Some(hash) => {
+                let task_posted = self.inner.schedule_gui(Task::BeginEdit(*hash));
+                nih_debug_assert!(task_posted, "The task queue is full, dropping task...");
+            }
+            None => nih_debug_assert_failure!("Unknown parameter: {:?}", param),
         }
 
         #[cfg(debug_assertions)]
@@ -172,32 +170,36 @@ impl<P: Vst3Plugin> GuiContext for WrapperGuiContext<P> {
     }
 
     unsafe fn raw_set_parameter_normalized(&self, param: ParamPtr, normalized: f32) {
-        match &*self.inner.component_handler.borrow() {
-            Some(handler) => match self.inner.param_ptr_to_hash.get(&param) {
-                Some(hash) => {
-                    // Only update the parameters manually if the host is not processing audio. If
-                    // the plugin is currently processing audio, the host will pass this change back
-                    // to the plugin in the audio callback. This also prevents the values from
-                    // changing in the middle of the process callback, which would be unsound.
-                    // FIXME: So this doesn't work for REAPER, because they just silently stop
-                    //        processing audio when you bypass the plugin. Great. We can add a time
-                    //        based heuristic to work around this in the meantime.
-                    if !self.inner.is_processing.load(Ordering::SeqCst) {
-                        self.inner.set_normalized_value_by_hash(
-                            *hash,
-                            normalized,
-                            self.inner
-                                .current_buffer_config
-                                .load()
-                                .map(|c| c.sample_rate),
-                        );
-                    }
-
-                    handler.perform_edit(*hash, normalized as f64);
+        match self.inner.param_ptr_to_hash.get(&param) {
+            Some(hash) => {
+                // Only update the parameters manually if the host is not processing audio. If
+                // the plugin is currently processing audio, the host will pass this change back
+                // to the plugin in the audio callback. This also prevents the values from
+                // changing in the middle of the process callback, which would be unsound.
+                // FIXME: So this doesn't work for REAPER, because they just silently stop
+                //        processing audio when you bypass the plugin. Great. We can add a time
+                //        based heuristic to work around this in the meantime.
+                if !self.inner.is_processing.load(Ordering::SeqCst) {
+                    self.inner.set_normalized_value_by_hash(
+                        *hash,
+                        normalized,
+                        self.inner
+                            .current_buffer_config
+                            .load()
+                            .map(|c| c.sample_rate),
+                    );
+                } else {
+                    // Until then the controller reports the edited value. Set before the edit is
+                    // sent, which is when the host may ask for it.
+                    self.inner.hold_controller_value(*hash, normalized);
                 }
-                None => nih_debug_assert_failure!("Unknown parameter: {:?}", param),
-            },
-            None => nih_debug_assert_failure!("Component handler not yet set"),
+
+                let task_posted = self
+                    .inner
+                    .schedule_gui(Task::PerformEdit(*hash, normalized as f64));
+                nih_debug_assert!(task_posted, "The task queue is full, dropping task...");
+            }
+            None => nih_debug_assert_failure!("Unknown parameter: {:?}", param),
         }
 
         #[cfg(debug_assertions)]
@@ -213,14 +215,12 @@ impl<P: Vst3Plugin> GuiContext for WrapperGuiContext<P> {
     }
 
     unsafe fn raw_end_set_parameter(&self, param: ParamPtr) {
-        match &*self.inner.component_handler.borrow() {
-            Some(handler) => match self.inner.param_ptr_to_hash.get(&param) {
-                Some(hash) => {
-                    handler.end_edit(*hash);
-                }
-                None => nih_debug_assert_failure!("Unknown parameter: {:?}", param),
-            },
-            None => nih_debug_assert_failure!("Component handler not yet set"),
+        match self.inner.param_ptr_to_hash.get(&param) {
+            Some(hash) => {
+                let task_posted = self.inner.schedule_gui(Task::EndEdit(*hash));
+                nih_debug_assert!(task_posted, "The task queue is full, dropping task...");
+            }
+            None => nih_debug_assert_failure!("Unknown parameter: {:?}", param),
         }
 
         #[cfg(debug_assertions)]

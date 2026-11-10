@@ -714,6 +714,11 @@ impl<P: Vst3Plugin> IEditController for Wrapper<P> {
     }
 
     unsafe fn get_param_normalized(&self, id: u32) -> f64 {
+        // An edit the processor has not received yet
+        if let Some(value) = self.inner.controller_value(id) {
+            return value as f64;
+        }
+
         match self.inner.param_by_hash.get(&id) {
             Some(param_ptr) => param_ptr.modulated_normalized_value() as f64,
             _ => 0.5,
@@ -722,8 +727,9 @@ impl<P: Vst3Plugin> IEditController for Wrapper<P> {
 
     unsafe fn set_param_normalized(&self, id: u32, value: f64) -> tresult {
         // If the plugin is currently processing audio, then this parameter change will also be sent
-        // to the process function
+        // to the process function. The controller has the value already.
         if self.inner.is_processing.load(Ordering::SeqCst) {
+            self.inner.hold_controller_value(id, value as f32);
             return kResultOk;
         }
 
