@@ -141,7 +141,9 @@ impl JamWindow {
         Self::spawn_refresh(cx);
         let focus_handle = cx.focus_handle();
         Self {
-            link_input: TextInputState::new("jam-join-link-input", focus_handle.clone())
+            // Its own handle: the root tracks `focus_handle`, so a click anywhere
+            // else in the window takes focus from the field.
+            link_input: TextInputState::new("jam-join-link-input", cx.focus_handle())
                 .with_placeholder("Paste a jam link or code")
                 .with_accessible_label("Jam link or code"),
             focus_handle,
@@ -160,7 +162,9 @@ impl JamWindow {
     pub fn preview(state: JamUiState, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         Self {
-            link_input: TextInputState::new("jam-join-link-input", focus_handle.clone())
+            // Its own handle: the root tracks `focus_handle`, so a click anywhere
+            // else in the window takes focus from the field.
+            link_input: TextInputState::new("jam-join-link-input", cx.focus_handle())
                 .with_placeholder("Paste a jam link or code")
                 .with_accessible_label("Jam link or code"),
             focus_handle,
@@ -434,8 +438,9 @@ impl Render for JamWindow {
                         cx.notify();
                     }
                     ("escape", true) => {
+                        // Back to the window, so a second Escape closes it.
                         cx.stop_propagation();
-                        window.blur();
+                        this.focus_handle.focus(window, cx);
                         cx.notify();
                     }
                     ("escape", false) => window.remove_window(),

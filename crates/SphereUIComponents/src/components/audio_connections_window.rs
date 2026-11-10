@@ -807,6 +807,16 @@ impl AudioConnectionsWindow {
             .as_ref()
             .is_some_and(|edit| edit.connection_id == row.id);
         if editing {
+            // The window root tracks the same focus handle as the field, so a
+            // click elsewhere never takes focus from it: the rename has to end
+            // on the press itself. Committed in the capture phase, before the
+            // press reaches the row, cell or button it landed on.
+            let entity = cx.entity().clone();
+            let mut callbacks =
+                bind_mouse_selection(cx.entity().clone(), |this| &mut this.name_input);
+            callbacks.on_mouse_down_out = Some(std::sync::Arc::new(move |window, cx| {
+                let _ = entity.update(cx, |this, cx| this.rename_outside_press(window, cx));
+            }));
             return div()
                 .w(px(width))
                 .flex_none()
@@ -814,7 +824,7 @@ impl AudioConnectionsWindow {
                 .child(text_field_with_callbacks_and_ime(
                     &self.name_input,
                     self.name_input.is_focused(window),
-                    bind_mouse_selection(cx.entity().clone(), |this| &mut this.name_input),
+                    callbacks,
                     cx.entity(),
                 ))
                 .into_any_element();
@@ -897,6 +907,15 @@ impl AudioConnectionsWindow {
         // editor simply closes and the previous name stays.
         (self.on_edit)(&ConnectionEdit::Rename { id, name: value }, window, cx);
         cx.notify();
+    }
+
+    /// A press outside the open rename commits it, as Enter does — unless it
+    /// lands on the field's own Cut/Copy/Paste menu, which is part of the edit.
+    fn rename_outside_press(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.panel.inline_edit.is_none() || self.name_input.context_menu.is_some() {
+            return;
+        }
+        self.commit_rename(window, cx);
     }
 
     /// Root key handling for the table.
