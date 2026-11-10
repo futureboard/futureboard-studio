@@ -27,12 +27,15 @@ use gpui::{
     div, px, AnyElement, App, AppContext, Context, FontWeight, InteractiveElement, IntoElement,
     ParentElement, Render, Rgba, StatefulInteractiveElement, Styled, Window,
 };
-use rodharerist::{CabModel, Line2Mode, Params, RowSend, StageChannel, StageKind, ToneEngineKind};
+use rodharerist::{
+    AmpClass, AmpModel, CabModel, DelaySync, Line2Mode, Params, RowSend, StageChannel, StageKind,
+    ToneEngineKind,
+};
 
 use crate::components::controls::fb_tooltip;
 use crate::components::plate::{
-    self, caption, color, color_a, icon, knob, numbers, plate_frame, plate_scale, type_px, words,
-    Dial, DialUnit, KnobCell, KnobLook, FAINT, INK, PALE, SOFT, WHITE,
+    self, caption, color, color_a, icon, knob_typed, numbers, plate_frame, plate_scale, type_px,
+    words, Dial, DialUnit, KnobCell, KnobLook, FAINT, INK, PALE, SOFT, WHITE,
 };
 use crate::components::rodhareist_blocks::{self as blocks, Category, ParamSpec};
 use crate::components::rodhareist_window::RodhareistEditorWindow;
@@ -145,6 +148,7 @@ pub(crate) struct RodUi {
 pub(crate) struct RodFields {
     pub search: AnyElement,
     pub preset_name: AnyElement,
+    pub knob_value: Option<AnyElement>,
 }
 
 impl Default for RodUi {
@@ -178,6 +182,12 @@ pub(crate) enum Family {
     Reverb,
     Eq,
     Filter,
+    /// Browse group for clean amp voices. Not a chain-block family.
+    Clean,
+    /// Browse group for crunch amp voices.
+    Crunch,
+    /// Browse group for high-gain amp voices.
+    HighGain,
 }
 
 impl Family {
@@ -196,7 +206,7 @@ impl Family {
     fn of(category: Category) -> Family {
         match category {
             Category::Gate | Category::Comp => Family::Dynamics,
-            Category::Wah => Family::Filter,
+            Category::Wah | Category::Pitch => Family::Filter,
             Category::Drive => Family::Drive,
             Category::Amp => Family::Amp,
             Category::Cab => Family::Cab,
@@ -217,9 +227,27 @@ impl Family {
             Family::Delay => &[Category::Delay],
             Family::Reverb => &[Category::Reverb],
             Family::Eq => &[Category::Eq],
-            Family::Filter => &[Category::Wah],
+            Family::Filter => &[Category::Wah, Category::Pitch],
+            Family::Clean | Family::Crunch | Family::HighGain => &[Category::Amp],
         }
     }
+
+    /// Explore's list. Clean, Crunch, High Gain and Drive are separate.
+    /// [`Family::Amp`] stays the chain block's family and, here, the NAM row.
+    const BROWSE: [Family; 12] = [
+        Family::Dynamics,
+        Family::Clean,
+        Family::Crunch,
+        Family::HighGain,
+        Family::Drive,
+        Family::Amp,
+        Family::Cab,
+        Family::Modulation,
+        Family::Delay,
+        Family::Reverb,
+        Family::Eq,
+        Family::Filter,
+    ];
 
     fn label(self) -> &'static str {
         match self {
@@ -232,6 +260,9 @@ impl Family {
             Family::Reverb => "Reverb",
             Family::Eq => "EQ",
             Family::Filter => "Filter",
+            Family::Clean => "Clean",
+            Family::Crunch => "Crunch",
+            Family::HighGain => "High Gain",
         }
     }
 
@@ -247,6 +278,9 @@ impl Family {
             Family::Reverb => "REVERB",
             Family::Eq => "EQ",
             Family::Filter => "FILTER",
+            Family::Clean => "CLEAN",
+            Family::Crunch => "CRUNCH",
+            Family::HighGain => "GAIN",
         }
     }
 
@@ -261,6 +295,9 @@ impl Family {
             Family::Reverb => 0x4fd1c5,
             Family::Eq => 0xf6d55c,
             Family::Filter => 0xff8a3d,
+            Family::Clean => 0x8fd3a8,
+            Family::Crunch => 0xe0a045,
+            Family::HighGain => 0xf25c54,
         }
     }
 
@@ -278,6 +315,9 @@ impl Family {
             }
             Family::Eq => "M6 4 V20 M12 4 V20 M18 4 V20 M4 9 H8 M10 15 H14 M16 7 H20",
             Family::Filter => "M3 16 C8 16 9 6 12 6 C15 6 16 16 21 16",
+            Family::Clean | Family::Crunch | Family::HighGain => {
+                "M3 6 H21 V18 H3 Z M3 13 H21 M7 9.5 V9.6 M11 9.5 V9.6 M15 9.5 V9.6"
+            }
         }
     }
 }
@@ -461,6 +501,34 @@ fn model_desc(label: &str) -> &'static str {
         "Vocal Wah" => "A narrow, more resonant vowel.",
         "Parked Filter" => "A short travel around one mid.",
         "Talk Filter" => "A wide envelope sweep with more dry body under it.",
+        "Herbert Lead" => "Four stages, tight and mid-forward, with very little sag.",
+        "VH4 Lead" => "Scooped modern lead. Stiffer than Herbert, less mid.",
+        "Ecstasy Red" => "British high gain that blooms and sags.",
+        "Uberschall" => "Huge gain, a lot of sag, a big low end.",
+        "Savage Lead" => "Bright modern lead. The top stays forward.",
+        "Archon Lead" => "Forward mids, tight, less scoop than a modern stack.",
+        "Deliverance" => "Three stages. Articulate, less scooped than the four-stage leads.",
+        "Jubilee Lead" => {
+            "Three-stage British crunch. More gain than a plexi, less than a modern lead."
+        }
+        "DSL Lead" => "Tighter British lead. Less sag than Jubilee.",
+        "Deluxe Reverb" => "Two-stage American clean. High headroom, a little sag.",
+        "Greenback 2x12" => "A vintage pair. Mid honk, the top rolls off early.",
+        "Alnico 4x12" => "Closed 4x12 with a strong speaker bell.",
+        "Vintage 1x15" => "Open fifteen. Loose and dark.",
+        "Bass 4x10" => "Four tens for bass. Tight, extended low.",
+        "Dark 1x12" => "A small closed single with very little top.",
+        "Modern 1x12" => "A tight closed single. More top than the dark 1x12.",
+        "V30 Stack 4x12" => "Closed 4x12. Mid-forward, the top stays.",
+        "Cream 2x12" => "A pair with more top than a greenback.",
+        "Ported 4x12" => "A tuned port under a closed 4x12. Deeper than a sealed stack.",
+        "Open 2x10" => "Two tens, open back, strong rear cancellation.",
+        "Octave Up" => "The note an octave above, mixed with the dry guitar.",
+        "Octave Down" => "The note an octave below.",
+        "Detune" => "Two voices, a little sharp and a little flat.",
+        "Fifth Up" => "A fifth above the note.",
+        "Fourth Down" => "A fourth below the note.",
+        "Shift" => "The semitone and cents knobs set the interval.",
         _ => "",
     }
 }
@@ -470,25 +538,59 @@ fn model_desc(label: &str) -> &'static str {
 #[derive(Clone, Copy, Debug)]
 struct Entry {
     category: Category,
+    /// Index into [`blocks::models`], which is what [`place`] writes.
     index: usize,
     label: &'static str,
+    /// The Explore group. Amp voices are split by gain; the chain block
+    /// stays [`Family::Amp`].
+    browse: Family,
+}
+
+fn amp_browse(choice_wire: &str, value: f32) -> Family {
+    if choice_wire == "tone_engine" {
+        return Family::Amp;
+    }
+    match AmpModel::from_index(value.round().max(0.0) as u32).class() {
+        AmpClass::Clean => Family::Clean,
+        AmpClass::Crunch => Family::Crunch,
+        AmpClass::HighGain => Family::HighGain,
+    }
 }
 
 fn entries(p: &Params) -> Vec<Entry> {
-    Family::ALL
-        .iter()
-        .flat_map(|family| family.categories().iter().copied())
-        .flat_map(|category| {
-            let (list, _) = blocks::models(p, category.kinds()[0]);
-            list.into_iter()
-                .enumerate()
-                .map(move |(index, choice)| Entry {
-                    category,
+    let mut out = Vec::new();
+    for family in Family::BROWSE {
+        if matches!(
+            family,
+            Family::Clean | Family::Crunch | Family::HighGain | Family::Amp
+        ) {
+            let (list, _) = blocks::models(p, StageKind::Amp);
+            for (index, choice) in list.into_iter().enumerate() {
+                if amp_browse(choice.wire_id, choice.value) != family {
+                    continue;
+                }
+                out.push(Entry {
+                    category: Category::Amp,
                     index,
                     label: choice.label,
-                })
-        })
-        .collect()
+                    browse: family,
+                });
+            }
+        } else {
+            for category in family.categories() {
+                let (list, _) = blocks::models(p, category.kinds()[0]);
+                for (index, choice) in list.into_iter().enumerate() {
+                    out.push(Entry {
+                        category: *category,
+                        index,
+                        label: choice.label,
+                        browse: family,
+                    });
+                }
+            }
+        }
+    }
+    out
 }
 
 // ── Chain helpers ──────────────────────────────────────────────────────────
@@ -887,7 +989,7 @@ fn footswitch_slots(ui: &RodUi, p: &Params) -> [Option<usize>; 4] {
     out
 }
 
-fn note_name(hz: f32) -> Option<(&'static str, f32)> {
+pub(crate) fn note_name(hz: f32) -> Option<(&'static str, f32)> {
     const NAMES: [&str; 12] = [
         "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
     ];
@@ -1004,7 +1106,10 @@ fn block_knob(
         .label(0.08, PALE)
         .label_below();
     let id = spec.id;
-    let element = knob(
+    let spec_min = spec.min;
+    let spec_max = spec.max;
+    let spec_label = spec.label;
+    let element = knob_typed(
         cx,
         format!("rodhareist-knob-{id}"),
         dial,
@@ -1015,6 +1120,9 @@ fn block_knob(
         true,
         s,
         move |this: &mut RodhareistEditorWindow, v, cx| this.set_wire_value(id, v, cx),
+        move |this, window, cx| {
+            this.begin_knob_entry(id, spec_label, spec_min, spec_max, window, cx)
+        },
     );
     if spec.inactive {
         div().opacity(0.4).child(element).into_any_element()
@@ -1107,7 +1215,8 @@ fn header(w: &RodhareistEditorWindow, p: &Params, cx: &mut Cx, s: f32) -> AnyEle
                 .font_weight(FontWeight::SEMIBOLD),
         )
         .child(div().flex_1())
-        .child(numbers(tempo, 12.0, SOFT, s).mr(px(10.0 * s)))
+        .child(key_control(p, cx, s))
+        .child(numbers(tempo, 12.0, SOFT, s).mr(px(8.0 * s)))
         .child(tuner)
         .into_any_element()
 }
@@ -1182,7 +1291,7 @@ fn level_knob(
         .absolute()
         .left(px((mid - WIDTH / 2.0) * s))
         .top(px(236.0 * s))
-        .child(knob(
+        .child(knob_typed(
             cx,
             format!("rodhareist-level-{id}"),
             dial,
@@ -1193,6 +1302,9 @@ fn level_knob(
             true,
             s,
             move |this: &mut RodhareistEditorWindow, v, cx| this.set_wire_value(id, v, cx),
+            move |this, window, cx| {
+                this.begin_knob_entry(id, label, spec.min, spec.max, window, cx)
+            },
         ))
         .into_any_element()
 }
@@ -1240,7 +1352,7 @@ fn chain_block(
             "EMPTY",
             color_a(0, 0.0),
             PLUS_ICON,
-            "Add block",
+            "Open Explore",
             true,
         ),
     };
@@ -1306,7 +1418,12 @@ fn chain_block(
                 .text_size(type_px(11.5 * type_k, s))
                 .line_height(px(13.2 * type_k * s))
                 .font_weight(FontWeight::SEMIBOLD)
-                .child(if names { name } else { "" }),
+                .child(match entry {
+                    Some(kind) if !blocks::is_on(p, kind) => "Bypassed",
+                    Some(_) if names => name,
+                    None => "Open Explore",
+                    Some(_) => "",
+                }),
         );
     if dashed {
         block = block.border_dashed();
@@ -1338,7 +1455,10 @@ fn chain_block(
                     if wet { " \u{00B7} wet path" } else { "" }
                 )
             }
-            None => format!("Slot {} \u{00B7} empty", slot + 1),
+            None => format!(
+                "Slot {} \u{00B7} empty \u{00B7} open Explore or Pedalboard for this slot",
+                slot + 1
+            ),
         }))
         .on_click({
             let entity = cx.entity().clone();
@@ -1395,15 +1515,7 @@ fn caption_line(p: &Params, focus: ChainFocus) -> String {
             };
             let row = p.stage_row[kind as usize] as usize;
             let lane = lane_controls(p, row);
-            let row_note = if lane.wet {
-                format!(" \u{00B7} lane {} wet path", row + 1)
-            } else if row == 0 && p.line2_mode == Line2Mode::Dry {
-                " \u{00B7} lane 1 dry".to_string()
-            } else if row == 0 {
-                String::new()
-            } else {
-                format!(" \u{00B7} lane {} {}", row + 1, lane.short)
-            };
+            let row_note = format!(" \u{00B7} {}", lane.detail);
             format!(
                 "Slot {} \u{00B7} {} \u{00B7} {}{}{}{}",
                 slot + 1,
@@ -1418,7 +1530,10 @@ fn caption_line(p: &Params, focus: ChainFocus) -> String {
                 }
             )
         }
-        ChainFocus::Empty(_) => format!("Slot {} \u{00B7} empty", slot + 1),
+        ChainFocus::Empty(_) => format!(
+            "Slot {} \u{00B7} empty \u{00B7} open Explore or Pedalboard for this slot",
+            slot + 1
+        ),
     }
 }
 
@@ -1447,11 +1562,11 @@ fn lane_controls(p: &Params, row: usize) -> LaneControls {
     if row == 0 {
         let wet = p.line2_mode == Line2Mode::WetDryWet;
         let (short, detail) = match p.line2_mode {
-            Line2Mode::Wet => ("wet", format!("Lane {number} · full chain")),
-            Line2Mode::Dry => ("dry", format!("Lane {number} · dry, before time effects")),
+            Line2Mode::Wet => ("main", format!("Lane {number} · main path")),
+            Line2Mode::Dry => ("dry", format!("Lane {number} · dry before time effects")),
             Line2Mode::WetDryWet => (
                 "wet path",
-                format!("Lane {number} · blocks here are the wet path"),
+                format!("Lane {number} · this lane is the wet path"),
             ),
         };
         LaneControls {
@@ -1460,9 +1575,9 @@ fn lane_controls(p: &Params, row: usize) -> LaneControls {
             short,
             detail,
             choices: vec![
-                ("Wet", p.line2_mode == Line2Mode::Wet, 0.0),
+                ("Main", p.line2_mode == Line2Mode::Wet, 0.0),
                 ("Dry", p.line2_mode == Line2Mode::Dry, 1.0),
-                ("W/D/W", wet, 2.0),
+                ("Wet path", wet, 2.0),
             ],
             mode_id: "line2_mode",
             send_id: "line2_mix",
@@ -1475,11 +1590,14 @@ fn lane_controls(p: &Params, row: usize) -> LaneControls {
         let wet = current == RowSend::WetDryWet;
         let (short, detail) = match current {
             RowSend::Off => ("off", format!("Lane {number} · off")),
-            RowSend::Serial => ("serial", format!("Lane {number} · replaces the chain")),
-            RowSend::Parallel => ("parallel", format!("Lane {number} · adds this lane")),
+            RowSend::Serial => (
+                "replaces",
+                format!("Lane {number} · this lane replaces the chain"),
+            ),
+            RowSend::Parallel => ("added", format!("Lane {number} · this lane is added")),
             RowSend::WetDryWet => (
                 "wet path",
-                format!("Lane {number} · blocks here are the wet path"),
+                format!("Lane {number} · this lane is the wet path"),
             ),
         };
         LaneControls {
@@ -1489,9 +1607,9 @@ fn lane_controls(p: &Params, row: usize) -> LaneControls {
             detail,
             choices: vec![
                 ("Off", current == RowSend::Off, 0.0),
-                ("Serial", current == RowSend::Serial, 1.0),
-                ("Parallel", current == RowSend::Parallel, 2.0),
-                ("W/D/W", wet, 3.0),
+                ("Replaces", current == RowSend::Serial, 1.0),
+                ("Added", current == RowSend::Parallel, 2.0),
+                ("Wet path", wet, 3.0),
             ],
             mode_id: ["row_send_1", "row_send_2", "row_send_3"][row - 1],
             send_id: ["row_level_1", "row_level_2", "row_level_3"][row - 1],
@@ -1539,9 +1657,10 @@ fn lane_send(p: &Params, row: usize, lane_h: f32, cx: &mut Cx, s: f32) -> AnyEle
                 act(cx, move |this, cx| this.set_wire_value(mode_id, value, cx)),
             )
         }));
+    let amount = if row == 0 { "Blend" } else { "Level" };
     let dial = Dial::new(
         send_id,
-        "Send",
+        amount,
         0.0,
         100.0,
         info.send_default,
@@ -1549,7 +1668,7 @@ fn lane_send(p: &Params, row: usize, lane_h: f32, cx: &mut Cx, s: f32) -> AnyEle
     );
     let look = KnobLook::small(20.0);
     let cell = KnobCell::new(44.0, 9.0, 10.0).gap(0.0).label(0.06, SOFT);
-    let send = knob(
+    let send = knob_typed(
         cx,
         format!("rodhareist-lane-send-{row}"),
         dial,
@@ -1560,6 +1679,7 @@ fn lane_send(p: &Params, row: usize, lane_h: f32, cx: &mut Cx, s: f32) -> AnyEle
         info.send_live,
         s,
         move |this: &mut RodhareistEditorWindow, v, cx| this.set_wire_value(send_id, v, cx),
+        move |this, window, cx| this.begin_knob_entry(send_id, amount, 0.0, 100.0, window, cx),
     );
     div()
         .id(("rodhareist-lane", row))
@@ -1574,7 +1694,7 @@ fn lane_send(p: &Params, row: usize, lane_h: f32, cx: &mut Cx, s: f32) -> AnyEle
         .gap(px(1.0 * s))
         .overflow_hidden()
         .tooltip(fb_tooltip(format!(
-            "{}. Drag Send to set the amount. Double-click resets it.",
+            "{}. Drag {amount} to set the amount. Double-click types it. Alt-click resets it.",
             info.detail
         )))
         .child(pills)
@@ -1618,7 +1738,7 @@ fn opening_lane(row: usize, lane_h: f32, s: f32) -> AnyElement {
             s,
         ))
         .child(words("Drop a block here", 12.0, WHITE, s))
-        .child(words("It runs in parallel with lane 1", 11.0, SOFT, s))
+        .child(words("This lane is added", 11.0, SOFT, s))
         .into_any_element()
 }
 
@@ -1655,11 +1775,78 @@ fn drop_cell(
     cell.on_drop(drop_chain(cx, slot, row)).into_any_element()
 }
 
+fn key_control(p: &Params, cx: &mut Cx, s: f32) -> AnyElement {
+    let semi = p.transpose_semi;
+    let cents = p.transpose_cents;
+    let step = |id: &'static str, value: f32, delta: f32, min: f32, max: f32, cx: &mut Cx| {
+        let next = (value + delta).clamp(min, max);
+        act(cx, move |this, cx| this.set_wire_value(id, next, cx))
+    };
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(4.0 * s))
+        .ml(px(12.0 * s))
+        .child(words("Key", 12.0, SOFT, s))
+        .child(key_step(
+            "rodhareist-key-down",
+            "\u{2212}",
+            s,
+            step("transpose_semi", semi, -1.0, -12.0, 12.0, cx),
+        ))
+        .child(numbers(format!("{semi:+.0}"), 13.0, WHITE, s).w(px(28.0 * s)))
+        .child(key_step(
+            "rodhareist-key-up",
+            "+",
+            s,
+            step("transpose_semi", semi, 1.0, -12.0, 12.0, cx),
+        ))
+        .child(words("fine", 11.0, FAINT, s))
+        .child(key_step(
+            "rodhareist-cents-down",
+            "\u{2212}",
+            s,
+            step("transpose_cents", cents, -1.0, -100.0, 100.0, cx),
+        ))
+        .child(numbers(format!("{cents:+.0}"), 12.0, PALE, s).w(px(32.0 * s)))
+        .child(key_step(
+            "rodhareist-cents-up",
+            "+",
+            s,
+            step("transpose_cents", cents, 1.0, -100.0, 100.0, cx),
+        ))
+        .into_any_element()
+}
+
+fn key_step(
+    id: &'static str,
+    label: &'static str,
+    s: f32,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(18.0 * s))
+        .rounded(px(2.0 * s))
+        .bg(color(0x262626))
+        .text_size(type_px(12.0, s))
+        .text_color(color(WHITE))
+        .cursor(gpui::CursorStyle::PointingHand)
+        .child(label)
+        .on_click(on_click)
+        .into_any_element()
+}
+
 fn display(
     w: &RodhareistEditorWindow,
     p: &Params,
     focus: ChainFocus,
     frame: &ChainFrame,
+    entry: Option<AnyElement>,
     cx: &mut Cx,
     s: f32,
 ) -> AnyElement {
@@ -1770,6 +1957,13 @@ fn display(
         .border(px(1.0))
         .border_color(color(plate::WELL_EDGE))
         .child(header(w, p, cx, s))
+        .children(entry.map(|field| {
+            div()
+                .absolute()
+                .left(px(108.0 * s))
+                .top(px(42.0 * s))
+                .child(field)
+        }))
         .children(meters(w, s))
         .child(input)
         .child(output)
@@ -1782,7 +1976,28 @@ fn display(
                 .left(px(CHAIN_LEFT * s))
                 .top(px(CAPTION_TOP * s))
                 .w(px(BLOCK_RUN * s))
-                .child(words(caption_line(p, focus), 13.0, WHITE, s)),
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0 * s))
+                .child(words(caption_line(p, focus), 13.0, WHITE, s))
+                .children((!w.ui.show_names).then(|| {
+                    div()
+                        .id("rodhareist-show-names")
+                        .px(px(6.0 * s))
+                        .py(px(2.0 * s))
+                        .rounded(px(2.0 * s))
+                        .border(px(1.0))
+                        .border_color(color(0x484848))
+                        .text_size(type_px(11.0, s))
+                        .text_color(color(WHITE))
+                        .cursor(gpui::CursorStyle::PointingHand)
+                        .child("Show names")
+                        .on_click(act(cx, |this, cx| {
+                            this.ui.show_names = true;
+                            cx.notify();
+                        }))
+                })),
         )
         .into_any_element()
 }
@@ -1898,6 +2113,72 @@ fn ir_unconfirmed_note(w: &RodhareistEditorWindow) -> Option<String> {
     }
     w.ir_project_name()
         .map(|name| format!("{name} is named, not loaded"))
+}
+
+fn load_status(w: &RodhareistEditorWindow, p: &Params, s: f32) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(2.0 * s))
+        .child(words(ir_status_line(w, p), 12.0, PALE, s))
+        .child(words(nam_status_line(w, p), 12.0, PALE, s))
+        .into_any_element()
+}
+
+fn ir_status_line(w: &RodhareistEditorWindow, p: &Params) -> String {
+    let unused = if !p
+        .stage_order
+        .iter()
+        .flatten()
+        .any(|kind| *kind == StageKind::Cab)
+    {
+        Some("unused: the cabinet is not on the path")
+    } else if !p.cab_on {
+        Some("unused: the cabinet is bypassed")
+    } else if p.cab_model != CabModel::Ir {
+        Some("unused: the cabinet is not an impulse response")
+    } else {
+        None
+    };
+    let file = if let Some((name, _)) = w.ir_loaded_info() {
+        format!("IR loaded: {name}")
+    } else if let Some(name) = w.ir_project_name() {
+        format!("{name} is named, not loaded")
+    } else {
+        "IR: no file loaded".to_string()
+    };
+    match unused {
+        Some(why) => format!("IR {why}. {file}"),
+        None => file,
+    }
+}
+
+fn nam_status_line(w: &RodhareistEditorWindow, p: &Params) -> String {
+    let unused = if !p
+        .stage_order
+        .iter()
+        .flatten()
+        .any(|kind| *kind == StageKind::Amp)
+    {
+        Some("unused: the amp is not on the path")
+    } else if !p.amp_on {
+        Some("unused: the amp is bypassed")
+    } else if p.tone_engine != ToneEngineKind::NamCapture {
+        Some("unused: the amp is not a capture")
+    } else {
+        None
+    };
+    let file = if let Some(name) = w.nam_loaded_info() {
+        format!("NAM loaded: {name}")
+    } else if let Some(name) = w.nam_project_name() {
+        format!("{name} is named, not loaded")
+    } else {
+        "NAM: no capture loaded".to_string()
+    };
+    match unused {
+        Some(why) => format!("NAM {why}. {file}"),
+        None => file,
+    }
 }
 
 fn ir_block(w: &RodhareistEditorWindow, p: &Params, cx: &mut Cx, s: f32) -> AnyElement {
@@ -2034,6 +2315,7 @@ fn home(
         .p(px(12.0 * s))
         .gap(px(6.0 * s))
         .child(heading("Presets", s))
+        .child(load_status(w, p, s))
         .child(preset_tabs(tab, presets.len(), user_count, cx, s));
     list = match tab {
         PresetTab::Factory => list.child(
@@ -2141,7 +2423,7 @@ fn home(
     let footswitches: Vec<AnyElement> = footswitch_slots(&w.ui, p)
         .into_iter()
         .enumerate()
-        .map(|(i, slot)| footswitch(p, i, slot, cx, s))
+        .map(|(i, slot)| footswitch(w, p, i, slot, cx, s))
         .collect();
 
     let top = div()
@@ -2188,7 +2470,14 @@ fn home(
     vec![list.into_any_element(), performance.into_any_element()]
 }
 
-fn footswitch(p: &Params, i: usize, slot: Option<usize>, cx: &mut Cx, s: f32) -> AnyElement {
+fn footswitch(
+    w: &RodhareistEditorWindow,
+    p: &Params,
+    i: usize,
+    slot: Option<usize>,
+    cx: &mut Cx,
+    s: f32,
+) -> AnyElement {
     let kind = slot.and_then(|slot| p.stage_order.get(slot).copied().flatten());
     let on = kind.is_some_and(|kind| blocks::is_on(p, kind));
     let family = kind.map(|kind| Family::of(Category::of(kind)));
@@ -2199,10 +2488,14 @@ fn footswitch(p: &Params, i: usize, slot: Option<usize>, cx: &mut Cx, s: f32) ->
     let name = kind.map_or("Empty", |kind| {
         blocks::model_name(p, kind).unwrap_or("No amp")
     });
+    let pinned = w.ui.footswitches[i].is_some();
+    let session = if pinned { " \u{00B7} this session" } else { "" };
     let sub = match (slot, family) {
-        (Some(slot), Some(family)) => format!("SLOT {} \u{00B7} {}", slot + 1, family.tag()),
-        (Some(slot), None) => format!("SLOT {}", slot + 1),
-        (None, _) => "UNASSIGNED".to_string(),
+        (Some(slot), Some(family)) => {
+            format!("SLOT {} \u{00B7} {}{session}", slot + 1, family.tag())
+        }
+        (Some(slot), None) => format!("SLOT {slot}{session}", slot = slot + 1),
+        (None, _) => "Assign in Settings".to_string(),
     };
     let mut button = div()
         .id(("rodhareist-fs", i))
@@ -2377,7 +2670,7 @@ fn tempo_box(p: &Params, cx: &mut Cx, s: f32) -> AnyElement {
             div()
                 .flex()
                 .flex_col()
-                .child(caption("Tempo", 10.5, 0.1, SOFT, s))
+                .child(caption("Delay A", 10.5, 0.1, SOFT, s))
                 .child(numbers(format!("{}", bpm.round()), 28.0, WHITE, s)),
         )
         .child(
@@ -2429,7 +2722,7 @@ fn line2_box(p: &Params, cx: &mut Cx, s: f32) -> AnyElement {
                     }))
                     .into_any_element()
             }));
-    let dial = Dial::new("line2_mix", "SEND", 0.0, 100.0, 70.0, DialUnit::Percent);
+    let dial = Dial::new("line2_mix", "BLEND", 0.0, 100.0, 70.0, DialUnit::Percent);
     let look =
         KnobLook::small(40.0).styled(4.0, 14.0, plate::FACE, plate::FACE_EDGE, 1.5, 5.0, 2.2);
     let cell = KnobCell::new(64.0, 10.0, 11.0).gap(1.0).label(0.08, SOFT);
@@ -2463,7 +2756,7 @@ fn line2_box(p: &Params, cx: &mut Cx, s: f32) -> AnyElement {
                 )
                 .child(buttons),
         )
-        .child(knob(
+        .child(knob_typed(
             cx,
             "rodhareist-line2-mix",
             dial,
@@ -2474,6 +2767,7 @@ fn line2_box(p: &Params, cx: &mut Cx, s: f32) -> AnyElement {
             info.send_live,
             s,
             |this: &mut RodhareistEditorWindow, v, cx| this.set_wire_value("line2_mix", v, cx),
+            |this, window, cx| this.begin_knob_entry("line2_mix", "BLEND", 0.0, 100.0, window, cx),
         ))
         .into_any_element()
 }
@@ -2493,7 +2787,7 @@ fn master_box(p: &Params, cx: &mut Cx, s: f32) -> AnyElement {
         .items_center()
         .justify_center()
         .p(px(6.0 * s))
-        .child(knob(
+        .child(knob_typed(
             cx,
             "rodhareist-master",
             dial,
@@ -2504,6 +2798,9 @@ fn master_box(p: &Params, cx: &mut Cx, s: f32) -> AnyElement {
             true,
             s,
             |this: &mut RodhareistEditorWindow, v, cx| this.set_wire_value("output_trim", v, cx),
+            |this, window, cx| {
+                this.begin_knob_entry("output_trim", "MASTER", -24.0, 24.0, window, cx)
+            },
         ))
         .into_any_element()
 }
@@ -2522,11 +2819,8 @@ fn explore(
     let current = w.ui.family;
     let mut rows: Vec<(Option<Family>, &'static str, u32, usize)> =
         vec![(None, "All blocks", INK, all.len())];
-    rows.extend(Family::ALL.iter().map(|&family| {
-        let count = all
-            .iter()
-            .filter(|e| Family::of(e.category) == family)
-            .count();
+    rows.extend(Family::BROWSE.iter().map(|&family| {
+        let count = all.iter().filter(|e| e.browse == family).count();
         (Some(family), family.label(), family.color(), count)
     }));
     let families = section(s, 6.0, 262.0)
@@ -2567,7 +2861,7 @@ fn explore(
     let query = w.search.value.trim().to_lowercase();
     let matches: Vec<Entry> = all
         .into_iter()
-        .filter(|e| current.is_none_or(|family| Family::of(e.category) == family))
+        .filter(|e| current.is_none_or(|family| e.browse == family))
         .filter(|e| {
             query.is_empty()
                 || e.label.to_lowercase().contains(&query)
@@ -2627,7 +2921,7 @@ fn explore(
 }
 
 fn library_card(p: &Params, entry: Entry, target: usize, cx: &mut Cx, s: f32) -> AnyElement {
-    let family = Family::of(entry.category);
+    let family = entry.browse;
     let here = p.stage_order[target].filter(|kind| Category::of(*kind) == entry.category);
     let placed = here.is_some_and(|kind| blocks::models(p, kind).1 == Some(entry.index));
     let label = if placed {
@@ -2779,44 +3073,22 @@ fn pedalboard(
             );
         return vec![
             left.into_any_element(),
-            section(s, 274.0, 743.0).p(px(18.0 * s)).into_any_element(),
+            section(s, 274.0, 743.0)
+                .p(px(18.0 * s))
+                .gap(px(8.0 * s))
+                .child(heading("This slot", s))
+                .child(words(
+                    "This slot is empty. Open Explore, or pick a block here, for this slot.",
+                    13.0,
+                    PALE,
+                    s,
+                ))
+                .into_any_element(),
         ];
     };
 
     let (list, selected) = blocks::models(p, kind);
-    let models = div()
-        .id("rodhareist-models")
-        .flex_1()
-        .min_h(px(0.0))
-        .overflow_y_scroll()
-        .flex()
-        .flex_col()
-        .gap(px(4.0 * s))
-        .children(list.into_iter().enumerate().map(|(index, choice)| {
-            let on = selected == Some(index);
-            let (bg, border, fg) = choice_colors(on, false);
-            let mut row = div()
-                .id(("rodhareist-model", index))
-                .flex()
-                .items_center()
-                .flex_shrink_0()
-                .h(px(32.0 * s))
-                .px(px(10.0 * s))
-                .rounded(px(3.0 * s))
-                .border(px(1.0))
-                .border_color(border)
-                .bg(bg)
-                .text_color(fg)
-                .text_size(type_px(13.0, s))
-                .child(choice.label);
-            if !on && !choice.wire_id.is_empty() {
-                row = row
-                    .cursor(gpui::CursorStyle::PointingHand)
-                    .hover(|style| style.bg(color(0x303030)))
-                    .on_click(w.set_cb(cx, choice.wire_id, choice.value));
-            }
-            row
-        }));
+    let models = model_column(w, kind, &list, selected, cx, s);
     let last = rodharerist::PATH_SLOTS - 1;
     let action = |id: &'static str,
                   label: &'static str,
@@ -2895,6 +3167,195 @@ fn pedalboard(
     vec![left.into_any_element(), right.into_any_element()]
 }
 
+fn model_row(
+    w: &RodhareistEditorWindow,
+    index: usize,
+    choice: &blocks::ModelChoice,
+    on: bool,
+    cx: &mut Cx,
+    s: f32,
+) -> AnyElement {
+    let (bg, border, fg) = choice_colors(on, false);
+    let mut row = div()
+        .id(("rodhareist-model", index))
+        .flex()
+        .items_center()
+        .flex_shrink_0()
+        .h(px(32.0 * s))
+        .px(px(10.0 * s))
+        .rounded(px(3.0 * s))
+        .border(px(1.0))
+        .border_color(border)
+        .bg(bg)
+        .text_color(fg)
+        .text_size(type_px(13.0, s))
+        .child(choice.label);
+    if !on && !choice.wire_id.is_empty() {
+        let wire = choice.wire_id;
+        let value = choice.value;
+        row = row
+            .cursor(gpui::CursorStyle::PointingHand)
+            .hover(|style| style.bg(color(0x303030)))
+            .on_click(w.set_cb(cx, wire, value));
+    }
+    row.into_any_element()
+}
+
+fn model_column(
+    w: &RodhareistEditorWindow,
+    kind: StageKind,
+    list: &[blocks::ModelChoice],
+    selected: Option<usize>,
+    cx: &mut Cx,
+    s: f32,
+) -> AnyElement {
+    let mut rows: Vec<AnyElement> = Vec::new();
+    if kind == StageKind::Amp {
+        let group_of = |choice: &blocks::ModelChoice| {
+            if choice.wire_id == "tone_engine" {
+                "NAM"
+            } else {
+                match AmpModel::from_index(choice.value.round().max(0.0) as u32).class() {
+                    AmpClass::Clean => "Clean",
+                    AmpClass::Crunch => "Crunch",
+                    AmpClass::HighGain => "High Gain",
+                }
+            }
+        };
+        for group in ["Clean", "Crunch", "High Gain", "NAM"] {
+            let members: Vec<_> = list
+                .iter()
+                .enumerate()
+                .filter(|(_, choice)| group_of(choice) == group)
+                .collect();
+            if members.is_empty() {
+                continue;
+            }
+            rows.push(
+                words(group, 11.0, SOFT, s)
+                    .mt(px(if rows.is_empty() { 0.0 } else { 6.0 } * s))
+                    .into_any_element(),
+            );
+            for (index, choice) in members {
+                rows.push(model_row(w, index, choice, selected == Some(index), cx, s));
+            }
+        }
+    } else {
+        for (index, choice) in list.iter().enumerate() {
+            rows.push(model_row(w, index, choice, selected == Some(index), cx, s));
+        }
+    }
+    div()
+        .id("rodhareist-models")
+        .flex_1()
+        .min_h(px(0.0))
+        .overflow_y_scroll()
+        .flex()
+        .flex_col()
+        .gap(px(4.0 * s))
+        .children(rows)
+        .into_any_element()
+}
+
+fn sync_label(sync: DelaySync) -> &'static str {
+    match sync {
+        DelaySync::Free => "Free",
+        DelaySync::Quarter => "1/4",
+        DelaySync::DottedEighth => "1/8.",
+        DelaySync::Eighth => "1/8",
+        DelaySync::Half => "1/2",
+        DelaySync::DottedQuarter => "1/4.",
+        DelaySync::QuarterTriplet => "1/4t",
+        DelaySync::EighthTriplet => "1/8t",
+        DelaySync::Sixteenth => "1/16",
+        DelaySync::DottedSixteenth => "1/16.",
+    }
+}
+
+fn delay_sync_row(
+    w: &RodhareistEditorWindow,
+    p: &Params,
+    kind: StageKind,
+    cx: &mut Cx,
+    s: f32,
+) -> AnyElement {
+    let second = kind == StageKind::Delay2;
+    let (sync_id, sync, free_ms) = if second {
+        ("delay2_sync", p.stage_b.delay_sync, p.stage_b.delay_time_ms)
+    } else {
+        ("delay_sync", p.delay_sync, p.delay_time_ms)
+    };
+    let tempo = w.host_tempo().map(|bpm| bpm as f32).unwrap_or(120.0);
+    let sounding = rodharerist::effective_delay_ms(sync, free_ms, tempo);
+    let stereo = if second {
+        p.stage_b.delay_model == rodharerist::DelayModel::Stereo
+    } else {
+        p.delay_model == rodharerist::DelayModel::Stereo
+    };
+    let pills = |id: &'static str, current: DelaySync, tag: u8| {
+        div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .gap(px(3.0 * s))
+            .children(DelaySync::ALL.iter().copied().map(|sync| {
+                plate::pill(
+                    ("rodhareist-sync", tag as usize * 16 + sync as usize),
+                    sync_label(sync),
+                    current == sync,
+                    accent(),
+                    plate::PillLook::words(18.0, 4.0, 11.0),
+                    true,
+                    s,
+                    w.set_cb(cx, id, sync as u8 as f32),
+                )
+            }))
+    };
+    let mut row = div()
+        .flex()
+        .flex_col()
+        .gap(px(4.0 * s))
+        .child(caption("Time", 10.5, 0.1, SOFT, s))
+        .child(pills(sync_id, sync, 0))
+        .child(words(
+            if sync == DelaySync::Free {
+                format!("Free time {free_ms:.0} ms")
+            } else {
+                format!("Sounding {sounding:.0} ms")
+            },
+            12.0,
+            PALE,
+            s,
+        ));
+    if stereo {
+        let (id, current, free_r) = if second {
+            (
+                "delay2_sync_r",
+                p.stage_b.delay_sync_r,
+                p.stage_b.delay_time_r_ms,
+            )
+        } else {
+            ("delay_sync_r", p.delay_sync_r, p.delay_time_r_ms)
+        };
+        let sounding_r = rodharerist::effective_delay_ms(current, free_r, tempo);
+        row = row
+            .child(caption("Time R", 10.5, 0.1, SOFT, s))
+            .child(pills(id, current, 1))
+            .child(words(
+                if current == DelaySync::Free {
+                    format!("Free time {free_r:.0} ms")
+                } else {
+                    format!("Sounding {sounding_r:.0} ms")
+                },
+                12.0,
+                PALE,
+                s,
+            ));
+    }
+    row.into_any_element()
+}
+
 fn block_card(
     w: &RodhareistEditorWindow,
     p: &Params,
@@ -2931,6 +3392,9 @@ fn block_card(
     // Which send row the block sits on, the side of the path it runs on,
     // and the cabinet's microphone and IR.
     let mut extras: Vec<AnyElement> = Vec::new();
+    if matches!(kind, StageKind::Delay | StageKind::Delay2) {
+        extras.push(delay_sync_row(w, p, kind, cx, s));
+    }
     extras.push(lane_pills(w, p, kind, cx, s));
     if let (Some(current), Some(id)) = (blocks::channel(p, kind), kind.channel_id()) {
         extras.push(
@@ -3509,7 +3973,7 @@ fn settings_rows(w: &RodhareistEditorWindow, p: &Params) -> Vec<Row> {
                     let slot = current[i];
                     let help = match slot {
                         Some(slot) => format!(
-                            "Toggles slot {}{}",
+                            "Toggles slot {}{}. A pin lasts for this editor session.",
                             slot + 1,
                             p.stage_order[slot].map_or(" \u{00B7} empty".to_string(), |kind| {
                                 format!(
@@ -3518,7 +3982,7 @@ fn settings_rows(w: &RodhareistEditorWindow, p: &Params) -> Vec<Row> {
                                 )
                             })
                         ),
-                        None => "Not assigned".into(),
+                        None => "Assign a slot. A pin lasts for this editor session.".into(),
                     };
                     Row {
                         label: format!("Footswitch {}", i + 1),
@@ -3791,7 +4255,7 @@ pub(crate) fn rodhareist_panel(
     let s = plate_scale((f32::from(viewport.width), f32::from(viewport.height)));
     let p = w.params_snapshot();
     let focus = resolve_focus(&p.stage_order, w.chain_focus);
-    let mut children = vec![display(w, &p, focus, frame, cx, s)];
+    let mut children = vec![display(w, &p, focus, frame, fields.knob_value, cx, s)];
     children.extend(match w.ui.page {
         Page::Home => home(w, &p, fields.preset_name, cx, s),
         Page::Explore => explore(w, &p, focus, fields.search, cx, s),
@@ -3968,7 +4432,7 @@ mod tests {
         assert_eq!(main.number, 1);
         assert!(!main.wet);
         assert!(!main.send_live);
-        assert_eq!(main.detail, "Lane 1 · full chain");
+        assert_eq!(main.detail, "Lane 1 · main path");
         assert_eq!(p.line2_mode, Line2Mode::Wet);
         assert_eq!(p.line2_mix, 70.0);
         for row in 1..4 {
@@ -3988,7 +4452,7 @@ mod tests {
         assert!(main.send_live);
         assert_eq!(main.mode_id, "line2_mode");
         assert_eq!(main.send_id, "line2_mix");
-        assert_eq!(main.detail, "Lane 1 · blocks here are the wet path");
+        assert_eq!(main.detail, "Lane 1 · this lane is the wet path");
 
         p.row_send[2] = RowSend::WetDryWet;
         let lane = lane_controls(&p, 3);
@@ -3997,7 +4461,7 @@ mod tests {
         assert!(lane.send_live);
         assert_eq!(lane.mode_id, "row_send_3");
         assert_eq!(lane.send_id, "row_level_3");
-        assert_eq!(lane.detail, "Lane 4 · blocks here are the wet path");
+        assert_eq!(lane.detail, "Lane 4 · this lane is the wet path");
     }
 
     #[test]
@@ -4011,5 +4475,22 @@ mod tests {
         assert_eq!(ir_path_line(&ir), "Cabinet is bypassed");
         ir.stage_order = [None; rodharerist::PATH_SLOTS];
         assert_eq!(ir_path_line(&ir), "Cabinet is not on the path");
+    }
+
+    #[test]
+    fn gain_groups_keep_a_clean_amp_out_of_high_gain() {
+        let all = entries(&rodharerist::default_params());
+        let grouped = |family: Family, label: &str| {
+            all.iter()
+                .any(|entry| entry.browse == family && entry.label == label)
+        };
+        assert!(grouped(Family::Clean, "Twin Clean"));
+        assert!(!grouped(Family::HighGain, "Twin Clean"));
+        assert!(grouped(Family::HighGain, "Herbert Lead"));
+        assert!(grouped(Family::HighGain, "Recto Modern"));
+        assert!(grouped(Family::Crunch, "Mandarin 80"));
+        assert!(grouped(Family::Drive, "Green Screamer"));
+        assert!(grouped(Family::Amp, "NAM Capture"));
+        assert!(!grouped(Family::Clean, "NAM Capture"));
     }
 }

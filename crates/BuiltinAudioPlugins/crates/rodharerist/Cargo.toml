@@ -15,6 +15,9 @@ crate-type = ["rlib", "cdylib"]
 [dependencies]
 biquad.workspace = true
 builtin-dsp-core.workspace = true
+# Tempo fallback (`DEFAULT_TEMPO_BPM`, min, max). The same constants
+# EchoSpace and WrapSynth already use; not a second set of numbers.
+echospace.workspace = true
 nam-rs.workspace = true
 # Partitioned FFT convolution for the cabinet IR engine (see src/dsp/ir.rs).
 # Already a workspace dependency (SphereAudioProcessor) — no new tree.

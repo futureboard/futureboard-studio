@@ -7362,6 +7362,7 @@ version = "2026.11.1-beta2.0.0"
 dependencies = [
  "biquad",
  "builtin_dsp_core",
+ "echospace",
  "nam-rs",
  "rustfft",
  "serde",

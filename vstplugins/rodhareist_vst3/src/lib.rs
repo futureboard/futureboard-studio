@@ -408,6 +408,9 @@ impl Plugin for Rodhareist {
         // callback's length. A fixed 32-sample host therefore infers inside
         // 32 samples, and a host that varies the callback keeps one latency.
         dsp.begin_block_with_frames(self.nam_block);
+        if let Some(tempo) = context.transport().tempo {
+            dsp.set_tempo_bpm(tempo as f32);
+        }
         match buffer.as_slice() {
             [left, right, ..] => {
                 if mono_input {

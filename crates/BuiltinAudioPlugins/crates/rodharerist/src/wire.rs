@@ -177,6 +177,22 @@ pub const UI_PARAM_IDS: &[&str] = &[
     // Compressor voices. Appended: an index in this table is an ABI.
     "comp_model",  // 151
     "comp2_model", // 152
+    // Delay note-sync, the pitch block, and the whole-rig transpose.
+    // Appended: an index in this table is an ABI.
+    "delay_sync",      // 153
+    "delay_sync_r",    // 154
+    "delay2_sync",     // 155
+    "delay2_sync_r",   // 156
+    "path_slot_15",    // 157
+    "pitch_on",        // 158
+    "pitch_model",     // 159
+    "pitch_semi",      // 160
+    "pitch_cents",     // 161
+    "pitch_mix",       // 162
+    "pitch_channel",   // 163
+    "pitch_row",       // 164
+    "transpose_semi",  // 165
+    "transpose_cents", // 166
 ];
 
 /// String id → wire index. Linear scan over a small table — control/UI
@@ -195,8 +211,8 @@ pub fn ui_param_id(index: u32) -> Option<&'static str> {
 mod tests {
     use super::*;
     use crate::dsp::{
-        AmpModel, CabModel, DelayModel, DriveModel, Dsp, EqModel, ModModel, ReverbModel, StageKind,
-        ToneEngineKind, WahModel, apply_to_params, default_params, ui_values,
+        apply_to_params, default_params, ui_values, AmpModel, CabModel, DelayModel, DriveModel,
+        Dsp, EqModel, ModModel, ReverbModel, StageKind, ToneEngineKind, WahModel,
     };
 
     #[test]
@@ -228,7 +244,7 @@ mod tests {
     /// accidental reorder/insert must fail here, loudly.
     #[test]
     fn wire_indices_are_pinned() {
-        assert_eq!(UI_PARAM_IDS.len(), 153);
+        assert_eq!(UI_PARAM_IDS.len(), 167);
         assert_eq!(ui_param_index("power"), Some(0));
         assert_eq!(ui_param_index("gate_on"), Some(3));
         assert_eq!(ui_param_index("drive_model"), Some(10));
@@ -290,6 +306,20 @@ mod tests {
         assert_eq!(ui_param_index("comp2_row"), Some(150));
         assert_eq!(ui_param_index("comp_model"), Some(151));
         assert_eq!(ui_param_index("comp2_model"), Some(152));
+        assert_eq!(ui_param_index("delay_sync"), Some(153));
+        assert_eq!(ui_param_index("delay_sync_r"), Some(154));
+        assert_eq!(ui_param_index("delay2_sync"), Some(155));
+        assert_eq!(ui_param_index("delay2_sync_r"), Some(156));
+        assert_eq!(ui_param_index("path_slot_15"), Some(157));
+        assert_eq!(ui_param_index("pitch_on"), Some(158));
+        assert_eq!(ui_param_index("pitch_model"), Some(159));
+        assert_eq!(ui_param_index("pitch_semi"), Some(160));
+        assert_eq!(ui_param_index("pitch_cents"), Some(161));
+        assert_eq!(ui_param_index("pitch_mix"), Some(162));
+        assert_eq!(ui_param_index("pitch_channel"), Some(163));
+        assert_eq!(ui_param_index("pitch_row"), Some(164));
+        assert_eq!(ui_param_index("transpose_semi"), Some(165));
+        assert_eq!(ui_param_index("transpose_cents"), Some(166));
     }
 
     /// Every block that can run on one side has its channel on the wire,

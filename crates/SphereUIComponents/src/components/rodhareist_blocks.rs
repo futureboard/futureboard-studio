@@ -10,8 +10,7 @@
 
 use rodharerist::{
     AmpModel, CabModel, CompModel, DelayModel, DriveModel, EqModel, MicModel, ModModel, Params,
-    ReverbModel,
-    StageChannel, StageKind, ToneEngineKind, WahModel,
+    PitchModel, ReverbModel, StageChannel, StageKind, ToneEngineKind, WahModel,
 };
 
 /// The block categories the editor lists, in signal-chain order.
@@ -20,6 +19,7 @@ pub(crate) enum Category {
     Gate,
     Comp,
     Wah,
+    Pitch,
     Drive,
     Amp,
     Cab,
@@ -39,10 +39,11 @@ pub(crate) enum Tint {
 }
 
 impl Category {
-    pub const ALL: [Category; 10] = [
+    pub const ALL: [Category; 11] = [
         Category::Gate,
         Category::Comp,
         Category::Wah,
+        Category::Pitch,
         Category::Drive,
         Category::Amp,
         Category::Cab,
@@ -57,6 +58,7 @@ impl Category {
             StageKind::Gate => Category::Gate,
             StageKind::Comp | StageKind::Comp2 => Category::Comp,
             StageKind::Wah => Category::Wah,
+            StageKind::Pitch => Category::Pitch,
             StageKind::Drive | StageKind::Drive2 => Category::Drive,
             StageKind::Amp => Category::Amp,
             StageKind::Cab => Category::Cab,
@@ -73,6 +75,7 @@ impl Category {
             Category::Gate => &[StageKind::Gate],
             Category::Comp => &[StageKind::Comp, StageKind::Comp2],
             Category::Wah => &[StageKind::Wah],
+            Category::Pitch => &[StageKind::Pitch],
             Category::Drive => &[StageKind::Drive, StageKind::Drive2],
             Category::Amp => &[StageKind::Amp],
             Category::Cab => &[StageKind::Cab],
@@ -88,6 +91,7 @@ impl Category {
             Category::Gate => "Gate",
             Category::Comp => "Compressor",
             Category::Wah => "Wah",
+            Category::Pitch => "Pitch",
             Category::Drive => "Drive",
             Category::Amp => "Amp",
             Category::Cab => "Cab",
@@ -104,6 +108,7 @@ impl Category {
             Category::Gate => "GTE",
             Category::Comp => "CMP",
             Category::Wah => "WAH",
+            Category::Pitch => "PIT",
             Category::Drive => "DRV",
             Category::Amp => "AMP",
             Category::Cab => "CAB",
@@ -116,9 +121,12 @@ impl Category {
 
     pub fn tint(self) -> Tint {
         match self {
-            Category::Gate | Category::Comp | Category::Wah | Category::Drive | Category::Amp => {
-                Tint::Amber
-            }
+            Category::Gate
+            | Category::Comp
+            | Category::Wah
+            | Category::Pitch
+            | Category::Drive
+            | Category::Amp => Tint::Amber,
             Category::Cab | Category::Eq => Tint::Neutral,
             Category::Mod | Category::Delay | Category::Reverb => Tint::Teal,
         }
@@ -133,6 +141,7 @@ pub(crate) fn block_name(kind: StageKind) -> &'static str {
         StageKind::Comp => "Comp A",
         StageKind::Comp2 => "Comp B",
         StageKind::Wah => "Wah",
+        StageKind::Pitch => "Pitch",
         StageKind::Drive => "Drive A",
         StageKind::Drive2 => "Drive B",
         StageKind::Amp => "Amp",
@@ -154,6 +163,7 @@ pub(crate) fn enable_id(kind: StageKind) -> &'static str {
         StageKind::Comp => "comp_on",
         StageKind::Comp2 => "comp2_on",
         StageKind::Wah => "wah_on",
+        StageKind::Pitch => "pitch_on",
         StageKind::Drive => "drive_on",
         StageKind::Drive2 => "drive2_on",
         StageKind::Amp => "amp_on",
@@ -175,6 +185,7 @@ pub(crate) fn is_on(p: &Params, kind: StageKind) -> bool {
         StageKind::Comp => p.comp_on,
         StageKind::Comp2 => b.comp_on,
         StageKind::Wah => p.wah_on,
+        StageKind::Pitch => p.pitch_on,
         StageKind::Drive => p.drive_on,
         StageKind::Drive2 => b.drive_on,
         StageKind::Amp => p.amp_on,
@@ -259,6 +270,10 @@ pub(crate) fn models(p: &Params, kind: StageKind) -> (Vec<ModelChoice>, Option<u
         StageKind::Wah => (
             choices(WahModel::ALL, "wah_model", wah_model_label),
             position(WahModel::ALL, &p.wah_model),
+        ),
+        StageKind::Pitch => (
+            choices(PitchModel::ALL, "pitch_model", pitch_model_label),
+            position(PitchModel::ALL, &p.pitch_model),
         ),
         StageKind::Drive => (
             choices(DriveModel::ALL, "drive_model", drive_model_label),
@@ -373,6 +388,11 @@ fn rows(kind: StageKind) -> &'static [Row] {
             ("wah_pos", "wah_pos", "Position"),
             ("wah_res", "wah_res", "Resonance"),
             ("wah_sens", "wah_sens", "Sensitivity"),
+        ],
+        StageKind::Pitch => &[
+            ("pitch_semi", "pitch_semi", "Semitones"),
+            ("pitch_cents", "pitch_cents", "Cents"),
+            ("pitch_mix", "pitch_mix", "Mix"),
         ],
         StageKind::Drive => &[
             ("drive_gain", "drive_gain", "Drive"),
@@ -630,6 +650,27 @@ pub(crate) fn amp_model_label(m: AmpModel) -> &'static str {
         CrunchSaw => "Crunch Saw",
         UltraScoop => "Ultra Scoop",
         SlamHead => "Slam Head",
+        HerbertLead => "Herbert Lead",
+        Vh4Lead => "VH4 Lead",
+        EcstasyRed => "Ecstasy Red",
+        Uberschall => "Uberschall",
+        SavageLead => "Savage Lead",
+        ArchonLead => "Archon Lead",
+        Deliverance => "Deliverance",
+        JubileeLead => "Jubilee Lead",
+        DslLead => "DSL Lead",
+        DeluxeReverb => "Deluxe Reverb",
+    }
+}
+
+pub(crate) fn pitch_model_label(model: PitchModel) -> &'static str {
+    match model {
+        PitchModel::OctaveUp => "Octave Up",
+        PitchModel::OctaveDown => "Octave Down",
+        PitchModel::Detune => "Detune",
+        PitchModel::FifthUp => "Fifth Up",
+        PitchModel::FourthDown => "Fourth Down",
+        PitchModel::Shift => "Shift",
     }
 }
 
@@ -671,6 +712,16 @@ pub(crate) fn cab_model_label(model: CabModel) -> &'static str {
         CabModel::Ice4x12 => "Ice 4x12",
         CabModel::Doom810 => "Doom 8x10",
         CabModel::Tight2x12 => "Tight 2x12",
+        CabModel::Green2x12 => "Greenback 2x12",
+        CabModel::Alnico4x12 => "Alnico 4x12",
+        CabModel::Vintage1x15 => "Vintage 1x15",
+        CabModel::Bass410 => "Bass 4x10",
+        CabModel::Dark1x12 => "Dark 1x12",
+        CabModel::Modern1x12 => "Modern 1x12",
+        CabModel::V30Stack => "V30 Stack 4x12",
+        CabModel::Cream2x12 => "Cream 2x12",
+        CabModel::Ported4x12 => "Ported 4x12",
+        CabModel::Open2x10 => "Open 2x10",
     }
 }
 

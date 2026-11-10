@@ -32,8 +32,8 @@ use std::sync::Arc;
 
 use gpui::{
     div, px, size, App, AppContext, Context, FocusHandle, InteractiveElement, IntoElement,
-    KeyDownEvent, ParentElement, Render, Styled, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowHandle, WindowKind,
+    KeyDownEvent, ParentElement, Render, StatefulInteractiveElement, Styled, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind,
 };
 use rodharerist::Params;
 
@@ -49,7 +49,8 @@ use crate::components::native_plugin_shell::{
 };
 use crate::components::plate;
 use crate::components::rodhareist_panel::{
-    chain_frame, rodhareist_panel, tapped_interval, ChainFocus, Page, PresetTab, RodFields, RodUi,
+    chain_frame, note_name, rodhareist_panel, tapped_interval, ChainFocus, Page, PresetTab,
+    RodFields, RodUi,
 };
 use crate::components::text_input::{
     bind_mouse_selection, text_field_with_callbacks_and_ime, TextInputAction, TextInputState,
@@ -363,6 +364,16 @@ pub struct RodhareistEditorWindow {
     pub(crate) search: TextInputState,
     /// Home's preset name, saved as the `.pst` stem; never a wire parameter.
     pub(crate) preset_name: TextInputState,
+    /// A knob the player is typing. Confirm writes the same wire path a drag
+    /// uses, and only when the text is a number inside that control's range.
+    knob_entry: Option<KnobEntry>,
+    knob_note: Option<String>,
+    /// The tuner popup, open while `tuner_on` is set.
+    tuner_window: Option<WindowHandle<TunerPopup>>,
+    /// An OS close of the popup turns the tuner off. A close that already
+    /// decided the parameter (the toggle, or the editor itself going away)
+    /// sets this false first so the close does not write it again.
+    tuner_dismiss_writes: bool,
     /// The insert's telemetry block (`rodharerist::telemetry`): per-channel
     /// levels and the tuner.
     pads: Option<[f32; SpherePluginHost::audio_bridge::BUILTIN_PAD_SLOTS]>,
@@ -403,6 +414,10 @@ impl RodhareistEditorWindow {
             preset_name: TextInputState::new("rodhareist-preset-name", cx.focus_handle())
                 .with_placeholder("Preset name")
                 .with_accessible_label("Preset name"),
+            knob_entry: None,
+            knob_note: None,
+            tuner_window: None,
+            tuner_dismiss_writes: true,
             pads: None,
             alive: Rc::new(Cell::new(true)),
         };
@@ -413,6 +428,12 @@ impl RodhareistEditorWindow {
         let name = window.user_preset_save_name();
         window.preset_name.set_value(name);
         window.start_meter(cx);
+        if window.params.tuner_on {
+            let entity = cx.entity().clone();
+            cx.defer(move |app| {
+                let _ = entity.update(app, |this, cx| this.open_tuner(cx));
+            });
+        }
         window
     }
 
@@ -466,8 +487,10 @@ impl RodhareistEditorWindow {
     /// edits. Each one reaches the host DSP, the state mirror, and the
     /// project's dirty flag through `forward_param`.
     pub(crate) fn set_params(&mut self, next: Params, cx: &mut Context<Self>) {
+        let was_tuner = self.params.tuner_on;
         let edits = wire_diff(&self.params, &next);
         self.params = next;
+        self.sync_tuner_window(was_tuner, cx);
         if let Some(forward) = self.host_ops.forward_param.clone() {
             for (index, value) in edits {
                 forward(&self.key, index, value, cx);
@@ -583,7 +606,12 @@ impl RodhareistEditorWindow {
 
     /// Whether one of the editor's text fields has the keyboard.
     pub(crate) fn typing(&self, window: &Window) -> bool {
-        self.search.is_focused(window) || self.preset_name.is_focused(window)
+        self.search.is_focused(window)
+            || self.preset_name.is_focused(window)
+            || self
+                .knob_entry
+                .as_ref()
+                .is_some_and(|entry| entry.text.is_focused(window))
     }
 
     /// Hands the keyboard back to the editor from a text field — on a page
@@ -600,6 +628,24 @@ impl RodhareistEditorWindow {
     /// this only steers: caret, selection, deletion, clipboard, Enter and
     /// Escape.
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let knob_focused = self
+            .knob_entry
+            .as_ref()
+            .is_some_and(|entry| entry.text.is_focused(window));
+        if knob_focused {
+            let action = self
+                .knob_entry
+                .as_mut()
+                .unwrap()
+                .text
+                .handle_key_ime(event, Some(cx));
+            match action {
+                TextInputAction::Submit => self.commit_knob_entry(window, cx),
+                TextInputAction::Cancel => self.cancel_knob_entry(window, cx),
+                TextInputAction::Consumed | TextInputAction::Pass => cx.notify(),
+            }
+            return;
+        }
         if self.preset_name.is_focused(window) {
             // Enter writes the `.pst`; Escape leaves the text as it is.
             match self.preset_name.handle_key_ime(event, Some(cx)) {
@@ -632,6 +678,13 @@ impl RodhareistEditorWindow {
 
     /// The text field the OS input handler is talking to.
     fn ime_field(&mut self, window: &Window) -> &mut TextInputState {
+        if self
+            .knob_entry
+            .as_ref()
+            .is_some_and(|entry| entry.text.is_focused(window))
+        {
+            return &mut self.knob_entry.as_mut().unwrap().text;
+        }
         if self.preset_name.is_focused(window) {
             &mut self.preset_name
         } else {
@@ -643,6 +696,124 @@ impl RodhareistEditorWindow {
         let mut next = self.params.clone();
         if rodharerist::apply_to_params(&mut next, id, value) {
             self.set_params(next, cx);
+        }
+    }
+
+    /// Opens numeric entry for one continuous control. The field starts on
+    /// the stored value, selected, so typing replaces it.
+    pub(crate) fn begin_knob_entry(
+        &mut self,
+        id: &'static str,
+        label: &'static str,
+        min: f32,
+        max: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current = wire_value(&self.params, id);
+        let mut text = TextInputState::new("rodhareist-knob-value", cx.focus_handle())
+            .with_placeholder(format!("{min:.0} to {max:.0}"))
+            .with_accessible_label(label)
+            .with_ascii_charset("0123456789.-+")
+            .with_field_height(22.0);
+        text.set_value(format_knob(current));
+        text.select_all();
+        text.focus_handle.focus(window, cx);
+        self.knob_entry = Some(KnobEntry {
+            id,
+            label,
+            min,
+            max,
+            text,
+        });
+        self.knob_note = None;
+        cx.notify();
+    }
+
+    fn commit_knob_entry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(entry) = self.knob_entry.as_ref() else {
+            return;
+        };
+        let text = entry.text.value.trim().to_string();
+        let (id, min, max) = (entry.id, entry.min, entry.max);
+        match text.parse::<f32>() {
+            Ok(value) if value.is_finite() && (min..=max).contains(&value) => {
+                self.knob_entry = None;
+                self.knob_note = None;
+                self.set_wire(id, value, cx);
+                self.focus_handle.focus(window, cx);
+            }
+            Ok(_) => {
+                self.knob_note = Some("Out of range".into());
+                cx.notify();
+            }
+            Err(_) => {
+                self.knob_note = Some("Not a number".into());
+                cx.notify();
+            }
+        }
+    }
+
+    fn cancel_knob_entry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.knob_entry = None;
+        self.knob_note = None;
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    fn sync_tuner_window(&mut self, was_on: bool, cx: &mut Context<Self>) {
+        let now = self.params.tuner_on;
+        if now && !was_on {
+            self.open_tuner(cx);
+        } else if !now && was_on {
+            self.close_tuner(cx);
+        }
+    }
+
+    fn open_tuner(&mut self, cx: &mut Context<Self>) {
+        if self.tuner_window.is_some() {
+            return;
+        }
+        let editor = cx.entity().clone();
+        let bounds =
+            crate::window_position::centered_window_bounds(None, size(px(560.0), px(420.0)), cx);
+        let mut options = crate::platform_chrome::external_dialog_window_options_partial();
+        options.window_bounds = Some(WindowBounds::Windowed(bounds));
+        options.kind = WindowKind::Floating;
+        options.is_resizable = true;
+        options.is_minimizable = false;
+        options.window_background = WindowBackgroundAppearance::Opaque;
+        options.window_min_size = Some(size(px(420.0), px(300.0)));
+        let opened = cx.open_window(options, move |window, cx| {
+            let closing = editor.clone();
+            window.on_window_should_close(cx, move |_window, cx| {
+                // Defer so a close that started inside the editor does not
+                // re-enter that entity while it still holds the window.
+                let closing = closing.clone();
+                cx.defer(move |app| {
+                    closing.update(app, |editor, cx| editor.tuner_closed(cx));
+                });
+                true
+            });
+            cx.new(|cx| TunerPopup::new(editor, cx))
+        });
+        if let Ok(handle) = opened {
+            self.tuner_window = Some(handle);
+        }
+    }
+
+    fn close_tuner(&mut self, cx: &mut Context<Self>) {
+        self.tuner_dismiss_writes = false;
+        if let Some(handle) = self.tuner_window.take() {
+            let _ = handle.update(cx, |_popup, window, _cx| window.remove_window());
+        }
+        self.tuner_dismiss_writes = true;
+    }
+
+    fn tuner_closed(&mut self, cx: &mut Context<Self>) {
+        self.tuner_window = None;
+        if self.tuner_dismiss_writes && self.params.tuner_on {
+            self.set_wire("tuner_on", 0.0, cx);
         }
     }
 
@@ -1116,6 +1287,11 @@ impl RodhareistEditorWindow {
     pub(crate) fn ir_error(&self) -> Option<String> {
         self.load_error(RodhareistFile::Impulse)
     }
+    /// The capture file named on the insert, whether or not the host loaded it.
+    pub(crate) fn nam_project_name(&self) -> Option<String> {
+        self.file_name(RodhareistFile::Capture)
+            .map(|name| display_name(&name))
+    }
     pub(crate) fn nam_loaded_info(&self) -> Option<String> {
         self.loaded_name(RodhareistFile::Capture)
             .map(|name| display_name(&name))
@@ -1360,6 +1536,7 @@ impl Render for RodhareistEditorWindow {
         }
         let on_close = self.on_close.clone();
         let alive = self.alive.clone();
+        let closing = cx.entity();
         // A chain drag that ended anywhere but a drop target closes the
         // lane it opened.
         if !cx.has_active_drag() {
@@ -1370,6 +1547,45 @@ impl Render for RodhareistEditorWindow {
             window.request_animation_frame();
         }
         let entity = cx.entity();
+        let knob_focused = self
+            .knob_entry
+            .as_ref()
+            .is_some_and(|entry| entry.text.is_focused(window));
+        let knob_label = self.knob_entry.as_ref().map(|entry| entry.label);
+        let knob_note = self.knob_note.clone();
+        let knob_range = self
+            .knob_entry
+            .as_ref()
+            .map(|entry| format!("{:.0} to {:.0}", entry.min, entry.max));
+        let knob_value = knob_label.map(|label| {
+            let field = text_field_with_callbacks_and_ime(
+                &self.knob_entry.as_ref().unwrap().text,
+                knob_focused,
+                bind_mouse_selection(entity.clone(), |this| {
+                    &mut this.knob_entry.as_mut().unwrap().text
+                }),
+                entity.clone(),
+            );
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .h(px(28.0))
+                .px(px(8.0))
+                .bg(plate::color(0x1a1a1a))
+                .border(px(1.0))
+                .border_color(plate::color(0x484848))
+                .child(plate::words(label, 12.0, plate::SOFT, 1.0))
+                .child(div().w(px(96.0)).child(field))
+                .child(plate::words(
+                    knob_note.clone().unwrap_or(knob_range.unwrap_or_default()),
+                    11.0,
+                    plate::PALE,
+                    1.0,
+                ))
+                .into_any_element()
+        });
         let fields = RodFields {
             search: text_field_with_callbacks_and_ime(
                 &self.search,
@@ -1382,9 +1598,10 @@ impl Render for RodhareistEditorWindow {
                 &self.preset_name,
                 self.preset_name.is_focused(window),
                 bind_mouse_selection(entity.clone(), |this| &mut this.preset_name),
-                entity,
+                entity.clone(),
             )
             .into_any_element(),
+            knob_value,
         };
         let content = rodhareist_panel(self, &frame, fields, window, cx);
 
@@ -1410,6 +1627,7 @@ impl Render for RodhareistEditorWindow {
                     // map, then actually close it — `on_close` alone only
                     // forgets the handle and leaves the OS window open.
                     alive.set(false);
+                    let _ = closing.update(cx, |this, cx| this.close_tuner(cx));
                     on_close(window, cx);
                     window.remove_window();
                 },
@@ -1507,6 +1725,115 @@ impl gpui::EntityInputHandler for RodhareistEditorWindow {
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
         None
+    }
+}
+
+struct KnobEntry {
+    id: &'static str,
+    label: &'static str,
+    min: f32,
+    max: f32,
+    text: TextInputState,
+}
+
+fn format_knob(value: f32) -> String {
+    if !value.is_finite() {
+        return "0".into();
+    }
+    if (value - value.round()).abs() < 0.05 {
+        format!("{}", value.round() as i32)
+    } else {
+        format!("{value:.1}")
+    }
+}
+
+/// The large tuner. It reads the same `TUNER_HZ` telemetry as the Home tile.
+struct TunerPopup {
+    editor: gpui::WeakEntity<RodhareistEditorWindow>,
+}
+
+impl TunerPopup {
+    fn new(editor: gpui::Entity<RodhareistEditorWindow>, cx: &mut Context<Self>) -> Self {
+        cx.observe(&editor, |_, _, cx| cx.notify()).detach();
+        Self {
+            editor: editor.downgrade(),
+        }
+    }
+}
+
+impl Render for TunerPopup {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let height = f32::from(window.viewport_size().height);
+        let note_px = (height * 0.32).clamp(72.0, 240.0);
+        let reading = self.editor.upgrade().map(|editor| {
+            let editor = editor.read(cx);
+            let on = editor.params.tuner_on;
+            let hz = editor
+                .pads()
+                .map(|block| block[rodharerist::telemetry::TUNER_HZ])
+                .filter(|_| on)
+                .unwrap_or(0.0);
+            (on, note_name(hz))
+        });
+        let (note, text, ink) = match reading {
+            None | Some((false, _)) => ("—".to_string(), "Off".to_string(), plate::FAINT),
+            Some((true, None)) => ("—".to_string(), "No pitch".to_string(), plate::WHITE),
+            Some((true, Some((name, cents)))) => {
+                let in_tune = cents.abs() < 3.0;
+                let text = if in_tune {
+                    "In tune".to_string()
+                } else {
+                    format!(
+                        "{}{:.0} cents",
+                        if cents > 0.0 { "+" } else { "−" },
+                        cents.abs()
+                    )
+                };
+                (
+                    name.to_string(),
+                    text,
+                    if in_tune { 0x9be15d } else { plate::WHITE },
+                )
+            }
+        };
+        let editor = self.editor.clone();
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(12.0))
+            .bg(plate::color(plate::WELL))
+            .child(plate::numbers(note, note_px, ink, 1.0))
+            .child(plate::words(
+                text,
+                (note_px * 0.22).clamp(18.0, 48.0),
+                plate::PALE,
+                1.0,
+            ))
+            .child(
+                div()
+                    .id("rodhareist-tuner-popup-close")
+                    .mt(px(18.0))
+                    .px(px(12.0))
+                    .py(px(6.0))
+                    .border(px(1.0))
+                    .border_color(plate::color(0x484848))
+                    .text_size(px(13.0))
+                    .text_color(plate::color(plate::WHITE))
+                    .cursor(gpui::CursorStyle::PointingHand)
+                    .child("Close")
+                    .on_click(move |_, _, app| {
+                        if let Some(editor) = editor.upgrade() {
+                            editor.update(app, |this, cx| {
+                                if this.params.tuner_on {
+                                    this.set_wire("tuner_on", 0.0, cx);
+                                }
+                            });
+                        }
+                    }),
+            )
     }
 }
 

@@ -17,9 +17,9 @@ use nih_plug_gpui::EditorContext;
 // prelude's `Params` trait that `RodhareistParams` derives and `WireParams`
 // implements. The core struct is spelled `CoreParams` here.
 use rodharerist::{
-    AmpModel, CabModel, CompModel, DelayModel, DriveModel, EqModel, MicModel, ModModel,
-    Params as CoreParams, ReverbModel, StageChannel, StageKind, ToneEngineKind, WahModel,
-    PATH_SLOTS, UI_PARAM_IDS,
+    AmpModel, CabModel, CompModel, DelayModel, DelaySync, DriveModel, EqModel, MicModel, ModModel,
+    Params as CoreParams, PitchModel, ReverbModel, StageChannel, StageKind, ToneEngineKind,
+    WahModel, PATH_SLOTS, UI_PARAM_IDS,
 };
 
 use crate::components::rodhareist_blocks::{self as blocks, ParamSpec};
@@ -417,6 +417,21 @@ const TONE_ENGINES: &[ToneEngineKind] = &[
     ToneEngineKind::Bypass,
 ];
 
+fn sync_label(sync: DelaySync) -> &'static str {
+    match sync {
+        DelaySync::Free => "Free",
+        DelaySync::Quarter => "1/4",
+        DelaySync::DottedEighth => "1/8.",
+        DelaySync::Eighth => "1/8",
+        DelaySync::Half => "1/2",
+        DelaySync::DottedQuarter => "1/4.",
+        DelaySync::QuarterTriplet => "1/4t",
+        DelaySync::EighthTriplet => "1/8t",
+        DelaySync::Sixteenth => "1/16",
+        DelaySync::DottedSixteenth => "1/16.",
+    }
+}
+
 fn tone_engine_label(engine: ToneEngineKind) -> &'static str {
     match engine {
         ToneEngineKind::Classic => "Amp model",
@@ -460,6 +475,10 @@ pub fn choice_labels(id: &str) -> Option<Vec<&'static str>> {
         "eq_model" | "eq2_model" => labels(EqModel::ALL, blocks::eq_model_label),
         "reverb_model" => labels(ReverbModel::ALL, blocks::reverb_model_label),
         "delay_model" | "delay2_model" => labels(DelayModel::ALL, blocks::delay_model_label),
+        "pitch_model" => labels(PitchModel::ALL, blocks::pitch_model_label),
+        "delay_sync" | "delay_sync_r" | "delay2_sync" | "delay2_sync_r" => {
+            labels(DelaySync::ALL, sync_label)
+        }
         "tone_engine" => labels(TONE_ENGINES, tone_engine_label),
         "line2_mode" => vec!["Wet", "Dry", "Wet/Dry/Wet"],
         _ => return None,
@@ -530,7 +549,13 @@ pub fn describe(id: &str) -> (String, String) {
         "cab_mic_type" => return ("Cab".into(), "Microphone".into()),
         "nam_loudness_norm" => return ("Amp".into(), "Capture Normalized".into()),
         "line2_mode" => return ("Lanes".into(), "Lane 1 Mode".into()),
-        "line2_mix" => return ("Lanes".into(), "Lane 1 Send".into()),
+        "line2_mix" => return ("Lanes".into(), "Lane 1 Blend".into()),
+        "transpose_semi" => return global("Transpose"),
+        "transpose_cents" => return global("Transpose Fine"),
+        "delay_sync" => return ("Delay A".into(), "Time Sync".into()),
+        "delay_sync_r" => return ("Delay A".into(), "Time R Sync".into()),
+        "delay2_sync" => return ("Delay B".into(), "Time Sync".into()),
+        "delay2_sync_r" => return ("Delay B".into(), "Time R Sync".into()),
         _ => {}
     }
     if let Some(n) = id.strip_prefix("row_send_") {
