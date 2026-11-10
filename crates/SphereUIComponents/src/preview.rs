@@ -61,23 +61,31 @@ impl Scene {
     }
 }
 
-/// Moves `window` off every desktop and shows it there without activating
-/// it: it lays out and draws like any window — at the scale of the display
-/// it opened on — while no one sees it and focus stays where it was.
+/// Where [`tuck_away`] puts a scene's window: off every desktop.
 #[cfg(target_os = "windows")]
-pub fn tuck_away(window: &Window) -> std::result::Result<(), String> {
+const OFF_DESKTOP: i32 = -24_000;
+
+#[cfg(target_os = "windows")]
+fn hwnd(window: &Window) -> std::result::Result<windows::Win32::Foundation::HWND, String> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNOACTIVATE,
-    };
-    const OFF_DESKTOP: i32 = -24_000;
     let handle = HasWindowHandle::window_handle(window)
         .map_err(|error| format!("no window handle: {error}"))?;
     let RawWindowHandle::Win32(win32) = handle.as_raw() else {
         return Err("not a Win32 window".to_string());
     };
-    let hwnd = HWND(win32.hwnd.get() as *mut _);
+    Ok(windows::Win32::Foundation::HWND(win32.hwnd.get() as *mut _))
+}
+
+/// Moves `window` off every desktop and shows it there without activating
+/// it: it lays out and draws like any window — at the scale of the display
+/// it opened on, unless [`set_scale`] changes it — while no one sees it and
+/// focus stays where it was.
+#[cfg(target_os = "windows")]
+pub fn tuck_away(window: &Window) -> std::result::Result<(), String> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNOACTIVATE,
+    };
+    let hwnd = hwnd(window)?;
     unsafe {
         SetWindowPos(
             hwnd,
@@ -90,6 +98,62 @@ pub fn tuck_away(window: &Window) -> std::result::Result<(), String> {
         )
         .map_err(|error| format!("SetWindowPos: {error}"))?;
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    }
+    Ok(())
+}
+
+/// Renders the tucked-away `window` at `scale` instead of its display's: it
+/// is told its DPI changed, as Windows does when a window moves to another
+/// monitor, so GPUI keeps the logical layout, resizes the renderer to the
+/// new device size, and rasterizes text and icons at that scale. Sent
+/// outside any window update, so the resize reaches the GPUI window.
+///
+/// The window's frame goes first: Windows limits a captioned window to the
+/// size of the screen, which a scaled window easily outgrows.
+#[cfg(target_os = "windows")]
+pub fn set_scale(
+    cx: &mut gpui::AsyncApp,
+    window: AnyWindowHandle,
+    scale: f32,
+) -> std::result::Result<(), String> {
+    use windows::Win32::Foundation::{LPARAM, RECT, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SendMessageW, SetWindowLongPtrW, SetWindowPos, GWL_STYLE,
+        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WM_DPICHANGED,
+        WS_CAPTION, WS_POPUP, WS_THICKFRAME,
+    };
+    let (hwnd, logical) = cx
+        .update_window(window, |_, window, _| {
+            hwnd(window).map(|hwnd| (hwnd, window.viewport_size()))
+        })
+        .map_err(|error| format!("{error:#}"))??;
+    let dpi = (96.0 * scale).round() as usize;
+    let rect = RECT {
+        left: OFF_DESKTOP,
+        top: OFF_DESKTOP,
+        right: OFF_DESKTOP + (logical.width.as_f32() * scale).round() as i32,
+        bottom: OFF_DESKTOP + (logical.height.as_f32() * scale).round() as i32,
+    };
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+        let frameless = style & !(WS_CAPTION.0 | WS_THICKFRAME.0) | WS_POPUP.0;
+        SetWindowLongPtrW(hwnd, GWL_STYLE, frameless as isize);
+        SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        )
+        .map_err(|error| format!("SetWindowPos: {error}"))?;
+        SendMessageW(
+            hwnd,
+            WM_DPICHANGED,
+            Some(WPARAM(dpi << 16 | dpi)),
+            Some(LPARAM(&rect as *const RECT as isize)),
+        );
     }
     Ok(())
 }

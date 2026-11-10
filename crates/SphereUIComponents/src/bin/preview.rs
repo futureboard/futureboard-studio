@@ -7,6 +7,8 @@
 //!   --out <DIR>     where the PNGs go (default: target/ui-preview)
 //!   --theme <ID>    render in this theme (default: the one saved in Settings)
 //!   --settle <MS>   how long each view runs before its frame is read (default: 700)
+//!   --scale <N>     render at scale N, e.g. 2 for HiDPI, written as
+//!                   `<scene>@<N>x.png` (default: the display's scale)
 //!   --list          print the scene names and exit
 //! ```
 //!
@@ -15,7 +17,9 @@
 //! there without activating it, so it lays out and draws while no one sees
 //! it. Its frame is then redrawn into the renderer's back buffer and copied
 //! back to the CPU (`Window::render_to_image`), and written as
-//! `<DIR>/<scene>.png`. The scenes themselves live in
+//! `<DIR>/<scene>.png`. With `--scale` the window is told its DPI changed,
+//! so it keeps its logical layout and GPUI rasterizes text and icons at that
+//! scale. The scenes themselves live in
 //! [`sphere_ui_components::preview`].
 
 use std::path::PathBuf;
@@ -29,6 +33,7 @@ struct Options {
     out: PathBuf,
     theme: Option<String>,
     settle: Duration,
+    scale: Option<f32>,
     only: Vec<String>,
     list: bool,
 }
@@ -38,6 +43,7 @@ fn parse_args() -> Result<Options, String> {
         out: PathBuf::from("target/ui-preview"),
         theme: None,
         settle: Duration::from_millis(700),
+        scale: None,
         only: Vec::new(),
         list: false,
     };
@@ -56,10 +62,22 @@ fn parse_args() -> Result<Options, String> {
                     .map_err(|_| "--settle needs a whole number of milliseconds")?;
                 options.settle = Duration::from_millis(ms);
             }
+            "--scale" => {
+                let scale: f32 = args
+                    .next()
+                    .ok_or("--scale needs a factor")?
+                    .parse()
+                    .map_err(|_| "--scale needs a number, e.g. 2")?;
+                if !(scale.is_finite() && scale > 0.0) {
+                    return Err("--scale needs a positive number".into());
+                }
+                options.scale = Some(scale);
+            }
             "--list" => options.list = true,
             "-h" | "--help" => {
                 return Err(
-                    "usage: preview [--out DIR] [--theme ID] [--settle MS] [--list] [SCENE…]"
+                    "usage: preview [--out DIR] [--theme ID] [--settle MS] [--scale N] \
+                     [--list] [SCENE…]"
                         .into(),
                 )
             }
@@ -112,8 +130,14 @@ fn main() {
     }
 
     let Options {
-        out, theme, settle, ..
+        out,
+        theme,
+        settle,
+        scale,
+        ..
     } = options;
+    // `@2x` and the like, so a scaled run never overwrites the plain one.
+    let suffix = scale.map(|scale| format!("@{scale}x")).unwrap_or_default();
     Application::with_platform(platform())
         .with_assets(EmbeddedAssets::new())
         .run(move |cx| {
@@ -145,9 +169,16 @@ fn main() {
                     if let Some(previous) = previous.replace(handle) {
                         let _ = cx.update_window(previous, |_, window, _| window.remove_window());
                     }
+                    if let Some(scale) = scale {
+                        if let Err(error) = preview::set_scale(cx, handle, scale) {
+                            eprintln!("{}: could not scale: {error}", scene.name);
+                            failed += 1;
+                            continue;
+                        }
+                    }
                     // Let it lay out, draw, and take its first telemetry.
                     cx.background_executor().timer(settle).await;
-                    let path = out.join(format!("{}.png", scene.name));
+                    let path = out.join(format!("{}{suffix}.png", scene.name));
                     let saved = cx
                         .update_window(handle, |_, window, _| window.render_to_image())
                         .and_then(|frame| frame)
