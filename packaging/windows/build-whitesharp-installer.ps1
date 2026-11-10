@@ -54,6 +54,13 @@ if (-not $AppVersion) {
     $AppVersion = $line.Matches[0].Groups[1].Value
 }
 
+# "2026.11.1-beta2.0.0" -> "2026.11.1": the numbers before any tag, at most four.
+$fileVersion = (($AppVersion -split '[^0-9.]', 2)[0].Trim('.') -split '\.' |
+    Select-Object -First 4) -join '.'
+if (-not $fileVersion) {
+    throw "Version '$AppVersion' does not start with a number."
+}
+
 # ---------------------------------------------------------------------------
 # Bundle
 # ---------------------------------------------------------------------------
@@ -114,12 +121,12 @@ $outputExe = Join-Path $Root "target\installer\$outputName"
 
 Write-Host ""
 Write-Host "WhiteSharp Installer" -ForegroundColor Cyan
-Write-Host "Version : $AppVersion"
+Write-Host "Version : $AppVersion (file version $fileVersion)"
 Write-Host "Source  : $bundleDir"
 Write-Host "Compiler: $Iscc"
 Write-Host ""
 
-& $Iscc "/Q" "/DMyAppVersion=$AppVersion" "/DMySourceDir=$bundleDir" $iss
+& $Iscc "/Q" "/DMyAppVersion=$AppVersion" "/DMyFileVersion=$fileVersion" "/DMySourceDir=$bundleDir" $iss
 if ($LASTEXITCODE -ne 0) {
     throw "Inno Setup compilation failed with exit code $LASTEXITCODE."
 }

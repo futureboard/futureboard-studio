@@ -11,7 +11,7 @@
 ;   cargo whitesharp-vst3 bundle whitesharp_vst3 --release
 ;
 ; build-whitesharp-installer.ps1 bundles, compiles this script and uploads the
-; result; it overrides MySourceDir and MyAppVersion using /D.
+; result; it overrides MySourceDir, MyAppVersion and MyFileVersion using /D.
 ;
 ; Install targets:
 ;   VST3:  %CommonProgramFiles%\VST3\WhiteSharp.vst3
@@ -33,7 +33,13 @@
 #endif
 
 #ifndef MyAppVersion
-#define MyAppVersion "0.1.3"
+#define MyAppVersion "2026.11.1"
+#endif
+
+; Windows file versions are up to four numbers; a pre-release tag such as
+; "-beta2.0.0" belongs in MyAppVersion only.
+#ifndef MyFileVersion
+#define MyFileVersion "2026.11.1"
 #endif
 
 [Setup]
@@ -44,7 +50,7 @@ AppVerName={#MyAppName} {#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
-VersionInfoVersion={#MyAppVersion}
+VersionInfoVersion={#MyFileVersion}
 
 ; Program Files only. Plug-in folders receive the plug-ins, never the
 ; uninstaller.
