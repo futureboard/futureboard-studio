@@ -39,6 +39,7 @@ mod mod_stage;
 mod nam;
 mod nonlinear;
 mod phaser;
+mod pitch;
 mod rate;
 mod reverb;
 mod smooth;
@@ -78,7 +79,7 @@ use wah::Wah;
 pub const PLUGIN_ID: &str = "futureboard.rodharerist";
 
 /// Number of slots in the user-orderable signal path (one per [`StageKind`]).
-pub const PATH_SLOTS: usize = 15;
+pub const PATH_SLOTS: usize = 16;
 
 /// One slot in the Helix-style signal path. Order is user-editable.
 ///
@@ -110,12 +111,15 @@ pub enum StageKind {
     Delay2 = 12,
     Eq2 = 13,
     Comp2 = 14,
+    /// Pitch shifter in the Filter family. Not in the default path: a
+    /// shift is never tonally neutral, same rule as the wah.
+    Pitch = 15,
 }
 
 impl StageKind {
     /// Number of distinct stages. Not the same thing as [`PATH_SLOTS`], even
     /// when the numbers coincide.
-    pub const COUNT: usize = 15;
+    pub const COUNT: usize = 16;
 
     pub const ALL: &'static [Self] = &[
         Self::Gate,
@@ -133,6 +137,7 @@ impl StageKind {
         Self::Delay2,
         Self::Eq2,
         Self::Comp2,
+        Self::Pitch,
     ];
 
     pub fn from_index(i: i32) -> Option<Self> {
@@ -152,6 +157,7 @@ impl StageKind {
             12 => Some(Self::Delay2),
             13 => Some(Self::Eq2),
             14 => Some(Self::Comp2),
+            15 => Some(Self::Pitch),
             _ => None,
         }
     }
@@ -222,6 +228,7 @@ impl StageKind {
             Self::Delay2 => "delay2_channel",
             Self::Eq2 => "eq2_channel",
             Self::Comp2 => "comp2_channel",
+            Self::Pitch => "pitch_channel",
             Self::Amp | Self::Cab => return None,
         })
     }
@@ -245,6 +252,7 @@ impl StageKind {
             Self::Delay2 => "delay2_row",
             Self::Eq2 => "eq2_row",
             Self::Comp2 => "comp2_row",
+            Self::Pitch => "pitch_row",
         }
     }
 }
@@ -522,6 +530,42 @@ pub enum AmpModel {
     UltraScoop,
     /// "Slam Head" — tight lows, a forward mid, a hard power section.
     SlamHead,
+    /// "Herbert Lead" — four tight stages, a forward mid, very little sag.
+    /// The circuit this follows is a Herbert-style modern channel.
+    HerbertLead,
+    /// "VH4 Lead" — scooped and stiff, the lows filtered before the clip.
+    /// The circuit this follows is a VH4-style lead channel.
+    Vh4Lead,
+    /// "Ecstasy Red" — high gain that blooms, more sag than a modern stack.
+    /// The circuit this follows is an Ecstasy red channel.
+    EcstasyRed,
+    /// "Uberschall" — huge saturated gain, a thick transformer, loose sag.
+    Uberschall,
+    /// "Savage Lead" — brighter and tighter than Fireball, more presence.
+    /// The circuit this follows is a Savage-style lead channel.
+    SavageLead,
+    /// "Archon Lead" — tight modern gain with a forward mid and a hard power section.
+    ArchonLead,
+    /// "Deliverance" — articulate high gain, less scoop, more feedback.
+    Deliverance,
+    /// "Jubilee Lead" — pushed British mids, more gain than JCM Crunch,
+    /// not a modern four-stage stack. The circuit this follows is a
+    /// Jubilee-style lead channel.
+    JubileeLead,
+    /// "DSL Lead" — a tighter British crunch than JCM, three stages.
+    /// The circuit this follows is a DSL-style lead channel.
+    DslLead,
+    /// "Deluxe Reverb" — blackface headroom between Princeton and Twin.
+    DeluxeReverb,
+}
+
+/// Where an amp sits when the player browses gain. Not a wire value:
+/// [`AmpModel`]'s index is unchanged. A clean voice is not filed as high gain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmpClass {
+    Clean,
+    Crunch,
+    HighGain,
 }
 
 impl AmpModel {
@@ -567,6 +611,16 @@ impl AmpModel {
         Self::CrunchSaw,
         Self::UltraScoop,
         Self::SlamHead,
+        Self::HerbertLead,
+        Self::Vh4Lead,
+        Self::EcstasyRed,
+        Self::Uberschall,
+        Self::SavageLead,
+        Self::ArchonLead,
+        Self::Deliverance,
+        Self::JubileeLead,
+        Self::DslLead,
+        Self::DeluxeReverb,
     ];
 
     pub fn from_model_id(id: &str) -> Option<Self> {
@@ -611,12 +665,80 @@ impl AmpModel {
             "crunch_saw" => Some(Self::CrunchSaw),
             "ultra_scoop" => Some(Self::UltraScoop),
             "slam_head" => Some(Self::SlamHead),
+            "herbert_lead" => Some(Self::HerbertLead),
+            "vh4_lead" => Some(Self::Vh4Lead),
+            "ecstasy_red" => Some(Self::EcstasyRed),
+            "uberschall" => Some(Self::Uberschall),
+            "savage_lead" => Some(Self::SavageLead),
+            "archon_lead" => Some(Self::ArchonLead),
+            "deliverance" => Some(Self::Deliverance),
+            "jubilee_lead" => Some(Self::JubileeLead),
+            "dsl_lead" => Some(Self::DslLead),
+            "deluxe_reverb" => Some(Self::DeluxeReverb),
             _ => None,
         }
     }
 
     pub fn from_index(i: u32) -> Self {
         Self::ALL.get(i as usize).copied().unwrap_or(Self::Mandarin)
+    }
+
+    /// Browse group. High-headroom voices are Clean, pushed British and
+    /// early-breakup voices are Crunch, and the saturated modern voices
+    /// are High Gain.
+    pub fn class(self) -> AmpClass {
+        match self {
+            Self::Twin
+            | Self::Princeton
+            | Self::Hundred
+            | Self::Normal15
+            | Self::Jazz120
+            | Self::Liverpool
+            | Self::Bass800
+            | Self::SilverTwin
+            | Self::StudioBass
+            | Self::DeluxeReverb => AmpClass::Clean,
+            Self::Recto
+            | Self::Slate
+            | Self::Invader
+            | Self::Mark
+            | Self::Fireball
+            | Self::Slo
+            | Self::Stealth
+            | Self::VintageModern
+            | Self::RazorModern
+            | Self::MidCannon
+            | Self::DjentStack
+            | Self::ChainsawLead
+            | Self::Blackfire
+            | Self::UltraScoop
+            | Self::SlamHead
+            | Self::HerbertLead
+            | Self::Vh4Lead
+            | Self::EcstasyRed
+            | Self::Uberschall
+            | Self::SavageLead
+            | Self::ArchonLead
+            | Self::Deliverance => AmpClass::HighGain,
+            Self::Mandarin
+            | Self::Plexi
+            | Self::TopBoost
+            | Self::Jcm
+            | Self::Bassman
+            | Self::Boutique
+            | Self::TweedCombo
+            | Self::Deluxe5
+            | Self::Jtm45
+            | Self::Brown
+            | Self::ParkHead
+            | Self::ThickStack
+            | Self::MiniChime
+            | Self::HotMod
+            | Self::ExpressLead
+            | Self::CrunchSaw
+            | Self::JubileeLead
+            | Self::DslLead => AmpClass::Crunch,
+        }
     }
 }
 
@@ -708,6 +830,26 @@ pub enum CabModel {
     Doom810,
     /// "Tight 2x12" — small sealed pair, scooped, fast.
     Tight2x12,
+    /// "Greenback 2x12" — open pair with a mid honk and an early rolloff.
+    Green2x12,
+    /// "Alnico 4x12" — closed four with a speaker bell and less scoop than a modern stack.
+    Alnico4x12,
+    /// "Vintage 1x15" — open fifteen, warmer and looser than the combo fifteen.
+    Vintage1x15,
+    /// "Bass 4x10" — punchier and less huge than the 8x10.
+    Bass410,
+    /// "Dark 1x12" — small sealed single, the top rolled off.
+    Dark1x12,
+    /// "Modern 1x12" — small sealed single, tight and scooped.
+    Modern1x12,
+    /// "V30 Stack 4x12" — mid-forward closed four, more bark than a greenback stack.
+    V30Stack,
+    /// "Cream 2x12" — a brighter pair than the greenback 2x12, less scoop than a modern 2x12.
+    Cream2x12,
+    /// "Ported 4x12" — a tuned low under a closed four, tighter than the deep 4x12.
+    Ported4x12,
+    /// "Open 2x10" — two tens, open back, boxy and bright.
+    Open2x10,
 }
 
 impl CabModel {
@@ -749,6 +891,16 @@ impl CabModel {
         Self::Ice4x12,
         Self::Doom810,
         Self::Tight2x12,
+        Self::Green2x12,
+        Self::Alnico4x12,
+        Self::Vintage1x15,
+        Self::Bass410,
+        Self::Dark1x12,
+        Self::Modern1x12,
+        Self::V30Stack,
+        Self::Cream2x12,
+        Self::Ported4x12,
+        Self::Open2x10,
     ];
 
     /// The modeled voicings only — [`Self::ALL`] minus [`Self::Ir`], which is
@@ -790,6 +942,16 @@ impl CabModel {
         Self::Ice4x12,
         Self::Doom810,
         Self::Tight2x12,
+        Self::Green2x12,
+        Self::Alnico4x12,
+        Self::Vintage1x15,
+        Self::Bass410,
+        Self::Dark1x12,
+        Self::Modern1x12,
+        Self::V30Stack,
+        Self::Cream2x12,
+        Self::Ported4x12,
+        Self::Open2x10,
     ];
 
     pub fn from_model_id(id: &str) -> Option<Self> {
@@ -830,6 +992,16 @@ impl CabModel {
             "ice_412" => Some(Self::Ice4x12),
             "doom_810" => Some(Self::Doom810),
             "tight_212" => Some(Self::Tight2x12),
+            "green_212" => Some(Self::Green2x12),
+            "alnico_412" => Some(Self::Alnico4x12),
+            "vintage_115" => Some(Self::Vintage1x15),
+            "bass_410" => Some(Self::Bass410),
+            "dark_112" => Some(Self::Dark1x12),
+            "modern_112" => Some(Self::Modern1x12),
+            "v30_412" => Some(Self::V30Stack),
+            "cream_212" => Some(Self::Cream2x12),
+            "ported_412" => Some(Self::Ported4x12),
+            "open_210" => Some(Self::Open2x10),
             _ => None,
         }
     }
@@ -1388,6 +1560,140 @@ fn mix_bottom_row(
     }
 }
 
+/// How a delay time follows the host. `0` is free milliseconds, which is
+/// what a saved rig already stores, so an old preset keeps its time.
+///
+/// The beat lengths are the ones the delay styles already describe: a
+/// quarter, a dotted eighth, an eighth, plus the longer and shorter
+/// divisions a Dual, Triplet, or Slap model is built around.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum DelaySync {
+    #[default]
+    Free = 0,
+    Quarter = 1,
+    DottedEighth = 2,
+    Eighth = 3,
+    Half = 4,
+    DottedQuarter = 5,
+    /// Two thirds of a beat. The right side of Triplet Tap.
+    QuarterTriplet = 6,
+    EighthTriplet = 7,
+    /// A slap is a sixteenth.
+    Sixteenth = 8,
+    DottedSixteenth = 9,
+}
+
+impl DelaySync {
+    pub const ALL: &'static [Self] = &[
+        Self::Free,
+        Self::Quarter,
+        Self::DottedEighth,
+        Self::Eighth,
+        Self::Half,
+        Self::DottedQuarter,
+        Self::QuarterTriplet,
+        Self::EighthTriplet,
+        Self::Sixteenth,
+        Self::DottedSixteenth,
+    ];
+
+    pub fn from_index(i: u32) -> Self {
+        Self::ALL.get(i as usize).copied().unwrap_or(Self::Free)
+    }
+
+    /// Beats of delay, or `None` while the time stays in free milliseconds.
+    pub fn beats(self) -> Option<f32> {
+        match self {
+            Self::Free => None,
+            Self::Quarter => Some(1.0),
+            Self::DottedEighth => Some(0.75),
+            Self::Eighth => Some(0.5),
+            Self::Half => Some(2.0),
+            Self::DottedQuarter => Some(1.5),
+            Self::QuarterTriplet => Some(2.0 / 3.0),
+            Self::EighthTriplet => Some(1.0 / 3.0),
+            Self::Sixteenth => Some(0.25),
+            Self::DottedSixteenth => Some(0.375),
+        }
+    }
+}
+
+/// Fallback tempo until the host publishes one, and the clamp around a
+/// published tempo. EchoSpace's constants, which WrapSynth uses too.
+
+/// The time the delay line hears. Free mode returns the stored
+/// milliseconds unchanged, so leaving sync restores the player's time.
+/// A note division is `beats * 60000 / tempo`, then clamped to the line's
+/// 40–1200 ms range. A missing or non-finite tempo uses 120.
+pub fn effective_delay_ms(sync: DelaySync, free_ms: f32, tempo_bpm: f32) -> f32 {
+    let Some(beats) = sync.beats() else {
+        return free_ms.clamp(40.0, 1200.0);
+    };
+    let tempo = if tempo_bpm.is_finite() && tempo_bpm > 0.0 {
+        tempo_bpm.clamp(echospace::MIN_TEMPO_BPM, echospace::MAX_TEMPO_BPM)
+    } else {
+        echospace::DEFAULT_TEMPO_BPM
+    };
+    (beats * 60_000.0 / tempo).clamp(40.0, 1200.0)
+}
+
+/// A pitch-shifter voicing. The semitone and cent knobs add to the
+/// mode's interval. Detune is the one mode that runs two voices, one
+/// each side of the dry pitch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum PitchModel {
+    #[default]
+    OctaveUp = 0,
+    OctaveDown = 1,
+    Detune = 2,
+    FifthUp = 3,
+    FourthDown = 4,
+    /// The knobs alone. Zero on both is the dry pitch.
+    Shift = 5,
+}
+
+impl PitchModel {
+    pub const ALL: &'static [Self] = &[
+        Self::OctaveUp,
+        Self::OctaveDown,
+        Self::Detune,
+        Self::FifthUp,
+        Self::FourthDown,
+        Self::Shift,
+    ];
+
+    pub fn from_model_id(id: &str) -> Option<Self> {
+        match id {
+            "octave_up" => Some(Self::OctaveUp),
+            "octave_down" => Some(Self::OctaveDown),
+            "detune" => Some(Self::Detune),
+            "fifth_up" => Some(Self::FifthUp),
+            "fourth_down" => Some(Self::FourthDown),
+            "shift" => Some(Self::Shift),
+            _ => None,
+        }
+    }
+
+    pub fn from_index(i: u32) -> Self {
+        Self::ALL.get(i as usize).copied().unwrap_or(Self::OctaveUp)
+    }
+
+    /// `(ratio, two voices)`. A detune sitting on zero is one dry voice,
+    /// so placing the block and leaving the knobs at rest does not chorus.
+    pub fn shift(self, semi: f32, cents: f32) -> (f32, bool) {
+        let spread = semi + cents / 100.0;
+        let (semitones, dual) = match self {
+            Self::OctaveUp => (12.0 + spread, false),
+            Self::OctaveDown => (-12.0 + spread, false),
+            Self::FifthUp => (7.0 + spread, false),
+            Self::FourthDown => (-5.0 + spread, false),
+            Self::Shift => (spread, false),
+            Self::Detune => (spread, spread.abs() > 1.0e-3),
+        };
+        (pitch::semitone_ratio(semitones), dual)
+    }
+}
+
 fn row_of(stage_row: &[u8; PATH_SLOTS], stage: StageKind) -> usize {
     (stage_row[stage as usize] as usize).min(BOTTOM_ROWS)
 }
@@ -1589,6 +1895,15 @@ pub struct Params {
     pub delay_time_r_ms: f32,
     #[serde(default = "default_delay_fb_r")]
     pub delay_fb_r: f32,
+    /// Note division for the left time, or free milliseconds. Free is the
+    /// default, so a saved time stays a saved time.
+    #[serde(default)]
+    pub delay_sync: DelaySync,
+    /// Note division for the Stereo model's right time. Dual and Triplet
+    /// keep deriving the right tap from the left, so this only sounds in
+    /// Stereo. Free by default.
+    #[serde(default)]
+    pub delay_sync_r: DelaySync,
 
     // Reverb.
     pub reverb_decay_s: f32, // 0.5..15
@@ -1668,9 +1983,35 @@ pub struct Params {
     #[serde(default = "default_row_level")]
     pub row_level: [f32; BOTTOM_ROWS],
     /// Which send row each block sits on. 0 is the main chain. Indexed by
-    /// the `StageKind` discriminant.
-    #[serde(default)]
+    /// the `StageKind` discriminant. A shorter array (a save from before a
+    /// stage was appended) pads with the main chain.
+    #[serde(default, deserialize_with = "deserialize_stage_row")]
     pub stage_row: [u8; PATH_SLOTS],
+
+    /// Pitch shifter. On by default, like the wah, and like the wah it is
+    /// not in the default path, so a rig that never placed it is unchanged.
+    #[serde(default = "default_true")]
+    pub pitch_on: bool,
+    #[serde(default)]
+    pub pitch_model: PitchModel,
+    /// Semitones added to the mode's interval, -12..12.
+    #[serde(default)]
+    pub pitch_semi: f32,
+    /// Cents added to the mode's interval, -100..100.
+    #[serde(default)]
+    pub pitch_cents: f32,
+    /// Wet mix of the shifted voice, 0..100.
+    #[serde(default = "default_pitch_mix")]
+    pub pitch_mix: f32,
+
+    /// Whole-rig transpose in semitones, -12..12. Zero is the saved
+    /// default: bypassing or removing a block does not clear it, and an
+    /// old project is not shifted.
+    #[serde(default)]
+    pub transpose_semi: f32,
+    /// Fine transpose in cents, -100..100. Zero by default.
+    #[serde(default)]
+    pub transpose_cents: f32,
 
     /// The editor's tuner is listening to the input. A view of the rig, not
     /// part of the tone: never saved, so a project or preset always opens
@@ -1743,6 +2084,27 @@ where
     Ok(out)
 }
 
+/// Read the saved row of each block, padding a shorter array (a save from
+/// before a stage was appended) with the main chain.
+fn deserialize_stage_row<'de, D>(d: D) -> Result<[u8; PATH_SLOTS], D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    let saved = Vec::<u8>::deserialize(d)?;
+    if saved.len() > PATH_SLOTS {
+        return Err(serde::de::Error::invalid_length(
+            saved.len(),
+            &"a row for at most PATH_SLOTS stages",
+        ));
+    }
+    let mut out = [0u8; PATH_SLOTS];
+    for (row, saved) in out.iter_mut().zip(saved) {
+        *row = saved.min(BOTTOM_ROWS as u8);
+    }
+    Ok(out)
+}
+
 /// Every block on both sides, except where `channels` names a side for a
 /// block that [`StageKind::splits`].
 fn sanitize_stage_channels(
@@ -1791,6 +2153,8 @@ pub struct StageBParams {
     pub delay_tone: f32,
     pub delay_time_r_ms: f32,
     pub delay_fb_r: f32,
+    pub delay_sync: DelaySync,
+    pub delay_sync_r: DelaySync,
 
     pub eq_on: bool,
     pub eq_model: EqModel,
@@ -1845,6 +2209,8 @@ impl Default for StageBParams {
             delay_tone: default_delay_tone(),
             delay_time_r_ms: default_delay_time_r(),
             delay_fb_r: default_delay_fb_r(),
+            delay_sync: DelaySync::Free,
+            delay_sync_r: DelaySync::Free,
 
             eq_on: true,
             eq_model: EqModel::Studio,
@@ -1892,6 +2258,8 @@ impl StageBParams {
             delay_tone: clamp(self.delay_tone, 0.0, 10.0),
             delay_time_r_ms: clamp(self.delay_time_r_ms, 40.0, 1_200.0),
             delay_fb_r: clamp(self.delay_fb_r, 0.0, 100.0),
+            delay_sync: self.delay_sync,
+            delay_sync_r: self.delay_sync_r,
 
             eq_on: self.eq_on,
             eq_model: self.eq_model,
@@ -1926,6 +2294,9 @@ fn default_delay_time_r() -> f32 {
 }
 fn default_delay_fb_r() -> f32 {
     35.0
+}
+fn default_pitch_mix() -> f32 {
+    100.0
 }
 fn default_reverb_shimmer() -> f32 {
     62.0
@@ -2012,6 +2383,8 @@ pub fn default_params() -> Params {
         delay_tone: default_delay_tone(),
         delay_time_r_ms: default_delay_time_r(),
         delay_fb_r: default_delay_fb_r(),
+        delay_sync: DelaySync::Free,
+        delay_sync_r: DelaySync::Free,
         reverb_decay_s: 8.5,
         reverb_mix: 55.0,
         reverb_shimmer: default_reverb_shimmer(),
@@ -2042,6 +2415,13 @@ pub fn default_params() -> Params {
         row_send: [RowSend::Off; BOTTOM_ROWS],
         row_level: default_row_level(),
         stage_row: [0; PATH_SLOTS],
+        pitch_on: true,
+        pitch_model: PitchModel::OctaveUp,
+        pitch_semi: 0.0,
+        pitch_cents: 0.0,
+        pitch_mix: default_pitch_mix(),
+        transpose_semi: 0.0,
+        transpose_cents: 0.0,
         tuner_on: false,
         nam_file: None,
         ir_file: None,
@@ -2457,6 +2837,118 @@ pub fn descriptor() -> PluginDescriptor {
                 max: 100.0,
                 unit: "%",
             },
+            ParamDescriptor {
+                id: "delay_sync",
+                name: "Delay Sync",
+                default_value: 0.0,
+                min: 0.0,
+                max: 9.0,
+                unit: "division",
+            },
+            ParamDescriptor {
+                id: "delay_sync_r",
+                name: "Delay Sync R",
+                default_value: 0.0,
+                min: 0.0,
+                max: 9.0,
+                unit: "division",
+            },
+            ParamDescriptor {
+                id: "delay2_sync",
+                name: "Delay B Sync",
+                default_value: 0.0,
+                min: 0.0,
+                max: 9.0,
+                unit: "division",
+            },
+            ParamDescriptor {
+                id: "delay2_sync_r",
+                name: "Delay B Sync R",
+                default_value: 0.0,
+                min: 0.0,
+                max: 9.0,
+                unit: "division",
+            },
+            ParamDescriptor {
+                id: "path_slot_15",
+                name: "Path Slot 16",
+                default_value: -1.0,
+                min: -1.0,
+                max: 15.0,
+                unit: "stage",
+            },
+            ParamDescriptor {
+                id: "pitch_on",
+                name: "Pitch",
+                default_value: 1.0,
+                min: 0.0,
+                max: 1.0,
+                unit: "bool",
+            },
+            ParamDescriptor {
+                id: "pitch_model",
+                name: "Pitch Mode",
+                default_value: 0.0,
+                min: 0.0,
+                max: 5.0,
+                unit: "model",
+            },
+            ParamDescriptor {
+                id: "pitch_semi",
+                name: "Pitch Semitones",
+                default_value: 0.0,
+                min: -12.0,
+                max: 12.0,
+                unit: "st",
+            },
+            ParamDescriptor {
+                id: "pitch_cents",
+                name: "Pitch Cents",
+                default_value: 0.0,
+                min: -100.0,
+                max: 100.0,
+                unit: "cents",
+            },
+            ParamDescriptor {
+                id: "pitch_mix",
+                name: "Pitch Mix",
+                default_value: 100.0,
+                min: 0.0,
+                max: 100.0,
+                unit: "%",
+            },
+            ParamDescriptor {
+                id: "pitch_channel",
+                name: "Pitch Channel",
+                default_value: 0.0,
+                min: 0.0,
+                max: 2.0,
+                unit: "channel",
+            },
+            ParamDescriptor {
+                id: "pitch_row",
+                name: "Pitch Row",
+                default_value: 0.0,
+                min: 0.0,
+                max: 3.0,
+                unit: "row",
+            },
+            ParamDescriptor {
+                id: "transpose_semi",
+                name: "Transpose",
+                default_value: 0.0,
+                min: -12.0,
+                max: 12.0,
+                unit: "st",
+            },
+            ParamDescriptor {
+                id: "transpose_cents",
+                name: "Transpose Fine",
+                default_value: 0.0,
+                min: -100.0,
+                max: 100.0,
+                unit: "cents",
+            },
         ],
     }
 }
@@ -2530,6 +3022,23 @@ pub struct Dsp {
     /// The frame each [`Held`] engine last ran on. One that sat a frame out
     /// is emptied before it runs again.
     held_ran: [u64; Held::COUNT],
+    /// Host tempo for a synced delay. 120 until the host publishes one —
+    /// the same fallback EchoSpace uses, not a tempo this plugin invents
+    /// as its sound.
+    tempo_bpm: f32,
+    /// Whole-rig pitch, after the input trim. A ratio of 1 returns the
+    /// dry sample and reports no latency.
+    transpose: pitch::PitchShift,
+    transpose_ratio: f32,
+    /// Set on the control thread when the transpose leaves zero, so the
+    /// reported latency does not wait for the blend to open.
+    transpose_on: bool,
+    /// The pitch-shifter block. Its wet path is mixed, so it does not add
+    /// to the latency the host compensates.
+    pitch_stage: pitch::PitchShift,
+    pitch_ratio: f32,
+    pitch_dual: bool,
+    pitch_mix: smooth::Smoothed,
 }
 
 /// Engines whose state outlasts the input by far more than a few samples. One
@@ -2544,16 +3053,17 @@ enum Held {
     Reverb,
     Ir,
     Nam,
+    Pitch,
 }
 
 impl Held {
-    const COUNT: usize = 5;
+    const COUNT: usize = 6;
 }
 
-/// Longest delay [`BypassDelay`] can apply, plus one. A power of two; it
-/// covers the largest latency the rig reports — a full NAM chunk with the
-/// widest rate adapter, plus the IR partition.
-const BYPASS_LINE: usize = 512;
+/// Longest delay [`BypassDelay`] can apply, plus one. A power of two. It
+/// covers a full NAM chunk, the widest rate adapter, the IR partition, and
+/// a transpose grain at rates through 192 kHz (half of a 40 ms window).
+const BYPASS_LINE: usize = 8192;
 
 const _: () = assert!(BYPASS_LINE.is_power_of_two());
 const _: () = assert!(nam::NAM_BLOCK + nam::MAX_ADAPTER_LATENCY + ir::PARTITION < BYPASS_LINE);
@@ -2763,6 +3273,14 @@ impl Dsp {
             bypass_delay: 0,
             frame: 0,
             held_ran: [0; Held::COUNT],
+            tempo_bpm: echospace::DEFAULT_TEMPO_BPM,
+            transpose: pitch::PitchShift::new(sr),
+            transpose_ratio: 1.0,
+            transpose_on: false,
+            pitch_stage: pitch::PitchShift::new(sr),
+            pitch_ratio: pitch::semitone_ratio(12.0),
+            pitch_dual: false,
+            pitch_mix: smooth::Smoothed::new(sr, 0.012, 1.0),
         };
         dsp.apply_params();
         dsp.power.set(dsp.params.power);
@@ -2899,6 +3417,8 @@ impl Dsp {
             delay_tone: clamp(params.delay_tone, 0.0, 10.0),
             delay_time_r_ms: clamp(params.delay_time_r_ms, 40.0, 1200.0),
             delay_fb_r: clamp(params.delay_fb_r, 0.0, 100.0),
+            delay_sync: params.delay_sync,
+            delay_sync_r: params.delay_sync_r,
             reverb_decay_s: clamp(params.reverb_decay_s, 0.5, 15.0),
             reverb_mix: clamp(params.reverb_mix, 0.0, 100.0),
             reverb_shimmer: clamp(params.reverb_shimmer, 0.0, 100.0),
@@ -2941,6 +3461,13 @@ impl Dsp {
                 }
                 row
             },
+            pitch_on: params.pitch_on,
+            pitch_model: params.pitch_model,
+            pitch_semi: clamp(params.pitch_semi, -12.0, 12.0),
+            pitch_cents: clamp(params.pitch_cents, -100.0, 100.0),
+            pitch_mix: clamp(params.pitch_mix, 0.0, 100.0),
+            transpose_semi: clamp(params.transpose_semi, -12.0, 12.0),
+            transpose_cents: clamp(params.transpose_cents, -100.0, 100.0),
             tuner_on: params.tuner_on,
             // File names are Studio's business, not the DSP's: dropping them
             // here keeps every later clone of these params (the per-edit
@@ -3066,6 +3593,12 @@ impl Dsp {
                 };
                 p.cab_model = m;
             }
+            "pitch" => {
+                let Some(m) = PitchModel::from_model_id(model_id) else {
+                    return false;
+                };
+                p.pitch_model = m;
+            }
             _ => return false,
         }
         let old = std::mem::replace(&mut self.params, p);
@@ -3190,15 +3723,20 @@ impl Dsp {
             delay_mix,
             delay_tone,
             delay_time_r_ms,
-            delay_fb_r
+            delay_fb_r,
+            delay_sync,
+            delay_sync_r
         ) {
+            let tempo = self.tempo_bpm;
+            let time = effective_delay_ms(p.delay_sync, p.delay_time_ms, tempo);
+            let time_r = effective_delay_ms(p.delay_sync_r, p.delay_time_r_ms, tempo);
             self.delay.configure(
                 p.delay_model,
-                p.delay_time_ms,
+                time,
                 p.delay_fb,
                 p.delay_mix,
                 p.delay_tone,
-                p.delay_time_r_ms,
+                time_r,
                 p.delay_fb_r,
             );
         }
@@ -3279,17 +3817,36 @@ impl Dsp {
             stage_b.delay_mix,
             stage_b.delay_tone,
             stage_b.delay_time_r_ms,
-            stage_b.delay_fb_r
+            stage_b.delay_fb_r,
+            stage_b.delay_sync,
+            stage_b.delay_sync_r
         ) {
+            let tempo = self.tempo_bpm;
+            let time = effective_delay_ms(b.delay_sync, b.delay_time_ms, tempo);
+            let time_r = effective_delay_ms(b.delay_sync_r, b.delay_time_r_ms, tempo);
             self.delay_b.configure(
                 b.delay_model,
-                b.delay_time_ms,
+                time,
                 b.delay_fb,
                 b.delay_mix,
                 b.delay_tone,
-                b.delay_time_r_ms,
+                time_r,
                 b.delay_fb_r,
             );
+        }
+        if moved!(pitch_model, pitch_semi, pitch_cents) {
+            let (ratio, dual) = p.pitch_model.shift(p.pitch_semi, p.pitch_cents);
+            self.pitch_ratio = ratio;
+            self.pitch_dual = dual;
+        }
+        if moved!(pitch_mix) {
+            self.pitch_mix
+                .set_target((p.pitch_mix / 100.0).clamp(0.0, 1.0));
+        }
+        if moved!(transpose_semi, transpose_cents) {
+            let semis = p.transpose_semi + p.transpose_cents / 100.0;
+            self.transpose_ratio = pitch::semitone_ratio(semis);
+            self.transpose_on = semis.abs() > 1.0e-3;
         }
         if self.fresh {
             // Nothing has played: this is a state being applied, and the
@@ -3455,7 +4012,63 @@ impl Dsp {
         } else {
             0
         };
-        nam + ir
+        // The pitch block mixes a dry path, so it does not add latency.
+        // Transpose is the whole signal: report its grain while it is off
+        // zero, including the samples before the blend has opened.
+        let transpose = if self.transpose_on {
+            self.transpose.delay_samples()
+        } else {
+            0
+        };
+        nam + ir + transpose
+    }
+
+    /// Host transport tempo. A non-finite or non-positive value is ignored
+    /// and the last good tempo (120 until the first one) stays. A synced
+    /// delay glides to the new time; a free delay is left alone.
+    pub fn set_tempo_bpm(&mut self, tempo_bpm: f32) {
+        if !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
+            return;
+        }
+        if (tempo_bpm - self.tempo_bpm).abs() < 1.0e-3 {
+            return;
+        }
+        self.tempo_bpm = tempo_bpm;
+        let synced = self.params.delay_sync != DelaySync::Free
+            || self.params.delay_sync_r != DelaySync::Free
+            || self.params.stage_b.delay_sync != DelaySync::Free
+            || self.params.stage_b.delay_sync_r != DelaySync::Free;
+        if !synced {
+            return;
+        }
+        let tempo = self.tempo_bpm;
+        let model = self.params.delay_model;
+        let time = effective_delay_ms(self.params.delay_sync, self.params.delay_time_ms, tempo);
+        let fb = self.params.delay_fb;
+        let mix = self.params.delay_mix;
+        let tone = self.params.delay_tone;
+        let time_r =
+            effective_delay_ms(self.params.delay_sync_r, self.params.delay_time_r_ms, tempo);
+        let fb_r = self.params.delay_fb_r;
+        self.delay
+            .configure(model, time, fb, mix, tone, time_r, fb_r);
+        let model = self.params.stage_b.delay_model;
+        let time = effective_delay_ms(
+            self.params.stage_b.delay_sync,
+            self.params.stage_b.delay_time_ms,
+            tempo,
+        );
+        let fb = self.params.stage_b.delay_fb;
+        let mix = self.params.stage_b.delay_mix;
+        let tone = self.params.stage_b.delay_tone;
+        let time_r = effective_delay_ms(
+            self.params.stage_b.delay_sync_r,
+            self.params.stage_b.delay_time_r_ms,
+            tempo,
+        );
+        let fb_r = self.params.stage_b.delay_fb_r;
+        self.delay_b
+            .configure(model, time, fb, mix, tone, time_r, fb_r);
     }
 }
 
@@ -3511,6 +4124,7 @@ pub fn apply_to_params(p: &mut Params, id: &str, value: f32) -> bool {
         "path_slot_12" => p.stage_order[12] = StageKind::from_index(value.round() as i32),
         "path_slot_13" => p.stage_order[13] = StageKind::from_index(value.round() as i32),
         "path_slot_14" => p.stage_order[14] = StageKind::from_index(value.round() as i32),
+        "path_slot_15" => p.stage_order[15] = StageKind::from_index(value.round() as i32),
         "gate_thresh" => p.gate_thresh_db = value,
         "drive_gain" => p.drive_gain = value,
         "drive_tone" => p.drive_tone = value,
@@ -3632,6 +4246,24 @@ pub fn apply_to_params(p: &mut Params, id: &str, value: f32) -> bool {
         "delay2_row" => set_row(p, StageKind::Delay2, value),
         "eq2_row" => set_row(p, StageKind::Eq2, value),
         "comp2_row" => set_row(p, StageKind::Comp2, value),
+        "pitch_row" => set_row(p, StageKind::Pitch, value),
+        "pitch_channel" => set_channel(p, StageKind::Pitch, value),
+
+        "delay_sync" => p.delay_sync = DelaySync::from_index(value.round().max(0.0) as u32),
+        "delay_sync_r" => p.delay_sync_r = DelaySync::from_index(value.round().max(0.0) as u32),
+        "delay2_sync" => {
+            p.stage_b.delay_sync = DelaySync::from_index(value.round().max(0.0) as u32)
+        }
+        "delay2_sync_r" => {
+            p.stage_b.delay_sync_r = DelaySync::from_index(value.round().max(0.0) as u32)
+        }
+        "pitch_on" => p.pitch_on = on,
+        "pitch_model" => p.pitch_model = PitchModel::from_index(value.round().max(0.0) as u32),
+        "pitch_semi" => p.pitch_semi = value,
+        "pitch_cents" => p.pitch_cents = value,
+        "pitch_mix" => p.pitch_mix = value,
+        "transpose_semi" => p.transpose_semi = value,
+        "transpose_cents" => p.transpose_cents = value,
 
         _ => return false,
     }
@@ -3706,6 +4338,7 @@ pub fn ui_values(p: &Params) -> Vec<(&'static str, f32)> {
         "path_slot_12",
         "path_slot_13",
         "path_slot_14",
+        "path_slot_15",
     ];
     for (i, id) in PATH_SLOT_IDS.iter().enumerate() {
         out.push((
@@ -3809,6 +4442,17 @@ pub fn ui_values(p: &Params) -> Vec<(&'static str, f32)> {
     for kind in StageKind::ALL {
         out.push((kind.row_id(), p.stage_row[*kind as usize] as f32));
     }
+    out.push(("delay_sync", p.delay_sync as u8 as f32));
+    out.push(("delay_sync_r", p.delay_sync_r as u8 as f32));
+    out.push(("delay2_sync", sb.delay_sync as u8 as f32));
+    out.push(("delay2_sync_r", sb.delay_sync_r as u8 as f32));
+    out.push(("pitch_on", b(p.pitch_on)));
+    out.push(("pitch_model", model_index(PitchModel::ALL, p.pitch_model)));
+    out.push(("pitch_semi", p.pitch_semi));
+    out.push(("pitch_cents", p.pitch_cents));
+    out.push(("pitch_mix", p.pitch_mix));
+    out.push(("transpose_semi", p.transpose_semi));
+    out.push(("transpose_cents", p.transpose_cents));
     out
 }
 
@@ -3887,6 +4531,9 @@ impl StereoEffect for Dsp {
         self.eq_b.reset();
         self.mod_b.reset();
         self.delay_b.reset();
+        self.transpose.reset();
+        self.pitch_stage.reset();
+        self.pitch_mix.snap();
         self.meters.reset();
         self.tuner.reset();
         self.in_gain.snap();
@@ -3917,6 +4564,9 @@ impl StereoEffect for Dsp {
         self.eq_b.set_sample_rate(sr);
         self.mod_b.set_sample_rate(sr);
         self.delay_b.set_sample_rate(sr);
+        self.transpose.set_sample_rate(sr);
+        self.pitch_stage.set_sample_rate(sr);
+        self.pitch_mix.set_time(sr, 0.012);
         self.cab_ir_step = 1.0 / (sr * CAB_ENGINE_FADE_SECONDS).max(1.0);
         self.line2_coeff = line2_coeff(sr);
         self.meters.rms_coeff = time_constant(sr, 0.300);
@@ -4065,6 +4715,12 @@ impl Dsp {
             [l, r],
             self.meters.rms_coeff,
         );
+
+        // After the trim and the meters, before any block. The tuner is
+        // fed in `process_stereo` before `run`, so it still hears the guitar.
+        let (shifted_l, shifted_r) = self.transpose.process(l, r, self.transpose_ratio, false);
+        l = shifted_l;
+        r = shifted_r;
 
         let mut dry_l = l;
         let mut dry_r = r;
@@ -4335,6 +4991,16 @@ impl Dsp {
             }
             StageKind::Eq2 if self.params.stage_b.eq_on => self.eq_b.process(l, r),
             StageKind::Comp2 if self.params.stage_b.comp_on => self.comp_b.process(l, r),
+            StageKind::Pitch if self.params.pitch_on => {
+                if self.resumes(Held::Pitch) {
+                    self.pitch_stage.reset();
+                }
+                let (wet_l, wet_r) =
+                    self.pitch_stage
+                        .process(l, r, self.pitch_ratio, self.pitch_dual);
+                let mix = self.pitch_mix.tick();
+                (l + (wet_l - l) * mix, r + (wet_r - r) * mix)
+            }
             _ => return None,
         })
     }
@@ -7089,6 +7755,20 @@ mod telemetry_tests {
         assert_eq!(CabModel::ALL[27], CabModel::Dark15);
         assert_eq!(CabModel::ALL[28], CabModel::Razor4x12);
         assert_eq!(CabModel::from_index(35), CabModel::Tight2x12);
+        assert_eq!(AmpModel::from_index(40), AmpModel::HerbertLead);
+        assert_eq!(AmpModel::from_index(49), AmpModel::DeluxeReverb);
+        assert_eq!(AmpModel::ALL[39], AmpModel::SlamHead);
+        assert_eq!(CabModel::from_index(36), CabModel::Green2x12);
+        assert_eq!(CabModel::from_index(45), CabModel::Open2x10);
+        assert_eq!(CabModel::ALL[11], CabModel::Ir);
+        assert!(StageKind::default_path()
+            .iter()
+            .all(|s| *s != Some(StageKind::Pitch)));
+        assert_eq!(default_params().transpose_semi, 0.0);
+        assert_eq!(default_params().delay_sync, DelaySync::Free);
+        assert!((effective_delay_ms(DelaySync::Quarter, 420.0, 120.0) - 500.0).abs() < 1.0e-3);
+        assert!((effective_delay_ms(DelaySync::Free, 420.0, 90.0) - 420.0).abs() < 1.0e-3);
+        assert!((effective_delay_ms(DelaySync::Quarter, 420.0, f32::NAN) - 500.0).abs() < 1.0e-3);
         assert_eq!(CabModel::from_model_id("doom_810"), Some(CabModel::Doom810));
         assert_eq!(ModModel::ALL[16], ModModel::BiasTrem);
         assert_eq!(ModModel::ALL[17], ModModel::RazorChorus);

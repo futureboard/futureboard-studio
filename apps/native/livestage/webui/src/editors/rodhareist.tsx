@@ -22,7 +22,7 @@ import './rodhareist.css'
 
 // ── The block model (rodhareist_blocks.rs) ──────────────────────────────
 
-const PATH_SLOTS = 15
+const PATH_SLOTS = 16
 
 /** `StageKind` discriminants: the `path_slot_*` wire values. */
 const Stage = {
@@ -41,8 +41,9 @@ const Stage = {
   Delay2: 12,
   Eq2: 13,
   Comp2: 14,
+  Pitch: 15,
 } as const
-const STAGE_COUNT = 15
+const STAGE_COUNT = 16
 
 /** The plug-in's own identity colours (the native `pal`), kept as they are:
  *  amber for dirt and dynamics before the amp, teal for time and
@@ -62,7 +63,7 @@ interface Category {
 const CATEGORIES: Category[] = [
   { name: 'Gate', glyph: 'GTE', tint: 'amber', kinds: [Stage.Gate] },
   { name: 'Compressor', glyph: 'CMP', tint: 'amber', kinds: [Stage.Comp, Stage.Comp2] },
-  { name: 'Wah', glyph: 'WAH', tint: 'amber', kinds: [Stage.Wah] },
+  { name: 'Filter', glyph: 'FLT', tint: 'amber', kinds: [Stage.Wah, Stage.Pitch] },
   { name: 'Drive', glyph: 'DRV', tint: 'amber', kinds: [Stage.Drive, Stage.Drive2] },
   { name: 'Amp', glyph: 'AMP', tint: 'amber', kinds: [Stage.Amp] },
   { name: 'Cab', glyph: 'CAB', tint: 'neutral', kinds: [Stage.Cab] },
@@ -147,6 +148,16 @@ const AMP_MODELS = [
   'Crunch Saw',
   'Ultra Scoop',
   'Slam Head',
+  'Herbert Lead',
+  'VH4 Lead',
+  'Ecstasy Red',
+  'Uberschall',
+  'Savage Lead',
+  'Archon Lead',
+  'Deliverance',
+  'Jubilee Lead',
+  'DSL Lead',
+  'Deluxe Reverb',
 ]
 const CAB_MODELS = [
   '1960v Vintage 4x12',
@@ -185,6 +196,16 @@ const CAB_MODELS = [
   'Ice 4x12',
   'Doom 8x10',
   'Tight 2x12',
+  'Greenback 2x12',
+  'Alnico 4x12',
+  'Vintage 1x15',
+  'Bass 4x10',
+  'Dark 1x12',
+  'Modern 1x12',
+  'V30 Stack 4x12',
+  'Cream 2x12',
+  'Ported 4x12',
+  'Open 2x10',
 ]
 /** `CabModel::Ir`: convolution with a loaded file, not a modeled voicing. */
 const CAB_IR = 11
@@ -229,6 +250,9 @@ const COMP_MODELS = [
   'Opto Slam',
 ]
 const WAH_MODELS = ['Cry Wah', 'Touch Wah', 'Bass Wah', 'Vocal Wah', 'Parked Filter', 'Talk Filter']
+const PITCH_MODELS = ['Octave Up', 'Octave Down', 'Detune', 'Fifth Up', 'Fourth Down', 'Shift']
+const DELAY_STEREO = 5
+const SYNC_LABELS = ['Free', '1/4', '1/8.', '1/8', '1/2', '1/4.', '1/4t', '1/8t', '1/16', '1/16.']
 const WAH_TOUCH = 1
 const DELAY_MODELS = [
   'Tape Echo',
@@ -371,6 +395,16 @@ const STAGES: StageInfo[] = [
   { name: 'Delay B', enable: 'delay2_on', models: { wire: 'delay2_model', labels: DELAY_MODELS }, rows: delayRows('delay2') },
   { name: 'EQ B', enable: 'eq2_on', models: { wire: 'eq2_model', labels: EQ_MODELS }, rows: eqRows('eq2') },
   { name: 'Comp B', enable: 'comp2_on', models: { wire: 'comp2_model', labels: COMP_MODELS }, rows: compRows('comp2') },
+  {
+    name: 'Pitch',
+    enable: 'pitch_on',
+    models: { wire: 'pitch_model', labels: PITCH_MODELS },
+    rows: [
+      ['pitch_semi', 'pitch_semi', 'Semitones'],
+      ['pitch_cents', 'pitch_cents', 'Cents'],
+      ['pitch_mix', 'pitch_mix', 'Mix'],
+    ],
+  },
 ]
 
 /** The NAM capture rows: the descriptor does not list them, so their ranges
@@ -708,6 +742,24 @@ function PresetBar(props: { editor: Editor; preset: number | null }) {
         <Trim editor={editor} id="output_trim" label="OUT" />
       </div>
       <div className="rh-bar-group">
+        <span className="rh-caption">KEY</span>
+        <button type="button" className="rh-action" aria-label="Transpose down" onClick={() => nudge(editor, 'transpose_semi', -1, -12, 12)}>
+          −
+        </button>
+        <span className="rh-tempo">{Math.round(editor.value('transpose_semi'))}</span>
+        <button type="button" className="rh-action" aria-label="Transpose up" onClick={() => nudge(editor, 'transpose_semi', 1, -12, 12)}>
+          +
+        </button>
+        <span className="rh-caption">FINE</span>
+        <button type="button" className="rh-action" aria-label="Transpose fine down" onClick={() => nudge(editor, 'transpose_cents', -1, -100, 100)}>
+          −
+        </button>
+        <span className="rh-tempo">{Math.round(editor.value('transpose_cents'))}</span>
+        <button type="button" className="rh-action" aria-label="Transpose fine up" onClick={() => nudge(editor, 'transpose_cents', 1, -100, 100)}>
+          +
+        </button>
+      </div>
+      <div className="rh-bar-group">
         <span className="rh-caption">TEMPO</span>
         {/* The plug-in follows the host transport's tempo; LiveStage runs
             no transport, so there is none to show (the native "—"). */}
@@ -975,6 +1027,20 @@ function CategoryColumn(props: PanelProps) {
   )
 }
 
+function nudge(editor: Editor, id: string, delta: number, min: number, max: number) {
+  const next = Math.min(max, Math.max(min, Math.round(editor.value(id) + delta)))
+  editor.set(id, next)
+}
+
+function ampSection(choice: Choice): string {
+  if (choice.wire === 'tone_engine') return 'NAM'
+  const clean = [2, 11, 12, 14, 15, 21, 22, 25, 30, 49]
+  const crunch = [0, 1, 3, 5, 7, 8, 10, 16, 17, 18, 24, 26, 27, 28, 31, 37, 47, 48]
+  if (clean.includes(choice.value)) return 'Clean'
+  if (crunch.includes(choice.value)) return 'Crunch'
+  return 'High Gain'
+}
+
 function ModelColumn(props: PanelProps) {
   const { editor, focus } = props
   if (!('block' in focus)) {
@@ -987,22 +1053,35 @@ function ModelColumn(props: PanelProps) {
   const kind = focus.block
   const accent = TINT[categoryOf(kind).tint]
   const [list, selected] = models(editor, kind)
+  const sections =
+    kind === Stage.Amp ? (['Clean', 'Crunch', 'High Gain', 'NAM'] as const) : ([''] as const)
   return (
     <div className="rh-models" style={{ '--rh-accent': accent } as CSSProperties}>
-      {list.map((model, index) => {
-        const active = selected === index
+      {sections.map((section) => {
+        const rows = list
+          .map((model, index) => ({ model, index }))
+          .filter(({ model }) => section === '' || ampSection(model) === section)
+        if (rows.length === 0) return null
         return (
-          <button
-            key={model.label}
-            type="button"
-            className={`rh-model${active ? ' on' : ''}`}
-            aria-pressed={active}
-            onClick={() => {
-              if (model.wire && !active) setWire(editor, model.wire, model.value)
-            }}
-          >
-            {model.label}
-          </button>
+          <div key={section || 'all'}>
+            {section !== '' && <div className="rh-caption">{section}</div>}
+            {rows.map(({ model, index }) => {
+              const active = selected === index
+              return (
+                <button
+                  key={`${model.wire}-${model.value}`}
+                  type="button"
+                  className={`rh-model${active ? ' on' : ''}`}
+                  aria-pressed={active}
+                  onClick={() => {
+                    if (model.wire && !active) setWire(editor, model.wire, model.value)
+                  }}
+                >
+                  {model.label}
+                </button>
+              )
+            })}
+          </div>
         )
       })}
     </div>
@@ -1097,6 +1176,38 @@ function ParamRow(props: { editor: Editor; spec: ParamSpec; accent: string }) {
 }
 
 /** A row of choice chips (microphone type, capture loudness). */
+function DelaySync(props: { editor: Editor; kind: number; accent: string }) {
+  const second = props.kind === Stage.Delay2
+  const modelId = second ? 'delay2_model' : 'delay_model'
+  const syncId = second ? 'delay2_sync' : 'delay_sync'
+  const rightId = second ? 'delay2_sync_r' : 'delay_sync_r'
+  const stereo = modelIndex(props.editor.value(modelId), DELAY_MODELS.length) === DELAY_STEREO
+  const choices = (wire: string): Choice[] => SYNC_LABELS.map((label, value) => ({ label, wire, value }))
+  return (
+    <>
+      <ChipRow
+        editor={props.editor}
+        label="Time"
+        choices={choices(syncId)}
+        selected={modelIndex(props.editor.value(syncId), SYNC_LABELS.length)}
+        accent={props.accent}
+      />
+      {stereo && (
+        <ChipRow
+          editor={props.editor}
+          label="Time R"
+          choices={choices(rightId)}
+          selected={modelIndex(props.editor.value(rightId), SYNC_LABELS.length)}
+          accent={props.accent}
+        />
+      )}
+      <span className="rh-note">
+        Free keeps the millisecond time. A division follows the host tempo; LiveStage has no transport, so the engine uses its usual fallback until a host publishes one.
+      </span>
+    </>
+  )
+}
+
 function ChipRow(props: { editor: Editor; label: string; choices: Choice[]; selected: number | null; accent: string }) {
   return (
     <div className="rh-row">
@@ -1216,6 +1327,9 @@ function ParamColumn(props: PanelProps) {
         )}
         {kind === Stage.Cab && cabIr && <LoaderNote label="Impulse" what="Impulse responses" />}
         {nam && <LoaderNote label="Capture" what="NAM captures" />}
+        {(kind === Stage.Delay || kind === Stage.Delay2) && (
+          <DelaySync editor={editor} kind={kind} accent={accent} />
+        )}
         {params(editor, kind).map((spec) => (
           <ParamRow key={spec.id} editor={editor} spec={spec} accent={accent} />
         ))}

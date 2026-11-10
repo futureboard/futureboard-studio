@@ -24,7 +24,7 @@ use gpui::{
     ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, TextAlign, TextRun, Window,
 };
 
-use crate::components::fader::{drag_to, is_reset_click, FaderDrag};
+use crate::components::fader::{drag_to, is_reset_click, is_reset_double_click, FaderDrag};
 use crate::components::plugin_kit::{Cx, KitEditor, KitModel, LiveBounds, LiveSlot};
 use crate::components::title_bar::TITLEBAR_HEIGHT;
 
@@ -906,7 +906,48 @@ pub fn knob_reading<T: 'static>(
     let set: KnobSet = Rc::new(move |value, app: &mut App| {
         let _ = entity.update(app, |this, cx| set(this, value, cx));
     });
-    knob_with(key, dial, value, readout, look, cell, ink, enabled, s, set)
+    knob_body(
+        key, dial, value, readout, look, cell, ink, enabled, s, set, None,
+    )
+}
+
+/// [`knob`], and a stationary double-click calls `on_double` instead of
+/// resetting. Alt-click still resets. Other editors keep [`knob`]'s reset.
+#[allow(clippy::too_many_arguments)]
+pub fn knob_typed<T: 'static>(
+    cx: &mut Context<T>,
+    key: impl Into<SharedString>,
+    dial: Dial,
+    value: f32,
+    look: KnobLook,
+    cell: KnobCell,
+    ink: Rgba,
+    enabled: bool,
+    s: f32,
+    set: impl Fn(&mut T, f32, &mut Context<T>) + 'static,
+    on_double: impl Fn(&mut T, &mut Window, &mut Context<T>) + 'static,
+) -> AnyElement {
+    let entity = cx.entity().clone();
+    let set_value: KnobSet = Rc::new(move |value, app: &mut App| {
+        let _ = entity.update(app, |this, cx| set(this, value, cx));
+    });
+    let entity = cx.entity().clone();
+    let type_in: Rc<dyn Fn(&mut Window, &mut App)> = Rc::new(move |window, app| {
+        let _ = entity.update(app, |this, cx| on_double(this, window, cx));
+    });
+    knob_body(
+        key,
+        dial,
+        value,
+        None,
+        look,
+        cell,
+        ink,
+        enabled,
+        s,
+        set_value,
+        Some(type_in),
+    )
 }
 
 /// What a knob calls with each new value.
@@ -926,6 +967,24 @@ pub fn knob_with(
     enabled: bool,
     s: f32,
     set: KnobSet,
+) -> AnyElement {
+    knob_body(
+        key, dial, value, readout, look, cell, ink, enabled, s, set, None,
+    )
+}
+
+fn knob_body(
+    key: impl Into<SharedString>,
+    dial: Dial,
+    value: f32,
+    readout: Option<String>,
+    look: KnobLook,
+    cell: KnobCell,
+    ink: Rgba,
+    enabled: bool,
+    s: f32,
+    set: KnobSet,
+    on_double: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
 ) -> AnyElement {
     let key: SharedString = key.into();
     let n = dial.norm(value);
@@ -971,7 +1030,17 @@ pub fn knob_with(
                 }
                 wheel_set(wheel_turn(dial, value, dy, event.modifiers.shift), app);
             })
-            .on_click(move |event, _window, app| {
+            .on_click(move |event, window, app| {
+                let alt = matches!(
+                    event,
+                    gpui::ClickEvent::Mouse(mouse) if mouse.down.modifiers.alt
+                );
+                if !alt && is_reset_double_click(event) {
+                    if let Some(type_in) = on_double.as_ref() {
+                        type_in(window, app);
+                        return;
+                    }
+                }
                 if is_reset_click(event) {
                     set(dial.default, app);
                 }

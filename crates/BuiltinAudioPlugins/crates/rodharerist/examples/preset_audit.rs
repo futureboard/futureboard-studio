@@ -36,8 +36,8 @@
 use std::f32::consts::TAU;
 
 use builtin_dsp_core::StereoEffect;
-use rodharerist::{AmpModel, CabModel, Dsp, MicModel, PATH_SLOTS, StageKind, default_params};
-use rustfft::{FftPlanner, num_complex::Complex};
+use rodharerist::{default_params, AmpModel, CabModel, Dsp, MicModel, StageKind, PATH_SLOTS};
+use rustfft::{num_complex::Complex, FftPlanner};
 
 const SR: f32 = 48_000.0;
 /// Long enough for a reverb tail and a few delay repeats to establish.
@@ -175,7 +175,7 @@ fn band_energy(spectrum: &[f32], lo: f32, hi: f32) -> f32 {
 /// Amp models in `AmpModel::ALL` order, with the cab each one is normally
 /// paired with in the bank — the map has to include the cab, because a preset
 /// is never auditioned without one.
-const AMP_MAP: [(AmpModel, CabModel); 40] = [
+const AMP_MAP: [(AmpModel, CabModel); 50] = [
     (AmpModel::Mandarin, CabModel::Vintage2x12),
     (AmpModel::Plexi, CabModel::Brit4x12),
     (AmpModel::Twin, CabModel::American2x12),
@@ -216,6 +216,16 @@ const AMP_MAP: [(AmpModel, CabModel); 40] = [
     (AmpModel::CrunchSaw, CabModel::Brit4x12),
     (AmpModel::UltraScoop, CabModel::Razor4x12),
     (AmpModel::SlamHead, CabModel::Cannon4x12),
+    (AmpModel::HerbertLead, CabModel::Modern4x12),
+    (AmpModel::Vh4Lead, CabModel::Razor4x12),
+    (AmpModel::EcstasyRed, CabModel::Slo4x12),
+    (AmpModel::Uberschall, CabModel::Oversized4x12),
+    (AmpModel::SavageLead, CabModel::Uber4x12),
+    (AmpModel::ArchonLead, CabModel::Cannon4x12),
+    (AmpModel::Deliverance, CabModel::Cream4x12),
+    (AmpModel::JubileeLead, CabModel::Brit4x12),
+    (AmpModel::DslLead, CabModel::Brit4x12),
+    (AmpModel::DeluxeReverb, CabModel::American1x12),
 ];
 
 /// Where each amp model actually sits on its Gain and Master travel, measured

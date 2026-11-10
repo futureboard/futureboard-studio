@@ -1164,16 +1164,19 @@ impl BuiltinHostProcessor {
     /// from it. Producer thread only, same exclusivity contract as
     /// [`Self::process_block`].
     ///
-    /// EchoSpace's synced delay and WrapSynth's synced LFOs and delay read
-    /// it, so the other variants fall through without touching their DSP:
-    /// this costs a discriminant test per block, and inside those a float
-    /// compare that exits early unless the tempo actually moved.
+    /// EchoSpace's synced delay, WrapSynth's synced LFOs and delay, and
+    /// Rodhareist's synced delay times read it. The other variants fall
+    /// through without touching their DSP: this costs a discriminant test
+    /// per block, and inside those a float compare that exits early unless
+    /// the tempo actually moved.
     fn set_transport_tempo(&self, tempo_bpm: f32) {
         // SAFETY: the dedicated producer thread is the sole DSP accessor.
         match unsafe { &mut *self.dsp.get() } {
             BuiltinDsp::Echospace(dsp) => dsp.set_tempo_bpm(tempo_bpm),
             // Its synced LFOs and delay.
             BuiltinDsp::WrapSynth(dsp) => dsp.set_tempo_bpm(tempo_bpm),
+            // Synced delay times. A free delay ignores the call.
+            BuiltinDsp::Rodhareist(dsp) => dsp.set_tempo_bpm(tempo_bpm),
             _ => {}
         }
     }
