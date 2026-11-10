@@ -1,4 +1,5 @@
-# Build the WhiteSharp Windows installer and, with -Upload, publish it to R2.
+# Build the WhiteSharp Windows installer and, with -Upload, copy it to the R2
+# mirror.
 #
 # Steps:
 #   1. cargo whitesharp-vst3 bundle whitesharp_vst3 --release   (skip: -SkipBundle)
@@ -9,9 +10,12 @@
 # value the plug-in reports to the host, so the installer cannot disagree with
 # the binary it carries.
 #
-# The upload name is the contract with the website: its /releases/plugins/
-# whitesharp endpoint lists whitesharp-release/ and serves the highest
-# WhiteSharp_<version>-windows.<ext> it finds. Nothing else needs publishing.
+# The website's /releases/plugins/whitesharp endpoint serves the latest GitHub
+# release of futureboard/whitesharp-release: publish the installer there
+# (gh release create <tag> <installer> -R futureboard/whitesharp-release).
+# R2 is the second mirror: the endpoint lists whitesharp-release/ and serves
+# the highest WhiteSharp_<version>-windows.<ext> from it only when GitHub has
+# no build or cannot be reached, or with ?mirror=1.
 #
 # R2 credentials come from the repository .env (CF_AWSS3_API,
 # R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY) and are only passed to the aws CLI
@@ -199,4 +203,4 @@ finally {
 }
 
 Write-Host "Uploaded: $target" -ForegroundColor Green
-Write-Host "The site serves it from /releases/plugins/whitesharp/download?platform=windows within ~2 minutes."
+Write-Host "Mirror: /releases/plugins/whitesharp/download?platform=windows&mirror=1 within ~2 minutes."
