@@ -239,7 +239,7 @@ impl WindowsPlatform {
                 0,
                 Some(HWND_MESSAGE),
                 None,
-                None,
+                Some(crate::window::get_module_handle().into()),
                 Some(&raw const context as *const _),
             )
         };
@@ -1442,9 +1442,14 @@ fn handle_gpu_device_lost(
 
 const PLATFORM_WINDOW_CLASS_NAME: PCWSTR = w!("Zed::PlatformWindow");
 
+/// Registered under this module, like `Zed::Window`. With no instance the class is the process'
+/// own, and every copy of GPUI in the process (a plug-in's VST2, VST3 and CLAP builds, or two
+/// plug-ins) shares it: only the first registration takes, and later copies run the first copy's
+/// window procedure, whose dispatcher answers to that copy's thread ids and never to theirs.
 fn register_platform_window_class() {
     let wc = WNDCLASSW {
         lpfnWndProc: Some(window_procedure),
+        hInstance: crate::window::get_module_handle().into(),
         lpszClassName: PCWSTR(PLATFORM_WINDOW_CLASS_NAME.as_ptr()),
         ..Default::default()
     };
