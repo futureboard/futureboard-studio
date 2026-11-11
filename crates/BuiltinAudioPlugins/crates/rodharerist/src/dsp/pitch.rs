@@ -41,9 +41,21 @@ const MAX_FADE_SECONDS: f32 = 0.006;
 /// Stretch of signal the search compares around each head.
 const MATCH_SECONDS: f32 = 0.006;
 /// Delay reported for a shifted signal. The heads wander between
-/// [`MIN_DELAY_SECONDS`] and about 25 ms; their average sits within a few
-/// ms of this — a little under for a shift up, a little over for one down.
-const LATENCY_SECONDS: f32 = 0.012;
+/// [`MIN_DELAY_SECONDS`] and about 25 ms, and where they average depends on
+/// the shift and the material: a shift up averages 6.5-12 ms, a shift down
+/// 12.5-19.5 ms (it rides up to its splice point and lands one period of the
+/// note earlier, so the lowest notes sit latest). An aligned shifter pads its
+/// output up to this value (see [`PitchShift::aligned`]). It sits above the
+/// latest average because a pad can only delay: below it, a shift down came
+/// out up to 7 ms after the delay the host compensates.
+const LATENCY_SECONDS: f32 = 0.020;
+/// Span of the time-weighted head average the pad follows. Each finished
+/// splice cycle counts by its length, so a small shift's long cycles and a
+/// large shift's short ones average over the same stretch of time.
+const PAD_AVERAGE_SECONDS: f32 = 1.0;
+/// Most the pad moves per sample, in samples: 0.1 % of playback speed, about
+/// 1.7 cents while it settles, far inside any vibrato.
+const PAD_SLEW: f32 = 0.001;
 /// How fast the dry/shifted blend moves, so engaging a shift does not click.
 const BLEND_SECONDS: f32 = 0.012;
 /// Time constant a ratio change glides with.
@@ -132,6 +144,22 @@ impl Geometry {
         let fade = (FADE_SHARE * self.min_jump / dev).clamp(self.min_fade, self.max_fade);
         let jump = self.min_jump.max(dev * fade / FADE_SHARE);
         (fade, jump)
+    }
+
+    /// Where a head at `ratio` is expected to average: up, it rides from its
+    /// landing down to the splice point; down, from its landing up to it, half
+    /// a jump either way. Jumps are a period of the note, between the
+    /// shortest jump (low single notes) and about half the span (chords), so
+    /// this takes the middle of that. The aligned pad starts here and then
+    /// follows the heads, within about 2 ms of where they settle.
+    fn expected_head(&self, ratio: f32) -> f32 {
+        let (fade, jump_lo) = self.plan(ratio);
+        let half_jump = 0.5 * jump_lo + 0.125 * self.span;
+        if ratio >= 1.0 {
+            self.min_delay + (ratio - 1.0) * fade + half_jump
+        } else {
+            self.min_delay + jump_lo + self.span - half_jump
+        }
     }
 
     /// Delay a head starts from when a shift engages: low, so the blend
@@ -398,9 +426,35 @@ pub(super) struct PitchShift {
     dual_gain: f32,
     voice_a: Voice,
     voice_b: Voice,
+    /// Pads the output so the shifted signal sits at [`Self::delay_samples`]
+    /// on average: on for the whole-rig transpose, whose delay the host
+    /// compensates; off for the pitch block, which mixes with its dry path.
+    align: bool,
+    pad_l: Vec<f32>,
+    pad_r: Vec<f32>,
+    pad_mask: usize,
+    pad_pos: usize,
+    /// The pad applied now, in samples, and the head average it follows.
+    pad: f32,
+    head_avg: f32,
+    /// The splice cycle in progress: the head delay summed since the last
+    /// splice, over how many samples, and whether a splice fade is running.
+    /// Averaging whole cycles is exact for any shift; a time constant was
+    /// shorter than a small shift's cycle and followed its sawtooth instead.
+    cycle_sum: f64,
+    cycle_len: u32,
+    splicing: bool,
 }
 
 impl PitchShift {
+    /// A shifter whose output delay averages [`Self::delay_samples`]: what
+    /// the host is told, so its compensation lines the shifted rig up.
+    pub(super) fn aligned(sample_rate: f32) -> Self {
+        let mut shift = Self::new(sample_rate);
+        shift.align = true;
+        shift
+    }
+
     pub(super) fn new(sample_rate: f32) -> Self {
         let mut shift = Self {
             sample_rate: 1.0,
@@ -420,6 +474,16 @@ impl PitchShift {
             dual_gain: 0.0,
             voice_a: Voice::parked(1.0),
             voice_b: Voice::parked(1.0),
+            align: false,
+            pad_l: Vec::new(),
+            pad_r: Vec::new(),
+            pad_mask: 0,
+            pad_pos: 0,
+            pad: 0.0,
+            head_avg: 0.0,
+            cycle_sum: 0.0,
+            cycle_len: 0,
+            splicing: false,
         };
         shift.set_sample_rate(sample_rate);
         shift
@@ -437,6 +501,10 @@ impl PitchShift {
         self.lp_coeff = 1.0 - (-std::f32::consts::TAU * ANALYSIS_LOWPASS_HZ / sr).exp();
         self.glide = 1.0 - (-1.0 / (sr * GLIDE_SECONDS).max(1.0)).exp();
         self.blend_step = 1.0 / (sr * BLEND_SECONDS).max(1.0);
+        let pad_len = (self.delay_samples() + 4).next_power_of_two();
+        self.pad_l = vec![0.0; pad_len];
+        self.pad_r = vec![0.0; pad_len];
+        self.pad_mask = pad_len - 1;
         self.reset();
     }
 
@@ -452,6 +520,59 @@ impl PitchShift {
         self.dual_gain = 0.0;
         self.voice_a = Voice::parked(self.geo.min_delay);
         self.voice_b = Voice::parked(self.geo.min_delay);
+        self.clear_pad();
+    }
+
+    fn clear_pad(&mut self) {
+        self.pad_l.fill(0.0);
+        self.pad_r.fill(0.0);
+        self.pad = 0.0;
+        self.head_avg = self.delay_samples() as f32;
+        self.cycle_sum = 0.0;
+        self.cycle_len = 0;
+        self.splicing = false;
+    }
+
+    /// Delays the wet signal by the pad, which follows the head average up
+    /// to the reported delay at no more than [`PAD_SLEW`] per sample.
+    #[inline]
+    fn pad_wet(&mut self, l: f32, r: f32) -> (f32, f32) {
+        let head = self.voice_a.delay[self.voice_a.active];
+        self.cycle_sum += f64::from(head);
+        self.cycle_len = self.cycle_len.saturating_add(1);
+        let splicing = self.voice_a.fade_len > 0.0;
+        if splicing && !self.splicing && self.cycle_len > 0 {
+            // A splice starts: the cycle that ends here is one full ride of
+            // the head, landing to splice point.
+            let mean = (self.cycle_sum / f64::from(self.cycle_len)) as f32;
+            let weight =
+                1.0 - (-(self.cycle_len as f32) / (self.sample_rate * PAD_AVERAGE_SECONDS)).exp();
+            self.head_avg += (mean - self.head_avg) * weight;
+            self.cycle_sum = 0.0;
+            self.cycle_len = 0;
+        }
+        self.splicing = splicing;
+        let max = self.pad_mask as f32 - 2.0;
+        let target = (self.delay_samples() as f32 - self.head_avg).clamp(0.0, max);
+        self.pad += (target - self.pad).clamp(-PAD_SLEW, PAD_SLEW);
+        self.pad_pos = (self.pad_pos + 1) & self.pad_mask;
+        self.pad_l[self.pad_pos] = l;
+        self.pad_r[self.pad_pos] = r;
+        let whole = self.pad.floor();
+        let frac = self.pad - whole;
+        let i0 = self.pad_pos.wrapping_sub(whole as usize) & self.pad_mask;
+        let i1 = i0.wrapping_sub(1) & self.pad_mask;
+        (
+            self.pad_l[i0] + (self.pad_l[i1] - self.pad_l[i0]) * frac,
+            self.pad_r[i0] + (self.pad_r[i1] - self.pad_r[i0]) * frac,
+        )
+    }
+
+    /// Average delay of the output while shifting: the active head plus the
+    /// pad. What the reported delay is meant to match.
+    #[cfg(test)]
+    fn output_delay(&self) -> f32 {
+        self.voice_a.delay[self.voice_a.active] + if self.align { self.pad } else { 0.0 }
     }
 
     /// Samples of delay a shifted signal carries once the blend has opened.
@@ -504,6 +625,15 @@ impl PitchShift {
             self.voice_a = Voice::parked(self.geo.start_delay(target));
             self.voice_b = Voice::parked(self.geo.start_delay(1.0 / target));
             self.dual_gain = if dual { 1.0 } else { 0.0 };
+            if self.align {
+                // Nothing of the last engagement may sound through the pad,
+                // and the blend is still closed: the pad can start where the
+                // heads are expected to average instead of slewing there.
+                self.clear_pad();
+                self.head_avg = self.geo.expected_head(target);
+                let max = self.pad_mask as f32 - 2.0;
+                self.pad = (self.delay_samples() as f32 - self.head_avg).clamp(0.0, max);
+            }
         } else {
             let gap = target - self.ratio;
             self.ratio = if gap.abs() < 1.0e-6 {
@@ -536,6 +666,10 @@ impl PitchShift {
             let norm = 1.0 / (1.0 + g);
             wet_l = (wet_l + b_l * g) * norm;
             wet_r = (wet_r + b_r * g) * norm;
+        }
+
+        if self.align {
+            (wet_l, wet_r) = self.pad_wet(wet_l, wet_r);
         }
 
         let blend_target = if unity { 0.0 } else { 1.0 };
@@ -908,32 +1042,42 @@ mod tests {
     }
 
     #[test]
-    fn the_heads_average_near_the_reported_delay() {
+    fn the_aligned_output_averages_the_reported_delay() {
+        // What the host compensates must be where the shifted signal sits:
+        // the head plus the pad, averaged once the pad has settled, on a
+        // single note and on a chord, both ways.
         let sr = 48_000.0;
         for semis in [-12.0, -5.0, -1.0, 1.0, 5.0, 7.0, 12.0] {
-            let ratio = semitone_ratio(semis);
-            let mut shift = PitchShift::new(sr);
-            let mut sum = 0.0f64;
-            let mut count = 0usize;
-            for n in 0..96_000 {
-                let x = if semis < 0.0 {
-                    chord(n, sr)
-                } else {
-                    note(n, 98.0, sr)
-                };
-                shift.process(x, x, ratio, false);
-                if n > 9_600 {
-                    sum += f64::from(shift.voice_a.delay[shift.voice_a.active]);
-                    count += 1;
+            for (material, chordal) in [("note", false), ("chord", true)] {
+                let ratio = semitone_ratio(semis);
+                let mut shift = PitchShift::aligned(sr);
+                let mut sum = 0.0f64;
+                let mut count = 0usize;
+                for n in 0..(sr as usize * 10) {
+                    let x = if chordal {
+                        chord(n, sr)
+                    } else {
+                        note(n, 98.0, sr)
+                    };
+                    shift.process(x, x, ratio, false);
+                    // Once the pad has settled from its starting estimate.
+                    if n > sr as usize * 4 {
+                        sum += f64::from(shift.output_delay());
+                        count += 1;
+                    }
                 }
+                let mean_ms = sum / count as f64 / f64::from(sr) * 1000.0;
+                let reported_ms = shift.delay_samples() as f64 / f64::from(sr) * 1000.0;
+                println!(
+                    "{semis:+} st {material}: output delay {mean_ms:.2} ms (head {:.2} + pad {:.2}), reported {reported_ms:.2} ms",
+                    f64::from(shift.head_avg) / f64::from(sr) * 1000.0,
+                    f64::from(shift.pad) / f64::from(sr) * 1000.0,
+                );
+                assert!(
+                    (mean_ms - reported_ms).abs() < 1.0,
+                    "{semis:+} st {material}: output averages {mean_ms} ms, reported {reported_ms} ms"
+                );
             }
-            let mean_ms = sum / count as f64 / f64::from(sr) * 1000.0;
-            let reported_ms = shift.delay_samples() as f64 / f64::from(sr) * 1000.0;
-            println!("{semis:+} st: mean head delay {mean_ms:.2} ms, reported {reported_ms:.2} ms");
-            assert!(
-                (mean_ms - reported_ms).abs() < 6.5,
-                "{semis:+} st: heads average {mean_ms} ms, reported {reported_ms} ms"
-            );
         }
     }
 
@@ -999,13 +1143,13 @@ mod tests {
     }
 
     #[test]
-    fn the_reported_delay_is_shorter_than_before() {
-        // The old fixed grain carried 20 ms; this one reports 12 ms at
-        // every rate.
+    fn the_reported_delay_is_20_ms_at_every_rate() {
+        // Above where any shift's heads average, so the aligned pad can make
+        // up the rest both ways (see LATENCY_SECONDS).
         for sr in [44_100.0f32, 48_000.0, 96_000.0, 192_000.0] {
             let shift = PitchShift::new(sr);
             let ms = shift.delay_samples() as f32 / sr * 1000.0;
-            assert!((ms - 12.0).abs() < 0.1, "{sr} Hz: {ms} ms");
+            assert!((ms - 20.0).abs() < 0.1, "{sr} Hz: {ms} ms");
         }
     }
 }

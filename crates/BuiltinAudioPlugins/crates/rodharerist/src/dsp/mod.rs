@@ -3064,7 +3064,7 @@ impl Held {
 
 /// Longest delay [`BypassDelay`] can apply, plus one. A power of two. It
 /// covers a full NAM chunk, the widest rate adapter, the IR partition, and
-/// the transpose shifter's reported delay (12 ms) at rates through 192 kHz.
+/// the transpose shifter's reported delay (20 ms) at rates through 192 kHz.
 const BYPASS_LINE: usize = 8192;
 
 const _: () = assert!(BYPASS_LINE.is_power_of_two());
@@ -3369,7 +3369,7 @@ impl Dsp {
             frame: 0,
             held_ran: [0; Held::COUNT],
             tempo_bpm: echospace::DEFAULT_TEMPO_BPM,
-            transpose: pitch::PitchShift::new(sr),
+            transpose: pitch::PitchShift::aligned(sr),
             transpose_ratio: 1.0,
             transpose_on: false,
             pitch_stage: pitch::PitchShift::new(sr),
@@ -6698,11 +6698,12 @@ mod tests {
         }
         let hear = |dsp: &mut Dsp, semis: f32, n: &mut usize| {
             assert!(dsp.apply_ui_param("transpose_semi", semis));
-            // Skip 40 ms of glide, then read 60 ms.
+            // Skip 40 ms of glide plus the 20 ms the shifted signal is
+            // delayed by, then read 60 ms.
             let mut out = Vec::new();
-            for i in 0..4_800 {
+            for i in 0..5_760 {
                 let (l, _) = dsp.process_stereo(tone(*n), tone(*n));
-                if i >= 1_920 {
+                if i >= 2_880 {
                     out.push(l);
                 }
                 *n += 1;
@@ -6728,7 +6729,7 @@ mod tests {
         dsp.apply_ui_param("transpose_semi", 2.0);
         let shifted = dsp.latency_samples();
         assert!(shifted > 0);
-        assert!(shifted <= (48_000.0f32 * 0.015) as usize, "{shifted}");
+        assert!(shifted <= (48_000.0f32 * 0.021) as usize, "{shifted}");
         dsp.apply_ui_param("transpose_semi", -3.0);
         assert_eq!(dsp.latency_samples(), shifted);
         dsp.apply_ui_param("transpose_cents", 40.0);
