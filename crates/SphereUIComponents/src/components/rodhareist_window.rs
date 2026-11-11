@@ -241,6 +241,15 @@ fn renames_case_only(from: &str, to: &str) -> bool {
     from != to && from.to_lowercase() == to.to_lowercase()
 }
 
+/// Whether `a` and `b` name one existing file (the same file under two
+/// spellings on a case-insensitive disk).
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 fn save_needs_confirm(
     stem: &str,
     exists: bool,
@@ -565,10 +574,18 @@ impl RodhareistEditorWindow {
         if let Some(interval) = tapped_interval(self.ui.last_tap, now) {
             // A synced delay ignores its free time, so a tap would change
             // nothing audible: the tap takes it back to Free.
+            let free = rodharerist::DelaySync::Free as u8 as f32;
+            let ms = interval.as_secs_f32() * 1_000.0;
             if self.params.delay_sync != rodharerist::DelaySync::Free {
-                self.set_wire("delay_sync", rodharerist::DelaySync::Free as u8 as f32, cx);
+                self.set_wire("delay_sync", free, cx);
             }
-            self.set_wire("delay_time", interval.as_secs_f32() * 1_000.0, cx);
+            // A Stereo delay's synced right side would keep following the
+            // host while the left took the tap: it takes the tap too.
+            if self.params.delay_sync_r != rodharerist::DelaySync::Free {
+                self.set_wire("delay_sync_r", free, cx);
+                self.set_wire("delay_time_r", ms, cx);
+            }
+            self.set_wire("delay_time", ms, cx);
         }
         self.ui.last_tap = Some(now);
         cx.notify();
@@ -1003,7 +1020,9 @@ impl RodhareistEditorWindow {
         // "Rig" → "rig" names the same file on Windows and macOS: write it in
         // place and only change the name's case. Treating it as another file
         // wrote the preset and then deleted the file it had just written.
-        if renames_case_only(&loaded_name, &stem) {
+        // Only where the disk ignores case: on Linux "rig.pst" can be another
+        // preset, which the normal path below confirms before replacing.
+        if renames_case_only(&loaded_name, &stem) && same_file(&from, &to) {
             self.replace_confirm = None;
             self.write_preset_file(&from)?;
             std::fs::rename(&from, &to).map_err(|e| format!("Could not rename the preset: {e}"))?;
