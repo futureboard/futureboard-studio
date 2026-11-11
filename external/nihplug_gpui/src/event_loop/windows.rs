@@ -5,6 +5,7 @@ use crossbeam::channel;
 use std::ffi::{c_void, CString};
 use std::mem;
 use std::ptr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Weak;
 use std::thread::{self, ThreadId};
 use windows::core::PCSTR;
@@ -68,10 +69,17 @@ where
         let (tasks_sender, tasks_receiver) = channel::bounded(super::TASK_QUEUE_CAPACITY);
 
         // Window classes need to have unique names or else multiple plugins loaded into the same
-        // process will end up calling the other plugin's callbacks
+        // process will end up calling the other plugin's callbacks. The tick count alone is not
+        // unique: two instances created on different threads (a host loading a project, parallel
+        // tests) can read the same tick, and the second registration then failed and panicked.
+        // This module's address separates plug-in binaries, and the counter separates instances
+        // within one.
+        static INSTANCES: AtomicU64 = AtomicU64::new(0);
+        let instance = INSTANCES.fetch_add(1, Ordering::Relaxed);
+        let module = window_proc as usize;
         let mut ticks = 0i64;
         assert!(unsafe { QueryPerformanceCounter(&mut ticks).as_bool() });
-        let class_name = CString::new(format!("nih-event-loop-{ticks}"))
+        let class_name = CString::new(format!("nih-event-loop-{module:x}-{instance}-{ticks}"))
             .expect("Where did these null bytes come from?");
         let class_name_ptr = PCSTR(class_name.as_bytes_with_nul().as_ptr());
 

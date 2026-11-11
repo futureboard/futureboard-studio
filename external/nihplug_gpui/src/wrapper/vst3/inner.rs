@@ -3,7 +3,7 @@ use crossbeam::atomic::AtomicCell;
 use crossbeam::channel::{self, SendTimeoutError};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use vst3_sys::base::{kInvalidArgument, kResultOk, tresult};
@@ -144,12 +144,56 @@ pub(crate) struct WrapperInner<P: Vst3Plugin> {
 }
 
 /// One parameter's value on the edit controller's side, while it is ahead of the processor's.
+///
+/// The value and whether it is held live in one word, so the audio thread can release exactly
+/// the edit it received with a compare-exchange: an editor edit that lands meanwhile is a
+/// different word and stays held.
 #[derive(Default)]
 struct ControllerValue {
-    /// The normalized value, as `f32` bits.
-    normalized: AtomicU32,
-    /// Whether `normalized` is the value to report instead of the parameter's own.
-    pending: AtomicBool,
+    /// [`HELD`] plus the normalized value's `f32` bits in the low half, or 0.
+    state: AtomicU64,
+}
+
+/// The bit of [`ControllerValue::state`] that marks a held edit.
+const HELD: u64 = 1 << 32;
+
+/// How close a delivered value must be to the held edit to count as that edit: a host may pass a
+/// value through `f64` or round it to a step on the way.
+const DELIVERED_TOLERANCE: f32 = 1.0e-5;
+
+impl ControllerValue {
+    /// The controller now has `normalized`, ahead of the processor.
+    fn hold(&self, normalized: f32) {
+        self.state
+            .store(HELD | u64::from(normalized.to_bits()), Ordering::Release);
+    }
+
+    /// What the controller reports instead of the parameter's own value, if anything.
+    fn reported(&self) -> Option<f32> {
+        let state = self.state.load(Ordering::Acquire);
+        (state & HELD != 0).then(|| f32::from_bits(state as u32))
+    }
+
+    /// The processor received `normalized` for this parameter. Only the held edit itself ends
+    /// the hold. During a drag the host can still deliver an older value of the same gesture;
+    /// that one must not, or the controller reports the stale value and the host sends it back
+    /// (#408). Lock-free; called on the audio thread.
+    fn delivered(&self, normalized: f32) {
+        let state = self.state.load(Ordering::Acquire);
+        if state & HELD == 0 {
+            return;
+        }
+        if (f32::from_bits(state as u32) - normalized).abs() <= DELIVERED_TOLERANCE {
+            // Fails, harmlessly, if the editor held a newer edit meanwhile.
+            let _ = self
+                .state
+                .compare_exchange(state, 0, Ordering::AcqRel, Ordering::Relaxed);
+        }
+    }
+
+    fn clear(&self) {
+        self.state.store(0, Ordering::Release);
+    }
 }
 
 /// Tasks that can be sent from the plugin to be executed on the main thread in a non-blocking
@@ -454,24 +498,19 @@ impl<P: Vst3Plugin> WrapperInner<P> {
     /// the editor.
     pub fn hold_controller_value(&self, hash: u32, normalized: f32) {
         if let Some(held) = self.controller_values.get(&hash) {
-            held.normalized
-                .store(normalized.to_bits(), Ordering::Relaxed);
-            held.pending.store(true, Ordering::Release);
+            held.hold(normalized);
         }
     }
 
     /// The edit controller's value of `hash`, when it is ahead of the parameter's own.
     pub fn controller_value(&self, hash: u32) -> Option<f32> {
-        let held = self.controller_values.get(&hash)?;
-        held.pending
-            .load(Ordering::Acquire)
-            .then(|| f32::from_bits(held.normalized.load(Ordering::Relaxed)))
+        self.controller_values.get(&hash)?.reported()
     }
 
     /// A state load replaces every value, edits still on their way included.
     fn clear_controller_values(&self) {
         for held in self.controller_values.values() {
-            held.pending.store(false, Ordering::Release);
+            held.clear();
         }
     }
 
@@ -498,9 +537,8 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         normalized_value: f32,
         sample_rate: Option<f32>,
     ) -> tresult {
-        // The parameter now has the value the host meant: the controller agrees with it again
         if let Some(held) = self.controller_values.get(&hash) {
-            held.pending.store(false, Ordering::Release);
+            held.delivered(normalized_value);
         }
 
         match self.param_by_hash.get(&hash) {
@@ -738,5 +776,49 @@ impl<P: Vst3Plugin> MainThreadExecutor<Task<P>> for WrapperInner<P> {
                 None => nih_debug_assert_failure!("Component handler not yet set"),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ControllerValue;
+
+    /// #408: during a drag the processor can still receive an older value of the same
+    /// parameter (the host delivers the drag's edits a few blocks behind). The controller must
+    /// keep reporting the latest edit until that one arrives, or the host reads the stale value
+    /// back and sends it again, undoing the edit.
+    #[test]
+    fn an_older_value_from_the_same_drag_does_not_release_the_edit() {
+        let held = ControllerValue::default();
+        held.hold(0.5);
+        held.hold(0.8);
+        held.delivered(0.5);
+        assert_eq!(held.reported(), Some(0.8));
+        held.delivered(0.8);
+        assert_eq!(held.reported(), None);
+    }
+
+    /// A delivery of an edit the editor has since replaced leaves the newer edit held.
+    #[test]
+    fn a_newer_edit_survives_the_delivery_of_the_one_before() {
+        let held = ControllerValue::default();
+        held.hold(0.3);
+        held.hold(0.9);
+        held.delivered(0.3);
+        assert_eq!(held.reported(), Some(0.9));
+        // A host round trip through f64 still counts as the held edit.
+        held.delivered((0.9f64) as f32);
+        assert_eq!(held.reported(), None);
+        // Nothing held: a delivery changes nothing.
+        held.delivered(0.4);
+        assert_eq!(held.reported(), None);
+    }
+
+    #[test]
+    fn a_state_load_releases_every_held_edit() {
+        let held = ControllerValue::default();
+        held.hold(0.25);
+        held.clear();
+        assert_eq!(held.reported(), None);
     }
 }
