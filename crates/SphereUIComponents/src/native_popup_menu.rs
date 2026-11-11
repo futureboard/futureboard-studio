@@ -130,10 +130,10 @@ mod win32 {
     use windows::Win32::Graphics::Gdi::ClientToScreen;
     use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
     use windows::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, DestroyMenu, PostMessageW, SetForegroundWindow,
-        TrackPopupMenuEx, HMENU, MENU_ITEM_FLAGS, MF_CHECKED, MF_DISABLED, MF_GRAYED, MF_POPUP,
-        MF_SEPARATOR, MF_STRING, TPMPARAMS, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-        TPM_TOPALIGN, TPM_VERTICAL, WM_APP, WM_NCDESTROY,
+        AppendMenuW, CreatePopupMenu, DestroyMenu, GetAncestor, PostMessageW, SetForegroundWindow,
+        TrackPopupMenuEx, GA_ROOT, HMENU, MENU_ITEM_FLAGS, MF_CHECKED, MF_DISABLED, MF_GRAYED,
+        MF_POPUP, MF_SEPARATOR, MF_STRING, TPMPARAMS, TPM_LEFTALIGN, TPM_RETURNCMD,
+        TPM_RIGHTBUTTON, TPM_TOPALIGN, TPM_VERTICAL, WM_APP, WM_NCDESTROY,
     };
 
     use super::{row_text, PopupItem, PopupResultCb};
@@ -345,8 +345,12 @@ mod win32 {
         };
         // SAFETY: Win32 calls on a live window and the menu built above; the
         // window must be foreground for the menu to close on an outside click.
+        // A plug-in editor is a child of the host's window, which cannot be
+        // foreground itself: its top-level ancestor is (Studio's own window
+        // is its own root).
         let picked = unsafe {
-            let _ = SetForegroundWindow(hwnd);
+            let root = GetAncestor(hwnd, GA_ROOT);
+            let _ = SetForegroundWindow(if root.0.is_null() { hwnd } else { root });
             let picked = TrackPopupMenuEx(
                 menu,
                 (TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_VERTICAL).0,

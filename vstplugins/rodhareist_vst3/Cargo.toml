@@ -63,9 +63,15 @@ windows = { version = "0.61", features = [
     "Win32_Graphics_DirectWrite",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
+    # Studio's native popup menu (`native_popup_menu.rs`): ClientToScreen and
+    # the window subclass that tracks the menu outside GPUI's update.
+    "Win32_Graphics_Gdi",
     "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+# The editor window's HWND, for the native popup menu. The version GPUI uses.
+raw-window-handle = "0.6"
 
 [patch."https://github.com/futureboard/gpui-se.git"]
 gpui = { path = "../../crates/gpui" }

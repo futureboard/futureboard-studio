@@ -5274,6 +5274,7 @@ dependencies = [
  "image",
  "nih_plug",
  "nih_plug_gpui",
+ "raw-window-handle 0.6.2",
  "rfd",
  "rodharerist",
  "serde",

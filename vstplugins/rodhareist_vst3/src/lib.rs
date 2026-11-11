@@ -52,6 +52,11 @@ mod theme;
 // Stand-ins for the Studio services those modules reach for.
 mod keymap;
 mod native_win32_menu;
+// Studio's OS-native popup menu: the text fields' Cut / Copy / Paste menu
+// comes up as the system's, not drawn and clipped inside the editor.
+#[path = "../../../crates/SphereUIComponents/src/native_popup_menu.rs"]
+#[allow(dead_code)]
+mod native_popup_menu;
 mod platform_chrome;
 mod window_position;
 

@@ -1,10 +1,11 @@
 //! The context menu, as far as Studio's text field uses it: its Cut / Copy /
 //! Paste / Select All menu on a right click.
 //!
-//! Studio's own menu prefers the platform's native popup and reaches into
-//! Studio's menu bar, overlay placement and native windowing; none of that
-//! exists in a plug-in. This draws the same entries as a plain list in Studio's
-//! theme, at the click, kept inside the window.
+//! Where the platform has native popup menus
+//! ([`crate::native_popup_menu::available`]) the menu is the system's, as in
+//! Studio: it is not clipped to the editor window the host gives the plug-in.
+//! Elsewhere this draws the same entries as a plain list in Studio's theme, at
+//! the click, kept inside the window.
 
 use std::sync::Arc;
 
@@ -75,6 +76,9 @@ pub fn context_menu_overlay(
     on_command: ContextCommandCb,
     on_close: ContextCloseCb,
 ) -> gpui::AnyElement {
+    if crate::native_popup_menu::available() {
+        return native_context_menu(entries, x, y, on_command, on_close);
+    }
     let height: f32 = entries
         .iter()
         .map(|entry| match entry {
@@ -166,5 +170,79 @@ pub fn context_menu_overlay(
             .children(rows),
     )
     .with_priority(3)
+    .into_any_element()
+}
+
+/// `entries` as native popup rows.
+fn popup_items(entries: Vec<ContextMenuEntry>) -> Vec<crate::native_popup_menu::PopupItem> {
+    use crate::native_popup_menu::PopupItem;
+    entries
+        .into_iter()
+        .map(|entry| match entry {
+            ContextMenuEntry::Header(label) => PopupItem::Header(label),
+            ContextMenuEntry::Separator => PopupItem::Separator,
+            ContextMenuEntry::Item {
+                label,
+                command,
+                shortcut,
+                disabled,
+            } => PopupItem::Command {
+                label,
+                command,
+                shortcut,
+                checked: false,
+                enabled: !disabled,
+            },
+        })
+        .collect()
+}
+
+/// Draws nothing; when first painted, brings the system menu up at the click.
+/// The caller's open state stays until the menu closes, then `on_command`
+/// runs for a choice and `on_close` always runs after it. Studio's
+/// `menu_dropdown::native_menu_element`, which the plug-in does not mount.
+fn native_context_menu(
+    entries: Vec<ContextMenuEntry>,
+    x: f32,
+    y: f32,
+    on_command: ContextCommandCb,
+    on_close: ContextCloseCb,
+) -> gpui::AnyElement {
+    let items = popup_items(entries);
+    gpui::canvas(
+        |_, _, _| (),
+        move |_, _, window, cx| {
+            // Repaints while the menu is up land here too.
+            if crate::native_popup_menu::is_open(window) {
+                return;
+            }
+            let close = on_close.clone();
+            let on_command = on_command.clone();
+            let shown = crate::native_popup_menu::show(
+                window,
+                cx,
+                gpui::point(px(x), px(y)),
+                None,
+                items.clone(),
+                Box::new(move |chosen, window, cx| {
+                    if let Some(command) = chosen {
+                        on_command(&command, window, cx);
+                    }
+                    close(&(), window, cx);
+                }),
+            );
+            if !shown {
+                // Nothing native came up: drop the open state rather than
+                // leave an invisible menu holding it.
+                let close = on_close.clone();
+                window.defer(cx, move |window, cx| close(&(), window, cx));
+            }
+        },
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .w(px(1.0))
+    .h(px(1.0))
     .into_any_element()
 }
