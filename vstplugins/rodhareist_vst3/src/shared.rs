@@ -78,27 +78,118 @@ pub struct Pick {
     pub epoch: u64,
 }
 
-/// The order a chain edit from the editor is heading to, packed four bits a
-/// slot (stage index + 1, 0 for empty). `NO_PATH_TARGET` when none is.
-const NO_PATH_TARGET: u64 = u64::MAX;
-const _: () = assert!(PATH_SLOTS * 4 < 64 && StageKind::COUNT <= 15);
-
 pub type PathOrder = [Option<StageKind>; PATH_SLOTS];
 
-fn pack_path(order: &PathOrder) -> u64 {
-    order.iter().enumerate().fold(0, |bits, (slot, stage)| {
-        let nibble = stage.map_or(0, |stage| u64::from(stage.index()) + 1);
-        bits | nibble << (slot * 4)
-    })
+/// A path packed five bits a slot (stage index + 1, 0 for empty), twelve
+/// slots a word. Sixteen slots of sixteen stages no longer fit one word.
+const SLOT_BITS: usize = 5;
+const SLOT_MASK: u64 = (1 << SLOT_BITS) - 1;
+const SLOTS_PER_WORD: usize = 64 / SLOT_BITS;
+const PATH_WORDS: usize = PATH_SLOTS.div_ceil(SLOTS_PER_WORD);
+const _: () = assert!(StageKind::COUNT < (1 << SLOT_BITS));
+
+type PackedPath = [u64; PATH_WORDS];
+
+fn pack_path(order: &PathOrder) -> PackedPath {
+    let mut words = [0; PATH_WORDS];
+    for (slot, stage) in order.iter().enumerate() {
+        let value = stage.map_or(0, |stage| u64::from(stage.index()) + 1);
+        words[slot / SLOTS_PER_WORD] |= value << ((slot % SLOTS_PER_WORD) * SLOT_BITS);
+    }
+    words
 }
 
-fn unpack_path(bits: u64) -> PathOrder {
+fn unpack_path(words: &PackedPath) -> PathOrder {
     std::array::from_fn(|slot| {
-        let nibble = (bits >> (slot * 4)) & 0xF;
-        nibble
+        let value =
+            (words[slot / SLOTS_PER_WORD] >> ((slot % SLOTS_PER_WORD) * SLOT_BITS)) & SLOT_MASK;
+        value
             .checked_sub(1)
             .and_then(|index| StageKind::from_index(index as i32))
     })
+}
+
+/// `PathTarget::current` when no chain edit is in flight.
+const NO_PATH_TARGET: u64 = u64::MAX;
+
+/// The order a chain edit from the editor is heading to. More than one word,
+/// so it is double-buffered: the editor (the only writer) fills the copy not
+/// in use and then points `current` at it, and a reader checks `current`
+/// again after reading a copy. Lock-free on both sides; the audio thread never
+/// waits for the editor.
+struct PathTarget {
+    copies: [[AtomicU64; PATH_WORDS]; 2],
+    /// `NO_PATH_TARGET`, or the publish's generation shifted left once with
+    /// the index of its copy in bit 0. The generation makes every publish a
+    /// new value, so a compare-exchange cannot clear a newer edit.
+    current: AtomicU64,
+    generation: AtomicU64,
+}
+
+impl Default for PathTarget {
+    fn default() -> Self {
+        Self {
+            copies: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
+            current: AtomicU64::new(NO_PATH_TARGET),
+            generation: AtomicU64::new(0),
+        }
+    }
+}
+
+impl PathTarget {
+    /// Editor thread only.
+    fn publish(&self, order: &PathOrder) {
+        let current = self.current.load(Ordering::Acquire);
+        let index = if current == NO_PATH_TARGET {
+            0
+        } else {
+            (current & 1) as usize ^ 1
+        };
+        // Release: a reader that sees one of these words also sees the
+        // `current` change that took this copy out of use.
+        for (cell, word) in self.copies[index].iter().zip(pack_path(order)) {
+            cell.store(word, Ordering::Release);
+        }
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        self.current
+            .store(generation << 1 | index as u64, Ordering::Release);
+    }
+
+    /// The target and the `current` it was read under. `None` when there is
+    /// none, or when the editor kept replacing it during a few tries, which
+    /// the next block reads again. No allocation, no waiting.
+    fn read(&self) -> Option<(u64, PathOrder)> {
+        for _ in 0..4 {
+            let current = self.current.load(Ordering::Acquire);
+            if current == NO_PATH_TARGET {
+                return None;
+            }
+            let copy = &self.copies[(current & 1) as usize];
+            let words: PackedPath = std::array::from_fn(|i| copy[i].load(Ordering::Acquire));
+            if self.current.load(Ordering::Acquire) == current {
+                return Some((current, unpack_path(&words)));
+            }
+        }
+        None
+    }
+
+    /// Clears the target if it is still `order`.
+    fn finish(&self, order: &PathOrder) {
+        if let Some((current, target)) = self.read() {
+            if target == *order {
+                let _ = self.current.compare_exchange(
+                    current,
+                    NO_PATH_TARGET,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                );
+            }
+        }
+    }
+
+    fn clear(&self) {
+        self.current.store(NO_PATH_TARGET, Ordering::Release);
+    }
 }
 
 pub struct Shared {
@@ -122,8 +213,8 @@ pub struct Shared {
     /// Editor → audio: reset the sticky clip lights.
     pub clear_clip: AtomicBool,
     /// Editor → audio: the order a chain edit ends in, published before its
-    /// first slot is written. Packed; see [`pack_path`].
-    path_target: AtomicU64,
+    /// first slot is written. See [`PathTarget`].
+    path_target: PathTarget,
 
     /// The loaders of the running `Dsp`; `None` before `initialize`.
     pub control: Mutex<Option<ControlSide>>,
@@ -152,7 +243,7 @@ impl Default for Shared {
             latency: AtomicU32::default(),
             tempo: AtomicF32::default(),
             clear_clip: AtomicBool::default(),
-            path_target: AtomicU64::new(NO_PATH_TARGET),
+            path_target: PathTarget::default(),
             control: Mutex::new(None),
             control_epoch: AtomicU64::new(0),
             nam_answers: AtomicU32::default(),
@@ -227,31 +318,26 @@ impl Shared {
     }
 
     /// Editor: the chain edit about to be written ends in `order`.
+    /// Called from the editor thread only (the target's single writer).
     pub fn publish_path_target(&self, order: &PathOrder) {
-        self.path_target.store(pack_path(order), Ordering::Release);
+        self.path_target.publish(order);
     }
 
-    /// The order a chain edit in flight ends in. Audio thread: one atomic
-    /// load, no allocation.
+    /// The order a chain edit in flight ends in. Audio thread: a few atomic
+    /// loads, no allocation, no waiting.
     pub fn path_target(&self) -> Option<PathOrder> {
-        let bits = self.path_target.load(Ordering::Acquire);
-        (bits != NO_PATH_TARGET).then(|| unpack_path(bits))
+        self.path_target.read().map(|(_, order)| order)
     }
 
     /// Audio thread: the edit that ends in `order` is over (applied, or its
     /// slots went elsewhere). A newer edit's target stays.
     pub fn finish_path_target(&self, order: &PathOrder) {
-        let _ = self.path_target.compare_exchange(
-            pack_path(order),
-            NO_PATH_TARGET,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        );
+        self.path_target.finish(order);
     }
 
     /// A state load or a new `Dsp` takes the chain as it stands.
     pub fn clear_path_target(&self) {
-        self.path_target.store(NO_PATH_TARGET, Ordering::Release);
+        self.path_target.clear();
     }
 
     /// Puts a new `Dsp`'s handles in place. Anything still building was
@@ -291,5 +377,37 @@ impl Shared {
             self.nam_answers.load(Ordering::Acquire),
             self.ir_answers.load(Ordering::Acquire),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every slot full, every stage used once (the last one in the last slot),
+    /// and a chain with gaps.
+    #[test]
+    fn a_full_chain_of_every_stage_round_trips() {
+        let full: PathOrder =
+            std::array::from_fn(|slot| Some(StageKind::ALL[(slot + 1) % StageKind::ALL.len()]));
+        assert_eq!(unpack_path(&pack_path(&full)), full);
+        let mut gaps: PathOrder = [None; PATH_SLOTS];
+        gaps[0] = Some(StageKind::Pitch);
+        gaps[PATH_SLOTS - 1] = Some(StageKind::Gate);
+        assert_eq!(unpack_path(&pack_path(&gaps)), gaps);
+
+        let shared = Shared::default();
+        assert_eq!(shared.path_target(), None);
+        shared.publish_path_target(&full);
+        assert_eq!(shared.path_target(), Some(full));
+        // A newer edit replaces it in the other copy and keeps it.
+        shared.publish_path_target(&gaps);
+        shared.finish_path_target(&full);
+        assert_eq!(shared.path_target(), Some(gaps));
+        shared.finish_path_target(&gaps);
+        assert_eq!(shared.path_target(), None);
+        shared.publish_path_target(&full);
+        shared.clear_path_target();
+        assert_eq!(shared.path_target(), None);
     }
 }

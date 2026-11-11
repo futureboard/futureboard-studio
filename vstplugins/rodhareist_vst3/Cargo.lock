@@ -1784,6 +1784,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
+name = "echospace"
+version = "2026.11.1-beta2.0.0"
+dependencies = [
+ "biquad",
+ "builtin_dsp_core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "either"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5279,6 +5289,7 @@ version = "2026.11.1-beta2.0.0"
 dependencies = [
  "biquad",
  "builtin_dsp_core",
+ "echospace",
  "nam-rs",
  "rustfft",
  "serde",
