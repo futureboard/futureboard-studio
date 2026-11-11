@@ -124,20 +124,39 @@ impl RodhareistParams {
     /// records it. `clear_clip` is an action and has no parameter; the caller
     /// handles it.
     pub fn set_from_editor(&self, context: &EditorContext, index: u32, value: f32) {
-        let Some(id) = rodharerist::ui_param_id(index) else {
+        if self.begin_from_editor(context, index) {
+            self.set_within_gesture(context, index, value);
+            self.end_from_editor(context, index);
+        }
+    }
+
+    /// Opens a host gesture on wire `index`. `false` when it is no parameter.
+    /// A knob drag opens one for the whole drag, so a host in Touch or Latch
+    /// records one pass and one undo step, not one per mouse move.
+    pub fn begin_from_editor(&self, context: &EditorContext, index: u32) -> bool {
+        let Some(entry) = rodharerist::ui_param_id(index).and_then(|id| self.wire.get(id)) else {
+            return false;
+        };
+        entry.param.begin(&context.setter());
+        true
+    }
+
+    /// One value inside a gesture [`Self::begin_from_editor`] opened.
+    pub fn set_within_gesture(&self, context: &EditorContext, index: u32, value: f32) {
+        let Some(entry) = rodharerist::ui_param_id(index).and_then(|id| self.wire.get(id)) else {
             return;
         };
-        let Some(entry) = self.wire.get(id) else {
-            return;
-        };
-        let setter = context.setter();
-        entry.param.begin(&setter);
-        entry.param.set_plain(&setter, value);
-        entry.param.end(&setter);
+        entry.param.set_plain(&context.setter(), value);
         // The title a host shows for MIDI learn follows the selected stomp.
         // This runs on the editor thread; the audio thread must not rename.
         if self.wire.refresh_host_names() {
             context.gui_context().param_titles_changed();
+        }
+    }
+
+    pub fn end_from_editor(&self, context: &EditorContext, index: u32) {
+        if let Some(entry) = rodharerist::ui_param_id(index).and_then(|id| self.wire.get(id)) {
+            entry.param.end(&context.setter());
         }
     }
 }

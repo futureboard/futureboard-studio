@@ -1,7 +1,7 @@
 //! The editor: Studio's Rodhareist window, given host ops that read and
 //! write this plug-in instead of Studio's engine.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -74,6 +74,51 @@ fn load_in_background(params: &Arc<RodhareistParams>, shared: &Arc<Shared>, task
     }
 }
 
+/// Host gestures held open while the mouse button is down in the editor.
+///
+/// The shared editor only reports values; it never says when a drag starts or
+/// ends. Each value used to be its own begin/set/end, so a host recording
+/// automation in Touch or Latch saw dozens of touches per knob drag and kept
+/// as many undo steps. While the button is down, the first value for a
+/// parameter opens its gesture and the release closes every open one.
+#[derive(Clone, Default)]
+struct Gestures {
+    held: Rc<Cell<bool>>,
+    open: Rc<RefCell<Vec<u32>>>,
+}
+
+impl Gestures {
+    fn edit(&self, params: &RodhareistParams, context: &EditorContext, index: u32, value: f32) {
+        if !self.held.get() {
+            // A wheel turn or a typed value: one complete gesture.
+            params.set_from_editor(context, index, value);
+            return;
+        }
+        let opened = self.open.borrow().contains(&index);
+        if opened || params.begin_from_editor(context, index) {
+            if !opened {
+                self.open.borrow_mut().push(index);
+            }
+            params.set_within_gesture(context, index, value);
+        }
+    }
+
+    fn press(&self, params: &RodhareistParams, context: &EditorContext) {
+        // A release the editor never saw (the button let go outside it)
+        // still ends what that drag opened.
+        self.release(params, context);
+        self.held.set(true);
+    }
+
+    fn release(&self, params: &RodhareistParams, context: &EditorContext) {
+        self.held.set(false);
+        let open = std::mem::take(&mut *self.open.borrow_mut());
+        for index in open {
+            params.end_from_editor(context, index);
+        }
+    }
+}
+
 struct PluginEditor {
     /// Tells the host when the MIDI titles change.
     context: EditorContext,
@@ -87,6 +132,14 @@ struct PluginEditor {
     keyboard: bool,
     /// A press landed in the editor since the last render.
     clicked: bool,
+    gestures: Gestures,
+}
+
+impl Drop for PluginEditor {
+    fn drop(&mut self) {
+        // Closing the editor mid-drag must not leave a host gesture open.
+        self.gestures.release(&self.params, &self.context);
+    }
 }
 
 impl PluginEditor {
@@ -104,7 +157,8 @@ impl PluginEditor {
         };
         builtin_plugin_editor::register(&key.insert_id, &params);
 
-        let host_ops = host_ops(&context, &params, &shared);
+        let gestures = Gestures::default();
+        let host_ops = host_ops(&context, &params, &shared, &gestures);
         let identity = ShellIdentity {
             plugin_name: "Rodhareist".to_string(),
             track_name: String::new(),
@@ -135,6 +189,7 @@ impl PluginEditor {
             window,
             keyboard: false,
             clicked: false,
+            gestures,
         }
     }
 
@@ -193,7 +248,11 @@ impl Render for PluginEditor {
             // stop the press from bubbling.
             .capture_any_mouse_down(cx.listener(|this, _event, _window, cx| {
                 this.clicked = true;
+                this.gestures.press(&this.params, &this.context);
                 cx.notify();
+            }))
+            .capture_any_mouse_up(cx.listener(|this, _event, _window, _cx| {
+                this.gestures.release(&this.params, &this.context);
             }))
             .child(self.window.clone())
     }
@@ -273,7 +332,9 @@ fn host_ops(
     context: &EditorContext,
     params: &Arc<RodhareistParams>,
     shared: &Arc<Shared>,
+    gestures: &Gestures,
 ) -> BuiltinEditorHostOps {
+    let gestures = gestures.clone();
     let clear_clip = rodharerist::ui_param_index(CLEAR_CLIP);
     let forward_params = params.clone();
     let forward_shared = shared.clone();
@@ -291,7 +352,7 @@ fn host_ops(
                     .clear_clip
                     .store(true, std::sync::atomic::Ordering::Relaxed);
             } else if !chain_edit.stage(index, value, cx) {
-                forward_params.set_from_editor(&forward_context, index, value);
+                gestures.edit(&forward_params, &forward_context, index, value);
             }
         })),
         load_nam_capture: Some(Arc::new(move |_key, request| {
