@@ -678,31 +678,72 @@ impl std::future::Future for MidiInputDoorbellWait {
     }
 }
 
+/// Hardware input events the queue between the native MIDI callbacks and
+/// [`HardwareMidiInput::drain`] holds at most.
+///
+/// When it is full the **newest** event is dropped (the callback cannot evict
+/// from the consumer's end) and counted in [`MidiInputDiagnostics::dropped`].
+/// The slots are allocated once when the queue is created, so queuing an event
+/// never allocates. 8,192 events is several seconds of dense controller data
+/// with nothing draining.
+pub const MIDI_INPUT_QUEUE_CAPACITY: usize = 8192;
+
+/// One event as the native MIDI callback queues it: no strings, so queuing
+/// never allocates. [`HardwareMidiInput::drain`] resolves `source` to the
+/// device's id and name on the control thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QueuedMidiInput {
+    /// Index of the device in the enabled set the connection was opened for.
+    pub(crate) source: u32,
+    pub(crate) event: MidiInputEvent,
+    pub(crate) received_at: Instant,
+}
+
 /// The queue end handed to the native MIDI callbacks: send, then ring.
 #[derive(Clone)]
 pub(crate) struct MidiInputSender {
-    tx: std::sync::mpsc::Sender<HardwareMidiInputMessage>,
+    tx: std::sync::mpsc::SyncSender<QueuedMidiInput>,
     doorbell: std::sync::Arc<MidiInputDoorbell>,
 }
 
 impl MidiInputSender {
-    pub(crate) fn send(
-        &self,
-        message: HardwareMidiInputMessage,
-    ) -> Result<(), std::sync::mpsc::SendError<HardwareMidiInputMessage>> {
-        let result = self.tx.send(message);
-        if result.is_ok() {
+    /// Queue without blocking or allocating. `false` when the queue is full
+    /// (the event is dropped: newest-dropped policy) or its receiver is gone.
+    pub(crate) fn send(&self, message: QueuedMidiInput) -> bool {
+        let queued = self.tx.try_send(message).is_ok();
+        if queued {
             self.doorbell.ring();
         }
-        result
+        queued
     }
 }
 
-/// Control-thread hardware MIDI input listener. Opens midir connections for
-/// enabled input / input-output devices and pushes decoded events onto a
-/// bounded queue drained by the UI poll loop.
+pub(crate) type MidiInputReceiver = std::sync::mpsc::Receiver<QueuedMidiInput>;
+
+/// The bounded queue between the native MIDI callbacks and
+/// [`HardwareMidiInput::drain`], [`MIDI_INPUT_QUEUE_CAPACITY`] events deep.
+fn midi_input_queue(
+    doorbell: &std::sync::Arc<MidiInputDoorbell>,
+) -> (MidiInputSender, MidiInputReceiver) {
+    let (tx, rx) = std::sync::mpsc::sync_channel(MIDI_INPUT_QUEUE_CAPACITY);
+    (
+        MidiInputSender {
+            tx,
+            doorbell: std::sync::Arc::clone(doorbell),
+        },
+        rx,
+    )
+}
+
+/// Control-thread hardware MIDI input listener. Opens midir (Windows/Linux) or
+/// CoreMIDI (macOS) connections for enabled input / input-output devices; their
+/// callbacks push decoded events onto a queue bounded at
+/// [`MIDI_INPUT_QUEUE_CAPACITY`] that the UI poll loop drains.
 pub struct HardwareMidiInput {
-    event_rx: Option<std::sync::mpsc::Receiver<HardwareMidiInputMessage>>,
+    event_rx: Option<MidiInputReceiver>,
+    /// `(id, name)` of each device the open connections were made for, indexed
+    /// by [`QueuedMidiInput::source`].
+    sources: Vec<(String, String)>,
     /// Rung by every connection's callback; shared across reconnects so a
     /// waiting control task never has to re-subscribe.
     doorbell: std::sync::Arc<MidiInputDoorbell>,
@@ -732,6 +773,7 @@ impl HardwareMidiInput {
     pub fn new() -> Self {
         Self {
             event_rx: None,
+            sources: Vec::new(),
             doorbell: std::sync::Arc::new(MidiInputDoorbell::default()),
             connections: Vec::new(),
             enabled_ids: Vec::new(),
@@ -770,12 +812,9 @@ impl HardwareMidiInput {
         if enabled.is_empty() {
             return;
         }
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = midi_input_queue(&self.doorbell);
         self.event_rx = Some(rx);
-        let tx = MidiInputSender {
-            tx,
-            doorbell: std::sync::Arc::clone(&self.doorbell),
-        };
+        self.sources = enabled.clone();
         self.connections = open_hardware_midi_inputs(enabled, tx);
         if self.connections.is_empty() {
             // Nothing opened: the platform backend may still be coming up (on
@@ -794,10 +833,18 @@ impl HardwareMidiInput {
         };
         let mut out = Vec::new();
         while out.len() < max {
-            match rx.try_recv() {
-                Ok(msg) => out.push(msg),
-                Err(_) => break,
-            }
+            let Ok(queued) = rx.try_recv() else {
+                break;
+            };
+            let Some((device_id, device_name)) = self.sources.get(queued.source as usize) else {
+                continue;
+            };
+            out.push(HardwareMidiInputMessage {
+                device_id: device_id.clone(),
+                device_name: device_name.clone(),
+                event: queued.event,
+                received_at: queued.received_at,
+            });
         }
         out
     }
@@ -805,6 +852,7 @@ impl HardwareMidiInput {
     pub fn stop(&mut self) {
         self.connections.clear();
         self.event_rx = None;
+        self.sources.clear();
         self.enabled_ids.clear();
     }
 }
@@ -822,13 +870,16 @@ pub fn decode_midi_bytes(bytes: &[u8]) -> Option<MidiInputEvent> {
     if bytes.is_empty() {
         return None;
     }
+    // A data byte has its top bit clear; a byte with it set is a status byte
+    // and never a note, velocity or value.
+    let data = |index: usize| bytes.get(index).copied().filter(|byte| byte & 0x80 == 0);
     let status = bytes[0];
     let kind = status & 0xF0;
     let channel = status & 0x0F;
     match kind {
         0x90 => {
-            let note = *bytes.get(1)?;
-            let velocity = *bytes.get(2)?;
+            let note = data(1)?;
+            let velocity = data(2)?;
             if velocity == 0 {
                 Some(MidiInputEvent::NoteOff { note, channel })
             } else {
@@ -840,15 +891,15 @@ pub fn decode_midi_bytes(bytes: &[u8]) -> Option<MidiInputEvent> {
             }
         }
         0x80 => {
-            let note = *bytes.get(1)?;
+            let note = data(1)?;
             // A channel Note Off always carries release velocity, even though
             // the legacy event type does not expose it yet.
-            let _release_velocity = *bytes.get(2)?;
+            let _release_velocity = data(2)?;
             Some(MidiInputEvent::NoteOff { note, channel })
         }
         0xB0 => {
-            let controller = *bytes.get(1)?;
-            let value = *bytes.get(2)?;
+            let controller = data(1)?;
+            let value = data(2)?;
             if controller == 123 {
                 Some(MidiInputEvent::AllNotesOff)
             } else {
@@ -860,16 +911,16 @@ pub fn decode_midi_bytes(bytes: &[u8]) -> Option<MidiInputEvent> {
             }
         }
         0xA0 => Some(MidiInputEvent::PolyPressure {
-            note: *bytes.get(1)?,
-            value: *bytes.get(2)?,
+            note: data(1)?,
+            value: data(2)?,
             channel,
         }),
         0xD0 => Some(MidiInputEvent::ChannelPressure {
-            value: *bytes.get(1)?,
+            value: data(1)?,
             channel,
         }),
         0xE0 => Some(MidiInputEvent::PitchBend {
-            value: u16::from(*bytes.get(1)?) | (u16::from(*bytes.get(2)?) << 7),
+            value: u16::from(data(1)?) | (u16::from(data(2)?) << 7),
             channel,
         }),
         _ => None,
@@ -892,92 +943,203 @@ fn midi_data_byte_count(status: u8) -> usize {
     }
 }
 
-/// Split a raw MIDI byte stream into complete messages, calling `on_message`
-/// once per message. Returns the number of bytes that could not be framed.
+/// Largest SysEx, `F0` and `F7` included, that hardware input reassembles.
 ///
-/// `midir` (Windows/Linux) hands the app exactly one message per callback, but a
-/// CoreMIDI packet is a *stream*: messages that share a timestamp are coalesced
-/// into a single packet, and some class-compliant drivers pass running status
-/// through. Decoding only the first three bytes of a packet therefore drops
-/// every message after the first — a chord arrives as one note.
+/// The buffer is allocated once per input connection, on the control thread,
+/// so the MIDI input thread never allocates for a dump. A longer SysEx is
+/// dropped whole (never delivered truncated) and counted in
+/// [`MidiInputDiagnostics::dropped`]; the stream resynchronizes on the next
+/// status byte.
+pub const MAX_INPUT_SYSEX_BYTES: usize = 64 * 1024;
+
+/// What one [`MidiStreamParser::push`] could not deliver.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MidiStreamCounts {
+    /// Bytes that belong to no complete message: a data byte with no status
+    /// to attach to, an unfinished message cut off by the next status byte, a
+    /// SysEx ended by a status byte other than `F7`, or a stray `F7`.
+    pub malformed: usize,
+    /// Complete SysEx messages dropped for exceeding the parser's capacity.
+    pub sysex_dropped: usize,
+}
+
+/// Incremental MIDI 1.0 byte-stream parser.
 ///
-/// `running_status` is threaded through by the caller because a packet boundary
-/// does not reset it. Per MIDI 1.0, System Real-Time bytes are single-byte
-/// messages that may appear anywhere and never disturb running status, while
-/// System Common clears it.
-pub fn split_midi_messages(
-    bytes: &[u8],
-    running_status: &mut Option<u8>,
-    mut on_message: impl FnMut(&[u8]),
-) -> usize {
-    let mut malformed = 0usize;
-    let mut message = [0u8; 3];
-    let mut index = 0usize;
+/// Platform MIDI APIs do not hand over one message per call: a CoreMIDI
+/// packet coalesces every message that shares a timestamp, a SysEx longer
+/// than a packet (CoreMIDI) or than the driver buffer (WinMM's 1 KB `MIM_LONGDATA`
+/// buffers through `midir`) arrives in several calls, and real-time bytes may
+/// sit inside another message. So this parser keeps its state between calls,
+/// and follows the MIDI 1.0 rules byte by byte:
+///
+/// - A status byte (`0x80..=0xF7`) **always** starts a new message. Whatever
+///   was in progress is abandoned and counted malformed; a status byte is never
+///   taken as data.
+/// - System Real-Time (`0xF8..=0xFF`) is a one-byte message that may appear
+///   anywhere, inside SysEx and between the data bytes of another message
+///   included. It is delivered on its own and disturbs nothing.
+/// - Channel messages set running status; System Common and SysEx clear it.
+/// - A message still incomplete at the end of a call is carried into the next
+///   call, as is an unterminated SysEx (up to its capacity).
+///
+/// Allocates only in [`Self::new`]; [`Self::push`] never allocates, locks or
+/// blocks.
+pub struct MidiStreamParser {
+    /// Channel status for running status, or 0.
+    running_status: u8,
+    /// The channel / System Common message in progress.
+    message: [u8; 3],
+    /// Bytes of `message` filled so far; 0 when nothing is in progress.
+    filled: u8,
+    /// Total length of the message in progress.
+    needed: u8,
+    /// Whether `message[0]` came from the stream (not from running status),
+    /// so an abandoned message is counted by the bytes actually received.
+    explicit_status: bool,
+    /// SysEx reassembly buffer, `F0` first.
+    sysex: Box<[u8]>,
+    sysex_len: usize,
+    in_sysex: bool,
+    sysex_overflowed: bool,
+}
 
-    while index < bytes.len() {
-        let byte = bytes[index];
-
-        // System Real-Time: one byte, legal anywhere, leaves running status alone.
-        if byte >= 0xF8 {
-            on_message(&bytes[index..index + 1]);
-            index += 1;
-            continue;
+impl MidiStreamParser {
+    /// A parser that reassembles SysEx of up to `max_sysex_bytes` (`F0` and
+    /// `F7` included).
+    pub fn new(max_sysex_bytes: usize) -> Self {
+        Self {
+            running_status: 0,
+            message: [0; 3],
+            filled: 0,
+            needed: 0,
+            explicit_status: false,
+            sysex: vec![0u8; max_sysex_bytes].into_boxed_slice(),
+            sysex_len: 0,
+            in_sysex: false,
+            sysex_overflowed: false,
         }
-
-        // SysEx runs to EOX. We do not consume dumps, so the span is emitted
-        // whole (real-time bytes inside it included) for the decoder to ignore.
-        if byte == 0xF0 {
-            *running_status = None;
-            let mut end = index + 1;
-            while end < bytes.len() {
-                let byte = bytes[end];
-                if byte == 0xF7 {
-                    end += 1;
-                    break;
-                }
-                // A non-real-time status byte means the dump was truncated.
-                if byte >= 0x80 && byte < 0xF8 {
-                    break;
-                }
-                end += 1;
-            }
-            on_message(&bytes[index..end]);
-            index = end;
-            continue;
-        }
-
-        let (status, data_start) = if byte >= 0x80 {
-            if byte >= 0xF0 {
-                *running_status = None;
-            } else {
-                *running_status = Some(byte);
-            }
-            (byte, index + 1)
-        } else if let Some(status) = *running_status {
-            (status, index)
-        } else {
-            // A data byte with nothing to attach it to: the stream started
-            // mid-message. Drop it rather than guessing at a status.
-            malformed += 1;
-            index += 1;
-            continue;
-        };
-
-        let needed = midi_data_byte_count(status);
-        let end = data_start + needed;
-        if end > bytes.len() {
-            // Truncated tail. Neither backend splits a message across
-            // callbacks, so this is a malformed stream, not something to buffer.
-            malformed += bytes.len() - index;
-            break;
-        }
-        message[0] = status;
-        message[1..=needed].copy_from_slice(&bytes[data_start..end]);
-        on_message(&message[..=needed]);
-        index = end;
     }
 
-    malformed
+    /// Feed the next bytes of the stream, calling `on_message` once per
+    /// complete message, in stream order.
+    pub fn push(&mut self, bytes: &[u8], mut on_message: impl FnMut(&[u8])) -> MidiStreamCounts {
+        let mut counts = MidiStreamCounts::default();
+        for &byte in bytes {
+            self.push_byte(byte, &mut on_message, &mut counts);
+        }
+        counts
+    }
+
+    fn push_byte(
+        &mut self,
+        byte: u8,
+        on_message: &mut impl FnMut(&[u8]),
+        counts: &mut MidiStreamCounts,
+    ) {
+        if byte >= 0xF8 {
+            on_message(&[byte]);
+            return;
+        }
+
+        if byte & 0x80 == 0 {
+            self.push_data(byte, on_message, counts);
+            return;
+        }
+
+        // A status byte: whatever was in progress ends here.
+        if self.filled > 0 {
+            let received = if self.explicit_status {
+                self.filled
+            } else {
+                self.filled - 1
+            };
+            counts.malformed += usize::from(received);
+            self.filled = 0;
+        }
+        if byte == 0xF7 {
+            if self.in_sysex {
+                self.in_sysex = false;
+                if self.sysex_overflowed || self.sysex_len >= self.sysex.len() {
+                    counts.sysex_dropped += 1;
+                } else {
+                    self.sysex[self.sysex_len] = 0xF7;
+                    self.sysex_len += 1;
+                    on_message(&self.sysex[..self.sysex_len]);
+                }
+            } else {
+                counts.malformed += 1;
+            }
+            self.running_status = 0;
+            return;
+        }
+        if self.in_sysex {
+            // Ended by a status byte other than EOX: incomplete, never
+            // delivered as if it were whole.
+            self.in_sysex = false;
+            if self.sysex_overflowed {
+                counts.sysex_dropped += 1;
+            } else {
+                counts.malformed += self.sysex_len;
+            }
+        }
+        if byte == 0xF0 {
+            self.running_status = 0;
+            self.in_sysex = true;
+            self.sysex_len = 0;
+            self.sysex_overflowed = self.sysex.is_empty();
+            if !self.sysex_overflowed {
+                self.sysex[0] = 0xF0;
+                self.sysex_len = 1;
+            }
+            return;
+        }
+
+        self.running_status = if byte < 0xF0 { byte } else { 0 };
+        let needed = 1 + midi_data_byte_count(byte) as u8;
+        if needed == 1 {
+            on_message(&[byte]);
+            return;
+        }
+        self.message[0] = byte;
+        self.filled = 1;
+        self.needed = needed;
+        self.explicit_status = true;
+    }
+
+    fn push_data(
+        &mut self,
+        byte: u8,
+        on_message: &mut impl FnMut(&[u8]),
+        counts: &mut MidiStreamCounts,
+    ) {
+        if self.in_sysex {
+            if self.sysex_len < self.sysex.len() {
+                self.sysex[self.sysex_len] = byte;
+                self.sysex_len += 1;
+            } else {
+                self.sysex_overflowed = true;
+            }
+            return;
+        }
+        if self.filled == 0 {
+            if self.running_status == 0 {
+                // Nothing to attach it to: the stream started mid-message or
+                // after System Common. Never guess a status.
+                counts.malformed += 1;
+                return;
+            }
+            self.message[0] = self.running_status;
+            self.filled = 1;
+            self.needed = 1 + midi_data_byte_count(self.running_status) as u8;
+            self.explicit_status = false;
+        }
+        self.message[usize::from(self.filled)] = byte;
+        self.filled += 1;
+        if self.filled == self.needed {
+            self.filled = 0;
+            on_message(&self.message[..usize::from(self.needed)]);
+        }
+    }
 }
 
 /// Counters for the hardware MIDI input boundary, so a silent keyboard can be
@@ -999,7 +1161,9 @@ pub struct MidiInputDiagnostics {
     pub ignored: u64,
     /// Bytes that could not be framed into a message.
     pub malformed: u64,
-    /// Events dropped because the queue receiver was gone.
+    /// Complete messages dropped at the input boundary: the queue was full
+    /// (newest dropped, see [`MIDI_INPUT_QUEUE_CAPACITY`]) or its receiver was
+    /// gone, or a SysEx exceeded [`MAX_INPUT_SYSEX_BYTES`].
     pub dropped: u64,
     /// Events the router delivered to at least one track.
     pub routed: u64,
@@ -1047,6 +1211,62 @@ pub(crate) fn note_midi_input_callback(
     bump(&input_counters::DROPPED, dropped);
 }
 
+/// What one native input callback produced, for [`note_midi_input_callback`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MidiInputCounts {
+    pub(crate) messages: u64,
+    pub(crate) events: u64,
+    pub(crate) ignored: u64,
+    pub(crate) malformed: u64,
+    pub(crate) dropped: u64,
+}
+
+impl MidiInputCounts {
+    pub(crate) fn note(self) {
+        note_midi_input_callback(
+            self.messages,
+            self.events,
+            self.ignored,
+            self.malformed,
+            self.dropped,
+        );
+    }
+}
+
+/// Parse `bytes` from one input connection's stream, decode each message and
+/// queue the events. Shared by every backend; runs on the platform MIDI
+/// thread, so it does not allocate, lock (beyond the doorbell's uncontended
+/// waker slot) or block.
+pub(crate) fn deliver_midi_input(
+    parser: &mut MidiStreamParser,
+    tx: &MidiInputSender,
+    source: u32,
+    bytes: &[u8],
+    received_at: Instant,
+    counts: &mut MidiInputCounts,
+) {
+    let stream = parser.push(bytes, |message| {
+        counts.messages += 1;
+        match decode_midi_bytes(message) {
+            Some(event) => {
+                counts.events += 1;
+                if !tx.send(QueuedMidiInput {
+                    source,
+                    event,
+                    received_at,
+                }) {
+                    counts.dropped += 1;
+                }
+            }
+            // Clock, sysex, program change, system common: real MIDI the
+            // internal event model does not carry. Counted, not lost.
+            None => counts.ignored += 1,
+        }
+    });
+    counts.malformed += stream.malformed as u64;
+    counts.dropped += stream.sysex_dropped as u64;
+}
+
 /// Record the routing verdict for one drained input event.
 #[inline]
 pub fn note_midi_input_routed(routed: bool) {
@@ -1084,7 +1304,7 @@ fn open_hardware_midi_inputs(
         return connections;
     };
     let ports = scanner.ports();
-    for (device_id, device_name) in enabled {
+    for (source, (device_id, device_name)) in enabled.into_iter().enumerate() {
         let ordinal = stable_id_ordinal(&device_id, &device_name);
         let Some(port) = ports
             .iter()
@@ -1105,29 +1325,27 @@ fn open_hardware_midi_inputs(
             continue;
         };
         let tx = tx.clone();
-        let id = device_id.clone();
-        let name = device_name.clone();
+        let source = source as u32;
+        // Allocated here, on the control thread; the callback only reuses it.
+        let mut parser = MidiStreamParser::new(MAX_INPUT_SYSEX_BYTES);
         match input.connect(
             port,
             &format!("Futureboard listen ({device_name})"),
             move |_stamp, message, _| {
-                // midir delivers exactly one complete message per callback, so
-                // this stays a direct decode; only the diagnostic counters are
-                // shared with the CoreMIDI path.
-                match decode_midi_bytes(message) {
-                    Some(event) => {
-                        let sent = tx
-                            .send(HardwareMidiInputMessage {
-                                device_id: id.clone(),
-                                device_name: name.clone(),
-                                event,
-                                received_at: Instant::now(),
-                            })
-                            .is_ok();
-                        note_midi_input_callback(1, 1, 0, 0, u64::from(!sent));
-                    }
-                    None => note_midi_input_callback(1, 0, 1, 0, 0),
-                }
+                // Not a direct decode: midir's WinMM backend hands a SysEx
+                // longer than its 1 KB buffers over in several callbacks, and
+                // its ALSA backend can leave a clock byte inside a reassembled
+                // SysEx. The same stream parser as CoreMIDI handles both.
+                let mut counts = MidiInputCounts::default();
+                deliver_midi_input(
+                    &mut parser,
+                    &tx,
+                    source,
+                    message,
+                    Instant::now(),
+                    &mut counts,
+                );
+                counts.note();
             },
             (),
         ) {
@@ -2089,13 +2307,15 @@ mod tests {
         );
     }
 
-    /// Split `bytes` with a fresh running status and collect the messages.
+    /// Parse `bytes` with a fresh parser and collect the messages.
     fn split(bytes: &[u8]) -> (Vec<Vec<u8>>, usize) {
         let mut messages = Vec::new();
-        let mut running = None;
-        let malformed = split_midi_messages(bytes, &mut running, |message| {
-            messages.push(message.to_vec());
-        });
+        let mut parser = MidiStreamParser::new(MAX_INPUT_SYSEX_BYTES);
+        let malformed = parser
+            .push(bytes, |message| {
+                messages.push(message.to_vec());
+            })
+            .malformed;
         (messages, malformed)
     }
 
@@ -2230,9 +2450,94 @@ mod tests {
 
     #[test]
     fn a_truncated_message_is_reported_not_guessed() {
-        let (messages, malformed) = split(&[0x90, 60]);
-        assert!(messages.is_empty());
+        // An unfinished message waits for its data (it may continue in the
+        // next packet); the next status byte abandons it as malformed.
+        let (messages, malformed) = split(&[0x90, 60, 0xC0, 5]);
+        assert_eq!(messages, vec![vec![0xC0, 5]]);
         assert_eq!(malformed, 2);
+    }
+
+    #[test]
+    fn a_sysex_ended_by_a_status_byte_is_not_delivered_as_whole() {
+        let (messages, malformed) = split(&[0xF0, 0x7D, 1, 2, 0x90, 60, 100]);
+        assert_eq!(messages, vec![vec![0x90, 60, 100]]);
+        assert_eq!(malformed, 4);
+    }
+
+    #[test]
+    fn a_stray_eox_is_malformed() {
+        let (messages, malformed) = split(&[0xF7, 0x90, 60, 100]);
+        assert_eq!(messages, vec![vec![0x90, 60, 100]]);
+        assert_eq!(malformed, 1);
+    }
+
+    #[test]
+    fn an_oversized_sysex_is_dropped_whole_and_the_stream_recovers() {
+        let mut parser = MidiStreamParser::new(8);
+        let mut messages = Vec::new();
+        let mut counts = MidiStreamCounts::default();
+        for chunk in [
+            &[0xF0, 1, 2, 3, 4][..],
+            &[5, 6, 7, 8, 9],
+            &[0xF7, 0x90, 60, 100],
+        ] {
+            let c = parser.push(chunk, |m| messages.push(m.to_vec()));
+            counts.malformed += c.malformed;
+            counts.sysex_dropped += c.sysex_dropped;
+        }
+        assert_eq!(
+            messages,
+            vec![vec![0x90, 60, 100]],
+            "never delivered truncated"
+        );
+        assert_eq!(counts.sysex_dropped, 1);
+        assert_eq!(counts.malformed, 0);
+        // Exactly at capacity still fits.
+        let mut messages = Vec::new();
+        let full = [0xF0, 1, 2, 3, 4, 5, 6, 0xF7];
+        let c = parser.push(&full, |m| messages.push(m.to_vec()));
+        assert_eq!(messages, vec![full.to_vec()]);
+        assert_eq!(c, MidiStreamCounts::default());
+    }
+
+    #[test]
+    fn the_input_queue_drops_the_newest_event_when_full_and_drain_names_the_device() {
+        let bell = std::sync::Arc::new(MidiInputDoorbell::default());
+        let (tx, rx) = midi_input_queue(&bell);
+        let at = Instant::now();
+        let event = |note: u8| QueuedMidiInput {
+            source: 1,
+            event: MidiInputEvent::NoteOn {
+                note: note % 128,
+                velocity: 1,
+                channel: 0,
+            },
+            received_at: at,
+        };
+        for i in 0..MIDI_INPUT_QUEUE_CAPACITY {
+            assert!(tx.send(event(i as u8)), "slot {i} accepted");
+        }
+        assert!(!tx.send(event(0)), "full: the newest is refused");
+
+        let mut input = HardwareMidiInput::new();
+        input.event_rx = Some(rx);
+        input.sources = vec![
+            ("a".to_string(), "A".to_string()),
+            ("b".to_string(), "B".to_string()),
+        ];
+        let drained = input.drain(usize::MAX);
+        assert_eq!(drained.len(), MIDI_INPUT_QUEUE_CAPACITY);
+        // Oldest first: the events that got in are the first ones sent.
+        assert_eq!(drained[0].event, event(0).event);
+        assert_eq!(drained[5].event, event(5).event);
+        assert!(
+            drained
+                .iter()
+                .all(|m| m.device_id == "b" && m.device_name == "B")
+        );
+        // Drained space is usable again.
+        assert!(tx.send(event(1)));
+        input.sources.clear();
     }
 
     #[test]
@@ -2244,14 +2549,12 @@ mod tests {
 
     #[test]
     fn running_status_carries_across_packet_boundaries() {
-        // The caller threads one running-status slot through every packet of a
-        // list, because a packet boundary is not a message boundary.
-        let mut running = None;
+        // One parser per connection sees every packet, because a packet
+        // boundary is not a message boundary.
+        let mut parser = MidiStreamParser::new(MAX_INPUT_SYSEX_BYTES);
         let mut messages = Vec::new();
-        split_midi_messages(&[0x90, 60, 100], &mut running, |m| {
-            messages.push(m.to_vec())
-        });
-        split_midi_messages(&[64, 100], &mut running, |m| messages.push(m.to_vec()));
+        parser.push(&[0x90, 60, 100], |m| messages.push(m.to_vec()));
+        parser.push(&[64, 100], |m| messages.push(m.to_vec()));
         assert_eq!(messages, vec![vec![0x90, 60, 100], vec![0x90, 64, 100]]);
     }
 
@@ -2277,6 +2580,48 @@ mod tests {
         assert!(after.ignored - before.ignored >= 1);
         assert!(after.routed > before.routed);
         assert!(after.unrouted > before.unrouted);
+    }
+}
+
+/// Counts heap allocations per thread, so tests can prove a MIDI input path
+/// allocates nothing on the thread that runs it.
+#[cfg(test)]
+pub(crate) mod alloc_counter {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNT: Cell<u64> = const { Cell::new(0) };
+    }
+
+    struct Counting;
+
+    // SAFETY: forwards to `System`; the counter is a const-initialized
+    // thread-local with no destructor, so touching it never allocates.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let _ = COUNT.try_with(|count| count.set(count.get() + 1));
+            unsafe { System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let _ = COUNT.try_with(|count| count.set(count.get() + 1));
+            unsafe { System.alloc_zeroed(layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let _ = COUNT.try_with(|count| count.set(count.get() + 1));
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    #[global_allocator]
+    static GLOBAL: Counting = Counting;
+
+    /// Allocations made on the calling thread so far.
+    pub(crate) fn this_thread() -> u64 {
+        COUNT.with(Cell::get)
     }
 }
 

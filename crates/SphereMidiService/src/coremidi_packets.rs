@@ -72,6 +72,86 @@ pub(crate) unsafe fn for_each_packet(
     }
 }
 
+/// Per-connection state the CoreMIDI read proc works with. Lives here, not in
+/// `macos_coremidi`, so the read path below runs in tests on every host.
+pub(crate) struct InputCallbackState {
+    tx: crate::MidiInputSender,
+    /// Index of the device in the enabled set, resolved to its id and name by
+    /// the draining side so the read proc never clones a string.
+    source: u32,
+    /// The connection's stream state: running status, a message cut at a
+    /// packet boundary and an in-progress SysEx all carry into the next packet
+    /// list. Only the read proc touches it; `busy` turns "CoreMIDI never calls
+    /// one port's read proc concurrently" into a checked condition instead of
+    /// an assumption.
+    parser: std::cell::UnsafeCell<crate::MidiStreamParser>,
+    busy: std::sync::atomic::AtomicBool,
+}
+
+impl InputCallbackState {
+    /// Called on the control thread when the port is opened; allocates the
+    /// SysEx buffer here so the read proc never does.
+    pub(crate) fn new(tx: crate::MidiInputSender, source: u32) -> Self {
+        Self {
+            tx,
+            source,
+            parser: std::cell::UnsafeCell::new(crate::MidiStreamParser::new(
+                crate::MAX_INPUT_SYSEX_BYTES,
+            )),
+            busy: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+// SAFETY: the only non-`Sync` field is `parser`, and it is reached solely
+// through `read_packet_list`, which first takes `busy` with an atomic swap (a
+// try-lock) and releases it after its last use, so no two threads ever hold a
+// reference to it at once.
+unsafe impl Sync for InputCallbackState {}
+
+/// What one read-proc invocation produced, for the input diagnostics.
+pub(crate) type PacketListCounts = crate::MidiInputCounts;
+
+/// The body of the CoreMIDI read proc: parse every packet of the list at
+/// `list` as one continuous stream, decode the messages and queue the events.
+///
+/// # Safety
+/// As [`for_each_packet`].
+pub(crate) unsafe fn read_packet_list(
+    state: &InputCallbackState,
+    list: *const u8,
+    align_to_4: bool,
+) -> PacketListCounts {
+    use std::sync::atomic::Ordering;
+    let mut counts = PacketListCounts::default();
+    if state.busy.swap(true, Ordering::Acquire) {
+        // A concurrent call on the same port. CoreMIDI does not do this; if it
+        // ever did, dropping the list (counted) beats a data race.
+        counts.dropped += 1;
+        return counts;
+    }
+    // SAFETY: `busy` was false and is now ours, so no other reference to the
+    // parser exists until it is released below.
+    let parser = unsafe { &mut *state.parser.get() };
+    let received_at = std::time::Instant::now();
+
+    // SAFETY: forwarded from the caller.
+    unsafe {
+        for_each_packet(list, align_to_4, |data| {
+            crate::deliver_midi_input(
+                parser,
+                &state.tx,
+                state.source,
+                data,
+                received_at,
+                &mut counts,
+            );
+        });
+    }
+    state.busy.store(false, Ordering::Release);
+    counts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,15 +324,15 @@ mod tests {
     #[test]
     fn a_coalesced_packet_reaches_the_splitter_intact() {
         // CoreMIDI puts messages that share a timestamp in one packet; the
-        // payload has to arrive whole for `split_midi_messages` to unpack it.
+        // payload has to arrive whole for the stream parser to unpack it.
         let payload: &[u8] = &[0x90, 60, 100, 0x90, 64, 100, 0x90, 67, 100];
         for align in LAYOUTS {
             assert_eq!(collect(&[payload], align), vec![payload.to_vec()]);
         }
 
-        let mut running = None;
+        let mut parser = crate::MidiStreamParser::new(crate::MAX_INPUT_SYSEX_BYTES);
         let mut events = Vec::new();
-        crate::split_midi_messages(payload, &mut running, |message| {
+        parser.push(payload, |message| {
             if let Some(event) = crate::decode_midi_bytes(message) {
                 events.push(event);
             }
@@ -305,5 +385,248 @@ mod tests {
         let single_note = build_packet_list(&[&[0x90, 60, 100]], true);
         assert_eq!(single_note.len(), 17);
         assert_eq!(next_packet_address(PACKET_LIST_FIRST_PACKET, 3, true), 20);
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #408: the reported cases, driven through `read_packet_list` — the
+    // exact code the CoreMIDI read proc runs — with packet lists laid out
+    // byte-for-byte as CoreMIDI lays them out.
+    // ---------------------------------------------------------------------
+
+    use crate::MidiInputEvent;
+
+    fn input_state() -> (InputCallbackState, crate::MidiInputReceiver) {
+        let bell = std::sync::Arc::new(crate::MidiInputDoorbell::default());
+        let (tx, rx) = crate::midi_input_queue(&bell);
+        (InputCallbackState::new(tx, 0), rx)
+    }
+
+    /// Run one read-proc invocation over `packets`, on both stride rules
+    /// (state is per call, so each layout gets its own connection).
+    fn deliver(packets: &[&[u8]]) -> Vec<(Vec<MidiInputEvent>, PacketListCounts)> {
+        LAYOUTS
+            .iter()
+            .map(|&align| {
+                let (state, rx) = input_state();
+                let list = build_packet_list(packets, align);
+                // SAFETY: well-formed list built with `align`, outlives the call.
+                let counts = unsafe { read_packet_list(&state, list.as_ptr(), align) };
+                (rx.try_iter().map(|m| m.event).collect(), counts)
+            })
+            .collect()
+    }
+
+    fn note_on(note: u8, velocity: u8) -> MidiInputEvent {
+        MidiInputEvent::NoteOn {
+            note,
+            velocity,
+            channel: 0,
+        }
+    }
+
+    fn cc(controller: u8, value: u8) -> MidiInputEvent {
+        MidiInputEvent::ControlChange {
+            controller,
+            value,
+            channel: 0,
+        }
+    }
+
+    #[test]
+    fn issue_408_note_on_then_control_change_in_one_packet() {
+        for (events, counts) in deliver(&[&[0x90, 60, 100, 0xB0, 7, 90]]) {
+            assert_eq!(events, vec![note_on(60, 100), cc(7, 90)]);
+            assert_eq!(counts.malformed, 0);
+        }
+    }
+
+    #[test]
+    fn issue_408_a_status_byte_ends_an_unfinished_note_on_instead_of_becoming_its_velocity() {
+        // The Note On lost its velocity byte. Per MIDI 1.0 a status byte always
+        // starts a new message: the CC must decode, the two orphaned bytes are
+        // malformed, and no note may be invented.
+        for (events, counts) in deliver(&[&[0x90, 60, 0xB0, 7, 90]]) {
+            assert_eq!(events, vec![cc(7, 90)], "no phantom note, CC kept");
+            assert_eq!(counts.malformed, 2);
+        }
+    }
+
+    #[test]
+    fn issue_408_a_clock_byte_inside_a_note_on_does_not_shift_the_following_cc() {
+        // Real-time bytes may appear between the data bytes of any message.
+        for (events, counts) in deliver(&[&[0x90, 60, 0xF8, 100, 0xB0, 7, 90]]) {
+            assert_eq!(events, vec![note_on(60, 100), cc(7, 90)]);
+            assert_eq!(counts.malformed, 0);
+            assert_eq!(counts.ignored, 1, "the clock is a message of its own");
+        }
+    }
+
+    #[test]
+    fn issue_408_a_running_status_note_cut_short_by_a_cc() {
+        for (events, counts) in deliver(&[&[0x90, 60, 100, 62, 0xB0, 7, 90]]) {
+            assert_eq!(events, vec![note_on(60, 100), cc(7, 90)]);
+            assert_eq!(counts.malformed, 1);
+        }
+    }
+
+    #[test]
+    fn issue_408_a_note_on_whose_velocity_is_in_the_next_packet() {
+        // CoreMIDI documents complete messages per packet, but a driver that
+        // splits one must not turn the next status byte into data.
+        for (events, _) in deliver(&[&[0x90, 60], &[100, 0xB0, 7, 90]]) {
+            assert_eq!(events, vec![note_on(60, 100), cc(7, 90)]);
+        }
+    }
+
+    #[test]
+    fn issue_408_decode_rejects_a_status_byte_in_a_data_position() {
+        assert_eq!(crate::decode_midi_bytes(&[0x90, 60, 0xB0]), None);
+        assert_eq!(crate::decode_midi_bytes(&[0xB0, 0x90, 7]), None);
+        assert_eq!(crate::decode_midi_bytes(&[0xE0, 0, 0xF8]), None);
+    }
+
+    /// A 1 KB SysEx (F0 7D, 1,021 data bytes, F7).
+    fn one_kb_sysex() -> Vec<u8> {
+        let mut sysex = vec![0xF0, 0x7D];
+        sysex.extend((0..1_021u32).map(|i| (i % 0x80) as u8));
+        sysex.push(0xF7);
+        assert_eq!(sysex.len(), 1_024);
+        sysex
+    }
+
+    #[test]
+    fn issue_408_a_1kb_sysex_in_several_packets_of_one_list_is_one_message() {
+        let sysex = one_kb_sysex();
+        let mut packets: Vec<&[u8]> = sysex.chunks(256).collect();
+        packets.push(&[0x90, 60, 100]);
+        for (events, counts) in deliver(&packets) {
+            assert_eq!(counts.malformed, 0, "a valid SysEx is not malformed");
+            assert_eq!(counts.messages, 2, "one SysEx and one Note On");
+            assert_eq!(counts.ignored, 1);
+            assert_eq!(events, vec![note_on(60, 100)]);
+        }
+    }
+
+    #[test]
+    fn issue_408_a_1kb_sysex_across_separate_read_proc_calls_is_one_message() {
+        let sysex = one_kb_sysex();
+        for align in LAYOUTS {
+            let (state, rx) = input_state();
+            let mut total = PacketListCounts::default();
+            for chunk in sysex.chunks(256) {
+                let list = build_packet_list(&[chunk], align);
+                // SAFETY: well-formed list built with `align`, outlives the call.
+                let counts = unsafe { read_packet_list(&state, list.as_ptr(), align) };
+                total.messages += counts.messages;
+                total.malformed += counts.malformed;
+                total.ignored += counts.ignored;
+            }
+            let list = build_packet_list(&[&[0x90, 60, 100]], align);
+            // SAFETY: as above.
+            let counts = unsafe { read_packet_list(&state, list.as_ptr(), align) };
+            assert_eq!(total.malformed, 0, "align_to_4={align}");
+            assert_eq!(total.messages, 1, "align_to_4={align}");
+            assert_eq!(counts.malformed, 0);
+            assert_eq!(
+                rx.try_iter().map(|m| m.event).collect::<Vec<_>>(),
+                vec![note_on(60, 100)]
+            );
+        }
+    }
+
+    /// Frame `packets` the way the read proc does, collecting the raw
+    /// messages (so SysEx content can be checked, which the event queue does
+    /// not carry).
+    fn frame(packets: &[&[u8]]) -> (Vec<Vec<u8>>, usize) {
+        let mut parser = crate::MidiStreamParser::new(crate::MAX_INPUT_SYSEX_BYTES);
+        let mut messages = Vec::new();
+        let mut malformed = 0;
+        for packet in packets {
+            malformed += parser
+                .push(packet, |message| messages.push(message.to_vec()))
+                .malformed;
+        }
+        (messages, malformed)
+    }
+
+    #[test]
+    fn issue_408_sysex_reassembled_across_packets_has_its_exact_bytes() {
+        let sysex = one_kb_sysex();
+        let packets: Vec<&[u8]> = sysex.chunks(300).collect();
+        assert_eq!(frame(&packets), (vec![sysex.clone()], 0));
+    }
+
+    #[test]
+    fn issue_408_a_clock_inside_sysex_is_delivered_and_not_part_of_the_dump() {
+        let (messages, malformed) = frame(&[&[0xF0, 0x7D, 0x01, 0xF8, 0x02], &[0x03, 0xF7]]);
+        assert_eq!(
+            messages,
+            vec![vec![0xF8], vec![0xF0, 0x7D, 0x01, 0x02, 0x03, 0xF7]]
+        );
+        assert_eq!(malformed, 0);
+    }
+
+    #[test]
+    fn issue_408_the_input_queue_is_bounded_while_nothing_drains() {
+        // Over a million events with nobody draining. The queue must hold at
+        // most a fixed number and count every event it could not take.
+        let mut packet = Vec::new();
+        for i in 0..1_000u32 {
+            packet.extend_from_slice(&[0x90, (i % 128) as u8, 100]);
+        }
+        let list = build_packet_list(&[&packet], PACKETS_ARE_4_BYTE_ALIGNED);
+        let (state, rx) = input_state();
+        let mut dropped = 0u64;
+        let mut sent = 0u64;
+        for _ in 0..1_100 {
+            // SAFETY: well-formed list, outlives the call.
+            let counts =
+                unsafe { read_packet_list(&state, list.as_ptr(), PACKETS_ARE_4_BYTE_ALIGNED) };
+            dropped += counts.dropped;
+            sent += counts.events;
+        }
+        let queued = rx.try_iter().count() as u64;
+        assert_eq!(sent, 1_100_000);
+        assert!(
+            queued <= 65_536,
+            "{queued} events queued: the queue is unbounded"
+        );
+        assert_eq!(queued + dropped, sent, "every event not queued is counted");
+    }
+
+    #[test]
+    fn issue_408_queuing_input_does_not_allocate_on_the_input_thread() {
+        let mut packet = Vec::new();
+        for i in 0..500u32 {
+            packet.extend_from_slice(&[0x90, (i % 128) as u8, 100]);
+        }
+        let list = build_packet_list(&[&packet], PACKETS_ARE_4_BYTE_ALIGNED);
+        let (state, rx) = input_state();
+        // SAFETY: well-formed list, outlives the calls.
+        unsafe { read_packet_list(&state, list.as_ptr(), PACKETS_ARE_4_BYTE_ALIGNED) };
+        let _ = rx.try_iter().count();
+        let before = crate::alloc_counter::this_thread();
+        // SAFETY: as above.
+        let counts = unsafe { read_packet_list(&state, list.as_ptr(), PACKETS_ARE_4_BYTE_ALIGNED) };
+        let allocations = crate::alloc_counter::this_thread() - before;
+        assert_eq!(counts.events, 500);
+        assert_eq!(
+            allocations, 0,
+            "{allocations} heap allocations for 500 events"
+        );
+        drop(rx);
+    }
+
+    #[test]
+    fn reassembling_a_split_sysex_does_not_allocate_on_the_input_thread() {
+        let sysex = one_kb_sysex();
+        let packets: Vec<&[u8]> = sysex.chunks(256).collect();
+        let list = build_packet_list(&packets, PACKETS_ARE_4_BYTE_ALIGNED);
+        let (state, _rx) = input_state();
+        let before = crate::alloc_counter::this_thread();
+        // SAFETY: well-formed list, outlives the call.
+        let counts = unsafe { read_packet_list(&state, list.as_ptr(), PACKETS_ARE_4_BYTE_ALIGNED) };
+        assert_eq!(crate::alloc_counter::this_thread() - before, 0);
+        assert_eq!((counts.messages, counts.malformed), (1, 0));
     }
 }

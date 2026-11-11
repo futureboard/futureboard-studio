@@ -5,18 +5,18 @@
 //! directly.
 
 use crate::coremidi_packets::{
-    PACKET_DATA_OFFSET, PACKET_LENGTH_OFFSET, PACKET_LIST_FIRST_PACKET, PACKETS_ARE_4_BYTE_ALIGNED,
-    for_each_packet,
+    InputCallbackState, PACKET_DATA_OFFSET, PACKET_LENGTH_OFFSET, PACKET_LIST_FIRST_PACKET,
+    PACKETS_ARE_4_BYTE_ALIGNED, read_packet_list,
 };
 use crate::{
-    DetectedMidiDevice, HardwareMidiInputMessage, MidiDeviceDirection,
-    coalesce_detected_midi_devices, decode_midi_bytes, stable_id, stable_id_ordinal,
+    DetectedMidiDevice, MidiDeviceDirection, coalesce_detected_midi_devices, stable_id,
+    stable_id_ordinal,
 };
 use std::ffi::c_void;
 use std::os::raw::{c_char, c_int, c_ulong};
 use std::ptr;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 type OSStatus = c_int;
 type MIDIObjectRef = u32;
@@ -595,21 +595,12 @@ pub fn scan_ports() -> Vec<DetectedMidiDevice> {
     coalesced
 }
 
-struct InputCallbackState {
-    tx: crate::MidiInputSender,
-    device_id: String,
-    device_name: String,
-    /// Running status carried across packets (0 = none). Atomic because the box
-    /// is owned by the control thread but only ever touched by CoreMIDI's read
-    /// thread, so a plain field would be a data race by construction.
-    running_status: AtomicU8,
-}
-
 /// CoreMIDI read proc. Runs on a high-priority CoreMIDI thread — never the
 /// audio render thread and never the UI thread — so it does the least it can:
 /// frame the packet bytes into messages, decode them, and hand them to the
-/// existing bounded queue that the control-thread poll drains. No locks, no
-/// I/O, no logging, no plugin work.
+/// bounded queue ([`crate::MIDI_INPUT_QUEUE_CAPACITY`]) that the control-thread
+/// poll drains. No allocation, no I/O, no logging, no plugin work; the only
+/// lock is the doorbell's uncontended waker slot.
 unsafe extern "C" fn midi_read_proc(
     pktlist: *const MIDIPacketList,
     read_proc_ref_con: *mut c_void,
@@ -623,45 +614,8 @@ unsafe extern "C" fn midi_read_proc(
     // lifetime and releases only after the port is disconnected and disposed.
     unsafe {
         let state = &*(read_proc_ref_con as *const InputCallbackState);
-        let received_at = std::time::Instant::now();
-
-        let mut running = match state.running_status.load(Ordering::Relaxed) {
-            0 => None,
-            status => Some(status),
-        };
-        let (mut messages, mut events, mut ignored, mut dropped) = (0u64, 0u64, 0u64, 0u64);
-        let mut malformed = 0u64;
-
-        for_each_packet(pktlist as *const u8, PACKETS_ARE_4_BYTE_ALIGNED, |data| {
-            malformed += crate::split_midi_messages(data, &mut running, |message| {
-                messages += 1;
-                match decode_midi_bytes(message) {
-                    Some(event) => {
-                        events += 1;
-                        if state
-                            .tx
-                            .send(HardwareMidiInputMessage {
-                                device_id: state.device_id.clone(),
-                                device_name: state.device_name.clone(),
-                                event,
-                                received_at,
-                            })
-                            .is_err()
-                        {
-                            dropped += 1;
-                        }
-                    }
-                    // Clock, sysex, aftertouch, pitch bend: real MIDI the
-                    // internal event model does not carry. Counted, not lost.
-                    None => ignored += 1,
-                }
-            }) as u64;
-        });
-
-        state
-            .running_status
-            .store(running.unwrap_or(0), Ordering::Relaxed);
-        crate::note_midi_input_callback(messages, events, ignored, malformed, dropped);
+        let counts = read_packet_list(state, pktlist as *const u8, PACKETS_ARE_4_BYTE_ALIGNED);
+        counts.note();
     }
 }
 
@@ -767,17 +721,14 @@ pub fn open_inputs(
         return connections;
     }
 
-    for (device_id, device_name) in enabled {
+    for (index, (device_id, device_name)) in enabled.into_iter().enumerate() {
         let Some(source) = find_source_by_name_or_id(&device_id, &device_name) else {
             eprintln!("[MIDI input] CoreMIDI source not found for '{device_name}'");
             continue;
         };
-        let mut callback = Box::new(InputCallbackState {
-            tx: tx.clone(),
-            device_id: device_id.clone(),
-            device_name: device_name.clone(),
-            running_status: AtomicU8::new(0),
-        });
+        // `index` is the device's position in `enabled`, which is how
+        // `HardwareMidiInput::drain` resolves queued events to a device.
+        let mut callback = Box::new(InputCallbackState::new(tx.clone(), index as u32));
         let callback_ptr = (&mut *callback) as *mut InputCallbackState as *mut c_void;
 
         let mut port: MIDIPortRef = 0;
