@@ -3039,6 +3039,8 @@ pub struct Dsp {
     pitch_ratio: f32,
     pitch_dual: bool,
     pitch_mix: smooth::Smoothed,
+    /// Lines a tap up with the path it rejoins; see [`AlignLine`].
+    align: Box<PathAlign>,
 }
 
 /// Engines whose state outlasts the input by far more than a few samples. One
@@ -3067,6 +3069,97 @@ const BYPASS_LINE: usize = 8192;
 
 const _: () = assert!(BYPASS_LINE.is_power_of_two());
 const _: () = assert!(nam::NAM_BLOCK + nam::MAX_ADAPTER_LATENCY + ir::PARTITION < BYPASS_LINE);
+
+/// Longest path difference an [`AlignLine`] can make up, plus one: a full NAM
+/// chunk with the widest rate adapter, and the IR partition.
+const ALIGN_LINE: usize = 256;
+
+const _: () = assert!(ALIGN_LINE.is_power_of_two());
+const _: () = assert!(nam::NAM_BLOCK + nam::MAX_ADAPTER_LATENCY + ir::PARTITION < ALIGN_LINE);
+
+/// A short stereo delay that lines a tapped signal up with the path it is
+/// mixed back into. A NAM capture or an IR cabinet delays the signal through
+/// it; a tap taken before it (Line 2's dry tap, a lane's input) would
+/// otherwise be mixed in early, combing against the delayed path and putting
+/// the output ahead of the latency the host compensates.
+#[derive(Debug, Clone)]
+struct AlignLine {
+    l: [f32; ALIGN_LINE],
+    r: [f32; ALIGN_LINE],
+    pos: usize,
+    /// The frame last written, so a line advances exactly once per frame.
+    frame: u64,
+}
+
+impl AlignLine {
+    fn new() -> Self {
+        Self {
+            l: [0.0; ALIGN_LINE],
+            r: [0.0; ALIGN_LINE],
+            pos: 0,
+            frame: u64::MAX,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.l.fill(0.0);
+        self.r.fill(0.0);
+    }
+
+    /// Writes this frame's sample and returns the one `delay` frames ago. A
+    /// second call in the same frame (a lane split into two spans) passes the
+    /// signal through rather than running the line's clock twice.
+    #[inline]
+    fn push(&mut self, frame: u64, l: f32, r: f32, delay: usize) -> (f32, f32) {
+        if self.frame == frame {
+            return (l, r);
+        }
+        self.frame = frame;
+        self.pos = (self.pos + 1) & (ALIGN_LINE - 1);
+        self.l[self.pos] = l;
+        self.r[self.pos] = r;
+        let at = self.pos.wrapping_sub(delay.min(ALIGN_LINE - 1)) & (ALIGN_LINE - 1);
+        (self.l[at], self.r[at])
+    }
+
+    /// A frame the line was not used in: keeps its clock, holds silence.
+    #[inline]
+    fn idle(&mut self, frame: u64) {
+        if self.frame != frame {
+            self.push(frame, 0.0, 0.0, 0);
+        }
+    }
+}
+
+/// Every place [`Dsp::run`] mixes two paths that can carry different latency.
+#[derive(Debug, Clone)]
+struct PathAlign {
+    /// Line 2's dry tap, against the end of the main path.
+    line2: AlignLine,
+    /// Per lane: main, the lane's input, and its dry tap, against the lane's
+    /// return.
+    main: [AlignLine; BOTTOM_ROWS],
+    input: [AlignLine; BOTTOM_ROWS],
+    dry: [AlignLine; BOTTOM_ROWS],
+}
+
+impl PathAlign {
+    fn new() -> Self {
+        Self {
+            line2: AlignLine::new(),
+            main: std::array::from_fn(|_| AlignLine::new()),
+            input: std::array::from_fn(|_| AlignLine::new()),
+            dry: std::array::from_fn(|_| AlignLine::new()),
+        }
+    }
+
+    fn lines(&mut self) -> impl Iterator<Item = &mut AlignLine> {
+        std::iter::once(&mut self.line2)
+            .chain(self.main.iter_mut())
+            .chain(self.input.iter_mut())
+            .chain(self.dry.iter_mut())
+    }
+}
 
 /// A fixed stereo delay line for the bypassed signal. Sized once; the audio
 /// path only writes and reads one slot each per frame.
@@ -3281,6 +3374,7 @@ impl Dsp {
             pitch_ratio: pitch::semitone_ratio(12.0),
             pitch_dual: false,
             pitch_mix: smooth::Smoothed::new(sr, 0.012, 1.0),
+            align: Box::new(PathAlign::new()),
         };
         dsp.apply_params();
         dsp.power.set(dsp.params.power);
@@ -3945,6 +4039,19 @@ impl Dsp {
     /// `prepare_nam_runtime` does at load — rather than a delay it imposes.
     /// Reporting it as latency put a stock capture 85 ms behind the dry
     /// signal.
+    /// Samples `stage` delays the signal through it, as [`Self::latency_samples`]
+    /// counts them. Only asked of a stage that just ran.
+    #[inline]
+    fn stage_delay(&self, stage: StageKind) -> usize {
+        match stage {
+            StageKind::Amp if self.params.tone_engine == ToneEngineKind::NamCapture => {
+                self.nam_latency_samples()
+            }
+            StageKind::Cab if self.params.cab_model == CabModel::Ir => self.ir.latency_samples(),
+            _ => 0,
+        }
+    }
+
     pub fn nam_latency_samples(&self) -> usize {
         self.amp_stage.nam_latency_samples()
     }
@@ -4534,6 +4641,9 @@ impl StereoEffect for Dsp {
         self.transpose.reset();
         self.pitch_stage.reset();
         self.pitch_mix.snap();
+        for line in self.align.lines() {
+            line.clear();
+        }
         self.meters.reset();
         self.tuner.reset();
         self.in_gain.snap();
@@ -4633,15 +4743,21 @@ impl Dsp {
         row_level: &[f32; BOTTOM_ROWS],
         row: usize,
         next: Option<usize>,
+        acc_main: &mut usize,
+        acc_row: &[usize; BOTTOM_ROWS],
+        row_dry_acc: &[usize; BOTTOM_ROWS],
     ) {
         if next == Some(row) {
             return;
         }
         let b = row - 1;
-        if !row_tapped[b] {
+        let dry_acc = if row_tapped[b] {
+            row_dry_acc[b]
+        } else {
             row_dry_l[b] = row_l[b];
             row_dry_r[b] = row_r[b];
-        }
+            acc_row[b]
+        };
         self.apply_row_return(
             main_l,
             main_r,
@@ -4654,7 +4770,10 @@ impl Dsp {
             row_send[b],
             row_level[b],
             b,
+            acc_row[b].saturating_sub(*acc_main),
+            acc_row[b].saturating_sub(dry_acc),
         );
+        *acc_main = (*acc_main).max(acc_row[b]);
         open[b] = false;
         mixed[b] = true;
     }
@@ -4673,13 +4792,23 @@ impl Dsp {
         send: RowSend,
         level: f32,
         index: usize,
+        // Latency the lane added over main, and over its own dry tap: main
+        // and the lane's input are delayed by the first, the tap by the
+        // second, so every term of the mix lines up with the lane's output.
+        shift_main: usize,
+        shift_dry: usize,
     ) {
+        let frame = self.frame;
+        let (main_in_l, main_in_r) =
+            self.align.main[index].push(frame, *main_l, *main_r, shift_main);
+        let (in_l, in_r) = self.align.input[index].push(frame, in_l, in_r, shift_main);
+        let (dry_l, dry_r) = self.align.dry[index].push(frame, dry_l, dry_r, shift_dry);
         let target = (level * 0.01).clamp(0.0, 1.0);
         let k = self.line2_coeff;
         self.row_gain[index] += (target - self.row_gain[index]) * k;
         let (l, r) = mix_bottom_row(
-            *main_l,
-            *main_r,
+            main_in_l,
+            main_in_r,
             in_l,
             in_r,
             row_l,
@@ -4742,6 +4871,12 @@ impl Dsp {
         let mut row_dry_l = [0.0f32; BOTTOM_ROWS];
         let mut row_dry_r = [0.0f32; BOTTOM_ROWS];
         let mut row_tapped = [false; BOTTOM_ROWS];
+        // Latency picked up so far on main and on each lane, and where each
+        // dry tap was taken, so a tap rejoins its path in line.
+        let mut acc_main = 0usize;
+        let mut tap_acc = 0usize;
+        let mut acc_row = [0usize; BOTTOM_ROWS];
+        let mut row_dry_acc = [0usize; BOTTOM_ROWS];
         for index in 0..PATH_SLOTS {
             let Some(stage) = order[index] else { continue };
             let row = row_of(&stage_row, stage);
@@ -4760,6 +4895,8 @@ impl Dsp {
                 row_dry_l[b] = l;
                 row_dry_r[b] = r;
                 row_tapped[b] = false;
+                acc_row[b] = acc_main;
+                row_dry_acc[b] = acc_main;
             }
             let (src_l, src_r) = if row == 0 {
                 (l, r)
@@ -4774,11 +4911,13 @@ impl Dsp {
                     dry_l = l;
                     dry_r = r;
                     tapped = true;
+                    tap_acc = acc_main;
                 } else if row > 0 && !row_tapped[row - 1] {
                     let b = row - 1;
                     row_dry_l[b] = row_l[b];
                     row_dry_r[b] = row_r[b];
                     row_tapped[b] = true;
+                    row_dry_acc[b] = acc_row[b];
                 }
             }
             // A block on one side hears that side alone (as a mono pair, so
@@ -4808,10 +4947,19 @@ impl Dsp {
                         &row_level,
                         row,
                         following_row(&order, &stage_row, index),
+                        &mut acc_main,
+                        &acc_row,
+                        &row_dry_acc,
                     );
                 }
                 continue;
             };
+            let added = self.stage_delay(stage);
+            if row == 0 {
+                acc_main += added;
+            } else {
+                acc_row[row - 1] += added;
+            }
             if row == 0 {
                 (l, r) = match channel {
                     StageChannel::Both => (out_l, out_r),
@@ -4841,6 +4989,9 @@ impl Dsp {
                     &row_level,
                     row,
                     following_row(&order, &stage_row, index),
+                    &mut acc_main,
+                    &acc_row,
+                    &row_dry_acc,
                 );
             }
         }
@@ -4849,7 +5000,11 @@ impl Dsp {
                 if !row_tapped[b] {
                     row_dry_l[b] = row_l[b];
                     row_dry_r[b] = row_r[b];
+                    row_dry_acc[b] = acc_row[b];
                 }
+                let shift_main = acc_row[b].saturating_sub(acc_main);
+                let shift_dry = acc_row[b].saturating_sub(row_dry_acc[b]);
+                acc_main = acc_main.max(acc_row[b]);
                 self.apply_row_return(
                     &mut l,
                     &mut r,
@@ -4862,6 +5017,8 @@ impl Dsp {
                     row_send[b],
                     row_level[b],
                     b,
+                    shift_main,
+                    shift_dry,
                 );
             } else if !mixed[b] {
                 let k = self.line2_coeff;
@@ -4871,6 +5028,15 @@ impl Dsp {
         if !tapped {
             dry_l = l;
             dry_r = r;
+        } else {
+            (dry_l, dry_r) =
+                self.align
+                    .line2
+                    .push(self.frame, dry_l, dry_r, acc_main.saturating_sub(tap_acc));
+        }
+        let frame = self.frame;
+        for line in self.align.lines() {
+            line.idle(frame);
         }
 
         let send = (self.params.line2_mix * 0.01).clamp(0.0, 1.0);
@@ -7171,6 +7337,49 @@ mod tests {
         }
         assert!(dsp.apply_ui_param("power", 1.0));
         assert_eq!(dsp.latency_samples(), latency, "Power moved the latency");
+    }
+
+    /// Line 2's dry tap sits before the delay, ahead of an IR cabinet that
+    /// carries the rig's reported latency. Mixed back unaligned, Dry played
+    /// the guitar 128 samples early; it must come out exactly at the latency.
+    #[test]
+    fn line2_dry_lines_up_with_a_latency_carrying_cab() {
+        let mut dsp = Dsp::new(48_000.0);
+        path_of(&mut dsp, &[StageKind::Delay, StageKind::Cab]);
+        assert!(dsp.select_model("cab", "ir"));
+        assert!(dsp.apply_ui_param("line2_mode", Line2Mode::Dry as u8 as f32));
+        let latency = dsp.latency_samples();
+        assert_eq!(latency, IR_PARTITION_SAMPLES);
+        // Let the Line 2 blend settle on Dry, then send a click.
+        feed(&mut dsp, &vec![0.0; 4_800]);
+        let out = feed(&mut dsp, &impulse(latency + 64));
+        for (n, &y) in out.iter().enumerate() {
+            let expected = if n == latency { 1.0 } else { 0.0 };
+            assert!((y - expected).abs() < 1.0e-4, "Line 2 dry at {n}: {y}");
+        }
+    }
+
+    /// A cabinet on a Parallel lane delays the lane by the IR partition. Its
+    /// return is `main + send * (lane - lane input)`: unaligned, main and the
+    /// input arrived early and the click came out twice.
+    #[test]
+    fn a_parallel_lane_with_a_cab_returns_in_line() {
+        let mut dsp = Dsp::new(48_000.0);
+        path_of(&mut dsp, &[StageKind::Cab]);
+        assert!(dsp.select_model("cab", "ir"));
+        let mut p = dsp.params().clone();
+        p.stage_row[StageKind::Cab as usize] = 1;
+        p.row_send[0] = RowSend::Parallel;
+        p.row_level[0] = 50.0;
+        dsp.set_params(p);
+        let latency = dsp.latency_samples();
+        assert_eq!(latency, IR_PARTITION_SAMPLES);
+        feed(&mut dsp, &vec![0.0; 4_800]);
+        let out = feed(&mut dsp, &impulse(latency + 64));
+        for (n, &y) in out.iter().enumerate() {
+            let expected = if n == latency { 1.0 } else { 0.0 };
+            assert!((y - expected).abs() < 1.0e-4, "parallel lane at {n}: {y}");
+        }
     }
 
     /// Issue #166: the Power fade blends the rig with a dry signal at the same
