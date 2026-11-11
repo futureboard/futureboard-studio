@@ -664,28 +664,43 @@ impl WindowsWindow {
             register_modal_dialog(hwnd, owner);
         }
 
-        if params.kind == WindowKind::Dialog {
-            unsafe { SetWindowTextW(hwnd, &window_name).log_err() };
-        }
+        // The window exists from here. A step below that fails must take it
+        // down again: returning the error alone left a live, invisible window,
+        // and for a modal dialog its owner disabled for good (#408). Destroying
+        // it runs the destroy handler, which forgets the modal and re-enables
+        // the owner.
+        let finished = (|| -> Result<()> {
+            if params.kind == WindowKind::Dialog {
+                unsafe { SetWindowTextW(hwnd, &window_name).log_err() };
+            }
 
-        register_drag_drop(&this)?;
-        set_non_rude_hwnd(hwnd, true);
-        configure_dwm_dark_mode(hwnd, appearance);
-        this.state.border_offset.update(hwnd)?;
-        let placement = retrieve_window_placement(
-            hwnd,
-            display,
-            params.bounds,
-            this.state.scale_factor.get(),
-            &this.state.border_offset,
-        )?;
-        if params.show {
-            unsafe { SetWindowPlacement(hwnd, &placement)? };
-        } else {
-            this.state.initial_placement.set(Some(WindowOpenStatus {
-                placement,
-                state: WindowOpenState::Windowed,
-            }));
+            register_drag_drop(&this)?;
+            set_non_rude_hwnd(hwnd, true);
+            configure_dwm_dark_mode(hwnd, appearance);
+            this.state.border_offset.update(hwnd)?;
+            let placement = retrieve_window_placement(
+                hwnd,
+                display,
+                params.bounds,
+                this.state.scale_factor.get(),
+                &this.state.border_offset,
+            )?;
+            if params.show {
+                unsafe { SetWindowPlacement(hwnd, &placement)? };
+            } else {
+                this.state.initial_placement.set(Some(WindowOpenStatus {
+                    placement,
+                    state: WindowOpenState::Windowed,
+                }));
+            }
+            Ok(())
+        })();
+        if let Err(error) = finished {
+            unsafe {
+                let _ = RevokeDragDrop(hwnd);
+                let _ = DestroyWindow(hwnd);
+            }
+            return Err(error);
         }
 
         Ok(Self(this))
@@ -1571,40 +1586,82 @@ impl NativeDialogTemplate {
 }
 
 thread_local! {
-    /// Live modal dialogs of this UI thread, as `(dialog, owner it holds
-    /// disabled)`. Several modals may hold the same owner (a dialog opened from
-    /// a floating editor while Settings is up); only the last one to close may
-    /// re-enable it.
-    static MODAL_DIALOGS: RefCell<Vec<(HWND, HWND)>> = const { RefCell::new(Vec::new()) };
+    /// Live modal dialogs of this UI thread. Several modals may hold the same
+    /// owner (a dialog opened from a floating editor while Settings is up);
+    /// only the last one to close may re-enable it.
+    static MODAL_DIALOGS: RefCell<Vec<ModalDialog>> = const { RefCell::new(Vec::new()) };
+    static NEXT_MODAL_TOKEN: Cell<usize> = const { Cell::new(1) };
+}
+
+/// The window property a registered modal dialog carries: its token.
+const MODAL_DIALOG_PROP: PCWSTR = windows::core::w!("Futureboard.ModalDialog");
+
+/// A modal dialog and the owner it holds disabled.
+#[derive(Clone, Copy)]
+struct ModalDialog {
+    dialog: HWND,
+    owner: HWND,
+    /// Also stored on the window as [`MODAL_DIALOG_PROP`].
+    token: usize,
+}
+
+impl ModalDialog {
+    /// Still the window that was registered. `IsWindow` alone is not enough:
+    /// once a dialog is destroyed Windows may give its handle to an unrelated
+    /// window, which an entry that outlived the dialog then took for a modal
+    /// (#408). Window properties go with the window, so a reused handle does
+    /// not carry the token.
+    fn live(&self) -> bool {
+        unsafe {
+            IsWindow(Some(self.dialog)).as_bool()
+                && GetPropW(self.dialog, MODAL_DIALOG_PROP).0 as usize == self.token
+        }
+    }
 }
 
 fn register_modal_dialog(dialog: HWND, owner: HWND) {
-    MODAL_DIALOGS.with_borrow_mut(|dialogs| dialogs.push((dialog, owner)));
+    let token = NEXT_MODAL_TOKEN.with(|next| {
+        let token = next.get();
+        next.set(token.wrapping_add(1).max(1));
+        token
+    });
+    unsafe {
+        SetPropW(
+            dialog,
+            MODAL_DIALOG_PROP,
+            Some(HANDLE(token as *mut std::ffi::c_void)),
+        )
+        .log_err();
+    }
+    MODAL_DIALOGS.with_borrow_mut(|dialogs| {
+        dialogs.push(ModalDialog {
+            dialog,
+            owner,
+            token,
+        })
+    });
 }
 
 fn is_modal_dialog(hwnd: HWND) -> bool {
-    MODAL_DIALOGS.with_borrow(|dialogs| {
-        dialogs
-            .iter()
-            .any(|&(dialog, _)| dialog == hwnd && unsafe { IsWindow(Some(dialog)) }.as_bool())
-    })
+    MODAL_DIALOGS.with_borrow(|dialogs| dialogs.iter().any(|m| m.dialog == hwnd && m.live()))
 }
 
 /// Whether a live modal dialog other than `except` holds `owner` disabled.
 fn owner_held_by_modal_dialog(owner: HWND, except: Option<HWND>) -> bool {
     MODAL_DIALOGS.with_borrow(|dialogs| {
-        dialogs.iter().any(|&(dialog, held)| {
-            held == owner && Some(dialog) != except && unsafe { IsWindow(Some(dialog)) }.as_bool()
-        })
+        dialogs
+            .iter()
+            .any(|m| m.owner == owner && Some(m.dialog) != except && m.live())
     })
 }
 
 /// Forget a destroyed modal dialog. Returns `true` when no other modal still
 /// holds `owner`, i.e. when the caller should re-enable it.
 pub(crate) fn end_modal_dialog(dialog: HWND, owner: HWND) -> bool {
-    MODAL_DIALOGS.with_borrow_mut(|dialogs| {
-        dialogs.retain(|&(live, _)| live != dialog && unsafe { IsWindow(Some(live)) }.as_bool())
-    });
+    unsafe {
+        let _ = RemovePropW(dialog, MODAL_DIALOG_PROP);
+    }
+    MODAL_DIALOGS.with_borrow_mut(|dialogs| dialogs.retain(|m| m.dialog != dialog && m.live()));
     !owner_held_by_modal_dialog(owner, Some(dialog))
 }
 
@@ -1982,6 +2039,66 @@ fn set_non_rude_hwnd(hwnd: HWND, non_rude: bool) {
 #[cfg(test)]
 mod tests {
     use super::{ClickState, NativeDialogTemplate, PressedButtons};
+
+    /// #408: the registry took any live window at a registered handle for the
+    /// modal, so a destroyed dialog's reused handle blocked an unrelated
+    /// window. It now also needs the dialog's own mark. Windows cannot be made
+    /// to reuse a handle on demand, so this removes the mark from a live
+    /// window instead, which is what a reused handle looks like. Plain hidden
+    /// Win32 windows only.
+    #[test]
+    fn a_window_at_a_registered_handle_without_its_mark_is_not_the_modal() {
+        use super::{
+            MODAL_DIALOG_PROP, end_modal_dialog, is_modal_dialog, owner_held_by_modal_dialog,
+            register_modal_dialog,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, RemovePropW, WS_OVERLAPPED,
+        };
+        use windows::core::w;
+        let make = || unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!(""),
+                WS_OVERLAPPED,
+                0,
+                0,
+                10,
+                10,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("a plain window")
+        };
+        let owner = make();
+        let dialog = make();
+        register_modal_dialog(dialog, owner);
+        assert!(is_modal_dialog(dialog));
+        assert!(owner_held_by_modal_dialog(owner, None));
+
+        unsafe {
+            let _ = RemovePropW(dialog, MODAL_DIALOG_PROP);
+        }
+        assert!(
+            !is_modal_dialog(dialog),
+            "a handle without the mark was taken for the modal"
+        );
+        assert!(!owner_held_by_modal_dialog(owner, None));
+
+        // A real end releases the owner and forgets the entry.
+        let second = make();
+        register_modal_dialog(second, owner);
+        assert!(end_modal_dialog(second, owner));
+        assert!(!is_modal_dialog(second));
+        unsafe {
+            let _ = DestroyWindow(second);
+            let _ = DestroyWindow(dialog);
+            let _ = DestroyWindow(owner);
+        }
+    }
     use gpui::{DevicePixels, MouseButton, NavigationDirection, point};
     use std::time::Duration;
     use windows::Win32::UI::WindowsAndMessaging::{WINDOW_EX_STYLE, WINDOW_STYLE};
