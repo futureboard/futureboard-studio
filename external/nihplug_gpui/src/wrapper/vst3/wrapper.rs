@@ -458,6 +458,8 @@ impl<P: Vst3Plugin> IComponent for Wrapper<P> {
             (true, None) => kResultFalse,
             (false, _) => {
                 self.inner.plugin.lock().deactivate();
+                // Nothing held for `process()` arrives through it any more
+                self.inner.release_controller_values();
 
                 kResultOk
             }
@@ -739,7 +741,7 @@ impl<P: Vst3Plugin> IEditController for Wrapper<P> {
             .load()
             .map(|c| c.sample_rate);
         self.inner
-            .set_normalized_value_by_hash(id, value as f32, sample_rate)
+            .set_normalized_value_while_stopped(id, value as f32, sample_rate)
     }
 
     unsafe fn set_component_handler(
@@ -962,6 +964,11 @@ impl<P: Vst3Plugin> IAudioProcessor for Wrapper<P> {
         // Always reset the processing status when the plugin gets activated or deactivated
         self.inner.last_process_status.store(ProcessStatus::Normal);
         self.inner.is_processing.store(state, Ordering::SeqCst);
+        if !state {
+            // An edit held for `process()` will not arrive through it any more. Released after
+            // `is_processing` is cleared, so a new edit writes the parameter instead of holding.
+            self.inner.release_controller_values();
+        }
 
         // This function is also used to reset buffers on the plugin, so we should do the same
         // thing. We don't call `reset()` in `setup_processing()` for that same reason.

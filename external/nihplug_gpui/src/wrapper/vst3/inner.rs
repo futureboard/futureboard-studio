@@ -124,7 +124,7 @@ pub(crate) struct WrapperInner<P: Vst3Plugin> {
     /// The edit controller's value of each parameter while it differs from the processor's: an
     /// edit made while audio is processing reaches the parameter only once the host passes it back
     /// through `process()`. See [`Self::hold_controller_value()`].
-    controller_values: HashMap<u32, ControllerValue>,
+    controller_values: ControllerValues,
     /// A mapping from parameter ID hashes (obtained from the string parameter IDs) to pointers to
     /// parameters belonging to the plugin. These addresses will remain stable as long as the
     /// `params` object does not get deallocated.
@@ -193,6 +193,56 @@ impl ControllerValue {
 
     fn clear(&self) {
         self.state.store(0, Ordering::Release);
+    }
+}
+
+/// The [`ControllerValue`] of every parameter, keyed by parameter hash. The map is built once;
+/// every operation after that is lock-free and never allocates.
+struct ControllerValues(HashMap<u32, ControllerValue>);
+
+impl ControllerValues {
+    fn new(param_hashes: &[u32]) -> Self {
+        Self(
+            param_hashes
+                .iter()
+                .map(|hash| (*hash, ControllerValue::default()))
+                .collect(),
+        )
+    }
+
+    /// An edit made while processing: the controller reports `normalized` until the processor
+    /// receives it.
+    fn hold(&self, hash: u32, normalized: f32) {
+        if let Some(held) = self.0.get(&hash) {
+            held.hold(normalized);
+        }
+    }
+
+    fn reported(&self, hash: u32) -> Option<f32> {
+        self.0.get(&hash)?.reported()
+    }
+
+    /// The processor received `normalized` for `hash` through `process()`.
+    fn delivered(&self, hash: u32, normalized: f32) {
+        if let Some(held) = self.0.get(&hash) {
+            held.delivered(normalized);
+        }
+    }
+
+    /// The parameter was written directly while not processing (host `setParamNormalized()`, an
+    /// editor edit): it now has the controller's value itself, so nothing is ahead of it.
+    fn written(&self, hash: u32) {
+        if let Some(held) = self.0.get(&hash) {
+            held.clear();
+        }
+    }
+
+    /// Processing stopped, the plugin was deactivated or a state was loaded: no held edit is
+    /// still on its way to the processor, so none may outlive this.
+    fn release_all(&self) {
+        for held in self.0.values() {
+            held.clear();
+        }
     }
 }
 
@@ -314,10 +364,7 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             .iter()
             .map(|(_, hash, _, _)| *hash)
             .collect();
-        let controller_values = param_hashes
-            .iter()
-            .map(|hash| (*hash, ControllerValue::default()))
-            .collect();
+        let controller_values = ControllerValues::new(&param_hashes);
         let param_by_hash = param_id_hashes_ptrs_groups
             .iter()
             .map(|(_, hash, ptr, _)| (*hash, *ptr))
@@ -497,21 +544,34 @@ impl<P: Vst3Plugin> WrapperInner<P> {
     /// what it reads, so reporting the parameter's own (old) value there undid every edit made in
     /// the editor.
     pub fn hold_controller_value(&self, hash: u32, normalized: f32) {
-        if let Some(held) = self.controller_values.get(&hash) {
-            held.hold(normalized);
-        }
+        self.controller_values.hold(hash, normalized);
     }
 
     /// The edit controller's value of `hash`, when it is ahead of the parameter's own.
     pub fn controller_value(&self, hash: u32) -> Option<f32> {
-        self.controller_values.get(&hash)?.reported()
+        self.controller_values.reported(hash)
     }
 
-    /// A state load replaces every value, edits still on their way included.
-    fn clear_controller_values(&self) {
-        for held in self.controller_values.values() {
-            held.clear();
-        }
+    /// Release every held edit. Called when processing stops or the plugin is deactivated (an
+    /// edit held for `process()` will not arrive through it any more, and a hold that outlived
+    /// its delivery would make `getParamNormalized()` report a stale value that Cubase then sends
+    /// back) and when a state load replaces every value.
+    pub fn release_controller_values(&self) {
+        self.controller_values.release_all();
+    }
+
+    /// [`set_normalized_value_by_hash()`][Self::set_normalized_value_by_hash()] for a write made
+    /// while not processing (host `setParamNormalized()`, an editor edit). The parameter then has
+    /// the value itself, so any hold for it is replaced, whether or not it matched.
+    pub fn set_normalized_value_while_stopped(
+        &self,
+        hash: u32,
+        normalized_value: f32,
+        sample_rate: Option<f32>,
+    ) -> tresult {
+        let result = self.set_normalized_value_by_hash(hash, normalized_value, sample_rate);
+        self.controller_values.written(hash);
+        result
     }
 
     /// Get a parameter's ID based on a `ParamPtr`. Used in the `GuiContext` implementation for the
@@ -537,9 +597,7 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         normalized_value: f32,
         sample_rate: Option<f32>,
     ) -> tresult {
-        if let Some(held) = self.controller_values.get(&hash) {
-            held.delivered(normalized_value);
-        }
+        self.controller_values.delivered(hash, normalized_value);
 
         match self.param_by_hash.get(&hash) {
             Some(param_ptr) => {
@@ -674,7 +732,7 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             nih_debug_assert_failure!("Deserializing plugin state from a state object failed");
             return false;
         }
-        self.clear_controller_values();
+        self.release_controller_values();
 
         // If the plugin was already initialized then it needs to be reinitialized
         if let Some(buffer_config) = buffer_config {
@@ -781,7 +839,7 @@ impl<P: Vst3Plugin> MainThreadExecutor<Task<P>> for WrapperInner<P> {
 
 #[cfg(test)]
 mod tests {
-    use super::ControllerValue;
+    use super::{ControllerValue, ControllerValues};
 
     /// #408: during a drag the processor can still receive an older value of the same
     /// parameter (the host delivers the drag's edits a few blocks behind). The controller must
@@ -820,5 +878,63 @@ mod tests {
         held.hold(0.25);
         held.clear();
         assert_eq!(held.reported(), None);
+    }
+
+    const GAIN: u32 = 7;
+    const MIX: u32 = 9;
+
+    /// What `getParamNormalized()` returns for a parameter whose own value is `param_value`.
+    fn get_param_normalized(values: &ControllerValues, hash: u32, param_value: f32) -> f32 {
+        values.reported(hash).unwrap_or(param_value)
+    }
+
+    /// `setProcessing(false)` (and `setActive(false)`) end every hold: an edit held for
+    /// `process()` will not arrive through it any more.
+    #[test]
+    fn stopping_processing_releases_every_held_edit() {
+        let values = ControllerValues::new(&[GAIN, MIX]);
+        values.hold(GAIN, 0.6);
+        values.hold(MIX, 0.2);
+        values.release_all();
+        assert_eq!(values.reported(GAIN), None);
+        assert_eq!(values.reported(MIX), None);
+    }
+
+    /// A hold that outlived its delivery (the processor got an older value of the drag and then
+    /// processing stopped) is replaced by a write made while not processing, even though the
+    /// written value does not match it: `getParamNormalized()` reports the written value, not the
+    /// stale held one Cubase would send back.
+    #[test]
+    fn a_write_while_stopped_replaces_a_stale_hold() {
+        let values = ControllerValues::new(&[GAIN, MIX]);
+        values.hold(GAIN, 0.8);
+        values.hold(MIX, 0.1);
+        values.delivered(GAIN, 0.5);
+        assert_eq!(values.reported(GAIN), Some(0.8));
+
+        // Not processing: the parameter itself is written to 0.35
+        let param_value = 0.35;
+        values.written(GAIN);
+        assert_eq!(
+            get_param_normalized(&values, GAIN, param_value),
+            param_value
+        );
+        // Other parameters keep their holds
+        assert_eq!(values.reported(MIX), Some(0.1));
+    }
+
+    /// The in-processing path is unchanged: only the held edit itself releases its hold.
+    #[test]
+    fn delivery_through_the_map_keeps_the_newer_hold() {
+        let values = ControllerValues::new(&[GAIN]);
+        values.hold(GAIN, 0.5);
+        values.hold(GAIN, 0.8);
+        values.delivered(GAIN, 0.5);
+        assert_eq!(get_param_normalized(&values, GAIN, 0.5), 0.8);
+        values.delivered(GAIN, 0.8);
+        assert_eq!(values.reported(GAIN), None);
+        // Unknown hashes are ignored
+        values.hold(1234, 0.4);
+        assert_eq!(values.reported(1234), None);
     }
 }

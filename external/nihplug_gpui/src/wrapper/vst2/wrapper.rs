@@ -941,7 +941,13 @@ impl<P: Vst2Plugin> Wrapper<P> {
                 config.as_ref(),
             )
         };
-        if self.inner.active.load(Ordering::Acquire) {
+        // Reinitialize whenever the plugin is initialized, not only while processing: after
+        // `effStopProcess` it stays initialized and `effStartProcess` resumes without
+        // initializing, so a state loaded in between would never reach `Plugin::initialize()`
+        // (where plugins reload their state's files). The VST3 and CLAP wrappers likewise
+        // reinitialize on every state load once they have a buffer config. When not initialized,
+        // `resume()` initializes with this state before processing starts.
+        if self.inner.initialized.load(Ordering::Acquire) {
             self.initialize_plugin();
         }
         if let Some(editor) = self.inner.editor.lock().as_ref() {
@@ -1551,6 +1557,125 @@ mod tests {
         assert_eq!(IO_CHANGED_CALLS.load(Ordering::SeqCst), 1);
 
         // Clean up
+        unsafe {
+            dispatcher(effect, EFF_CLOSE, 0, 0, std::ptr::null_mut(), 0.0);
+        }
+    }
+
+    static STATE_TEST_INITIALIZE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Counts `initialize()` calls, where plugins reload the files their state names.
+    #[derive(Default)]
+    struct StateTestPlugin {
+        inner: LatencyTestPlugin,
+    }
+
+    impl Plugin for StateTestPlugin {
+        const NAME: &'static str = "State Test";
+        const VENDOR: &'static str = "Test Vendor";
+        const URL: &'static str = "https://example.com";
+        const EMAIL: &'static str = "info@example.com";
+        const VERSION: &'static str = "0.0.1";
+
+        const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = LatencyTestPlugin::AUDIO_IO_LAYOUTS;
+
+        const MIDI_INPUT: MidiConfig = MidiConfig::None;
+        const MIDI_OUTPUT: MidiConfig = MidiConfig::None;
+
+        type SysExMessage = ();
+        type BackgroundTask = ();
+
+        fn params(&self) -> Arc<dyn Params> {
+            self.inner.params.clone()
+        }
+
+        fn initialize(
+            &mut self,
+            _audio_io_layout: &AudioIOLayout,
+            _buffer_config: &BufferConfig,
+            _context: &mut impl InitContext<Self>,
+        ) -> bool {
+            STATE_TEST_INITIALIZE_CALLS.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+
+        fn process(
+            &mut self,
+            _buffer: &mut Buffer,
+            _aux: &mut AuxiliaryBuffers,
+            _context: &mut impl ProcessContext<Self>,
+        ) -> ProcessStatus {
+            ProcessStatus::Normal
+        }
+    }
+
+    impl Vst2Plugin for StateTestPlugin {
+        const VST2_UID: [u8; 4] = *b"StPl";
+    }
+
+    unsafe extern "C" fn silent_host_callback(
+        _effect: *mut AEffect,
+        _opcode: i32,
+        _index: i32,
+        _value: isize,
+        _ptr: *mut c_void,
+        _opt: f32,
+    ) -> isize {
+        0
+    }
+
+    /// A state loaded while processing is stopped (`effStopProcess`, still resumed) reaches
+    /// `initialize()` before processing restarts, so the plugin does not keep playing the files
+    /// of the previous state.
+    #[test]
+    fn a_state_loaded_while_stopped_reinitializes_before_processing_restarts() {
+        let effect = Wrapper::<StateTestPlugin>::create(silent_host_callback);
+        assert!(!effect.is_null());
+        let dispatcher = unsafe { (*effect).dispatcher };
+        unsafe {
+            dispatcher(effect, EFF_OPEN, 0, 0, std::ptr::null_mut(), 0.0);
+            dispatcher(effect, EFF_MAINS_CHANGED, 0, 1, std::ptr::null_mut(), 0.0);
+            dispatcher(effect, EFF_START_PROCESS, 0, 0, std::ptr::null_mut(), 0.0);
+        }
+
+        let mut chunk_ptr: *mut u8 = std::ptr::null_mut();
+        let length = unsafe {
+            dispatcher(
+                effect,
+                EFF_GET_CHUNK,
+                0,
+                0,
+                &mut chunk_ptr as *mut *mut u8 as *mut c_void,
+                0.0,
+            )
+        };
+        assert!(length > 0 && !chunk_ptr.is_null());
+        let chunk = unsafe { std::slice::from_raw_parts(chunk_ptr, length as usize) }.to_vec();
+
+        unsafe {
+            dispatcher(effect, EFF_STOP_PROCESS, 0, 0, std::ptr::null_mut(), 0.0);
+        }
+        let before = STATE_TEST_INITIALIZE_CALLS.load(Ordering::SeqCst);
+        let mut chunk = chunk;
+        let loaded = unsafe {
+            dispatcher(
+                effect,
+                EFF_SET_CHUNK,
+                0,
+                chunk.len() as isize,
+                chunk.as_mut_ptr() as *mut c_void,
+                0.0,
+            )
+        };
+        assert_eq!(loaded, 1);
+        unsafe {
+            dispatcher(effect, EFF_START_PROCESS, 0, 0, std::ptr::null_mut(), 0.0);
+        }
+        assert!(
+            STATE_TEST_INITIALIZE_CALLS.load(Ordering::SeqCst) > before,
+            "the state loaded while stopped never reached initialize()"
+        );
+
         unsafe {
             dispatcher(effect, EFF_CLOSE, 0, 0, std::ptr::null_mut(), 0.0);
         }

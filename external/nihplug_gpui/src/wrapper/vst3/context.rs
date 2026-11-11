@@ -180,7 +180,7 @@ impl<P: Vst3Plugin> GuiContext for WrapperGuiContext<P> {
                 //        processing audio when you bypass the plugin. Great. We can add a time
                 //        based heuristic to work around this in the meantime.
                 if !self.inner.is_processing.load(Ordering::SeqCst) {
-                    self.inner.set_normalized_value_by_hash(
+                    self.inner.set_normalized_value_while_stopped(
                         *hash,
                         normalized,
                         self.inner
