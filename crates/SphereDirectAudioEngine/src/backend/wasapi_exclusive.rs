@@ -441,23 +441,20 @@ unsafe fn wasapi_thread(
     let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
 
     // ── MMCSS ─────────────────────────────────────────────────────────────────
-    let task: Vec<u16> = "Pro Audio\0".encode_utf16().collect();
-    let mut task_idx = 0u32;
-    let mmcss_h = AvSetMmThreadCharacteristicsW(task.as_ptr(), &mut task_idx);
-    if mmcss_h != 0 {
-        eprintln!("[DAUx WASAPI Excl] MMCSS 'Pro Audio' set (index={task_idx})");
-        shared.mmcss_active.store(true, Ordering::Relaxed);
-    } else {
-        eprintln!("[DAUx WASAPI Excl] MMCSS set failed (non-fatal)");
-    }
+    // Left, and the flag cleared, when `pro_audio` drops: on every exit. The
+    // early failures below used to return without clearing it (#408). They drop
+    // it before reporting the failure, so the flag is clear by the time `open`
+    // returns its error.
+    let pro_audio = ProAudioScope::join(&shared, handshake);
+    let mmcss_h = pro_audio.handle;
 
     // ── Device enumerator ─────────────────────────────────────────────────────
     let enumerator: IMMDeviceEnumerator =
         match CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) {
             Ok(e) => e,
             Err(e) => {
+                drop(pro_audio);
                 let _ = info_tx.send(Err(format!("CoCreateInstance(IMMDeviceEnumerator): {e}")));
-                cleanup_mmcss(mmcss_h);
                 CoUninitialize();
                 return;
             }
@@ -466,8 +463,8 @@ unsafe fn wasapi_thread(
     let device: IMMDevice = match resolve_device(&enumerator, device_id.as_deref()) {
         Ok(d) => d,
         Err(e) => {
+            drop(pro_audio);
             let _ = info_tx.send(Err(e));
-            cleanup_mmcss(mmcss_h);
             CoUninitialize();
             return;
         }
@@ -493,13 +490,47 @@ unsafe fn wasapi_thread(
         handshake,
     );
 
-    cleanup_mmcss(mmcss_h);
-    // An abandoned open handed the shared state to whichever stream the
-    // caller opened next.
-    if !handshake.is_abandoned() {
-        shared.mmcss_active.store(false, Ordering::Relaxed);
-    }
+    drop(pro_audio);
     CoUninitialize();
+}
+
+/// This thread's MMCSS "Pro Audio" registration and the `mmcss_active` flag it
+/// publishes. Dropping it leaves MMCSS and clears the flag, so no exit can
+/// leave "Pro Audio scheduling active" reported for a stream that is gone. An
+/// abandoned open handed the shared state to whichever stream the caller
+/// opened next, so then the flag is left alone.
+struct ProAudioScope<'a> {
+    handle: isize,
+    shared: &'a SharedState,
+    handshake: &'a OpenHandshake,
+}
+
+impl<'a> ProAudioScope<'a> {
+    unsafe fn join(shared: &'a SharedState, handshake: &'a OpenHandshake) -> Self {
+        let task: Vec<u16> = "Pro Audio\0".encode_utf16().collect();
+        let mut task_idx = 0u32;
+        let handle = AvSetMmThreadCharacteristicsW(task.as_ptr(), &mut task_idx);
+        if handle != 0 {
+            eprintln!("[DAUx WASAPI Excl] MMCSS 'Pro Audio' set (index={task_idx})");
+            shared.mmcss_active.store(true, Ordering::Relaxed);
+        } else {
+            eprintln!("[DAUx WASAPI Excl] MMCSS set failed (non-fatal)");
+        }
+        Self {
+            handle,
+            shared,
+            handshake,
+        }
+    }
+}
+
+impl Drop for ProAudioScope<'_> {
+    fn drop(&mut self) {
+        unsafe { cleanup_mmcss(self.handle) };
+        if !self.handshake.is_abandoned() {
+            self.shared.mmcss_active.store(false, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Opens the WASAPI exclusive stream, negotiates format and period, runs the
@@ -972,6 +1003,32 @@ mod tests {
     /// the 18-byte `WAVEFORMATEX` header are the extensible tail.
     fn header(fmt: &WAVEFORMATEXTENSIBLE) -> WAVEFORMATEX {
         fmt.Format
+    }
+
+    /// #408: the device thread joined MMCSS, set `mmcss_active`, and its early
+    /// failures returned without clearing it. The registration is now a guard
+    /// that clears the flag on any exit. Joins MMCSS on this test thread only:
+    /// no device is opened.
+    #[test]
+    fn leaving_the_pro_audio_scope_any_way_clears_the_flag() {
+        let shared = SharedState::default();
+        let handshake = OpenHandshake::new();
+
+        let scope = unsafe { ProAudioScope::join(&shared, &handshake) };
+        let joined = scope.handle != 0;
+        assert_eq!(shared.mmcss_active.load(Ordering::Relaxed), joined);
+        drop(scope);
+        assert!(!shared.mmcss_active.load(Ordering::Relaxed));
+
+        // An early `?` return, the shape of the failures that leaked the flag.
+        fn fails_early(shared: &SharedState, handshake: &OpenHandshake) -> Result<(), ()> {
+            let _scope = unsafe { ProAudioScope::join(shared, handshake) };
+            Err(())?;
+            Ok(())
+        }
+        assert!(fails_early(&shared, &handshake).is_err());
+        assert!(!shared.mmcss_active.load(Ordering::Relaxed));
+        assert!(joined, "MMCSS was not available, so the flag was never set");
     }
 
     #[test]

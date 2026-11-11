@@ -259,6 +259,10 @@ struct SphereDauxClapProcessor {
   enum RestartPhase : int { kRestartIdle = 0, kRestartWaitingForStop = 1 };
   int restart_phase{kRestartIdle};
   std::chrono::steady_clock::time_point restart_stop_requested_at{};
+  /// When the last restart finished (its activate() returned). The next one
+  /// waits `kRestartMinInterval` after it; see `service_main_thread`.
+  std::chrono::steady_clock::time_point last_restart_at{};
+  bool restarted_before{false};
 
   // ── Diagnostics ──────────────────────────────────────────────────────────
   unsigned long long process_count{0};

@@ -42,6 +42,13 @@ std::atomic<bool> g_main_thread_work{false};
 /// before concluding no audio is flowing and stopping it itself.
 constexpr auto kAudioStopGrace = std::chrono::milliseconds(100);
 
+/// The shortest time between two restarts of one instance. Every restart
+/// stops processing, so a plug-in that reports latency changes (or asks for a
+/// restart) on every block was restarted on every report: continuous dropouts
+/// (#408). Requests inside the interval are merged into one restart at its end,
+/// which still re-reads the latest latency.
+constexpr auto kRestartMinInterval = std::chrono::milliseconds(250);
+
 void raise_main_thread_work() {
   g_main_thread_work.store(true, std::memory_order_release);
 }
@@ -934,7 +941,10 @@ int SphereDauxClapProcessor::service_main_thread() {
 
   // Begin a restart: ask the audio thread to stop processing. Also the retry
   // path for an instance whose last reactivation failed (inactive, stopped).
-  if (restart_phase == kRestartIdle &&
+  const bool restart_cooled_down =
+      !restarted_before || std::chrono::steady_clock::now() - last_restart_at >=
+                               kRestartMinInterval;
+  if (restart_phase == kRestartIdle && restart_cooled_down &&
       restart_requested.load(std::memory_order_acquire)) {
     int state = audio_state.load(std::memory_order_seq_cst);
     bool begun = false;
@@ -987,6 +997,8 @@ int SphereDauxClapProcessor::service_main_thread() {
       const bool ok = plugin->activate(
           plugin, sample_rate, 1, static_cast<uint32_t>(kMaxProcessFrames));
       activating.store(false, std::memory_order_release);
+      last_restart_at = std::chrono::steady_clock::now();
+      restarted_before = true;
 
       if (!ok) {
         // Left deactivated and parked: process() is never called again,
