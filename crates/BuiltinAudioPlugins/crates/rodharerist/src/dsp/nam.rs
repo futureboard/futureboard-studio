@@ -283,6 +283,13 @@ const MAX_LSTM_LAYERS: usize = 16;
 const MAX_SUBMODELS: usize = 16;
 /// Nesting of condition DSPs and slimmable submodels.
 const MAX_DEPTH: usize = 4;
+/// Layer arrays per WaveNet and layers per array (A1 standard: 2 x 10).
+/// A kernel-1 layer adds nothing to the receptive field, so only a count
+/// bounds the per-layer buffers nam-rs builds.
+const MAX_LAYER_ARRAYS: usize = 16;
+const MAX_LAYERS_PER_ARRAY: usize = 64;
+/// Convolutions in a post-stack head.
+const MAX_HEAD_CONVS: usize = 16;
 
 /// Rejects a capture whose shape would make nam-rs allocate without bound,
 /// overflow a size, or prewarm for minutes. Pure arithmetic on the parsed
@@ -317,7 +324,21 @@ fn check_model_size(model: &NamModel, depth: usize) -> Result<(), String> {
             }
             let mut field = 0usize;
             let mut history = 0usize;
+            if c.layers.len() > MAX_LAYER_ARRAYS {
+                return Err(format!("{} layer arrays", c.layers.len()));
+            }
             for array in &c.layers {
+                if array.dilations.len() > MAX_LAYERS_PER_ARRAY {
+                    return Err(format!("{} layers in one array", array.dilations.len()));
+                }
+                // The widest signal the array's convolutions hold history
+                // for: its input and conditioning as well as its own width.
+                let width = array
+                    .input_size
+                    .max(array.condition_size)
+                    .max(array.channels)
+                    .max(array.bottleneck)
+                    .max(1);
                 for &width in &[
                     array.channels,
                     array.bottleneck,
@@ -345,7 +366,7 @@ fn check_model_size(model: &NamModel, depth: usize) -> Result<(), String> {
                     // `kernel` and `dilation` are bounded above, so this
                     // product fits a usize; the running sums are checked.
                     let span = (kernel - 1) * dilation;
-                    let ring = (span + 1) * array.channels.max(array.bottleneck).max(1);
+                    let ring = (span + 1) * width;
                     field = field.checked_add(span).ok_or("receptive field overflows")?;
                     history = history.checked_add(ring).ok_or("history overflows")?;
                 }
@@ -362,6 +383,12 @@ fn check_model_size(model: &NamModel, depth: usize) -> Result<(), String> {
             if let Some(head) = &c.post_stack_head {
                 if head.channels > MAX_CHANNELS || head.out_channels > MAX_CHANNELS {
                     return Err(format!("a post-stack head {} channels wide", head.channels));
+                }
+                if head.kernel_sizes.len() > MAX_HEAD_CONVS {
+                    return Err(format!(
+                        "{} post-stack head convolutions",
+                        head.kernel_sizes.len()
+                    ));
                 }
                 for &kernel in &head.kernel_sizes {
                     if kernel == 0 || kernel > MAX_KERNEL {
@@ -1112,6 +1139,14 @@ mod tests {
         for (from, to) in [
             (r#""dilations": [1]"#, r#""dilations": [1000000000000]"#),
             (r#""channels": 1"#, r#""channels": 100000"#),
+            // Narrow layers on a wide input: the input width is what the
+            // first convolution holds history for.
+            (
+                r#""input_size": 1, "condition_size": 1, "channels": 1, "head_size": 1,
+            "kernel_size": 1, "dilations": [1]"#,
+                r#""input_size": 512, "condition_size": 1, "channels": 1, "head_size": 1,
+            "kernel_size": 4096, "dilations": [64]"#,
+            ),
         ] {
             let hostile = TINY_WAVENET_48K.replace(from, to);
             assert_ne!(hostile, TINY_WAVENET_48K, "fixture edit {to} missed");
@@ -1119,6 +1154,13 @@ mod tests {
                 .expect_err("a hostile shape must be refused");
             assert!(matches!(err, NamLoadError::TooLarge(_)), "{to}: {err}");
         }
+        // A million kernel-1 layers add no receptive field, only layers.
+        let ones = vec!["1"; 1_000_000].join(",");
+        let many =
+            TINY_WAVENET_48K.replace(r#""dilations": [1]"#, &format!(r#""dilations": [{ones}]"#));
+        let err = prepare_nam_runtime(&many, "x".into(), 48_000.0, false, false)
+            .expect_err("a million layers must be refused");
+        assert!(matches!(err, NamLoadError::TooLarge(_)), "{err}");
         // A deep but real receptive field still loads.
         let deep = TINY_WAVENET_48K.replace(r#""dilations": [1]"#, r#""dilations": [512]"#);
         assert!(prepare_nam_runtime(&deep, "ok".into(), 48_000.0, false, false).is_ok());

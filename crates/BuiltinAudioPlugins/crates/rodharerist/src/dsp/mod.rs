@@ -3108,11 +3108,21 @@ impl AlignLine {
 
     /// Writes this frame's sample and returns the one `delay` frames ago. A
     /// second call in the same frame (a lane split into two spans) passes the
-    /// signal through rather than running the line's clock twice.
+    /// signal through rather than running the line's clock twice. Frames the
+    /// line sat out are caught up here as silence, so an unused line costs
+    /// nothing per frame.
     #[inline]
     fn push(&mut self, frame: u64, l: f32, r: f32, delay: usize) -> (f32, f32) {
         if self.frame == frame {
             return (l, r);
+        }
+        let missed = frame.wrapping_sub(self.frame).wrapping_sub(1);
+        if missed > 0 {
+            for _ in 0..missed.min(ALIGN_LINE as u64) {
+                self.pos = (self.pos + 1) & (ALIGN_LINE - 1);
+                self.l[self.pos] = 0.0;
+                self.r[self.pos] = 0.0;
+            }
         }
         self.frame = frame;
         self.pos = (self.pos + 1) & (ALIGN_LINE - 1);
@@ -3120,14 +3130,6 @@ impl AlignLine {
         self.r[self.pos] = r;
         let at = self.pos.wrapping_sub(delay.min(ALIGN_LINE - 1)) & (ALIGN_LINE - 1);
         (self.l[at], self.r[at])
-    }
-
-    /// A frame the line was not used in: keeps its clock, holds silence.
-    #[inline]
-    fn idle(&mut self, frame: u64) {
-        if self.frame != frame {
-            self.push(frame, 0.0, 0.0, 0);
-        }
     }
 }
 
@@ -4039,15 +4041,18 @@ impl Dsp {
     /// `prepare_nam_runtime` does at load — rather than a delay it imposes.
     /// Reporting it as latency put a stock capture 85 ms behind the dry
     /// signal.
-    /// Samples `stage` delays the signal through it, as [`Self::latency_samples`]
-    /// counts them. Only asked of a stage that just ran.
+    /// Samples `stage` delays the signal through it while switched on. The one
+    /// place a block's latency is defined: [`Self::latency_samples`] sums it
+    /// over the path and [`Self::run`] aligns taps with it, so the two cannot
+    /// disagree.
     #[inline]
     fn stage_delay(&self, stage: StageKind) -> usize {
+        let p = &self.params;
         match stage {
-            StageKind::Amp if self.params.tone_engine == ToneEngineKind::NamCapture => {
+            StageKind::Amp if p.amp_on && p.tone_engine == ToneEngineKind::NamCapture => {
                 self.nam_latency_samples()
             }
-            StageKind::Cab if self.params.cab_model == CabModel::Ir => self.ir.latency_samples(),
+            StageKind::Cab if p.cab_on && p.cab_model == CabModel::Ir => self.ir.latency_samples(),
             _ => 0,
         }
     }
@@ -4108,17 +4113,11 @@ impl Dsp {
             p.stage_order.iter().flatten().any(|s| *s == kind)
                 && (row == 0 || p.row_send[row - 1] != RowSend::Off)
         };
-        let nam = if p.amp_on && runs(StageKind::Amp) && p.tone_engine == ToneEngineKind::NamCapture
-        {
-            self.nam_latency_samples()
-        } else {
-            0
-        };
-        let ir = if p.cab_on && runs(StageKind::Cab) && p.cab_model == CabModel::Ir {
-            self.ir.latency_samples()
-        } else {
-            0
-        };
+        let blocks: usize = StageKind::ALL
+            .iter()
+            .filter(|&&kind| runs(kind))
+            .map(|&kind| self.stage_delay(kind))
+            .sum();
         // The pitch block mixes a dry path, so it does not add latency.
         // Transpose is the whole signal: report its grain while it is off
         // zero, including the samples before the blend has opened.
@@ -4127,7 +4126,7 @@ impl Dsp {
         } else {
             0
         };
-        nam + ir + transpose
+        blocks + transpose
     }
 
     /// Host transport tempo. A non-finite or non-positive value is ignored
@@ -5033,10 +5032,6 @@ impl Dsp {
                 self.align
                     .line2
                     .push(self.frame, dry_l, dry_r, acc_main.saturating_sub(tap_acc));
-        }
-        let frame = self.frame;
-        for line in self.align.lines() {
-            line.idle(frame);
         }
 
         let send = (self.params.line2_mix * 0.01).clamp(0.0, 1.0);
