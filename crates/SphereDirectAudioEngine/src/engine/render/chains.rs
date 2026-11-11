@@ -259,9 +259,18 @@ pub(crate) fn apply_insert_bypass_automation(track: &mut RuntimeTrack, beat: Opt
         let Some(lane_ix) = insert.bypass_lane else {
             continue;
         };
-        insert.automation_bypass = beat
+        let bypassed = beat
             .and_then(|beat| automation_lanes.get(lane_ix)?.evaluate_normalized(beat))
             .map(|value| value >= 0.5);
+        // The lane switching the insert back on is the same act as the user
+        // doing it: an insert Audioguard bypassed is processed and watched
+        // again. Only on that edge — a lane that simply holds it on does not
+        // re-arm it every block — and only so often (`rearm_from_lane`).
+        // Stores only.
+        if insert.automation_bypass == Some(true) && bypassed == Some(false) {
+            insert.guard.rearm_from_lane();
+        }
+        insert.automation_bypass = bypassed;
     }
 }
 

@@ -500,7 +500,14 @@ pub struct InsertGuard {
     invalid_run: u8,
     window_blocks: u32,
     window_misses: u32,
+    /// Times a bypass lane re-armed it since the user last switched it on.
+    lane_rearms: u8,
 }
+
+/// How often a bypass lane may switch a guard-bypassed insert back on before
+/// it takes the user's own switch. A lane inside a loop would otherwise run a
+/// broken plug-in, and report its bypass, on every pass.
+const LANE_REARMS: u8 = 1;
 
 /// Consecutive invalid blocks before an insert is bypassed.
 const INVALID_RUN_TO_TRIP: u8 = 3;
@@ -514,6 +521,23 @@ impl InsertGuard {
     /// Realtime-safe: stores only. The health is cleared in place (it is
     /// shared with the control mirror; a new one would allocate).
     pub(crate) fn rearm(&mut self) {
+        self.lane_rearms = 0;
+        self.watch_afresh();
+    }
+
+    /// The insert's bypass lane switched it back on. Lifts a bypass of the
+    /// guard's, [`LANE_REARMS`] times; an insert the guard has not bypassed is
+    /// left as it is, so the lane cannot keep resetting what is being counted
+    /// against it. Realtime-safe: stores only.
+    pub(crate) fn rearm_from_lane(&mut self) {
+        if !self.bypassed || self.lane_rearms >= LANE_REARMS {
+            return;
+        }
+        self.lane_rearms += 1;
+        self.watch_afresh();
+    }
+
+    fn watch_afresh(&mut self) {
         self.bypassed = false;
         self.invalid_run = 0;
         self.window_blocks = 0;
@@ -1442,6 +1466,41 @@ mod tests {
         let mut right = vec![0.0f32; 8];
         guard.check_output(&mut left, &mut right);
         assert!(!guard.bypassed);
+    }
+
+    /// A bypass lane lifts the guard's bypass once; after that the insert
+    /// stays out until the user switches it on. And a lane edge never touches
+    /// an insert the guard has not bypassed.
+    #[test]
+    fn a_lane_rearms_a_bypassed_insert_once_and_leaves_a_watched_one_alone() {
+        let mut guard = InsertGuard::default();
+        // Not bypassed: what is being counted against it stays counted.
+        for block in 0..MISS_WINDOW_BLOCKS - 1 {
+            guard.note_bridge_block_at(true, AudioguardLevel::High, false);
+            if block % 64 == 0 {
+                guard.rearm_from_lane();
+            }
+        }
+        guard.note_bridge_block_at(true, AudioguardLevel::High, false);
+        assert!(guard.bypassed, "lane edges did not reset the miss window");
+        assert_eq!(guard.health.trip(), InsertTrip::MissedDeadlines);
+
+        guard.rearm_from_lane();
+        assert!(!guard.bypassed, "the lane switched it back on");
+        assert_eq!(guard.health.trip(), InsertTrip::None);
+        guard.trip(InsertTrip::InvalidOutput);
+        guard.rearm_from_lane();
+        assert!(guard.bypassed, "a second time takes the user's switch");
+        assert_eq!(guard.health.trip(), InsertTrip::InvalidOutput);
+
+        guard.rearm();
+        assert!(!guard.bypassed);
+        guard.trip(InsertTrip::InvalidOutput);
+        guard.rearm_from_lane();
+        assert!(
+            !guard.bypassed,
+            "the user's switch gives the lane its turn back"
+        );
     }
 
     /// The trip after a re-arm is reported again, whichever way the render's

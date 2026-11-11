@@ -160,6 +160,25 @@ fn send_and_bypass_automation_override_the_controls() {
     render::apply_insert_bypass_automation(&mut src, None);
     assert!(!src.inserts[0].active(), "off again by hand once stopped");
 
+    // An insert Audioguard bypassed stays out while its lane merely holds it
+    // on, and is re-armed when the lane switches it back on.
+    src.inserts[0].guard.bypassed = true;
+    render::apply_insert_bypass_automation(&mut src, Some(4.0));
+    assert!(
+        !src.inserts[0].active(),
+        "a lane holding it on does not lift the guard's bypass"
+    );
+    src.automation_lanes[2].points[0].value = 1.0;
+    render::apply_insert_bypass_automation(&mut src, Some(4.0));
+    assert!(src.inserts[0].guard.bypassed);
+    src.automation_lanes[2].points[0].value = 0.0;
+    render::apply_insert_bypass_automation(&mut src, Some(4.0));
+    assert!(
+        src.inserts[0].active(),
+        "switched back on by its lane: re-armed"
+    );
+    render::apply_insert_bypass_automation(&mut src, None);
+
     // A disabled (Off) lane says nothing: the send's own values stand.
     for lane in &mut src.automation_lanes {
         lane.enabled = false;
