@@ -24,8 +24,9 @@ pub const MAX_BRIDGE_BLOCK_FRAMES: usize = 2048;
 /// the bridge's one-block handshake.
 ///
 /// The engine hands the host a block and plays back the block the host
-/// finished one exchange earlier, so the handshake costs one *configured*
-/// period: the device buffer size the stream was opened with (see
+/// finished one exchange earlier, so the handshake costs one period: the
+/// block size the open stream steadily delivers — the size it reported until
+/// the device shows another (see
 /// [`crate::engine::SharedState::bridge_period_frames_for_block`]). It is not
 /// the frame count of the callback being rendered. Variable-size callbacks
 /// (WASAPI shared/event mode, variable-period drivers, partial renders) would
