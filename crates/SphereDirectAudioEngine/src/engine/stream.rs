@@ -102,12 +102,6 @@ pub(super) fn log_sample_rate_decision(
 }
 
 //
-// The per-block render path was split into the `render` submodule so this file
-// stays focused on device lifecycle, command dispatch, and the public engine
-// API. Pure relocation — re-exported here so existing `crate::engine::*` call
-// sites and the in-file controller keep resolving unchanged.
-pub use render::*;
-
 pub(super) fn build_output_stream(
     device: &cpal::Device,
     config: &cpal::StreamConfig,

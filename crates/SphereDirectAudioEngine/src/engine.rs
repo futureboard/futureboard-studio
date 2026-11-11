@@ -213,7 +213,7 @@ pub use self::diagnostics::*;
 mod shared_state;
 pub use self::shared_state::*;
 mod stream;
-pub use self::stream::*;
+use self::stream::*;
 
 mod audition;
 mod commands;
@@ -233,8 +233,10 @@ mod transport_control;
 #[cfg(test)]
 use self::project::*;
 
-// DSP / render kernel
+// DSP / render kernel, re-exported so `crate::engine::*` call sites keep
+// resolving unchanged.
 mod render;
+pub use self::render::*;
 
 // ── Engine inner ───────────────────────────────────────────────────────────────
 
