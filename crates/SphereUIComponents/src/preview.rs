@@ -480,6 +480,36 @@ pub fn scenes() -> Vec<Scene> {
             open: rodhareist_explore,
         },
         Scene {
+            name: "rodhareist-explore-amp",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: rodhareist_explore_amp,
+        },
+        Scene {
+            name: "rodhareist-footswitches",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: rodhareist_footswitches,
+        },
+        Scene {
+            name: "rodhareist-knob-entry",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: rodhareist_knob_entry,
+        },
+        Scene {
+            name: "rodhareist-tuner",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: rodhareist_tuner,
+        },
+        Scene {
+            name: "rodhareist-tuner-in-tune",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: rodhareist_tuner_in_tune,
+        },
+        Scene {
             name: "rodhareist-pedalboard",
             width: plate::WINDOW_SIZE.0,
             height: plate::WINDOW_SIZE.1,
@@ -3590,15 +3620,21 @@ fn rodhareist_focused(
     options: WindowOptions,
     cx: &mut App,
 ) -> Result<AnyWindowHandle> {
-    rodhareist_with(page, edit, focus, |_| {}, options, cx)
+    rodhareist_with(page, edit, focus, |_, _| {}, options, cx)
 }
+
+/// What a Rodhareist scene sets on the editor once it is built.
+type RodView = fn(
+    &mut crate::components::rodhareist_window::RodhareistEditorWindow,
+    &mut gpui::Context<crate::components::rodhareist_window::RodhareistEditorWindow>,
+);
 
 /// [`rodhareist_focused`], with the editor's view state set by `view`.
 fn rodhareist_with(
     page: crate::components::rodhareist_panel::Page,
     edit: fn(&mut rodharerist::Params),
     focus: rodharerist::StageKind,
-    view: fn(&mut crate::components::rodhareist_window::RodhareistEditorWindow),
+    view: RodView,
     options: WindowOptions,
     cx: &mut App,
 ) -> Result<AnyWindowHandle> {
@@ -3629,7 +3665,7 @@ fn rodhareist_with(
                     focus,
                 ));
             }
-            view(&mut window);
+            view(&mut window, cx);
             window
         })
     })?;
@@ -3654,7 +3690,7 @@ fn rodhareist_users(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHan
         crate::components::rodhareist_panel::Page::Home,
         |_| {},
         rodharerist::StageKind::Amp,
-        |window| window.ui.preset_tab = crate::components::rodhareist_panel::PresetTab::Users,
+        |window, _| window.ui.preset_tab = crate::components::rodhareist_panel::PresetTab::Users,
         options,
         cx,
     )
@@ -3672,6 +3708,107 @@ fn rodhareist_lanes(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHan
             p.row_send[0] = rodharerist::RowSend::Parallel;
         },
         StageKind::Delay,
+        options,
+        cx,
+    )
+}
+
+/// The tuner page reading `hz`, with the needle eased for a second of frames
+/// so the still shows where it settles.
+fn rodhareist_tuning(
+    view: RodView,
+    options: WindowOptions,
+    cx: &mut App,
+) -> Result<AnyWindowHandle> {
+    rodhareist_with(
+        crate::components::rodhareist_panel::Page::Home,
+        |p| p.tuner_on = true,
+        rodharerist::StageKind::Amp,
+        view,
+        options,
+        cx,
+    )
+}
+
+fn tune_preview(
+    window: &mut crate::components::rodhareist_window::RodhareistEditorWindow,
+    hz: f32,
+) {
+    use crate::components::rodhareist_panel::{pitch_of, tuner_frame};
+    use rodharerist::telemetry as tm;
+    let mut block = window
+        .pads()
+        .copied()
+        .unwrap_or([0.0; SpherePluginHost::audio_bridge::BUILTIN_PAD_SLOTS]);
+    block[tm::TUNER_HZ] = hz;
+    block[tm::TUNER_CLARITY] = 0.92;
+    window.show_pads(block);
+    let start = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    for frame in 0..60 {
+        let at = start + std::time::Duration::from_millis(16 * frame);
+        tuner_frame(&mut window.ui.tuner, pitch_of(hz), at);
+    }
+}
+
+/// A2 played 19 cents sharp: the needle right of centre, the strobe drifting.
+fn rodhareist_tuner(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    rodhareist_tuning(|window, _| tune_preview(window, 111.22), options, cx)
+}
+
+/// A2 in tune: the window green, the strobe still.
+fn rodhareist_tuner_in_tune(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    rodhareist_tuning(|window, _| tune_preview(window, 110.05), options, cx)
+}
+
+/// Settings › Footswitches on a full chain: sixteen slots to pick from.
+fn rodhareist_footswitches(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    rodhareist_with(
+        crate::components::rodhareist_panel::Page::Settings,
+        |p| {
+            p.stage_order =
+                std::array::from_fn(|slot| rodharerist::StageKind::ALL.get(slot).copied());
+        },
+        rodharerist::StageKind::Amp,
+        |window, _| {
+            window.ui.settings = crate::components::rodhareist_panel::SettingsSection::Footswitches;
+        },
+        options,
+        cx,
+    )
+}
+
+/// The amp's DRIVE value typed in on the Pedalboard: the field opens under
+/// the knob that was double-clicked.
+fn rodhareist_knob_entry(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    rodhareist_with(
+        crate::components::rodhareist_panel::Page::Pedalboard,
+        |_| {},
+        rodharerist::StageKind::Amp,
+        |window, cx| {
+            window.show_knob_entry(
+                "amp_gain",
+                "DRIVE",
+                (0.0, 10.0),
+                gpui::point(gpui::px(370.0), gpui::px(628.0)),
+                cx,
+            );
+        },
+        options,
+        cx,
+    )
+}
+
+/// Explore on Amp, the Crunch subtab (#407).
+fn rodhareist_explore_amp(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    rodhareist_with(
+        crate::components::rodhareist_panel::Page::Explore,
+        |_| {},
+        rodharerist::StageKind::Amp,
+        |window, _| {
+            use crate::components::rodhareist_panel::Family;
+            window.ui.family = Some(Family::Amp);
+            window.ui.explore_amp = Some(Family::Crunch);
+        },
         options,
         cx,
     )

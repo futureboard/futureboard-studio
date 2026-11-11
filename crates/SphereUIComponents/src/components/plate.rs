@@ -84,7 +84,10 @@ const PLEX_MONO_FAMILY: &str = "IBM Plex Mono";
 const MONA_SANS_FAMILY: &str = "Mona Sans";
 const MONA_SANS_EXPANDED_FAMILY: &str = "Mona Sans Expanded";
 const MONA_SANS_SEMI_EXPANDED_FAMILY: &str = "Mona Sans SemiExpanded";
-static FACES: [&[u8]; 14] = [
+/// Rodhareist's number face, set with tabular figures so readouts hold
+/// still. See [`NumberFace`].
+const BARLOW_FAMILY: &str = "Barlow";
+static FACES: [&[u8]; 17] = [
     include_bytes!("../../assets/fonts/outfit/Outfit-Light.ttf"),
     include_bytes!("../../assets/fonts/outfit/Outfit-Regular.ttf"),
     include_bytes!("../../assets/fonts/outfit/Outfit-Medium.ttf"),
@@ -99,6 +102,9 @@ static FACES: [&[u8]; 14] = [
     include_bytes!("../../assets/fonts/mona-sans/MonaSans-SemiBold.ttf"),
     include_bytes!("../../assets/fonts/mona-sans/MonaSansExpanded-Regular.ttf"),
     include_bytes!("../../assets/fonts/mona-sans/MonaSansSemiExpanded-Light.ttf"),
+    include_bytes!("../../assets/fonts/barlow/Barlow-Regular.ttf"),
+    include_bytes!("../../assets/fonts/barlow/Barlow-Medium.ttf"),
+    include_bytes!("../../assets/fonts/barlow/Barlow-SemiBold.ttf"),
 ];
 static REGISTERED: AtomicBool = AtomicBool::new(false);
 
@@ -133,9 +139,46 @@ pub fn outfit(weight: FontWeight) -> Font {
     embedded(OUTFIT_FAMILY, weight)
 }
 
-/// The designs' number face.
+/// Which face [`numbers`] (and so every knob and pill readout) sets digits
+/// in. The plates' designs use IBM Plex Mono; Rodhareist uses Barlow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum NumberFace {
+    #[default]
+    PlexMono,
+    Barlow,
+}
+
+thread_local! {
+    static NUMBER_FACE: std::cell::Cell<NumberFace> = const { std::cell::Cell::new(NumberFace::PlexMono) };
+}
+
+/// Builds `f` with numbers set in `face`, then puts the previous face back.
+/// The font is fixed into each element when it is built, so an editor that
+/// wraps its render in this changes only its own readouts, not the other
+/// plates'.
+pub fn with_number_face<R>(face: NumberFace, f: impl FnOnce() -> R) -> R {
+    let previous = NUMBER_FACE.with(|cell| cell.replace(face));
+    struct Restore(NumberFace);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            NUMBER_FACE.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(previous);
+    f()
+}
+
+/// The designs' number face: IBM Plex Mono, or Barlow with tabular figures
+/// inside [`with_number_face`].
 pub fn mono(weight: FontWeight) -> Font {
-    embedded(PLEX_MONO_FAMILY, weight)
+    match NUMBER_FACE.with(|cell| cell.get()) {
+        NumberFace::PlexMono => embedded(PLEX_MONO_FAMILY, weight),
+        NumberFace::Barlow => {
+            let mut font = embedded(BARLOW_FAMILY, weight);
+            font.features = gpui::FontFeatures(std::sync::Arc::new(vec![("tnum".to_string(), 1)]));
+            font
+        }
+    }
 }
 
 /// The Imager's face, Mona Sans, 300–600.
@@ -998,6 +1041,7 @@ fn knob_body(
         .size(px(look.size * s))
         .flex_shrink_0()
         .child(face);
+    let value_type_in = on_double.clone().filter(|_| enabled);
     if enabled {
         let drag_set = set.clone();
         let wheel_set = set.clone();
@@ -1066,6 +1110,20 @@ fn knob_body(
         WHITE,
         s,
     );
+    // Where the knob takes a typed value, a double-click on the printed
+    // value opens it too: that is where a player looks to type a number.
+    let reading: AnyElement = match value_type_in {
+        Some(type_in) => reading
+            .id(ElementId::Name(format!("{key}-value").into()))
+            .cursor(gpui::CursorStyle::IBeam)
+            .on_click(move |event, window, app| {
+                if event.click_count() >= 2 {
+                    type_in(window, app);
+                }
+            })
+            .into_any_element(),
+        None => reading.into_any_element(),
+    };
     let cell_div = if cell.label_below {
         cell_div.child(button).child(label).child(reading)
     } else {

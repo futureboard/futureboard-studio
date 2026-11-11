@@ -141,6 +141,102 @@ pub(crate) struct RodUi {
     /// The chain layout last asked for, and the move toward it on screen.
     pub chain_look: Option<ChainLook>,
     pub chain_motion: Option<ChainMotion>,
+    /// The tuner page's moving parts.
+    pub tuner: TunerLook,
+    /// Explore's amp subtab (Clean, Crunch, High Gain, NAM); `None` for all.
+    pub explore_amp: Option<Family>,
+    /// The Pedalboard amp list's subtab; `None` shows the selected model's.
+    pub board_amp: Option<Family>,
+}
+
+/// How long the tuner keeps the last note on screen between notes.
+const TUNER_HOLD: Duration = Duration::from_millis(400);
+/// A reading this close to the note counts as in tune.
+const IN_TUNE_CENTS: f32 = 3.0;
+/// Strobe drift: periods per second, per cent off the note.
+const STROBE_RATE: f32 = 0.08;
+
+/// The tuner page's needle, strobe and in-tune pulse, eased toward the DSP's
+/// reading on each frame. Animation only while something is moving: a
+/// reading off the note, the needle settling, the pulse, or a held note
+/// fading out.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TunerLook {
+    /// The needle, in cents (-50..50), as drawn.
+    pub cents: f32,
+    /// The strobe band's offset, in stripe periods (0..1).
+    pub strobe: f32,
+    /// The note on screen: name, octave, cents. Held for [`TUNER_HOLD`]
+    /// after the pitch goes away.
+    pub note: Option<(&'static str, i32, f32)>,
+    /// When a pitch was last heard.
+    pub heard: Option<Instant>,
+    /// When the reading came into tune, for the pulse.
+    pub in_tune_since: Option<Instant>,
+    last: Option<Instant>,
+}
+
+/// The note `hz` is nearest to: name, octave (A4 is 440 Hz) and how far off
+/// it is in cents.
+pub(crate) fn pitch_of(hz: f32) -> Option<(&'static str, i32, f32)> {
+    let (name, cents) = note_name(hz)?;
+    let n = (12.0 * (hz / 440.0).log2() + 69.0).round() as i32;
+    Some((name, n.div_euclid(12) - 1, cents))
+}
+
+/// Moves the tuner's look one frame toward `reading` (the DSP's pitch while
+/// the tuner is on). Returns whether another frame is needed.
+pub(crate) fn tuner_frame(
+    look: &mut TunerLook,
+    reading: Option<(&'static str, i32, f32)>,
+    now: Instant,
+) -> bool {
+    let dt = look
+        .last
+        .map_or(0.0, |last| now.duration_since(last).as_secs_f32())
+        .min(0.1);
+    look.last = Some(now);
+    let target = match reading {
+        Some(note) => {
+            look.note = Some(note);
+            look.heard = Some(now);
+            note.2.clamp(-50.0, 50.0)
+        }
+        None => {
+            let holding = look
+                .heard
+                .is_some_and(|heard| now.duration_since(heard) < TUNER_HOLD);
+            if !holding {
+                look.note = None;
+            }
+            if holding {
+                look.cents
+            } else {
+                0.0
+            }
+        }
+    };
+    // Settles in about the FAST motion time (three time constants).
+    let tau = crate::theme::motion::FAST_MS as f32 / 1_000.0 / 3.0;
+    look.cents += (target - look.cents) * (1.0 - (-dt / tau).exp());
+    let live = reading.is_some();
+    let off = reading.map_or(0.0, |note| note.2);
+    if live {
+        look.strobe = (look.strobe + off.clamp(-50.0, 50.0) * STROBE_RATE * dt).rem_euclid(1.0);
+    }
+    let in_tune = live && off.abs() < IN_TUNE_CENTS;
+    // A note that stops while in tune keeps that state through the hold; one
+    // heard off the pitch clears it.
+    if in_tune {
+        look.in_tune_since.get_or_insert(now);
+    } else if live {
+        look.in_tune_since = None;
+    }
+    let pulsing = look.in_tune_since.is_some_and(|since| {
+        now.duration_since(since) < Duration::from_millis(crate::theme::motion::SLOW_MS)
+    });
+    let holding = look.note.is_some() && !live;
+    (target - look.cents).abs() > 0.05 || (live && off.abs() >= 0.5) || pulsing || holding
 }
 
 /// The editor's two text fields, built by the window (they need its entity
@@ -148,7 +244,9 @@ pub(crate) struct RodUi {
 pub(crate) struct RodFields {
     pub search: AnyElement,
     pub preset_name: AnyElement,
-    pub knob_value: Option<AnyElement>,
+    /// A knob's type-in field and the window point it opens at (where the
+    /// knob or its value was double-clicked).
+    pub knob_value: Option<(AnyElement, gpui::Point<gpui::Pixels>)>,
 }
 
 impl Default for RodUi {
@@ -165,6 +263,9 @@ impl Default for RodUi {
             drag_block: None,
             chain_look: None,
             chain_motion: None,
+            tuner: TunerLook::default(),
+            explore_amp: None,
+            board_amp: None,
         }
     }
 }
@@ -232,21 +333,22 @@ impl Family {
         }
     }
 
-    /// Explore's list. Clean, Crunch, High Gain and Drive are separate.
-    /// [`Family::Amp`] stays the chain block's family and, here, the NAM row.
-    const BROWSE: [Family; 12] = [
-        Family::Dynamics,
-        Family::Clean,
-        Family::Crunch,
-        Family::HighGain,
-        Family::Drive,
-        Family::Amp,
-        Family::Cab,
-        Family::Modulation,
-        Family::Delay,
-        Family::Reverb,
-        Family::Eq,
-        Family::Filter,
+    /// The category a browse group sits under: the amp's gain classes are
+    /// subtabs of Amp (#407).
+    fn parent(self) -> Family {
+        match self {
+            Family::Clean | Family::Crunch | Family::HighGain => Family::Amp,
+            other => other,
+        }
+    }
+
+    /// The amp's subtabs, in order. [`Family::Amp`] as a subtab is the NAM
+    /// capture engine.
+    const AMP_TABS: [(Family, &'static str); 4] = [
+        (Family::Clean, "Clean"),
+        (Family::Crunch, "Crunch"),
+        (Family::HighGain, "High Gain"),
+        (Family::Amp, "NAM"),
     ];
 
     fn label(self) -> &'static str {
@@ -541,8 +643,8 @@ struct Entry {
     /// Index into [`blocks::models`], which is what [`place`] writes.
     index: usize,
     label: &'static str,
-    /// The Explore group. Amp voices are split by gain; the chain block
-    /// stays [`Family::Amp`].
+    /// The Explore group. Amp voices carry their gain class (a subtab of
+    /// Amp, see [`Family::parent`]); the chain block stays [`Family::Amp`].
     browse: Family,
 }
 
@@ -559,22 +661,22 @@ fn amp_browse(choice_wire: &str, value: f32) -> Family {
 
 fn entries(p: &Params) -> Vec<Entry> {
     let mut out = Vec::new();
-    for family in Family::BROWSE {
-        if matches!(
-            family,
-            Family::Clean | Family::Crunch | Family::HighGain | Family::Amp
-        ) {
+    for family in Family::ALL {
+        if family == Family::Amp {
+            // In subtab order, so "All" lists Clean, Crunch, High Gain, NAM.
             let (list, _) = blocks::models(p, StageKind::Amp);
-            for (index, choice) in list.into_iter().enumerate() {
-                if amp_browse(choice.wire_id, choice.value) != family {
-                    continue;
+            for (class, _) in Family::AMP_TABS {
+                for (index, choice) in list.iter().enumerate() {
+                    if amp_browse(choice.wire_id, choice.value) != class {
+                        continue;
+                    }
+                    out.push(Entry {
+                        category: Category::Amp,
+                        index,
+                        label: choice.label,
+                        browse: class,
+                    });
                 }
-                out.push(Entry {
-                    category: Category::Amp,
-                    index,
-                    label: choice.label,
-                    browse: family,
-                });
             }
         } else {
             for category in family.categories() {
@@ -1135,26 +1237,27 @@ fn block_knob(
 
 fn header(w: &RodhareistEditorWindow, p: &Params, cx: &mut Cx, s: f32) -> AnyElement {
     let page = w.ui.page;
+    // No tab is current while the tuner has the deck.
+    let tuner_up = p.tuner_on;
+    // The tabs follow the wordmark, so the controls on the right never run
+    // into them.
     let nav = div()
-        .absolute()
-        .left_0()
-        .right_0()
-        .top(px(4.0 * s))
         .flex()
         .flex_row()
-        .justify_center()
+        .h_full()
+        .ml(px(22.0 * s))
         .gap(px(2.0 * s))
         .children(Page::ALL.iter().map(|&(item, label)| {
-            let current = item == page;
+            let current = item == page && !tuner_up;
             div()
                 .id(("rodhareist-nav", item as usize))
                 .flex()
                 .items_center()
-                .h(px(32.0 * s))
-                .px(px(9.0 * s))
+                .h_full()
+                .px(px(10.0 * s))
                 .border_b(px(2.0 * s))
                 .border_color(if current { accent() } else { color_a(0, 0.0) })
-                .text_size(type_px(15.0, s))
+                .text_size(type_px(14.5, s))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(color(if current { WHITE } else { SOFT }))
                 .cursor(gpui::CursorStyle::PointingHand)
@@ -1162,6 +1265,8 @@ fn header(w: &RodhareistEditorWindow, p: &Params, cx: &mut Cx, s: f32) -> AnyEle
                 .child(label)
                 .on_click(act_in(cx, move |this, window, cx| {
                     this.ui.page = item;
+                    // A tab leaves the tuner, too.
+                    this.close_tuner_page(cx);
                     // The field on the page being left stops taking keys.
                     this.release_text_focus(window, cx);
                     if item == Page::Home {
@@ -1170,10 +1275,25 @@ fn header(w: &RodhareistEditorWindow, p: &Params, cx: &mut Cx, s: f32) -> AnyEle
                     cx.notify();
                 }))
         }));
-    let tempo = w.host_tempo().map_or_else(
-        || "\u{2014} BPM".to_string(),
-        |bpm| format!("{} BPM", bpm.round()),
-    );
+    let tempo = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.0 * s))
+        .h(px(28.0 * s))
+        .px(px(10.0 * s))
+        .rounded(px(4.0 * s))
+        .border(px(1.0))
+        .border_color(color(plate::WELL_EDGE))
+        .bg(color(plate::GROUND))
+        .child(caption("BPM", 10.0, 0.1, FAINT, s))
+        .child(numbers(
+            w.host_tempo()
+                .map_or_else(|| "\u{2014}".to_string(), |bpm| format!("{}", bpm.round())),
+            13.5,
+            INK,
+            s,
+        ));
     let tuner_on = p.tuner_on;
     let (bg, border, fg) = if tuner_on {
         (accent(), accent(), color(plate::WELL))
@@ -1186,14 +1306,15 @@ fn header(w: &RodhareistEditorWindow, p: &Params, cx: &mut Cx, s: f32) -> AnyEle
         .flex_row()
         .items_center()
         .gap(px(6.0 * s))
-        .h(px(26.0 * s))
-        .px(px(9.0 * s))
-        .rounded(px(3.0 * s))
+        .h(px(28.0 * s))
+        .px(px(11.0 * s))
+        .rounded(px(4.0 * s))
         .border(px(1.0))
         .border_color(border)
         .bg(bg)
         .text_color(fg)
-        .text_size(type_px(12.0, s))
+        .text_size(type_px(12.5, s))
+        .font_weight(FontWeight::MEDIUM)
         .cursor(gpui::CursorStyle::PointingHand)
         .child(icon(TUNER_ICON, (12.0, 12.0), (12.0, 12.0), 1.4, fg, s))
         .child("Tuner")
@@ -1207,20 +1328,22 @@ fn header(w: &RodhareistEditorWindow, p: &Params, cx: &mut Cx, s: f32) -> AnyEle
         .flex()
         .flex_row()
         .items_center()
-        .pl(px(13.0 * s))
-        .pr(px(12.0 * s))
-        .child(nav)
+        .pl(px(14.0 * s))
+        .pr(px(10.0 * s))
+        .gap(px(8.0 * s))
+        .border_b(px(1.0))
+        .border_color(color_a(0xffffff, 0.06))
         .child(
             words(plate::spaced("RODHAREIST", 0.0), 16.0, WHITE, s)
                 .font_weight(FontWeight::SEMIBOLD),
         )
+        .child(nav)
         .child(div().flex_1())
         .child(key_control(p, cx, s))
-        .child(numbers(tempo, 12.0, SOFT, s).mr(px(8.0 * s)))
+        .child(tempo)
         .child(tuner)
         .into_any_element()
 }
-
 /// A meter bar's lit height: −60 dB to 0 dB over 145 design pixels.
 fn meter_h(level: f32) -> f32 {
     let db = 20.0 * level.max(1.0e-6).log10();
@@ -1778,75 +1901,152 @@ fn drop_cell(
 fn key_control(p: &Params, cx: &mut Cx, s: f32) -> AnyElement {
     let semi = p.transpose_semi;
     let cents = p.transpose_cents;
-    let step = |id: &'static str, value: f32, delta: f32, min: f32, max: f32, cx: &mut Cx| {
-        let next = (value + delta).clamp(min, max);
-        act(cx, move |this, cx| this.set_wire_value(id, next, cx))
-    };
     div()
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(4.0 * s))
-        .ml(px(12.0 * s))
-        .child(words("Key", 12.0, SOFT, s))
+        .gap(px(2.0 * s))
+        .h(px(28.0 * s))
+        .px(px(6.0 * s))
+        .rounded(px(4.0 * s))
+        .border(px(1.0))
+        .border_color(color(plate::WELL_EDGE))
+        .bg(color(plate::GROUND))
+        .child(transpose_group(
+            "key",
+            "Key",
+            "transpose_semi",
+            semi,
+            (-12.0, 12.0),
+            signed_whole(semi, ""),
+            "Semitones. Click the value to reset.",
+            cx,
+            s,
+        ))
+        .child(
+            div()
+                .w(px(1.0))
+                .h(px(16.0 * s))
+                .mx(px(6.0 * s))
+                .bg(color(plate::WELL_EDGE)),
+        )
+        .child(transpose_group(
+            "fine",
+            "Fine",
+            "transpose_cents",
+            cents,
+            (-100.0, 100.0),
+            signed_whole(cents, "\u{00A2}"),
+            "Cents. Click the value to reset.",
+            cx,
+            s,
+        ))
+        .into_any_element()
+}
+
+/// A whole number with its sign, and a plain   at zero: `+3`, `−12`, `0`.
+fn signed_whole(value: f32, unit: &str) -> String {
+    let whole = value.round();
+    if whole == 0.0 {
+        format!("0{unit}")
+    } else if whole > 0.0 {
+        format!("+{whole:.0}{unit}")
+    } else {
+        format!("\u{2212}{:.0}{unit}", -whole)
+    }
+}
+
+/// One transpose stepper: its caption, −, the value (bright when it moves the
+/// pitch, a click puts it back to zero), and +.
+#[allow(clippy::too_many_arguments)]
+fn transpose_group(
+    key: &'static str,
+    label: &'static str,
+    wire: &'static str,
+    value: f32,
+    (min, max): (f32, f32),
+    text: String,
+    help: &'static str,
+    cx: &mut Cx,
+    s: f32,
+) -> AnyElement {
+    let step = |delta: f32, cx: &mut Cx| {
+        let next = (value + delta).clamp(min, max);
+        act(cx, move |this, cx| this.set_wire_value(wire, next, cx))
+    };
+    let moved = value.abs() > 1.0e-3;
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(2.0 * s))
+        .child(caption(label, 10.0, 0.1, FAINT, s).mr(px(4.0 * s)))
         .child(key_step(
-            "rodhareist-key-down",
+            ("rodhareist-transpose-down", key),
             "\u{2212}",
+            value > min,
             s,
-            step("transpose_semi", semi, -1.0, -12.0, 12.0, cx),
+            step(-1.0, cx),
         ))
-        .child(numbers(format!("{semi:+.0}"), 13.0, WHITE, s).w(px(28.0 * s)))
+        .child(
+            div()
+                .id(gpui::ElementId::Name(
+                    format!("rodhareist-transpose-value-{key}").into(),
+                ))
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(38.0 * s))
+                .h(px(22.0 * s))
+                .rounded(px(3.0 * s))
+                .cursor(gpui::CursorStyle::PointingHand)
+                .hover(|style| style.bg(color(0x2a2a2a)))
+                .tooltip(fb_tooltip(help))
+                .child(numbers(text, 13.5, if moved { WHITE } else { FAINT }, s))
+                .on_click(act(cx, move |this, cx| this.set_wire_value(wire, 0.0, cx))),
+        )
         .child(key_step(
-            "rodhareist-key-up",
+            ("rodhareist-transpose-up", key),
             "+",
+            value < max,
             s,
-            step("transpose_semi", semi, 1.0, -12.0, 12.0, cx),
-        ))
-        .child(words("fine", 11.0, FAINT, s))
-        .child(key_step(
-            "rodhareist-cents-down",
-            "\u{2212}",
-            s,
-            step("transpose_cents", cents, -1.0, -100.0, 100.0, cx),
-        ))
-        .child(numbers(format!("{cents:+.0}"), 12.0, PALE, s).w(px(32.0 * s)))
-        .child(key_step(
-            "rodhareist-cents-up",
-            "+",
-            s,
-            step("transpose_cents", cents, 1.0, -100.0, 100.0, cx),
+            step(1.0, cx),
         ))
         .into_any_element()
 }
 
 fn key_step(
-    id: &'static str,
+    id: (&'static str, &'static str),
     label: &'static str,
+    enabled: bool,
     s: f32,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
-    div()
-        .id(id)
+    let button = div()
+        .id(gpui::ElementId::Name(format!("{}-{}", id.0, id.1).into()))
         .flex()
         .items_center()
         .justify_center()
-        .size(px(18.0 * s))
-        .rounded(px(2.0 * s))
-        .bg(color(0x262626))
-        .text_size(type_px(12.0, s))
-        .text_color(color(WHITE))
-        .cursor(gpui::CursorStyle::PointingHand)
-        .child(label)
-        .on_click(on_click)
-        .into_any_element()
+        .size(px(22.0 * s))
+        .rounded(px(3.0 * s))
+        .text_size(type_px(14.0, s))
+        .text_color(color(if enabled { INK } else { 0x5a5a5a }))
+        .child(label);
+    if enabled {
+        button
+            .cursor(gpui::CursorStyle::PointingHand)
+            .hover(|style| style.bg(color(0x2e2e2e)))
+            .on_click(on_click)
+            .into_any_element()
+    } else {
+        button.into_any_element()
+    }
 }
-
 fn display(
     w: &RodhareistEditorWindow,
     p: &Params,
     focus: ChainFocus,
     frame: &ChainFrame,
-    entry: Option<AnyElement>,
     cx: &mut Cx,
     s: f32,
 ) -> AnyElement {
@@ -1957,13 +2157,6 @@ fn display(
         .border(px(1.0))
         .border_color(color(plate::WELL_EDGE))
         .child(header(w, p, cx, s))
-        .children(entry.map(|field| {
-            div()
-                .absolute()
-                .left(px(108.0 * s))
-                .top(px(42.0 * s))
-                .child(field)
-        }))
         .children(meters(w, s))
         .child(input)
         .child(output)
@@ -2115,13 +2308,25 @@ fn ir_unconfirmed_note(w: &RodhareistEditorWindow) -> Option<String> {
         .map(|name| format!("{name} is named, not loaded"))
 }
 
+/// Sidebar text that wraps at the sidebar's width. Plate `words` never wraps,
+/// so a long status ran out of the 262 px sidebar into the deck beside it
+/// (#404).
+fn sidebar_text(text: impl Into<gpui::SharedString>, size: f32, ink: u32, s: f32) -> gpui::Div {
+    words(text, size, ink, s)
+        .whitespace_normal()
+        .w_full()
+        .min_w(px(0.0))
+}
+
 fn load_status(w: &RodhareistEditorWindow, p: &Params, s: f32) -> AnyElement {
     div()
         .flex()
         .flex_col()
-        .gap(px(2.0 * s))
-        .child(words(ir_status_line(w, p), 12.0, PALE, s))
-        .child(words(nam_status_line(w, p), 12.0, PALE, s))
+        .flex_shrink_0()
+        .w_full()
+        .gap(px(3.0 * s))
+        .child(sidebar_text(ir_status_line(w, p), 12.0, PALE, s))
+        .child(sidebar_text(nam_status_line(w, p), 12.0, PALE, s))
         .into_any_element()
 }
 
@@ -2198,11 +2403,79 @@ fn ir_block(w: &RodhareistEditorWindow, p: &Params, cx: &mut Cx, s: f32) -> AnyE
             110.0,
             s,
         ))
-        .child(words(ir_path_line(p), 12.0, PALE, s));
+        .child(sidebar_text(ir_path_line(p), 12.0, PALE, s));
     if let Some(note) = ir_unconfirmed_note(w) {
-        block = block.child(words(note, 12.0, ACCENT, s));
+        block = block.child(sidebar_text(note, 12.0, ACCENT, s));
     }
     block.into_any_element()
+}
+
+/// A row of subtabs in the preset switch's style: `(value, label, count)`
+/// per tab, the one equal to `current` lit. `pick` stores a click in the
+/// editor's view state. Counts are left out where the row is narrow.
+#[allow(clippy::too_many_arguments)]
+fn subtabs(
+    id: &'static str,
+    tabs: Vec<(Option<Family>, &'static str, usize)>,
+    current: Option<Family>,
+    counts: bool,
+    cx: &mut Cx,
+    s: f32,
+    pick: fn(&mut RodUi, Option<Family>),
+) -> AnyElement {
+    let tab =
+        |index: usize, value: Option<Family>, label: &'static str, count: usize, cx: &mut Cx| {
+            let on = value == current;
+            let mut cell = div()
+                .id((id, index))
+                .flex_1()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_center()
+                .gap(px(5.0 * s))
+                .h_full()
+                .px(px(4.0 * s))
+                .rounded(px(2.0 * s))
+                .bg(if on { color(0x343434) } else { color_a(0, 0.0) })
+                .border_b(px(2.0 * s))
+                .border_color(if on { accent() } else { color_a(0, 0.0) })
+                .cursor(gpui::CursorStyle::PointingHand)
+                .hover(|style| style.bg(color(0x2e2e2e)))
+                .child(
+                    words(label, 12.0, if on { WHITE } else { SOFT }, s)
+                        .font_weight(FontWeight::MEDIUM),
+                );
+            if counts {
+                cell = cell.child(numbers(
+                    count.to_string(),
+                    10.5,
+                    if on { ACCENT } else { FAINT },
+                    s,
+                ));
+            }
+            cell.on_click(act(cx, move |this, cx| {
+                pick(&mut this.ui, value);
+                cx.notify();
+            }))
+        };
+    div()
+        .flex()
+        .flex_row()
+        .flex_shrink_0()
+        .h(px(30.0 * s))
+        .p(px(2.0 * s))
+        .gap(px(2.0 * s))
+        .rounded(px(3.0 * s))
+        .border(px(1.0))
+        .border_color(color(0x454545))
+        .bg(color(0x1f1f1f))
+        .children(
+            tabs.into_iter()
+                .enumerate()
+                .map(|(index, (value, label, count))| tab(index, value, label, count, cx)),
+        )
+        .into_any_element()
 }
 
 /// The sidebar's two preset lists, as one segmented switch: the factory
@@ -2386,7 +2659,7 @@ fn home(
         }
     };
     if has_note {
-        list = list.child(words(note, 12.0, ACCENT, s));
+        list = list.child(sidebar_text(note, 12.0, ACCENT, s));
     }
     let list = list.child(ir_block(w, p, cx, s));
 
@@ -2462,7 +2735,7 @@ fn home(
                 .flex_row()
                 .gap(px(10.0 * s))
                 .h(px(96.0 * s))
-                .child(tuner_box(w, p, s))
+                .child(tuner_box(w, p, cx, s))
                 .child(tempo_box(p, cx, s))
                 .child(line2_box(p, cx, s))
                 .child(master_box(p, cx, s)),
@@ -2565,7 +2838,7 @@ fn footswitch(
     button.into_any_element()
 }
 
-fn tuner_box(w: &RodhareistEditorWindow, p: &Params, s: f32) -> AnyElement {
+fn tuner_box(w: &RodhareistEditorWindow, p: &Params, cx: &mut Cx, s: f32) -> AnyElement {
     let on = p.tuner_on;
     let hz = w
         .pads()
@@ -2596,6 +2869,7 @@ fn tuner_box(w: &RodhareistEditorWindow, p: &Params, s: f32) -> AnyElement {
         }
     };
     tile(s)
+        .id("rodhareist-home-tuner")
         .flex_1()
         .flex()
         .flex_col()
@@ -2603,6 +2877,10 @@ fn tuner_box(w: &RodhareistEditorWindow, p: &Params, s: f32) -> AnyElement {
         .px(px(14.0 * s))
         .py(px(10.0 * s))
         .opacity(if on { 1.0 } else { 0.45 })
+        .cursor(gpui::CursorStyle::PointingHand)
+        .hover(|style| style.opacity(1.0))
+        .tooltip(fb_tooltip("Opens the tuner"))
+        .on_click(act(cx, |this, cx| this.toggle_wire("tuner_on", cx)))
         .child(
             div()
                 .flex()
@@ -2654,6 +2932,306 @@ fn tuner_box(w: &RodhareistEditorWindow, p: &Params, s: f32) -> AnyElement {
                 ),
         )
         .into_any_element()
+}
+
+/// In-tune green, as the Home tile uses it.
+const TUNED: u32 = 0x9be15d;
+/// The tuner page's scale and strobe width, at the design size.
+const TUNER_SCALE_W: f32 = 700.0;
+/// One strobe stripe period, at the design size.
+const STROBE_PERIOD: f32 = 28.0;
+
+/// The tuner, in the deck while `tuner_on` is set: the note, a cents needle,
+/// a strobe band and the signal's clarity, all from the DSP's tuner reading.
+/// The rig keeps playing (the DSP does not mute while tuning).
+fn tuner_page(w: &RodhareistEditorWindow, cx: &mut Cx, s: f32) -> Vec<AnyElement> {
+    use rodharerist::telemetry as tm;
+    let look = &w.ui.tuner;
+    let now = Instant::now();
+    let hz = w.pads().map_or(0.0, |block| block[tm::TUNER_HZ]);
+    let live = hz > 0.0;
+    let clarity = w
+        .pads()
+        .map_or(0.0, |block| block[tm::TUNER_CLARITY])
+        .clamp(0.0, 1.0);
+    let in_tune = look.note.is_some() && look.in_tune_since.is_some();
+    let ink = match look.note {
+        None => FAINT,
+        Some(_) if in_tune => TUNED,
+        Some(_) => WHITE,
+    };
+    let (note, octave, status) = match look.note {
+        None => (
+            "\u{2014}".to_string(),
+            String::new(),
+            "Play one string".to_string(),
+        ),
+        Some((name, octave, cents)) => (
+            name.to_string(),
+            octave.to_string(),
+            if in_tune {
+                "In tune".to_string()
+            } else {
+                format!(
+                    "{}{:.0} cents {}",
+                    if cents > 0.0 { "+" } else { "\u{2212}" },
+                    cents.abs(),
+                    if cents > 0.0 { "sharp" } else { "flat" }
+                )
+            },
+        ),
+    };
+    // The pulse on coming into tune: a ring that fades over SLOW.
+    let pulse = look.in_tune_since.map_or(0.0, |since| {
+        let t = now.duration_since(since).as_secs_f32()
+            / (crate::theme::motion::SLOW_MS as f32 / 1_000.0);
+        (1.0 - t).clamp(0.0, 1.0)
+    });
+
+    let note_box = div()
+        .relative()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .w(px(230.0 * s))
+        .h_full()
+        .rounded(px(6.0 * s))
+        .bg(color(plate::WELL))
+        .border(px((1.0 + 2.0 * pulse) * s))
+        .border_color(if in_tune {
+            color_a(TUNED, 0.35 + 0.65 * pulse)
+        } else {
+            color(plate::WELL_EDGE)
+        })
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_start()
+                .child(
+                    numbers(note, 92.0, ink, s)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .line_height(px(100.0 * s)),
+                )
+                .child(numbers(octave, 26.0, SOFT, s).mt(px(14.0 * s))),
+        )
+        .child(numbers(status, 15.0, ink, s));
+
+    // The cents scale: a tick every 5 cents, labels every 25, the in-tune
+    // window washed green, and the eased needle.
+    let ticks = (-10..=10).map(|step: i32| {
+        let cents = step as f32 * 5.0;
+        let major = step % 2 == 0;
+        div()
+            .absolute()
+            .left(gpui::relative((cents + 50.0) / 100.0))
+            .ml(px(-0.5 * s))
+            .bottom(px(22.0 * s))
+            .w(px(1.0 * s))
+            .h(px(if step == 0 {
+                54.0
+            } else if major {
+                30.0
+            } else {
+                16.0
+            } * s))
+            .bg(color(if step == 0 { PALE } else { 0x5a5a5a }))
+    });
+    let labels = [-50, -25, 0, 25, 50].map(|cents: i32| {
+        div()
+            .absolute()
+            .left(gpui::relative((cents as f32 + 50.0) / 100.0))
+            .ml(px(-20.0 * s))
+            .w(px(40.0 * s))
+            .bottom_0()
+            .flex()
+            .justify_center()
+            .child(numbers(
+                if cents > 0 {
+                    format!("+{cents}")
+                } else {
+                    cents.to_string()
+                },
+                11.0,
+                FAINT,
+                s,
+            ))
+    });
+    let window_l = (50.0 - IN_TUNE_CENTS) / 100.0;
+    let needle_ink = match look.note {
+        None => 0x5a5a5a,
+        Some(_) if in_tune => TUNED,
+        Some(_) => ACCENT,
+    };
+    let needle = div()
+        .absolute()
+        .left(gpui::relative(
+            (look.cents.clamp(-50.0, 50.0) + 50.0) / 100.0,
+        ))
+        .ml(px(-2.0 * s))
+        .top(px(6.0 * s))
+        .bottom(px(18.0 * s))
+        .w(px(4.0 * s))
+        .rounded(px(2.0 * s))
+        .bg(color(needle_ink));
+    let scale = div()
+        .relative()
+        .w(px(TUNER_SCALE_W * s))
+        .h(px(120.0 * s))
+        .child(
+            div()
+                .absolute()
+                .left(gpui::relative(window_l))
+                .w(gpui::relative(2.0 * IN_TUNE_CENTS / 100.0))
+                .top(px(6.0 * s))
+                .bottom(px(22.0 * s))
+                .bg(color_a(TUNED, if in_tune { 0.28 } else { 0.1 })),
+        )
+        .children(ticks)
+        .children(labels)
+        .child(needle);
+
+    // The strobe: stripes that drift with how far off the note is, and stand
+    // still in tune. Drawn only while there is a note to show.
+    let stripes = (TUNER_SCALE_W / STROBE_PERIOD) as usize + 2;
+    let offset = look.strobe * STROBE_PERIOD;
+    let strobe_ink = if in_tune { TUNED } else { 0x8a8a8a };
+    let mut strobe = div()
+        .relative()
+        .w(px(TUNER_SCALE_W * s))
+        .h(px(34.0 * s))
+        .rounded(px(3.0 * s))
+        .overflow_hidden()
+        .bg(color(plate::WELL))
+        .border(px(1.0))
+        .border_color(color(plate::WELL_EDGE));
+    if look.note.is_some() {
+        strobe = strobe.children((0..stripes).map(|i| {
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left(px((i as f32 * STROBE_PERIOD - offset) * s))
+                .w(px(STROBE_PERIOD * 0.5 * s))
+                .bg(color_a(strobe_ink, 0.55))
+        }));
+    }
+
+    let readout = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(18.0 * s))
+        .child(numbers(
+            if live && hz > 0.0 {
+                format!("{hz:.1} Hz")
+            } else {
+                "\u{2014} Hz".to_string()
+            },
+            13.0,
+            INK,
+            s,
+        ))
+        .child(numbers("A4 = 440 Hz", 12.0, FAINT, s))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0 * s))
+                .child(caption("Signal", 10.0, 0.1, SOFT, s))
+                .child(
+                    div()
+                        .w(px(90.0 * s))
+                        .h(px(6.0 * s))
+                        .bg(color(0x1a1a1a))
+                        .child(
+                            div()
+                                .h_full()
+                                .w(gpui::relative(clarity))
+                                .bg(color(if clarity > 0.6 { TUNED } else { 0x8a8a8a })),
+                        ),
+                ),
+        );
+
+    let done = div()
+        .id("rodhareist-tuner-done")
+        .flex()
+        .items_center()
+        .justify_center()
+        .h(px(32.0 * s))
+        .px(px(22.0 * s))
+        .rounded(px(3.0 * s))
+        .border(px(1.0))
+        .border_color(accent())
+        .bg(color(0x1f1f1f))
+        .text_size(type_px(13.0, s))
+        .text_color(color(WHITE))
+        .cursor(gpui::CursorStyle::PointingHand)
+        .hover(|style| style.bg(color(0x2e2e2e)))
+        .child("Done")
+        .on_click(act(cx, |this, cx| this.close_tuner_page(cx)));
+
+    let page = section(s, 6.0, 1011.0)
+        .px(px(24.0 * s))
+        .py(px(18.0 * s))
+        .gap(px(16.0 * s))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(12.0 * s))
+                        .child(heading("Tuner", s))
+                        .child(words(
+                            "The rig keeps playing while you tune.",
+                            12.0,
+                            SOFT,
+                            s,
+                        )),
+                )
+                .child(readout),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .flex_1()
+                .min_h(px(0.0))
+                .gap(px(24.0 * s))
+                .child(note_box)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .justify_center()
+                        .gap(px(14.0 * s))
+                        .child(scale)
+                        .child(strobe),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .child(words(
+                    "Esc or Done closes the tuner. Any page tab leaves it too.",
+                    11.5,
+                    FAINT,
+                    s,
+                ))
+                .child(done),
+        );
+    vec![page.into_any_element()]
 }
 
 fn tempo_box(p: &Params, cx: &mut Cx, s: f32) -> AnyElement {
@@ -2819,8 +3397,8 @@ fn explore(
     let current = w.ui.family;
     let mut rows: Vec<(Option<Family>, &'static str, u32, usize)> =
         vec![(None, "All blocks", INK, all.len())];
-    rows.extend(Family::BROWSE.iter().map(|&family| {
-        let count = all.iter().filter(|e| e.browse == family).count();
+    rows.extend(Family::ALL.iter().map(|&family| {
+        let count = all.iter().filter(|e| e.browse.parent() == family).count();
         (Some(family), family.label(), family.color(), count)
     }));
     let families = section(s, 6.0, 262.0)
@@ -2859,9 +3437,41 @@ fn explore(
 
     let target = focus_slot(&p.stage_order, focus);
     let query = w.search.value.trim().to_lowercase();
+    // Amp's subtab narrows Amp to one gain class (or the NAM engine).
+    let amp_tab = (current == Some(Family::Amp))
+        .then_some(w.ui.explore_amp)
+        .flatten();
+    let amp_tabs = (current == Some(Family::Amp)).then(|| {
+        let mut tabs = vec![(
+            None,
+            "All",
+            all.iter()
+                .filter(|e| e.browse.parent() == Family::Amp)
+                .count(),
+        )];
+        tabs.extend(Family::AMP_TABS.iter().map(|&(class, label)| {
+            (
+                Some(class),
+                label,
+                all.iter()
+                    .filter(|e| e.category == Category::Amp && e.browse == class)
+                    .count(),
+            )
+        }));
+        subtabs(
+            "rodhareist-explore-amp",
+            tabs,
+            amp_tab,
+            true,
+            cx,
+            s,
+            |ui, tab| ui.explore_amp = tab,
+        )
+    });
     let matches: Vec<Entry> = all
         .into_iter()
-        .filter(|e| current.is_none_or(|family| e.browse == family))
+        .filter(|e| current.is_none_or(|family| e.browse.parent() == family))
+        .filter(|e| amp_tab.is_none_or(|class| e.browse == class))
         .filter(|e| {
             query.is_empty()
                 || e.label.to_lowercase().contains(&query)
@@ -2916,6 +3526,7 @@ fn explore(
                 .child(search)
                 .child(words(format!("Target: slot {}", target + 1), 12.0, PALE, s)),
         )
+        .children(amp_tabs)
         .child(grid);
     vec![families.into_any_element(), library.into_any_element()]
 }
@@ -3210,33 +3821,28 @@ fn model_column(
     s: f32,
 ) -> AnyElement {
     let mut rows: Vec<AnyElement> = Vec::new();
+    let mut tabs = None;
     if kind == StageKind::Amp {
-        let group_of = |choice: &blocks::ModelChoice| {
-            if choice.wire_id == "tone_engine" {
-                "NAM"
-            } else {
-                match AmpModel::from_index(choice.value.round().max(0.0) as u32).class() {
-                    AmpClass::Clean => "Clean",
-                    AmpClass::Crunch => "Crunch",
-                    AmpClass::HighGain => "High Gain",
-                }
-            }
-        };
-        for group in ["Clean", "Crunch", "High Gain", "NAM"] {
-            let members: Vec<_> = list
+        let class_of = |choice: &blocks::ModelChoice| amp_browse(choice.wire_id, choice.value);
+        // The subtab picked, else the one the selected model is in (#407).
+        let shown =
+            w.ui.board_amp
+                .or_else(|| selected.and_then(|i| list.get(i)).map(class_of))
+                .unwrap_or(Family::Clean);
+        tabs = Some(subtabs(
+            "rodhareist-board-amp",
+            Family::AMP_TABS
                 .iter()
-                .enumerate()
-                .filter(|(_, choice)| group_of(choice) == group)
-                .collect();
-            if members.is_empty() {
-                continue;
-            }
-            rows.push(
-                words(group, 11.0, SOFT, s)
-                    .mt(px(if rows.is_empty() { 0.0 } else { 6.0 } * s))
-                    .into_any_element(),
-            );
-            for (index, choice) in members {
+                .map(|&(class, label)| (Some(class), label, 0))
+                .collect(),
+            Some(shown),
+            false,
+            cx,
+            s,
+            |ui, tab| ui.board_amp = tab,
+        ));
+        for (index, choice) in list.iter().enumerate() {
+            if class_of(choice) == shown {
                 rows.push(model_row(w, index, choice, selected == Some(index), cx, s));
             }
         }
@@ -3246,14 +3852,23 @@ fn model_column(
         }
     }
     div()
-        .id("rodhareist-models")
-        .flex_1()
-        .min_h(px(0.0))
-        .overflow_y_scroll()
         .flex()
         .flex_col()
-        .gap(px(4.0 * s))
-        .children(rows)
+        .flex_1()
+        .min_h(px(0.0))
+        .gap(px(6.0 * s))
+        .children(tabs)
+        .child(
+            div()
+                .id("rodhareist-models")
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap(px(4.0 * s))
+                .children(rows),
+        )
         .into_any_element()
 }
 
@@ -3903,7 +4518,22 @@ fn load_row(
 
 // ── Settings ───────────────────────────────────────────────────────────────
 
+/// The footswitch slot grid: square cells, eight to a row, a fixed width.
+/// A wrapping pill row capped at 420 px ran sixteen slots past the card.
+const SLOT_CELL: f32 = 28.0;
+const SLOT_GAP: f32 = 3.0;
+const SLOT_GRID_W: f32 = 8.0 * SLOT_CELL + 7.0 * SLOT_GAP;
+
 enum Control {
+    /// A slot pick: a fixed grid of numbered squares, eight to a row, so up
+    /// to sixteen slots stay inside the row.
+    Slots(
+        Vec<(
+            String,
+            bool,
+            Box<dyn Fn(&mut RodhareistEditorWindow, &mut Cx)>,
+        )>,
+    ),
     Pills(
         Vec<(
             String,
@@ -3987,7 +4617,7 @@ fn settings_rows(w: &RodhareistEditorWindow, p: &Params) -> Vec<Row> {
                     Row {
                         label: format!("Footswitch {}", i + 1),
                         help,
-                        control: Control::Pills(
+                        control: Control::Slots(
                             (0..shown)
                                 .map(|k| {
                                     (
@@ -4128,6 +4758,34 @@ fn settings_row(index: usize, row: Row, cx: &mut Cx, s: f32) -> AnyElement {
         }
     };
     let control: AnyElement = match row.control {
+        Control::Slots(options) => div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .flex_shrink_0()
+            .justify_end()
+            .w(px(SLOT_GRID_W * s))
+            .gap(px(SLOT_GAP * s))
+            .children(
+                options
+                    .into_iter()
+                    .enumerate()
+                    .map(|(k, (label, on, pick))| {
+                        plate::pill(
+                            ("rodhareist-slot-pick", index * 64 + k),
+                            label,
+                            on,
+                            accent(),
+                            plate::PillLook::numbers(SLOT_CELL, 0.0, 12.0),
+                            true,
+                            s,
+                            run(std::rc::Rc::from(pick)),
+                        )
+                        .w(px(SLOT_CELL * s))
+                        .justify_center()
+                    }),
+            )
+            .into_any_element(),
         Control::Pills(options) => div()
             .flex()
             .flex_row()
@@ -4255,13 +4913,32 @@ pub(crate) fn rodhareist_panel(
     let s = plate_scale((f32::from(viewport.width), f32::from(viewport.height)));
     let p = w.params_snapshot();
     let focus = resolve_focus(&p.stage_order, w.chain_focus);
-    let mut children = vec![display(w, &p, focus, frame, fields.knob_value, cx, s)];
-    children.extend(match w.ui.page {
-        Page::Home => home(w, &p, fields.preset_name, cx, s),
-        Page::Explore => explore(w, &p, focus, fields.search, cx, s),
-        Page::Pedalboard => pedalboard(w, &p, focus, cx, s),
-        Page::Settings => settings(w, &p, cx, s),
+    let mut children = vec![display(w, &p, focus, frame, cx, s)];
+    // The tuner takes the deck while it is on, whichever page is behind it.
+    children.extend(if p.tuner_on {
+        tuner_page(w, cx, s)
+    } else {
+        match w.ui.page {
+            Page::Home => home(w, &p, fields.preset_name, cx, s),
+            Page::Explore => explore(w, &p, focus, fields.search, cx, s),
+            Page::Pedalboard => pedalboard(w, &p, focus, cx, s),
+            Page::Settings => settings(w, &p, cx, s),
+        }
     });
+    // A knob's type-in floats just under where it was double-clicked, above
+    // everything, kept inside the window.
+    if let Some((field, at)) = fields.knob_value {
+        children.push(
+            gpui::deferred(
+                gpui::anchored()
+                    .position(gpui::point(at.x - px(120.0 * s), at.y + px(16.0 * s)))
+                    .snap_to_window_with_margin(px(8.0 * s))
+                    .child(field),
+            )
+            .with_priority(2)
+            .into_any_element(),
+        );
+    }
     plate_frame(s, children)
 }
 
@@ -4492,5 +5169,80 @@ mod tests {
         assert!(grouped(Family::Drive, "Green Screamer"));
         assert!(grouped(Family::Amp, "NAM Capture"));
         assert!(!grouped(Family::Clean, "NAM Capture"));
+    }
+
+    /// #407: the gain classes and the NAM engine are subtabs of one Amp
+    /// category, and every amp entry sits in exactly one of them.
+    #[test]
+    fn amp_classes_are_subtabs_of_amp() {
+        let all = entries(&rodharerist::default_params());
+        let amps: Vec<_> = all.iter().filter(|e| e.category == Category::Amp).collect();
+        assert!(!amps.is_empty());
+        for entry in &amps {
+            assert_eq!(entry.browse.parent(), Family::Amp, "{}", entry.label);
+            assert!(
+                Family::AMP_TABS
+                    .iter()
+                    .any(|(class, _)| *class == entry.browse),
+                "{}",
+                entry.label
+            );
+        }
+        let in_tabs: usize = Family::AMP_TABS
+            .iter()
+            .map(|(class, _)| amps.iter().filter(|e| e.browse == *class).count())
+            .sum();
+        assert_eq!(in_tabs, amps.len());
+        // Explore lists the nine chain families, Amp once.
+        assert_eq!(Family::ALL.iter().filter(|f| **f == Family::Amp).count(), 1);
+        assert!(!Family::ALL.contains(&Family::Clean));
+    }
+
+    #[test]
+    fn pitch_of_names_the_note_and_octave() {
+        let (name, octave, cents) = pitch_of(110.0).unwrap();
+        assert_eq!((name, octave), ("A", 2));
+        assert!(cents.abs() < 0.01);
+        let (name, octave, cents) = pitch_of(82.41).unwrap();
+        assert_eq!((name, octave), ("E", 2));
+        assert!(cents.abs() < 1.0);
+        assert!(pitch_of(0.0).is_none());
+    }
+
+    /// The needle eases onto the reading, an in-tune note stops animating
+    /// once its pulse is over, and silence clears the note after the hold.
+    #[test]
+    fn the_tuner_eases_then_rests() {
+        let mut look = TunerLook::default();
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let sharp = pitch_of(111.22);
+        let mut moving = true;
+        for frame in 0..60 {
+            moving = tuner_frame(&mut look, sharp, at(frame * 16));
+        }
+        let cents = sharp.unwrap().2;
+        assert!(
+            (look.cents - cents).abs() < 0.5,
+            "{} vs {cents}",
+            look.cents
+        );
+        assert!(moving, "a note off the pitch keeps the strobe moving");
+
+        let tuned = pitch_of(110.01);
+        for frame in 60..120 {
+            moving = tuner_frame(&mut look, tuned, at(frame * 16));
+        }
+        assert!(look.in_tune_since.is_some());
+        assert!(!moving, "in tune and settled: no frames");
+
+        // Silence: the note holds briefly, then clears and the needle rests.
+        assert!(tuner_frame(&mut look, None, at(120 * 16)));
+        assert!(look.note.is_some());
+        for frame in 121..200 {
+            moving = tuner_frame(&mut look, None, at(frame * 16));
+        }
+        assert!(look.note.is_none());
+        assert!(!moving);
     }
 }
