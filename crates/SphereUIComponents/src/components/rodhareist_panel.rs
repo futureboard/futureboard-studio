@@ -3887,6 +3887,124 @@ fn sync_label(sync: DelaySync) -> &'static str {
     }
 }
 
+/// The delay time knob a sync choice belongs to: `(time id, sync id, sync,
+/// free ms)` for each of the four time knobs.
+fn delay_time_sync(
+    p: &Params,
+    time_id: &str,
+) -> Option<(&'static str, &'static str, DelaySync, f32)> {
+    Some(match time_id {
+        "delay_time" => ("delay_time", "delay_sync", p.delay_sync, p.delay_time_ms),
+        "delay_time_r" => (
+            "delay_time_r",
+            "delay_sync_r",
+            p.delay_sync_r,
+            p.delay_time_r_ms,
+        ),
+        "delay2_time" => (
+            "delay2_time",
+            "delay2_sync",
+            p.stage_b.delay_sync,
+            p.stage_b.delay_time_ms,
+        ),
+        "delay2_time_r" => (
+            "delay2_time_r",
+            "delay2_sync_r",
+            p.stage_b.delay_sync_r,
+            p.stage_b.delay_time_r_ms,
+        ),
+        _ => return None,
+    })
+}
+
+/// The synced divisions, shortest first: the steps the time knob turns
+/// through in Sync.
+fn sync_steps() -> Vec<DelaySync> {
+    let mut steps: Vec<DelaySync> = DelaySync::ALL
+        .iter()
+        .copied()
+        .filter(|sync| sync.beats().is_some())
+        .collect();
+    steps.sort_by(|a, b| {
+        a.beats()
+            .partial_cmp(&b.beats())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    steps
+}
+
+/// The division nearest `ms` at `tempo`: where Sync starts from a free time,
+/// so switching does not jump.
+fn nearest_sync(ms: f32, tempo: f32) -> DelaySync {
+    sync_steps()
+        .into_iter()
+        .min_by(|a, b| {
+            let da = (rodharerist::effective_delay_ms(*a, ms, tempo) - ms).abs();
+            let db = (rodharerist::effective_delay_ms(*b, ms, tempo) - ms).abs();
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or(DelaySync::Quarter)
+}
+
+/// A time knob in Sync: it steps through the divisions, shortest first, and
+/// reads the one chosen. Free keeps the millisecond knob ([`block_knob`]).
+#[allow(clippy::too_many_arguments)]
+fn sync_knob(
+    cx: &mut Cx,
+    spec: ParamSpec,
+    sync_id: &'static str,
+    sync: DelaySync,
+    ink: Rgba,
+    size: f32,
+    width: f32,
+    s: f32,
+) -> AnyElement {
+    let steps = sync_steps();
+    let last = steps.len().saturating_sub(1);
+    let index = steps.iter().position(|step| *step == sync).unwrap_or(0);
+    let quarter = steps
+        .iter()
+        .position(|step| *step == DelaySync::Quarter)
+        .unwrap_or(0);
+    let dial = Dial::new(
+        spec.id,
+        spec.label,
+        0.0,
+        last as f32,
+        quarter as f32,
+        DialUnit::Plain,
+    );
+    let look = KnobLook::small(size).styled(3.6, 18.0, 0x1a1a1a, 0x555555, 1.0, 6.0, 2.0);
+    let cell = KnobCell::new(width, 11.0, 12.5)
+        .gap(3.0)
+        .label(0.08, PALE)
+        .label_below();
+    let element = plate::knob_reading(
+        cx,
+        format!("rodhareist-knob-{}", spec.id),
+        dial,
+        index as f32,
+        Some(sync_label(sync).to_string()),
+        look,
+        cell,
+        ink,
+        true,
+        s,
+        move |this: &mut RodhareistEditorWindow, v, cx| {
+            let step = steps[(v.round().max(0.0) as usize).min(last)];
+            this.set_wire_value(sync_id, step as u8 as f32, cx);
+        },
+    );
+    if spec.inactive {
+        div().opacity(0.4).child(element).into_any_element()
+    } else {
+        element
+    }
+}
+
+/// The delay's time mode: Free (the time knob sets milliseconds) or Sync (it
+/// steps through note divisions at the host tempo), for Time and, on the
+/// stereo model, Time R. Shows the time that sounds.
 fn delay_sync_row(
     w: &RodhareistEditorWindow,
     p: &Params,
@@ -3895,82 +4013,102 @@ fn delay_sync_row(
     s: f32,
 ) -> AnyElement {
     let second = kind == StageKind::Delay2;
-    let (sync_id, sync, free_ms) = if second {
-        ("delay2_sync", p.stage_b.delay_sync, p.stage_b.delay_time_ms)
-    } else {
-        ("delay_sync", p.delay_sync, p.delay_time_ms)
-    };
     let tempo = w.host_tempo().map(|bpm| bpm as f32).unwrap_or(120.0);
-    let sounding = rodharerist::effective_delay_ms(sync, free_ms, tempo);
     let stereo = if second {
         p.stage_b.delay_model == rodharerist::DelayModel::Stereo
     } else {
         p.delay_model == rodharerist::DelayModel::Stereo
     };
-    let pills = |id: &'static str, current: DelaySync, tag: u8| {
-        div()
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .items_center()
-            .gap(px(3.0 * s))
-            .children(DelaySync::ALL.iter().copied().map(|sync| {
-                plate::pill(
-                    ("rodhareist-sync", tag as usize * 16 + sync as usize),
-                    sync_label(sync),
-                    current == sync,
-                    accent(),
-                    plate::PillLook::words(18.0, 4.0, 11.0),
-                    true,
-                    s,
-                    w.set_cb(cx, id, sync as u8 as f32),
-                )
-            }))
-    };
-    let mut row = div()
+    let mut sides = vec![if second { "delay2_time" } else { "delay_time" }];
+    if stereo {
+        sides.push(if second {
+            "delay2_time_r"
+        } else {
+            "delay_time_r"
+        });
+    }
+    let rows = sides.into_iter().enumerate().filter_map(|(tag, time_id)| {
+        let (time_id, sync_id, sync, free_ms) = delay_time_sync(p, time_id)?;
+        let sounding = rodharerist::effective_delay_ms(sync, free_ms, tempo);
+        let synced = sync != DelaySync::Free;
+        let to_sync = nearest_sync(sounding, tempo);
+        let mode = |index: usize,
+                    label: &'static str,
+                    on: bool,
+                    pick: Box<dyn Fn(&mut RodhareistEditorWindow, &mut Cx)>,
+                    cx: &mut Cx| {
+            plate::pill(
+                ("rodhareist-delay-mode", tag * 2 + index),
+                label,
+                on,
+                accent(),
+                plate::PillLook::words(22.0, 10.0, 11.5),
+                true,
+                s,
+                act(cx, move |this, cx| pick(this, cx)),
+            )
+        };
+        let label = if tag == 0 && stereo {
+            "Time L"
+        } else if tag == 0 {
+            "Time"
+        } else {
+            "Time R"
+        };
+        Some(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0 * s))
+                .child(caption(label, 10.5, 0.1, SOFT, s).w(px(52.0 * s)))
+                .child(mode(
+                    0,
+                    "Free",
+                    !synced,
+                    // Keep what sounds: the synced time becomes the free time.
+                    Box::new(move |this, cx| {
+                        if synced {
+                            this.set_wire_value(time_id, sounding, cx);
+                            this.set_wire_value(sync_id, DelaySync::Free as u8 as f32, cx);
+                        }
+                    }),
+                    cx,
+                ))
+                .child(mode(
+                    1,
+                    "Sync",
+                    synced,
+                    // Start from the division nearest the free time.
+                    Box::new(move |this, cx| {
+                        if !synced {
+                            this.set_wire_value(sync_id, to_sync as u8 as f32, cx);
+                        }
+                    }),
+                    cx,
+                ))
+                .child(
+                    numbers(
+                        if synced {
+                            format!("{} \u{00B7} {sounding:.0} ms", sync_label(sync))
+                        } else {
+                            format!("{sounding:.0} ms")
+                        },
+                        12.0,
+                        PALE,
+                        s,
+                    )
+                    .ml(px(6.0 * s)),
+                ),
+        )
+    });
+    div()
         .flex()
         .flex_col()
-        .gap(px(4.0 * s))
-        .child(caption("Time", 10.5, 0.1, SOFT, s))
-        .child(pills(sync_id, sync, 0))
-        .child(words(
-            if sync == DelaySync::Free {
-                format!("Free time {free_ms:.0} ms")
-            } else {
-                format!("Sounding {sounding:.0} ms")
-            },
-            12.0,
-            PALE,
-            s,
-        ));
-    if stereo {
-        let (id, current, free_r) = if second {
-            (
-                "delay2_sync_r",
-                p.stage_b.delay_sync_r,
-                p.stage_b.delay_time_r_ms,
-            )
-        } else {
-            ("delay_sync_r", p.delay_sync_r, p.delay_time_r_ms)
-        };
-        let sounding_r = rodharerist::effective_delay_ms(current, free_r, tempo);
-        row = row
-            .child(caption("Time R", 10.5, 0.1, SOFT, s))
-            .child(pills(id, current, 1))
-            .child(words(
-                if current == DelaySync::Free {
-                    format!("Free time {free_r:.0} ms")
-                } else {
-                    format!("Sounding {sounding_r:.0} ms")
-                },
-                12.0,
-                PALE,
-                s,
-            ));
-    }
-    row.into_any_element()
+        .gap(px(6.0 * s))
+        .children(rows)
+        .into_any_element()
 }
-
 fn block_card(
     w: &RodhareistEditorWindow,
     p: &Params,
@@ -3999,6 +4137,12 @@ fn block_card(
     let knobs: Vec<AnyElement> = specs
         .into_iter()
         .map(|spec| {
+            // A delay time in Sync is a division knob; in Free, milliseconds.
+            if let Some((_, sync_id, sync, _)) = delay_time_sync(p, spec.id) {
+                if sync != DelaySync::Free {
+                    return sync_knob(cx, spec, sync_id, sync, ink, size, width, s);
+                }
+            }
             let value = values.get(spec.id).copied().unwrap_or(spec.min);
             block_knob(cx, spec, value, ink, size, width, s)
         })
@@ -5196,6 +5340,28 @@ mod tests {
         // Explore lists the nine chain families, Amp once.
         assert_eq!(Family::ALL.iter().filter(|f| **f == Family::Amp).count(), 1);
         assert!(!Family::ALL.contains(&Family::Clean));
+    }
+
+    /// The Sync knob turns from the shortest division to the longest, and
+    /// holds every division the core has (not Free).
+    #[test]
+    fn the_sync_knob_steps_shortest_first_through_every_division() {
+        let steps = sync_steps();
+        assert!(!steps.contains(&DelaySync::Free));
+        assert_eq!(steps.len(), DelaySync::ALL.len() - 1);
+        let beats: Vec<f32> = steps.iter().map(|s| s.beats().unwrap()).collect();
+        assert!(beats.windows(2).all(|w| w[0] < w[1]), "{beats:?}");
+        assert_eq!(steps.first(), Some(&DelaySync::Sixteenth));
+        assert_eq!(steps.last(), Some(&DelaySync::Half));
+    }
+
+    /// Switching a free time to Sync lands on the division closest to it.
+    #[test]
+    fn sync_starts_from_the_division_nearest_the_free_time() {
+        // At 120 BPM a quarter is 500 ms, an eighth 250, a dotted eighth 375.
+        assert_eq!(nearest_sync(500.0, 120.0), DelaySync::Quarter);
+        assert_eq!(nearest_sync(260.0, 120.0), DelaySync::Eighth);
+        assert_eq!(nearest_sync(370.0, 120.0), DelaySync::DottedEighth);
     }
 
     #[test]

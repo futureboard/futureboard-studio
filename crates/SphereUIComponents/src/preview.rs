@@ -486,6 +486,12 @@ pub fn scenes() -> Vec<Scene> {
             open: rodhareist_explore_amp,
         },
         Scene {
+            name: "rodhareist-delay-sync",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: rodhareist_delay_sync,
+        },
+        Scene {
             name: "rodhareist-footswitches",
             width: plate::WINDOW_SIZE.0,
             height: plate::WINDOW_SIZE.1,
@@ -3758,6 +3764,17 @@ fn rodhareist_tuner(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHan
 /// A2 in tune: the window green, the strobe still.
 fn rodhareist_tuner_in_tune(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
     rodhareist_tuning(|window, _| tune_preview(window, 110.05), options, cx)
+}
+
+/// The Delay in Sync: the time knob reads a division, the toggle says Sync.
+fn rodhareist_delay_sync(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    rodhareist_focused(
+        crate::components::rodhareist_panel::Page::Pedalboard,
+        |p| p.delay_sync = rodharerist::DelaySync::DottedEighth,
+        rodharerist::StageKind::Delay,
+        options,
+        cx,
+    )
 }
 
 /// Settings › Footswitches on a full chain: sixteen slots to pick from.
