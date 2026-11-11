@@ -14,10 +14,15 @@
 //! makes a remote browser look like one (#386).
 //!
 //! PINs are kept as PBKDF2-HMAC-SHA256 hashes with a random salt, checked
-//! in constant time, and never sent back. Failed log-ins and unlocks are
-//! rate limited per peer address and per user name. Tokens live in this
-//! process only (a restart asks for the PIN again) and lapse after 12 hours
-//! unused; a token a connected client holds counts as in use.
+//! in constant time, and never sent back. Failed log-ins, setup codes and
+//! unlocks are rate limited per peer address and per user name (and per
+//! lock). An address that stands for clients this server cannot tell apart
+//! (see [`crate::web::Peer::shared`]: this machine, which a proxy or tunnel
+//! here makes every client behind it look like) is not one client's to
+//! lock: there each connection is held to its own failures, and all of
+//! them together to the larger [`SHARED_FAIL_LIMIT`] (#408). Tokens live in
+//! this process only (a restart asks for the PIN again) and lapse after 12
+//! hours unused; a token a connected client holds counts as in use.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -38,6 +43,17 @@ const FAIL_WINDOW: Duration = Duration::from_secs(5 * 60);
 const FAIL_LIMIT: usize = 5;
 /// … refuse further tries for this long after the last one.
 const FAIL_WAIT: Duration = Duration::from_secs(30);
+/// Failures over [`FAIL_WINDOW`] from all the clients of one address that
+/// stands for many (see [`Key::Shared`]) before all of them wait. Each of
+/// those connections is held to [`FAIL_LIMIT`] on its own, so one client's
+/// mistakes never lock out the others; this bounds what reconnecting can
+/// add: no more guesses through the address in five minutes than this
+/// (a user name and a lock keep their own [`FAIL_LIMIT`] too), against a
+/// PIN's 10 000 or more and a setup code's million or more. A
+/// client that keeps failing this fast on purpose still makes the others
+/// wait; nothing in a request tells it from them (declare the proxy with
+/// `--trusted-proxy` so each is counted on its own).
+const SHARED_FAIL_LIMIT: usize = 10 * FAIL_LIMIT;
 /// PBKDF2 rounds for a new PIN hash. A PIN is short, so the rate limit is
 /// what really protects it; the rounds keep a copied users file from giving
 /// the PINs away at a glance, while a check stays well under a tenth of a
@@ -115,7 +131,7 @@ struct Token {
 }
 
 struct Client {
-    peer: Option<IpAddr>,
+    peer: crate::web::Peer,
     token: Option<String>,
     /// The `auth` message this client was last sent.
     sent: Option<Value>,
@@ -125,11 +141,30 @@ struct Client {
     setup: bool,
 }
 
+/// What failures are counted under.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Key {
+    /// A client's own address.
     Peer(IpAddr),
+    /// One connection, from an address that stands for many clients (or
+    /// none could be read).
     Client(ClientId),
+    /// All the connections from such an address, together: at most
+    /// [`SHARED_FAIL_LIMIT`] failures. A success by one of them does not
+    /// clear it.
+    Shared(Option<IpAddr>),
     Name(String),
+    /// A locked token, whoever holds it.
+    Token(String),
+}
+
+impl Key {
+    fn limit(&self) -> usize {
+        match self {
+            Key::Shared(_) => SHARED_FAIL_LIMIT,
+            _ => FAIL_LIMIT,
+        }
+    }
 }
 
 /// Who a command comes from, as far as permissions go.
@@ -263,10 +298,10 @@ impl Users {
             .find(|u| u.name.eq_ignore_ascii_case(name))
     }
 
-    /// A client from `peer` (tests).
+    /// A client that connected from `peer` directly (tests).
     #[cfg(test)]
     pub fn join(&mut self, client: ClientId, peer: Option<IpAddr>) {
-        self.join_as(client, crate::web::Peer { addr: peer });
+        self.join_as(client, crate::web::Peer::of(peer));
     }
 
     /// A client that connected as `peer`: failed log-ins count against its
@@ -275,7 +310,7 @@ impl Users {
         self.clients.insert(
             client,
             Client {
-                peer: peer.addr,
+                peer,
                 token: None,
                 sent: None,
                 admitted: false,
@@ -286,6 +321,10 @@ impl Users {
 
     pub fn leave(&mut self, client: ClientId) {
         self.clients.remove(&client);
+        // Its own failures go with it (its address's stay): a new
+        // connection is a new client, and the table stays as small as the
+        // clients there are.
+        self.failures.remove(&Key::Client(client));
     }
 
     /// Who `client` is now: `None` when it has to log in first.
@@ -497,11 +536,21 @@ impl Users {
         }
     }
 
+    /// What a failure by `client` (trying `name`) counts under: its
+    /// address, or, when that stands for clients this server cannot tell
+    /// apart, the connection and the address together (see [`Key`]).
     fn keys(&self, client: ClientId, name: Option<&str>) -> Vec<Key> {
-        let mut keys = vec![match self.clients.get(&client).and_then(|c| c.peer) {
-            Some(peer) => Key::Peer(peer),
-            None => Key::Client(client),
-        }];
+        let peer = self
+            .clients
+            .get(&client)
+            .map_or(crate::web::Peer::of(None), |c| c.peer);
+        let mut keys = match peer {
+            crate::web::Peer {
+                addr: Some(addr),
+                shared: false,
+            } => vec![Key::Peer(addr)],
+            crate::web::Peer { addr, .. } => vec![Key::Client(client), Key::Shared(addr)],
+        };
         if let Some(name) = name {
             keys.push(Key::Name(name.to_lowercase()));
         }
@@ -514,7 +563,7 @@ impl Users {
                 return false;
             };
             times.retain(|t| now.saturating_duration_since(*t) < FAIL_WINDOW);
-            times.len() >= FAIL_LIMIT
+            times.len() >= key.limit()
                 && times
                     .last()
                     .is_some_and(|last| now.saturating_duration_since(*last) < FAIL_WAIT)
@@ -527,8 +576,10 @@ impl Users {
         }
     }
 
+    /// One client got it right: its own failures are forgotten, not those
+    /// of others it shares an address with.
     fn succeeded(&mut self, keys: &[Key]) {
-        for key in keys {
+        for key in keys.iter().filter(|k| !matches!(k, Key::Shared(_))) {
             self.failures.remove(key);
         }
     }
@@ -680,7 +731,10 @@ impl Users {
             return Outcome::reply(json!({"ok": true}));
         }
         let (name, lock_pin) = (t.user.clone(), t.lock_pin.clone());
-        let keys = self.keys(client, name.as_deref());
+        let mut keys = self.keys(client, name.as_deref());
+        // Whoever holds the lock, from wherever (an open-mode lock has no
+        // user name to count under).
+        keys.push(Key::Token(token.clone()));
         if self.blocked(&keys, now) {
             return Outcome::error(TOO_MANY);
         }
@@ -1333,6 +1387,168 @@ mod tests {
         assert!(ok(&u
             .command(Some(1), "setup", &json!({"code": "12345678"}), later)
             .unwrap()));
+    }
+
+    /// A browser's [`crate::web::Peer`] as the web server makes it: one
+    /// elsewhere (`client`) reaching this server through a reverse proxy on
+    /// this machine that was not declared with `--trusted-proxy`.
+    fn through_undeclared_proxy(client: &str) -> crate::web::Peer {
+        let head = format!(
+            "GET /ws HTTP/1.1\r\nHost: mixer.example.org\r\nX-Forwarded-For: {client}\r\n\r\n"
+        );
+        crate::web::peer_for(
+            "127.0.0.1".parse().unwrap(),
+            &head,
+            &crate::web::Proxies::default(),
+        )
+        .unwrap()
+    }
+
+    /// #408, follow-up to #386: behind a proxy here that is not declared
+    /// trusted, every remote browser comes from loopback. One of them
+    /// typing wrong setup codes or PINs must not lock the others out of
+    /// the setup and log-in screens.
+    #[test]
+    fn one_client_behind_an_undeclared_proxy_cannot_lock_out_the_others() {
+        let now = Instant::now();
+        // The setup screen.
+        let mut u = users();
+        u.require_setup_code("12345678".to_string());
+        u.join_as(1, through_undeclared_proxy("203.0.113.7"));
+        u.join_as(2, through_undeclared_proxy("198.51.100.9"));
+        for _ in 0..FAIL_LIMIT {
+            let wrong = u
+                .command(Some(1), "setup", &json!({"code": "00000000"}), now)
+                .unwrap();
+            assert_eq!(wrong.reply["error"], WRONG_CODE);
+        }
+        let blocked = u
+            .command(Some(1), "setup", &json!({"code": "00000000"}), now)
+            .unwrap();
+        assert_eq!(blocked.reply["error"], TOO_MANY, "the guesser is held");
+        let other = u
+            .command(Some(2), "setup", &json!({"code": "12345678"}), now)
+            .unwrap();
+        assert!(ok(&other), "{}", other.reply);
+        assert!(u.admitted(2));
+
+        // The log-in screen: one client tries names and PINs.
+        let mut u = band(now);
+        u.join_as(3, through_undeclared_proxy("203.0.113.7"));
+        u.join_as(4, through_undeclared_proxy("198.51.100.9"));
+        for n in 0..FAIL_LIMIT {
+            let wrong = login(&mut u, 3, &format!("nobody{n}"), "0000", now);
+            assert_eq!(wrong.reply["error"], WRONG_LOGIN);
+        }
+        assert_eq!(
+            login(&mut u, 3, "nobody9", "0000", now).reply["error"],
+            TOO_MANY
+        );
+        let other = login(&mut u, 4, "Mo", "3333", now);
+        assert!(ok(&other), "{}", other.reply);
+    }
+
+    /// #408, the other side: one client behind such a proxy buys no more
+    /// guesses by reconnecting. Each connection is held to [`FAIL_LIMIT`],
+    /// all of them together to [`SHARED_FAIL_LIMIT`], a user name and a
+    /// lock to [`FAIL_LIMIT`] whoever tries them. A client that connects
+    /// directly is held per address, reconnecting or not, as before.
+    #[test]
+    fn reconnecting_through_an_undeclared_proxy_buys_no_more_guesses() {
+        let now = Instant::now();
+        let wrong = json!({"code": "00000000"});
+        let mut u = users();
+        u.require_setup_code("12345678".to_string());
+        let (mut next, mut failures) = (10, 0);
+        'reconnect: loop {
+            u.join_as(next, through_undeclared_proxy("203.0.113.7"));
+            for _ in 0..FAIL_LIMIT {
+                let reply = u.command(Some(next), "setup", &wrong, now).unwrap().reply;
+                if reply["error"] == TOO_MANY {
+                    break 'reconnect;
+                }
+                assert_eq!(reply["error"], WRONG_CODE);
+                failures += 1;
+                assert!(failures <= SHARED_FAIL_LIMIT);
+            }
+            u.leave(next);
+            next += 1;
+        }
+        assert_eq!(failures, SHARED_FAIL_LIMIT);
+        // Connections gone, their own counts gone with them.
+        u.leave(next);
+        assert!(!u.failures.keys().any(|k| matches!(k, Key::Client(_))));
+        // Past the wait, one more try at a time; one client getting it
+        // right does not clear the others' count.
+        let later = now + FAIL_WAIT + Duration::from_secs(1);
+        u.join_as(1, through_undeclared_proxy("198.51.100.9"));
+        let right = json!({"code": "12345678"});
+        assert!(ok(&u.command(Some(1), "setup", &right, later).unwrap()));
+        u.join_as(2, through_undeclared_proxy("203.0.113.7"));
+        let reply = |u: &mut Users, at| u.command(Some(2), "setup", &wrong, at).unwrap().reply;
+        assert_eq!(reply(&mut u, later)["error"], WRONG_CODE);
+        assert_eq!(reply(&mut u, later)["error"], TOO_MANY);
+
+        // A user's name: FAIL_LIMIT tries, from any number of connections.
+        let mut u = band(now);
+        for n in 0..FAIL_LIMIT as ClientId {
+            u.join_as(20 + n, through_undeclared_proxy("203.0.113.7"));
+            assert_eq!(
+                login(&mut u, 20 + n, "Ann", "0000", now).reply["error"],
+                WRONG_LOGIN
+            );
+            u.leave(20 + n);
+        }
+        u.join_as(30, through_undeclared_proxy("203.0.113.7"));
+        assert_eq!(
+            login(&mut u, 30, "Ann", "1111", now).reply["error"],
+            TOO_MANY
+        );
+
+        // An open-mode lock: FAIL_LIMIT tries, whoever holds its token.
+        let mut u = users();
+        u.require_setup_code("12345678".to_string());
+        u.join_as(40, through_undeclared_proxy("203.0.113.7"));
+        assert!(ok(&u.command(Some(40), "setup", &right, now).unwrap()));
+        let locked = u
+            .command(Some(40), "lock", &json!({"pin": "9999"}), now)
+            .unwrap();
+        assert!(ok(&locked), "{}", locked.reply);
+        let token = locked.reply["token"].clone();
+        let unlock = |u: &mut Users, client: ClientId, pin: &str| {
+            u.join_as(client, through_undeclared_proxy("203.0.113.7"));
+            assert!(ok(&u.command(Some(client), "setup", &right, now).unwrap()));
+            let resumed = u
+                .command(Some(client), "resume", &json!({"token": token}), now)
+                .unwrap();
+            assert!(ok(&resumed), "{}", resumed.reply);
+            let reply = u
+                .command(Some(client), "unlock", &json!({"pin": pin}), now)
+                .unwrap()
+                .reply;
+            u.leave(client);
+            reply
+        };
+        for n in 0..FAIL_LIMIT as ClientId {
+            assert_eq!(unlock(&mut u, 50 + n, "0000")["error"], WRONG_PIN);
+        }
+        assert_eq!(unlock(&mut u, 60, "9999")["error"], TOO_MANY);
+
+        // Directly from another machine: its address, whichever connection.
+        let mut u = users();
+        u.require_setup_code("12345678".to_string());
+        for n in 0..FAIL_LIMIT as ClientId {
+            u.join(70 + n, Some("10.0.0.7".parse().unwrap()));
+            let reply = u.command(Some(70 + n), "setup", &wrong, now).unwrap().reply;
+            assert_eq!(reply["error"], WRONG_CODE);
+            u.leave(70 + n);
+        }
+        u.join(80, Some("::ffff:10.0.0.7".parse().unwrap()));
+        let reply = u.command(Some(80), "setup", &right, now).unwrap().reply;
+        assert_eq!(reply["error"], TOO_MANY);
+        // ... and nobody else's.
+        u.join(81, Some("10.0.0.8".parse().unwrap()));
+        assert!(ok(&u.command(Some(81), "setup", &right, now).unwrap()));
     }
 
     #[test]

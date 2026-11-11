@@ -111,6 +111,23 @@ plain HTTP + WebSocket server:
   `livestage-server`. Create an admin user straight away:
   once a user exists, clients sign in with a name and PIN (PBKDF2-hashed,
   rate-limited) and receive a session token.
+- **Failed attempts** (setup code, log-in, unlock, changing your own PIN):
+  5 within 5 minutes lock that client out for 30 seconds, counted per
+  address and, separately, per user name and per lock. Browsers that reach
+  the server through a local proxy or tunnel all arrive from the same
+  address, so they are told apart by connection: each gets its own 5, and
+  that address as a whole gets 50 per 5 minutes, so reconnecting buys no
+  more guesses. One client behind an undeclared proxy can still exhaust
+  those 50 for everyone behind it; declaring the proxy with
+  `--trusted-proxy` gives each real client its own count.
+- **Trusted proxies** (`--trusted-proxy ADDR`, `--forwarded-header NAME`):
+  the client address is read from `X-Forwarded-For` / `Forwarded`
+  right to left, skipping the trusted proxies, and stops at the first
+  address that is not one; an entry that is not an address stops it with
+  no client. `X-Real-IP` must hold exactly one address. Malformed or folded
+  header lines are refused. A forwarder on a trusted address must **append**
+  the client's address and not pass on what the client sent (an SSH tunnel
+  or a pass-through proxy on 127.0.0.1 lets a client choose its identity).
 - **Host names:** requests must name the server by IP address, `localhost`,
   the machine's own name or `NAME.local`, or a name added with `--web-host`.
   Other names are refused, which blocks DNS-rebinding pages. The WebSocket

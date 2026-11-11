@@ -151,12 +151,16 @@ const USAGE: &str = "usage: livestage-server [--session FILE] [--host NAME] [--i
                         code is made at each start and printed here
   --trusted-proxy ADDR  a reverse proxy's IP address (127.0.0.1 for one on this machine) whose
                         --forwarded-header names the client: failed log-ins and connection limits
-                        then count per client. Without it, every client behind a proxy shares
-                        one address, and forwarding headers are ignored
+                        then count per client. Give every proxy of a chain. Without it, every
+                        client behind a proxy shares one address and forwarding headers are
+                        ignored; a wrong PIN there holds back that connection, and only many
+                        from all of them together hold back the rest
   --forwarded-header NAME  the one header a trusted proxy names the client in, and that it sets
                         itself (whatever the client sent there): x-forwarded-for (default; the
-                        proxy must append the client's address, its last one is taken),
-                        forwarded (the last element's for=) or x-real-ip. Any other is ignored
+                        proxy must append the client's address) or forwarded (each proxy appends
+                        an element with for=): the right-most address that is not a trusted
+                        proxy's is taken, nothing before it; or x-real-ip (one address, which
+                        the proxy must set, not pass on). Any other is ignored
   --daemon              no stdin; stop with SIGINT or SIGTERM";
 
 fn parse_args() -> Result<Options, String> {

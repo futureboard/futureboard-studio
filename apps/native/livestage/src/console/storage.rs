@@ -9,6 +9,15 @@
 //! seconds and answers the server on the socket; the console calls the same
 //! functions directly.
 //!
+//! A UUID can be copied onto any drive, so the one recorded to is the drive
+//! the operator chose (Record here, `use`), known by [`drive_key`]; a drive
+//! is never taken for it on sight (#408). With no drive saved, none is
+//! recorded to until one is chosen. A drive with no serial number cannot be
+//! told from another of its model and size, so it stays the one recorded
+//! to only while it stays plugged in after it was chosen ([`CONFIRMED`]):
+//! plugged in again, or after a restart, it is chosen again. Until then
+//! recordings go to the internal storage, as when the drive is missing.
+//!
 //! What is read (sysfs, `blkid`, /proc/mounts) is parsed by plain functions,
 //! and what to do about it is decided by plain functions ([`build_state`],
 //! [`plan`]); both are tested on canned text. Under `--root` nothing is run:
@@ -30,6 +39,10 @@ const DATA_LABEL: &str = "lsdata";
 const DATA_MOUNT: &str = "/data";
 /// Volumes ejected and still plugged in: `device uuid` per line.
 const EJECTED: &str = "/run/livestage/ejected";
+/// Drives with no serial number the operator chose to record to, while they
+/// stay plugged in: one [`confirmation`] per line. In /run, so a restart
+/// forgets them too.
+const CONFIRMED: &str = "/run/livestage/confirmed";
 /// Held while anything is mounted, unmounted or formatted (by the service or
 /// the console).
 #[cfg(target_os = "linux")]
@@ -56,6 +69,16 @@ const SAME_ID: &str =
     "has the same volume ID as another drive plugged in; unplug the one not to record to";
 const NOT_THE_DRIVE: &str =
     "has the recording drive's volume ID but is another drive; choose Record here to record to it";
+const NOT_CHOSEN: &str = "has the recording drive's volume ID, but no drive was chosen with it; \
+choose Record here to record to it";
+const NO_SERIAL: &str = "has no serial number, so it cannot be told from a copy of the recording \
+drive; choose Record here to record to it";
+
+/// A volume with the target's UUID that is not known to be the drive
+/// chosen: never mounted read-write.
+fn not_the_chosen_drive(refused: Option<&str>) -> bool {
+    refused.is_some_and(|r| [NOT_THE_DRIVE, NOT_CHOSEN, NO_SERIAL].contains(&r))
+}
 const NOT_A_FOLDER: &str =
     "has a \"LiveStage Recordings\" that is not a folder on it; rename or remove it on a computer";
 
@@ -152,6 +175,59 @@ fn ejected_file(ejected: &Ejected) -> String {
         .iter()
         .map(|(device, uuid)| format!("{device} {uuid}\n"))
         .collect()
+}
+
+/// Drives with no serial number chosen while plugged in (see [`CONFIRMED`]).
+pub type Confirmed = BTreeSet<String>;
+
+fn parse_confirmed(text: &str) -> Confirmed {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn confirmed_file(confirmed: &Confirmed) -> String {
+    confirmed.iter().map(|line| format!("{line}\n")).collect()
+}
+
+/// What tells this plugging-in of `device` from the next: its name, its
+/// UUID, and where its disk sits among the devices, which names the USB
+/// port and a SCSI host number the kernel gives anew each time a disk is
+/// plugged in. `""` for a device that is not there.
+fn confirmation(inventory: &Inventory, device: &str) -> String {
+    let disk = inventory
+        .disks
+        .iter()
+        .find(|d| d.name == device || d.parts.iter().any(|p| p.name == device));
+    let (Some(disk), Some(probe)) = (disk, inventory.probes.get(device)) else {
+        return String::new();
+    };
+    let place: String = disk
+        .bus_path
+        .chars()
+        .map(|c| if c.is_whitespace() { '_' } else { c })
+        .collect();
+    format!("{device} {} {place}", probe.uuid)
+}
+
+/// Forgets the confirmations of drives that have been unplugged (or
+/// reformatted, or plugged in again).
+fn prune_confirmed(confirmed: &Confirmed, inventory: &Inventory) -> Confirmed {
+    confirmed
+        .iter()
+        .filter(|line| {
+            let device = line.split(' ').next().unwrap_or("");
+            inventory.present().contains(device) && confirmation(inventory, device) == **line
+        })
+        .cloned()
+        .collect()
+}
+
+/// Whether a [`drive_key`] has a serial number in it.
+fn has_serial(drive: &str) -> bool {
+    drive.rsplit('/').next().is_some_and(|serial| serial != "-")
 }
 
 /// Forgets the ejected volumes that have been unplugged (or reformatted).
@@ -261,12 +337,15 @@ fn at_its_folder(volume: &Volume) -> bool {
 /// The state: the volumes, the disks and where recordings go. `free` gives
 /// the free bytes of a mounted path. `target_drive` is what the target was
 /// saved with besides its UUID ([`drive_key`]; `""` when nothing was).
+/// `confirmed`: drives with no serial number chosen since they were
+/// plugged in (see [`CONFIRMED`]).
 pub fn build_state(
     inventory: &Inventory,
     target: &str,
     target_label: &str,
     target_drive: &str,
     ejected: &Ejected,
+    confirmed: &Confirmed,
     free: &dyn Fn(&str) -> Option<u64>,
 ) -> State {
     let system = inventory.system_disk().map(|d| d.name.clone());
@@ -347,8 +426,10 @@ pub fn build_state(
 
     // One UUID on two volumes: which is which cannot be told from it. One
     // already mounted at the folder keeps it; the others are refused. A
-    // volume with the target's UUID that is another drive than the one
-    // chosen is refused too.
+    // volume with the target's UUID is refused too unless it is known to be
+    // the drive chosen: none was saved (it is never taken on sight), it is
+    // another drive, or it has no serial number and was not chosen since it
+    // was plugged in (#408).
     let shared: BTreeSet<String> = shared_ids(&volumes)
         .into_iter()
         .map(str::to_string)
@@ -356,11 +437,19 @@ pub fn build_state(
     for volume in volumes.iter_mut().filter(|v| v.id != api::INTERNAL) {
         if shared.contains(&volume.id) && !at_its_folder(volume) {
             volume.refused = Some(SAME_ID.to_string());
-        } else if !target_drive.is_empty()
-            && volume.id == target
-            && drive_key(inventory, &volume.device) != target_drive
-        {
-            volume.refused = Some(NOT_THE_DRIVE.to_string());
+        } else if volume.id == target {
+            let refused = if target_drive.is_empty() {
+                Some(NOT_CHOSEN)
+            } else if drive_key(inventory, &volume.device) != target_drive {
+                Some(NOT_THE_DRIVE)
+            } else if !has_serial(target_drive)
+                && !confirmed.contains(&confirmation(inventory, &volume.device))
+            {
+                Some(NO_SERIAL)
+            } else {
+                None
+            };
+            volume.refused = refused.map(str::to_string);
         }
     }
 
@@ -499,7 +588,7 @@ pub fn plan(state: &State, inventory: &Inventory, media: &[String]) -> Vec<Step>
             continue;
         }
         // Read-write only for the drive chosen, not one with its UUID.
-        let rw = volume.id == state.target.id && volume.refused.as_deref() != Some(NOT_THE_DRIVE);
+        let rw = volume.id == state.target.id && !not_the_chosen_drive(volume.refused.as_deref());
         let folder = api::mount_dir(&volume.id);
         match (volume.mounted, volume.mount_path.as_deref()) {
             // Another device still holds the folder (detached first).
@@ -637,9 +726,12 @@ impl Storage {
 
     fn state_of(system: &System, inventory: &Inventory) -> State {
         let ejected = parse_ejected(&system.read(EJECTED).unwrap_or_default());
+        let confirmed = parse_confirmed(&system.read(CONFIRMED).unwrap_or_default());
         let free = |path: &str| system.space(path).map(|(free, _)| free);
         let (target, label, drive) = Self::target(system);
-        let mut state = build_state(inventory, &target, &label, &drive, &ejected, &free);
+        let mut state = build_state(
+            inventory, &target, &label, &drive, &ejected, &confirmed, &free,
+        );
         // Its recordings folder must be a folder on it, not a link to
         // somewhere else (nor a file): else recordings go to the internal
         // folder.
@@ -684,6 +776,11 @@ impl Storage {
         let pruned = prune_ejected(&ejected, &inventory);
         if pruned != ejected {
             let _ = system.write(EJECTED, &ejected_file(&pruned));
+        }
+        let confirmed = parse_confirmed(&system.read(CONFIRMED).unwrap_or_default());
+        let pruned = prune_confirmed(&confirmed, &inventory);
+        if pruned != confirmed {
+            let _ = system.write(CONFIRMED, &confirmed_file(&pruned));
         }
         let state = Self::state_of(system, &inventory);
         let media: Vec<String> = std::fs::read_dir(system.path(api::MEDIA))
@@ -746,10 +843,9 @@ impl Storage {
                 }
             }
         }
-        // The target's name as last seen, kept for when it is missing; and
-        // what else identifies it when nothing was saved yet (a setting
-        // from before that was kept), taken from the one volume with its
-        // UUID.
+        // The target's name as last seen, kept for when it is missing. What
+        // else identifies it is never taken from a volume that has its UUID
+        // (#408): only choosing a drive saves that.
         let (target, saved_label, saved_drive) = Self::target(system);
         if target != api::INTERNAL
             && !shared_ids(&state.volumes).contains(target.as_str())
@@ -757,22 +853,11 @@ impl Storage {
                 .volumes
                 .iter()
                 .find(|v| v.id == target && v.refused.is_none())
+            && !volume.label.is_empty()
+            && volume.label != saved_label
+            && let Err(error) = system.set_record_storage(&target, &volume.label, &saved_drive)
         {
-            let label = if volume.label.is_empty() {
-                saved_label.clone()
-            } else {
-                volume.label.clone()
-            };
-            let drive = if saved_drive.is_empty() {
-                drive_key(&inventory, &volume.device)
-            } else {
-                saved_drive.clone()
-            };
-            if (label != saved_label || drive != saved_drive)
-                && let Err(error) = system.set_record_storage(&target, &label, &drive)
-            {
-                log.push(error);
-            }
+            log.push(error);
         }
         // The target's folder, whenever it is mounted read-write.
         if state.target.id != api::INTERNAL {
@@ -918,11 +1003,26 @@ impl Storage {
             label = volume.label.clone();
             // This drive from now on, not just any with its UUID.
             drive = drive_key(&inventory, &volume.device);
+            if !has_serial(&drive) {
+                self.confirm(system, &inventory, &volume.device)?;
+            }
         }
         system.set_record_storage(id, &label, &drive)?;
         // The previous target goes back to read-only.
         self.reconcile(system);
         Ok(())
+    }
+
+    /// The operator chose `device`, a drive with no serial number, while it
+    /// is plugged in (see [`CONFIRMED`]).
+    fn confirm(&self, system: &System, inventory: &Inventory, device: &str) -> Result<(), String> {
+        let line = confirmation(inventory, device);
+        if line.is_empty() {
+            return Err("That drive is not plugged in.".to_string());
+        }
+        let mut confirmed = parse_confirmed(&system.read(CONFIRMED).unwrap_or_default());
+        confirmed.insert(line);
+        system.write(CONFIRMED, &confirmed_file(&confirmed))
     }
 
     /// Unmounts a volume so it can be pulled out; it stays unmounted until
@@ -1062,7 +1162,11 @@ impl Storage {
             if let Some(volume) = state.volume(&id) {
                 recordings_folder(system, volume)?;
             }
-            system.set_record_storage(&id, label, &drive_key(&inventory, &partition))?;
+            let drive = drive_key(&inventory, &partition);
+            if !has_serial(&drive) {
+                self.confirm(system, &inventory, &partition)?;
+            }
+            system.set_record_storage(&id, label, &drive)?;
         }
         self.reconcile(system);
         Ok(())
@@ -1731,7 +1835,15 @@ pub(crate) mod tests {
 
         // Recording internally: every supported volume read-only; the stale
         // mount and the empty folder go.
-        let state = build_state(&inventory, "internal", "", "", &Ejected::new(), &free);
+        let state = build_state(
+            &inventory,
+            "internal",
+            "",
+            "",
+            &Ejected::new(),
+            &Confirmed::new(),
+            &free,
+        );
         let steps = plan(&state, &inventory, &media);
         assert_eq!(
             steps,
@@ -1760,8 +1872,18 @@ pub(crate) mod tests {
             ]
         );
 
-        // The stick is the target: read-write. Ejected: left alone.
-        let state = build_state(&inventory, "1A2B-3C4D", "", "", &Ejected::new(), &free);
+        // The stick is the target (chosen while plugged in): read-write.
+        // Ejected: left alone.
+        let (drive, confirmed) = chosen(&inventory, "sdb1");
+        let state = build_state(
+            &inventory,
+            "1A2B-3C4D",
+            "",
+            &drive,
+            &Ejected::new(),
+            &confirmed,
+            &free,
+        );
         assert!(!state.target.available);
         assert_eq!(state.target.label, "SHOW \"A\"");
         assert_eq!(state.target.recordings_dir, api::INTERNAL_RECORDINGS);
@@ -1770,7 +1892,15 @@ pub(crate) mod tests {
             rw: true
         }));
         let ejected: Ejected = [("sdd".to_string(), "AAAA-BBBB".to_string())].into();
-        let state = build_state(&inventory, "1A2B-3C4D", "", "", &ejected, &free);
+        let state = build_state(
+            &inventory,
+            "1A2B-3C4D",
+            "",
+            &drive,
+            &ejected,
+            &confirmed,
+            &free,
+        );
         assert!(state.volume("AAAA-BBBB").unwrap().ejected);
         assert!(
             !plan(&state, &inventory, &[])
@@ -1781,7 +1911,15 @@ pub(crate) mod tests {
         // Once it is read-write, it is where recordings go.
         let mut mounted = inventory.clone();
         mounted.mounts[3].rw = true;
-        let state = build_state(&mounted, "1A2B-3C4D", "", "", &Ejected::new(), &free);
+        let state = build_state(
+            &mounted,
+            "1A2B-3C4D",
+            "",
+            &drive,
+            &Ejected::new(),
+            &confirmed,
+            &free,
+        );
         assert!(state.target.available);
         assert_eq!(
             state.target.recordings_dir,
@@ -1791,12 +1929,28 @@ pub(crate) mod tests {
         // Another drive took sdb's name: the old mount is stale.
         let mut swapped = mounted.clone();
         swapped.probes.get_mut("sdb1").unwrap().uuid = "5555-6666".into();
-        let state = build_state(&swapped, "1A2B-3C4D", "", "", &Ejected::new(), &free);
+        let state = build_state(
+            &swapped,
+            "1A2B-3C4D",
+            "",
+            &drive,
+            &Ejected::new(),
+            &confirmed,
+            &free,
+        );
         assert!(state.falling_back());
         // No name ever known for it: its UUID.
         assert_eq!(state.target.label, "1A2B-3C4D");
         // Its name as saved when it was last seen.
-        let state = build_state(&swapped, "1A2B-3C4D", "SHOW", "", &Ejected::new(), &free);
+        let state = build_state(
+            &swapped,
+            "1A2B-3C4D",
+            "SHOW",
+            &drive,
+            &Ejected::new(),
+            &confirmed,
+            &free,
+        );
         assert_eq!(state.target.label, "SHOW");
         assert!(state.falling_back());
         let steps = plan(&state, &swapped, &[]);
@@ -1949,11 +2103,26 @@ pub(crate) mod tests {
             system.load_config().unwrap().record_storage_label,
             "SHOW \"A\""
         );
-        // A setting from before the drive was saved: taken from the one
-        // volume with the UUID when it is seen.
+        // A setting from before the drive was saved (or written by hand):
+        // no drive is taken from a volume with the UUID, nor its name
+        // (#408); it waits to be chosen.
         system.set_record_storage("1A2B-3C4D", "SHOW", "").unwrap();
         storage.poll(&system);
-        assert_eq!(system.load_config().unwrap().record_storage_drive, drive);
+        let config = system.load_config().unwrap();
+        assert_eq!(config.record_storage_drive, "");
+        assert_eq!(config.record_storage_label, "SHOW");
+        assert_eq!(
+            storage
+                .state(&system)
+                .volume("1A2B-3C4D")
+                .unwrap()
+                .refused
+                .as_deref(),
+            Some(NOT_CHOSEN)
+        );
+        system
+            .set_record_storage("1A2B-3C4D", "SHOW \"A\"", &drive)
+            .unwrap();
         // Unplugged: gone from sysfs, blkid and the mounts.
         std::fs::remove_dir_all(root.join("sys/block/sdb")).unwrap();
         std::fs::remove_dir_all(root.join("sys/class/block/sdb1")).unwrap();
@@ -1971,6 +2140,35 @@ pub(crate) mod tests {
         assert!(state.falling_back());
         assert_eq!(state.target.label, "SHOW \"A\"");
         assert_eq!(state.target.recordings_dir, api::INTERNAL_RECORDINGS);
+        // #408: it has no serial number, so the service forgets it was
+        // chosen once it is gone; plugged in again, it waits to be chosen
+        // again, and is the target once it is.
+        storage.poll(&system);
+        assert_eq!(system.read(CONFIRMED).unwrap_or_default(), "");
+        disk(
+            &root,
+            "sdb",
+            "SanDisk Ultra",
+            64,
+            true,
+            &[("sdb1", 1, 64_000)],
+        );
+        put(&root, BLKID_SAMPLE, BLKID);
+        let state = storage.state(&system);
+        assert_eq!(
+            state.volume("1A2B-3C4D").unwrap().refused.as_deref(),
+            Some(NO_SERIAL)
+        );
+        assert!(state.falling_back());
+        let reply = storage.handle(
+            &system,
+            &Request::Use {
+                id: "1A2B-3C4D".into(),
+            },
+        );
+        assert!(reply.ok, "{:?}", reply.error);
+        assert_eq!(reply.storage.volume("1A2B-3C4D").unwrap().refused, None);
+        assert_eq!(system.load_config().unwrap().record_storage_drive, drive);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2022,6 +2220,16 @@ pub(crate) mod tests {
 
     /// `inventory` with one more stick, sdg, its one volume `uuid`.
     fn with_stick(inventory: &Inventory, uuid: &str, model: &str) -> Inventory {
+        with_stick_serial(inventory, uuid, model, None)
+    }
+
+    /// The same, the stick with serial number `serial`.
+    fn with_stick_serial(
+        inventory: &Inventory,
+        uuid: &str,
+        model: &str,
+        serial: Option<&str>,
+    ) -> Inventory {
         let mut inventory = inventory.clone();
         inventory.disks.push(BlockDisk {
             name: "sdg".into(),
@@ -2031,7 +2239,7 @@ pub(crate) mod tests {
             read_only: false,
             bus_path: String::new(),
             dev: "8:96".into(),
-            serial: None,
+            serial: serial.map(str::to_string),
             parts: vec![BlockPart {
                 name: "sdg1".into(),
                 number: 1,
@@ -2050,6 +2258,16 @@ pub(crate) mod tests {
         inventory
     }
 
+    /// What choosing `device` (Record here) while it is plugged in saves:
+    /// its drive key, and, for a drive with no serial number (the
+    /// machine's sticks have none), its confirmation.
+    fn chosen(inventory: &Inventory, device: &str) -> (String, Confirmed) {
+        (
+            drive_key(inventory, device),
+            [confirmation(inventory, device)].into(),
+        )
+    }
+
     fn touches(steps: &[Step], device: &str, folder: &str) -> bool {
         steps.iter().any(|s| match s {
             Step::Mount { device: d, .. } => d == device,
@@ -2066,15 +2284,23 @@ pub(crate) mod tests {
         let inventory = Storage::new().inventory(&system);
         let free = |_: &str| None;
         let folder = "/media/1A2B-3C4D";
-        let drive = drive_key(&inventory, "sdb1");
+        let (drive, confirmed) = chosen(&inventory, "sdb1");
         assert_eq!(drive, "exfat/64000000000/SanDisk_Ultra/-");
 
         // The target (sdb1) mounted read-write, recording; sdg1 comes with
         // its UUID: sdg1 is refused and not mounted, sdb1 is left as it is.
-        let mut mounted = inventory.clone();
+        let mut mounted = inventory;
         mounted.mounts[3].rw = true;
         let both = with_stick(&mounted, "1A2B-3C4D", "SanDisk Ultra");
-        let state = build_state(&both, "1A2B-3C4D", "", &drive, &Ejected::new(), &free);
+        let state = build_state(
+            &both,
+            "1A2B-3C4D",
+            "",
+            &drive,
+            &Ejected::new(),
+            &confirmed,
+            &free,
+        );
         let sdg = state.volumes.iter().find(|v| v.device == "sdg1").unwrap();
         let sdb = state.volumes.iter().find(|v| v.device == "sdb1").unwrap();
         assert_eq!(sdg.refused.as_deref(), Some(SAME_ID));
@@ -2092,16 +2318,33 @@ pub(crate) mod tests {
         }));
 
         // The same with no drive saved (a setting from before): still
-        // refused, by the UUID alone.
-        let state = build_state(&both, "1A2B-3C4D", "", "", &Ejected::new(), &free);
-        assert!(state.target.available);
+        // refused, by the UUID alone; and since no drive was chosen,
+        // neither is recorded to (#408).
+        let state = build_state(
+            &both,
+            "1A2B-3C4D",
+            "",
+            "",
+            &Ejected::new(),
+            &Confirmed::new(),
+            &free,
+        );
+        assert!(!state.target.available);
         assert!(!touches(&plan(&state, &both, &[]), "sdg1", folder));
 
         // Both plugged in, neither mounted (a start): neither is mounted,
         // nothing is recorded to either.
         let mut cold = both.clone();
         cold.mounts.retain(|m| m.path != folder);
-        let state = build_state(&cold, "1A2B-3C4D", "", &drive, &Ejected::new(), &free);
+        let state = build_state(
+            &cold,
+            "1A2B-3C4D",
+            "",
+            &drive,
+            &Ejected::new(),
+            &confirmed,
+            &free,
+        );
         assert!(
             state
                 .volumes
@@ -2116,7 +2359,15 @@ pub(crate) mod tests {
 
         // Not the target either: one already mounted keeps its mount, the
         // newcomer is not mounted.
-        let state = build_state(&both, "internal", "", "", &Ejected::new(), &free);
+        let state = build_state(
+            &both,
+            "internal",
+            "",
+            "",
+            &Ejected::new(),
+            &Confirmed::new(),
+            &free,
+        );
         assert!(!touches(&plan(&state, &both, &[]), "sdg1", folder));
 
         // Asked for by its UUID: refused, the drive is not changed.
@@ -2155,12 +2406,20 @@ pub(crate) mod tests {
         let free = |_: &str| None;
         let drive = drive_key(&inventory, "sdb1");
         // sdb is gone; sdg has its UUID, label and size, another model.
-        let mut gone = inventory.clone();
+        let mut gone = inventory;
         gone.disks.retain(|d| d.name != "sdb");
         gone.probes.remove("sdb1");
         gone.mounts.retain(|m| m.device() != Some("sdb1"));
         let other = with_stick(&gone, "1A2B-3C4D", "Kingston DataTraveler");
-        let state = build_state(&other, "1A2B-3C4D", "SHOW", &drive, &Ejected::new(), &free);
+        let state = build_state(
+            &other,
+            "1A2B-3C4D",
+            "SHOW",
+            &drive,
+            &Ejected::new(),
+            &Confirmed::new(),
+            &free,
+        );
         let sdg = state.volume("1A2B-3C4D").unwrap();
         assert_eq!(sdg.refused.as_deref(), Some(NOT_THE_DRIVE));
         assert!(!state.target.available);
@@ -2172,22 +2431,40 @@ pub(crate) mod tests {
             rw: false
         }));
         // Mounted read-write before (by hand): back to read-only.
-        let mut rw = other.clone();
+        let mut rw = other;
         rw.mounts.push(MountEntry {
             source: "/dev/sdg1".into(),
             path: "/media/1A2B-3C4D".into(),
             fs: "exfat".into(),
             rw: true,
         });
-        let state = build_state(&rw, "1A2B-3C4D", "SHOW", &drive, &Ejected::new(), &free);
+        let state = build_state(
+            &rw,
+            "1A2B-3C4D",
+            "SHOW",
+            &drive,
+            &Ejected::new(),
+            &Confirmed::new(),
+            &free,
+        );
         assert!(!state.target.available);
         assert!(plan(&state, &rw, &[]).contains(&Step::Remount {
             path: "/media/1A2B-3C4D".into(),
             rw: false
         }));
-        // The same drive again (same model, size, filesystem): the target.
+        // The same drive again (same model, size, filesystem), chosen
+        // again since it has no serial number (#408): the target.
         let same = with_stick(&gone, "1A2B-3C4D", "SanDisk Ultra");
-        let state = build_state(&same, "1A2B-3C4D", "SHOW", &drive, &Ejected::new(), &free);
+        let (_, confirmed) = chosen(&same, "sdg1");
+        let state = build_state(
+            &same,
+            "1A2B-3C4D",
+            "SHOW",
+            &drive,
+            &Ejected::new(),
+            &confirmed,
+            &free,
+        );
         assert_eq!(state.volume("1A2B-3C4D").unwrap().refused, None);
         assert!(plan(&state, &same, &[]).contains(&Step::Mount {
             device: "sdg1".into(),
@@ -2195,6 +2472,172 @@ pub(crate) mod tests {
             fs: "exfat".into(),
             rw: true
         }));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #408: with no drive saved for the target (a setting from before
+    /// drives were saved, or one written by hand), the first drive that
+    /// shows up with its UUID is not taken for it: it is only mounted
+    /// read-only until the operator chooses it (Record here).
+    #[test]
+    fn a_drive_is_not_trusted_on_first_sight() {
+        let (system, root) = machine("first-sight");
+        let inventory = Storage::new().inventory(&system);
+        let free = |_: &str| None;
+        // sdb is gone; sdg has its UUID and label, another model.
+        let mut gone = inventory.clone();
+        gone.disks.retain(|d| d.name != "sdb");
+        gone.probes.remove("sdb1");
+        gone.mounts.retain(|m| m.device() != Some("sdb1"));
+        let other = with_stick(&gone, "1A2B-3C4D", "Kingston DataTraveler");
+        let state = build_state(
+            &other,
+            "1A2B-3C4D",
+            "SHOW",
+            "",
+            &Ejected::new(),
+            &Confirmed::new(),
+            &free,
+        );
+        let sdg = state.volume("1A2B-3C4D").unwrap();
+        assert_eq!(
+            sdg.refused.as_deref(),
+            Some(NOT_CHOSEN),
+            "taken on first sight"
+        );
+        assert!(!state.target.available);
+        assert_eq!(state.target.recordings_dir, api::INTERNAL_RECORDINGS);
+        assert!(plan(&state, &other, &[]).contains(&Step::Mount {
+            device: "sdg1".into(),
+            id: "1A2B-3C4D".into(),
+            fs: "exfat".into(),
+            rw: false
+        }));
+        // The service does not save it as the drive either.
+        system.set_record_storage("1A2B-3C4D", "SHOW", "").unwrap();
+        let storage = Storage::new();
+        storage.poll(&system);
+        assert_eq!(system.load_config().unwrap().record_storage_drive, "");
+        assert!(
+            storage
+                .state(&system)
+                .volume("1A2B-3C4D")
+                .unwrap()
+                .refused
+                .is_some()
+        );
+        // Chosen by the operator: that drive from now on.
+        let reply = storage.handle(
+            &system,
+            &Request::Use {
+                id: "1A2B-3C4D".into(),
+            },
+        );
+        assert!(reply.ok, "{:?}", reply.error);
+        assert_eq!(reply.storage.volume("1A2B-3C4D").unwrap().refused, None);
+        assert_eq!(
+            system.load_config().unwrap().record_storage_drive,
+            drive_key(&inventory, "sdb1")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #408: a drive with no serial number cannot be told from another
+    /// drive of its model and size with its UUID copied on. Coming back, it
+    /// is not recorded to until the operator chooses it again.
+    #[test]
+    fn a_drive_without_a_serial_number_is_not_trusted_when_it_comes_back() {
+        let (system, root) = machine("no-serial");
+        let inventory = Storage::new().inventory(&system);
+        let free = |_: &str| None;
+        let drive = drive_key(&inventory, "sdb1");
+        assert!(drive.ends_with("/-"), "{drive}");
+        let mut gone = inventory;
+        gone.disks.retain(|d| d.name != "sdb");
+        gone.probes.remove("sdb1");
+        gone.mounts.retain(|m| m.device() != Some("sdb1"));
+        // Same model, size and filesystem, no serial: the same key.
+        let same = with_stick(&gone, "1A2B-3C4D", "SanDisk Ultra");
+        let state = build_state(
+            &same,
+            "1A2B-3C4D",
+            "SHOW",
+            &drive,
+            &Ejected::new(),
+            &Confirmed::new(),
+            &free,
+        );
+        assert_eq!(
+            state.volume("1A2B-3C4D").unwrap().refused.as_deref(),
+            Some(NO_SERIAL),
+            "a serial-less lookalike is taken for the drive"
+        );
+        assert!(!state.target.available);
+        assert!(plan(&state, &same, &[]).contains(&Step::Mount {
+            device: "sdg1".into(),
+            id: "1A2B-3C4D".into(),
+            fs: "exfat".into(),
+            rw: false
+        }));
+        // Chosen while it is plugged in: the target, read-write.
+        let (_, confirmed) = chosen(&same, "sdg1");
+        let state = build_state(
+            &same,
+            "1A2B-3C4D",
+            "SHOW",
+            &drive,
+            &Ejected::new(),
+            &confirmed,
+            &free,
+        );
+        assert_eq!(state.volume("1A2B-3C4D").unwrap().refused, None);
+        assert!(plan(&state, &same, &[]).contains(&Step::Mount {
+            device: "sdg1".into(),
+            id: "1A2B-3C4D".into(),
+            fs: "exfat".into(),
+            rw: true
+        }));
+        // Plugged in again (the kernel puts it somewhere new), or gone:
+        // forgotten.
+        let mut again = same.clone();
+        again.disks.last_mut().unwrap().bus_path = "/sys/devices/usb1/1-2/host7".into();
+        assert!(prune_confirmed(&confirmed, &again).is_empty());
+        assert!(prune_confirmed(&confirmed, &gone).is_empty());
+        assert_eq!(prune_confirmed(&confirmed, &same), confirmed);
+
+        // A drive with a serial number is known by it: back again, it is
+        // the target with nothing to choose; another one like it, or one
+        // with none, is not.
+        let serial = with_stick_serial(&gone, "1A2B-3C4D", "SanDisk Ultra", Some("4C530001"));
+        let drive = drive_key(&serial, "sdg1");
+        assert!(drive.ends_with("/4C530001"), "{drive}");
+        let state = build_state(
+            &serial,
+            "1A2B-3C4D",
+            "SHOW",
+            &drive,
+            &Ejected::new(),
+            &Confirmed::new(),
+            &free,
+        );
+        assert_eq!(state.volume("1A2B-3C4D").unwrap().refused, None);
+        for lookalike in [Some("4C530002"), None] {
+            let other = with_stick_serial(&gone, "1A2B-3C4D", "SanDisk Ultra", lookalike);
+            let state = build_state(
+                &other,
+                "1A2B-3C4D",
+                "SHOW",
+                &drive,
+                &Ejected::new(),
+                &Confirmed::new(),
+                &free,
+            );
+            assert_eq!(
+                state.volume("1A2B-3C4D").unwrap().refused.as_deref(),
+                Some(NOT_THE_DRIVE),
+                "{lookalike:?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2208,8 +2651,14 @@ pub(crate) mod tests {
             .unwrap()
             .replace("/media/1A2B-3C4D exfat ro", "/media/1A2B-3C4D exfat rw");
         put(&root, "/proc/mounts", &mounts);
-        system.set_record_storage("1A2B-3C4D", "SHOW", "").unwrap();
         let storage = Storage::new();
+        let (drive, confirmed) = chosen(&storage.inventory(&system), "sdb1");
+        system
+            .set_record_storage("1A2B-3C4D", "SHOW", &drive)
+            .unwrap();
+        system
+            .write(CONFIRMED, &confirmed_file(&confirmed))
+            .unwrap();
         assert!(storage.state(&system).target.available);
         // A file where the folder goes.
         put(&root, "/media/1A2B-3C4D/LiveStage Recordings", "");

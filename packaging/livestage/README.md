@@ -240,7 +240,12 @@ free space, filesystem), the recording time left, and:
 - **Record here**: takes go to the drive's `LiveStage Recordings` folder.
   The choice is saved; when the drive is not plugged in, recordings go to the
   data partition and the page says so, and they go back to the drive when it
-  returns (never in the middle of a take).
+  returns (never in the middle of a take). A drive is never adopted on its
+  own: with no drive chosen yet, or a drive that looks like the chosen one
+  but is not, the page asks for **Record here** first. A drive that reports
+  no serial number is trusted only while it stays plugged in after
+  **Record here** (or **Format**); after it is unplugged, or after a reboot,
+  takes go to the data partition until **Record here** is pressed again.
 - **Eject**: unmounts a drive so it can be pulled out.
 - **Format**: erases a whole drive into one exFAT partition. Never the
   system's own disk.

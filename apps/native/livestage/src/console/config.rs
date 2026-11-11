@@ -48,7 +48,8 @@ pub struct SetupConfig {
     pub record_storage_label: String,
     /// What else identifies that volume (`RECORD_STORAGE_DRIVE`: its
     /// drive's serial number and model, its size and filesystem), since a
-    /// UUID can be copied onto any drive; empty when none was known.
+    /// UUID can be copied onto any drive; empty when none was known, and
+    /// then no drive is recorded to until one is chosen (#408).
     pub record_storage_drive: String,
 }
 

@@ -32,8 +32,10 @@
 //!   keeps that mount), the others carry `Volume::refused`, and `use` of
 //!   that UUID is refused. A volume with the target's UUID that is not the
 //!   drive chosen (serial number, model, size, filesystem) is refused too
-//!   and only mounted read-only, until it is chosen with `use`. Ejecting a
-//!   UUID ejects every volume that has it.
+//!   and only mounted read-only, until it is chosen with `use`; so is one
+//!   when no drive was saved with the UUID (never taken on sight), and one
+//!   with no serial number that was not chosen since it was plugged in
+//!   (#408). Ejecting a UUID ejects every volume that has it.
 
 #![allow(dead_code)]
 

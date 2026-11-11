@@ -38,11 +38,15 @@
 //! which the operator here reads off this machine. A connection
 //! from a proxy given with `--trusted-proxy` is counted (log-in failures,
 //! slots and arrivals alike) under the client address that proxy forwards
-//! in the one header `--forwarded-header` names; a forwarding header from
-//! anyone else, or another header from it, is not believed. Until its
+//! in the one header `--forwarded-header` names, and only as far as the
+//! trusted proxies appended it ([`forwarded_client`]); a forwarding header
+//! from anyone else, or another header from it, is not believed. Until its
 //! request head is read, a trusted proxy's connection is held to no
 //! address's limits, as this machine's are not: they are the client's to
-//! bear once it is known.
+//! bear once it is known. An address that stands for clients this server
+//! cannot tell apart (this machine, a trusted proxy that named nobody) is
+//! [`Peer::shared`]: no one client may lock the others out of logging in
+//! there (#408).
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -91,6 +95,23 @@ pub struct Peer {
     /// Its address: the connection's, or the one a trusted proxy forwarded.
     /// `None` when it could not be read.
     pub addr: Option<IpAddr>,
+    /// That address stands for clients this server cannot tell apart, so
+    /// it is not one client's to lock (see `users`): this machine (a
+    /// browser here, or anyone behind a proxy or tunnel here that is not
+    /// trusted, #408), a trusted proxy that named no client, or no address
+    /// at all.
+    pub shared: bool,
+}
+
+impl Peer {
+    /// A client that is `addr` itself, as far as this server can tell.
+    pub fn of(addr: Option<IpAddr>) -> Self {
+        let addr = addr.map(|a| a.to_canonical());
+        Self {
+            addr,
+            shared: addr.is_none_or(|a| a.is_loopback()),
+        }
+    }
 }
 
 /// Messages a client may have queued before it counts as stalled.
@@ -206,18 +227,31 @@ impl Drop for Queued {
 /// The one header a trusted proxy names its client in
 /// (`--forwarded-header`). Only that one is read: a proxy passes on what
 /// the client sent in the others, and the client could name itself there.
+/// Of that one, only what the trusted proxies appended counts (see
+/// [`forwarded_client`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ForwardedHeader {
-    /// `X-Forwarded-For`, its last address (the one the proxy appended).
+    /// `X-Forwarded-For`: its right-most address that is not a trusted
+    /// proxy's.
     #[default]
     XForwardedFor,
-    /// `Forwarded`, the `for=` of its last element.
+    /// `Forwarded`: the `for=` of its right-most element that is not a
+    /// trusted proxy's.
     Forwarded,
-    /// `X-Real-IP`.
+    /// `X-Real-IP`: one address, which the proxy sets.
     XRealIp,
 }
 
 impl ForwardedHeader {
+    /// The header's name, as [`Request::header`] takes it.
+    fn name(self) -> &'static str {
+        match self {
+            Self::XForwardedFor => "x-forwarded-for",
+            Self::Forwarded => "forwarded",
+            Self::XRealIp => "x-real-ip",
+        }
+    }
+
     /// As `--forwarded-header` takes it, any case.
     pub fn parse(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
@@ -1053,38 +1087,69 @@ fn machine_name() -> Option<String> {
 /// - Otherwise the connection's own address, whatever forwarding header
 ///   the request carries.
 ///
-/// Neither is ever taken for a browser on this machine (#386).
+/// Neither is ever taken for a browser on this machine (#386). Loopback,
+/// or a trusted proxy that named no client, is [`Peer::shared`] (#408).
 fn client_peer(socket: Option<IpAddr>, request: &Request, proxies: &Proxies) -> (Peer, bool) {
+    let socket = socket.map(|s| s.to_canonical());
     if proxies.trusts(socket) {
-        if let Some(client) = forwarded_client(request, proxies.header) {
-            return (Peer { addr: Some(client) }, true);
-        }
+        return match forwarded_client(request, proxies) {
+            Some(client) => (Peer::of(Some(client)), true),
+            None => (
+                Peer {
+                    addr: socket,
+                    shared: true,
+                },
+                false,
+            ),
+        };
     }
-    (Peer { addr: socket }, false)
+    (Peer::of(socket), false)
 }
 
-/// The client a proxy forwarded `request` for, from `header` only (see
-/// [`ForwardedHeader`]): the last address of `X-Forwarded-For` (the one
-/// the proxy appended; those before it are what the client claimed), the
-/// last `for=` of `Forwarded`, or `X-Real-IP`. `None` when it holds no
-/// address.
-fn forwarded_client(request: &Request, header: ForwardedHeader) -> Option<IpAddr> {
-    match header {
-        ForwardedHeader::XForwardedFor => request
-            .header("x-forwarded-for")?
-            .rsplit(',')
-            .next()
-            .and_then(forwarded_address),
-        ForwardedHeader::Forwarded => request
-            .header("forwarded")?
-            .rsplit(',')
-            .next()?
-            .split(';')
-            .filter_map(|pair| pair.split_once('='))
-            .find(|(name, _)| name.trim().eq_ignore_ascii_case("for"))
-            .and_then(|(_, value)| forwarded_address(value)),
-        ForwardedHeader::XRealIp => request.header("x-real-ip").and_then(forwarded_address),
+/// The [`Peer`] the command loop is told about for a request head `head`
+/// that arrived over a connection from `socket` (tests elsewhere). `None`:
+/// the head is refused (400).
+#[cfg(test)]
+pub(crate) fn peer_for(socket: IpAddr, head: &str, proxies: &Proxies) -> Option<Peer> {
+    let request = Request::parse(head.as_bytes())?;
+    Some(client_peer(Some(socket), &request, proxies).0)
+}
+
+/// The client the trusted proxies forwarded `request` for, from
+/// `proxies.header` only (see [`ForwardedHeader`]); `None` when they named
+/// none.
+///
+/// Each proxy appends the address it took the request from, so the list is
+/// read from its end (all its lines, in order: see [`Request::parse`]),
+/// past the addresses of trusted proxies (a chain of them), to the first
+/// one that is not: what they say ends there, and everything before it is
+/// what that client wrote. The walk stops with `None` at anything that is
+/// not an address (`unknown`, an obfuscated `for=`, an element with no
+/// `for=`), since what is before it was not written by a trusted proxy
+/// either; and with that address at a loopback one, which is a client on
+/// the proxy's own machine (or a forwarder there that appends nothing),
+/// not a hop that speaks for the address before it. `X-Real-IP` holds one
+/// address, which the proxy sets: more than one (two lines, or a list) is
+/// not believed.
+fn forwarded_client(request: &Request, proxies: &Proxies) -> Option<IpAddr> {
+    let value = request.header(proxies.header.name())?;
+    if proxies.header == ForwardedHeader::XRealIp && value.contains(',') {
+        return None;
     }
+    for entry in value.rsplit(',') {
+        let address = match proxies.header {
+            ForwardedHeader::Forwarded => entry
+                .split(';')
+                .filter_map(|pair| pair.split_once('='))
+                .find(|(name, _)| name.trim().eq_ignore_ascii_case("for"))
+                .and_then(|(_, value)| forwarded_address(value)),
+            ForwardedHeader::XForwardedFor | ForwardedHeader::XRealIp => forwarded_address(entry),
+        }?;
+        if address.is_loopback() || !proxies.trusts(Some(address)) {
+            return Some(address);
+        }
+    }
+    None
 }
 
 /// One forwarded address: `192.0.2.1`, `192.0.2.1:4711`, `2001:db8::1`,
@@ -1202,11 +1267,26 @@ fn read_head(stream: &mut TcpStream, until: Instant) -> Option<(Vec<u8>, usize)>
 struct Request {
     method: String,
     path: String,
-    /// Lower-cased names.
+    /// Lower-cased names. A header sent in more lines is one value, the
+    /// lines' joined with `", "` in order (RFC 9110 §5.3), as a proxy that
+    /// appends a line of its own means it.
     headers: HashMap<String, String>,
 }
 
+/// An HTTP field name: a token (RFC 9110 §5.6.2).
+fn is_token(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
 impl Request {
+    /// `None`: not a request head this server takes (400). A field line
+    /// that continues the one before (obs-fold), a name with space before
+    /// its colon, or a line with no colon is refused rather than read some
+    /// way a proxy in front did not (RFC 9112 §5.1, §5.2): it could
+    /// otherwise smuggle a forwarding header past the proxy (#408).
     fn parse(head: &[u8]) -> Option<Self> {
         let text = std::str::from_utf8(head).ok()?;
         let mut lines = text.split("\r\n");
@@ -1214,10 +1294,22 @@ impl Request {
         let method = first.next()?.to_string();
         let target = first.next()?;
         let path = target.split(['?', '#']).next().unwrap_or("/").to_string();
-        let headers = lines
-            .filter_map(|line| line.split_once(':'))
-            .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
-            .collect();
+        let mut headers: HashMap<String, String> = HashMap::new();
+        // The head ends with an empty line (or two splits' worth of one).
+        for line in lines.filter(|line| !line.is_empty()) {
+            let (name, value) = line.split_once(':')?;
+            if !is_token(name) {
+                return None;
+            }
+            let value = value.trim_matches([' ', '\t']);
+            headers
+                .entry(name.to_ascii_lowercase())
+                .and_modify(|joined| {
+                    joined.push_str(", ");
+                    joined.push_str(value);
+                })
+                .or_insert_with(|| value.to_string());
+        }
         Some(Self {
             method,
             path,
@@ -2862,8 +2954,15 @@ mod tests {
         let peer = |socket: &str, head: &str| {
             let (peer, through_proxy) = peer_of(socket, head, &Proxies::default());
             assert!(!through_proxy, "{head}");
-            assert_eq!(peer.addr, Some(ip(socket)), "{head}");
+            assert_eq!(peer, Peer::of(Some(ip(socket))), "{head}");
         };
+        // This machine stands for whoever a forwarder here passes on; another
+        // machine is itself.
+        assert!(Peer::of(Some(ip("::ffff:127.0.0.1"))).shared);
+        assert!(Peer::of(Some(ip("::1"))).shared);
+        assert!(Peer::of(None).shared);
+        assert!(!Peer::of(Some(ip("10.0.0.7"))).shared);
+        assert!(!Peer::of(Some(ip("::ffff:10.0.0.7"))).shared);
         for socket in ["127.0.0.1", "::ffff:127.0.0.1", "::1", "10.0.0.7"] {
             for host in [
                 "localhost",
@@ -2974,6 +3073,161 @@ mod tests {
             assert!(!through_proxy, "{header}");
             assert_eq!(peer.addr, Some(ip("127.0.0.1")));
         }
+    }
+
+    /// #408: what a trusted proxy says counts only as far as it wrote it
+    /// itself. A client can put anything in front of what the proxy
+    /// appends, send more lines of the header, or write one a proxy reads
+    /// as something else; none of that may name it. Every case is checked
+    /// and every miss reported.
+    #[test]
+    fn a_client_cannot_choose_its_identity_through_a_trusted_proxy() {
+        use ForwardedHeader::*;
+        // nginx here, and a load balancer in front of it, both trusted.
+        let proxies = |header| Proxies {
+            addrs: vec![ip("127.0.0.1"), ip("10.0.0.1")],
+            header,
+        };
+        // The client the server takes the request to be from, when the
+        // proxy's word is taken; `None`: refused, or the proxy itself.
+        let client = |lines: &str, kind: ForwardedHeader| -> Option<IpAddr> {
+            let head = format!("GET /ws HTTP/1.1\r\nHost: mixer.example.org\r\n{lines}\r\n\r\n");
+            let request = Request::parse(head.as_bytes())?;
+            let (peer, through_proxy) =
+                client_peer(Some(ip("127.0.0.1")), &request, &proxies(kind));
+            through_proxy.then_some(peer.addr).flatten()
+        };
+        let real = Some(ip("203.0.113.7"));
+        let chosen = Some(ip("6.6.6.6"));
+        type Expected = Result<Option<IpAddr>, Option<IpAddr>>;
+        // (head lines, header, the client it must be (`Ok`) or must not be
+        // (`Err`))
+        let cases: &[(&str, ForwardedHeader, Expected)] = &[
+            // A line that a proxy passes on as part of another header
+            // (obs-fold), or under another name (space before the colon),
+            // after the line the proxy set: never the forwarding header.
+            (
+                "X-Forwarded-For: 203.0.113.7\r\nX-Note: a\r\n X-Forwarded-For: 6.6.6.6",
+                XForwardedFor,
+                Err(chosen),
+            ),
+            (
+                "X-Forwarded-For: 203.0.113.7\r\nX-Note: a\r\n\tX-Forwarded-For: 6.6.6.6",
+                XForwardedFor,
+                Err(chosen),
+            ),
+            (
+                "X-Forwarded-For: 203.0.113.7\r\nX-Forwarded-For : 6.6.6.6",
+                XForwardedFor,
+                Err(chosen),
+            ),
+            (
+                "X-Forwarded-For: 203.0.113.7\r\nX-Forwarded-For\t: 6.6.6.6",
+                XForwardedFor,
+                Err(chosen),
+            ),
+            (
+                "X-Real-IP: 203.0.113.7\r\nX-Real-IP : 6.6.6.6",
+                XRealIp,
+                Err(chosen),
+            ),
+            // X-Real-IP holds one address. Two lines (the proxy's, and the
+            // client's it passed on): which is whose cannot be told.
+            (
+                "X-Real-IP: 203.0.113.7\r\nX-Real-IP: 6.6.6.6",
+                XRealIp,
+                Ok(None),
+            ),
+            (
+                "X-Real-IP: 6.6.6.6\r\nX-Real-IP: 203.0.113.7",
+                XRealIp,
+                Ok(None),
+            ),
+            ("X-Real-IP: 6.6.6.6, 203.0.113.7", XRealIp, Ok(None)),
+            // More lines of a list header are one list, in order: the
+            // proxy appends its line after the client's (HAProxy's
+            // `forwardfor`).
+            (
+                "X-Forwarded-For: 6.6.6.6\r\nX-Forwarded-For: 203.0.113.7",
+                XForwardedFor,
+                Ok(real),
+            ),
+            (
+                "Forwarded: for=6.6.6.6\r\nForwarded: for=203.0.113.7",
+                Forwarded,
+                Ok(real),
+            ),
+            // A chain of trusted proxies: the right-most address no trusted
+            // proxy has, whatever the client wrote before it.
+            (
+                "X-Forwarded-For: 6.6.6.6, 203.0.113.7, 10.0.0.1",
+                XForwardedFor,
+                Ok(real),
+            ),
+            (
+                "X-Forwarded-For: 6.6.6.6, 203.0.113.7, ::ffff:10.0.0.1",
+                XForwardedFor,
+                Ok(real),
+            ),
+            (
+                "X-Forwarded-For: 6.6.6.6\r\nX-Forwarded-For: 203.0.113.7, 10.0.0.1",
+                XForwardedFor,
+                Ok(real),
+            ),
+            (
+                "Forwarded: for=6.6.6.6, for=203.0.113.7;proto=http, for=\"10.0.0.1:443\"",
+                Forwarded,
+                Ok(real),
+            ),
+            (
+                "Forwarded: for=\"[2001:db8::66]\", for=\"[2001:db8::7]:4711\", for=\"[::ffff:10.0.0.1]\"",
+                Forwarded,
+                Ok(Some(ip("2001:db8::7"))),
+            ),
+            // Something the proxies did not write as an address stops the
+            // walk: what is before it is the client's. The proxy itself.
+            (
+                "X-Forwarded-For: 6.6.6.6, unknown, 10.0.0.1",
+                XForwardedFor,
+                Ok(None),
+            ),
+            (
+                "X-Forwarded-For: 6.6.6.6, , 10.0.0.1",
+                XForwardedFor,
+                Ok(None),
+            ),
+            (
+                "Forwarded: for=6.6.6.6, for=_hidden, for=10.0.0.1",
+                Forwarded,
+                Ok(None),
+            ),
+            ("Forwarded: for=6.6.6.6, proto=https", Forwarded, Ok(None)),
+            // A loopback address in the list is the proxy's own machine (a
+            // browser there, or a tunnel that appends nothing), not a hop
+            // that wrote what is before it: the walk stops there too.
+            (
+                "X-Forwarded-For: 6.6.6.6, 127.0.0.1",
+                XForwardedFor,
+                Err(chosen),
+            ),
+            (
+                "X-Forwarded-For: 6.6.6.6, ::1, 10.0.0.1",
+                XForwardedFor,
+                Err(chosen),
+            ),
+        ];
+        let missed: Vec<String> = cases
+            .iter()
+            .filter_map(|(lines, kind, expected)| {
+                let got = client(lines, *kind);
+                let right = match expected {
+                    Ok(want) => got == *want,
+                    Err(never) => got != *never,
+                };
+                (!right).then(|| format!("{lines:?} {kind:?}: got {got:?}, wanted {expected:?}"))
+            })
+            .collect();
+        assert!(missed.is_empty(), "\n{}", missed.join("\n"));
     }
 
     /// #293: connections a trusted proxy forwards are limited per client,
@@ -3149,7 +3403,8 @@ mod tests {
         // address, and waits at the setup-code screen while there are no
         // users.
         let here = joined(Vec::new(), Vec::new(), "localhost:8730", "");
-        assert_eq!(here, Peer { addr: lo });
+        assert_eq!(here, Peer::of(lo));
+        assert!(here.shared);
         let mut users = crate::users::Users::in_memory(1);
         users.require_setup_code("12345678".to_string());
         users.join_as(1, here);
@@ -3164,11 +3419,11 @@ mod tests {
                 "localhost:8730",
                 ""
             ),
-            Peer { addr: lo }
+            Peer::of(lo)
         );
         // Through a proxy here that is not trusted: one shared address.
         let proxied = "X-Forwarded-For: 203.0.113.7\r\n";
-        let untrusted = Peer { addr: lo };
+        let untrusted = Peer::of(lo);
         assert_eq!(
             joined(
                 vec!["mixer.example.org".to_string()],
@@ -3196,7 +3451,8 @@ mod tests {
                 proxied
             ),
             Peer {
-                addr: Some(ip("203.0.113.7"))
+                addr: Some(ip("203.0.113.7")),
+                shared: false,
             }
         );
     }
