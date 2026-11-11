@@ -125,10 +125,10 @@ mod tests {
         detector.set_range(50.0, 1_500.0);
         let mut periods = Vec::new();
         for (n, &sample) in out.iter().enumerate() {
-            if let Some(est) = detector.push(sample, 0.2) {
-                if n > out.len() / 2 {
-                    periods.extend(est.period);
-                }
+            if let Some(est) = detector.push(sample, 0.2)
+                && n > out.len() / 2
+            {
+                periods.extend(est.period);
             }
         }
         periods.sort_by(f32::total_cmp);
@@ -557,10 +557,10 @@ mod tests {
         let mut track = Vec::new();
         for (i, &x) in out.iter().enumerate() {
             let t = i as f32 / sr;
-            if let Some(period) = detector.push(x, 0.15).and_then(|e| e.period) {
-                if (from..to).contains(&t) {
-                    track.push(69.0 + 12.0 * (sr / period / 440.0).log2());
-                }
+            if let Some(period) = detector.push(x, 0.15).and_then(|e| e.period)
+                && (from..to).contains(&t)
+            {
+                track.push(69.0 + 12.0 * (sr / period / 440.0).log2());
             }
         }
         track
@@ -815,14 +815,24 @@ mod tests {
         let sr = 48_000u32;
         // Build a 2.0-second WAV buffer with two sung notes: A3 (220 Hz) and C4 (261.63 Hz)
         let mut mono = vec![0.0f32; sr as usize * 2];
-        for i in (sr as usize / 10)..(sr as usize * 9 / 10) {
+        for (i, sample) in mono
+            .iter_mut()
+            .enumerate()
+            .take(sr as usize * 9 / 10)
+            .skip(sr as usize / 10)
+        {
             let t = i as f32 / sr as f32;
-            mono[i] = 0.45 * (std::f32::consts::TAU * 220.0 * t).sin()
+            *sample = 0.45 * (std::f32::consts::TAU * 220.0 * t).sin()
                 + 0.15 * (std::f32::consts::TAU * 440.0 * t).sin();
         }
-        for i in (sr as usize * 11 / 10)..(sr as usize * 19 / 10) {
+        for (i, sample) in mono
+            .iter_mut()
+            .enumerate()
+            .take(sr as usize * 19 / 10)
+            .skip(sr as usize * 11 / 10)
+        {
             let t = i as f32 / sr as f32;
-            mono[i] = 0.45 * (std::f32::consts::TAU * 261.63 * t).sin()
+            *sample = 0.45 * (std::f32::consts::TAU * 261.63 * t).sin()
                 + 0.15 * (std::f32::consts::TAU * 523.25 * t).sin();
         }
         let wav_bytes = encode_mono_wav_i16(&mono, sr);

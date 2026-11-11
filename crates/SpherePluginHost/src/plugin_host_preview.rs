@@ -101,7 +101,7 @@ impl VoiceMidiState {
     }
 
     fn panic(&mut self) {
-        let drained: Vec<PreviewNoteKey> = self.active_notes.drain(..).collect();
+        let drained: Vec<PreviewNoteKey> = std::mem::take(&mut self.active_notes);
         for key in drained {
             self.pending_events
                 .push(Vst3MidiEvent::note_off(0, key.channel, key.pitch, 0.0));

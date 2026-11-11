@@ -5892,7 +5892,7 @@ impl StudioLayout {
         // the deferred queue is normally drained once. The guard exists only to
         // make an unexpected re-queue source terminate instead of spinning.
         const MAX_EDITOR_OPEN_FLUSHES: u32 = 10;
-        let pending: Vec<_> = self.plugin_editors.deferred_opens.drain(..).collect();
+        let pending: Vec<_> = std::mem::take(&mut self.plugin_editors.deferred_opens);
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (track_id, insert_index, instance_id) in pending {
             seen.insert(instance_id.clone());

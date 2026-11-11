@@ -152,7 +152,7 @@ mod tests {
 
     #[test]
     fn channels_stay_separate() {
-        let samples = vec![1.0f32, -0.25].repeat(1_000);
+        let samples = [1.0f32, -0.25].repeat(1_000);
         let pyramid = PeakPyramid::build(&samples, 2);
         let left = pyramid.range(&samples, 0, 0, 1_000).unwrap();
         let right = pyramid.range(&samples, 1, 0, 1_000).unwrap();

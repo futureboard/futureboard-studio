@@ -369,13 +369,18 @@ impl TrackAutomationChange {
     }
 }
 
+/// Per send, the index of its `(level lane, on/off lane)`.
+pub(crate) type SendLaneIndices = Vec<(Option<usize>, Option<usize>)>;
+/// Per insert, the index of its bypass lane.
+pub(crate) type BypassLaneIndices = Vec<Option<usize>>;
+
 /// Which lane each send (`(level, on/off)`) and each insert (bypass) reads,
 /// as indices into `lanes`. Off the audio thread.
 pub(crate) fn lane_indices(
     lanes: &[RuntimeAutomationLane],
     sends: &[RuntimeSend],
     inserts: &[RuntimeInsert],
-) -> (Vec<(Option<usize>, Option<usize>)>, Vec<Option<usize>>) {
+) -> (SendLaneIndices, BypassLaneIndices) {
     let mut send_lanes = vec![(None, None); sends.len()];
     let mut bypass_lanes = vec![None; inserts.len()];
     for (lane_ix, lane) in lanes.iter().enumerate() {

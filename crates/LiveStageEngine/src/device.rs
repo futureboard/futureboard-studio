@@ -389,8 +389,7 @@ impl<F: FnMut(&[f32], &mut [f32])> Duplex<F> {
     fn run(&mut self, frames: usize) {
         let started = Instant::now();
         let in_ch = self.in_channels;
-        if in_ch > 0 {
-            let available = self.ring.len() / in_ch;
+        if let Some(available) = self.ring.len().checked_div(in_ch) {
             // Capture running ahead of playback (two clocks, or a burst)
             // would add latency forever; drop the excess beyond a few periods.
             let keep = frames * 3 + 256;

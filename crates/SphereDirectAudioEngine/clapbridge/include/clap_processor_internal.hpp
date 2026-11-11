@@ -265,10 +265,10 @@ struct SphereDauxClapProcessor {
   bool restarted_before{false};
 
   // ── Diagnostics ──────────────────────────────────────────────────────────
-  unsigned long long process_count{0};
-  double last_input_peak{0.0};
-  double last_output_peak{0.0};
-  double last_difference_peak{0.0};
+  std::atomic<unsigned long long> process_count{0};
+  std::atomic<double> last_input_peak{0.0};
+  std::atomic<double> last_output_peak{0.0};
+  std::atomic<double> last_difference_peak{0.0};
 
   std::atomic<bool> processor_valid{true};
 

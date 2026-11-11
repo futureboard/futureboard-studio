@@ -69,6 +69,10 @@ impl TimelineState {
     /// of its file, `window_start..window_end` seconds into it: one pass of
     /// a loop recording, whose passes all share the file the recorder wrote
     /// straight through.
+    #[allow(
+        clippy::neg_cmp_op_on_partial_ord,
+        reason = "the negated comparisons are deliberately true for NaN, so a NaN duration or window is rejected"
+    )]
     pub fn seed_recorded_clip_window(
         &mut self,
         clip_id: &str,

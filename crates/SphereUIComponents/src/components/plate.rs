@@ -575,7 +575,7 @@ pub fn trace_svg(d: &str, origin: (f32, f32), k: f32, builder: &mut PathBuilder)
         let n = std::mem::take(numbers);
         match command {
             'M' => {
-                for (i, pair) in n.chunks_exact(2).enumerate() {
+                for (i, pair) in n.as_chunks::<2>().0.iter().enumerate() {
                     *current = (pair[0], pair[1]);
                     if i == 0 {
                         builder.move_to(at(pair[0], pair[1]));
@@ -586,7 +586,7 @@ pub fn trace_svg(d: &str, origin: (f32, f32), k: f32, builder: &mut PathBuilder)
                 }
             }
             'L' => {
-                for pair in n.chunks_exact(2) {
+                for pair in n.as_chunks::<2>().0 {
                     *current = (pair[0], pair[1]);
                     builder.line_to(at(pair[0], pair[1]));
                 }
@@ -604,13 +604,13 @@ pub fn trace_svg(d: &str, origin: (f32, f32), k: f32, builder: &mut PathBuilder)
                 }
             }
             'C' => {
-                for c in n.chunks_exact(6) {
+                for c in n.as_chunks::<6>().0 {
                     *current = (c[4], c[5]);
                     builder.cubic_bezier_to(at(c[4], c[5]), at(c[0], c[1]), at(c[2], c[3]));
                 }
             }
             'A' => {
-                for a in n.chunks_exact(7) {
+                for a in n.as_chunks::<7>().0 {
                     *current = (a[5], a[6]);
                     builder.arc_to(
                         point(px(a[0] * k), px(a[1] * k)),

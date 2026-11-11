@@ -518,6 +518,28 @@ pub const MASTER_TRACK_ID: &str = "master";
 /// reads as one, and a cap could come back in one place.
 pub const MAX_INSERT_SLOTS: usize = usize::MAX;
 
+/// Whether a chain of `len` inserts is within [`MAX_INSERT_SLOTS`]. Every
+/// "is there room" check goes through this or [`insert_chain_full`], so the
+/// comparison with an unlimited bound is in one place.
+#[inline]
+#[allow(
+    clippy::absurd_extreme_comparisons,
+    reason = "MAX_INSERT_SLOTS is usize::MAX today: no cap, kept as one named bound"
+)]
+pub fn insert_chain_fits(len: usize) -> bool {
+    len <= MAX_INSERT_SLOTS
+}
+
+/// Whether a chain of `len` inserts has no room for one more.
+#[inline]
+#[allow(
+    clippy::absurd_extreme_comparisons,
+    reason = "MAX_INSERT_SLOTS is usize::MAX today: no cap, kept as one named bound"
+)]
+pub fn insert_chain_full(len: usize) -> bool {
+    len >= MAX_INSERT_SLOTS
+}
+
 /// A chain deep enough that a test stands for "many more than the old eight".
 #[cfg(test)]
 pub(crate) const LONG_CHAIN_FOR_TESTS: usize = 64;
@@ -611,7 +633,7 @@ impl TrackState {
         match self.track_type {
             TrackType::Video => false,
             TrackType::Midi if self.fx_chain_floor() == 0 => false,
-            _ => self.inserts.len() + needed <= MAX_INSERT_SLOTS,
+            _ => insert_chain_fits(self.inserts.len() + needed),
         }
     }
 
@@ -1098,7 +1120,7 @@ impl TimelineState {
             return None;
         }
         let (to_len, placeholder) = if to_track == MASTER_TRACK_ID {
-            if self.master.inserts.len() >= MAX_INSERT_SLOTS {
+            if insert_chain_full(self.master.inserts.len()) {
                 return None;
             }
             (self.master.inserts.len(), false)
@@ -1249,7 +1271,7 @@ impl TimelineState {
         }
         let source = source.clone();
         let placeholder = if to_track == MASTER_TRACK_ID {
-            if self.master.inserts.len() >= MAX_INSERT_SLOTS {
+            if insert_chain_full(self.master.inserts.len()) {
                 return None;
             }
             false

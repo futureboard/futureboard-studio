@@ -482,10 +482,11 @@ mod probe {
         lparam: LPARAM,
     ) -> LRESULT {
         // GPUI's handling: activate on every click that reaches the window.
-        if msg == WM_MOUSEACTIVATE && STUDIO.load(Ordering::Relaxed) {
-            if unsafe { GetActiveWindow() } != hwnd {
-                let _ = unsafe { SetActiveWindow(hwnd) };
-            }
+        if msg == WM_MOUSEACTIVATE
+            && STUDIO.load(Ordering::Relaxed)
+            && unsafe { GetActiveWindow() } != hwnd
+        {
+            let _ = unsafe { SetActiveWindow(hwnd) };
         }
         unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
     }

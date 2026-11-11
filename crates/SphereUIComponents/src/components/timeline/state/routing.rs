@@ -1093,10 +1093,7 @@ pub fn rodhareist_wdw_wire(plugin_id: &str, index: u32) -> bool {
 #[cfg(feature = "builtin-plugin-editor")]
 fn rodhareist_params_are_wdw(params: &rodharerist::Params) -> bool {
     params.line2_mode == rodharerist::Line2Mode::WetDryWet
-        || params
-            .row_send
-            .iter()
-            .any(|send| *send == rodharerist::RowSend::WetDryWet)
+        || params.row_send.contains(&rodharerist::RowSend::WetDryWet)
 }
 
 #[cfg(test)]

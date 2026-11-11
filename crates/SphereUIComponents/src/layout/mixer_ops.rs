@@ -3048,10 +3048,6 @@ fn clone_track_for_mixer_detail(track: &TrackState, include_detail: bool) -> Tra
     }
 }
 
-/// The shared insert-drop commit: anchors resolved against the live chains,
-/// no-ops refused, and a cross-channel move reaching the engine snapshot under
-/// the destination only, as the same instance.
-
 /// An input change (record arm, input monitor) pressed on the mixer strip of
 /// `id`: applied to every track ganged with it and handed to the engine one
 /// track at a time. A track the engine refuses is put back and the error

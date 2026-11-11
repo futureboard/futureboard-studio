@@ -10,17 +10,13 @@ use serde::{Deserialize, Serialize};
 /// per-note channel assignment is part of the performance contract.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum MpeOutputMode {
     Off,
+    #[default]
     Auto,
     Lower,
     Upper,
-}
-
-impl Default for MpeOutputMode {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 impl MpeOutputMode {

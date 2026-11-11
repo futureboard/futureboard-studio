@@ -1508,6 +1508,10 @@ mod tests {
     /// there. At the smallest allowed lane height it must still leave a usable
     /// draw area above it, or a short lane becomes resize-only.
     #[test]
+    #[allow(
+        clippy::assertions_on_constants,
+        reason = "documents the lane hit-zone constants as a named test"
+    )]
     fn resize_zone_leaves_a_draw_area_at_the_minimum_lane_height() {
         assert!(LANE_RESIZE_ZONE * 4.0 < MIN_LANE_HEIGHT);
     }

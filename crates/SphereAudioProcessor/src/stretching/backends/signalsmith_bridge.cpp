@@ -75,6 +75,10 @@ struct FbSignalsmithHandle {
 
 } // namespace
 
+// Rust declares every function below `extern "C"`, not `"C-unwind"`: an
+// exception reaching it is undefined behaviour. The stretcher allocates when
+// it is (re)configured, so each body runs inside `try`, and an out-of-memory
+// `std::bad_alloc` becomes an error code (or a null handle) instead.
 extern "C" {
 
 void *fb_signalsmith_create(float sample_rate, int channels) {
@@ -82,16 +86,20 @@ void *fb_signalsmith_create(float sample_rate, int channels) {
         return nullptr;
     }
 
-    auto *handle = new (std::nothrow) FbSignalsmithHandle();
-    if (handle == nullptr) {
+    FbSignalsmithHandle *handle = nullptr;
+    try {
+        // `std::nothrow` covers the allocation only; the stretcher's own
+        // constructor and presets can still throw.
+        handle = new FbSignalsmithHandle();
+        handle->sample_rate = sample_rate;
+        handle->channels = channels;
+        handle->apply_preset();
+        handle->apply_ratios();
+        return handle;
+    } catch (...) {
+        delete handle;
         return nullptr;
     }
-
-    handle->sample_rate = sample_rate;
-    handle->channels = channels;
-    handle->apply_preset();
-    handle->apply_ratios();
-    return handle;
 }
 
 void fb_signalsmith_destroy(void *handle) {
@@ -103,7 +111,10 @@ void fb_signalsmith_reset(void *handle) {
         return;
     }
     auto *state = static_cast<FbSignalsmithHandle *>(handle);
-    state->stretch.reset();
+    try {
+        state->stretch.reset();
+    } catch (...) {
+    }
 }
 
 int fb_signalsmith_configure(void *handle, float pitch_ratio, float quality) {
@@ -155,19 +166,19 @@ int fb_signalsmith_process_stereo(
         quality = 0.75f;
     }
 
-    const bool reconfigure = !state->configured || state->quality != quality;
-    state->pitch_ratio = pitch_ratio;
-    state->quality = quality;
-
-    if (reconfigure) {
-        state->apply_preset();
-    }
-    state->apply_ratios();
-
     // Direct, allocation-free pass-through: the caller supplies exactly the
     // input samples the stretcher should consume to produce `output_frames`.
     // The time-stretch ratio is `output_frames / input_frames`.
     try {
+        const bool reconfigure = !state->configured || state->quality != quality;
+        state->pitch_ratio = pitch_ratio;
+        state->quality = quality;
+
+        if (reconfigure) {
+            state->apply_preset();
+        }
+        state->apply_ratios();
+
         if (state->channels == 1) {
             if (static_cast<int>(state->mono_in.size()) < input_frames) {
                 state->mono_in.resize(static_cast<size_t>(input_frames));
@@ -206,7 +217,11 @@ int fb_signalsmith_latency_samples(void *handle) {
         return 0;
     }
     auto *state = static_cast<FbSignalsmithHandle *>(handle);
-    return state->stretch.inputLatency() + state->stretch.outputLatency();
+    try {
+        return state->stretch.inputLatency() + state->stretch.outputLatency();
+    } catch (...) {
+        return 0;
+    }
 }
 
 void fb_signalsmith_io_latency(void *handle, int *input_latency, int *output_latency) {
@@ -214,11 +229,16 @@ void fb_signalsmith_io_latency(void *handle, int *input_latency, int *output_lat
     int out = 0;
     if (handle != nullptr) {
         auto *state = static_cast<FbSignalsmithHandle *>(handle);
-        if (!state->configured) {
-            state->apply_preset();
+        try {
+            if (!state->configured) {
+                state->apply_preset();
+            }
+            in = state->stretch.inputLatency();
+            out = state->stretch.outputLatency();
+        } catch (...) {
+            in = 0;
+            out = 0;
         }
-        in = state->stretch.inputLatency();
-        out = state->stretch.outputLatency();
     }
     if (input_latency != nullptr) {
         *input_latency = in > 0 ? in : 0;
@@ -233,15 +253,19 @@ int fb_signalsmith_output_seek_length(void *handle, float playback_rate) {
         return 0;
     }
     auto *state = static_cast<FbSignalsmithHandle *>(handle);
-    if (!state->configured) {
-        state->apply_preset();
-    }
     if (!valid_ratio(playback_rate)) {
         playback_rate = 1.0f;
     }
-    // inputLatency + playback_rate * outputLatency (see outputSeekLength()).
-    const int len = static_cast<int>(state->stretch.outputSeekLength(playback_rate));
-    return len > 0 ? len : 0;
+    try {
+        if (!state->configured) {
+            state->apply_preset();
+        }
+        // inputLatency + playback_rate * outputLatency (see outputSeekLength()).
+        const int len = static_cast<int>(state->stretch.outputSeekLength(playback_rate));
+        return len > 0 ? len : 0;
+    } catch (...) {
+        return 0;
+    }
 }
 
 int fb_signalsmith_output_seek(
@@ -264,15 +288,15 @@ int fb_signalsmith_output_seek(
         quality = 0.75f;
     }
 
-    const bool reconfigure = !state->configured || state->quality != quality;
-    state->pitch_ratio = pitch_ratio;
-    state->quality = quality;
-    if (reconfigure) {
-        state->apply_preset();
-    }
-    state->apply_ratios();
-
     try {
+        const bool reconfigure = !state->configured || state->quality != quality;
+        state->pitch_ratio = pitch_ratio;
+        state->quality = quality;
+        if (reconfigure) {
+            state->apply_preset();
+        }
+        state->apply_ratios();
+
         if (state->channels == 1) {
             if (static_cast<int>(state->mono_in.size()) < input_frames) {
                 state->mono_in.resize(static_cast<size_t>(input_frames));

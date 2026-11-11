@@ -833,6 +833,10 @@ impl CantoEngine {
         self.publish_notes();
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one argument per editable note property; the shared API of the app, panel and plug-in"
+    )]
     pub fn update_note(
         &mut self,
         index: usize,
@@ -1078,7 +1082,7 @@ impl CantoEngine {
         let mut block = vec![0.0f32; 1024 * 2];
         while out.len() < total + latency && e.playing {
             e.render_stereo_f32(&mut block);
-            out.extend(block.chunks_exact(2).map(|f| f[0]));
+            out.extend(block.as_chunks::<2>().0.iter().map(|f| f[0]));
         }
         out.drain(..latency.min(out.len()));
         out.truncate(total);
@@ -1183,10 +1187,11 @@ impl CantoEngine {
     /// draw order). Only used on the non-bypass path, where the presented note
     /// is the note itself, so nothing is cloned.
     fn note_index_at(&mut self, time_sec: f32) -> Option<usize> {
-        if let Some(note) = self.notes.get(self.active_hint) {
-            if time_sec >= note.start && time_sec <= note.start + note.dur {
-                return Some(self.active_hint);
-            }
+        if let Some(note) = self.notes.get(self.active_hint)
+            && time_sec >= note.start
+            && time_sec <= note.start + note.dur
+        {
+            return Some(self.active_hint);
         }
         let found = self
             .notes
@@ -1442,7 +1447,7 @@ impl CantoEngine {
 
         // Allocation-free per-sample loop: notes are read by index and the
         // pitch/formant math runs only on control ticks inside `shift_sample`.
-        for frame in out_interleaved.chunks_exact_mut(2) {
+        for frame in out_interleaved.as_chunks_mut::<2>().0 {
             let (out_l, out_r) = if !self.playing {
                 match self.audition_step() {
                     Some(sample) => sample,
@@ -1509,12 +1514,12 @@ impl CantoEngine {
             frame[1] = out_r;
             // The meter shows the vocal alone.
             block_peak = block_peak.max(out_l.abs().max(out_r.abs()));
-            if self.playing {
-                if let Some(backing) = &self.backing {
-                    let (bl, br) = backing.at(self.playhead_sec - heard_lag);
-                    frame[0] = (out_l + bl).clamp(-1.0, 1.0);
-                    frame[1] = (out_r + br).clamp(-1.0, 1.0);
-                }
+            if self.playing
+                && let Some(backing) = &self.backing
+            {
+                let (bl, br) = backing.at(self.playhead_sec - heard_lag);
+                frame[0] = (out_l + bl).clamp(-1.0, 1.0);
+                frame[1] = (out_r + br).clamp(-1.0, 1.0);
             }
         }
 
@@ -1897,21 +1902,21 @@ fn split_voiced_segment(
 
     // 7-point median filter to reject octave/consonant spikes
     let mut median_midi = vec![0.0f64; raw_midi.len()];
-    for i in 0..raw_midi.len() {
+    for (i, median) in median_midi.iter_mut().enumerate() {
         let lo = i.saturating_sub(3);
         let hi = (i + 4).min(raw_midi.len());
         let mut win: Vec<f64> = raw_midi[lo..hi].to_vec();
         win.sort_by(|a, b| a.total_cmp(b));
-        median_midi[i] = win[win.len() / 2];
+        *median = win[win.len() / 2];
     }
 
     // 5-point moving average for plateau segmentation
     let mut smooth_midi = vec![0.0f64; median_midi.len()];
-    for i in 0..median_midi.len() {
+    for (i, smooth) in smooth_midi.iter_mut().enumerate() {
         let lo = i.saturating_sub(2);
         let hi = (i + 3).min(median_midi.len());
         let sum: f64 = median_midi[lo..hi].iter().sum();
-        smooth_midi[i] = sum / (hi - lo) as f64;
+        *smooth = sum / (hi - lo) as f64;
     }
 
     // Minimum ~95ms per note plateau
@@ -1950,17 +1955,17 @@ fn split_voiced_segment(
         }
     }
 
-    if seg.len() - note_start_idx >= min_frames {
-        if let Some(note) = build_pitched_note(
+    if seg.len() - note_start_idx >= min_frames
+        && let Some(note) = build_pitched_note(
             &seg[note_start_idx..],
             &median_midi[note_start_idx..],
             frame_dt,
             ref_rms,
             key_pc,
             note_counter,
-        ) {
-            notes.push(note);
-        }
+        )
+    {
+        notes.push(note);
     }
 
     notes
@@ -2203,7 +2208,7 @@ mod backing_tests {
     fn first_click(engine: &mut CantoEngine, frames: usize) -> Option<usize> {
         let mut out = vec![0.0f32; frames * 2];
         engine.render_stereo_f32(&mut out);
-        out.chunks_exact(2).position(|f| f[0].abs() > 0.5)
+        out.as_chunks::<2>().0.iter().position(|f| f[0].abs() > 0.5)
     }
 
     /// A silent take and a backing track with one click at `click` frames.

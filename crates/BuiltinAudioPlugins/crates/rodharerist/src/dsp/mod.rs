@@ -1687,9 +1687,6 @@ impl DelaySync {
     }
 }
 
-/// Fallback tempo until the host publishes one, and the clamp around a
-/// published tempo. EchoSpace's constants, which WrapSynth uses too.
-
 /// The time the delay line hears. Free mode returns the stored
 /// milliseconds unchanged, so leaving sync restores the player's time.
 /// A note division is `beats * 60000 / tempo`, then clamped to the line's

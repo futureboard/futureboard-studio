@@ -388,6 +388,10 @@ pub(crate) fn fade_curve_points(
 /// `within` keeps only the part inside that span of the clip's time (a
 /// crossfade overlay draws the part of each fade over its own overlap).
 /// Points are `(x - origin_x, gain)`.
+#[allow(
+    clippy::neg_cmp_op_on_partial_ord,
+    reason = "the negated comparisons are deliberately true for NaN, so a NaN fade draws no curve"
+)]
 pub(crate) fn fade_edge_curve(
     time: &ClipTimeAxis<'_>,
     fades: &EffectiveFades,
@@ -1593,6 +1597,10 @@ mod tests {
     /// the least room on each — drawing them was measured at 59% of the frame.
     /// Raising `CLIP_STRIP_MIN_W` back toward zero puts that cost back.
     #[test]
+    #[allow(
+        clippy::assertions_on_constants,
+        reason = "documents the clip detail-tier constants as a named test"
+    )]
     fn clip_detail_tiers_stay_ordered_and_useful() {
         assert!(
             CLIP_RESIZE_HANDLE_MIN_W < CLIP_STRIP_MIN_W,

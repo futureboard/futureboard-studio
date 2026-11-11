@@ -115,8 +115,12 @@ pub fn position_frequency(position: f32, max_frequency_hz: f32, scale: Frequency
 
 /// Lowest frequency the logarithmic scale plots. Kept in one place so the tile
 /// renderer and the overlays cannot disagree at the bottom of the axis.
-fn spectrogram_min_hz(max_frequency_hz: f32) -> f32 {
-    20.0_f32.min(max_frequency_hz.max(20.0))
+///
+/// Always 20 Hz. It was written `20.min(max_hz.max(20))`, which is 20 for any
+/// rate; a Nyquist below 20 Hz only meets the guard on the divisor in
+/// [`frequency_position`].
+fn spectrogram_min_hz(_max_frequency_hz: f32) -> f32 {
+    20.0
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -82,6 +82,69 @@ impl Drop for LoadJob {
     }
 }
 
+fn finish(state: &JobState, res: Result<CantoAnalysisResult, String>) {
+    if let Ok(mut slot) = state.result.lock() {
+        *slot = Some(res);
+    }
+    state.stage.store(STAGE_DONE, Ordering::Release);
+}
+
+fn cancelled(state: &JobState) -> bool {
+    state.progress.cancel.load(Ordering::Relaxed)
+}
+
+fn run(shared: &Shared, kind: JobKind, state: &JobState) -> Result<CantoAnalysisResult, String> {
+    let install = |f: &mut dyn FnMut(&mut crate::engine::CantoEngine) -> CantoAnalysisResult| {
+        state.stage.store(STAGE_INSTALLING, Ordering::Relaxed);
+        let mut engine = shared.lock();
+        let res = f(&mut engine);
+        shared.publish(&engine);
+        res
+    };
+    match kind {
+        JobKind::File { path, cached } => {
+            state.stage.store(STAGE_DECODING, Ordering::Relaxed);
+            let decoded = decode_audio_file_to_mono(&path, shared.sample_rate() as u32)?;
+            if cancelled(state) {
+                return Err("Cancelled".to_string());
+            }
+            let adopted = cached
+                .and_then(|json| serde_json::from_str::<CantoAnalysisResult>(&json).ok())
+                .and_then(|r| Analysis::from_cached(r, decoded.duration_sec));
+            let analysis = match adopted {
+                Some(a) => {
+                    state.used_cache.store(true, Ordering::Relaxed);
+                    a
+                }
+                None => {
+                    state.stage.store(STAGE_ANALYZING, Ordering::Relaxed);
+                    analyze_samples(&decoded.samples, shared.sample_rate(), &state.progress)
+                        .ok_or_else(|| "Cancelled".to_string())?
+                }
+            };
+            let mut slot = Some((decoded, analysis));
+            Ok(install(&mut |e| {
+                let (decoded, analysis) = slot.take().expect("installed once");
+                e.install_analyzed(decoded, analysis)
+            }))
+        }
+        JobKind::Reanalyze => {
+            // Copy the samples so analysis doesn't hold the engine lock.
+            let samples = shared.lock().audio_samples.clone();
+            if samples.is_empty() {
+                return Err("No audio loaded to analyze".to_string());
+            }
+            state.stage.store(STAGE_ANALYZING, Ordering::Relaxed);
+            let analysis = analyze_samples(&samples, shared.sample_rate(), &state.progress)
+                .ok_or_else(|| "Cancelled".to_string())?;
+            let mut slot = Some(analysis);
+            Ok(install(&mut |e| {
+                e.adopt(slot.take().expect("installed once"))
+            }))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,68 +226,5 @@ mod tests {
         job.cancel();
         assert_eq!(wait(&job).unwrap_err(), "Cancelled");
         assert!(!shared.lock().has_audio());
-    }
-}
-
-fn finish(state: &JobState, res: Result<CantoAnalysisResult, String>) {
-    if let Ok(mut slot) = state.result.lock() {
-        *slot = Some(res);
-    }
-    state.stage.store(STAGE_DONE, Ordering::Release);
-}
-
-fn cancelled(state: &JobState) -> bool {
-    state.progress.cancel.load(Ordering::Relaxed)
-}
-
-fn run(shared: &Shared, kind: JobKind, state: &JobState) -> Result<CantoAnalysisResult, String> {
-    let install = |f: &mut dyn FnMut(&mut crate::engine::CantoEngine) -> CantoAnalysisResult| {
-        state.stage.store(STAGE_INSTALLING, Ordering::Relaxed);
-        let mut engine = shared.lock();
-        let res = f(&mut engine);
-        shared.publish(&engine);
-        res
-    };
-    match kind {
-        JobKind::File { path, cached } => {
-            state.stage.store(STAGE_DECODING, Ordering::Relaxed);
-            let decoded = decode_audio_file_to_mono(&path, shared.sample_rate() as u32)?;
-            if cancelled(state) {
-                return Err("Cancelled".to_string());
-            }
-            let adopted = cached
-                .and_then(|json| serde_json::from_str::<CantoAnalysisResult>(&json).ok())
-                .and_then(|r| Analysis::from_cached(r, decoded.duration_sec));
-            let analysis = match adopted {
-                Some(a) => {
-                    state.used_cache.store(true, Ordering::Relaxed);
-                    a
-                }
-                None => {
-                    state.stage.store(STAGE_ANALYZING, Ordering::Relaxed);
-                    analyze_samples(&decoded.samples, shared.sample_rate(), &state.progress)
-                        .ok_or_else(|| "Cancelled".to_string())?
-                }
-            };
-            let mut slot = Some((decoded, analysis));
-            Ok(install(&mut |e| {
-                let (decoded, analysis) = slot.take().expect("installed once");
-                e.install_analyzed(decoded, analysis)
-            }))
-        }
-        JobKind::Reanalyze => {
-            // Copy the samples so analysis doesn't hold the engine lock.
-            let samples = shared.lock().audio_samples.clone();
-            if samples.is_empty() {
-                return Err("No audio loaded to analyze".to_string());
-            }
-            state.stage.store(STAGE_ANALYZING, Ordering::Relaxed);
-            let analysis = analyze_samples(&samples, shared.sample_rate(), &state.progress)
-                .ok_or_else(|| "Cancelled".to_string())?;
-            let mut slot = Some(analysis);
-            Ok(install(&mut |e| {
-                e.adopt(slot.take().expect("installed once"))
-            }))
-        }
     }
 }

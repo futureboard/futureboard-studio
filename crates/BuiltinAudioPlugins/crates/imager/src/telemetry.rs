@@ -15,7 +15,7 @@ pub const SLOTS: usize = 64;
 /// Analyser bins folded into one slot.
 const FOLD: usize = SPECTRUM_BINS / SLOTS;
 
-const _: () = assert!(SPECTRUM_BINS % SLOTS == 0);
+const _: () = assert!(SPECTRUM_BINS.is_multiple_of(SLOTS));
 
 /// The block for one side analysis.
 pub fn side_block(bins: &[f32; SPECTRUM_BINS]) -> [f32; SLOTS] {

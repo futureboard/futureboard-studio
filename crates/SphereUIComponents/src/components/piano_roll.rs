@@ -7815,6 +7815,10 @@ mod note_hit_geometry_tests {
     /// A note showing a resize handle always keeps at least as much move zone
     /// beside it, so grabbing the body never becomes impossible.
     #[test]
+    #[allow(
+        clippy::assertions_on_constants,
+        reason = "documents the note hit-zone constants as a named test"
+    )]
     fn resize_handle_never_covers_the_whole_note() {
         assert!(NOTE_RESIZE_MIN_W - RESIZE_ZONE >= RESIZE_ZONE);
     }

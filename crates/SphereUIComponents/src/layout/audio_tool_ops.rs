@@ -214,7 +214,7 @@ impl StudioLayout {
                     timeline.begin_inspector_clip_gesture(&clip_id);
                     // The clip's tempo fits it to the project's: it plays one
                     // of its beats per project beat, and its length follows.
-                    let _ = timeline.state.fit_clip_to_source_bpm(&clip_id, bpm as f64);
+                    let _ = timeline.state.fit_clip_to_source_bpm(&clip_id, bpm);
                     if timeline.commit_inspector_clip_gesture(&clip_id, cx) {
                         timeline.mark_media_changed(cx);
                     }

@@ -99,7 +99,7 @@ pub fn installed_effects() -> Vec<InstalledEffect> {
         })
         .filter(|effect| !effect.path.is_empty())
         .collect();
-    effects.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    effects.sort_by_key(|effect| effect.name.to_lowercase());
     effects.dedup_by(|a, b| a.path == b.path && a.class_id == b.class_id);
     effects
 }

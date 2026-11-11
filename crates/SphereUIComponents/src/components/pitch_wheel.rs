@@ -797,7 +797,7 @@ fn fs_wheel(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             let mut bgra = Vec::with_capacity((unpadded * edge) as usize);
             for row in 0..edge {
                 let start = (row * padded) as usize;
-                for px in mapped[start..start + unpadded as usize].chunks_exact(4) {
+                for px in mapped[start..start + unpadded as usize].as_chunks::<4>().0 {
                     bgra.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
                 }
             }
@@ -879,7 +879,7 @@ mod tests {
         // Transparent at the corner, painted on the ring.
         assert_eq!(pixels[3], 0, "corner must stay transparent");
         assert!(
-            pixels.chunks_exact(4).any(|px| px[3] > 0),
+            pixels.as_chunks::<4>().0.iter().any(|px| px[3] > 0),
             "wheel painted nothing"
         );
     }

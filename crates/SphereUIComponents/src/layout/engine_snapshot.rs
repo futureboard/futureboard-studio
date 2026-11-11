@@ -1786,7 +1786,7 @@ mod tests {
     fn a_track_routed_to_a_bus_or_folder_reaches_the_engine_routed() {
         let mut state = TimelineState::default();
         let audio = state.create_audio_track();
-        let bus = state.create_bus_track(&[audio.clone()]);
+        let bus = state.create_bus_track(std::slice::from_ref(&audio));
         let member = state.create_audio_track();
         state.select_track(&member);
         state.selection.selected_track_ids = vec![member.clone()];

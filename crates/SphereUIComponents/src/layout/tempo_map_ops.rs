@@ -152,8 +152,8 @@ pub(crate) fn plan_tempo_map(
             })
         };
         let mut end = a + 1;
-        for b in a + 2..n {
-            if !fits(at, (beats[b] - at) / (b - a) as f64, b) {
+        for (b, &beat) in beats.iter().enumerate().skip(a + 2) {
+            if !fits(at, (beat - at) / (b - a) as f64, b) {
                 break;
             }
             end = b;

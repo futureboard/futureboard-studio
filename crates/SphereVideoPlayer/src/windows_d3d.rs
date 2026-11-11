@@ -449,10 +449,18 @@ impl FrameConverter {
                     "gpu conversion: unexpected readback pitch {pitch} for {row_bytes}-byte rows"
                 )));
             }
-            let source = std::slice::from_raw_parts(
-                mapped.pData as *const u8,
-                pitch * self.output_height as usize,
-            );
+            // D3D11 guarantees `RowPitch` bytes between rows but only
+            // `row_bytes` in the last one; a length of `pitch * height` would
+            // run past a mapping whose last row is not padded.
+            let height = self.output_height as usize;
+            let mapped_len = match height {
+                0 => 0,
+                h => pitch * (h - 1) + row_bytes,
+            };
+            // SAFETY: the mapping holds `pitch` bytes per row for every row
+            // but the last, which holds at least `row_bytes`; it stays mapped
+            // until `Unmap` below, and nothing else writes it meanwhile.
+            let source = std::slice::from_raw_parts(mapped.pData as *const u8, mapped_len);
             for row in 0..self.output_height as usize {
                 let from = row * pitch;
                 let to = row * row_bytes;
@@ -666,7 +674,7 @@ mod tests {
     fn nv12(width: usize, height: usize, luma: u8, cb: u8, cr: u8) -> (Vec<u8>, Vec<u8>) {
         let luma_plane = vec![luma; width * height];
         let mut chroma_plane = vec![0u8; width * height.div_ceil(2)];
-        for pair in chroma_plane.chunks_exact_mut(2) {
+        for pair in chroma_plane.as_chunks_mut::<2>().0 {
             pair[0] = cb;
             pair[1] = cr;
         }

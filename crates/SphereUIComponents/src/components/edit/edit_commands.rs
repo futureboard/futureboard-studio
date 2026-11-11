@@ -878,7 +878,7 @@ impl EditCommand {
                 }
             }
             EditCommand::EditMidiNotes { .. } => "Edit MIDI Notes",
-            EditCommand::TransformMidiNotes { label, .. } => *label,
+            EditCommand::TransformMidiNotes { label, .. } => label,
             EditCommand::MoveMidiNotesBetweenClips { .. } => "Move MIDI Notes to Clip",
             EditCommand::SetTrackAutomationLanes { .. } => "Edit Automation",
             EditCommand::SetControllerPoints { .. } => "Edit CC Lane",

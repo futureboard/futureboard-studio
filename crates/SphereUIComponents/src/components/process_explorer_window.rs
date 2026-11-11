@@ -227,7 +227,7 @@ impl ProcessExplorerWindow {
             .or_else(|| {
                 self.hosts
                     .values()
-                    .find(|host| host.instance_ids.iter().any(|id| *id == row.insert_id))
+                    .find(|host| host.instance_ids.contains(&row.insert_id))
             })
     }
 
@@ -864,10 +864,7 @@ fn host_row(host: &HostSample, rows: &[PluginProcessRow]) -> gpui::AnyElement {
     // reported its host's pid is still found that way.
     let names: Vec<&str> = rows
         .iter()
-        .filter(|row| {
-            host.instance_ids.iter().any(|id| *id == row.insert_id)
-                || row.host_pid == Some(host.pid)
-        })
+        .filter(|row| host.instance_ids.contains(&row.insert_id) || row.host_pid == Some(host.pid))
         .map(|row| row.plugin_name.as_str())
         .collect();
     let carried = match (names.is_empty(), host.instances()) {

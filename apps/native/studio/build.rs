@@ -679,7 +679,7 @@ fn hex_decode_32(hex: &str) -> Option<[u8; 32]> {
         return None;
     }
     let mut out = [0u8; 32];
-    for (index, pair) in bytes.chunks_exact(2).enumerate() {
+    for (index, pair) in bytes.as_chunks::<2>().0.iter().enumerate() {
         let high = (pair[0] as char).to_digit(16)?;
         let low = (pair[1] as char).to_digit(16)?;
         out[index] = ((high << 4) | low) as u8;

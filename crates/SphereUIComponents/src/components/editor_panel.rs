@@ -384,47 +384,6 @@ fn default_surface_tab(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_clip_on_an_ara_track_opens_the_ara_page() {
-        for current in EditorSurfaceTab::ALL {
-            assert_eq!(
-                default_surface_tab(true, true, true, current),
-                EditorSurfaceTab::Ara,
-                "from {current:?}"
-            );
-        }
-        assert_eq!(
-            default_surface_tab(false, true, true, EditorSurfaceTab::AudioEditor),
-            EditorSurfaceTab::Ara,
-            "a selected ARA track with no clip"
-        );
-    }
-
-    #[test]
-    fn plain_audio_opens_the_audio_editor_unless_tuning() {
-        assert_eq!(
-            default_surface_tab(true, false, true, EditorSurfaceTab::Ara),
-            EditorSurfaceTab::AudioEditor
-        );
-        assert_eq!(
-            default_surface_tab(true, false, true, EditorSurfaceTab::Voxtune),
-            EditorSurfaceTab::Voxtune
-        );
-    }
-
-    #[test]
-    fn with_voxtune_off_the_next_clip_opens_the_audio_editor() {
-        assert_eq!(
-            default_surface_tab(true, false, false, EditorSurfaceTab::Voxtune),
-            EditorSurfaceTab::AudioEditor
-        );
-    }
-}
-
 /// What the Editor tab shows while the MIDI editor is in its own window.
 fn midi_popped_out_panel(on_dock: Option<Rc<dyn Fn(&mut Window, &mut App)>>) -> impl IntoElement {
     use crate::theme::{radius, space, typography};
@@ -474,4 +433,45 @@ fn empty_editor_panel() -> impl IntoElement {
         .text_size(px(11.0))
         .text_color(Colors::text_muted())
         .child("Select a clip to edit")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_clip_on_an_ara_track_opens_the_ara_page() {
+        for current in EditorSurfaceTab::ALL {
+            assert_eq!(
+                default_surface_tab(true, true, true, current),
+                EditorSurfaceTab::Ara,
+                "from {current:?}"
+            );
+        }
+        assert_eq!(
+            default_surface_tab(false, true, true, EditorSurfaceTab::AudioEditor),
+            EditorSurfaceTab::Ara,
+            "a selected ARA track with no clip"
+        );
+    }
+
+    #[test]
+    fn plain_audio_opens_the_audio_editor_unless_tuning() {
+        assert_eq!(
+            default_surface_tab(true, false, true, EditorSurfaceTab::Ara),
+            EditorSurfaceTab::AudioEditor
+        );
+        assert_eq!(
+            default_surface_tab(true, false, true, EditorSurfaceTab::Voxtune),
+            EditorSurfaceTab::Voxtune
+        );
+    }
+
+    #[test]
+    fn with_voxtune_off_the_next_clip_opens_the_audio_editor() {
+        assert_eq!(
+            default_surface_tab(true, false, false, EditorSurfaceTab::Voxtune),
+            EditorSurfaceTab::AudioEditor
+        );
+    }
 }

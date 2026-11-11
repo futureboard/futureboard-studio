@@ -1358,7 +1358,7 @@ mod tests {
             ["Lead"],
             "a fixed channel, not per note"
         );
-        assert_eq!(route.edited_tracks(), [lead.clone()]);
+        assert_eq!(route.edited_tracks(), std::slice::from_ref(&lead));
 
         let disconnect = SoundfontMidiRoute::Disconnect {
             track_id: lead.clone(),

@@ -3566,6 +3566,25 @@ impl StudioLayout {
     }
 }
 
+/// Audioguard's line in the Performance window.
+fn audioguard_reading(status: &DirectAudio::audioguard::AudioguardStatus) -> String {
+    use DirectAudio::AudioguardLevel;
+    let mut parts = vec![status.level.as_str().to_string()];
+    if status.level != AudioguardLevel::Off {
+        parts.push(if status.rendering_ahead {
+            format!("rendering {:.0} ms ahead", status.ahead_ms)
+        } else {
+            "rendering in the callback".to_string()
+        });
+        parts.push(format!("{} ring misses", status.ring_misses));
+        parts.push(format!("{} output mutes", status.output_mutes));
+    }
+    if status.mmcss_active {
+        parts.push("MMCSS Pro Audio".to_string());
+    }
+    parts.join(" · ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3699,7 +3718,7 @@ mod tests {
     /// A default Audio track captures nothing until the user picks a bus.
     #[test]
     fn a_new_audio_track_defaults_to_no_input() {
-        use crate::components::add_track_dialog::{AddTrackKind, NO_AUDIO_INPUT_LABEL};
+        use crate::components::add_track_dialog::NO_AUDIO_INPUT_LABEL;
 
         let dialog = crate::components::add_track_dialog::AddTrackDialogState::open_for(0, false);
         assert_eq!(dialog.input_label, NO_AUDIO_INPUT_LABEL);
@@ -3711,7 +3730,7 @@ mod tests {
     /// A stale label from a removed bus becomes No Input, never another bus.
     #[test]
     fn a_selection_whose_bus_disappeared_falls_back_to_no_input() {
-        use crate::components::add_track_dialog::{AddTrackKind, NO_AUDIO_INPUT_LABEL};
+        use crate::components::add_track_dialog::NO_AUDIO_INPUT_LABEL;
 
         let mut dialog =
             crate::components::add_track_dialog::AddTrackDialogState::open_for(0, false);
@@ -3737,23 +3756,4 @@ mod tests {
             NO_AUDIO_INPUT_LABEL
         );
     }
-}
-
-/// Audioguard's line in the Performance window.
-fn audioguard_reading(status: &DirectAudio::audioguard::AudioguardStatus) -> String {
-    use DirectAudio::AudioguardLevel;
-    let mut parts = vec![status.level.as_str().to_string()];
-    if status.level != AudioguardLevel::Off {
-        parts.push(if status.rendering_ahead {
-            format!("rendering {:.0} ms ahead", status.ahead_ms)
-        } else {
-            "rendering in the callback".to_string()
-        });
-        parts.push(format!("{} ring misses", status.ring_misses));
-        parts.push(format!("{} output mutes", status.output_mutes));
-    }
-    if status.mmcss_active {
-        parts.push("MMCSS Pro Audio".to_string());
-    }
-    parts.join(" · ")
 }

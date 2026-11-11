@@ -169,10 +169,10 @@ pub fn refine_scale(chroma: &[f32; 12], key: u8, base: Scale) -> Scale {
         .copied()
         .map(|s| (s, covers(s)))
         .max_by(|a, b| a.1.total_cmp(&b.1));
-    if let Some((mode, cover)) = best_mode {
-        if cover > plain_cover + MODE_MARGIN {
-            return mode;
-        }
+    if let Some((mode, cover)) = best_mode
+        && cover > plain_cover + MODE_MARGIN
+    {
+        return mode;
     }
 
     // Pentatonic: the parent scale's fourth and seventh (major), or second

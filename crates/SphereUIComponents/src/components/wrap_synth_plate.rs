@@ -2607,6 +2607,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::assertions_on_constants,
+        reason = "documents the plate's layout constants as a named test"
+    )]
     fn the_columns_fill_the_well_and_the_deck() {
         // Four boxes across the well, 16 in from each side of its rim.
         let boxes = BOX_INSET * 2.0 + span(4);

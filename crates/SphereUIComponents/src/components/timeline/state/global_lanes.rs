@@ -285,9 +285,7 @@ impl TimelineState {
         &mut self,
         kind: GlobalLaneKind,
     ) -> Option<(GlobalLaneHeights, GlobalLaneHeights)> {
-        if self.global_lane_heights.get(kind).is_none() {
-            return None;
-        }
+        self.global_lane_heights.get(kind)?;
         let prev = self.global_lane_heights.clone();
         self.global_lane_heights.set(kind, None);
         Some((prev, self.global_lane_heights.clone()))

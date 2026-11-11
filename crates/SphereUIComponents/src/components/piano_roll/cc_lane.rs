@@ -129,6 +129,10 @@ fn grid_cc_samples(
 const CC_POINT_MERGE_EPS: f32 = 1.0e-3;
 
 /// Points with `lo <= beat <= hi`. `points` is stored in beat order.
+#[allow(
+    clippy::neg_cmp_op_on_partial_ord,
+    reason = "`!(lo <= hi)` is deliberately true when either bound is NaN, so a NaN range is empty"
+)]
 fn controller_points_in_beat_range(
     points: &[MidiControllerPoint],
     lo: f32,

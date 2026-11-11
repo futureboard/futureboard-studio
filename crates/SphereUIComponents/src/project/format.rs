@@ -4890,7 +4890,8 @@ mod tests {
         let project = decode_project(&bytes).expect("decode legacy positions");
         let mut timeline = crate::components::timeline::timeline_state::TimelineState::default();
 
-        super::super::apply_to_timeline(&project, &mut timeline);
+        let warnings = super::super::apply_to_timeline(&project, &mut timeline);
+        assert!(warnings.is_empty(), "load warnings: {warnings:?}");
 
         assert_eq!(timeline.song_text_events.len(), 1);
         assert_eq!(timeline.song_text_events[0].id, "negative");
@@ -5470,8 +5471,6 @@ mod tests {
     }
 
     // ââ Audio Connections codec ââââââââââââââââââââââââââââââââââââââââââ
-
-    use super::*;
 
     fn connection(id: &str, direction: &str, ports: &[u32]) -> ProjectAudioConnection {
         ProjectAudioConnection {

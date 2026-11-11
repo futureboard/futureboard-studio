@@ -2102,8 +2102,7 @@ fn build_grid(sig: &TimeSignatureMap, clip_start: f64, view: Viewport) -> Vec<Gr
     if right <= left || ppb <= 0.0 {
         return out;
     }
-    let mut bar = sig.bar_at_beat(left);
-    for _ in 0..4096 {
+    for bar in (sig.bar_at_beat(left)..).take(4096) {
         let start = sig.bar_start_beat(bar);
         if start > right {
             break;
@@ -2153,7 +2152,6 @@ fn build_grid(sig: &TimeSignatureMap, clip_start: f64, view: Viewport) -> Vec<Gr
                 }
             }
         }
-        bar += 1;
     }
     out
 }

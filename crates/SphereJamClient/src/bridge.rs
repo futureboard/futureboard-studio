@@ -381,7 +381,6 @@ pub fn datagram_frame_sizes(channels: usize, format: SampleFormat) -> Vec<i32> {
     [512, 256, 128, 64, 32]
         .into_iter()
         .filter(|size| (*size as usize) * per_frame <= DATAGRAM_PAYLOAD_BYTES)
-        .map(|size| size as i32)
         .collect()
 }
 

@@ -191,7 +191,7 @@ pub fn resample_spectrum_log(
     let min_hz = min_hz.max(MIN_HZ);
     let max_hz = max_hz.max(min_hz + 1.0);
     let mut out = vec![DB_FLOOR; count];
-    for i in 0..count {
+    for (i, slot) in out.iter_mut().enumerate() {
         let t0 = i as f32 / count as f32;
         let t1 = (i + 1) as f32 / count as f32;
         let hz0 = log_hz(t0, min_hz, max_hz);
@@ -200,13 +200,13 @@ pub fn resample_spectrum_log(
         let b1 = ((hz1 * fft / sr).ceil() as usize).min(bins);
         if b1 <= b0 + 1 {
             let bin_f = (hz0 + hz1) * 0.5 * fft / sr;
-            out[i] = interp_bin(magnitudes_db, bin_f);
+            *slot = interp_bin(magnitudes_db, bin_f);
         } else {
             let mut peak = DB_FLOOR;
             for mag in magnitudes_db.iter().take(b1).skip(b0) {
                 peak = peak.max(*mag);
             }
-            out[i] = peak;
+            *slot = peak;
         }
     }
     out

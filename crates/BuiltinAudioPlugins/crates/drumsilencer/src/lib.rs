@@ -222,10 +222,9 @@ impl MeterFrame {
     pub fn rack_slots<const N: usize>(&self) -> ([f32; N], [f32; N]) {
         let mut slot_in = [0.0; N];
         let mut slot_out = [0.0; N];
-        for band in 0..BANDS.min(N) {
-            slot_in[band] = self.drum_bands[band];
-            slot_out[band] = self.input_bands[band];
-        }
+        let bands = BANDS.min(N);
+        slot_in[..bands].copy_from_slice(&self.drum_bands[..bands]);
+        slot_out[..bands].copy_from_slice(&self.input_bands[..bands]);
         (slot_in, slot_out)
     }
 }

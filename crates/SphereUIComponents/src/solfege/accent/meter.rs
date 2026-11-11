@@ -221,6 +221,10 @@ impl Meter {
     /// bar position is taken modulo the bar length here rather than by the
     /// caller, so a caller cannot get the modulus wrong for a meter whose bar
     /// is not `numerator` beats long.
+    #[allow(
+        clippy::neg_cmp_op_on_partial_ord,
+        reason = "`!(bar > 0.0)` is deliberately true for a NaN bar length, which reads as off-grid"
+    )]
     pub fn beat_strength(&self, position_beats: f32) -> f32 {
         let bar = self.bar_beats;
         if !(bar > 0.0) || !position_beats.is_finite() {
@@ -253,6 +257,10 @@ impl Meter {
     /// strong: nothing articulates the strong beat, and the ear hears the note
     /// as displacing it. That is why "strong beat = accent" is not enough on
     /// its own — the emphasised note here is the one *before* the strong beat.
+    #[allow(
+        clippy::neg_cmp_op_on_partial_ord,
+        reason = "the negated comparisons are deliberately true for NaN, so a NaN duration or bar has no syncopation"
+    )]
     pub fn syncopation(&self, position_beats: f32, duration_beats: f32) -> f32 {
         let bar = self.bar_beats;
         if !(duration_beats > 0.0) || !(bar > 0.0) || !position_beats.is_finite() {

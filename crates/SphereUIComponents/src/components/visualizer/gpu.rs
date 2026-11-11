@@ -860,6 +860,21 @@ mod shared {
         device: &wgpu::Device,
         descriptor: &wgpu::TextureDescriptor<'_>,
     ) -> Result<(wgpu::Texture, SharedHandle), String> {
+        // The resource below is always a 2D, one-mip, one-sample BGRA8 render
+        // target. wgpu trusts `descriptor` to describe it, so anything else
+        // is refused here instead of becoming a texture wgpu misunderstands.
+        let usable = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC;
+        if descriptor.format != wgpu::TextureFormat::Bgra8Unorm
+            || descriptor.dimension != wgpu::TextureDimension::D2
+            || descriptor.mip_level_count != 1
+            || descriptor.sample_count != 1
+            || descriptor.size.depth_or_array_layers != 1
+            || !usable.contains(descriptor.usage)
+        {
+            return Err(format!(
+                "a shared visualizer texture must be a single 2D BGRA8 render target, not {descriptor:?}"
+            ));
+        }
         // SAFETY: the hal device is only used to create one resource and a
         // handle to it, while the wgpu device it belongs to is alive.
         let hal_device = unsafe { device.as_hal::<wgpu::hal::api::Dx12>() }
@@ -903,7 +918,8 @@ mod shared {
             .map_err(|error| format!("CreateSharedHandle: {error}"))?;
         let handle = SharedHandle(handle);
         // SAFETY: the resource matches `descriptor` (format, size, one mip,
-        // one sample) and is handed to wgpu, which owns it from here.
+        // one sample — checked on entry) and is handed to wgpu, which owns it
+        // from here.
         let hal_texture = unsafe {
             wgpu::hal::dx12::Device::texture_from_raw(
                 resource,

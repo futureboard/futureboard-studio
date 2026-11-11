@@ -192,11 +192,19 @@ impl SharedRegionSink {
 
         if done == last {
             bridge.xrun_count.fetch_add(1, Ordering::Relaxed);
-            None
-        } else {
-            self.last_read_seq.store(done, Ordering::Relaxed);
-            Some(done)
+            return None;
         }
+        // Only the answer to the latest request is the engine's to read. A
+        // `done` behind `request_seq` means another request is outstanding,
+        // and the host is writing `audio_out` for it right now: reading it
+        // would race the host. Skipped, not consumed: the latest answer is
+        // read once it lands.
+        if done != bridge.request_seq.load(Ordering::Acquire) {
+            bridge.xrun_count.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        self.last_read_seq.store(done, Ordering::Relaxed);
+        Some(done)
     }
 }
 
@@ -352,10 +360,20 @@ impl PluginBridgeSink for SharedRegionSink {
     }
 
     fn write_input(&self, in_l: &[f32], in_r: &[f32], frames: usize) {
-        // SAFETY: the engine owns `audio_in` only after the host published
-        // `done_seq` for the previous request (consumed by `read_output` above
-        // in `apply_external_bridge_insert_block`) and before this side bumps
-        // `request_seq` again.
+        // The host reads `audio_in` until it answers the request: writing it
+        // meanwhile would race that read. The device callback never does (it
+        // writes only once the host answered); this makes any other caller —
+        // an export priming the sink — wait its turn instead of racing.
+        if self.request_in_flight() {
+            self.region
+                .bridge()
+                .xrun_count
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        // SAFETY: no request is in flight (checked above), so the host is not
+        // reading `audio_in`, and it will not until `request_block` below
+        // publishes the next request.
         unsafe {
             self.region
                 .bridge()
@@ -406,6 +424,12 @@ impl PluginBridgeSink for SharedRegionSink {
 
     fn request_block(&self, frames: u32) {
         let bridge = self.region.bridge();
+        // One request at a time: a second one would let the host start on it
+        // while the engine still reads the first answer.
+        if self.request_in_flight() {
+            bridge.xrun_count.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         bridge
             .block_frames
             .store(frames.min(MAX_BLOCK_FRAMES as u32), Ordering::Relaxed);
@@ -477,6 +501,8 @@ mod tests {
             interleaved[i * 2] = i as f32;
             interleaved[i * 2 + 1] = -(i as f32);
         }
+        // The engine asks for a block; the host answers it.
+        sink.request_block(frames as u32);
         // SAFETY: single-threaded test; no concurrent reader.
         unsafe { region.bridge().audio_out.write_interleaved(&interleaved) };
         // The host publishes the produced block by bumping `done_seq`.
@@ -496,11 +522,6 @@ mod tests {
         let again = sink.read_output(&mut out_l[..frames], &mut out_r[..frames], frames);
         assert_eq!(again, 0);
         assert_eq!(region.bridge().xrun_count.load(Ordering::Relaxed), 1);
-        // Once the host produces the next block, reads resume.
-        region.bridge().done_seq.store(2, Ordering::Release);
-        let fresh = sink.read_output(&mut out_l[..frames], &mut out_r[..frames], frames);
-        assert_eq!(fresh, frames);
-
         // request_block sets block_frames and advances request_seq (the host's
         // service loop fires when request_seq != done_seq).
         let before = region.bridge().request_seq.load(Ordering::Acquire);
@@ -513,6 +534,54 @@ mod tests {
             region.bridge().request_seq.load(Ordering::Acquire),
             before + 1
         );
+        // Once the host answers it, reads resume.
+        region.bridge().done_seq.store(2, Ordering::Release);
+        let fresh = sink.read_output(&mut out_l[..frames], &mut out_r[..frames], frames);
+        assert_eq!(fresh, frames);
+    }
+
+    /// One request at a time: while the host works on one, the engine neither
+    /// writes its input, asks again, nor reads an older answer — each of those
+    /// would touch `audio_in` / `audio_out` while the host does.
+    #[test]
+    fn a_request_in_flight_keeps_the_engine_off_the_buffers() {
+        let region = Arc::new(SharedAudioRegion::new_in_process());
+        region.bridge().init_header(48_000, 4, 2);
+        let sink = SharedRegionSink::new(region.clone());
+        let bridge = region.bridge();
+        let frames = 4usize;
+
+        sink.request_block(frames as u32);
+        assert!(sink.request_in_flight());
+        // A second request is refused while the first is out.
+        sink.request_block(frames as u32);
+        assert_eq!(bridge.request_seq.load(Ordering::Acquire), 1);
+        // So is writing the input the host is reading.
+        let marker = [9.0f32; 4];
+        sink.write_input(&marker, &marker, frames);
+        let mut seen = [0.0f32; 8];
+        // SAFETY: single-threaded test; the host side is simulated here.
+        unsafe { bridge.audio_in.read_interleaved(&mut seen, frames * 2) };
+        assert!(
+            seen.iter().all(|&s| s != 9.0),
+            "input written while the host owns it"
+        );
+
+        // An answer to an older request while a newer one is out (two
+        // requests from an earlier, unguarded caller) is not read: the host
+        // is writing `audio_out` for the newer one.
+        bridge.request_seq.store(3, Ordering::Release);
+        bridge.done_seq.store(2, Ordering::Release);
+        let mut out_l = [0.0f32; 4];
+        let mut out_r = [0.0f32; 4];
+        assert_eq!(sink.read_output(&mut out_l, &mut out_r, frames), 0);
+        // The answer to the latest request is.
+        bridge.done_seq.store(3, Ordering::Release);
+        assert_eq!(sink.read_output(&mut out_l, &mut out_r, frames), frames);
+        // Answered: the engine may write and ask again.
+        sink.write_input(&marker, &marker, frames);
+        sink.request_block(frames as u32);
+        assert_eq!(bridge.request_seq.load(Ordering::Acquire), 4);
     }
 
     /// Manual scheduler/xrun stress probe. It drives the exact shared-region
@@ -637,6 +706,8 @@ mod tests {
             0.0f32, 0.0, 1.0, 2.0, // frame 0
             0.0, 0.0, 3.0, 4.0, // frame 1
         ];
+        // The engine asks for the block the host then answers.
+        sink.request_block(frames as u32);
         // SAFETY: single-threaded test; no concurrent reader.
         unsafe { region.bridge().audio_out.write_interleaved(&interleaved) };
         region.bridge().done_seq.store(1, Ordering::Release);
@@ -674,6 +745,8 @@ mod tests {
             0.0f32, 0.0, 1.0, 2.0, // frame 0: main silent, aux loud
             0.0, 0.0, 3.0, 4.0, // frame 1
         ];
+        // The engine asks for the block the host then answers.
+        sink.request_block(frames as u32);
         // SAFETY: single-threaded test; no concurrent reader.
         unsafe { region.bridge().audio_out.write_interleaved(&interleaved) };
         region.bridge().done_seq.store(1, Ordering::Release);

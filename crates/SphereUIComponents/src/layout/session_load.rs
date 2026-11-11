@@ -13,7 +13,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use gpui::{AppContext, BorrowAppContext, Context, Window};
+use gpui::{BorrowAppContext, Context};
 
 use crate::app_state::{AppMode, AppSessionGate, ProjectState, SessionInstallStatus};
 use crate::loading_session::{
@@ -40,7 +40,6 @@ fn project_load_warning_to_routing_warning(
 }
 use crate::components::message_box_dialog::{
     open_message_box_window, MessageBoxKind, MessageBoxOptions, MessageBoxResponseCb,
-    MessageBoxResult,
 };
 use crate::session_shutdown::{
     PluginUnloadTarget, SessionLifecycleStep, SessionShutdownReason, SessionShutdownSnapshot,

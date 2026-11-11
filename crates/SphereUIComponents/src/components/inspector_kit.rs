@@ -946,6 +946,10 @@ mod tests {
     /// control past the panel edge, which is the failure this floor exists to
     /// prevent — so the two must stay ordered.
     #[test]
+    #[allow(
+        clippy::assertions_on_constants,
+        reason = "documents the label-column constants as a named test"
+    )]
     fn label_column_can_shrink_before_it_truncates() {
         assert!(LABEL_COL_MIN < LABEL_COL);
         assert!(LABEL_COL_MIN > 0.0);
@@ -965,6 +969,10 @@ mod tests {
     /// Density contract: rows and their controls come off the shared ladder,
     /// and a row never claims more height than the control it wraps.
     #[test]
+    #[allow(
+        clippy::assertions_on_constants,
+        reason = "documents the density-ladder constants as a named test"
+    )]
     fn row_stays_denser_than_the_control_it_holds() {
         assert!(ROW_MIN_HEIGHT <= size::COMFORTABLE);
         assert!(ICON < ICON_HEADER);

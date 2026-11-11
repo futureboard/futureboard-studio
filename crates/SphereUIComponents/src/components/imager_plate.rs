@@ -472,7 +472,7 @@ fn correlation_text(value: f32) -> String {
 /// while it is silent.
 fn balance_of(image: &SpherePluginHost::audio_bridge::StereoImageFrame) -> Option<f32> {
     let (mut left, mut right) = (0.0f32, 0.0f32);
-    for pair in image.scope.chunks_exact(2) {
+    for pair in image.scope.as_chunks::<2>().0 {
         left += pair[0] * pair[0];
         right += pair[1] * pair[1];
     }
@@ -1749,7 +1749,7 @@ fn paint_scope(window: &mut Window, cx: &mut App, bounds: Bounds<Pixels>, live: 
     for (age, frame) in live.image_frames().enumerate() {
         let alpha = 0.2 + 0.75 * (age + 1) as f32 / frames as f32;
         let tone = color_a(ACCENT, alpha);
-        for pair in frame.scope.chunks_exact(2) {
+        for pair in frame.scope.as_chunks::<2>().0 {
             let (l, r) = (pair[0] * gain, pair[1] * gain);
             let side = ((l - r) * std::f32::consts::FRAC_1_SQRT_2).clamp(-1.0, 1.0);
             let mid = ((l + r) * std::f32::consts::FRAC_1_SQRT_2).clamp(-1.0, 1.0);
@@ -2095,12 +2095,12 @@ mod tests {
             scope: [0.0; SpherePluginHost::audio_bridge::IMAGE_SCOPE_POINTS * 2],
         };
         assert_eq!(balance_of(&frame), None);
-        for pair in frame.scope.chunks_exact_mut(2) {
+        for pair in frame.scope.as_chunks_mut::<2>().0 {
             pair[0] = 0.5;
             pair[1] = 0.5;
         }
         assert_eq!(balance_text(balance_of(&frame).unwrap()), "C");
-        for pair in frame.scope.chunks_exact_mut(2) {
+        for pair in frame.scope.as_chunks_mut::<2>().0 {
             pair[1] = 0.0;
         }
         assert_eq!(balance_text(balance_of(&frame).unwrap()), "L 100");

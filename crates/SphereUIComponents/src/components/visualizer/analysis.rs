@@ -301,9 +301,9 @@ impl Analyzer {
             self.ll = flush(coeff * self.ll + take * l * l);
             self.rr = flush(coeff * self.rr + take * r * r);
             let peaks = [l.abs(), r.abs()];
-            for side in 0..2 {
-                if peaks[side] >= self.peak[side] {
-                    self.peak[side] = peaks[side];
+            for (side, &peak) in peaks.iter().enumerate() {
+                if peak >= self.peak[side] {
+                    self.peak[side] = peak;
                     self.peak_hold_age[side] = 0.0;
                 }
             }

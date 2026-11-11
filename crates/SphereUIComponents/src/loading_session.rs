@@ -1807,52 +1807,6 @@ fn untitled_recovery_can_open(lifecycle_busy: bool, mode: Option<AppMode>) -> bo
     !lifecycle_busy && matches!(mode, Some(AppMode::Welcome | AppMode::Studio))
 }
 
-#[cfg(test)]
-mod untitled_recovery_tests {
-    use super::*;
-
-    #[test]
-    fn untitled_recovery_opens_from_welcome_or_the_studio_only_when_idle() {
-        assert!(untitled_recovery_can_open(false, Some(AppMode::Welcome)));
-        assert!(untitled_recovery_can_open(false, Some(AppMode::Studio)));
-        assert!(!untitled_recovery_can_open(true, Some(AppMode::Studio)));
-        assert!(!untitled_recovery_can_open(true, Some(AppMode::Welcome)));
-        assert!(!untitled_recovery_can_open(
-            false,
-            Some(AppMode::LoadingSession)
-        ));
-        assert!(!untitled_recovery_can_open(
-            false,
-            Some(AppMode::LoadFailed)
-        ));
-        assert!(!untitled_recovery_can_open(false, None));
-    }
-
-    /// Only an explicit Open Saved remembers the autosave as declined.
-    /// Escape or the close button opens the saved project without
-    /// answering, so the autosave is offered again next time; and a
-    /// dismissal never recovers.
-    #[test]
-    fn only_an_explicit_open_saved_declines_the_autosave() {
-        assert_eq!(
-            titled_recovery_answer(0, false),
-            TitledRecoveryAnswer::Recover
-        );
-        assert_eq!(
-            titled_recovery_answer(1, false),
-            TitledRecoveryAnswer::Decline
-        );
-        assert_eq!(
-            titled_recovery_answer(1, true),
-            TitledRecoveryAnswer::OpenSaved
-        );
-        assert_eq!(
-            titled_recovery_answer(0, true),
-            TitledRecoveryAnswer::OpenSaved
-        );
-    }
-}
-
 /// Begin a pre-studio project open. Shows the loading window immediately and
 /// only invokes `on_success` after decode/validate succeed.
 pub fn begin_project_session_load(
@@ -2069,4 +2023,50 @@ fn open_loading_session_window(
         cx.new(|cx| LoadingSessionWindow::new_for_load(session_name, transaction, cx))
     })
     .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod untitled_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn untitled_recovery_opens_from_welcome_or_the_studio_only_when_idle() {
+        assert!(untitled_recovery_can_open(false, Some(AppMode::Welcome)));
+        assert!(untitled_recovery_can_open(false, Some(AppMode::Studio)));
+        assert!(!untitled_recovery_can_open(true, Some(AppMode::Studio)));
+        assert!(!untitled_recovery_can_open(true, Some(AppMode::Welcome)));
+        assert!(!untitled_recovery_can_open(
+            false,
+            Some(AppMode::LoadingSession)
+        ));
+        assert!(!untitled_recovery_can_open(
+            false,
+            Some(AppMode::LoadFailed)
+        ));
+        assert!(!untitled_recovery_can_open(false, None));
+    }
+
+    /// Only an explicit Open Saved remembers the autosave as declined.
+    /// Escape or the close button opens the saved project without
+    /// answering, so the autosave is offered again next time; and a
+    /// dismissal never recovers.
+    #[test]
+    fn only_an_explicit_open_saved_declines_the_autosave() {
+        assert_eq!(
+            titled_recovery_answer(0, false),
+            TitledRecoveryAnswer::Recover
+        );
+        assert_eq!(
+            titled_recovery_answer(1, false),
+            TitledRecoveryAnswer::Decline
+        );
+        assert_eq!(
+            titled_recovery_answer(1, true),
+            TitledRecoveryAnswer::OpenSaved
+        );
+        assert_eq!(
+            titled_recovery_answer(0, true),
+            TitledRecoveryAnswer::OpenSaved
+        );
+    }
 }

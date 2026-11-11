@@ -6454,11 +6454,14 @@ mod producer_plan_tests {
         )
     }
 
-    fn insert<T>(map: &Arc<Mutex<Arc<HashMap<String, Arc<T>>>>>, id: &str, value: Arc<T>) {
+    /// The copy-on-write id map shape every shared processor table uses.
+    type SharedMap<T> = Arc<Mutex<Arc<HashMap<String, Arc<T>>>>>;
+
+    fn insert<T>(map: &SharedMap<T>, id: &str, value: Arc<T>) {
         Arc::make_mut(&mut map.lock().unwrap()).insert(id.to_string(), value);
     }
 
-    fn remove<T>(map: &Arc<Mutex<Arc<HashMap<String, Arc<T>>>>>, id: &str) {
+    fn remove<T>(map: &SharedMap<T>, id: &str) {
         Arc::make_mut(&mut map.lock().unwrap()).remove(id);
     }
 
@@ -7715,10 +7718,11 @@ mod platform {
                 cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
                 ..Default::default()
             };
-            if thread_id != 0 && GetGUIThreadInfo(thread_id, &mut info).is_ok() {
-                if !info.hwndFocus.is_invalid() {
-                    return info.hwndFocus;
-                }
+            if thread_id != 0
+                && GetGUIThreadInfo(thread_id, &mut info).is_ok()
+                && !info.hwndFocus.is_invalid()
+            {
+                return info.hwndFocus;
             }
             foreground
         }
@@ -8622,41 +8626,6 @@ mod platform {
         }
     }
 
-    #[cfg(test)]
-    mod transport_key_tests {
-        use super::is_text_entry_class;
-
-        #[test]
-        fn text_controls_keep_the_space_key() {
-            for class in [
-                "Edit",
-                "EDIT",
-                "ComboBox",
-                "RichEdit20W",
-                "RICHEDIT50W",
-                "Windows.UI.Core.CoreWindow",
-                "JUCE_TextBox_1",
-            ] {
-                assert!(
-                    is_text_entry_class(class),
-                    "{class} owns a caret; Space must not start playback"
-                );
-            }
-        }
-
-        #[test]
-        fn plugin_view_classes_hand_the_space_key_to_the_transport() {
-            for class in [
-                "JUCE_1",
-                "VSTPluginEditorWindow",
-                "FutureboardDauxVst3EditorContent",
-                "Static",
-            ] {
-                assert!(!is_text_entry_class(class), "{class} is not a text control");
-            }
-        }
-    }
-
     /// Block until this thread's message queue has input or `timeout_ms`
     /// elapses. Returns `true` when woken by input. This replaces the old
     /// unconditional `sleep(8ms)` poll: the loop now idles in the kernel and
@@ -9141,6 +9110,41 @@ mod platform {
             }
             if top != 0 {
                 let _ = DestroyWindow(hwnd_from(top));
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod transport_key_tests {
+        use super::is_text_entry_class;
+
+        #[test]
+        fn text_controls_keep_the_space_key() {
+            for class in [
+                "Edit",
+                "EDIT",
+                "ComboBox",
+                "RichEdit20W",
+                "RICHEDIT50W",
+                "Windows.UI.Core.CoreWindow",
+                "JUCE_TextBox_1",
+            ] {
+                assert!(
+                    is_text_entry_class(class),
+                    "{class} owns a caret; Space must not start playback"
+                );
+            }
+        }
+
+        #[test]
+        fn plugin_view_classes_hand_the_space_key_to_the_transport() {
+            for class in [
+                "JUCE_1",
+                "VSTPluginEditorWindow",
+                "FutureboardDauxVst3EditorContent",
+                "Static",
+            ] {
+                assert!(!is_text_entry_class(class), "{class} is not a text control");
             }
         }
     }

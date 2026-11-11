@@ -1205,7 +1205,6 @@ impl ResourceSampler {
             }
         }
 
-        drop(sample);
         self.counters = counters;
         ResourceUsage {
             studio,

@@ -105,11 +105,8 @@ struct BounceShared {
 fn isolate_for_bounce(snapshot: &mut EngineProjectSnapshot, targets: &[BounceTarget]) {
     let target = |id: &str| targets.iter().find(|t| t.track_id == id);
     snapshot.clips.retain(|clip| {
-        target(&clip.track_id).is_some_and(|t| {
-            t.clip_ids
-                .as_ref()
-                .is_none_or(|ids| ids.iter().any(|id| *id == clip.id))
-        })
+        target(&clip.track_id)
+            .is_some_and(|t| t.clip_ids.as_ref().is_none_or(|ids| ids.contains(&clip.id)))
     });
     snapshot
         .midi_clips
@@ -799,6 +796,10 @@ fn close_dialog(dialog: Option<&WindowHandle<ProgressDialogWindow>>, cx: &mut gp
 }
 
 /// What `kind` renders for `track_ids`, or why it cannot.
+#[allow(
+    clippy::neg_cmp_op_on_partial_ord,
+    reason = "`!(end > start)` is deliberately true for NaN, so a track with a NaN range is skipped"
+)]
 fn bounce_targets(
     kind: BounceKind,
     state: &TimelineState,

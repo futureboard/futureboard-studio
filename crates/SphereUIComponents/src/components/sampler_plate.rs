@@ -849,6 +849,10 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(
+        clippy::assertions_on_constants,
+        reason = "documents the plate's layout constants as a named test"
+    )]
     fn the_deck_fits_between_the_well_and_the_keyboard() {
         assert!(DECK_TOP < instrument_plate::DECK_BOTTOM);
         // The deck is as wide as the well.

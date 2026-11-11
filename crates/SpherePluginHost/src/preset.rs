@@ -407,7 +407,8 @@ pub fn state_preset_owner(path: &Path) -> Option<String> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
     use std::time::SystemTime;
-    static SEEN: OnceLock<Mutex<HashMap<PathBuf, (SystemTime, Option<String>)>>> = OnceLock::new();
+    type OwnerCache = HashMap<PathBuf, (SystemTime, Option<String>)>;
+    static SEEN: OnceLock<Mutex<OwnerCache>> = OnceLock::new();
     let modified = fs::metadata(path).and_then(|meta| meta.modified()).ok()?;
     let seen = SEEN.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some((when, owner)) = seen.lock().ok()?.get(path) {

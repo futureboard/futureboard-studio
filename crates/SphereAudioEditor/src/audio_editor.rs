@@ -353,6 +353,10 @@ fn tools_menu_options() -> Vec<DropdownOption> {
     ]
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a flat GPUI element builder; each argument is one visual property"
+)]
 fn dropdown_button(
     id: &'static str,
     prefix: &'static str,

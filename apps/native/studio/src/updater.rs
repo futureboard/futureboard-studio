@@ -293,8 +293,8 @@ fn decode_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
     }
     let nibble = |byte: u8| (byte as char).to_digit(16).map(|value| value as u8);
     let mut out = [0_u8; N];
-    for (slot, pair) in out.iter_mut().zip(text.chunks_exact(2)) {
-        *slot = (nibble(pair[0])? << 4) | nibble(pair[1])?;
+    for (slot, &[high, low]) in out.iter_mut().zip(text.as_chunks::<2>().0) {
+        *slot = (nibble(high)? << 4) | nibble(low)?;
     }
     Some(out)
 }

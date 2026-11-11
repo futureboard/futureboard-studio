@@ -515,9 +515,7 @@ impl JamApp {
                             .child(text_field_with_callbacks(
                                 &self.link_input,
                                 false,
-                                bind_mouse_selection(cx.entity().clone(), |this| {
-                                    &mut this.link_input
-                                }),
+                                bind_mouse_selection(cx.entity(), |this| &mut this.link_input),
                             )),
                     )
                     .child(fb_button(

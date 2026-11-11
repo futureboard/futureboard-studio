@@ -223,9 +223,9 @@ impl Room {
                                     if d > limit {
                                         continue;
                                     }
-                                    let hits_x = (nx - u as i32).unsigned_abs() + nx.unsigned_abs();
-                                    let hits_y = (ny - v as i32).unsigned_abs() + ny.unsigned_abs();
-                                    let hits_floor = (nz - w as i32).unsigned_abs();
+                                    let hits_x = (nx - u).unsigned_abs() + nx.unsigned_abs();
+                                    let hits_y = (ny - v).unsigned_abs() + ny.unsigned_abs();
+                                    let hits_floor = (nz - w).unsigned_abs();
                                     let hits_ceiling = nz.unsigned_abs();
                                     let order = hits_x + hits_y + hits_floor + hits_ceiling;
                                     // Which way the sound left the loudspeaker:

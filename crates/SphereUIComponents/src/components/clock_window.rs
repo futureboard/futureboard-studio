@@ -260,7 +260,7 @@ impl ClockWindow {
         ClockReading {
             position_beats,
             position_seconds,
-            bpm: state.effective_bpm_at_playhead() as f64,
+            bpm: state.effective_bpm_at_playhead(),
             ts_num: u32::from(signature.numerator.max(1)),
             ts_den: u32::from(signature.denominator.max(1)),
             playing: state.transport.playing,

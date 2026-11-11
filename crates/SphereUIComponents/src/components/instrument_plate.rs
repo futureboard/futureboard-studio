@@ -405,7 +405,7 @@ pub fn keyboard(k: Keyboard<'_>, s: f32) -> AnyElement {
             black,
             k.active.contains(&pitch),
             (k.mark)(pitch),
-            k.mapped.map_or(true, |mapped| mapped(pitch)),
+            k.mapped.is_none_or(|mapped| mapped(pitch)),
             k.playable,
             k.accent,
             s,
@@ -616,6 +616,10 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(
+        clippy::assertions_on_constants,
+        reason = "documents the plate's layout constants as a named test"
+    )]
     fn the_strip_fits_under_the_deck_and_on_the_plate() {
         assert!(DECK_BOTTOM < KEYBOARD_TOP);
         assert!(KEYBOARD_TOP + KEYBOARD_H <= PLATE_H);

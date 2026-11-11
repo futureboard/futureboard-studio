@@ -117,7 +117,7 @@ impl PatchedFile {
 
     fn wav(path: &Path) -> std::io::Result<Self> {
         use std::io::{Read, Seek, SeekFrom};
-        let mut file = std::fs::File::open(path)?;
+        let file = std::fs::File::open(path)?;
         let len = file.metadata()?.len();
         let mut source = Self {
             file,

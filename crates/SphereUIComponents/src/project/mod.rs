@@ -3685,7 +3685,8 @@ mod v33_routing_adapter_tests {
         let bytes = crate::project::format::encode_project(&FutureboardProject::from(&tl));
         let reopened = crate::project::format::decode_project(&bytes).expect("decode");
         let mut loaded = TimelineState::default();
-        apply_to_timeline(&reopened, &mut loaded);
+        let warnings = apply_to_timeline(&reopened, &mut loaded);
+        assert!(warnings.is_empty(), "load warnings: {warnings:?}");
 
         assert_eq!(
             loaded
@@ -3734,10 +3735,9 @@ mod v33_routing_adapter_tests {
     fn a_migrated_project_saves_as_v34_and_does_not_migrate_again() {
         use crate::components::timeline::timeline_state::TimelineState;
 
-        let mut v33 = FutureboardProject::new("legacy");
         let mut tl_seed = TimelineState::default();
         let track_id = tl_seed.create_audio_track();
-        v33 = FutureboardProject::from(&tl_seed);
+        let mut v33 = FutureboardProject::from(&tl_seed);
         // Force the v33 shape: a legacy combined route, no registry.
         v33.tracks[0].routing.audio_input_connection_id = None;
         v33.tracks[0].routing.legacy_input = Some(V33TrackInputRouting::AudioDeviceChannels {
@@ -4429,7 +4429,8 @@ mod group_track_persistence_tests {
         let bytes = encode_project(&FutureboardProject::from(&state));
         let decoded = decode_project(&bytes).expect("decode");
         let mut restored = TimelineState::default();
-        apply_to_timeline(&decoded, &mut restored);
+        let warnings = apply_to_timeline(&decoded, &mut restored);
+        assert!(warnings.is_empty(), "load warnings: {warnings:?}");
 
         assert_eq!(
             restored
@@ -4464,7 +4465,8 @@ mod group_track_persistence_tests {
 
         let bytes = encode_project(&FutureboardProject::from(&state));
         let mut restored = TimelineState::default();
-        apply_to_timeline(&decode_project(&bytes).expect("decode"), &mut restored);
+        let warnings = apply_to_timeline(&decode_project(&bytes).expect("decode"), &mut restored);
+        assert!(warnings.is_empty(), "load warnings: {warnings:?}");
 
         let tree = restored.group_tree();
         let depth = |id: &str| tree.depth[restored.tracks.iter().position(|t| t.id == id).unwrap()];
@@ -4553,7 +4555,8 @@ mod inspector_property_persistence_tests {
         let bytes = encode_project(&FutureboardProject::from(&state));
         let decoded = decode_project(&bytes).expect("decode");
         let mut restored = TimelineState::default();
-        apply_to_timeline(&decoded, &mut restored);
+        let warnings = apply_to_timeline(&decoded, &mut restored);
+        assert!(warnings.is_empty(), "load warnings: {warnings:?}");
 
         let track = restored.find_track(&track_id).expect("track");
         assert!((track.pan - -0.42).abs() < 1.0e-6);
@@ -4596,7 +4599,8 @@ mod articulation_persistence_tests {
         let bytes = encode_project(&project);
         let decoded = decode_project(&bytes).expect("decode");
         let mut restored = TimelineState::default();
-        apply_to_timeline(&decoded, &mut restored);
+        let warnings = apply_to_timeline(&decoded, &mut restored);
+        assert!(warnings.is_empty(), "load warnings: {warnings:?}");
 
         let notes = restored.midi_clip_notes(&clip_id).expect("notes restored");
         assert_eq!(notes.len(), 2);
@@ -4694,7 +4698,8 @@ mod vsti_substrip_persistence_tests {
         let decoded = decode_project(&bytes).expect("decode");
 
         let mut restored = TimelineState::default();
-        apply_to_timeline(&decoded, &mut restored);
+        let warnings = apply_to_timeline(&decoded, &mut restored);
+        assert!(warnings.is_empty(), "load warnings: {warnings:?}");
 
         let child = restored
             .tracks
@@ -4757,7 +4762,8 @@ mod vsti_substrip_persistence_tests {
         let decoded = decode_project(&bytes).expect("decode");
 
         let mut restored = TimelineState::default();
-        apply_to_timeline(&decoded, &mut restored);
+        let warnings = apply_to_timeline(&decoded, &mut restored);
+        assert!(warnings.is_empty(), "load warnings: {warnings:?}");
 
         let track = restored
             .tracks
@@ -4816,7 +4822,8 @@ mod vsti_substrip_persistence_tests {
         let bytes = encode_project(&FutureboardProject::from(&state));
         let decoded = decode_project(&bytes).expect("decode");
         let mut restored = TimelineState::default();
-        apply_to_timeline(&decoded, &mut restored);
+        let warnings = apply_to_timeline(&decoded, &mut restored);
+        assert!(warnings.is_empty(), "load warnings: {warnings:?}");
 
         let fx = restored
             .tracks
@@ -4874,7 +4881,8 @@ mod vsti_substrip_persistence_tests {
         let bytes = encode_project(&FutureboardProject::from(&state));
         let decoded = decode_project(&bytes).expect("decode");
         let mut restored = TimelineState::default();
-        apply_to_timeline(&decoded, &mut restored);
+        let warnings = apply_to_timeline(&decoded, &mut restored);
+        assert!(warnings.is_empty(), "load warnings: {warnings:?}");
 
         let fx = restored
             .tracks
@@ -4930,7 +4938,8 @@ mod vsti_substrip_persistence_tests {
         let bytes = encode_project(&FutureboardProject::from(&state));
         let decoded = decode_project(&bytes).expect("decode");
         let mut restored = TimelineState::default();
-        apply_to_timeline(&decoded, &mut restored);
+        let warnings = apply_to_timeline(&decoded, &mut restored);
+        assert!(warnings.is_empty(), "load warnings: {warnings:?}");
 
         let fx = restored
             .tracks

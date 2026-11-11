@@ -88,14 +88,17 @@ impl std::error::Error for GraphValidationError {}
 pub struct RuntimeAudioGraph {
     pub nodes: Vec<AudioGraphNode>,
     /// Pass-1 source track indices (audio / midi / instrument), array order.
-    pub pass1_source_indices: Vec<usize>,
+    /// Each track once: the planner checks it, and the parallel chain pass
+    /// relies on it. Crate-private so nothing outside can break that.
+    pub(crate) pass1_source_indices: Vec<usize>,
     /// Source tracks that can produce audio without live input in the current
     /// runtime snapshot. Filled after clip and MIDI routes are resolved.
     pub active_source_mask: Vec<bool>,
     /// Round-robin cursor for bounded bridge-latency observation.
     pub latency_scan_cursor: usize,
-    /// Pass-2 routing tracks in topological order (bus / return).
-    pub pass2_routing_indices: Vec<usize>,
+    /// Pass-2 routing tracks in topological order (bus / return). Each track
+    /// once, as for `pass1_source_indices`.
+    pub(crate) pass2_routing_indices: Vec<usize>,
     pub master_index: Option<usize>,
     pub rejected_routes: Vec<GraphRouteIssue>,
     /// Scratch for the render pass: the tracks whose insert chains run in the
@@ -316,6 +319,22 @@ pub fn plan_runtime_audio_graph(
     }
 
     let pass2_routing_indices = topological_sort_routing(&routing_indices, &adjacency);
+
+    // The render pass hands each listed track to a pool thread as `&mut`
+    // (`render::chains`), which is sound only if no track is listed twice.
+    // Checked here, on the control thread, once per plan, in release too.
+    for (pass, indices) in [
+        ("pass 1", &pass1_source_indices),
+        ("pass 2", &pass2_routing_indices),
+    ] {
+        let mut seen = vec![false; tracks.len()];
+        for &index in indices.iter() {
+            assert!(
+                index < seen.len() && !std::mem::replace(&mut seen[index], true),
+                "audio graph {pass} lists track {index} twice or out of range"
+            );
+        }
+    }
 
     Ok(RuntimeAudioGraph {
         nodes,

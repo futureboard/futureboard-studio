@@ -16,17 +16,13 @@ pub type Tick = f32;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ExpressionInterpolation {
+    #[default]
     Linear,
     Step,
     Smooth,
     Bezier,
-}
-
-impl Default for ExpressionInterpolation {
-    fn default() -> Self {
-        Self::Linear
-    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]

@@ -830,14 +830,12 @@ pub fn strum_chords_with(
 ) -> usize {
     let groups = chord_groups(notes, ids);
     let mut changed = 0;
-    let mut stroke = 0usize;
-    for mut group in groups.into_iter().filter(|g| g.len() >= 2) {
+    for (stroke, mut group) in groups.into_iter().filter(|g| g.len() >= 2).enumerate() {
         let up = if spec.alternate && stroke % 2 == 1 {
             !spec.up
         } else {
             spec.up
         };
-        stroke += 1;
         if !up {
             group.reverse();
         }

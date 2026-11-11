@@ -1949,10 +1949,10 @@ mod imp {
             + usize::from(host.warmup.is_some());
         let pending_close = host.closing_views.len() + host.fallback_closing_views.len();
         #[cfg(target_os = "macos")]
-        let memory = crate::components::plugin_editor_mac_region::appkit::task_memory();
+        let (resident, virtual_size) =
+            crate::components::plugin_editor_mac_region::appkit::task_memory().unwrap_or((0, 0));
         #[cfg(not(target_os = "macos"))]
-        let memory: Option<(u64, u64)> = None;
-        let (resident, virtual_size) = memory.unwrap_or((0, 0));
+        let (resident, virtual_size) = (0_u64, 0_u64);
         eprintln!(
             "[cef-resources] active_browser_count={browsers} pending_browser_close_count={pending_close} active_surface_count={browsers} active_texture_count=0 active_iosurface_count=host-does-not-own resident_bytes={resident} virtual_bytes={virtual_size}"
         );
@@ -4025,6 +4025,10 @@ mod tests {
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     #[test]
+    #[allow(
+        clippy::assertions_on_constants,
+        reason = "documents the per-platform hosting mode as a named test"
+    )]
     fn desktop_hosts_builtin_editors_as_native_children() {
         assert!(
             !OFFSCREEN_HOSTING,

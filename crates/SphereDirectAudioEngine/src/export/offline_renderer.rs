@@ -319,7 +319,9 @@ pub fn render_offline_tracks_with_bridges(
 
 /// Render the master and, when `capture_tracks`, every mixer-channel tap in
 /// one graph pass — the mixdown and the stems of one job from the same
-/// render. `gain` applies to the master only.
+/// render. `gain` applies to the master only. Tests' shorthand for
+/// [`render_offline_mix_and_tracks_with_plugins`] without ARA renderers.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn render_offline_mix_and_tracks_with_bridges(
     snapshot: &EngineProjectSnapshot,
@@ -348,7 +350,10 @@ pub fn render_offline_mix_and_tracks_with_bridges(
     )
 }
 
-/// [`render_offline_mix_and_tracks_with_bridges`] with the ARA renderers too.
+/// Render the master and, when `capture_tracks`, every mixer-channel tap in
+/// one graph pass — the mixdown and the stems of one job from the same
+/// render — with the bridged plug-ins and ARA renderers in `plugins`. `gain`
+/// applies to the master only.
 #[allow(clippy::too_many_arguments)]
 pub fn render_offline_mix_and_tracks_with_plugins(
     snapshot: &EngineProjectSnapshot,
@@ -472,9 +477,26 @@ fn render_offline_impl(
         // not process leftover realtime `audio_in`. The first rendered block
         // consumes this silent response and requests the first timeline block,
         // matching realtime's one-block bridge latency (covered by PDC).
+        //
+        // The device callback was detached a moment ago and has usually just
+        // published a request of its own. The host is reading `audio_in` and
+        // writing `audio_out` for it until it answers, so the prime waits for
+        // that answer (the sink refuses to write or ask while one is out).
         let prime_frames = block;
         let zeros = vec![0.0f32; prime_frames];
-        for sink in runtime.plugin_bridge_sinks.values() {
+        for (id, sink) in &runtime.plugin_bridge_sinks {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while sink.request_in_flight() {
+                if cancel.is_cancelled() {
+                    return Err(ExportError::Cancelled);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(ExportError::PluginBridge(format!(
+                        "plugin bridge '{id}' did not finish its realtime block within 5 seconds"
+                    )));
+                }
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
             sink.write_input(&zeros, &zeros, prime_frames);
             sink.request_block(prime_frames as u32);
         }

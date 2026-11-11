@@ -3398,8 +3398,6 @@ impl Render for PluginEditorWindow {
 /// Open the GPUI-hosted plugin editor window for an insert slot. The caller
 /// (StudioLayout) keeps the returned handle to dedupe/close. Drop of the entity
 /// detaches the native view.
-#[allow(clippy::too_many_arguments)]
-/// Opens an editor window for one plug-in instance.
 ///
 /// `in_process` forces the in-process embed path regardless of the bridge
 /// setting. It exists for ARA, whose instances are always hosted here; every
@@ -3612,6 +3610,10 @@ mod platform_support_tests {
 
     /// The compact shell has to leave room for the chrome it exists to carry.
     #[test]
+    #[allow(
+        clippy::assertions_on_constants,
+        reason = "documents the shell's layout constants as a named test"
+    )]
     fn the_host_owned_shell_is_at_least_its_own_chrome() {
         let height = HEADER_H + HOST_OWNED_SHELL_BODY_H;
         assert!(height > HEADER_H);
@@ -3786,7 +3788,7 @@ mod parked_content_tests {
         // The host catches up; a#3's own answer releases it.
         host.handle_next(); // close a#3
         host.handle_next(); // open b#4
-        let answers: Vec<_> = host.outbox.drain(..).collect();
+        let answers: Vec<_> = std::mem::take(&mut host.outbox);
         assert_eq!(answers, vec![("a", a3)]);
         window.deliver("a", a3, &host);
         assert_eq!(

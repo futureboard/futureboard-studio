@@ -460,11 +460,14 @@ unsafe fn wasapi_thread(
             }
         };
 
+    // Every COM object is released before `CoUninitialize`: releasing one
+    // after its apartment is gone can call into code COM already unloaded.
     let device: IMMDevice = match resolve_device(&enumerator, device_id.as_deref()) {
         Ok(d) => d,
         Err(e) => {
             drop(pro_audio);
             let _ = info_tx.send(Err(e));
+            drop(enumerator);
             CoUninitialize();
             return;
         }
@@ -491,6 +494,8 @@ unsafe fn wasapi_thread(
     );
 
     drop(pro_audio);
+    drop(device);
+    drop(enumerator);
     CoUninitialize();
 }
 

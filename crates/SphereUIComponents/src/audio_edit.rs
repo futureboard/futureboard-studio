@@ -224,7 +224,7 @@ impl Pcm {
             let mut out = Vec::with_capacity(frames * to);
             for frame in self.samples.chunks(from) {
                 if from == 1 {
-                    out.extend(std::iter::repeat(frame[0]).take(to));
+                    out.extend(std::iter::repeat_n(frame[0], to));
                 } else if to == 1 {
                     out.push(frame.iter().sum::<f32>() / from as f32);
                 } else {
@@ -694,7 +694,7 @@ mod tests {
         (0..frames)
             .flat_map(|i| {
                 let v = (i as f32 * 0.05).sin();
-                std::iter::repeat(v).take(channels)
+                std::iter::repeat_n(v, channels)
             })
             .collect()
     }

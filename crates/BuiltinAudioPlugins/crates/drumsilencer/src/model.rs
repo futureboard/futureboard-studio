@@ -44,7 +44,6 @@ pub struct Model {
     channels: usize,
     conv_time: usize,
     conv_freq: usize,
-    head: usize,
     /// `[H, K]`.
     in_w: Box<[f32]>,
     in_b: Box<[f32]>,
@@ -152,7 +151,7 @@ impl Model {
             || channels > 256
             || conv_time == 0
             || conv_time > 64
-            || conv_freq % 2 == 0
+            || conv_freq.is_multiple_of(2)
             || conv_freq > 63
             || head == 0
             || head > 256
@@ -196,7 +195,6 @@ impl Model {
             channels,
             conv_time,
             conv_freq,
-            head,
             in_w,
             in_b,
             layers: layers.into_boxed_slice(),

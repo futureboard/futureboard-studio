@@ -1891,7 +1891,6 @@ impl Timeline {
     /// Called by the cached [`crate::components::timeline::track_lane_view::TrackLaneView`],
     /// which renders during the prepaint of the tree `render` just returned —
     /// so `frame_lane_ctx` is always this frame's.
-
     pub(crate) fn render_track_lane(&self, track_id: &str) -> gpui::AnyElement {
         use gpui::{IntoElement, ParentElement, Styled};
         let Some(ctx) = self.frame_lane_ctx.as_ref() else {

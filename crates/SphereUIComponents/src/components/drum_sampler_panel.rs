@@ -1494,6 +1494,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::assertions_on_constants,
+        reason = "documents the plate's layout constants as a named test"
+    )]
     fn the_plate_regions_fit_the_artboard() {
         assert!(WELL_TOP + WELL_H < DECK_TOP);
         assert!(DECK_TOP + DECK_H <= PLATE_H);

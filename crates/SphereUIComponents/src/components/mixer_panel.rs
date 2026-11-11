@@ -94,7 +94,7 @@ fn mixer_strip_is_selected(track_id: &str, primary: Option<&str>, selected_ids: 
 /// Maximum insert slots per track. Once reached, the trailing empty "+ Add
 /// Insert" slot and the INSERTS header "+" are hidden/disabled. The same limit
 /// a plug-in dragged in from another channel is held to.
-use crate::components::timeline::timeline_state::MAX_INSERT_SLOTS;
+use crate::components::timeline::timeline_state::insert_chain_full;
 
 // ─── Mixer sub-header ("Mixer  N ch") ────────────────────────────────────────
 
@@ -1139,7 +1139,7 @@ fn inserts_section(
     let first_shown = usize::from(track.track_type == TrackType::Instrument);
     let floor = track.fx_chain_floor();
     let used = track.inserts.len();
-    let at_max = used >= MAX_INSERT_SLOTS;
+    let at_max = insert_chain_full(used);
 
     let mut chips = div().flex().flex_col().flex_none();
     for (insert_index, slot) in track.inserts.iter().enumerate().skip(first_shown) {
@@ -1280,7 +1280,7 @@ fn master_inserts_section(
     i18n: I18n,
 ) -> impl IntoElement {
     let used = master.inserts.len();
-    let at_max = used >= MAX_INSERT_SLOTS;
+    let at_max = insert_chain_full(used);
 
     let mut chips = div().flex().flex_col().flex_none();
     for (insert_index, slot) in master.inserts.iter().enumerate() {

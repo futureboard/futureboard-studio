@@ -458,7 +458,7 @@ fn render(
                 s + beat * 0.5,
                 s + beat * 0.5 + 0.05,
             );
-            if b % 16 == 0 {
+            if b.is_multiple_of(16) {
                 score.note(DRUMS, 49, 90, s, s + 0.5);
             }
             s += beat;

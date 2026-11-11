@@ -144,10 +144,9 @@ impl TimelineState {
             return Vec::new();
         }
         self.clear_chord_range(start, start + total, None);
-        let mut id = self.next_chord_event_id();
         let mut beat = start;
         let mut ids = Vec::with_capacity(chords.len());
-        for placement in chords {
+        for (id, placement) in (self.next_chord_event_id()..).zip(chords) {
             let length = placement.length_beats.max(MIN_CHORD_BEATS);
             self.chord_events.push(ChordTrackEvent {
                 id,
@@ -157,7 +156,6 @@ impl TimelineState {
                 flats: placement.flats,
             });
             ids.push(id);
-            id += 1;
             beat += length;
         }
         self.sort_chord_events();

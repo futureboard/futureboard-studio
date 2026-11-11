@@ -49,7 +49,9 @@ impl BackingAudio {
     pub fn from_interleaved(samples: &[f32], sample_rate: u32, waveform_peaks: Vec<f32>) -> Self {
         let to_i16 = |s: f32| (s.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
         let frames: Box<[[i16; 2]]> = samples
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|f| [to_i16(f[0]), to_i16(f[1])])
             .collect();
         Self {

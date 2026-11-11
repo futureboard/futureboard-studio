@@ -2065,7 +2065,7 @@ impl SolfegeEditorPanel {
         if lod.peaks.is_empty() || preview.sample_rate == 0 {
             return None;
         }
-        let seconds_per_beat = self.timeline.read(cx).state.seconds_per_beat() as f32;
+        let seconds_per_beat = self.timeline.read(cx).state.seconds_per_beat();
         let peaks_per_second = preview.sample_rate as f32 / lod.samples_per_peak.max(1) as f32;
         let bar_color = Colors::with_alpha(Colors::accent_cyan(), 0.6);
         let mid_color = Colors::with_alpha(Colors::border_subtle(), 0.9);

@@ -431,10 +431,10 @@ struct SphereDauxVst3Processor {
   bool processing{false};
 
   // Diagnostics
-  unsigned long long process_count{0};
-  double last_input_peak{0.0};
-  double last_output_peak{0.0};
-  double last_difference_peak{0.0};
+  std::atomic<unsigned long long> process_count{0};
+  std::atomic<double> last_input_peak{0.0};
+  std::atomic<double> last_output_peak{0.0};
+  std::atomic<double> last_difference_peak{0.0};
   bool first_process_done{false};
   bool process_audio_out_logged{false};
 

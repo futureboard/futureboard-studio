@@ -390,7 +390,7 @@ impl ExportSettings {
         defaults
             .track_targets
             .iter()
-            .filter(|target| self.selected_tracks.iter().any(|id| *id == target.id))
+            .filter(|target| self.selected_tracks.contains(&target.id))
             .collect()
     }
 

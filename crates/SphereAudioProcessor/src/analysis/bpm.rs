@@ -307,19 +307,6 @@ impl TempoAnalysis {
         peaks
     }
 
-    fn best_in(&self, min_bpm: f32, max_bpm: f32) -> Option<(f32, f32)> {
-        let mut best: Option<(f32, f32)> = None;
-        let steps = ((max_bpm - min_bpm) / GRID_BPM).round() as usize;
-        for step in 0..=steps {
-            let bpm = min_bpm + step as f32 * GRID_BPM;
-            let score = self.score(bpm);
-            if best.is_none_or(|(_, s)| score > s) {
-                best = Some((bpm, score));
-            }
-        }
-        best.filter(|(_, score)| *score > 0.0)
-    }
-
     /// Re-measure the period at the longest beat multiple whose
     /// autocorrelation peak is still clear, then snap near-whole tempos.
     fn refine(&self, bpm: f32) -> f32 {

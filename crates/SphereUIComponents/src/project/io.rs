@@ -1,7 +1,7 @@
 use super::{
     format::{
-        decode_project, decode_project_identity, decode_project_with_options, encode_project,
-        ProjectError, ProjectIdentity,
+        decode_project_identity, decode_project_with_options, encode_project, ProjectError,
+        ProjectIdentity,
     },
     now_secs, ClipSource, FutureboardProject, ProjectAsset,
 };
@@ -1273,10 +1273,12 @@ struct ClipSourceFormat {
 
 impl ClipSourceFormat {
     fn of(stretch: &AudioClipStretchState) -> Option<Self> {
-        (stretch.original_sample_rate > 0 && stretch.original_duration_samples > 0).then(|| Self {
-            sample_rate: stretch.original_sample_rate,
-            frames: stretch.original_duration_samples,
-        })
+        (stretch.original_sample_rate > 0 && stretch.original_duration_samples > 0).then_some(
+            Self {
+                sample_rate: stretch.original_sample_rate,
+                frames: stretch.original_duration_samples,
+            },
+        )
     }
 }
 

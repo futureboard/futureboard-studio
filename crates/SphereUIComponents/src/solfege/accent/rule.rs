@@ -204,13 +204,13 @@ impl AccentRule {
     /// finished value.
     pub fn components(&self, features: &[f32]) -> [f32; 4] {
         let mut out = [0.0_f32; 4];
-        for target in 0..4 {
+        for (target, slot) in out.iter_mut().enumerate() {
             let mut sum = self.intercepts[target];
             for (position, &column) in self.columns.iter().enumerate() {
                 sum +=
                     self.weights[target][position] * features.get(column).copied().unwrap_or(0.0);
             }
-            out[target] = sum;
+            *slot = sum;
         }
         out
     }

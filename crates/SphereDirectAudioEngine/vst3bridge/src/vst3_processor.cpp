@@ -2790,14 +2790,12 @@ sphere_daux_vst3_process_stereo_sample(SphereDauxVst3Processor *processor,
 
   const auto result = processor->processor->process(processor->process_data);
 
-  processor->last_input_peak = std::max(std::abs(static_cast<double>(in_l)),
-                                        std::abs(static_cast<double>(in_r)));
-  processor->last_output_peak =
-      std::max(std::abs(static_cast<double>(processor->output_l)),
-               std::abs(static_cast<double>(processor->output_r)));
-  processor->last_difference_peak =
-      std::max(std::abs(static_cast<double>(processor->output_l - in_l)),
-               std::abs(static_cast<double>(processor->output_r - in_r)));
+  processor->last_input_peak.store(std::max(std::abs(static_cast<double>(in_l)),
+                                        std::abs(static_cast<double>(in_r))), std::memory_order_relaxed);
+  processor->last_output_peak.store(std::max(std::abs(static_cast<double>(processor->output_l)),
+               std::abs(static_cast<double>(processor->output_r))), std::memory_order_relaxed);
+  processor->last_difference_peak.store(std::max(std::abs(static_cast<double>(processor->output_l - in_l)),
+               std::abs(static_cast<double>(processor->output_r - in_r))), std::memory_order_relaxed);
 
   // First-process debug log (fires once, outside the hot path thereafter)
   if (!processor->first_process_done) {
@@ -2806,14 +2804,14 @@ sphere_daux_vst3_process_stereo_sample(SphereDauxVst3Processor *processor,
                  "[SphereVST3] first process %s inputPeakL=%.6f "
                  "outputPeakL=%.6f diffPeak=%.6f\n",
                  result == Steinberg::kResultOk ? "ok" : "failed",
-                 processor->last_input_peak, processor->last_output_peak,
-                 processor->last_difference_peak);
+                 processor->last_input_peak.load(std::memory_order_relaxed), processor->last_output_peak.load(std::memory_order_relaxed),
+                 processor->last_difference_peak.load(std::memory_order_relaxed));
   }
 
   if (result != Steinberg::kResultOk)
     return 0;
 
-  processor->process_count += 1;
+  processor->process_count.fetch_add(1, std::memory_order_relaxed);
 
   *out_l = processor->output_l;
   *out_r = processor->output_r;
@@ -2947,9 +2945,9 @@ extern "C" int sphere_daux_vst3_process_stereo_block_with_midi(
     diff_peak =
         std::max(diff_peak, std::abs(static_cast<double>(out_r[i] - in_r[i])));
   }
-  processor->last_input_peak = std::max(input_peak_l, input_peak_r);
-  processor->last_output_peak = std::max(output_peak_l, output_peak_r);
-  processor->last_difference_peak = diff_peak;
+  processor->last_input_peak.store(std::max(input_peak_l, input_peak_r), std::memory_order_relaxed);
+  processor->last_output_peak.store(std::max(output_peak_l, output_peak_r), std::memory_order_relaxed);
+  processor->last_difference_peak.store(diff_peak, std::memory_order_relaxed);
   processor->log_process_audio_out_once(n, buses_used, output_buses.data(),
                                         bus_stats.data());
 
@@ -2959,7 +2957,7 @@ extern "C" int sphere_daux_vst3_process_stereo_block_with_midi(
                  "[SphereVST3] first process %s frames=%d inputPeakL=%.6f "
                  "outputPeakL=%.6f diffPeak=%.6f\n",
                  result == Steinberg::kResultOk ? "ok" : "failed", frames,
-                 input_peak_l, output_peak_l, processor->last_difference_peak);
+                 input_peak_l, output_peak_l, processor->last_difference_peak.load(std::memory_order_relaxed));
   }
 
   processor->process_data.numSamples = 1;
@@ -2976,7 +2974,7 @@ extern "C" int sphere_daux_vst3_process_stereo_block_with_midi(
 
   if (result != Steinberg::kResultOk)
     return 0;
-  processor->process_count += 1;
+  processor->process_count.fetch_add(1, std::memory_order_relaxed);
   return 1;
 }
 
@@ -3087,9 +3085,9 @@ extern "C" int sphere_daux_vst3_process_main_output_block_with_midi(
     }
   }
 
-  processor->last_input_peak = std::max(input_peak_l, input_peak_r);
-  processor->last_output_peak = output_peak;
-  processor->last_difference_peak = diff_peak;
+  processor->last_input_peak.store(std::max(input_peak_l, input_peak_r), std::memory_order_relaxed);
+  processor->last_output_peak.store(output_peak, std::memory_order_relaxed);
+  processor->last_difference_peak.store(diff_peak, std::memory_order_relaxed);
   processor->log_process_audio_out_once(n, buses_used, output_buses.data(),
                                         bus_stats.data());
 
@@ -3099,8 +3097,8 @@ extern "C" int sphere_daux_vst3_process_main_output_block_with_midi(
                  "[SphereVST3] first process %s frames=%d channels=%d "
                  "outputPeak=%.6f diffPeak=%.6f\n",
                  result == Steinberg::kResultOk ? "ok" : "failed", n,
-                 produced_channels, processor->last_output_peak,
-                 processor->last_difference_peak);
+                 produced_channels, processor->last_output_peak.load(std::memory_order_relaxed),
+                 processor->last_difference_peak.load(std::memory_order_relaxed));
   }
 
   processor->process_data.numSamples = 1;
@@ -3118,7 +3116,7 @@ extern "C" int sphere_daux_vst3_process_main_output_block_with_midi(
 
   if (result != Steinberg::kResultOk)
     return 0;
-  processor->process_count += 1;
+  processor->process_count.fetch_add(1, std::memory_order_relaxed);
   return produced_channels;
 }
 
@@ -5564,22 +5562,22 @@ sphere_daux_vst3_embed_content_size(SphereDauxVst3Processor *processor,
 
 extern "C" unsigned long long
 sphere_daux_vst3_process_count(SphereDauxVst3Processor *processor) {
-  return processor ? processor->process_count : 0;
+  return processor ? processor->process_count.load(std::memory_order_relaxed) : 0;
 }
 
 extern "C" double
 sphere_daux_vst3_last_input_peak(SphereDauxVst3Processor *processor) {
-  return processor ? processor->last_input_peak : 0.0;
+  return processor ? processor->last_input_peak.load(std::memory_order_relaxed) : 0.0;
 }
 
 extern "C" double
 sphere_daux_vst3_last_output_peak(SphereDauxVst3Processor *processor) {
-  return processor ? processor->last_output_peak : 0.0;
+  return processor ? processor->last_output_peak.load(std::memory_order_relaxed) : 0.0;
 }
 
 extern "C" double
 sphere_daux_vst3_last_difference_peak(SphereDauxVst3Processor *processor) {
-  return processor ? processor->last_difference_peak : 0.0;
+  return processor ? processor->last_difference_peak.load(std::memory_order_relaxed) : 0.0;
 }
 
 extern "C" int sphere_daux_vst3_is_valid(SphereDauxVst3Processor *processor) {

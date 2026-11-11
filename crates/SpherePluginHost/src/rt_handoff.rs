@@ -157,11 +157,14 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread::{self, ThreadId};
 
+    /// Which value was dropped on which thread.
+    type DropLog = Arc<Mutex<Vec<(u32, ThreadId)>>>;
+
     /// Records the thread that drops it.
     #[derive(Default)]
     struct Tracked {
         id: u32,
-        dropped_on: Option<Arc<Mutex<Vec<(u32, ThreadId)>>>>,
+        dropped_on: Option<DropLog>,
     }
 
     impl Drop for Tracked {
@@ -172,7 +175,7 @@ mod tests {
         }
     }
 
-    fn tracked(id: u32, log: &Arc<Mutex<Vec<(u32, ThreadId)>>>) -> Tracked {
+    fn tracked(id: u32, log: &DropLog) -> Tracked {
         Tracked {
             id,
             dropped_on: Some(log.clone()),

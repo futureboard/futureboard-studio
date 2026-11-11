@@ -512,6 +512,8 @@ pub(crate) struct Quantizer {
 }
 
 impl Quantizer {
+    /// Seeded with the fixed default rather than per file: the tests' form.
+    #[cfg(test)]
     pub(crate) fn new(dither: AudioDither) -> Self {
         Self {
             dither,
@@ -560,6 +562,10 @@ impl Quantizer {
     /// Full-scale `[-1, 1]` float to a signed integer whose positive full
     /// scale is `max`. Clamps; NaN becomes 0.
     #[inline]
+    #[allow(
+        clippy::wrong_self_convention,
+        reason = "converts from f32 through the quantizer's dither state, which needs `&mut self`"
+    )]
     fn from_f32(&mut self, x: f32, max: f64) -> i32 {
         let scaled = f64::from(x.clamp(-1.0, 1.0)) * max;
         match self.dither {
@@ -570,6 +576,10 @@ impl Quantizer {
 
     /// Full-scale signed 32-bit to `bits` bits (`bits < 32`).
     #[inline]
+    #[allow(
+        clippy::wrong_self_convention,
+        reason = "converts from i32 through the quantizer's dither state, which needs `&mut self`"
+    )]
     fn from_i32(&mut self, x: i32, bits: u32) -> i32 {
         let shift = 32 - bits;
         match self.dither {

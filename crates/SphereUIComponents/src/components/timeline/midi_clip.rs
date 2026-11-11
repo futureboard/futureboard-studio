@@ -409,9 +409,9 @@ fn midi_controller_preview_canvas(preview: std::sync::Arc<ControllerPreview>) ->
 
                 let values = &preview.lane_values[lane_idx];
                 let mut prev_y: Option<f32> = None;
-                for col in 0..=preview.columns {
+                for (col, value) in values.iter().enumerate().take(preview.columns + 1) {
                     let x = (col as f32 * preview.step_px).min(preview.width);
-                    let y = row_top + (1.0 - values[col]) * usable + 1.0;
+                    let y = row_top + (1.0 - value) * usable + 1.0;
                     if let Some(prev) = prev_y {
                         let top = prev.min(y);
                         let h = (prev - y).abs().max(1.4);

@@ -606,6 +606,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::assertions_on_constants,
+        reason = "checks the build configuration this test binary was compiled with"
+    )]
     fn compile_time_key_requires_a_developer_build() {
         // build.rs sets the cfg only alongside debug assertions.
         assert!(cfg!(debug_assertions) || !cfg!(futureboard_tone3000_dev_key));

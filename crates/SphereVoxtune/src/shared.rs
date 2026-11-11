@@ -147,11 +147,11 @@ impl Shared {
         out[..lead * 2].fill(0.0);
         let start = take_sec.max(0.0);
         if playing && lead < frames {
-            if !engine.playing || out_of_line(engine.playhead_sec, start, sr) {
-                if start < engine.duration_sec {
-                    engine.seek(start);
-                    engine.set_playing(true);
-                }
+            if (!engine.playing || out_of_line(engine.playhead_sec, start, sr))
+                && start < engine.duration_sec
+            {
+                engine.seek(start);
+                engine.set_playing(true);
             }
         } else if !playing && engine.playing {
             engine.set_playing(false);
@@ -450,7 +450,7 @@ impl HostResampler {
         let table = kernel_table();
         let reach = HALF_TAPS as f64 / bandwidth;
         let gain = bandwidth as f32;
-        for frame in out.chunks_exact_mut(2) {
+        for frame in out.as_chunks_mut::<2>().0 {
             let p = self.pos;
             let lo = (p - reach).ceil().max(0.0) as u64;
             let hi = (p + reach).floor() as u64;
@@ -628,7 +628,7 @@ mod tests {
         while left.len() < total {
             let take_sec = from + left.len() as f64 / host_rate as f64;
             assert!(shared.render_following_host(take_sec, true, host_rate, &mut out));
-            left.extend(out.chunks_exact(2).map(|frame| frame[0]));
+            left.extend(out.as_chunks::<2>().0.iter().map(|frame| frame[0]));
         }
         left.truncate(total);
         left
@@ -753,7 +753,13 @@ mod tests {
                 (true, Miss::Skipped) => {}
                 _ => assert!(shared.render_following_host(take_sec, true, host_rate, &mut out)),
             }
-            heard.push(out.chunks_exact(2).map(|frame| frame[0]).collect());
+            heard.push(
+                out.as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|frame| frame[0])
+                    .collect(),
+            );
             playheads.push(shared.playhead());
         }
         (heard, playheads)

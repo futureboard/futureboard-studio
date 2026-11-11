@@ -546,27 +546,6 @@ pub trait ShortcutHintExt: gpui::StatefulInteractiveElement + Sized {
 
 impl<E: gpui::StatefulInteractiveElement + Sized> ShortcutHintExt for E {}
 
-/// Example usage:
-///
-/// ```rust
-/// use crate::components::controls::{fb_button, FbButtonKind, ShortcutHintExt};
-///
-/// // Method 1: Using the extension trait on any StatefulInteractiveElement
-/// fb_button("my-button", "Save", FbButtonKind::Primary, true, on_click)
-///     .shortcut_hint("project:save");
-///
-/// // Method 2: Using the wrapper function
-/// use crate::components::controls::with_shortcut_hint;
-/// with_shortcut_hint(
-///     fb_button("my-button", "Save", FbButtonKind::Primary, true, on_click),
-///     "project:save"
-/// );
-///
-/// // Method 3: Using the tooltip directly
-/// fb_button("my-button", "Save", FbButtonKind::Primary, true, on_click)
-///     .tooltip(shortcut_tooltip("project:save"));
-/// ```
-
 /// Non-interactive identity chip — plugin format, track type, counts, status.
 pub fn fb_badge(label: impl Into<String>, tone: Rgba) -> impl IntoElement {
     let label: String = label.into();
@@ -896,7 +875,7 @@ pub fn fb_dock_tab(
         })
         .children(icon_path.map(|path| svg().path(path).w(px(14.0)).h(px(14.0)).text_color(text)))
         .child(label)
-        .children(shortcut.as_deref().map(|s| fb_shortcut_hint(s)))
+        .children(shortcut.as_deref().map(fb_shortcut_hint))
         .on_click(on_click)
 }
 

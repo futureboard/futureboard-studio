@@ -1139,8 +1139,8 @@ bool SphereDauxClapProcessor::process_planar(
   }
 
   steady_time += static_cast<uint64_t>(frames);
-  ++process_count;
-  last_input_peak = input_peak;
+  process_count.fetch_add(1, std::memory_order_relaxed);
+  last_input_peak.store(input_peak, std::memory_order_relaxed);
   return true;
 }
 
@@ -1358,8 +1358,8 @@ int sphere_daux_clap_process_stereo_block_with_midi(
                             std::abs(static_cast<double>(r - in_r[i]))));
     }
   }
-  p->last_output_peak = output_peak;
-  p->last_difference_peak = difference_peak;
+  p->last_output_peak.store(output_peak, std::memory_order_relaxed);
+  p->last_difference_peak.store(difference_peak, std::memory_order_relaxed);
   return 1;
 }
 
@@ -1417,7 +1417,7 @@ int sphere_daux_clap_process_main_output_block_with_midi(
       }
     }
   }
-  p->last_output_peak = output_peak;
+  p->last_output_peak.store(output_peak, std::memory_order_relaxed);
   return 1;
 }
 
@@ -1475,19 +1475,19 @@ int sphere_daux_clap_output_bus_channel_counts(SphereDauxClapProcessor *p,
 }
 
 unsigned long long sphere_daux_clap_process_count(SphereDauxClapProcessor *p) {
-  return p ? p->process_count : 0;
+  return p ? p->process_count.load(std::memory_order_relaxed) : 0;
 }
 
 double sphere_daux_clap_last_input_peak(SphereDauxClapProcessor *p) {
-  return p ? p->last_input_peak : 0.0;
+  return p ? p->last_input_peak.load(std::memory_order_relaxed) : 0.0;
 }
 
 double sphere_daux_clap_last_output_peak(SphereDauxClapProcessor *p) {
-  return p ? p->last_output_peak : 0.0;
+  return p ? p->last_output_peak.load(std::memory_order_relaxed) : 0.0;
 }
 
 double sphere_daux_clap_last_difference_peak(SphereDauxClapProcessor *p) {
-  return p ? p->last_difference_peak : 0.0;
+  return p ? p->last_difference_peak.load(std::memory_order_relaxed) : 0.0;
 }
 
 void sphere_daux_clap_set_param(SphereDauxClapProcessor *p,

@@ -831,7 +831,7 @@ fn fs_handle(in: HandleOut) -> @location(0) vec4<f32> {
             let mut bgra = Vec::with_capacity((unpadded * height) as usize);
             for row in 0..height {
                 let start = (row * padded) as usize;
-                for px in mapped[start..start + unpadded as usize].chunks_exact(4) {
+                for px in mapped[start..start + unpadded as usize].as_chunks::<4>().0 {
                     bgra.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
                 }
             }

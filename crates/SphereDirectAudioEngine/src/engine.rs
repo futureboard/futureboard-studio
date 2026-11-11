@@ -972,15 +972,6 @@ fn transport_freeze_debug_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("FUTUREBOARD_TRANSPORT_FREEZE_DEBUG").is_some())
 }
 
-/// What each engine state means for the audio callback.
-///
-/// The distinction these assert is the difference between playback that
-/// survives a project sync and playback that stops dead in the middle of a
-/// song, so it is worth pinning rather than leaving to the one `matches!` in
-/// the render path.
-
-/// Where each of `track_ids` is in `snapshot`, which is the order the graph
-/// built from it holds its tracks in.
 /// The Control Room configuration as last set, kept on the control thread.
 ///
 /// The callback's `RuntimeMonitor` is the graph's, so it is replaced with a

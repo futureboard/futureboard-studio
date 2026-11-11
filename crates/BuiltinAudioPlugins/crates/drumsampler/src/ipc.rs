@@ -94,7 +94,7 @@ macro_rules! wire_ids {
 /// Wire index *is* the position in this table. Append only: the first
 /// release's 160 ids keep the indices they shipped with.
 #[rustfmt::skip]
-pub const UI_PARAM_IDS: [&str; PARAM_COUNT] = wire_ids!(
+pub static UI_PARAM_IDS: [&str; PARAM_COUNT] = wire_ids!(
     [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
     [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
      16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,

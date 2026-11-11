@@ -700,6 +700,10 @@ impl Limiter {
     }
 
     /// Applied gain, linear and never above one, for metering.
+    #[allow(
+        clippy::misnamed_getters,
+        reason = "the applied (smoothed) gain is what metering wants, not the target `gain`"
+    )]
     pub const fn gain(&self) -> f32 {
         self.smoothed
     }

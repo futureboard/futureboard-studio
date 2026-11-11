@@ -169,7 +169,7 @@ pub fn musical_timeline(state: &TimelineState) -> AraMusicalTimeline {
 
     push(&mut tempo, state, base_bpm, 0.0);
     for point in &state.tempo_map.points {
-        let beat = point.beat as f64;
+        let beat = point.beat;
         if beat > 0.0 {
             push(&mut tempo, state, base_bpm, beat);
         }
@@ -184,7 +184,7 @@ pub fn musical_timeline(state: &TimelineState) -> AraMusicalTimeline {
 
     let mut bars: Vec<AraBarSignature> = Vec::new();
     for point in &state.time_signature_map.points {
-        let quarter = point.beat as f64;
+        let quarter = point.beat;
         let strictly_after = bars
             .last()
             .is_none_or(|last: &AraBarSignature| quarter > last.quarter_position);
@@ -227,7 +227,7 @@ pub fn project_view(
     key: &AraSessionKey,
     shape_of: &mut dyn FnMut(&str) -> Option<SourceShape>,
 ) -> AraProjectView {
-    document_view(state, key, &[key.track_id.clone()], shape_of)
+    document_view(state, key, std::slice::from_ref(&key.track_id), shape_of)
 }
 
 /// Builds the ARA graph for one plug-in's document: one region sequence per
@@ -261,7 +261,7 @@ pub fn document_view(
         .tracks
         .iter()
         .enumerate()
-        .filter(|(_, track)| members.iter().any(|member| *member == track.id))
+        .filter(|(_, track)| members.contains(&track.id))
     {
         if track.id == key.track_id {
             lead_name = Some(track.name.clone());

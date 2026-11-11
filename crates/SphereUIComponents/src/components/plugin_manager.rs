@@ -2155,7 +2155,7 @@ impl Render for PluginManagerWindow {
         let void_cb = |f: fn(&mut PluginManagerWindow, &mut Context<PluginManagerWindow>)| {
             let target = target.clone();
             Arc::new(move |_: &(), _w: &mut Window, cx: &mut App| {
-                let _ = target.update(cx, |this, cx| f(this, cx));
+                let _ = target.update(cx, &f);
             }) as VoidCb
         };
 

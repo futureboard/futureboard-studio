@@ -600,7 +600,7 @@ fn choose_levels(
             LEVELS
                 .iter()
                 .filter(|&&factor| factor == 1.0 || !fit.pinned)
-                .filter(|&&factor| factor != 0.5 || beats_per_bar % 2 == 0)
+                .filter(|&&factor| factor != 0.5 || beats_per_bar.is_multiple_of(2))
                 .filter_map(|&factor| {
                     let bpm = fit.bpm * factor as f32;
                     if factor != 1.0 && !(bpm >= min_bpm && bpm <= max_bpm) {

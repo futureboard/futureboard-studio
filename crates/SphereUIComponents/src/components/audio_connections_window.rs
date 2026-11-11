@@ -2248,9 +2248,8 @@ mod tests {
         assert!(wide.device > narrow.device, "Audio Device grows");
         assert!(wide.left_port > narrow.left_port);
         assert!(wide.right_port > narrow.right_port);
-        assert_eq!(
+        assert!(
             wide.device - narrow.device > wide.name - narrow.name,
-            true,
             "Audio Device is weighted highest — endpoint names are longest"
         );
 

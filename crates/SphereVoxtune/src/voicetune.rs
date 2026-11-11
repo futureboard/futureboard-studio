@@ -568,7 +568,11 @@ impl OfflineVoiceRenderer {
         let mut output = Vec::with_capacity(total);
         let hop = 128usize;
 
-        for idx in 0..(total + latency) {
+        let source = original_samples
+            .iter()
+            .copied()
+            .chain(std::iter::repeat_n(0.0, latency));
+        for (idx, sample) in source.enumerate() {
             if idx % hop == 0 {
                 let t = idx as f64 / sr as f64;
                 let active_note = plan
@@ -601,11 +605,6 @@ impl OfflineVoiceRenderer {
                 shifter.push_control(control);
             }
 
-            let sample = if idx < total {
-                original_samples[idx]
-            } else {
-                0.0
-            };
             let (wet, _) = shifter.process(sample, sample);
             if idx >= latency {
                 output.push(wet[0]);

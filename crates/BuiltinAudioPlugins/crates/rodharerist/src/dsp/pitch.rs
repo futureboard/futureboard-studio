@@ -788,7 +788,7 @@ mod tests {
         for chunk in samples[start..].chunks_exact(frame) {
             let basis = |i: usize, b: usize| {
                 let w = std::f64::consts::TAU * f64::from(freqs[b / 2]) / f64::from(sr);
-                if b % 2 == 0 {
+                if b.is_multiple_of(2) {
                     (w * i as f64).cos()
                 } else {
                     (w * i as f64).sin()

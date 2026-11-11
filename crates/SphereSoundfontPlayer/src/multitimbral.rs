@@ -149,7 +149,7 @@ mod tests {
         let mut channels = default_channels();
         assert_eq!(audible_channels(&channels), u16::MAX);
         channels[2].mute = true;
-        assert_eq!(audible_channels(&channels), u16::MAX & !(1 << 2));
+        assert_eq!(audible_channels(&channels), !(1 << 2));
         channels[5].solo = true;
         channels[9].solo = true;
         assert_eq!(audible_channels(&channels), 1 << 5 | 1 << 9);

@@ -469,7 +469,7 @@ fn a_key_released_in_another_voice_mode_does_not_stick() {
         move |dsp: &mut Dsp| {
             let params = Params {
                 voice_mode: mode,
-                ..dsp.params().clone()
+                ..*dsp.params()
             };
             dsp.set_params(params);
         }

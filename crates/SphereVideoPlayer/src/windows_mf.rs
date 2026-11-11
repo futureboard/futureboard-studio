@@ -49,9 +49,9 @@ use std::time::Instant;
 
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use windows::Win32::Media::MediaFoundation::{
-    IMF2DBuffer, IMF2DBuffer2, IMFDXGIBuffer, IMFMediaType, IMFSample, IMFSourceReader,
-    MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
-    MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_YUV_MATRIX, MF_PD_DURATION,
+    IMF2DBuffer2, IMFDXGIBuffer, IMFMediaType, IMFSample, IMFSourceReader, MF_MT_DEFAULT_STRIDE,
+    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
+    MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_YUV_MATRIX, MF_PD_DURATION,
     MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, MF_SOURCE_READER_ALL_STREAMS,
     MF_SOURCE_READER_D3D_MANAGER, MF_SOURCE_READER_DISABLE_DXVA,
     MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
@@ -876,9 +876,12 @@ fn dxgi_surface(sample: &IMFSample) -> Option<(ID3D11Texture2D, u32)> {
 
 /// Copies one RGB32 sample into a tightly packed, top-down BGRA buffer.
 ///
-/// Software path only. `IMF2DBuffer::Lock2D` reports the real pitch and is
-/// tried first; the plain `Lock` path stays for buffers that do not implement
-/// it.
+/// Software path only. Every row read is bounded by what the lock reported:
+/// `IMF2DBuffer2::Lock2DSize` gives the real pitch and the buffer's extent,
+/// and a buffer without it is read through the plain `Lock`, whose length is
+/// the bound. (`IMF2DBuffer::Lock2D` reports no length, so a sample larger
+/// than the cached format — a size change without a media-type change, or a
+/// cropped surface — would have been read past its end.)
 fn convert_rgb32_sample(
     sample: &IMFSample,
     format: OutputFormat,
@@ -893,51 +896,68 @@ fn convert_rgb32_sample(
         let height = format.height as usize;
         let mut bgra = vec![0u8; row_bytes * height];
 
-        let two_d = buffer.cast::<IMF2DBuffer>().ok();
-        let mut scanline0: *mut u8 = std::ptr::null_mut();
-        let mut pitch = 0i32;
-        let mut locked_len = 0u32;
-
-        // `Lock2D` hands back the first scanline *of the image* and a signed
-        // pitch, so a bottom-up surface is walked by stepping backwards rather
-        // than by flipping the row index.
-        let (base, step) = if let Some(two_d) = &two_d {
+        // The image's first scanline, the signed step to the next one, and
+        // the locked bytes before and after that scanline. A bottom-up
+        // surface is walked by stepping backwards from its top row.
+        let two_d = buffer.cast::<IMF2DBuffer2>().ok();
+        let (base, step, extent) = if let Some(two_d) = &two_d {
+            let mut scanline0: *mut u8 = std::ptr::null_mut();
+            let mut signed_pitch = 0i32;
+            let mut buffer_start: *mut u8 = std::ptr::null_mut();
+            let mut buffer_len = 0u32;
             two_d
-                .Lock2D(&mut scanline0, &mut pitch)
-                .map_err(|e| hresult_error("presentation: IMF2DBuffer::Lock2D", e))?;
-            (scanline0, pitch as isize)
+                .Lock2DSize(
+                    MF2DBuffer_LockFlags_Read,
+                    &mut scanline0,
+                    &mut signed_pitch,
+                    &mut buffer_start,
+                    &mut buffer_len,
+                )
+                .map_err(|e| hresult_error("presentation: IMF2DBuffer2::Lock2DSize", e))?;
+            let len = buffer_len as usize;
+            let after = bytes_after(buffer_start, len, scanline0);
+            let before = if after == 0 { 0 } else { len - after };
+            (scanline0, signed_pitch as isize, (before, after))
         } else {
+            let mut start: *mut u8 = std::ptr::null_mut();
+            let mut locked_len = 0u32;
             buffer
-                .Lock(&mut scanline0, None, Some(&mut locked_len))
+                .Lock(&mut start, None, Some(&mut locked_len))
                 .map_err(|e| hresult_error("presentation: IMFMediaBuffer::Lock", e))?;
+            let len = locked_len as usize;
             let stride = format.abs_stride();
-            if format.stride < 0 && !scanline0.is_null() {
-                // Bottom-up: buffer row 0 is the image's last row.
+            if format.stride < 0 {
+                // Bottom-up: buffer row 0 is the image's last row. Only an
+                // address computation; the bounds below decide whether any
+                // of it is read.
+                let top = (stride * height.saturating_sub(1)).min(len);
                 (
-                    scanline0.add(stride * height.saturating_sub(1)),
+                    start.wrapping_add(top),
                     -(stride as isize),
+                    (top, len - top),
                 )
             } else {
-                (scanline0, stride as isize)
+                (start, stride as isize, (0, len))
             }
         };
 
-        let usable_pitch = step.unsigned_abs();
-        let enough_bytes = two_d.is_some() || (locked_len as usize) >= usable_pitch * height;
-        let result = if base.is_null() || usable_pitch < row_bytes || !enough_bytes {
+        let result = if base.is_null() || !rows_fit(step, row_bytes, height, extent) {
             Err(VideoError::Backend(format!(
-                "presentation: unexpected frame layout: {}x{} pitch={step} bytes={locked_len}",
-                format.width, format.height
+                "presentation: unexpected frame layout: {}x{} pitch={step} bytes={}+{}",
+                format.width, format.height, extent.0, extent.1
             )))
         } else {
             for row in 0..height {
+                // SAFETY: `rows_fit` checked that every row from `base`,
+                // `row_bytes` long and `step` apart, lies inside the locked
+                // bytes.
                 let source = base.offset(step * row as isize);
                 let destination = bgra.as_mut_ptr().add(row * row_bytes);
                 std::ptr::copy_nonoverlapping(source, destination, row_bytes);
             }
             // RGB32's fourth channel is undefined padding; force it opaque so
             // the frame composites correctly in the UI.
-            for pixel in bgra.chunks_exact_mut(4) {
+            for pixel in bgra.as_chunks_mut::<4>().0 {
                 pixel[3] = 0xFF;
             }
             Ok(())
@@ -1103,6 +1123,28 @@ fn semi_planar_layout(
     })
 }
 
+/// Whether `height` rows of `row_bytes`, starting at a scanline with `before`
+/// readable bytes ahead of it and `after` from it on, and `step` bytes apart
+/// (negative for a bottom-up surface), all lie inside the locked buffer.
+fn rows_fit(step: isize, row_bytes: usize, height: usize, (before, after): (usize, usize)) -> bool {
+    let pitch = step.unsigned_abs();
+    if height == 0 {
+        return true;
+    }
+    if pitch < row_bytes {
+        return false;
+    }
+    let Some(span) = pitch.checked_mul(height - 1) else {
+        return false;
+    };
+    if step >= 0 {
+        span.checked_add(row_bytes)
+            .is_some_and(|need| need <= after)
+    } else {
+        span <= before && row_bytes <= after
+    }
+}
+
 /// Bytes from `from` to the end of the `len`-byte buffer at `start`, or zero
 /// when `from` is not inside it.
 fn bytes_after(start: *const u8, len: usize, from: *const u8) -> usize {
@@ -1179,6 +1221,25 @@ mod tests {
         // Outside the buffer on either side: nothing is readable.
         assert_eq!(bytes_after(start, 64, start.wrapping_add(65)), 0);
         assert_eq!(bytes_after(start.wrapping_add(8), 56, start), 0);
+    }
+
+    #[test]
+    fn rgb32_rows_must_fit_the_locked_buffer() {
+        // 4 rows of 16 bytes at pitch 16: exactly 64 bytes.
+        assert!(rows_fit(16, 16, 4, (0, 64)));
+        assert!(!rows_fit(16, 16, 4, (0, 63)), "one byte short");
+        // A padded pitch needs the padding only between rows, not after the
+        // last one.
+        assert!(rows_fit(20, 16, 4, (0, 76)));
+        assert!(!rows_fit(20, 16, 4, (0, 75)));
+        // Bottom-up: three rows lie before the top scanline.
+        assert!(rows_fit(-16, 16, 4, (48, 16)));
+        assert!(!rows_fit(-16, 16, 4, (47, 16)));
+        assert!(!rows_fit(-16, 16, 4, (48, 15)));
+        // A pitch narrower than a row, or one that overflows, never fits.
+        assert!(!rows_fit(8, 16, 4, (0, usize::MAX)));
+        assert!(!rows_fit(isize::MAX, 16, 4, (0, usize::MAX)));
+        assert!(rows_fit(16, 16, 0, (0, 0)), "no rows, nothing to read");
     }
 
     #[test]

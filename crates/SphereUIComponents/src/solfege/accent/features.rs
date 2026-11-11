@@ -179,8 +179,8 @@ pub fn contexts_from_notes(
 
     let mut phrase_of: Vec<usize> = Vec::with_capacity(count);
     let mut phrase = 0usize;
-    for index in 0..count {
-        let mut boundary = rests_before[index].is_some_and(|gap| gap > PHRASE_GAP_BEATS);
+    for (index, &rest_before) in rests_before.iter().enumerate().take(count) {
+        let mut boundary = rest_before.is_some_and(|gap| gap > PHRASE_GAP_BEATS);
         if !boundary && index > 0 {
             let previous = index - 1;
             let low = previous.saturating_sub(LOCAL_WINDOW_NOTES);
@@ -299,11 +299,11 @@ pub fn note_feature_vector(
     let high = (index + LOCAL_WINDOW_NOTES + 1).min(notes.len());
     let mut window_high = None::<u8>;
     let mut window_low = None::<u8>;
-    for other in low..high {
+    for (other, note) in notes.iter().enumerate().take(high).skip(low) {
         if other == index {
             continue;
         }
-        let pitch = notes[other].pitch;
+        let pitch = note.pitch;
         window_high = Some(window_high.map_or(pitch, |current: u8| current.max(pitch)));
         window_low = Some(window_low.map_or(pitch, |current: u8| current.min(pitch)));
     }

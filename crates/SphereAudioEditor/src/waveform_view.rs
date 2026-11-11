@@ -62,6 +62,10 @@ impl WaveformViewModel {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a flat GPUI element builder fed straight from the editor's view state"
+)]
 pub fn waveform_view(
     view_h: f32,
     viewport_width: f32,

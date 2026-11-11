@@ -453,10 +453,10 @@ fn decode_via_symphonia_reader(
     let source = corrected_source(source).map_err(|e| format!("Failed to read audio: {e}"))?;
     let mss = MediaSourceStream::new(source, Default::default());
     let mut hint = Hint::new();
-    if let Some(ext) = ext_hint {
-        if !ext.is_empty() {
-            hint.with_extension(ext);
-        }
+    if let Some(ext) = ext_hint
+        && !ext.is_empty()
+    {
+        hint.with_extension(ext);
     }
 
     let probed = symphonia::default::get_probe()

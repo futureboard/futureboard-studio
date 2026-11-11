@@ -378,7 +378,7 @@ impl AutomationCurveShape {
         }
     }
 
-    /// The shape a segment with curve and 	ension is, if it is one of
+    /// The shape a segment with `curve` and `tension` is, if it is one of
     /// these. Hold ignores tension.
     pub fn of(curve: AutomationCurve, tension: f32) -> Option<Self> {
         Self::ALL.into_iter().find(|shape| {

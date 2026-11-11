@@ -3,8 +3,8 @@ use std::sync::Arc;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     div, px, svg, AccessibleAction, App, AppContext, DragMoveEvent, Empty, InteractiveElement,
-    IntoElement, MouseButton, MouseDownEvent, ParentElement, Render, Role,
-    StatefulInteractiveElement, Styled, Toggled, Window, WindowControlArea,
+    IntoElement, MouseButton, ParentElement, Render, Role, StatefulInteractiveElement, Styled,
+    Toggled, Window, WindowControlArea,
 };
 
 use crate::assets;
@@ -18,7 +18,6 @@ use crate::components::title_bar::{
     draggable_spacer, section_separator, CHROME_TITLE_SIZE, WINDOW_CONTROL_WIDTH,
 };
 use crate::i18n::I18n;
-use crate::keymap::accel_display;
 use crate::platform_chrome::PlatformChromePolicy;
 use crate::theme::{self, space, Colors};
 
@@ -140,7 +139,7 @@ fn chrome_action_button(
         .items_center()
         .gap(px(space::HAIR))
         .child(button)
-        .children(shortcut.as_deref().map(|s| fb_shortcut_hint(s)))
+        .children(shortcut.as_deref().map(fb_shortcut_hint))
 }
 
 /// One transport-bar button.

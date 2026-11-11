@@ -3,19 +3,15 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum MpeChannelExhaustionPolicy {
+    #[default]
     OldestReleased,
     OldestActive,
     LowestVelocity,
     HighestNote,
     LowestNote,
     RejectNewNote,
-}
-
-impl Default for MpeChannelExhaustionPolicy {
-    fn default() -> Self {
-        Self::OldestReleased
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,9 +102,9 @@ impl MpeChannelAllocator {
     /// call to [`Self::release`] makes the channel reusable.
     pub fn mark_released(&mut self, note_id: NoteId) -> Option<u8> {
         let channel = self.channel_for_note(note_id)?;
-        self.slots[channel as usize]
-            .as_mut()
-            .map(|slot| slot.held = false);
+        if let Some(slot) = self.slots[channel as usize].as_mut() {
+            slot.held = false;
+        }
         self.released_channels[channel as usize] = true;
         Some(channel)
     }

@@ -2189,7 +2189,7 @@ impl AudioToolWindow {
                             .child(inspector_mini_button(
                                 "bpm-use",
                                 "Use Original BPM",
-                                self.bpm.first().is_some(),
+                                !self.bpm.is_empty(),
                                 cx.listener(|this, _, _, cx| {
                                     if let Some(best) = this.bpm.first() {
                                         this.dispatch(
@@ -2205,7 +2205,7 @@ impl AudioToolWindow {
                             .child(inspector_mini_button(
                                 "bpm-tempo",
                                 "Tempo Marker",
-                                self.bpm.first().is_some(),
+                                !self.bpm.is_empty(),
                                 cx.listener(|this, _, _, cx| {
                                     if let Some(best) = this.bpm.first() {
                                         let beat = this

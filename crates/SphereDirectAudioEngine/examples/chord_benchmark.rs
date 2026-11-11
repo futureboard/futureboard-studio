@@ -510,7 +510,7 @@ fn analyze(
         json,
         scores: Some(scores),
         seg: Some((over, under)),
-        boundary: Some((mae * rb.len() as f64, rb.len(), hits, eb.len().max(0))),
+        boundary: Some((mae * rb.len() as f64, rb.len(), hits, eb.len())),
         seconds,
         analysis_ms,
     })

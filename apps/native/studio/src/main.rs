@@ -62,7 +62,8 @@ fn launch() -> Result<i32, String> {
     let engine_main: extern "C" fn() -> i32 = unsafe { library.function(engine_abi::MAIN_SYMBOL)? };
     // The engine owns the process from here on and is never unloaded: its
     // audio, plug-in host and CEF threads can outlive the call below.
-    std::mem::forget(library);
+    // `platform::Library` has no `Drop`, so the engine library is never
+    // unloaded: the handle is simply never closed.
     Ok(engine_main())
 }
 

@@ -763,8 +763,8 @@ bool SphereDauxVst2Processor::process_planar(
                            output_channels.data(),
                            static_cast<int32_t>(frames));
 
-  ++process_count;
-  last_input_peak = input_peak;
+  process_count.fetch_add(1, std::memory_order_relaxed);
+  last_input_peak.store(input_peak, std::memory_order_relaxed);
   return true;
 }
 
@@ -920,8 +920,8 @@ int sphere_daux_vst2_process_stereo_block_with_midi(
                             std::abs(static_cast<double>(r - in_r[i]))));
     }
   }
-  p->last_output_peak = output_peak;
-  p->last_difference_peak = difference_peak;
+  p->last_output_peak.store(output_peak, std::memory_order_relaxed);
+  p->last_difference_peak.store(difference_peak, std::memory_order_relaxed);
   return 1;
 }
 
@@ -973,7 +973,7 @@ int sphere_daux_vst2_process_main_output_block_with_midi(
         output_peak = a;
     }
   }
-  p->last_output_peak = output_peak;
+  p->last_output_peak.store(output_peak, std::memory_order_relaxed);
   return 1;
 }
 
@@ -1027,19 +1027,19 @@ int sphere_daux_vst2_output_bus_channel_counts(SphereDauxVst2Processor *p,
 }
 
 unsigned long long sphere_daux_vst2_process_count(SphereDauxVst2Processor *p) {
-  return p ? p->process_count : 0;
+  return p ? p->process_count.load(std::memory_order_relaxed) : 0;
 }
 
 double sphere_daux_vst2_last_input_peak(SphereDauxVst2Processor *p) {
-  return p ? p->last_input_peak : 0.0;
+  return p ? p->last_input_peak.load(std::memory_order_relaxed) : 0.0;
 }
 
 double sphere_daux_vst2_last_output_peak(SphereDauxVst2Processor *p) {
-  return p ? p->last_output_peak : 0.0;
+  return p ? p->last_output_peak.load(std::memory_order_relaxed) : 0.0;
 }
 
 double sphere_daux_vst2_last_difference_peak(SphereDauxVst2Processor *p) {
-  return p ? p->last_difference_peak : 0.0;
+  return p ? p->last_difference_peak.load(std::memory_order_relaxed) : 0.0;
 }
 
 void sphere_daux_vst2_set_param(SphereDauxVst2Processor *p,

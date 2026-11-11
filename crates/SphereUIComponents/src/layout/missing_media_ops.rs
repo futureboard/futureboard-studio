@@ -332,7 +332,7 @@ impl StudioLayout {
         let rows = self.missing_media_rows(cx);
         if let Some(handle) = self.external_windows.missing_media {
             if handle
-                .update(cx, |window, _window, cx| window.set_rows(rows.clone(), cx))
+                .update(cx, |view, _window, cx| view.set_rows(rows.clone(), cx))
                 .is_ok()
             {
                 return true;
@@ -404,7 +404,7 @@ impl StudioLayout {
         };
         let rows = self.missing_media_rows(cx);
         if handle
-            .update(cx, |window, _window, cx| window.set_rows(rows, cx))
+            .update(cx, |view, _window, cx| view.set_rows(rows, cx))
             .is_err()
         {
             self.external_windows.missing_media = None;
@@ -413,7 +413,7 @@ impl StudioLayout {
 
     fn say_in_missing_media(&mut self, status: String, cx: &mut Context<Self>) {
         if let Some(handle) = self.external_windows.missing_media {
-            let _ = handle.update(cx, |window, _window, cx| window.set_status(status, cx));
+            let _ = handle.update(cx, |view, _window, cx| view.set_status(status, cx));
         }
     }
 

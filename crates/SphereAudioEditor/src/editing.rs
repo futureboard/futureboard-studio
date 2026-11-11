@@ -405,15 +405,9 @@ pub struct EnvelopePoint {
     pub curve: EnvelopeCurve,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ClipEnvelope {
     pub points: Vec<EnvelopePoint>,
-}
-
-impl Default for ClipEnvelope {
-    fn default() -> Self {
-        Self { points: Vec::new() }
-    }
 }
 
 impl ClipEnvelope {
@@ -496,23 +490,35 @@ impl AudioRangeSelection {
 
 /// Explicit interaction state for the editor.  The project host turns the
 /// drag intents into one coalesced `UpdateClip` command at pointer-up.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum AudioEditorDrag {
+    #[default]
     None,
-    SelectingRange { anchor_beat: f32 },
-    SelectingSpectralRange { anchor_frame: i64, anchor_hz: f32 },
-    TrimmingLeft { start_beat: f32 },
-    TrimmingRight { start_beat: f32 },
-    AdjustingFadeIn { original_seconds: f32 },
-    AdjustingFadeOut { original_seconds: f32 },
-    MovingWarpMarker { marker_id: u64 },
-    MovingEnvelopePoint { point_id: u64 },
-}
-
-impl Default for AudioEditorDrag {
-    fn default() -> Self {
-        Self::None
-    }
+    SelectingRange {
+        anchor_beat: f32,
+    },
+    SelectingSpectralRange {
+        anchor_frame: i64,
+        anchor_hz: f32,
+    },
+    TrimmingLeft {
+        start_beat: f32,
+    },
+    TrimmingRight {
+        start_beat: f32,
+    },
+    AdjustingFadeIn {
+        original_seconds: f32,
+    },
+    AdjustingFadeOut {
+        original_seconds: f32,
+    },
+    MovingWarpMarker {
+        marker_id: u64,
+    },
+    MovingEnvelopePoint {
+        point_id: u64,
+    },
 }
 
 #[cfg(test)]

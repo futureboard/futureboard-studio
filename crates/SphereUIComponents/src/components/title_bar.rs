@@ -633,6 +633,28 @@ fn external_window_control_button(
         .child(window_control_icon(area, icon_path, "").text_color(Colors::text_faint()))
 }
 
+pub fn status_item(text: impl Into<String>, strong: bool) -> impl gpui::IntoElement {
+    div()
+        .h(px(18.0))
+        .flex()
+        .items_center()
+        .px(px(6.0))
+        .rounded(px(crate::theme::radius::CONTROL))
+        .text_size(px(crate::theme::typography::UI_XS))
+        .font(theme::ui_font())
+        .font_weight(if strong {
+            gpui::FontWeight::MEDIUM
+        } else {
+            gpui::FontWeight::NORMAL
+        })
+        .text_color(if strong {
+            Colors::statusbar_text()
+        } else {
+            Colors::statusbar_text_muted()
+        })
+        .child(text.into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{titlebar_press, TitlebarPress};
@@ -664,26 +686,4 @@ mod tests {
             }
         }
     }
-}
-
-pub fn status_item(text: impl Into<String>, strong: bool) -> impl gpui::IntoElement {
-    div()
-        .h(px(18.0))
-        .flex()
-        .items_center()
-        .px(px(6.0))
-        .rounded(px(crate::theme::radius::CONTROL))
-        .text_size(px(crate::theme::typography::UI_XS))
-        .font(theme::ui_font())
-        .font_weight(if strong {
-            gpui::FontWeight::MEDIUM
-        } else {
-            gpui::FontWeight::NORMAL
-        })
-        .text_color(if strong {
-            Colors::statusbar_text()
-        } else {
-            Colors::statusbar_text_muted()
-        })
-        .child(text.into())
 }

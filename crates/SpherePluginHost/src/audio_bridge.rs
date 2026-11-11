@@ -225,11 +225,20 @@ impl<T: Copy + Default, const CAP: usize> SpscRing<T, CAP> {
     }
 
     /// Consumer side: pop the oldest value, or `None` when empty. Wait-free.
+    ///
+    /// The other process writes `tail`, and the plug-in host runs code that can
+    /// scribble on the mapping. A `tail` more than `CAP` ahead is not a queue,
+    /// it is corruption: the ring is emptied rather than drained for up to
+    /// four billion pops, reading slots the producer may be writing.
     pub fn try_pop(&self) -> Option<T> {
         let head = self.head.load(Ordering::Relaxed);
         let tail = self.tail.load(Ordering::Acquire);
         if head == tail {
             return None; // empty
+        }
+        if tail.wrapping_sub(head) > CAP as u32 {
+            self.head.store(tail, Ordering::Release);
+            return None;
         }
         let idx = (head & Self::MASK) as usize;
         // SAFETY: single consumer owns `head`; slot was published by the producer

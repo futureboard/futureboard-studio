@@ -430,11 +430,10 @@ impl InsertCell {
             InsertDsp::Builtin(fx) => {
                 if self.telemetry.is_watched() {
                     // SAFETY: see the type's contract.
-                    let analyzer = unsafe { &mut *self.analyzer.get() }.as_mut();
-                    let analyzer = analyzer.map(|a| {
+                    let mut analyzer = unsafe { &mut *self.analyzer.get() }.as_mut();
+                    if let Some(a) = &mut analyzer {
                         a.push_block(left, right);
-                        a
-                    });
+                    }
                     fx.process(left, right);
                     self.telemetry.publish(fx, analyzer);
                 } else {
@@ -500,6 +499,10 @@ impl HighPass {
         }
     }
 
+    #[allow(
+        clippy::neg_cmp_op_on_partial_ord,
+        reason = "`!(x > ε)` is deliberately true for NaN, so a NaN state is flushed to zero too"
+    )]
     fn process(&mut self, x: f32) -> f32 {
         let y = self.b0 * x + self.z1;
         self.z1 = self.b1 * x - self.a1 * y + self.z2;
@@ -1219,7 +1222,7 @@ impl Graph {
 
     fn process_block(&mut self, input: &[f32], n: usize) {
         let in_ch = self.in_channels;
-        let available = if in_ch == 0 { 0 } else { input.len() / in_ch };
+        let available = input.len().checked_div(in_ch).unwrap_or(0);
         for (ch, plane) in self.inputs.iter_mut().enumerate() {
             for (i, sample) in plane[..n].iter_mut().enumerate() {
                 *sample = if i < available {

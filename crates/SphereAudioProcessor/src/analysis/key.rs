@@ -184,7 +184,7 @@ pub fn pitch_class_profile(samples: &[f32], sample_rate: f32) -> Option<[f32; 12
     let mut chroma = [0.0_f32; 12];
     let mut frame_chroma = [0.0_f32; 12];
     let mut current = partials[0].frame;
-    let mut flush = |frame_chroma: &mut [f32; 12], chroma: &mut [f32; 12]| {
+    let flush = |frame_chroma: &mut [f32; 12], chroma: &mut [f32; 12]| {
         let total: f32 = frame_chroma.iter().sum();
         if total > f32::EPSILON {
             for (acc, value) in chroma.iter_mut().zip(frame_chroma.iter()) {

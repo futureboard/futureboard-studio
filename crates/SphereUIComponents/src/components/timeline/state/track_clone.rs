@@ -255,7 +255,7 @@ impl TimelineState {
             return false;
         }
         if track_id == MASTER_TRACK_ID {
-            return count <= MAX_INSERT_SLOTS;
+            return insert_chain_fits(count);
         }
         let Some(track) = self.find_track(track_id) else {
             return false;
@@ -263,7 +263,7 @@ impl TimelineState {
         match track.track_type {
             TrackType::Video | TrackType::Group | TrackType::Master => false,
             TrackType::Midi if track.fx_chain_floor() == 0 => false,
-            _ => track.fx_chain_floor() + count <= MAX_INSERT_SLOTS,
+            _ => insert_chain_fits(track.fx_chain_floor() + count),
         }
     }
 
@@ -329,7 +329,7 @@ impl TimelineState {
             .first()
             .is_some_and(|slot| slot.plugin_is_instrument == Some(true));
         let placeholder = !first_is_instrument && track.needs_instrument_placeholder();
-        if slots.len() + usize::from(placeholder) > MAX_INSERT_SLOTS {
+        if !insert_chain_fits(slots.len() + usize::from(placeholder)) {
             return None;
         }
         let existing: Vec<String> = self

@@ -1909,7 +1909,7 @@ mod tests {
         }
         let back: Session = serde_json::from_str(&text).unwrap();
         assert_eq!(back, session);
-        let mut normalized = back.clone();
+        let mut normalized = back;
         normalized.normalize();
         assert_eq!(normalized, session, "nothing to tidy");
     }

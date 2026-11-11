@@ -604,7 +604,9 @@ mod tests {
 
         let bytes = std::fs::read(&path).unwrap();
         let samples: Vec<i32> = bytes[RAUF_DATA_OFFSET as usize..]
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect();
         assert_eq!(samples, [1, -2, 3, 4, i32::MIN, i32::MAX]);

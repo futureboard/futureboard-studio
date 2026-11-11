@@ -400,7 +400,7 @@ pub fn track_input_detail(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio_connections::{AudioConnection, AudioConnectionStatus};
+    use crate::audio_connections::AudioConnectionStatus;
 
     fn device() -> AvailablePorts {
         AvailablePorts::for_device("dev-1", "Studio 24c", 4, 4)

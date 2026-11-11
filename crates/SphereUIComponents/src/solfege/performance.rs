@@ -19,9 +19,7 @@
 
 use serde::Deserialize;
 
-use crate::components::timeline::timeline_state::{
-    MidiNoteState, PitchCurve, PitchPoint, PitchSegmentShape,
-};
+use crate::components::timeline::timeline_state::{MidiNoteState, PitchCurve, PitchSegmentShape};
 
 /// Format tag written by the generator. Checked rather than assumed so a file
 /// from a later, incompatible version is refused instead of half-applied.
@@ -304,7 +302,13 @@ mod tests {
         );
         let mut notes = vec![MidiNoteState::new(60, 0.0, 1.0, 64)];
         notes[0].pitch_curve = Some(PitchCurve {
-            points: vec![PitchPoint::new(0.0, 50.0, PitchSegmentShape::Smooth)],
+            points: vec![
+                crate::components::timeline::timeline_state::PitchPoint::new(
+                    0.0,
+                    50.0,
+                    PitchSegmentShape::Smooth,
+                ),
+            ],
         });
         let mut ids = 1;
         let applied = apply(&doc, &mut notes, 0.5, &mut ids).expect("applies");

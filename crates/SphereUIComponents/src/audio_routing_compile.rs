@@ -1024,7 +1024,7 @@ mod tests {
         });
 
         let held = publisher.current();
-        assert_eq!(Arc::strong_count(&held) >= 2, true);
+        assert!(Arc::strong_count(&held) >= 2);
         assert_eq!(
             held.output_routing.hardware_owner,
             HardwareOutputOwner::MonitorControlRoom

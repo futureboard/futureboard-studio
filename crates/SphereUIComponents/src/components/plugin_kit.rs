@@ -140,6 +140,10 @@ pub trait KitModel: Copy + PartialEq + 'static {
     fn key(self) -> &'static str;
     fn defaults(self) -> Self::Params;
     /// The insert's params in Studio's state mirror.
+    #[allow(
+        clippy::wrong_self_convention,
+        reason = "`self` is the editor family that picks which mirror table to read"
+    )]
     fn from_mirror(self, insert_id: &str) -> Option<Self::Params>;
     /// Every param as `(wire index, value)`, in the order an editor sends
     /// them.

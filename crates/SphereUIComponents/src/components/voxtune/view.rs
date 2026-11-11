@@ -2552,9 +2552,6 @@ impl VoxtuneEditor {
             .into_any_element()
     }
 
-    /// The pitch keyboard. Labels take the key's own contrast: dark on white
-    /// keys, light on black ones, dimmer off the scale.
-
     fn render_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let card = |children: Vec<AnyElement>| {
             div()

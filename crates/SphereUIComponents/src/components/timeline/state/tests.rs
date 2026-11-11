@@ -2453,7 +2453,7 @@ mod audio_clip_split_tests {
 
         state.update_audio_clip_metadata("C:/a/loop.wav", "wav", 48_000, 2, 192_000, 4.0);
 
-        let clips: Vec<_> = state.tracks[0].clips.iter().cloned().collect();
+        let clips: Vec<_> = state.tracks[0].clips.to_vec();
         assert_eq!(clips.len(), 2);
         assert!((clips[0].duration_beats - left_len).abs() < 1e-4);
         assert!((clips[1].duration_beats - right_len).abs() < 1e-4);

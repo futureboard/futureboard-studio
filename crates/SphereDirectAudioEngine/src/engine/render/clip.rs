@@ -131,8 +131,9 @@ pub(crate) fn clip_fade_gain_with_curves(
     gain
 }
 
-/// [`clip_fade_gain_with_curves`] at the default curve on both edges.
-#[inline]
+/// [`clip_fade_gain_with_curves`] at the default curve on both edges. The
+/// render always passes the clip's own curves; this is the tests' shorthand.
+#[cfg(test)]
 pub(crate) fn clip_fade_gain(rel: u64, duration: u64, fade_in: u64, fade_out: u64) -> f32 {
     clip_fade_gain_with_curves(
         rel,

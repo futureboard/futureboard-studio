@@ -290,7 +290,8 @@ fn tiled_bars(
     build: impl FnOnce(&[Range<usize>]) -> (Vec<WaveformBars>, bool),
 ) -> (VisibleBars, bool) {
     let Some(base) = base else {
-        let (mut built, _) = build(&[window.first..window.end]);
+        let whole = window.first..window.end;
+        let (mut built, _) = build(std::slice::from_ref(&whole));
         let bars = Arc::new(built.pop().unwrap_or_default());
         let range = window.visible_slice(&bars);
         return (vec![(bars, range)], false);
@@ -724,14 +725,16 @@ fn chunk_visible_bars(
             })
             .collect();
         let peak_span = |level: usize| -> Range<usize> {
-            let mut span = usize::MAX..0;
+            // No columns leaves `start > end`: an empty span, which the cache
+            // answers with no chunks.
+            let (mut start, mut end) = (usize::MAX, 0);
             for &(_, lo, hi) in tile_columns.iter().flatten() {
                 let p0 = sample_to_peak_index(lo, level);
                 let p1 = sample_to_peak_index(hi, level).max(p0);
-                span.start = span.start.min(p0);
-                span.end = span.end.max(p1 + 1);
+                start = start.min(p0);
+                end = end.max(p1 + 1);
             }
-            span
+            start..end
         };
         let span = peak_span(spp);
         let fallback_span = fallback_spp.map(|ladder| (ladder, peak_span(ladder)));

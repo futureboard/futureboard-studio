@@ -21,11 +21,21 @@ struct StretchHandleState {
     processor: Box<dyn StretchProcessor + Send>,
 }
 
-fn state_from_handle(handle: *mut SphereStretchHandle) -> Option<&'static mut StretchHandleState> {
+/// The state behind a handle, for the length of one export call.
+///
+/// # Safety
+///
+/// `handle` is null or came from [`sphere_stretch_create`], has not been
+/// passed to [`sphere_stretch_destroy`], and no other call uses it while the
+/// returned reference lives.
+unsafe fn state_from_handle<'a>(
+    handle: *mut SphereStretchHandle,
+) -> Option<&'a mut StretchHandleState> {
     if handle.is_null() {
         return None;
     }
-    // SAFETY: `SphereStretchHandle` is an opaque FFI newtype for `StretchHandleState`.
+    // SAFETY: a live handle is a `Box<StretchHandleState>` from
+    // `sphere_stretch_create`, used by one call at a time (caller's contract).
     Some(unsafe { &mut *(handle.cast::<StretchHandleState>()) })
 }
 
@@ -66,30 +76,52 @@ pub extern "C" fn sphere_stretch_create(
     result.unwrap_or(ptr::null_mut())
 }
 
+/// Free a handle. Null is ignored.
+///
+/// # Safety
+///
+/// `handle` is null or came from [`sphere_stretch_create`] and has not been
+/// destroyed already; no other call is using it, and it is not used again.
 #[unsafe(no_mangle)]
-pub extern "C" fn sphere_stretch_destroy(handle: *mut SphereStretchHandle) {
+pub unsafe extern "C" fn sphere_stretch_destroy(handle: *mut SphereStretchHandle) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         if handle.is_null() {
             return;
         }
+        // SAFETY: a live handle from `sphere_stretch_create`, freed once
+        // (caller's contract).
         unsafe {
             drop(Box::from_raw(handle.cast::<StretchHandleState>()));
         }
     }));
 }
 
+/// Clear the processor's history. Null is ignored.
+///
+/// # Safety
+///
+/// `handle` is null or a live handle from [`sphere_stretch_create`], used by
+/// no other call at the same time.
 #[unsafe(no_mangle)]
-pub extern "C" fn sphere_stretch_reset(handle: *mut SphereStretchHandle) {
+pub unsafe extern "C" fn sphere_stretch_reset(handle: *mut SphereStretchHandle) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
-        let Some(state) = state_from_handle(handle) else {
+        // SAFETY: forwarded from this function's contract.
+        let Some(state) = (unsafe { state_from_handle(handle) }) else {
             return;
         };
         state.processor.reset();
     }));
 }
 
+/// Set the stretch mode, algorithm and ratios. Returns 0, or a negative code:
+/// -1 null handle, -2 invalid parameters, -3 backend unavailable, -4 panic.
+///
+/// # Safety
+///
+/// `handle` is null or a live handle from [`sphere_stretch_create`], used by
+/// no other call at the same time.
 #[unsafe(no_mangle)]
-pub extern "C" fn sphere_stretch_set_params(
+pub unsafe extern "C" fn sphere_stretch_set_params(
     handle: *mut SphereStretchHandle,
     mode: u32,
     algorithm: u32,
@@ -101,7 +133,8 @@ pub extern "C" fn sphere_stretch_set_params(
     quality: f32,
 ) -> i32 {
     let result = catch_unwind(AssertUnwindSafe(|| {
-        let Some(state) = state_from_handle(handle) else {
+        // SAFETY: forwarded from this function's contract.
+        let Some(state) = (unsafe { state_from_handle(handle) }) else {
             return -1;
         };
 
@@ -142,6 +175,15 @@ pub extern "C" fn sphere_stretch_set_params(
     result.unwrap_or(-4)
 }
 
+/// Stretch `frames` stereo frames. Returns 0, or a negative code: -1 null or
+/// overlapping buffers, -2 length mismatch, -3 processing error, -4 panic.
+///
+/// # Safety
+///
+/// `handle` is a live handle from [`sphere_stretch_create`], used by no other
+/// call at the same time. Each buffer is valid for `frames` `f32`s, the inputs
+/// for reads and the outputs for writes. An output may not overlap any other
+/// buffer; overlapping ones are refused with -1.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sphere_stretch_process_stereo(
     handle: *mut SphereStretchHandle,
@@ -161,11 +203,27 @@ pub unsafe extern "C" fn sphere_stretch_process_stereo(
         {
             return -1;
         }
+        // An output aliasing anything else would be a `&mut` overlapping
+        // another reference: refuse it rather than hand that to the processor.
+        let Some(bytes) = frames.checked_mul(std::mem::size_of::<f32>()) else {
+            return -1;
+        };
+        let range = |p: *const f32| (p as usize, (p as usize).saturating_add(bytes));
+        let overlaps = |a: (usize, usize), b: (usize, usize)| a.0 < b.1 && b.0 < a.1;
+        let (il, ir) = (range(input_l), range(input_r));
+        let (ol, or) = (range(output_l), range(output_r));
+        if overlaps(ol, or) || [il, ir].iter().any(|&i| overlaps(i, ol) || overlaps(i, or)) {
+            return -1;
+        }
 
-        let Some(state) = state_from_handle(handle) else {
+        // SAFETY: forwarded from this function's contract.
+        let Some(state) = (unsafe { state_from_handle(handle) }) else {
             return -1;
         };
 
+        // SAFETY: each pointer is non-null and valid for `frames` values
+        // (caller's contract), and no output overlaps another buffer (checked
+        // above), so the `&mut` slices alias nothing.
         let input_l = unsafe { std::slice::from_raw_parts(input_l, frames) };
         let input_r = unsafe { std::slice::from_raw_parts(input_r, frames) };
         let output_l = unsafe { std::slice::from_raw_parts_mut(output_l, frames) };
@@ -454,7 +512,9 @@ mod tests {
         assert!(!handle.is_null());
 
         assert_eq!(
-            sphere_stretch_set_params(handle, 1, 1, 2.0, 1.0, f32::NAN, f32::NAN, false, 0.75),
+            unsafe {
+                sphere_stretch_set_params(handle, 1, 1, 2.0, 1.0, f32::NAN, f32::NAN, false, 0.75)
+            },
             0
         );
 
@@ -477,9 +537,68 @@ mod tests {
             0
         );
 
-        sphere_stretch_reset(handle);
-        sphere_stretch_destroy(handle);
-        sphere_stretch_destroy(ptr::null_mut());
+        // SAFETY: `handle` is live and used only here; destroyed once.
+        unsafe {
+            sphere_stretch_reset(handle);
+            sphere_stretch_destroy(handle);
+            sphere_stretch_destroy(ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn overlapping_buffers_are_refused() {
+        let handle = sphere_stretch_create(48_000.0, 2);
+        assert!(!handle.is_null());
+        let input = [0.25_f32; 8];
+        let mut shared = [0.0_f32; 8];
+        let mut other = [0.0_f32; 8];
+        let out = shared.as_mut_ptr();
+        // SAFETY: valid buffers of 4 frames each; the call refuses the
+        // aliasing before it reads or writes any of them.
+        unsafe {
+            // Both outputs on one buffer.
+            assert_eq!(
+                sphere_stretch_process_stereo(handle, input.as_ptr(), input.as_ptr(), out, out, 4),
+                -1
+            );
+            // An output over an input (in place).
+            assert_eq!(
+                sphere_stretch_process_stereo(
+                    handle,
+                    out,
+                    input.as_ptr(),
+                    out,
+                    other.as_mut_ptr(),
+                    4
+                ),
+                -1
+            );
+            // Overlapping halves of one buffer.
+            assert_eq!(
+                sphere_stretch_process_stereo(
+                    handle,
+                    input.as_ptr(),
+                    input.as_ptr(),
+                    out,
+                    out.add(2),
+                    4
+                ),
+                -1
+            );
+            // Two inputs may share a buffer: they are only read.
+            assert_eq!(
+                sphere_stretch_process_stereo(
+                    handle,
+                    input.as_ptr(),
+                    input.as_ptr(),
+                    out,
+                    out.add(4),
+                    4
+                ),
+                0
+            );
+            sphere_stretch_destroy(handle);
+        }
     }
 
     #[test]

@@ -342,6 +342,10 @@ mod tests {
     /// The strip has to hold a comfortable tool button with room under it for
     /// the selection marker.
     #[test]
+    #[allow(
+        clippy::assertions_on_constants,
+        reason = "documents the tool strip's layout constants as a named test"
+    )]
     fn the_strip_fits_a_button_and_its_marker() {
         assert!(CLASSIC_TOOL_STRIP_HEIGHT >= size::COMFORTABLE + 2.0 * 2.0);
         assert!((CLASSIC_TOOL_STRIP_HEIGHT - size::COMFORTABLE) / 2.0 >= 2.0);

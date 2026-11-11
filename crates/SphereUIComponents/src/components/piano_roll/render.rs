@@ -3171,12 +3171,9 @@ impl PianoRoll {
                 row_lines.push((y + row_h, line));
             }
         }
-        let pitch_range = if self.drum_mode {
-            1..=0
-        } else {
-            first_pitch..=last_pitch
-        };
-        for p in pitch_range {
+        // Drum mode draws its rows above; no pitch rows then.
+        let pitch_range = (!self.drum_mode).then_some(first_pitch..=last_pitch);
+        for p in pitch_range.into_iter().flatten() {
             let pitch = p as u8;
             let y = self.pitch_to_y(pitch);
             let in_scale = !scale_active || scale.contains_pitch(pitch);

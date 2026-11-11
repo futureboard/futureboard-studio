@@ -448,7 +448,7 @@ const SCRAMBLE_OUT: [f32; LINE_COUNT] = [
 
 /// Entry `(row, column)` of the 16×16 Sylvester–Hadamard matrix.
 const fn walsh(row: usize, column: usize) -> f32 {
-    if (row & column).count_ones() % 2 == 0 {
+    if (row & column).count_ones().is_multiple_of(2) {
         1.0
     } else {
         -1.0

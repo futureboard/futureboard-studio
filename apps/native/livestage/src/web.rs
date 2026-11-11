@@ -1048,7 +1048,7 @@ fn host_allowed(host: Option<&str>, names: &[String], machine: Option<&str>) -> 
             return true;
         }
     }
-    names.iter().any(|name| *name == host)
+    names.contains(&host)
 }
 
 /// This machine's name, as the network knows it (the appliance's setup
@@ -1762,7 +1762,7 @@ mod tests {
             999,
             Some("10.0.0.51".parse().unwrap()),
             later,
-            reconnect.clone(),
+            reconnect,
             None
         ));
         assert_eq!(slots.open.len(), MAX_CONNECTIONS);
@@ -1985,7 +1985,7 @@ mod tests {
                 }
                 !ended
             });
-            if n % 2 == 0 {
+            if n.is_multiple_of(2) {
                 if let Some((id, _)) = old {
                     close(id);
                 }
@@ -2842,7 +2842,7 @@ mod tests {
             }
             if step % 40 == 20 {
                 let k = operators.len();
-                let peer = if k % 2 == 0 {
+                let peer = if k.is_multiple_of(2) {
                     IpAddr::from([10, 9, 9, k as u8 + 1])
                 } else {
                     IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 9, k as u16, 0, 0, 0, 1))

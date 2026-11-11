@@ -363,8 +363,7 @@ pub fn build_mask_image(
         let bin = ((hz / max_hz) * (mask.bins - 1) as f32).round() as usize;
         row_bins.push(bin.min(mask.bins - 1));
     }
-    for row in 0..height {
-        let bin = row_bins[row];
+    for &bin in &row_bins {
         for x in 0..width {
             let column = x * mask.columns / width;
             let gain = mask.gain(column, bin).clamp(0.0, 1.0);

@@ -78,8 +78,10 @@ mod tests {
 
     #[test]
     fn zoom_preserves_anchor() {
-        let mut viewport = AudioEditorViewport::default();
-        viewport.scroll_x = 100.0;
+        let mut viewport = AudioEditorViewport {
+            scroll_x: 100.0,
+            ..Default::default()
+        };
         let anchor = 240.0;
         let beat_before = viewport.x_to_beat(anchor);
         viewport.zoom_around_x(2.0, anchor);

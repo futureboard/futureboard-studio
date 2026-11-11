@@ -2924,7 +2924,7 @@ fn tuner_box(w: &RodhareistEditorWindow, p: &Params, cx: &mut Cx, s: f32) -> Any
                             div()
                                 .absolute()
                                 .left(gpui::relative(0.5))
-                                .ml(px(-1.0 * s))
+                                .ml(px(-s))
                                 .top(px(-3.0 * s))
                                 .bottom(px(-3.0 * s))
                                 .w(px(2.0 * s))

@@ -596,7 +596,7 @@ mod tests {
         state.selection.selected_clip_ids = vec!["stale-clip".to_string()];
 
         state.apply_marquee_selection(
-            &[second.clone()],
+            std::slice::from_ref(&second),
             vec!["fresh-clip".to_string()],
             &second,
             false,
@@ -658,7 +658,7 @@ mod tests {
         let first = state.create_audio_track();
         let second = state.create_audio_track();
 
-        state.apply_marquee_selection(&[second.clone()], Vec::new(), &first, false);
+        state.apply_marquee_selection(std::slice::from_ref(&second), Vec::new(), &first, false);
 
         assert_eq!(
             state.selection.selected_track_id.as_deref(),

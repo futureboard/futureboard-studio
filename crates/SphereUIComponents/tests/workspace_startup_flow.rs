@@ -15,8 +15,7 @@ use sphere_ui_components::loading_session::{
     FailureSurface, LoadStage, ReplacementSurfaces, SessionTransactionSurface,
 };
 use sphere_ui_components::project::{
-    load_project, load_project_strict, save_project, validate_project_file, FutureboardProject,
-    PROJECT_FILE_EXT,
+    load_project_strict, save_project, validate_project_file, FutureboardProject, PROJECT_FILE_EXT,
 };
 
 /// Stages a transaction actually walks, from its first stage onwards.

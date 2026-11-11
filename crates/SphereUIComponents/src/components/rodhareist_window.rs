@@ -1172,7 +1172,7 @@ impl RodhareistEditorWindow {
             .host_status_source
             .as_ref()
             .and_then(|source| source(&self.key))
-            .map(|(_rate, _block, _latency, tempo)| tempo as f64)
+            .map(|(_rate, _block, _latency, tempo)| tempo)
             .filter(|tempo| *tempo > 0.0)
     }
 
@@ -1867,7 +1867,7 @@ mod tests {
     fn wire_diff_reports_only_the_field_that_changed() {
         let before = rodharerist::default_params();
         let mut after = before.clone();
-        after.amp_gain = after.amp_gain + 1.0;
+        after.amp_gain += 1.0;
         let diff = wire_diff(&before, &after);
         assert_eq!(diff.len(), 1);
         let (index, value) = diff[0];

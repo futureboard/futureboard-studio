@@ -360,54 +360,6 @@ fn hot_scope_rows(scopes: &[crate::perf::ScopeSample]) -> Vec<gpui::AnyElement> 
     rows
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{frame_accounting_rows, hot_scope_rows};
-    use crate::perf::ScopeSample;
-
-    /// The breakdown is the block that explains a profiler which otherwise
-    /// looks broken, so it must render unconditionally — including before any
-    /// perf window has completed (cpu 0.0) and on a degenerate frame time.
-    #[test]
-    fn breakdown_always_renders_every_row() {
-        // Frame breakdown: label + UI CPU + draw + present + unaccounted.
-        // Draw split: label + prepaint + paint + a11y + text + solve + measure
-        // + node counts.
-        const EXPECTED_ROWS: usize = 13;
-        assert_eq!(frame_accounting_rows(0.2, 40.0).len(), EXPECTED_ROWS);
-        assert_eq!(frame_accounting_rows(0.0, 0.0).len(), EXPECTED_ROWS);
-        // A frame cheaper than the measured CPU (clock jitter) must not
-        // produce a negative remainder or panic.
-        assert_eq!(frame_accounting_rows(5.0, 1.0).len(), EXPECTED_ROWS);
-    }
-
-    #[test]
-    fn no_scope_rows_when_the_collector_has_nothing() {
-        assert!(hot_scope_rows(&[]).is_empty(), "panel stays compact");
-    }
-
-    /// One header row plus one row per scope, so the panel height is
-    /// predictable and the rows cannot silently disappear.
-    #[test]
-    fn scope_rows_are_header_plus_one_per_scope() {
-        let scopes = vec![
-            ScopeSample {
-                name: "poll_native_audio",
-                total_ms: 480.0,
-                percent: 62.0,
-                count: 140,
-            },
-            ScopeSample {
-                name: "Timeline",
-                total_ms: 40.0,
-                percent: 5.0,
-                count: 60,
-            },
-        ];
-        assert_eq!(hot_scope_rows(&scopes).len(), scopes.len() + 1);
-    }
-}
-
 fn overlay_scope_row(label: &str, value: &str, percent: f32) -> impl IntoElement {
     // A scope taking most of the window is the answer, so colour it like one.
     let value_color = if percent >= 50.0 {
@@ -472,4 +424,52 @@ fn overlay_line(label: &'static str, value: &str) -> impl IntoElement {
                 .text_color(Colors::text_secondary())
                 .child(value.to_string()),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{frame_accounting_rows, hot_scope_rows};
+    use crate::perf::ScopeSample;
+
+    /// The breakdown is the block that explains a profiler which otherwise
+    /// looks broken, so it must render unconditionally — including before any
+    /// perf window has completed (cpu 0.0) and on a degenerate frame time.
+    #[test]
+    fn breakdown_always_renders_every_row() {
+        // Frame breakdown: label + UI CPU + draw + present + unaccounted.
+        // Draw split: label + prepaint + paint + a11y + text + solve + measure
+        // + node counts.
+        const EXPECTED_ROWS: usize = 13;
+        assert_eq!(frame_accounting_rows(0.2, 40.0).len(), EXPECTED_ROWS);
+        assert_eq!(frame_accounting_rows(0.0, 0.0).len(), EXPECTED_ROWS);
+        // A frame cheaper than the measured CPU (clock jitter) must not
+        // produce a negative remainder or panic.
+        assert_eq!(frame_accounting_rows(5.0, 1.0).len(), EXPECTED_ROWS);
+    }
+
+    #[test]
+    fn no_scope_rows_when_the_collector_has_nothing() {
+        assert!(hot_scope_rows(&[]).is_empty(), "panel stays compact");
+    }
+
+    /// One header row plus one row per scope, so the panel height is
+    /// predictable and the rows cannot silently disappear.
+    #[test]
+    fn scope_rows_are_header_plus_one_per_scope() {
+        let scopes = vec![
+            ScopeSample {
+                name: "poll_native_audio",
+                total_ms: 480.0,
+                percent: 62.0,
+                count: 140,
+            },
+            ScopeSample {
+                name: "Timeline",
+                total_ms: 40.0,
+                percent: 5.0,
+                count: 60,
+            },
+        ];
+        assert_eq!(hot_scope_rows(&scopes).len(), scopes.len() + 1);
+    }
 }

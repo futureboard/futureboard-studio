@@ -262,7 +262,7 @@ impl Live {
         let rate = if target < self.scope_gain { 0.5 } else { 0.04 };
         self.scope_gain = (self.scope_gain + (target - self.scope_gain) * rate).clamp(1.0, 16.0);
         let mut fresh = [0.0f32; POLAR_BINS];
-        for pair in frame.scope.chunks_exact(2) {
+        for pair in frame.scope.as_chunks::<2>().0 {
             let (angle, radius) = polar_of(pair[0], pair[1]);
             let bin = ((angle / std::f32::consts::PI + 0.5) * (POLAR_BINS - 1) as f32).round();
             let bin = (bin.max(0.0) as usize).min(POLAR_BINS - 1);
@@ -1226,7 +1226,13 @@ fn paint_polar(
     for (age, frame) in live.image.iter().enumerate() {
         let alpha = 0.18 + 0.72 * (age + 1) as f32 / frames as f32;
         let color = Colors::with_alpha(accent, alpha);
-        for pair in frame.scope.chunks_exact(2).take(IMAGE_SCOPE_POINTS) {
+        for pair in frame
+            .scope
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .take(IMAGE_SCOPE_POINTS)
+        {
             let (angle, r) = polar_of(pair[0], pair[1]);
             let (x, y) = at(angle, (r * live.scope_gain).min(1.0) * radius);
             window.paint_quad(fill(rect(x - 1.0, y - 1.0, 2.0, 2.0), color));
@@ -1363,7 +1369,13 @@ pub(crate) fn paint_scope(window: &mut Window, cx: &mut App, bounds: Bounds<Pixe
     for (age, frame) in live.image.iter().enumerate() {
         let alpha = 0.18 + 0.72 * (age + 1) as f32 / frames as f32;
         let color = Colors::with_alpha(accent, alpha);
-        for pair in frame.scope.chunks_exact(2).take(IMAGE_SCOPE_POINTS) {
+        for pair in frame
+            .scope
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .take(IMAGE_SCOPE_POINTS)
+        {
             let (l, r) = (pair[0] * live.scope_gain, pair[1] * live.scope_gain);
             let side = ((r - l) * std::f32::consts::FRAC_1_SQRT_2).clamp(-1.0, 1.0);
             let mid = ((l + r) * std::f32::consts::FRAC_1_SQRT_2).clamp(-1.0, 1.0);

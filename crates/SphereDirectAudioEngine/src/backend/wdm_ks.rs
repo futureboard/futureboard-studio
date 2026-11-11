@@ -204,6 +204,19 @@ struct KsDataRangeAudio {
     maximum_sample_frequency: u32,
 }
 
+/// A type the driver, or a byte buffer it filled, may hand back as any bytes.
+///
+/// # Safety
+///
+/// Every bit pattern of `size_of::<Self>()` bytes is a valid `Self`: integers
+/// and GUIDs in a `#[repr(C)]` layout, no references, `bool`s or enums.
+unsafe trait PlainData: Copy {}
+// SAFETY: integers, and `#[repr(C)]` structs of integers and GUIDs.
+unsafe impl PlainData for u32 {}
+unsafe impl PlainData for KsMultipleItem {}
+unsafe impl PlainData for KsDataRange {}
+unsafe impl PlainData for KsDataRangeAudio {}
+
 // ── Pin connect / data format (for KsCreatePin) ────────────────────────────────
 
 /// `KSIDENTIFIER` — used for both `KSPIN_INTERFACE` and `KSPIN_MEDIUM`.
@@ -1593,8 +1606,13 @@ unsafe fn device_interface_path(
         ));
     }
 
-    let mut buffer = vec![0u8; required_size as usize];
-    let detail = buffer.as_mut_ptr() as *mut SP_DEVICE_INTERFACE_DETAIL_DATA_W;
+    // `u32` storage: the detail struct is 4-byte aligned, and a `Vec<u8>`
+    // promises only 1.
+    let byte_len = required_size as usize;
+    let mut buffer = vec![0u32; byte_len.div_ceil(size_of::<u32>())];
+    let detail = buffer
+        .as_mut_ptr()
+        .cast::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>();
     (*detail).cbSize = size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32;
 
     SetupDiGetDeviceInterfaceDetailW(
@@ -1607,14 +1625,18 @@ unsafe fn device_interface_path(
     )
     .map_err(|e| format!("SetupDiGetDeviceInterfaceDetailW(data) failed: {e}"))?;
 
-    let path_ptr = (*detail).DevicePath.as_ptr();
-    let mut len = 0usize;
-    while *path_ptr.add(len) != 0 {
-        len += 1;
-    }
-    Ok(String::from_utf16_lossy(std::slice::from_raw_parts(
-        path_ptr, len,
-    )))
+    // The path runs past the struct's one-element `DevicePath` array to the
+    // end of the buffer. Read it through a pointer derived from the buffer
+    // (not from the array), and never past the bytes the call filled.
+    let path_offset = std::mem::offset_of!(SP_DEVICE_INTERFACE_DETAIL_DATA_W, DevicePath);
+    let filled = (required_size as usize).min(byte_len);
+    let max_units = filled.saturating_sub(path_offset) / size_of::<u16>();
+    let path_ptr = buffer.as_ptr().cast::<u8>().add(path_offset).cast::<u16>();
+    // SAFETY: `max_units` u16s from `path_ptr` lie inside `buffer`, which
+    // the call initialised, and `DevicePath` is 2-byte aligned in the struct.
+    let units = std::slice::from_raw_parts(path_ptr, max_units);
+    let len = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+    Ok(String::from_utf16_lossy(&units[..len]))
 }
 
 fn open_filter_handle(path: &str) -> Result<HANDLE, SphereAudioError> {
@@ -1705,14 +1727,19 @@ fn query_pin_data_ranges(
     };
 
     let mut buffer = vec![0u8; 64 * 1024];
-    let returned = ks_ioctl(
-        handle,
-        (&prop as *const KsPinProperty).cast(),
-        size_of::<KsPinProperty>() as u32,
-        buffer.as_mut_ptr().cast(),
-        buffer.len() as u32,
-    )?;
-    let ranges = parse_audio_data_ranges(&buffer[..returned as usize]);
+    // SAFETY: `prop` is readable for its size and `buffer` writable for its
+    // length; the bytes are read back through `read_unaligned_from` only.
+    let returned = unsafe {
+        ks_ioctl(
+            handle,
+            (&prop as *const KsPinProperty).cast(),
+            size_of::<KsPinProperty>() as u32,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+        )
+    }?;
+    // A driver reporting more than the buffer holds is not trusted with it.
+    let ranges = parse_audio_data_ranges(&buffer[..(returned as usize).min(buffer.len())]);
     Ok((returned, ranges))
 }
 
@@ -1721,24 +1748,28 @@ fn parse_audio_data_ranges(buffer: &[u8]) -> Vec<KsAudioRangeProbe> {
         return Vec::new();
     }
 
-    let multiple: KsMultipleItem = read_unaligned_from(buffer, 0);
+    let Some(multiple) = read_unaligned_from::<KsMultipleItem>(buffer, 0) else {
+        return Vec::new();
+    };
     let mut ranges = Vec::new();
     let mut offset = size_of::<KsMultipleItem>();
     for _ in 0..multiple.count {
-        if offset + size_of::<KsDataRange>() > buffer.len() {
+        let Some(data_range) = read_unaligned_from::<KsDataRange>(buffer, offset) else {
             break;
-        }
-
-        let data_range: KsDataRange = read_unaligned_from(buffer, offset);
+        };
         let format_size = data_range.format_size as usize;
-        if format_size < size_of::<KsDataRange>() || offset + format_size > buffer.len() {
+        if format_size < size_of::<KsDataRange>()
+            || offset.saturating_add(format_size) > buffer.len()
+        {
             break;
         }
 
         if data_range.major_format == KSDATAFORMAT_TYPE_AUDIO
             && format_size >= size_of::<KsDataRangeAudio>()
         {
-            let audio: KsDataRangeAudio = read_unaligned_from(buffer, offset);
+            let Some(audio) = read_unaligned_from::<KsDataRangeAudio>(buffer, offset) else {
+                break;
+            };
             ranges.push(KsAudioRangeProbe {
                 subtype: if audio.data_range.sub_format == KSDATAFORMAT_SUBTYPE_PCM {
                     AudioRangeSubtype::Pcm
@@ -1844,9 +1875,12 @@ fn align_up(value: usize, alignment: usize) -> usize {
     (value + alignment - 1) & !(alignment - 1)
 }
 
-fn read_unaligned_from<T: Copy>(buffer: &[u8], offset: usize) -> T {
-    debug_assert!(offset + size_of::<T>() <= buffer.len());
-    unsafe { std::ptr::read_unaligned(buffer.as_ptr().add(offset).cast::<T>()) }
+/// The `T` at `offset` in `buffer`, or `None` when it does not fit.
+fn read_unaligned_from<T: PlainData>(buffer: &[u8], offset: usize) -> Option<T> {
+    let bytes = buffer.get(offset..offset.checked_add(size_of::<T>())?)?;
+    // SAFETY: `bytes` holds exactly `size_of::<T>()` initialised bytes, read
+    // unaligned, and any bit pattern is a valid `T` (`PlainData`).
+    Some(unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<T>()) })
 }
 
 fn format_pin_communication(value: u32) -> String {
@@ -1870,21 +1904,34 @@ fn format_pin_dataflow(value: u32) -> String {
 
 // ── DeviceIoControl helpers ────────────────────────────────────────────────────
 
-fn ks_property_get<TIn, TOut>(
+/// Get a KS property into `output`. The driver writes whatever bytes it likes
+/// there, so `TOut` must be valid for any of them (`PlainData`).
+fn ks_property_get<TIn, TOut: PlainData>(
     handle: HANDLE,
     input: &TIn,
     output: &mut TOut,
 ) -> Result<u32, String> {
-    ks_ioctl(
-        handle,
-        (input as *const TIn).cast(),
-        size_of::<TIn>() as u32,
-        (output as *mut TOut).cast(),
-        size_of::<TOut>() as u32,
-    )
+    // SAFETY: both pointers come from references valid for their whole size,
+    // and any bytes the driver writes form a valid `TOut`.
+    unsafe {
+        ks_ioctl(
+            handle,
+            (input as *const TIn).cast(),
+            size_of::<TIn>() as u32,
+            (output as *mut TOut).cast(),
+            size_of::<TOut>() as u32,
+        )
+    }
 }
 
-fn ks_ioctl(
+/// `IOCTL_KS_PROPERTY` on `handle`.
+///
+/// # Safety
+///
+/// `input` is readable for `input_size` bytes and `output` writable for
+/// `output_size` bytes, and whatever the driver writes into `output` is a
+/// valid value of the type the caller reads it back as.
+unsafe fn ks_ioctl(
     handle: HANDLE,
     input: *const c_void,
     input_size: u32,

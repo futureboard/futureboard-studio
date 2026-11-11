@@ -1,6 +1,8 @@
 //! DC offset measurement and constant subtraction.
 
-use super::{AudioClipProcessor, peak_amplitude};
+use super::AudioClipProcessor;
+#[cfg(test)]
+use super::peak_amplitude;
 
 /// Per-channel DC estimate in linear amplitude.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -92,7 +94,8 @@ impl AudioClipProcessor for DcOffsetProcessor {
     }
 }
 
-/// Peak remaining after DC removal — used by tests and the tool readout.
+/// Peak remaining after DC removal. Tests only; nothing reads it out.
+#[cfg(test)]
 pub fn residual_peak_after_dc(samples: &[f32], _channels: usize, offset: DcOffset) -> f32 {
     let mut processor = DcOffsetProcessor::new(offset, true);
     let mut out = vec![0.0; samples.len()];

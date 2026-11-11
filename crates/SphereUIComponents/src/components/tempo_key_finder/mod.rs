@@ -201,7 +201,7 @@ struct Analysis {
 
 enum Phase {
     Analyzing,
-    Ready(Analysis),
+    Ready(Box<Analysis>),
     Failed(String),
 }
 
@@ -319,7 +319,7 @@ impl TempoKeyFinderWindow {
                     Ok(analysis) => {
                         this.tempo_pick = best_tempo_index(&analysis.tempos);
                         this.key_pick = 0;
-                        this.phase = Phase::Ready(analysis);
+                        this.phase = Phase::Ready(Box::new(analysis));
                     }
                     Err(error) => this.phase = Phase::Failed(error),
                 }
@@ -413,7 +413,7 @@ impl TempoKeyFinderWindow {
 
     fn analysis(&self) -> Option<&Analysis> {
         match &self.phase {
-            Phase::Ready(analysis) => Some(analysis),
+            Phase::Ready(analysis) => Some(&**analysis),
             _ => None,
         }
     }
