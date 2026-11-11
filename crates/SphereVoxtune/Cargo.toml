@@ -26,3 +26,9 @@ symphonia = { version = "0.5", default-features = false, features = [
     "aac",
     "alac",
 ] }
+
+[dev-dependencies]
+# Tests only: Studio's FLAC exporter writes the fixtures for the pre-#352
+# header tests. Dev-dependencies of a path dependency are not built by the
+# Android crate or the plug-in.
+sphere-encoder = { path = "../SphereEncoder" }

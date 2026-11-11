@@ -8501,6 +8501,7 @@ dependencies = [
  "biquad",
  "serde",
  "serde_json",
+ "sphere-encoder",
  "symphonia",
  "thiserror 2.0.18",
 ]

@@ -147,10 +147,7 @@ impl Shared {
         out[..lead * 2].fill(0.0);
         let start = take_sec.max(0.0);
         if playing && lead < frames {
-            // A block's worth of slack: the host's position and ours agree
-            // to within rounding when nothing jumped.
-            let slack = 2.0 * frames as f64 / sr + 0.002;
-            if !engine.playing || (engine.playhead_sec - start).abs() > slack {
+            if !engine.playing || out_of_line(engine.playhead_sec, start, sr) {
                 if start < engine.duration_sec {
                     engine.seek(start);
                     engine.set_playing(true);
@@ -207,12 +204,9 @@ impl Shared {
         let bandwidth = resampler_bandwidth(er, hr);
         let reach = HALF_TAPS as f64 / bandwidth;
         if playing {
-            // A block's worth of slack: the host's position and ours agree
-            // to within rounding when nothing jumped.
-            let slack = 2.0 * (out.len() / 2) as f64 / hr + 0.002;
             if !resampler.following
                 || resampler.host_rate != hr
-                || (resampler.next_time(er) - take_sec).abs() > slack
+                || out_of_line(resampler.next_time(er), take_sec, hr)
             {
                 // Host frame 0 is take time `take_sec`, which may be before
                 // the take: that part is silence, and the take starts on its
@@ -280,6 +274,20 @@ impl Shared {
             }
         }
     }
+}
+
+/// How far, in frames, the take's position may sit from the host's before
+/// the take is put back in line with it. While every block is rendered only
+/// rounding separates them (a take starting mid-block starts on a whole
+/// frame, half a frame at most). A block the take did not render — the
+/// engine lock was busy, or the plug-in glue skipped the call — leaves it at
+/// least one frame behind, and it re-aligns on the next block it renders.
+const ALIGN_TOLERANCE_FRAMES: f64 = 0.75;
+
+/// The take's position `ours` and the host's `host` (seconds) disagree by
+/// more than rounding at `rate`: the host jumped, or blocks were missed.
+fn out_of_line(ours: f64, host: f64, rate: f64) -> bool {
+    (ours - host).abs() * rate > ALIGN_TOLERANCE_FRAMES
 }
 
 /// Half the interpolation kernel, in engine frames at full bandwidth.
@@ -397,15 +405,17 @@ impl HostResampler {
     fn restart(&mut self, at: f64, engine_rate: f64, host_rate: f64, reach: f64) -> f64 {
         // Enough history before the first host frame for the whole kernel.
         let pre = reach.ceil() + 1.0;
+        // The engine starts on one of the take's own samples and the
+        // fraction goes into the read position: the engine reads between
+        // samples with two points, which would dull the take again whenever
+        // the host's frame falls between two of the take's.
+        let at_frame = at * engine_rate;
+        let first = at_frame.floor() - pre;
         self.written = 0;
-        self.pos = pre;
-        self.origin = at - pre / engine_rate;
+        self.pos = at_frame - first;
+        self.origin = first / engine_rate;
         self.host_rate = host_rate;
-        self.silence = if self.origin < 0.0 {
-            (-self.origin * engine_rate).round() as u64
-        } else {
-            0
-        };
+        self.silence = if first < 0.0 { -first as u64 } else { 0 };
         self.origin.max(0.0)
     }
 
@@ -601,11 +611,22 @@ mod tests {
     /// Renders `seconds` of the take from 0.25 s at `host_rate` in blocks of
     /// `block` frames, as a host does. Left channel only.
     fn render_at(shared: &Shared, host_rate: f32, block: usize, seconds: f64) -> Vec<f32> {
+        render_from(shared, 0.25, host_rate, block, seconds)
+    }
+
+    /// [`render_at`] from take time `from`.
+    fn render_from(
+        shared: &Shared,
+        from: f64,
+        host_rate: f32,
+        block: usize,
+        seconds: f64,
+    ) -> Vec<f32> {
         let total = (seconds * host_rate as f64) as usize;
         let mut left = Vec::with_capacity(total);
         let mut out = vec![0.0f32; block * 2];
         while left.len() < total {
-            let take_sec = 0.25 + left.len() as f64 / host_rate as f64;
+            let take_sec = from + left.len() as f64 / host_rate as f64;
             assert!(shared.render_following_host(take_sec, true, host_rate, &mut out));
             left.extend(out.chunks_exact(2).map(|frame| frame[0]));
         }
@@ -645,6 +666,32 @@ mod tests {
         }
     }
 
+    /// Playback started (or re-aligned) where the host's frame falls between
+    /// two of the take's samples keeps the top end too: the band-limited
+    /// converter takes the fraction, not the engine's two-point read.
+    #[test]
+    fn a_take_at_another_rate_keeps_its_high_frequencies_from_any_start() {
+        // Six 48 kHz frames past 0.25 s is 5.51 frames of a 44.1 kHz take.
+        let from = 0.25 + 6.0 / 48_000.0;
+        for hz in [10_000.0f32, 16_000.0] {
+            let native = render_at(&tone_take(44_100, hz).fork_playback(), 44_100.0, 441, 1.0);
+            let converted = render_from(
+                &tone_take(44_100, hz).fork_playback(),
+                from,
+                48_000.0,
+                480,
+                1.0,
+            );
+            let reference = amplitude(&native, 44_100.0, hz);
+            let heard = amplitude(&converted, 48_000.0, hz);
+            let db = 20.0 * (heard / reference).log10();
+            assert!(
+                db.abs() < 0.2,
+                "{hz} Hz is {db:.2} dB off from an off-grid start"
+            );
+        }
+    }
+
     /// How the host splits its blocks does not change what it hears.
     #[test]
     fn the_converted_take_does_not_depend_on_the_host_block_size() {
@@ -665,6 +712,98 @@ mod tests {
             .zip(&split)
             .fold(0.0f32, |worst, (a, b)| worst.max((a - b).abs()));
         assert!(worst < 1.0e-4, "block size changed the output by {worst}");
+    }
+
+    /// How a block goes wrong in [`render_missing_one`].
+    #[derive(Clone, Copy, Debug)]
+    enum Miss {
+        /// Nothing goes wrong: the reference.
+        None,
+        /// The UI thread holds the engine lock for the whole callback.
+        EngineLock,
+        /// The plug-in glue never calls the player (its region list or the
+        /// region's player slot was busy), so the engine is not told.
+        Skipped,
+    }
+
+    /// Renders `blocks` host blocks of `block` frames from take time 0.25 s
+    /// at `host_rate`, the host advancing every block whatever happens to
+    /// block `missed`. Returns the left channel of every block and the
+    /// published playhead after each.
+    fn render_missing_one(
+        shared: &Shared,
+        host_rate: f32,
+        block: usize,
+        blocks: usize,
+        missed: usize,
+        miss: Miss,
+    ) -> (Vec<Vec<f32>>, Vec<f64>) {
+        let mut out = vec![0.0f32; block * 2];
+        let mut heard = Vec::new();
+        let mut playheads = Vec::new();
+        for b in 0..blocks {
+            let take_sec = 0.25 + (b * block) as f64 / host_rate as f64;
+            out.fill(0.0);
+            match (b == missed, miss) {
+                (true, Miss::EngineLock) => {
+                    let guard = shared.lock();
+                    assert!(!shared.render_following_host(take_sec, true, host_rate, &mut out));
+                    drop(guard);
+                }
+                (true, Miss::Skipped) => {}
+                _ => assert!(shared.render_following_host(take_sec, true, host_rate, &mut out)),
+            }
+            heard.push(out.chunks_exact(2).map(|frame| frame[0]).collect());
+            playheads.push(shared.playhead());
+        }
+        (heard, playheads)
+    }
+
+    /// Audit #408 (follow-up to #357): after one missed callback the take
+    /// lines up with the host again on the very next block, at the take's
+    /// own rate and converted to another host rate, whether the engine lock
+    /// was busy or the glue skipped the call.
+    #[test]
+    fn one_missed_block_does_not_leave_the_take_late() {
+        let block = 512;
+        let (blocks, missed) = (8, 3);
+        let mut late_blocks = Vec::new();
+        for take_rate in [48_000u32, 44_100] {
+            for miss in [Miss::EngineLock, Miss::Skipped] {
+                let host = 48_000.0f32;
+                let (reference, _) = render_missing_one(
+                    &tone_take(take_rate, 3_000.0).fork_playback(),
+                    host,
+                    block,
+                    blocks,
+                    missed,
+                    Miss::None,
+                );
+                let (heard, playheads) = render_missing_one(
+                    &tone_take(take_rate, 3_000.0).fork_playback(),
+                    host,
+                    block,
+                    blocks,
+                    missed,
+                    miss,
+                );
+                for b in missed + 1..blocks {
+                    let expected = 0.25 + ((b + 1) * block) as f64 / host as f64;
+                    let late = (expected - playheads[b]) * host as f64;
+                    let worst = reference[b]
+                        .iter()
+                        .zip(&heard[b])
+                        .fold(0.0f32, |worst, (a, h)| worst.max((a - h).abs()));
+                    if late.abs() >= 1.0 || worst >= 1.0e-3 {
+                        late_blocks.push(format!(
+                            "{take_rate} Hz take, {miss:?}: block {b} is {late:.1} frames \
+                             late, output off by {worst:.3}"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(late_blocks.is_empty(), "{}", late_blocks.join("\n"));
     }
 
     #[test]

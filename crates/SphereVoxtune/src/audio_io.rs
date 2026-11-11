@@ -5,7 +5,7 @@
 //! via fast inline RIFF parsing, and MP3, FLAC, OGG/Vorbis, M4A/AAC, AIFF, ALAC via `symphonia`.
 
 use std::fs::File;
-use std::io::{self, Cursor, Read};
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use symphonia::core::audio::SampleBuffer;
@@ -377,10 +377,80 @@ pub fn compute_waveform_peaks(mono: &[f32], num_bins: usize) -> Vec<f32> {
     peaks
 }
 
+/// Recognises the STREAMINFO of FLAC files Studio exported before #352
+/// (minimum block size = the last block's length), which symphonia refuses.
+/// The same source file Studio's import and LiveStage's playback use
+/// (`sphere_encoder::flac_header`), compiled in here rather than depended on
+/// so the Android crate and the plug-in still build this crate on its own.
+#[path = "../../SphereEncoder/src/flac_header.rs"]
+mod flac_header;
+
+/// A source read with a pre-#352 FLAC export's minimum block size replaced
+/// by the corrected value; the file itself is never written.
+struct FlacHeaderFix {
+    inner: Box<dyn MediaSource>,
+    len: Option<u64>,
+    pos: u64,
+    min_block: [u8; 2],
+}
+
+impl Read for FlacHeaderFix {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        let at = flac_header::STREAMINFO_MIN_BLOCK_SIZE_OFFSET;
+        for (i, byte) in self.min_block.iter().enumerate() {
+            let offset = at + i as u64;
+            if (self.pos..self.pos + n as u64).contains(&offset) {
+                buf[(offset - self.pos) as usize] = *byte;
+            }
+        }
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for FlacHeaderFix {
+    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+        self.pos = self.inner.seek(to)?;
+        Ok(self.pos)
+    }
+}
+
+impl MediaSource for FlacHeaderFix {
+    fn is_seekable(&self) -> bool {
+        self.inner.is_seekable()
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        self.len
+    }
+}
+
+/// `source` positioned at its start, read with its STREAMINFO corrected when
+/// it is a pre-#352 FLAC export; any other source is returned as it is.
+fn corrected_source(mut source: Box<dyn MediaSource>) -> io::Result<Box<dyn MediaSource>> {
+    if !source.is_seekable() {
+        return Ok(source);
+    }
+    let fix = flac_header::legacy_min_block_size_fix(&mut source);
+    source.seek(SeekFrom::Start(0))?;
+    Ok(match fix {
+        Some(min_block) => Box::new(FlacHeaderFix {
+            len: source.byte_len(),
+            inner: source,
+            pos: 0,
+            min_block: min_block.to_be_bytes(),
+        }),
+        None => source,
+    })
+}
+
 fn decode_via_symphonia_reader(
     source: Box<dyn MediaSource>,
     ext_hint: Option<&str>,
 ) -> Result<RawInterleavedBuffer, String> {
+    // Every decode starts here, from a file or from bytes.
+    let source = corrected_source(source).map_err(|e| format!("Failed to read audio: {e}"))?;
     let mss = MediaSourceStream::new(source, Default::default());
     let mut hint = Hint::new();
     if let Some(ext) = ext_hint {
@@ -747,5 +817,113 @@ mod tests {
         let bytes = encode_mono_wav_i16(&[0.2; 64], 48_000);
         let err = decode_audio_bytes_to_mono(&bytes, Some("wav"), 768_000).unwrap_err();
         assert!(err.contains("Project sample rate 768000 Hz"), "{err}");
+    }
+
+    /// A stereo FLAC of `frames` frames written by Studio's exporter, and the
+    /// same file with the STREAMINFO Studio wrote before #352: minimum block
+    /// size = the last block's length. Returns (current, pre-#352) bytes.
+    fn studio_flac_exports(frames: usize, path: &Path) -> (Vec<u8>, Vec<u8>) {
+        use sphere_encoder::flac::FlacEncoder;
+        use sphere_encoder::{
+            AudioEncodeSpec, AudioEncoder, AudioMetadata, AudioSampleFormat, FlacEncodeOptions,
+        };
+        let mut encoder = FlacEncoder::create(
+            path,
+            AudioEncodeSpec {
+                sample_rate: 48_000,
+                channels: 2,
+                sample_format: AudioSampleFormat::I16,
+            },
+            FlacEncodeOptions::default(),
+            AudioMetadata::default(),
+        )
+        .unwrap();
+        let input: Vec<f32> = (0..frames * 2)
+            .map(|i| ((i / 2) as f32 * 0.01 + (i % 2) as f32).sin() * 0.5)
+            .collect();
+        encoder.write_interleaved_f32(&input).unwrap();
+        encoder.finalize().unwrap();
+        let current = std::fs::read(path).unwrap();
+        assert_eq!(&current[8..12], &[0x10, 0x00, 0x10, 0x00], "fixed header");
+        let mut old = current.clone();
+        old[8..10].copy_from_slice(&((frames % 4_096) as u16).to_be_bytes());
+        (current, old)
+    }
+
+    /// Audit #408 (follow-up to #388): a FLAC exported by a Studio build
+    /// before #352 loads into Voxtune — from a file (mono and stereo) and from
+    /// bytes — exactly like the same export with the corrected header. Last
+    /// blocks of 2545, 1 and 5 frames, the last two below FLAC's 16-frame
+    /// minimum. The file on disk is not modified.
+    #[test]
+    fn flac_exported_before_352_loads() {
+        let mut refused = Vec::new();
+        for frames in [150_001usize, 65_537, 65_541] {
+            let base = std::env::temp_dir().join(format!(
+                "voxtune_flac_pre352_{}_{frames}",
+                std::process::id()
+            ));
+            let (fixed_path, old_path) = (
+                base.with_extension("fixed.flac"),
+                base.with_extension("old.flac"),
+            );
+            let (_, old) = studio_flac_exports(frames, &fixed_path);
+            std::fs::write(&old_path, &old).unwrap();
+
+            // The fixture is the reported case: symphonia alone does not
+            // read the old header.
+            let mut hint = Hint::new();
+            hint.with_extension("flac");
+            let raw = symphonia::default::get_probe().format(
+                &hint,
+                MediaSourceStream::new(
+                    Box::new(File::open(&old_path).unwrap()),
+                    Default::default(),
+                ),
+                &FormatOptions::default(),
+                &MetadataOptions::default(),
+            );
+            assert!(
+                raw.is_err(),
+                "{frames}: symphonia read the pre-#352 fixture without a fix"
+            );
+
+            let reference = decode_audio_file_to_mono(&fixed_path, 48_000).unwrap();
+            let reference_stereo = decode_audio_file_to_stereo(&fixed_path, 48_000).unwrap();
+            assert_eq!(reference.samples.len(), frames);
+            let mono = decode_audio_file_to_mono(&old_path, 48_000);
+            let stereo = decode_audio_file_to_stereo(&old_path, 48_000);
+            let bytes = decode_audio_bytes_to_mono(&old, Some("flac"), 48_000);
+            let on_disk = std::fs::read(&old_path).unwrap();
+            let _ = std::fs::remove_file(&old_path);
+            let _ = std::fs::remove_file(&fixed_path);
+
+            match mono {
+                Ok(audio) if audio.samples == reference.samples => {}
+                Ok(audio) => refused.push(format!(
+                    "{frames}: file, mono: {} frames, not the export's",
+                    audio.samples.len()
+                )),
+                Err(e) => refused.push(format!("{frames}: file, mono: {e}")),
+            }
+            match stereo {
+                Ok(audio) if audio.samples == reference_stereo.samples => {}
+                Ok(audio) => refused.push(format!(
+                    "{frames}: file, stereo: {} frames, not the export's",
+                    audio.samples.len() / 2
+                )),
+                Err(e) => refused.push(format!("{frames}: file, stereo: {e}")),
+            }
+            match bytes {
+                Ok(audio) if audio.samples == reference.samples => {}
+                Ok(audio) => refused.push(format!(
+                    "{frames}: bytes: {} frames, not the export's",
+                    audio.samples.len()
+                )),
+                Err(e) => refused.push(format!("{frames}: bytes: {e}")),
+            }
+            assert!(on_disk == old, "{frames}: the file on disk was modified");
+        }
+        assert!(refused.is_empty(), "{}", refused.join("\n"));
     }
 }
