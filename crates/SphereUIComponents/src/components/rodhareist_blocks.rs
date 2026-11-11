@@ -660,6 +660,12 @@ pub(crate) fn amp_model_label(m: AmpModel) -> &'static str {
         JubileeLead => "Jubilee Lead",
         DslLead => "DSL Lead",
         DeluxeReverb => "Deluxe Reverb",
+        TangerineVerb => "Tangerine 100",
+        DarkCitrus => "Dark Citrus 15",
+        PlusLead => "Plus Lead 120",
+        QuadTen => "Quad Ten Reverb",
+        NeoClean => "Neo Clean 250",
+        IronLead => "Iron Lead 100",
     }
 }
 
@@ -722,6 +728,11 @@ pub(crate) fn cab_model_label(model: CabModel) -> &'static str {
         CabModel::Cream2x12 => "Cream 2x12",
         CabModel::Ported4x12 => "Ported 4x12",
         CabModel::Open2x10 => "Open 2x10",
+        CabModel::Tangerine4x12 => "Tangerine 4x12",
+        CabModel::Neo1x12 => "Neo 1x12",
+        CabModel::Neo2x12 => "Neo 2x12",
+        CabModel::LeadStraight => "Lead Straight 4x12",
+        CabModel::T75Straight => "T75 Straight 4x12",
     }
 }
 

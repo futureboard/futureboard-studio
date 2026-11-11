@@ -158,6 +158,12 @@ const AMP_MODELS = [
   'Jubilee Lead',
   'DSL Lead',
   'Deluxe Reverb',
+  'Tangerine 100',
+  'Dark Citrus 15',
+  'Plus Lead 120',
+  'Quad Ten Reverb',
+  'Neo Clean 250',
+  'Iron Lead 100',
 ]
 const CAB_MODELS = [
   '1960v Vintage 4x12',
@@ -206,6 +212,11 @@ const CAB_MODELS = [
   'Cream 2x12',
   'Ported 4x12',
   'Open 2x10',
+  'Tangerine 4x12',
+  'Neo 1x12',
+  'Neo 2x12',
+  'Lead Straight 4x12',
+  'T75 Straight 4x12',
 ]
 /** `CabModel::Ir`: convolution with a loaded file, not a modeled voicing. */
 const CAB_IR = 11

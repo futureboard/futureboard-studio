@@ -557,6 +557,27 @@ pub enum AmpModel {
     DslLead,
     /// "Deluxe Reverb" — blackface headroom between Princeton and Twin.
     DeluxeReverb,
+    /// "Tangerine 100" — a modern British dirty channel: thick low mids,
+    /// more gain and tighter than Mandarin or Thick Stack. The circuit this
+    /// follows is a two-channel 100 W British head's dirty channel, MKII.
+    TangerineVerb,
+    /// "Dark Citrus 15" — a small EL84 high-gain head: saturated and
+    /// compressed, a dark top, a power section that breaks up early.
+    DarkCitrus,
+    /// "Plus Lead 120" — American high gain with more mid and less
+    /// tightness than Invader. The circuit this follows is a 120 W
+    /// four-stage lead head of the early 1990s.
+    PlusLead,
+    /// "Quad Ten Reverb" — blackface clean through four tens: more breakup
+    /// and sag than Twin Clean. The circuit this follows is a mid-60s
+    /// 4x10 reverb combo.
+    QuadTen,
+    /// "Neo Clean 250" — a tube preamp into a stiff solid-state power
+    /// stage: very high headroom, almost no sag, warmer than Jazz 120.
+    NeoClean,
+    /// "Iron Lead 100" — British high gain, four tight stages with a
+    /// heavy mid.
+    IronLead,
 }
 
 /// Where an amp sits when the player browses gain. Not a wire value:
@@ -621,6 +642,12 @@ impl AmpModel {
         Self::JubileeLead,
         Self::DslLead,
         Self::DeluxeReverb,
+        Self::TangerineVerb,
+        Self::DarkCitrus,
+        Self::PlusLead,
+        Self::QuadTen,
+        Self::NeoClean,
+        Self::IronLead,
     ];
 
     pub fn from_model_id(id: &str) -> Option<Self> {
@@ -675,6 +702,12 @@ impl AmpModel {
             "jubilee_lead" => Some(Self::JubileeLead),
             "dsl_lead" => Some(Self::DslLead),
             "deluxe_reverb" => Some(Self::DeluxeReverb),
+            "tangerine_verb" => Some(Self::TangerineVerb),
+            "dark_citrus" => Some(Self::DarkCitrus),
+            "plus_lead" => Some(Self::PlusLead),
+            "quad_ten" => Some(Self::QuadTen),
+            "neo_clean" => Some(Self::NeoClean),
+            "iron_lead" => Some(Self::IronLead),
             _ => None,
         }
     }
@@ -697,7 +730,9 @@ impl AmpModel {
             | Self::Bass800
             | Self::SilverTwin
             | Self::StudioBass
-            | Self::DeluxeReverb => AmpClass::Clean,
+            | Self::DeluxeReverb
+            | Self::QuadTen
+            | Self::NeoClean => AmpClass::Clean,
             Self::Recto
             | Self::Slate
             | Self::Invader
@@ -719,7 +754,11 @@ impl AmpModel {
             | Self::Uberschall
             | Self::SavageLead
             | Self::ArchonLead
-            | Self::Deliverance => AmpClass::HighGain,
+            | Self::Deliverance
+            | Self::TangerineVerb
+            | Self::DarkCitrus
+            | Self::PlusLead
+            | Self::IronLead => AmpClass::HighGain,
             Self::Mandarin
             | Self::Plexi
             | Self::TopBoost
@@ -850,6 +889,21 @@ pub enum CabModel {
     Ported4x12,
     /// "Open 2x10" — two tens, open back, boxy and bright.
     Open2x10,
+    /// "Tangerine 4x12" — a big closed 4x12 on V30-type speakers: a thick
+    /// low mid under a forward upper mid.
+    Tangerine4x12,
+    /// "Neo 1x12" — a sealed single on a flat, high-power speaker: tight,
+    /// extended, very little cone breakup.
+    Neo1x12,
+    /// "Neo 2x12" — a closed pair mixing a chimey vintage speaker with a
+    /// flat high-power one: airy top, tight low.
+    Neo2x12,
+    /// "Lead Straight 4x12" — a straight closed 4x12, tight and bright,
+    /// the low mids cut.
+    LeadStraight,
+    /// "T75 Straight 4x12" — a straight British 4x12 on scooped 75 W
+    /// speakers: crisp top, tighter lows than a greenback stack.
+    T75Straight,
 }
 
 impl CabModel {
@@ -901,6 +955,11 @@ impl CabModel {
         Self::Cream2x12,
         Self::Ported4x12,
         Self::Open2x10,
+        Self::Tangerine4x12,
+        Self::Neo1x12,
+        Self::Neo2x12,
+        Self::LeadStraight,
+        Self::T75Straight,
     ];
 
     /// The modeled voicings only — [`Self::ALL`] minus [`Self::Ir`], which is
@@ -952,6 +1011,11 @@ impl CabModel {
         Self::Cream2x12,
         Self::Ported4x12,
         Self::Open2x10,
+        Self::Tangerine4x12,
+        Self::Neo1x12,
+        Self::Neo2x12,
+        Self::LeadStraight,
+        Self::T75Straight,
     ];
 
     pub fn from_model_id(id: &str) -> Option<Self> {
@@ -1002,6 +1066,11 @@ impl CabModel {
             "cream_212" => Some(Self::Cream2x12),
             "ported_412" => Some(Self::Ported4x12),
             "open_210" => Some(Self::Open2x10),
+            "tangerine_412" => Some(Self::Tangerine4x12),
+            "neo_112" => Some(Self::Neo1x12),
+            "neo_212" => Some(Self::Neo2x12),
+            "lead_straight_412" => Some(Self::LeadStraight),
+            "t75_412" => Some(Self::T75Straight),
             _ => None,
         }
     }
@@ -8030,6 +8099,10 @@ mod telemetry_tests {
         assert_eq!(AmpModel::ALL[39], AmpModel::SlamHead);
         assert_eq!(CabModel::from_index(36), CabModel::Green2x12);
         assert_eq!(CabModel::from_index(45), CabModel::Open2x10);
+        assert_eq!(AmpModel::from_index(50), AmpModel::TangerineVerb);
+        assert_eq!(AmpModel::from_index(55), AmpModel::IronLead);
+        assert_eq!(CabModel::from_index(46), CabModel::Tangerine4x12);
+        assert_eq!(CabModel::from_index(50), CabModel::T75Straight);
         assert_eq!(CabModel::ALL[11], CabModel::Ir);
         assert!(StageKind::default_path()
             .iter()
