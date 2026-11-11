@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::audio_file::AudioFileBuffer;
 use crate::types::{EngineFadeSnapshot, EngineMidiClipSnapshot, EngineMidiNoteSnapshot};
