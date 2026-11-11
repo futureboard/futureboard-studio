@@ -260,3 +260,29 @@ fn realtime_cost() {
         seconds * 10.0
     );
 }
+
+/// #408: one NaN or Inf input sample must not reach the output, on the
+/// processed path or bypassed, and the signal around it must come through.
+/// The STFT kept a bad sample in its history for a whole window, so every
+/// frame overlapping it (over a thousand samples) came out non-finite.
+#[test]
+fn one_non_finite_input_sample_never_reaches_the_output() {
+    for power in [1.0, 0.0] {
+        let mut dsp = Dsp::with_model(SR, parity_model());
+        assert!(dsp.apply_ui_param("power", power));
+        let mut input = noise(24_000, 9);
+        input[6_000] = (f32::NAN, f32::INFINITY);
+        input[6_001] = (f32::NEG_INFINITY, f32::NAN);
+        let out = run(&mut dsp, &input);
+        let bad = out
+            .iter()
+            .filter(|(l, r)| !l.is_finite() || !r.is_finite())
+            .count();
+        assert_eq!(bad, 0, "power {power}: {bad} non-finite output samples");
+        let tail: f32 = out[12_000..].iter().map(|(l, r)| l * l + r * r).sum();
+        assert!(
+            tail > 1.0e-3,
+            "power {power}: silent after the bad sample ({tail})"
+        );
+    }
+}

@@ -686,6 +686,11 @@ impl StereoEffect for Dsp {
     }
 
     fn process_stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
+        // The guard every other built-in has (#408): a NaN or Inf kept in the
+        // history poisons every STFT frame that overlaps it, a whole window of
+        // output, and the meters with it.
+        let left = if left.is_finite() { left } else { 0.0 };
+        let right = if right.is_finite() { right } else { 0.0 };
         let hist_len = self.hist_l.len();
         self.hist_l[self.write] = left;
         self.hist_r[self.write] = right;
