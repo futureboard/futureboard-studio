@@ -20,9 +20,20 @@
 //!
 //! Ownership: [`RenderCore`] holds everything the render owns (the graph, the
 //! per-stream state and the command queue). It sits behind a mutex the device
-//! callback only ever `try_lock`s, so the callback never blocks on it. Whoever
-//! holds it renders the next block at the graph's cursor; the ring holds blocks
-//! in order, so falling back from the ring to rendering inline is seamless.
+//! callback and the guard thread only `try_lock`, so neither waits on it and
+//! the callback's unlock never has a parked waiter to wake. Whoever holds it renders the next block at the
+//! graph's cursor. The guard thread publishes each block to the ring before it
+//! lets go of the core, so a callback holding the core sees every block
+//! rendered ahead, plays those first and only then renders inline: blocks are
+//! heard in render order. Each block carries its render index, and the
+//! callback counts a miss for any block that is not the next one in order
+//! (none should be) as well as for a block that is not ready in time.
+//!
+//! What the callback does: a copy from the ring, or an inline render under a
+//! `try_lock`. When the guard holds the core, the callback busy-polls for at
+//! most half a period, then plays silence and counts a miss; the late block is
+//! played next, in order. It never allocates, logs or waits on a lock, and it
+//! wakes the guard thread (`Thread::unpark`) once per block.
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -540,6 +551,10 @@ pub struct RenderCore {
     pub local: LocalAudioState,
     cmd_rx: Receiver<EngineCommand>,
     sample_rate: u32,
+    /// Renders started so far, by anyone. The index of the next render is the
+    /// order the device must hear it in: a ring slot carries the index it was
+    /// rendered at, and the callback checks it plays them in sequence.
+    blocks_rendered: u64,
 }
 
 impl RenderCore {
@@ -554,12 +569,15 @@ impl RenderCore {
             local,
             cmd_rx,
             sample_rate,
+            blocks_rendered: 0,
         }
     }
 
-    /// Drain the command queue and render one block into `out`.
+    /// Drain the command queue and render one block into `out`. Counted
+    /// before it runs, so a render that panics leaves a gap in the sequence.
     #[inline]
     fn render(&mut self, out: &mut [f32], channels: usize, shared: &Arc<SharedState>) {
+        self.blocks_rendered = self.blocks_rendered.wrapping_add(1);
         let _denormals = DenormalScope::enter();
         drain_commands(
             &self.cmd_rx,
@@ -602,10 +620,17 @@ struct Slot {
     start: u64,
     next_position: u64,
     playing: bool,
+    /// [`RenderCore::blocks_rendered`] before this block was rendered.
+    sequence: u64,
 }
 
 /// Single-producer (guard thread) / single-consumer (device callback) ring of
 /// rendered blocks. Slots are allocated once; nothing is allocated after.
+///
+/// The producer publishes a block (stores `tail`) while it still holds the
+/// [`RenderCore`] lock. So whoever holds that lock sees every block rendered
+/// ahead already in the ring, and the graph's cursor is right after the last
+/// of them. The callback relies on this to render inline in order.
 struct GuardRing {
     slots: Box<[UnsafeCell<Slot>]>,
     /// Blocks consumed / published, monotonically counted.
@@ -613,9 +638,10 @@ struct GuardRing {
     tail: AtomicUsize,
 }
 
-// SAFETY: a slot is written only by the producer while `tail - head <
-// GUARD_SLOTS` says the consumer is not reading it, and read only by the
-// consumer between the producer's Release publish and its own Release pop.
+// SAFETY: a slot is written only by the producer (the guard thread) while
+// `tail - head < GUARD_SLOTS - 1` says the consumer is not reading it, and read
+// only by the consumer (the device callback) between the producer's Release
+// store of `tail` and its own Release store of `head`.
 unsafe impl Sync for GuardRing {}
 unsafe impl Send for GuardRing {}
 
@@ -629,6 +655,7 @@ impl GuardRing {
                     start: 0,
                     next_position: 0,
                     playing: false,
+                    sequence: 0,
                 })
             })
             .collect();
@@ -669,6 +696,9 @@ pub struct GuardedRenderer {
     thread: Option<std::thread::JoinHandle<()>>,
     /// Frames of the ring's front slot already played.
     front_offset: usize,
+    /// Render index ([`RenderCore::blocks_rendered`]) the device must hear
+    /// next. A block that arrives with another index is out of order.
+    next_block: u64,
 }
 
 impl GuardedRenderer {
@@ -699,70 +729,96 @@ impl GuardedRenderer {
             inner,
             thread,
             front_offset: 0,
+            next_block: 0,
         }
     }
 
-    /// Run `f` on the render state with the device callback's own lock
-    /// discipline: blocks only until the guard finishes the block it is on.
-    /// For the stream's start-up (WDM-KS prefill), never the callback.
+    /// Run `f` on the render state, waiting until the guard finishes the
+    /// block it is on. Never from the device callback.
     pub fn with_core<R>(&self, f: impl FnOnce(&mut RenderCore) -> R) -> R {
         f(&mut self.inner.core.lock())
     }
 
-    /// Fill one interleaved device block. Realtime-safe: a copy from the ring,
-    /// or an inline render under a `try_lock`; never a blocking wait.
+    /// Fill one interleaved device block, in render order.
+    ///
+    /// Plays what the ring holds; for what is still missing it takes the
+    /// render state with one `try_lock` and renders inline. When the guard
+    /// holds the render state it is rendering the very block this needs: the
+    /// callback then polls the ring and `try_lock` for at most half a period,
+    /// and fills silence and counts a miss if the block has not come. It never
+    /// waits on the lock, allocates or logs; it does wake the guard thread
+    /// (`Thread::unpark`) once per block.
     pub fn render(&mut self, out: &mut [f32]) {
-        let inner = &*self.inner;
-        let offset = &mut self.front_offset;
+        let Self {
+            inner,
+            thread,
+            front_offset,
+            next_block,
+        } = self;
+        let inner = &**inner;
         let channels = inner.channels;
         let shared = &inner.shared;
         let need = out.len() / channels;
         inner.block_frames.store(need, Ordering::Relaxed);
-        let mut filled = take_from_ring(inner, offset, out, 0, need);
-        if filled < need {
+        let mut filled = take_from_ring(inner, front_offset, next_block, out, 0, need);
+        let mut wait_until = None;
+        while filled < need {
             if let Some(mut core) = inner.core.try_lock() {
-                // The ring is empty here, so the graph's cursor is right after
-                // the last frame played: rendering on continues seamlessly.
-                core.render(&mut out[filled * channels..], channels, shared);
-            } else {
-                // The guard is rendering the very block this needs. Give it
-                // part of the period, then fall back to whatever is ready.
-                let deadline = Instant::now() + block_period(need, shared).mul_f32(0.5);
-                while filled < need && Instant::now() < deadline {
-                    std::hint::spin_loop();
-                    filled = take_from_ring(inner, offset, out, filled, need);
-                    if filled < need {
-                        if let Some(mut core) = inner.core.try_lock() {
-                            filled = take_from_ring(inner, offset, out, filled, need);
-                            if filled < need {
-                                core.render(&mut out[filled * channels..], channels, shared);
-                                filled = need;
-                            }
-                        }
-                    }
-                }
+                // The guard publishes a block before it lets go of the render
+                // state, so with it held the ring holds every block rendered
+                // ahead. Play those first; what is still missing starts at the
+                // graph's cursor.
+                filled = take_from_ring(inner, front_offset, next_block, out, filled, need);
                 if filled < need {
-                    out[filled * channels..].fill(0.0);
-                    shared.dropout_count.fetch_add(1, Ordering::Relaxed);
-                    shared.guard_misses.fetch_add(1, Ordering::Relaxed);
-                    shared
-                        .dropout_last_reason
-                        .store(DropoutReason::RenderAheadMiss as u8, Ordering::Relaxed);
+                    let index = core.blocks_rendered;
+                    if index != *next_block {
+                        count_miss(shared);
+                    }
+                    core.render(&mut out[filled * channels..], channels, shared);
+                    *next_block = index.wrapping_add(1);
+                    filled = need;
                 }
+                break;
             }
+            // The guard holds the render state: it is rendering the block this
+            // needs. Give it part of the period, then fall back to silence.
+            let now = Instant::now();
+            let until =
+                *wait_until.get_or_insert_with(|| now + block_period(need, shared).mul_f32(0.5));
+            if now >= until {
+                break;
+            }
+            std::hint::spin_loop();
+            filled = take_from_ring(inner, front_offset, next_block, out, filled, need);
         }
-        if let Some(thread) = &self.thread {
+        if filled < need {
+            out[filled * channels..].fill(0.0);
+            count_miss(shared);
+        }
+        if let Some(thread) = thread {
             thread.thread().unpark();
         }
     }
 }
 
+/// A device block the guard did not deliver in time or in order.
+#[inline]
+fn count_miss(shared: &SharedState) {
+    shared.dropout_count.fetch_add(1, Ordering::Relaxed);
+    shared.guard_misses.fetch_add(1, Ordering::Relaxed);
+    shared
+        .dropout_last_reason
+        .store(DropoutReason::RenderAheadMiss as u8, Ordering::Relaxed);
+}
+
 /// Copy frames `from..need` of `out` from the ring. Returns how far `out` is
-/// filled after it. Publishes the played block clock as it goes. Consumer side
-/// only (the device callback).
+/// filled after it. Publishes the played block clock as it goes, and counts a
+/// miss for a block that is not the next in render order. Consumer side only
+/// (the device callback).
 fn take_from_ring(
     inner: &GuardInner,
     front_offset: &mut usize,
+    next_block: &mut u64,
     out: &mut [f32],
     mut from: usize,
     need: usize,
@@ -778,6 +834,12 @@ fn take_from_ring(
         // SAFETY: `head < tail`, so the producer has published this slot and
         // will not write it again until `head` moves past it.
         let slot = unsafe { &*ring.slots[head % GUARD_SLOTS].get() };
+        if *front_offset == 0 {
+            if slot.sequence != *next_block {
+                count_miss(shared);
+            }
+            *next_block = slot.sequence.wrapping_add(1);
+        }
         let take = (slot.frames - *front_offset).min(need - from);
         let src = &slot.samples[*front_offset * channels..(*front_offset + take) * channels];
         out[from * channels..(from + take) * channels].copy_from_slice(src);
@@ -878,7 +940,14 @@ fn guard_thread(inner: Arc<GuardInner>) {
         let pending = shared.guard_pending_frames.load(Ordering::Acquire) as usize;
         let room = inner.ring.len() < GUARD_SLOTS - 1;
         if allowed && room && pending < target {
-            let mut core = inner.core.lock();
+            // Never wait on the lock: a waiter parked on it would make the
+            // callback's unlock wake it from the audio thread. The callback
+            // holds it only while it renders a block, and unparks this thread
+            // when it is done.
+            let Some(mut core) = inner.core.try_lock() else {
+                std::thread::park_timeout(Duration::from_millis(2));
+                continue;
+            };
             if core.has_live_tracks() {
                 drop(core);
                 shared.guard_engaged.store(false, Ordering::Relaxed);
@@ -903,6 +972,7 @@ fn guard_thread(inner: Arc<GuardInner>) {
             // reading this slot; only this thread writes slots.
             let slot = unsafe { &mut *inner.ring.slots[tail % GUARD_SLOTS].get() };
             let samples = &mut slot.samples[..block * channels];
+            let sequence = core.blocks_rendered;
             core.local.guard_rendering = true;
             let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 crate::plugin_bridge::set_render_ahead_grace(block_period(block, &shared));
@@ -926,11 +996,16 @@ fn guard_thread(inner: Arc<GuardInner>) {
             slot.start = core.local.last_block_start;
             slot.playing = core.local.last_block_playing;
             slot.next_position = shared.position_samples.load(Ordering::Relaxed);
-            drop(core);
+            slot.sequence = sequence;
+            // Published before the render state is let go. Unlocking first
+            // left a window in which the ring looked empty to a callback that
+            // already held the render state: it rendered the next block inline
+            // and played this one after it (audit #408).
             inner
                 .ring
                 .tail
                 .store(tail.wrapping_add(1), Ordering::Release);
+            drop(core);
             shared.guard_engaged.store(true, Ordering::Relaxed);
             shared
                 .guard_ahead_frames
@@ -1101,6 +1176,119 @@ mod tests {
             .zip(&expected)
             .position(|(a, b)| a.to_bits() != b.to_bits());
         assert_eq!(first_difference, None, "render-ahead changed the audio");
+    }
+
+    /// The reported case (audit #408): device blocks asked for back-to-back,
+    /// with no idle time between callbacks, which is when the callback and
+    /// the guard thread contend for the render on almost every block. The
+    /// output must be exactly what inline rendering plays; a block that comes
+    /// late or out of order must be counted as a miss. Several runs, because
+    /// it is a race.
+    #[test]
+    fn back_to_back_render_ahead_plays_in_order_or_counts_a_miss() {
+        const BLOCK: usize = 256;
+        const BLOCKS: usize = 3000;
+        const RUNS: usize = 6;
+
+        let reference_shared = playing_shared();
+        let (mut reference, _keep) = playing_core();
+        let mut expected = vec![0.0f32; BLOCK * 2 * BLOCKS];
+        for block in expected.chunks_mut(BLOCK * 2) {
+            reference.render(block, 2, &reference_shared);
+        }
+
+        let mut failures = Vec::new();
+        let mut ring_blocks = 0usize;
+        let mut clean_runs = 0usize;
+        for run in 0..RUNS {
+            let shared = playing_shared();
+            let (core, _keep_tx) = playing_core();
+            let mut guarded = GuardedRenderer::new(core, 2, Arc::clone(&shared));
+            let mut played = vec![0.0f32; BLOCK * 2 * BLOCKS];
+            for block in played.chunks_mut(BLOCK * 2) {
+                guarded.render(block);
+                if shared.guard_pending_frames.load(Ordering::Acquire) > 0 {
+                    ring_blocks += 1;
+                }
+            }
+            drop(guarded);
+            let misses = shared.guard_misses.load(Ordering::Relaxed);
+            let first_difference = played
+                .iter()
+                .zip(&expected)
+                .position(|(a, b)| a.to_bits() != b.to_bits());
+            println!(
+                "run {run}: first difference at block {:?}, {misses} misses",
+                first_difference.map(|sample| sample / (BLOCK * 2))
+            );
+            if first_difference.is_none() && misses == 0 {
+                clean_runs += 1;
+            }
+            if let Some(sample) = first_difference {
+                if misses == 0 {
+                    let at = sample / (BLOCK * 2);
+                    // Which inline block was played there instead, if any.
+                    fn block_of(audio: &[f32], index: usize) -> Option<&[f32]> {
+                        audio.get(index * BLOCK * 2..(index + 1) * BLOCK * 2)
+                    }
+                    let played_instead = (at.saturating_sub(4)..(at + 4).min(BLOCKS))
+                        .find(|&other| block_of(&expected, other) == block_of(&played, at));
+                    failures.push(format!(
+                        "run {run}: block {at} differs from inline rendering (it holds inline \
+                         block {played_instead:?}) with 0 misses counted"
+                    ));
+                }
+            }
+        }
+        assert!(ring_blocks > 0, "the guard never rendered ahead");
+        assert!(
+            failures.is_empty(),
+            "{} of {RUNS} runs played blocks out of order without a miss:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+        // A miss is only a guard render that took longer than half a period,
+        // which a test tone does not: most runs must be exact, not excused.
+        assert!(
+            clean_runs * 2 > RUNS,
+            "only {clean_runs} of {RUNS} runs matched inline rendering without a miss"
+        );
+    }
+
+    /// A block that reaches the callback out of render order is counted as a
+    /// miss, whatever let it through.
+    #[test]
+    fn a_block_out_of_render_order_is_counted_as_a_miss() {
+        let shared = playing_shared();
+        let (core, _tx) = playing_core();
+        let inner = GuardInner {
+            core: Mutex::new(core),
+            ring: GuardRing::new(2),
+            channels: 2,
+            shared: Arc::clone(&shared),
+            block_frames: AtomicUsize::new(0),
+            stop: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+        };
+        // Publish render 1 while the device is waiting for render 0.
+        for (index, sequence) in [(0usize, 1u64), (1, 2)] {
+            // SAFETY: no consumer is reading yet; this test is the producer.
+            let slot = unsafe { &mut *inner.ring.slots[index].get() };
+            slot.frames = 4;
+            slot.sequence = sequence;
+        }
+        inner.ring.tail.store(2, Ordering::Release);
+        let mut front_offset = 0;
+        let mut next_block = 0;
+        let mut out = vec![1.0f32; 8 * 2];
+        let filled = take_from_ring(&inner, &mut front_offset, &mut next_block, &mut out, 0, 8);
+        assert_eq!(filled, 8);
+        assert_eq!(next_block, 3);
+        assert_eq!(
+            shared.guard_misses.load(Ordering::Relaxed),
+            1,
+            "the skipped render is one miss; the block after it is in order"
+        );
     }
 
     /// Anything live stops the guard producing, the ring plays out, and the
