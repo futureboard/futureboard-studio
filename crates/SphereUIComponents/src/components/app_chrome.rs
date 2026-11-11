@@ -254,6 +254,10 @@ pub struct TransportChromeState {
     pub count_in_enabled: bool,
     pub loop_enabled: bool,
     pub metronome_enabled: bool,
+    /// Automation Arm: moving a control while playing writes its lanes.
+    pub automation_arm: bool,
+    /// Some lane was overridden by hand: lights Re-Enable Automation.
+    pub automation_overridden: bool,
     pub follow_playhead: bool,
     /// True when auto-scroll is in continuous (smooth) mode rather than paged.
     /// Drives the FOLLOW button accent and is toggled via right-click.
@@ -295,6 +299,8 @@ pub struct TransportChromeState {
     pub on_metronome_toggle: ChromeActionCb,
     /// Opens the metronome volume / settings menu at the pointer position.
     pub on_metronome_menu: BpmMenuCb,
+    pub on_automation_arm_toggle: ChromeActionCb,
+    pub on_reenable_automation: ChromeActionCb,
     pub on_follow_toggle: ChromeActionCb,
     /// Right-click on FOLLOW: switch auto-scroll between paged and continuous.
     pub on_follow_mode_toggle: ChromeActionCb,
@@ -783,6 +789,8 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
     let on_loop = state.on_loop_toggle.clone();
     let on_metronome = state.on_metronome_toggle.clone();
     let on_metronome_menu = state.on_metronome_menu.clone();
+    let on_automation_arm = state.on_automation_arm_toggle.clone();
+    let on_reenable_automation = state.on_reenable_automation.clone();
     let on_follow = state.on_follow_toggle.clone();
     let on_follow_mode = state.on_follow_mode_toggle.clone();
     let on_bpm_drag = state.on_bpm_drag.clone();
@@ -1104,6 +1112,35 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
             None,
         ))
         .child(metronome_split)
+        // Automation Arm takes the record hue: armed, moving a control while
+        // playing writes over its lane. Re-Enable Automation lights only while
+        // some lane is overridden by hand, and puts every one back in play.
+        .child(transport_button(
+            "transport-automation-arm",
+            assets::ICON_AUTOMATION_PATH,
+            "Automation Arm \u{2014} moving a control while playing records its automation",
+            Some(state.automation_arm),
+            Colors::state_arm(),
+            Colors::text_muted(),
+            bar_plane,
+            on_automation_arm,
+            None,
+        ))
+        .child(transport_button(
+            "transport-reenable-automation",
+            assets::ICON_REFRESH_CW_PATH,
+            if state.automation_overridden {
+                "Re-Enable Automation \u{2014} play the lanes of controls moved by hand again"
+            } else {
+                "Re-Enable Automation \u{2014} no automation is overridden"
+            },
+            Some(state.automation_overridden),
+            Colors::state_automation(),
+            Colors::with_alpha(Colors::text_muted(), 0.45),
+            bar_plane,
+            on_reenable_automation,
+            None,
+        ))
         .child(transport_button(
             "transport-follow-playhead",
             assets::TIMELINE_SCROLL_PATH,

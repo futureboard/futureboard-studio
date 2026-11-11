@@ -1321,6 +1321,10 @@ impl StudioLayout {
         // update, so changing tabs here never nests entity updates.
         cx.observe(&timeline, |this, _timeline, cx| {
             this.follow_clip_selection_in_dock(cx);
+            // A control moved by hand overrode its lanes, or lanes were put
+            // back in play: the engine's copy of them has to follow. Applied
+            // live, so this never rebuilds the graph.
+            this.sync_automation_overrides(cx);
         })
         .detach();
         {
@@ -3162,34 +3166,24 @@ impl StudioLayout {
                 }
             }
             "master:automation-toggle" => self.toggle_master_automation(cx),
-            "automation:curve:linear" => {
-                let lane = self.take_menu_automation_lane(cx);
-                self.set_selected_automation_curve(
-                    lane,
-                    crate::components::timeline::timeline_state::AutomationCurve::Linear,
-                    cx,
-                );
-            }
-            "automation:curve:hold" => {
-                let lane = self.take_menu_automation_lane(cx);
-                self.set_selected_automation_curve(
-                    lane,
-                    crate::components::timeline::timeline_state::AutomationCurve::Hold,
-                    cx,
-                );
-            }
-            "automation:curve:smooth" => {
-                let lane = self.take_menu_automation_lane(cx);
-                self.set_selected_automation_curve(
-                    lane,
-                    crate::components::timeline::timeline_state::AutomationCurve::Smooth,
-                    cx,
-                );
+            "automation:curve:linear"
+            | "automation:curve:slow"
+            | "automation:curve:fast"
+            | "automation:curve:smooth"
+            | "automation:curve:sharp-s"
+            | "automation:curve:hold" => {
+                use crate::components::timeline::timeline_state::AutomationCurveShape;
+                if let Some(shape) = AutomationCurveShape::from_command(command_id) {
+                    let lane = self.take_menu_automation_lane(cx);
+                    self.set_selected_automation_shape(lane, shape, cx);
+                }
             }
             "edit:deselect-all" | "automation:clear-selection" => {
                 self.clear_automation_selection(cx)
             }
             "automation:toggle-mode" => self.toggle_selected_track_automation_mode(cx),
+            "automation:toggle-arm" => self.toggle_automation_arm(cx),
+            "automation:re-enable" => self.reenable_automation(cx),
             "automation:cycle-target" => self.cycle_selected_track_automation_target(cx),
             // A chain edit undone has to reach the engine, the detached mixer
             // and the moved insert's editor caches at once, like the action

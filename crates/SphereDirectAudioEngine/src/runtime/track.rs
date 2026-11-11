@@ -251,6 +251,9 @@ pub struct RuntimeTrack {
     /// [`RuntimeProject::resolve_indices`]. Empty for tracks with no plugin
     /// parameter lanes, so the common render path bails immediately.
     pub plugin_param_automation: Vec<RuntimePluginParamBinding>,
+    /// Where this block's automation is read, per stage; stamped at the
+    /// start of every block (see [`RuntimeAutomationClock`]).
+    pub automation_clock: RuntimeAutomationClock,
     pub meter: Arc<RuntimeTrackMeter>,
     pub meter_peak_l: f32,
     pub meter_peak_r: f32,
@@ -532,67 +535,23 @@ impl RuntimeTrack {
 /// ([`RuntimeAutomationLane::evaluate_normalized`]) and the control's own value
 /// stands.
 pub(crate) fn resolve_send_and_bypass_lanes(track: &mut RuntimeTrack) {
-    for send in &mut track.sends {
-        send.level_lane = None;
-        send.enabled_lane = None;
+    let (send_lanes, bypass_lanes) =
+        lane_indices(&track.automation_lanes, &track.sends, &track.inserts);
+    for (send, (level, enabled)) in track.sends.iter_mut().zip(send_lanes) {
+        send.level_lane = level;
+        send.enabled_lane = enabled;
     }
-    for insert in &mut track.inserts {
-        insert.bypass_lane = None;
-        insert.automation_bypassed = false;
-    }
-    for (lane_ix, lane) in track.automation_lanes.iter().enumerate() {
-        match &lane.target {
-            RuntimeAutomationTarget::SendGain { send_id } => {
-                if let Some(send) = track.sends.iter_mut().find(|s| &s.id == send_id) {
-                    send.level_lane = Some(lane_ix);
-                }
-            }
-            RuntimeAutomationTarget::SendEnabled { send_id } => {
-                if let Some(send) = track.sends.iter_mut().find(|s| &s.id == send_id) {
-                    send.enabled_lane = Some(lane_ix);
-                }
-            }
-            RuntimeAutomationTarget::InsertBypass { insert_id } => {
-                if let Some(insert) = track.inserts.iter_mut().find(|i| &i.id == insert_id) {
-                    insert.bypass_lane = Some(lane_ix);
-                }
-            }
-            _ => {}
-        }
+    for (insert, lane) in track.inserts.iter_mut().zip(bypass_lanes) {
+        insert.bypass_lane = lane;
+        insert.automation_bypass = None;
     }
 }
 
 /// Resolve a track's plugin-parameter automation lanes into compact bindings.
-/// Runs off the audio thread (LoadProject / SetPluginBridgeSink) so allocation
-/// and string parsing here are fine. Lanes with no points are skipped so a
-/// freshly added empty lane never forces the parameter to its default value.
+/// Runs off the audio thread (LoadProject / SetPluginBridgeSink); see
+/// [`plugin_param_bindings`].
 pub(super) fn build_plugin_param_bindings(track: &RuntimeTrack) -> Vec<RuntimePluginParamBinding> {
-    let mut out: Vec<RuntimePluginParamBinding> = Vec::new();
-    for (lane_ix, lane) in track.automation_lanes.iter().enumerate() {
-        if !lane.enabled || lane.points.is_empty() {
-            continue;
-        }
-        let RuntimeAutomationTarget::PluginParameter {
-            insert_id,
-            parameter_id,
-        } = &lane.target
-        else {
-            continue;
-        };
-        let Some(insert_ix) = track.inserts.iter().position(|i| &i.id == insert_id) else {
-            continue;
-        };
-        let Ok(param_id) = parameter_id.parse::<u32>() else {
-            continue;
-        };
-        out.push(RuntimePluginParamBinding {
-            insert_ix,
-            lane_ix,
-            param_id,
-            last_value: f32::NAN,
-        });
-    }
-    out
+    plugin_param_bindings(&track.automation_lanes, &track.inserts)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

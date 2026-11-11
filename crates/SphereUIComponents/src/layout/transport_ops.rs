@@ -495,6 +495,12 @@ impl StudioLayout {
         let on_stop = make_command_handler("transport:stop");
         let on_loop_toggle = make_command_handler("transport:toggle-loop");
         let on_metronome_toggle = make_command_handler("transport:toggle-metronome");
+        let on_automation_arm_toggle = make_command_handler("automation:toggle-arm");
+        let on_reenable_automation = make_command_handler("automation:re-enable");
+        let (automation_arm, automation_overridden) = {
+            let state = &self.timeline.read(cx).state;
+            (state.automation_arm, state.has_overridden_automation())
+        };
         let on_metronome_menu: components::BpmMenuCb = {
             let this = cx.entity().clone();
             Arc::new(
@@ -732,6 +738,8 @@ impl StudioLayout {
             count_in_enabled,
             loop_enabled,
             metronome_enabled,
+            automation_arm,
+            automation_overridden,
             follow_playhead,
             auto_scroll_continuous,
             position_label,
@@ -767,6 +775,8 @@ impl StudioLayout {
             on_loop_toggle,
             on_metronome_toggle,
             on_metronome_menu,
+            on_automation_arm_toggle,
+            on_reenable_automation,
             on_follow_toggle,
             on_follow_mode_toggle,
             on_set_bpm,

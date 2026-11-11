@@ -165,6 +165,8 @@ pub const PROJECT_MAGIC: &[u8; 8] = b"FBSTUD1\0";
 /// v61 adds automation target tags 5 (a send's on/off, by send id) and 6 (an
 /// insert's bypass, by insert id), and appends each automation lane's mode
 /// (Read 0, Touch 1, Latch 2, Write 3) after its points. A pre-v61 lane reads.
+/// Lanes have no modes any more (recording is the Automation Arm): the byte
+/// is still written, always 0, and ignored on read.
 /// v62 appends the master bus's automation lanes after its inserts, then a
 /// flag for whether the arrangement shows them. A pre-v62 master has none.
 /// v63 appends each insert's mix bus (`0` main, `1` wet/dry/wet) after its

@@ -332,7 +332,7 @@ impl PluginBridgeSink for SharedRegionSink {
         }
     }
 
-    fn push_param(&self, param_id: u32, value: f32, sample_offset: u32) {
+    fn push_param(&self, param_id: u32, value: f32, sample_offset: u32) -> bool {
         let bridge = self.region.bridge();
         let ok = bridge
             .params
@@ -348,6 +348,7 @@ impl PluginBridgeSink for SharedRegionSink {
                 eprintln!("[plugin-param] ring_full dropped param_id={param_id} value={value:.4}");
             }
         }
+        ok
     }
 
     fn write_input(&self, in_l: &[f32], in_r: &[f32], frames: usize) {

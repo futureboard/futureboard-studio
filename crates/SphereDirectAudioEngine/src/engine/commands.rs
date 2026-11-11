@@ -133,6 +133,7 @@ impl EngineInner {
                 EngineCommand::SetLoopbackRecord(_) => "SetLoopbackRecord",
                 EngineCommand::SetTrackPreviewMode { .. } => "SetTrackPreviewMode",
                 EngineCommand::SetSoundfontChannels { .. } => "SetSoundfontChannels",
+                EngineCommand::SetTrackAutomation(_) => "SetTrackAutomation",
                 EngineCommand::SetInsertParam { .. } => "SetInsertParam",
                 EngineCommand::SetMonitorSource { .. } => "SetMonitorSource",
                 EngineCommand::SetMonitorControl { .. } => "SetMonitorControl",

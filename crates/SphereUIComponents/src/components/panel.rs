@@ -2976,7 +2976,7 @@ fn track_inspector(
     // When Track Volume automation is reading, the slider/readout follow the
     // effective (automation) value and an `A` marker plus a separate base
     // readout make the manual value clear. Otherwise it shows the base only.
-    let has_volume_automation = track.has_active_volume_automation();
+    let has_volume_automation = track.has_volume_automation();
     let display_vol = track.display_volume();
     let volume_text = i18n.tr_vars(
         "inspector.volume.db",

@@ -1,8 +1,8 @@
 use crate::assets;
 use crate::components::timeline::timeline_state::{
     automation_value_to_y, automation_y_to_value, evaluate_automation, AutomationHover,
-    AutomationLaneState, AutomationMarquee, AutomationMode, AutomationPoint, AutomationSampler,
-    AutomationTarget, TimelineGestureContext, TimelineState, HEADER_WIDTH, MASTER_TRACK_ID,
+    AutomationLaneState, AutomationMarquee, AutomationPoint, AutomationSampler, AutomationTarget,
+    TimelineGestureContext, TimelineState, HEADER_WIDTH, MASTER_TRACK_ID,
 };
 use crate::theme::{radius, space, typography, Colors};
 use gpui::prelude::FluentBuilder;
@@ -57,11 +57,12 @@ const AUTOMATION_SUBLANE_HEADER_INDENT: f32 = AUTOMATION_SUBLANE_RAIL_X + space:
 pub enum AutomationLaneAction {
     /// Focus the editor on this lane (header body click).
     Activate,
-    /// Step the lane's mode: Off, Read, Touch, Latch, Write.
+    /// Switch the lane on or off.
     ToggleEnable,
-    /// Set the lane's mode directly from its segmented control: `None` is
-    /// Off.
-    SetMode(Option<crate::components::timeline::timeline_state::AutomationMode>),
+    /// Switch the lane on (`true`) or off from its segmented control.
+    SetEnabled(bool),
+    /// Put a lane overridden by hand back in play.
+    ReEnable,
     /// Remove every point but keep the lane.
     Clear,
     /// Remove the sub-lane (lane and its points).
@@ -346,14 +347,14 @@ pub fn automation_lane(
         .child(div().flex_1().min_w(px(0.0)).child(name_button))
         .child(readout);
 
-    // ── Row 2: the mode, as one flush segmented control, then the lane's own
-    // controls ────────────────────────────────────────────────────────────────
+    // ── Row 2: the lane's switch, as one flush segmented control, then the
+    // lane's own controls ─────────────────────────────────────────────────────
     //
-    // Off, Read, Touch, Latch, Write — each one click. Read takes the
-    // automation hue; the three that record take the record hue, so a lane
-    // that will write over the curve says so before the transport rolls. Fill
+    // Off or On — each one click. On takes the automation hue, or the record
+    // hue while the Automation Arm is writing the lane. A lane overridden by
+    // hand adds a grey Re-enable segment: the control's own value is playing
+    // until it is clicked (or the transport's Re-Enable Automation is). Fill
     // and border carry the state together, never hue alone.
-    let current = lane.enabled.then_some(lane.mode);
     let mut segments = div()
         .flex()
         .flex_row()
@@ -364,37 +365,24 @@ pub fn automation_lane(
         .border(px(1.0))
         .border_color(border_subtle)
         .bg(Colors::surface_input());
-    let choices: [(Option<AutomationMode>, &'static str, &'static str); 5] = [
-        (None, "Off", "Off \u{2014} the lane is bypassed"),
+    let choices: [(bool, &'static str, &'static str); 2] = [
+        (false, "Off", "Off \u{2014} the lane is bypassed"),
         (
-            Some(AutomationMode::Read),
-            "R",
-            "Read \u{2014} the lane plays the parameter",
-        ),
-        (
-            Some(AutomationMode::Touch),
-            "T",
-            "Touch \u{2014} records while the control moves, then plays the lane again",
-        ),
-        (
-            Some(AutomationMode::Latch),
-            "L",
-            "Latch \u{2014} records from the first move until playback stops",
-        ),
-        (
-            Some(AutomationMode::Write),
-            "W",
-            "Write \u{2014} records the control for as long as playback runs",
+            true,
+            "On",
+            "On \u{2014} the lane plays the parameter; with the Automation Arm on, moving the control while playing writes it",
         ),
     ];
-    for (index, (mode, label, tip)) in choices.into_iter().enumerate() {
-        let on = current == mode;
-        let hue = match mode {
-            None => text_muted,
-            Some(AutomationMode::Read) => Colors::state_automation(),
-            Some(_) => Colors::state_arm(),
+    for (index, (enabled, label, tip)) in choices.into_iter().enumerate() {
+        let on = lane.enabled == enabled;
+        let hue = if !enabled {
+            text_muted
+        } else if lane.recording {
+            Colors::state_arm()
+        } else {
+            Colors::state_automation()
         };
-        let (fill, border) = if on && mode.is_some() {
+        let (fill, border) = if on && enabled && !lane.overridden {
             Colors::latched(header_bg, hue)
         } else if on {
             (
@@ -408,7 +396,7 @@ pub fn automation_lane(
             )
         };
         let hover = Colors::composite(fill, state_hover);
-        let recording = on && lane.recording;
+        let recording = on && enabled && lane.recording;
         segments = segments.child(
             div()
                 .id((
@@ -420,7 +408,7 @@ pub fn automation_lane(
                 .justify_center()
                 .gap(px(space::HAIR))
                 .h_full()
-                .min_w(px(if mode.is_none() { 26.0 } else { 18.0 }))
+                .min_w(px(26.0))
                 .px(px(space::TIGHT))
                 .bg(fill)
                 .border(px(1.0))
@@ -431,22 +419,54 @@ pub fn automation_lane(
                 } else {
                     gpui::FontWeight::MEDIUM
                 })
-                .text_color(if on { hue } else { text_muted })
+                .text_color(if on && !lane.overridden {
+                    hue
+                } else {
+                    text_muted
+                })
                 .cursor(gpui::CursorStyle::PointingHand)
                 .hover(move |s| s.bg(hover))
                 .tooltip(crate::components::fb_tooltip(tip))
                 .on_mouse_down(
                     gpui::MouseButton::Left,
-                    lane_action(AutomationLaneAction::SetMode(mode)),
+                    lane_action(AutomationLaneAction::SetEnabled(enabled)),
                 )
-                // A lane being written right now shows a dot in its mode.
+                // A lane being written right now shows a dot.
                 .when(recording, |segment| {
                     segment.child(div().size(px(4.0)).rounded(px(radius::PILL)).bg(hue))
                 })
                 .child(label),
         );
     }
-
+    if lane.enabled && lane.overridden {
+        let fill = Colors::composite(header_bg, Colors::state_hover());
+        let hover = Colors::composite(fill, state_hover);
+        segments = segments.child(
+            div()
+                .id(("automation-lane-reenable", id_num))
+                .flex()
+                .items_center()
+                .justify_center()
+                .h_full()
+                .px(px(space::TIGHT))
+                .bg(fill)
+                .border(px(1.0))
+                .border_color(border_subtle)
+                .text_size(px(typography::UI_XS))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(text_muted)
+                .cursor(gpui::CursorStyle::PointingHand)
+                .hover(move |s| s.bg(hover))
+                .tooltip(crate::components::fb_tooltip(
+                    "Overridden \u{2014} the control was moved by hand. Click to play the lane again",
+                ))
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    lane_action(AutomationLaneAction::ReEnable),
+                )
+                .child("Re-enable"),
+        );
+    }
     let point_count = lane.points.len();
     let mode_row = div()
         .flex()
@@ -988,7 +1008,13 @@ fn lane_envelope(
     let baseline_y = automation_value_to_y(default_value, lane_height);
 
     let enabled = lane.enabled;
-    let curve_color = Colors::automation_curve();
+    // An overridden lane is drawn grey: the control's own value is what
+    // plays until Re-Enable Automation.
+    let curve_color = if lane.overridden {
+        Colors::text_muted()
+    } else {
+        Colors::automation_curve()
+    };
     // Curve at ~0.85 so it stays clearly readable without the razor-sharp edge.
     let line_color = if enabled {
         Colors::with_alpha(curve_color, 0.85)

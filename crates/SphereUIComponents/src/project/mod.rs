@@ -549,7 +549,9 @@ pub struct AutomationLane {
     pub enabled: bool,
     pub points: Vec<AutomationPoint>,
     pub visible: bool,
-    /// v61+: Read 0, Touch 1, Latch 2, Write 3. Older files read as Read.
+    /// v61+ byte that once held a per-lane recording mode (Read 0, Touch 1,
+    /// Latch 2, Write 3). Recording is the transport's Automation Arm now, so
+    /// it is written 0 and ignored on read: every enabled lane plays.
     pub mode: u8,
 }
 
@@ -2904,7 +2906,7 @@ fn lane_to_project(
         parameter_name: al.name.clone(),
         target: target_to_desc(&al.target),
         enabled: al.enabled,
-        mode: al.mode.to_tag(),
+        mode: 0,
         points: al
             .points
             .iter()
@@ -2920,12 +2922,13 @@ fn lane_to_project(
 }
 
 /// [`lane_to_project`] the other way round. Never restores a lane as
-/// recording: that belongs to a transport run, not to the file.
+/// recording or overridden: those belong to a session, not to the file. A
+/// lane saved in Touch, Latch or Write (v61-v63) simply plays.
 fn lane_from_project(
     al: &AutomationLane,
 ) -> crate::components::timeline::timeline_state::AutomationLaneState {
     use crate::components::timeline::timeline_state::{
-        AutomationCurve, AutomationLaneState, AutomationMode, AutomationPoint as TlAutoPoint,
+        AutomationCurve, AutomationLaneState, AutomationPoint as TlAutoPoint,
     };
     AutomationLaneState {
         id: al.id.clone(),
@@ -2933,8 +2936,8 @@ fn lane_from_project(
         target: desc_to_target(&al.target, &al.parameter_name),
         enabled: al.enabled,
         visible: al.visible,
-        mode: AutomationMode::from_tag(al.mode),
         recording: false,
+        overridden: false,
         points: al
             .points
             .iter()
@@ -3349,12 +3352,12 @@ mod v33_routing_adapter_tests {
         }
     }
 
-    /// v62: the master's lanes, their points and modes, and whether the
+    /// v62: the master's lanes, their points and switches, and whether the
     /// arrangement shows them come back from the file; a v61 file has none.
     #[test]
     fn v62_round_trips_master_automation() {
         use crate::components::timeline::timeline_state::{
-            AutomationMode, AutomationTarget, TimelineState, MASTER_TRACK_ID,
+            AutomationTarget, TimelineState, MASTER_TRACK_ID,
         };
         let mut tl = TimelineState::default();
         tl.toggle_track_lane_mode(MASTER_TRACK_ID);
@@ -3362,7 +3365,7 @@ mod v33_routing_adapter_tests {
             .ensure_automation_lane(MASTER_TRACK_ID, AutomationTarget::TrackVolume)
             .unwrap();
         tl.add_automation_point(MASTER_TRACK_ID, &lane, 8.0, 0.3);
-        tl.set_automation_lane_mode(MASTER_TRACK_ID, &lane, Some(AutomationMode::Latch));
+        tl.set_automation_lane_enabled(MASTER_TRACK_ID, &lane, false);
 
         let project = FutureboardProject::from(&tl);
         let bytes = crate::project::format::encode_project(&project);
@@ -3373,7 +3376,7 @@ mod v33_routing_adapter_tests {
         assert_eq!(loaded.master.automation_lanes.len(), 1);
         let restored = &loaded.master.automation_lanes[0];
         assert_eq!(restored.target, AutomationTarget::TrackVolume);
-        assert_eq!(restored.mode, AutomationMode::Latch);
+        assert!(!restored.enabled);
         assert_eq!(restored.points.len(), 1);
         assert!((restored.points[0].beat - 8.0).abs() < 1.0e-6);
 

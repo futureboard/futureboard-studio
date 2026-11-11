@@ -47,6 +47,7 @@ struct Graveyards {
     #[allow(clippy::box_collection)] // matches EngineCommand::SetBridgeEditorActive
     bridge_editor: Sender<Box<std::collections::HashSet<String>>>,
     ara: Sender<Vec<RuntimeAraRenderer>>,
+    automation: Sender<Box<crate::runtime::TrackAutomationChange>>,
 }
 
 static GRAVEYARDS: OnceLock<Graveyards> = OnceLock::new();
@@ -97,6 +98,7 @@ pub fn prime() {
         insert_param: spawn_worker("daux-param-graveyard"),
         bridge_editor: spawn_worker("daux-editor-graveyard"),
         ara: spawn_worker("daux-ara-graveyard"),
+        automation: spawn_worker("daux-automation-graveyard"),
     });
     let leaked = LEAKED.load(Ordering::Relaxed);
     let reported = LEAKS_REPORTED.swap(leaked, Ordering::Relaxed);
@@ -203,6 +205,13 @@ pub fn retire_insert_param_change(old: Box<InsertParamChange>) {
 #[allow(clippy::box_collection)] // matches EngineCommand::SetBridgeEditorActive
 pub fn retire_bridge_editor_active(old: Box<std::collections::HashSet<String>>) {
     send_or_leak(graveyards().map(|g| &g.bridge_editor), old);
+}
+
+/// Dispose an applied track automation change — it now holds the replaced
+/// lanes and bindings — away from the realtime callback.
+#[inline]
+pub fn retire_track_automation(old: Box<crate::runtime::TrackAutomationChange>) {
+    send_or_leak(graveyards().map(|g| &g.automation), old);
 }
 
 /// Dispose a retired ARA renderer list away from the realtime callback.

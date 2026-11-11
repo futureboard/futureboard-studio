@@ -383,6 +383,13 @@ pub struct TimelineState {
     pub track_pan_gesture_origin: std::collections::HashMap<TrackId, f32>,
     /// Which clip each copied or split clip came from (see [`ClipLineage`]).
     pub clip_lineage: ClipLineage,
+    /// Automation Arm: while on and playing, moving a control writes its
+    /// lanes (touch-style: from the grab until it is let go). Session-only,
+    /// never saved, so opening a project never starts writing over it.
+    pub automation_arm: bool,
+    /// Lanes were overridden or re-enabled since the engine last heard; see
+    /// [`TimelineState::take_automation_override_change`].
+    pub(crate) automation_override_changed: bool,
 }
 
 impl Default for TimelineState {
@@ -541,6 +548,8 @@ impl Default for TimelineState {
             master_volume_gesture_origin: None,
             track_pan_gesture_origin: std::collections::HashMap::new(),
             clip_lineage: ClipLineage::default(),
+            automation_arm: false,
+            automation_override_changed: false,
         }
     }
 }

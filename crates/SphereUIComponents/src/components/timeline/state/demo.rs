@@ -69,8 +69,8 @@ impl TimelineState {
                 target: AutomationTarget::TrackVolume,
                 enabled: true,
                 visible: false,
-                mode: AutomationMode::Read,
                 recording: false,
+                overridden: false,
                 points: vec![
                     AutomationPoint::new(0.0, 0.8),
                     AutomationPoint::new(4.0, 0.5),
@@ -373,6 +373,8 @@ impl TimelineState {
             master_volume_gesture_origin: None,
             track_pan_gesture_origin: std::collections::HashMap::new(),
             clip_lineage: ClipLineage::default(),
+            automation_arm: false,
+            automation_override_changed: false,
         }
     }
 

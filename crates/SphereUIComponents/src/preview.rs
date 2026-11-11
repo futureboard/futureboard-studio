@@ -2364,9 +2364,10 @@ fn ara_notes_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHand
 }
 
 /// The demo arrangement with automation lanes shown on its first track:
-/// Volume reading a curve, Pan in Touch, Mute in Write while it records.
+/// Volume playing a curve, Pan overridden by hand, Mute recording with the
+/// Automation Arm on.
 fn automation_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
-    use crate::components::timeline::timeline_state::{AutomationMode, AutomationTarget};
+    use crate::components::timeline::timeline_state::AutomationTarget;
     let handle = cx.open_window(options, |_, cx| {
         let timeline = cx.new(|_| {
             let mut timeline = crate::components::timeline::Timeline::with_demo_content();
@@ -2392,14 +2393,27 @@ fn automation_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHan
                 crate::components::timeline::timeline_state::TrackLaneMode::Automation;
             for lane in &mut track.automation_lanes {
                 lane.visible = true;
+                // Volume shows the curve shapes: a sharp S, a fast ease and a
+                // soft S.
+                if lane.id == volume {
+                    use crate::components::timeline::timeline_state::AutomationCurve;
+                    for (point, (curve, tension)) in lane.points.iter_mut().zip([
+                        (AutomationCurve::Smooth, 0.6),
+                        (AutomationCurve::Linear, -0.6),
+                        (AutomationCurve::Smooth, -0.5),
+                    ]) {
+                        point.curve = curve;
+                        point.tension = tension;
+                    }
+                }
                 if lane.id == pan {
-                    lane.mode = AutomationMode::Touch;
+                    lane.overridden = true;
                 }
                 if lane.id == mute {
-                    lane.mode = AutomationMode::Write;
                     lane.recording = true;
                 }
             }
+            state.automation_arm = true;
             timeline
         });
         cx.new(|_| ArrangementMetersPreview { timeline })
@@ -2407,12 +2421,10 @@ fn automation_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHan
     Ok(handle.into())
 }
 
-/// The master's automation block after the last track: Volume in Read with a
-/// fade, and a second lane in Latch.
+/// The master's automation block after the last track: Volume playing a
+/// fade, and a second lane switched off.
 fn master_automation_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
-    use crate::components::timeline::timeline_state::{
-        AutomationMode, AutomationTarget, MASTER_TRACK_ID,
-    };
+    use crate::components::timeline::timeline_state::{AutomationTarget, MASTER_TRACK_ID};
     let handle = cx.open_window(options, |_, cx| {
         let timeline = cx.new(|_| {
             let mut timeline = crate::components::timeline::Timeline::with_demo_content();
@@ -2443,7 +2455,7 @@ fn master_automation_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWi
             for (beat, value) in [(0.0, 0.0), (4.0, 1.0), (6.0, 0.0)] {
                 state.add_automation_point(MASTER_TRACK_ID, &bypass, beat, value);
             }
-            state.set_automation_lane_mode(MASTER_TRACK_ID, &bypass, Some(AutomationMode::Latch));
+            state.set_automation_lane_enabled(MASTER_TRACK_ID, &bypass, false);
             // Scrolled so the last tracks and the master block are in view.
             let layout = state.track_row_layout();
             state.viewport.scroll_y = (layout.master_y - 220.0).max(0.0);

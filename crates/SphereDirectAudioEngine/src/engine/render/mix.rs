@@ -29,8 +29,11 @@ pub(super) fn two_mut<T>(v: &mut [T], a: usize, b: usize) -> (&mut T, &mut T) {
 
 #[inline]
 pub(crate) fn effective_track_muted(track: &RuntimeTrack, beat: f64) -> bool {
+    if track.automation_lanes.is_empty() {
+        return track.muted;
+    }
     track
-        .automation_values_at_beat(beat)
+        .automation_values_at_beat(track.automation_clock.fader_beat(beat))
         .muted
         .unwrap_or(track.muted)
 }
@@ -464,6 +467,11 @@ pub(super) fn finish_track_block(
     if emit {
         scatter_vsti_output_children(runtime, track_index, frames, output, channels);
     }
+    // The audio here left the timeline this track's latency ago: its sends
+    // and fader read their lanes there, and the fader ramps to the lanes'
+    // value at the block's end (see `RuntimeAutomationClock`).
+    let clock = runtime.tracks[track_index].automation_clock;
+    let (beat, fader_target_beat) = (clock.fader_beat(beat), clock.fader_end_beat(beat));
     // Pre-fader sends tap the post-insert signal currently in block_*.
     accumulate_sends(runtime, track_index, frames, true, beat, !emit);
     // PFL and a TrackPreFader monitor source tap the same point the pre-fader
@@ -472,7 +480,12 @@ pub(super) fn finish_track_block(
         capture_monitor_taps(runtime, track_index, frames, TapStage::PreFader);
     }
     let smooth = runtime.fader_smoothing;
-    apply_fader(&mut runtime.tracks[track_index], frames, beat, smooth);
+    apply_fader(
+        &mut runtime.tracks[track_index],
+        frames,
+        if smooth { fader_target_beat } else { beat },
+        smooth,
+    );
     if emit {
         accumulate_block_meter(&mut runtime.tracks[track_index], frames);
         // AFL, a TrackAfterFader source, and a Bus source tap after the fader and

@@ -218,24 +218,30 @@ pub(super) fn apply_plugin_param_automation(track: &mut RuntimeTrack, beat: f64)
         if (value - binding.last_value).abs() <= crate::runtime::PLUGIN_PARAM_AUTOMATION_EPS {
             continue;
         }
-        binding.last_value = value;
         let Some(insert) = inserts.get_mut(binding.insert_ix) else {
             continue;
         };
+        // Recorded as sent only once it was: a value dropped here (bypassed
+        // insert, full ring, no sink yet) is tried again next block rather
+        // than lost until the lane happens to move.
         if !insert.active() {
             continue;
         }
-        match insert.kind_tag {
-            crate::runtime::RuntimeInsertKind::ExternalBridge => {
-                if let Some(sink) = insert.bridge_sink.as_ref() {
-                    sink.push_param(binding.param_id, value, 0);
-                }
-            }
-            _ => {
-                if let Some(vst3) = insert.vst3.as_mut() {
+        let sent = match insert.kind_tag {
+            crate::runtime::RuntimeInsertKind::ExternalBridge => insert
+                .bridge_sink
+                .as_ref()
+                .is_some_and(|sink| sink.push_param(binding.param_id, value, 0)),
+            _ => match insert.vst3.as_mut() {
+                Some(vst3) => {
                     vst3.set_param(binding.param_id, value as f64);
+                    true
                 }
-            }
+                None => false,
+            },
+        };
+        if sent {
+            binding.last_value = value;
         }
     }
 }
@@ -253,9 +259,9 @@ pub(crate) fn apply_insert_bypass_automation(track: &mut RuntimeTrack, beat: Opt
         let Some(lane_ix) = insert.bypass_lane else {
             continue;
         };
-        insert.automation_bypassed = beat
+        insert.automation_bypass = beat
             .and_then(|beat| automation_lanes.get(lane_ix)?.evaluate_normalized(beat))
-            .is_some_and(|value| value >= 0.5);
+            .map(|value| value >= 0.5);
     }
 }
 
@@ -284,12 +290,16 @@ pub fn apply_track_chain_block(
     // pre-resolved bindings, ring push / set_param only, no allocation. Only
     // while playing so manual edits / the plugin editor own the value when the
     // transport is stopped.
+    //
+    // Read at the beat of the audio entering the chain, not the block's: a
+    // bus is fed audio its sources' plug-ins have already delayed.
+    let chain_beat = track.automation_clock.chain_beat(transport.ppq_position);
     if transport.playing {
-        apply_plugin_param_automation(track, transport.ppq_position);
+        apply_plugin_param_automation(track, chain_beat);
     }
     // Insert bypass automation, the same way: read while playing, and the
     // insert's own switch stands while stopped.
-    apply_insert_bypass_automation(track, transport.playing.then_some(transport.ppq_position));
+    apply_insert_bypass_automation(track, transport.playing.then_some(chain_beat));
 
     render_ara_block(track, frames, transport);
     render_soundfont_instrument_block(track, frames);

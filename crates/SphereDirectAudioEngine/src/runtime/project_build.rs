@@ -225,7 +225,7 @@ impl RuntimeProject {
                     kind_tag: RuntimeInsertKind::from_kind(&insert.kind),
                     enabled: insert.enabled,
                     bypass_lane: None,
-                    automation_bypassed: false,
+                    automation_bypass: None,
                     bridge_is_effect: insert
                         .params
                         .get("role")
@@ -357,6 +357,7 @@ impl RuntimeProject {
                     .collect(),
                 // Resolved below in resolve_indices once insert ids are known.
                 plugin_param_automation: Vec::new(),
+                automation_clock: Default::default(),
                 meter: Arc::new(RuntimeTrackMeter::default()),
                 meter_peak_l: 0.0,
                 meter_peak_r: 0.0,

@@ -355,10 +355,19 @@ impl TrackState {
 
 impl TrackState {
     /// `true` when this track has an enabled Track Volume automation lane that
-    /// actually carries points — i.e. automation can resolve a value.
-    pub fn has_active_volume_automation(&self) -> bool {
+    /// carries points, whether it is playing or overridden by hand.
+    pub fn has_volume_automation(&self) -> bool {
         self.automation_lanes.iter().any(|l| {
             l.enabled && matches!(l.target, AutomationTarget::TrackVolume) && !l.points.is_empty()
+        })
+    }
+
+    /// `true` when a Track Volume lane with points is playing: switched on,
+    /// not overridden by hand, not being recorded — i.e. automation is what
+    /// the fader shows and the engine hears.
+    pub fn has_active_volume_automation(&self) -> bool {
+        self.automation_lanes.iter().any(|l| {
+            l.plays() && matches!(l.target, AutomationTarget::TrackVolume) && !l.points.is_empty()
         })
     }
 

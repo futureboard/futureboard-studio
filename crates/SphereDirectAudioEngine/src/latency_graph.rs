@@ -602,6 +602,7 @@ mod tests {
             sends,
             automation_lanes: Vec::new(),
             plugin_param_automation: Vec::new(),
+            automation_clock: Default::default(),
             meter: std::sync::Arc::new(crate::runtime::RuntimeTrackMeter::default()),
             meter_peak_l: 0.0,
             meter_peak_r: 0.0,

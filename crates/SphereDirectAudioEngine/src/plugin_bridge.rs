@@ -145,7 +145,13 @@ pub trait PluginBridgeSink: Send + Sync + std::fmt::Debug {
     /// for the host to apply to the next block. Wait-free ring push; dropped if
     /// the ring is full. Default no-op for sinks that do not carry a param ring
     /// (test stubs); the shared-region sink forwards it to the host plugin.
-    fn push_param(&self, _param_id: u32, _value: f32, _sample_offset: u32) {}
+    ///
+    /// Returns whether the change was taken: `false` (ring full) tells the
+    /// automation pass to send it again next block instead of treating it as
+    /// delivered. A sink without a ring has nothing to retry, so says `true`.
+    fn push_param(&self, _param_id: u32, _value: f32, _sample_offset: u32) -> bool {
+        true
+    }
 
     /// Write the track's pre-plugin stereo input for effect inserts (engine →
     /// host `audio_in`). Must be called only after a successful

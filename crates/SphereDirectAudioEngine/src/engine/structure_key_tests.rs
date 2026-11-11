@@ -122,6 +122,39 @@ fn clip_gain_is_left_out_of_the_key() {
     assert_ne!(key, project_structure_key(&mut moved, 48_000, true));
 }
 
+/// Automation is applied live (`SetTrackAutomation`), so editing a lane
+/// leaves the key alone and the lanes are put back.
+#[test]
+fn automation_lanes_are_left_out_of_the_key() {
+    let lane = |value: f32| crate::types::EngineAutomationLaneSnapshot {
+        id: "lane-1".to_string(),
+        name: "Volume".to_string(),
+        target: Default::default(),
+        enabled: true,
+        points: vec![crate::types::EngineAutomationPointSnapshot {
+            beat: 0.0,
+            value,
+            curve: 0,
+            tension: 0.0,
+        }],
+    };
+    let mut a = snapshot(120.0, &[]);
+    a.tracks.push(soundfont_track("Single"));
+    a.tracks[0].automation_lanes.push(lane(0.2));
+    let key = project_structure_key(&mut a, 48_000, true);
+
+    let mut edited = a.clone();
+    edited.tracks[0].automation_lanes[0] = lane(0.9);
+    edited.tracks[0].automation_lanes.push(lane(0.5));
+    assert_eq!(key, project_structure_key(&mut edited, 48_000, true));
+    assert_eq!(
+        edited.tracks[0].automation_lanes.len(),
+        2,
+        "the lanes are put back"
+    );
+    assert_eq!(edited.tracks[0].automation_lanes[0].points[0].value, 0.9);
+}
+
 /// Insert params are a `HashMap`: the same entries in another order must
 /// give the same key.
 #[test]

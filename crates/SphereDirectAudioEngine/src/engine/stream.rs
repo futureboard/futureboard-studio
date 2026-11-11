@@ -653,6 +653,10 @@ where
                         } => {
                             runtime.update_soundfont_channels(track_index, &channels);
                         }
+                        EngineCommand::SetTrackAutomation(mut change) => {
+                            runtime.install_track_automation(&mut change);
+                            crate::graveyard::retire_track_automation(change);
+                        }
                         EngineCommand::SetInsertParam {
                             track_index,
                             insert_index,

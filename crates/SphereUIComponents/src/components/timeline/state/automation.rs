@@ -300,8 +300,8 @@ pub struct AutomationPickerModel {
 pub enum AutomationCurve {
     Linear,
     Hold,
-    /// S-curve — reserved. Evaluated as Linear until the curve math lands, but
-    /// stored/round-tripped so existing data is never lost.
+    /// S-curve, bendable by tension: sharper (`> 0`) or softer (`< 0`). See
+    /// `DirectAudio::automation_curve_factor`.
     Smooth,
 }
 
@@ -334,6 +334,86 @@ impl AutomationCurve {
             AutomationCurve::Hold => "Hold",
             AutomationCurve::Smooth => "Smooth",
         }
+    }
+}
+
+/// A segment shape the Curve menu offers: a curve kind and its tension. The
+/// segment can still be bent further by dragging it; these are starting
+/// points that cover the common moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutomationCurveShape {
+    Linear,
+    /// Ease in: starts slowly, arrives fast.
+    Slow,
+    /// Ease out: moves fast, settles slowly.
+    Fast,
+    SCurve,
+    /// A steeper S that holds near both ends.
+    SharpS,
+    Hold,
+}
+
+/// Tension of the Slow, Fast and Sharp S presets.
+const CURVE_PRESET_TENSION: f32 = 0.6;
+
+impl AutomationCurveShape {
+    pub const ALL: [Self; 6] = [
+        Self::Linear,
+        Self::Slow,
+        Self::Fast,
+        Self::SCurve,
+        Self::SharpS,
+        Self::Hold,
+    ];
+
+    /// The curve kind and tension a segment takes for this shape.
+    pub fn curve_and_tension(self) -> (AutomationCurve, f32) {
+        match self {
+            Self::Linear => (AutomationCurve::Linear, 0.0),
+            Self::Slow => (AutomationCurve::Linear, CURVE_PRESET_TENSION),
+            Self::Fast => (AutomationCurve::Linear, -CURVE_PRESET_TENSION),
+            Self::SCurve => (AutomationCurve::Smooth, 0.0),
+            Self::SharpS => (AutomationCurve::Smooth, CURVE_PRESET_TENSION),
+            Self::Hold => (AutomationCurve::Hold, 0.0),
+        }
+    }
+
+    /// The shape a segment with curve and 	ension is, if it is one of
+    /// these. Hold ignores tension.
+    pub fn of(curve: AutomationCurve, tension: f32) -> Option<Self> {
+        Self::ALL.into_iter().find(|shape| {
+            let (c, t) = shape.curve_and_tension();
+            c == curve && (curve == AutomationCurve::Hold || (t - tension).abs() < 1.0e-3)
+        })
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Linear => "Linear",
+            Self::Slow => "Slow (ease in)",
+            Self::Fast => "Fast (ease out)",
+            Self::SCurve => "S-Curve",
+            Self::SharpS => "Sharp S",
+            Self::Hold => "Hold (step)",
+        }
+    }
+
+    /// The menu command that applies this shape to the selected points.
+    pub fn command(self) -> &'static str {
+        match self {
+            Self::Linear => "automation:curve:linear",
+            Self::Slow => "automation:curve:slow",
+            Self::Fast => "automation:curve:fast",
+            Self::SCurve => "automation:curve:smooth",
+            Self::SharpS => "automation:curve:sharp-s",
+            Self::Hold => "automation:curve:hold",
+        }
+    }
+
+    pub fn from_command(command: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|shape| shape.command() == command)
     }
 }
 
@@ -485,59 +565,6 @@ impl AutomationPoint {
     }
 }
 
-/// What an enabled lane does while the transport plays. A lane that is off
-/// (`enabled == false`) does none of these.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum AutomationMode {
-    /// Plays the lane.
-    #[default]
-    Read,
-    /// Plays the lane, and records the control while it is being moved; let
-    /// go and the lane takes over again.
-    Touch,
-    /// Like Touch, but once moved the control's value keeps being recorded
-    /// until the transport stops.
-    Latch,
-    /// Records the control for as long as the transport plays.
-    Write,
-}
-
-impl AutomationMode {
-    pub const ALL: [Self; 4] = [Self::Read, Self::Touch, Self::Latch, Self::Write];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Read => "Read",
-            Self::Touch => "Touch",
-            Self::Latch => "Latch",
-            Self::Write => "Write",
-        }
-    }
-
-    /// Whether the mode records while playing.
-    pub fn records(self) -> bool {
-        !matches!(self, Self::Read)
-    }
-
-    pub fn to_tag(self) -> u8 {
-        match self {
-            Self::Read => 0,
-            Self::Touch => 1,
-            Self::Latch => 2,
-            Self::Write => 3,
-        }
-    }
-
-    pub fn from_tag(tag: u8) -> Self {
-        match tag {
-            1 => Self::Touch,
-            2 => Self::Latch,
-            3 => Self::Write,
-            _ => Self::Read,
-        }
-    }
-}
-
 /// One copied automation point, relative to the first point copied.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AutomationClipboardPoint {
@@ -567,15 +594,25 @@ pub struct AutomationLaneState {
     /// in-track automation overlay shown by [`TrackLaneMode::Automation`]).
     pub visible: bool,
     pub points: Vec<AutomationPoint>,
-    /// What the lane does while playing, when enabled.
-    pub mode: AutomationMode,
     /// A pass is recording into this lane right now. UI-only, never saved:
     /// the engine holds the lane back meanwhile so the moving control is what
     /// is heard (see `engine_snapshot`).
     pub recording: bool,
+    /// The user moved this lane's control by hand while it was not being
+    /// recorded, so the control's own value plays instead of the lane until
+    /// Re-Enable Automation. Session-only, never saved: a reopened project
+    /// plays its automation.
+    pub overridden: bool,
 }
 
 impl AutomationLaneState {
+    /// Whether the lane drives its control: switched on, not overridden by
+    /// hand, and not held back while it is being recorded. Lanes without
+    /// points have nothing to play either; callers check that themselves.
+    pub fn plays(&self) -> bool {
+        self.enabled && !self.recording && !self.overridden
+    }
+
     /// Build an empty lane for `target` with an auto-derived id/name.
     pub fn new(id: impl Into<String>, target: AutomationTarget) -> Self {
         Self {
@@ -585,8 +622,8 @@ impl AutomationLaneState {
             enabled: true,
             visible: false,
             points: Vec::new(),
-            mode: AutomationMode::Read,
             recording: false,
+            overridden: false,
         }
     }
 
@@ -1299,19 +1336,21 @@ impl TimelineState {
         }
     }
 
-    /// Set the curve of every selected point in one lane — the shape of the
-    /// segment leaving each. Returns how many changed. Committed edit.
-    pub fn set_selected_automation_curve(
+    /// Give every selected point of one lane `shape`'s curve and tension —
+    /// the segment leaving each. Returns how many changed. Committed edit.
+    pub fn set_selected_automation_shape(
         &mut self,
         track_id: &str,
         lane_id: &str,
-        curve: AutomationCurve,
+        shape: AutomationCurveShape,
     ) -> usize {
+        let (curve, tension) = shape.curve_and_tension();
         let mut changed = 0;
         if let Some(lane) = self.lane_mut(track_id, lane_id) {
             for point in lane.points.iter_mut().filter(|p| p.selected) {
-                if point.curve != curve {
+                if point.curve != curve || (point.tension - tension).abs() > 1.0e-6 {
                     point.curve = curve;
+                    point.set_tension(tension);
                     changed += 1;
                 }
             }
@@ -1323,17 +1362,22 @@ impl TimelineState {
         changed
     }
 
-    /// The curve every selected point of one lane shares, or `None` when they
-    /// differ or nothing is selected — what a menu checks.
-    pub fn selected_automation_curve(
+    /// The shape every selected point of one lane shares, or `None` when they
+    /// differ, one was bent by hand, or nothing is selected — what the Curve
+    /// menu checks.
+    pub fn selected_automation_shape(
         &self,
         track_id: &str,
         lane_id: &str,
-    ) -> Option<AutomationCurve> {
+    ) -> Option<AutomationCurveShape> {
         let lane = self.automation_lane(track_id, lane_id)?;
-        let mut curves = lane.points.iter().filter(|p| p.selected).map(|p| p.curve);
-        let first = curves.next()?;
-        curves.all(|curve| curve == first).then_some(first)
+        let mut shapes = lane
+            .points
+            .iter()
+            .filter(|p| p.selected)
+            .map(|p| AutomationCurveShape::of(p.curve, p.tension));
+        let first = shapes.next()??;
+        shapes.all(|shape| shape == Some(first)).then_some(first)
     }
 
     /// The selected points of one lane, relative to the first, for a paste
@@ -1445,9 +1489,11 @@ impl TimelineState {
             .unwrap_or(0.0)
     }
 
-    /// Set a segment's tension (clamped to `-1.0..=1.0`), forcing the curved
-    /// (Linear) kind so the tension is visible/audible. Committed edit — the
-    /// caller dirties once on release.
+    /// Set a segment's tension (clamped to `-1.0..=1.0`). A Smooth segment
+    /// stays an S and bends (sharper or softer); a Hold segment, which has no
+    /// shape to bend, becomes a curved Linear one so the tension is
+    /// visible and audible. Committed edit — the caller dirties once on
+    /// release.
     pub fn set_automation_segment_tension(
         &mut self,
         track_id: &str,
@@ -1457,7 +1503,9 @@ impl TimelineState {
     ) {
         if let Some(lane) = self.lane_mut(track_id, lane_id) {
             if let Some(p) = lane.points.iter_mut().find(|p| p.id == left_point_id) {
-                p.curve = AutomationCurve::Linear;
+                if p.curve != AutomationCurve::Smooth {
+                    p.curve = AutomationCurve::Linear;
+                }
                 p.set_tension(tension);
             }
         }
@@ -1777,66 +1825,126 @@ impl TimelineState {
         }
     }
 
-    /// Toggle a lane's enabled flag (read on/off). Committed edit — when off the
-    /// lane keeps its points but stops driving the target. Returns the new state.
-    pub fn toggle_automation_lane_enabled(
+    /// Switch a lane on or off. Returns whether it changed. Committed edit:
+    /// an off lane keeps its points but never plays or records.
+    pub fn set_automation_lane_enabled(
         &mut self,
         track_id: &str,
         lane_id: &str,
-    ) -> Option<bool> {
-        let lane = self.lane_mut(track_id, lane_id)?;
-        lane.enabled = !lane.enabled;
-        let enabled = lane.enabled;
-        let playhead = self.transport.playhead_beats;
-        self.recompute_effective_volumes(playhead, "lane_enable_toggle");
-        Some(enabled)
-    }
-
-    /// Step a lane through Off, Read, Touch, Latch and Write. Committed edit.
-    /// Returns the lane's `(enabled, mode)` after the step.
-    pub fn cycle_automation_lane_mode(
-        &mut self,
-        track_id: &str,
-        lane_id: &str,
-    ) -> Option<(bool, AutomationMode)> {
-        let lane = self.lane_mut(track_id, lane_id)?;
-        let (enabled, mode) = match (lane.enabled, lane.mode) {
-            (false, _) => (true, AutomationMode::Read),
-            (true, AutomationMode::Read) => (true, AutomationMode::Touch),
-            (true, AutomationMode::Touch) => (true, AutomationMode::Latch),
-            (true, AutomationMode::Latch) => (true, AutomationMode::Write),
-            (true, AutomationMode::Write) => (false, AutomationMode::Read),
-        };
-        lane.enabled = enabled;
-        lane.mode = mode;
-        let playhead = self.transport.playhead_beats;
-        self.recompute_effective_volumes(playhead, "lane_mode_cycle");
-        Some((enabled, mode))
-    }
-
-    /// Set a lane's mode: `None` turns it off. Returns whether it changed.
-    /// Committed edit.
-    pub fn set_automation_lane_mode(
-        &mut self,
-        track_id: &str,
-        lane_id: &str,
-        mode: Option<AutomationMode>,
+        enabled: bool,
     ) -> bool {
         let Some(lane) = self.lane_mut(track_id, lane_id) else {
             return false;
         };
-        let (enabled, mode) = match mode {
-            Some(mode) => (true, mode),
-            None => (false, lane.mode),
-        };
-        if lane.enabled == enabled && lane.mode == mode {
+        if lane.enabled == enabled {
             return false;
         }
         lane.enabled = enabled;
-        lane.mode = mode;
         let playhead = self.transport.playhead_beats;
-        self.recompute_effective_volumes(playhead, "lane_mode_set");
+        self.recompute_effective_volumes(playhead, "lane_enable_set");
         true
+    }
+
+    /// Whether the transport is recording automation right now: the arm is on
+    /// and playback runs. A control moved meanwhile is written, not overridden.
+    pub fn automation_writing(&self) -> bool {
+        self.automation_arm && self.transport.playing
+    }
+
+    /// The user moved a control by hand: every lane of `track_id` whose
+    /// target `matches` and that would play stops playing, and the control's
+    /// own value is heard until [`Self::reenable_automation`]. Nothing is
+    /// overridden while automation is being written — the recorder takes the
+    /// move instead. Returns whether a lane was newly overridden; the engine
+    /// then has to hear about it ([`Self::take_automation_override_change`]).
+    pub fn override_automation(
+        &mut self,
+        track_id: &str,
+        matches: impl Fn(&AutomationTarget) -> bool,
+    ) -> bool {
+        if self.automation_writing() {
+            return false;
+        }
+        let lanes = if track_id == MASTER_TRACK_ID {
+            &mut self.master.automation_lanes
+        } else {
+            match self.tracks.iter_mut().find(|t| t.id == track_id) {
+                Some(track) => &mut track.automation_lanes,
+                None => return false,
+            }
+        };
+        let mut overridden = false;
+        for lane in lanes.iter_mut() {
+            if lane.plays() && !lane.points.is_empty() && matches(&lane.target) {
+                lane.overridden = true;
+                overridden = true;
+            }
+        }
+        if overridden {
+            self.automation_override_changed = true;
+        }
+        overridden
+    }
+
+    /// Whether any lane anywhere is overridden: what lights Re-Enable
+    /// Automation.
+    pub fn has_overridden_automation(&self) -> bool {
+        self.tracks
+            .iter()
+            .flat_map(|t| t.automation_lanes.iter())
+            .chain(self.master.automation_lanes.iter())
+            .any(|lane| lane.overridden)
+    }
+
+    /// Re-Enable Automation: every overridden lane plays again. Returns
+    /// whether anything changed. Not an undo step — overriding is not one
+    /// either; both are about what plays, not what the project holds.
+    pub fn reenable_automation(&mut self) -> bool {
+        let mut changed = false;
+        for lane in self
+            .tracks
+            .iter_mut()
+            .flat_map(|t| t.automation_lanes.iter_mut())
+            .chain(self.master.automation_lanes.iter_mut())
+        {
+            if lane.overridden {
+                lane.overridden = false;
+                changed = true;
+            }
+        }
+        if changed {
+            self.automation_override_changed = true;
+            let playhead = self.transport.playhead_beats;
+            self.recompute_effective_volumes(playhead, "reenable_automation");
+        }
+        changed
+    }
+
+    /// Re-enable one lane. Returns whether it was overridden.
+    pub fn reenable_automation_lane(&mut self, track_id: &str, lane_id: &str) -> bool {
+        let Some(lane) = self.lane_mut(track_id, lane_id) else {
+            return false;
+        };
+        if !lane.overridden {
+            return false;
+        }
+        lane.overridden = false;
+        self.automation_override_changed = true;
+        let playhead = self.transport.playhead_beats;
+        self.recompute_effective_volumes(playhead, "reenable_automation_lane");
+        true
+    }
+
+    /// Whether an override or re-enable is waiting for the engine, without
+    /// taking it.
+    pub fn automation_override_pending(&self) -> bool {
+        self.automation_override_changed
+    }
+
+    /// Whether lanes were overridden or re-enabled since the last call: the
+    /// engine's copy of the lanes has to be resent.
+    pub fn take_automation_override_change(&mut self) -> bool {
+        std::mem::take(&mut self.automation_override_changed)
     }
 
     /// Hide a lane's sub-row (does not delete it). UI-only.
@@ -1919,10 +2027,23 @@ impl TimelineState {
     /// Replace a track's automation lanes wholesale. The undo/redo counterpart
     /// to [`Self::capture_automation_lanes`]; keeps the selected target valid
     /// and recomputes effective volumes so playback follows the restored curve.
-    pub fn set_track_automation_lanes(&mut self, track_id: &str, lanes: Vec<AutomationLaneState>) {
+    pub fn set_track_automation_lanes(
+        &mut self,
+        track_id: &str,
+        mut lanes: Vec<AutomationLaneState>,
+    ) {
         let Some((host_lanes, selected)) = self.automation_host_mut(track_id) else {
             return;
         };
+        // Overriding is about what plays now, not what the project holds, so
+        // undo and redo carry each lane's current override across instead of
+        // the one captured with the edit.
+        for lane in &mut lanes {
+            lane.overridden = host_lanes
+                .iter()
+                .find(|current| current.id == lane.id)
+                .is_some_and(|current| current.overridden);
+        }
         *host_lanes = lanes;
         // A restored lane set may no longer contain the selected target (undoing
         // the creation of the lane that was selected), so re-point it rather
@@ -2373,7 +2494,7 @@ mod mixer_target_tests {
         assert_eq!(state.tracks[0].sends[0].automated, None);
 
         state.lane_mut(&track_id, &lane).unwrap().recording = false;
-        state.set_automation_lane_mode(&track_id, &lane, None);
+        state.set_automation_lane_enabled(&track_id, &lane, false);
         state.recompute_effective_volumes(2.0, "playback_tick");
         assert_eq!(state.tracks[0].sends[0].display_gain_db(), 0.0);
     }
@@ -2481,11 +2602,11 @@ mod point_tool_tests {
             .collect();
         state.set_automation_selection(&track, &lane, &ids[..2]);
         assert_eq!(
-            state.selected_automation_curve(&track, &lane),
-            Some(AutomationCurve::Linear)
+            state.selected_automation_shape(&track, &lane),
+            Some(AutomationCurveShape::Linear)
         );
         assert_eq!(
-            state.set_selected_automation_curve(&track, &lane, AutomationCurve::Hold),
+            state.set_selected_automation_shape(&track, &lane, AutomationCurveShape::Hold),
             2
         );
         let curves: Vec<AutomationCurve> = state
@@ -2504,9 +2625,58 @@ mod point_tool_tests {
             ]
         );
         assert_eq!(
-            state.selected_automation_curve(&track, &lane),
-            Some(AutomationCurve::Hold)
+            state.selected_automation_shape(&track, &lane),
+            Some(AutomationCurveShape::Hold)
         );
+    }
+
+    /// A preset sets curve and tension together and is recognised again; a
+    /// segment bent by hand is no preset. Bending a Smooth segment keeps it
+    /// an S; bending a Hold one makes it a curved line.
+    #[test]
+    fn curve_presets_and_bending() {
+        let (mut state, track, lane) = lane_with_points(&[0.0, 4.0, 8.0]);
+        let ids: Vec<u64> = state
+            .automation_lane(&track, &lane)
+            .unwrap()
+            .points
+            .iter()
+            .map(|p| p.id)
+            .collect();
+        state.set_automation_selection(&track, &lane, &ids[..1]);
+        assert_eq!(
+            state.set_selected_automation_shape(&track, &lane, AutomationCurveShape::SharpS),
+            1
+        );
+        let first = &state.automation_lane(&track, &lane).unwrap().points[0];
+        assert_eq!(first.curve, AutomationCurve::Smooth);
+        assert!(first.tension > 0.0);
+        assert_eq!(
+            state.selected_automation_shape(&track, &lane),
+            Some(AutomationCurveShape::SharpS)
+        );
+
+        state.set_automation_segment_tension(&track, &lane, ids[0], -0.35);
+        let first = &state.automation_lane(&track, &lane).unwrap().points[0];
+        assert_eq!(first.curve, AutomationCurve::Smooth, "still an S");
+        assert_eq!(first.tension, -0.35);
+        assert_eq!(state.selected_automation_shape(&track, &lane), None);
+
+        state.set_automation_selection(&track, &lane, &ids[1..2]);
+        state.set_selected_automation_shape(&track, &lane, AutomationCurveShape::Hold);
+        state.set_automation_segment_tension(&track, &lane, ids[1], 0.5);
+        assert_eq!(
+            state.automation_lane(&track, &lane).unwrap().points[1].curve,
+            AutomationCurve::Linear
+        );
+        for shape in AutomationCurveShape::ALL {
+            assert_eq!(
+                AutomationCurveShape::from_command(shape.command()),
+                Some(shape)
+            );
+            let (curve, tension) = shape.curve_and_tension();
+            assert_eq!(AutomationCurveShape::of(curve, tension), Some(shape));
+        }
     }
 
     /// Paste lands the copied shape at the new beat, replacing what was there,

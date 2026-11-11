@@ -73,7 +73,7 @@ fn bridge_effect_track(block: f32) -> RuntimeTrack {
             kind_tag: crate::runtime::RuntimeInsertKind::ExternalBridge,
             enabled: true,
             bypass_lane: None,
-            automation_bypassed: false,
+            automation_bypass: None,
             params: Arc::new(params),
             bridge_is_effect: true,
             bridge_is_builtin: false,
@@ -96,6 +96,7 @@ fn bridge_effect_track(block: f32) -> RuntimeTrack {
         sends: Vec::new(),
         automation_lanes: Vec::new(),
         plugin_param_automation: Vec::new(),
+        automation_clock: Default::default(),
         meter: Arc::new(Default::default()),
         meter_peak_l: 0.0,
         meter_peak_r: 0.0,
@@ -211,11 +212,12 @@ impl PluginBridgeSink for ParamCaptureSink {
         0
     }
     fn push_midi(&self, _: u8, _: u8, _: u8, _: u32) {}
-    fn push_param(&self, param_id: u32, value: f32, _sample_offset: u32) {
+    fn push_param(&self, param_id: u32, value: f32, _sample_offset: u32) -> bool {
         self.last_param_id.store(param_id as u64, Ordering::Release);
         self.last_value_bits
             .store(value.to_bits() as u64, Ordering::Release);
         self.pushes.fetch_add(1, Ordering::Release);
+        true
     }
     fn write_input(&self, _: &[f32], _: &[f32], _: usize) {}
     fn request_block(&self, _: u32) {}
@@ -306,6 +308,72 @@ fn plugin_param_automation_dedupes_unchanged_value_and_is_idle_when_stopped() {
     };
     apply_track_chain_block(&mut track, 4, stopped);
     assert_eq!(sink.pushes.load(Ordering::Acquire), 1);
+}
+
+/// A value that could not be delivered (the insert was bypassed) is not
+/// recorded as sent: it goes out on the first block the insert runs again,
+/// instead of waiting for the lane to move.
+#[test]
+fn plugin_param_automation_resends_a_value_it_could_not_deliver() {
+    let mut track = bridge_effect_track(0.0);
+    track.automation_lanes = vec![plugin_param_lane("insert-1", "42")];
+    track.plugin_param_automation = vec![crate::runtime::RuntimePluginParamBinding {
+        insert_ix: 0,
+        lane_ix: 0,
+        param_id: 42,
+        last_value: f32::NAN,
+    }];
+    let sink = std::sync::Arc::new(ParamCaptureSink::default());
+    track.inserts[0].bridge_sink = Some(sink.clone());
+    let transport = RuntimeTransportContext {
+        playing: true,
+        ppq_position: 2.0,
+        ..RuntimeTransportContext::default()
+    };
+
+    track.inserts[0].enabled = false;
+    apply_track_chain_block(&mut track, 4, transport);
+    assert_eq!(
+        sink.pushes.load(Ordering::Acquire),
+        0,
+        "bypassed: nothing sent"
+    );
+
+    track.inserts[0].enabled = true;
+    apply_track_chain_block(&mut track, 4, transport);
+    assert_eq!(
+        sink.pushes.load(Ordering::Acquire),
+        1,
+        "the same value goes out once the insert runs"
+    );
+}
+
+/// Plug-in parameter lanes are read where the chain's audio is on the
+/// timeline: a chain fed audio 1 beat late reads its lane 1 beat back.
+#[test]
+fn plugin_param_automation_reads_at_the_chain_beat() {
+    let mut track = bridge_effect_track(0.0);
+    track.automation_lanes = vec![plugin_param_lane("insert-1", "42")];
+    track.plugin_param_automation = vec![crate::runtime::RuntimePluginParamBinding {
+        insert_ix: 0,
+        lane_ix: 0,
+        param_id: 42,
+        last_value: f32::NAN,
+    }];
+    let sink = std::sync::Arc::new(ParamCaptureSink::default());
+    track.inserts[0].bridge_sink = Some(sink.clone());
+    track.automation_clock.chain_lag_beats = 1.0;
+    let transport = RuntimeTransportContext {
+        playing: true,
+        ppq_position: 3.0,
+        ..RuntimeTransportContext::default()
+    };
+    apply_track_chain_block(&mut track, 4, transport);
+    let pushed = f32::from_bits(sink.last_value_bits.load(Ordering::Acquire) as u32);
+    assert!(
+        (pushed - 0.5).abs() < 1e-4,
+        "read at beat 2: pushed={pushed}"
+    );
 }
 
 #[test]
@@ -854,7 +922,7 @@ pub(super) fn bridge_effect_track_with_id(id: &str) -> RuntimeInsert {
         kind_tag: crate::runtime::RuntimeInsertKind::ExternalBridge,
         enabled: true,
         bypass_lane: None,
-        automation_bypassed: false,
+        automation_bypass: None,
         params: Arc::new(params),
         bridge_is_effect: true,
         bridge_is_builtin: false,
@@ -955,6 +1023,7 @@ fn serial_bridge_effect_chain_applies_both_gains() {
         sends: Vec::new(),
         automation_lanes: Vec::new(),
         plugin_param_automation: Vec::new(),
+        automation_clock: Default::default(),
         meter: Arc::new(Default::default()),
         meter_peak_l: 0.0,
         meter_peak_r: 0.0,
@@ -1107,6 +1176,7 @@ fn serial_bridge_effect_chain_bypasses_only_missed_middle_insert() {
         sends: Vec::new(),
         automation_lanes: Vec::new(),
         plugin_param_automation: Vec::new(),
+        automation_clock: Default::default(),
         meter: Arc::new(Default::default()),
         meter_peak_l: 0.0,
         meter_peak_r: 0.0,

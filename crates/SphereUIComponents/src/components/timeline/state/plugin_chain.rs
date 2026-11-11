@@ -1548,6 +1548,9 @@ impl TimelineState {
     }
 
     pub fn toggle_insert_bypass(&mut self, track_id: &str, insert_id: &str) -> Option<bool> {
+        self.override_automation(track_id, |target| {
+            matches!(target, AutomationTarget::InsertBypass { insert_id: id } if id == insert_id)
+        });
         let slot = self
             .insert_slots_mut(track_id)?
             .iter_mut()
@@ -1740,6 +1743,18 @@ impl TimelineState {
             return false;
         }
         param.value_normalized = value;
+        // A hand edit in Studio's parameter editor: its lane stops playing
+        // until Re-Enable Automation. A plug-in's own window does not report
+        // its edits here yet (host values are read when it loads), so moves
+        // made there neither override nor record.
+        let param_id = param_id.to_string();
+        self.override_automation(track_id, |target| {
+            matches!(
+                target,
+                AutomationTarget::PluginParameter { insert_id: id, parameter_id, .. }
+                    if id == insert_id && *parameter_id == param_id
+            )
+        });
         true
     }
 

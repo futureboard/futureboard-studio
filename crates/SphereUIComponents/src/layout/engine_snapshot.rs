@@ -964,7 +964,9 @@ fn build_engine_automation_lanes_from(
             }
             // A lane being recorded is held back: what is heard is the
             // control being moved, and what is written is what was heard.
-            && !lane.recording;
+            // So is one overridden by hand, until Re-Enable Automation.
+            && !lane.recording
+            && !lane.overridden;
 
             EngineAutomationLaneSnapshot {
                 id: lane.id.clone(),

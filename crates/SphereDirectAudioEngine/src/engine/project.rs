@@ -36,10 +36,21 @@ pub(super) fn project_structure_key(
         .iter_mut()
         .map(|clip| std::mem::replace(&mut clip.gain, 1.0))
         .collect();
+    // Nor are automation lanes (see `AudioEngine::apply_automation_changes`):
+    // a rebuild per point drag cut every sounding note and restarted every
+    // delay line, and starting or ending a recording pass did it too.
+    let lanes: Vec<_> = snapshot
+        .tracks
+        .iter_mut()
+        .map(|track| std::mem::take(&mut track.automation_lanes))
+        .collect();
     let value = serde_json::to_value(&*snapshot);
     snapshot.midi_clips = midi;
     for (track, parts) in snapshot.tracks.iter_mut().zip(parts) {
         track.soundfont_channels = parts;
+    }
+    for (track, lanes) in snapshot.tracks.iter_mut().zip(lanes) {
+        track.automation_lanes = lanes;
     }
     for (clip, gain) in snapshot.clips.iter_mut().zip(gains) {
         clip.gain = gain;
@@ -192,6 +203,52 @@ impl EngineInner {
         }
     }
 
+    /// Sends the running graph the automation of every track whose lanes
+    /// differ from the loaded project's.
+    ///
+    /// Lanes are left out of the structure key, so a point edit, an undo, or
+    /// a recording pass starting or ending never rebuilds the graph: the
+    /// lanes are resolved against the track here, on the control thread, and
+    /// the callback only swaps them in. The mirror takes its own copy so a
+    /// stream opened later plays them too.
+    pub(super) fn apply_automation_changes(&self, snapshot: &EngineProjectSnapshot) {
+        let changed: Vec<usize> = {
+            let project = self.project.lock();
+            let Some(project) = project.as_ref() else {
+                return;
+            };
+            snapshot
+                .tracks
+                .iter()
+                .enumerate()
+                .filter(|(_, track)| {
+                    project
+                        .tracks
+                        .iter()
+                        .find(|t| t.id == track.id)
+                        .is_some_and(|previous| previous.automation_lanes != track.automation_lanes)
+                })
+                .map(|(index, _)| index)
+                .collect()
+        };
+        for track_index in changed {
+            let lanes = &snapshot.tracks[track_index].automation_lanes;
+            let change = {
+                let mut mirror = self.runtime.lock();
+                let Some(track) = mirror.tracks.get(track_index) else {
+                    continue;
+                };
+                let change =
+                    crate::runtime::TrackAutomationChange::prepare(track_index, track, lanes);
+                let mut own =
+                    crate::runtime::TrackAutomationChange::prepare(track_index, track, lanes);
+                mirror.install_track_automation(&mut own);
+                change
+            };
+            let _ = self.send_command(EngineCommand::SetTrackAutomation(Box::new(change)));
+        }
+    }
+
     pub fn load_project(&self, snapshot: EngineProjectSnapshot) -> Result<(), SphereAudioError> {
         let insert_param_revision = self.insert_param_revision();
         self.load_project_as_of(snapshot, insert_param_revision)
@@ -228,6 +285,7 @@ impl EngineInner {
                 .store(old_state as u8, Ordering::Relaxed);
             self.apply_soundfont_channel_changes(&snapshot);
             self.apply_clip_gain_changes(&snapshot);
+            self.apply_automation_changes(&snapshot);
             return self.replace_midi_schedule(snapshot);
         }
         // A full build from here on; until it lands, nothing matches.

@@ -180,6 +180,14 @@ pub(super) fn render_project_block_interleaved_core(
     }
     runtime.refresh_runtime_latency_graph(runtime.bridge_period_frames);
     let block_beat = sample_to_beat(runtime, base_sample);
+    stamp_automation_clocks(
+        runtime,
+        base_sample,
+        frames,
+        loop_bounds,
+        block_beat,
+        transport_active,
+    );
     // Real transport ProcessContext for every plugin processed this block —
     // tempo from the map at this position, time signature from the engine,
     // project position from the playhead, playing = transport state. Replaces
@@ -353,8 +361,20 @@ pub(super) fn render_project_block_interleaved_core(
 
     let master_index = runtime.audio_graph.master_index;
     // A Master Volume lane that has something to say overrides the master
-    // fader, the way a track's Volume lane overrides its own.
-    let master_volume = master_automation_volume(&runtime.tracks, master_index, block_beat)
+    // fader, the way a track's Volume lane overrides its own. Read where the
+    // master's audio is on the timeline, at the block's end: the gain ramps
+    // to it across the block.
+    let master_volume_beat = master_index
+        .and_then(|ix| runtime.tracks.get(ix))
+        .map(|master| {
+            if runtime.fader_smoothing {
+                master.automation_clock.fader_end_beat(block_beat)
+            } else {
+                master.automation_clock.fader_beat(block_beat)
+            }
+        })
+        .unwrap_or(block_beat);
+    let master_volume = master_automation_volume(&runtime.tracks, master_index, master_volume_beat)
         .unwrap_or(master_volume);
 
     for clip_index in 0..runtime.clips.len() {
@@ -914,4 +934,82 @@ pub(super) fn render_project_block_interleaved_core(
     }
 
     frames as u64
+}
+
+/// Stamp every track's [`crate::runtime::RuntimeAutomationClock`] for this block: where on the
+/// timeline the audio at each automation stage came from, and where the block
+/// ends. Arithmetic and tempo-map lookups only, and none at all for a track
+/// without lanes.
+///
+/// A source's audio reaches its fader `track_output_latency` samples after it
+/// left the timeline; a bus's chain is fed audio its sources already delayed
+/// (`output - block` latency); the master's chain is fed the aligned mix
+/// (`max_path_latency_samples` with compensation on) and its fader sits after
+/// its own inserts. Stopped, every stage reads at the playhead.
+pub(super) fn stamp_automation_clocks(
+    runtime: &mut RuntimeProject,
+    base_sample: u64,
+    frames: usize,
+    loop_bounds: Option<crate::transport::LoopBounds>,
+    block_beat: f64,
+    playing: bool,
+) {
+    let RuntimeProject {
+        tracks,
+        tempo_map,
+        latency_graph,
+        audio_graph,
+        sample_rate,
+        pdc_enabled,
+        ..
+    } = runtime;
+    let sample_rate = (*sample_rate).max(1) as f64;
+    let block_end_beats = if playing {
+        let (end_sample, _) =
+            crate::transport::advance_loop_position(base_sample, frames as u64, loop_bounds);
+        tempo_map.beat_at_samples(end_sample, sample_rate) - block_beat
+    } else {
+        0.0
+    };
+    let lag_beats = |lag: u32| {
+        if lag == 0 {
+            0.0
+        } else {
+            let earlier = base_sample.saturating_sub(u64::from(lag));
+            block_beat - tempo_map.beat_at_samples(earlier, sample_rate)
+        }
+    };
+    for (idx, track) in tracks.iter_mut().enumerate() {
+        if track.automation_lanes.is_empty() {
+            track.automation_clock = crate::runtime::RuntimeAutomationClock::default();
+            continue;
+        }
+        let (fader_lag, chain_lag) = if !playing {
+            (0, 0)
+        } else if audio_graph.master_index == Some(idx) {
+            let mix = if *pdc_enabled {
+                latency_graph.max_path_latency_samples
+            } else {
+                0
+            };
+            (mix.saturating_add(latency_graph.master_plugin_latency), mix)
+        } else {
+            let output = latency_graph
+                .track_output_latency
+                .get(idx)
+                .copied()
+                .unwrap_or(0);
+            let block = latency_graph
+                .track_block_latency
+                .get(idx)
+                .copied()
+                .unwrap_or(0);
+            (output, output.saturating_sub(block))
+        };
+        track.automation_clock = crate::runtime::RuntimeAutomationClock {
+            fader_lag_beats: lag_beats(fader_lag),
+            chain_lag_beats: lag_beats(chain_lag),
+            block_end_beats,
+        };
+    }
 }

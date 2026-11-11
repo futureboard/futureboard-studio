@@ -36,6 +36,7 @@ fn track(id: &str, ty: &str, sends: Vec<RuntimeSend>) -> RuntimeTrack {
         sends,
         automation_lanes: Vec::new(),
         plugin_param_automation: Vec::new(),
+        automation_clock: Default::default(),
         meter: Arc::new(Default::default()),
         meter_peak_l: 0.0,
         meter_peak_r: 0.0,
@@ -149,6 +150,15 @@ fn send_and_bypass_automation_override_the_controls() {
         src.inserts[0].active(),
         "its own switch stands while stopped"
     );
+
+    // The lane owns the switch both ways: an insert switched off by hand
+    // runs while its lane says on.
+    src.inserts[0].enabled = false;
+    src.automation_lanes[2].points[0].value = 0.0;
+    render::apply_insert_bypass_automation(&mut src, Some(4.0));
+    assert!(src.inserts[0].active(), "switched on by its lane");
+    render::apply_insert_bypass_automation(&mut src, None);
+    assert!(!src.inserts[0].active(), "off again by hand once stopped");
 
     // A disabled (Off) lane says nothing: the send's own values stand.
     for lane in &mut src.automation_lanes {

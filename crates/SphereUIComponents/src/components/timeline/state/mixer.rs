@@ -63,7 +63,11 @@ impl TimelineState {
     }
 
     pub fn set_master_volume(&mut self, norm: f32) {
-        self.master.volume = norm.clamp(0.0, 1.0);
+        let v = norm.clamp(0.0, 1.0);
+        if (self.master.volume - v).abs() > 1.0e-5 {
+            self.override_automation(MASTER_TRACK_ID, is_volume);
+        }
+        self.master.volume = v;
     }
 
     /// Set the Control Room level. Unlike the master fader this needs no
@@ -237,6 +241,9 @@ impl TimelineState {
 
     pub fn set_master_volume_preview(&mut self, norm: f32) -> bool {
         let v = norm.clamp(0.0, 1.0);
+        if (self.master.volume - v).abs() > 1.0e-5 {
+            self.override_automation(MASTER_TRACK_ID, is_volume);
+        }
         let changed = self
             .master_volume_preview
             .map(|prev| (prev - v).abs() > 1.0e-5)
@@ -276,6 +283,16 @@ impl TimelineState {
 
     pub fn set_track_volume_preview(&mut self, track_id: &str, norm: f32) -> bool {
         let v = norm.clamp(0.0, 1.0);
+        // Grabbing a fader is not moving it: only a value away from the base
+        // overrides the lane.
+        if self
+            .tracks
+            .iter()
+            .find(|t| t.id == track_id)
+            .is_some_and(|t| (t.volume - v).abs() > 1.0e-5)
+        {
+            self.override_automation(track_id, is_volume);
+        }
         let changed = self
             .track_volume_previews
             .get(track_id)
@@ -329,6 +346,14 @@ impl TimelineState {
     /// track the fader. When automation read is on with an active lane, base is
     /// updated underneath but effective stays automation-driven (DAW behavior).
     pub fn set_track_volume(&mut self, track_id: &str, norm: f32) {
+        if self
+            .tracks
+            .iter()
+            .find(|t| t.id == track_id)
+            .is_some_and(|t| (t.volume - norm.clamp(0.0, 1.0)).abs() > 1.0e-5)
+        {
+            self.override_automation(track_id, is_volume);
+        }
         if let Some(t) = self.tracks.iter_mut().find(|t| t.id == track_id) {
             let v = norm.clamp(0.0, 1.0);
             t.volume = v;
@@ -389,7 +414,7 @@ impl TimelineState {
                 .automation_lanes
                 .iter()
                 .find(|l| {
-                    l.enabled
+                    l.plays()
                         && matches!(l.target, AutomationTarget::TrackVolume)
                         && !l.points.is_empty()
                 })
@@ -435,7 +460,7 @@ impl TimelineState {
                 track
                     .automation_lanes
                     .iter()
-                    .find(|l| l.enabled && !l.recording && !l.points.is_empty() && want(&l.target))
+                    .find(|l| l.plays() && !l.points.is_empty() && want(&l.target))
                     .map(|l| evaluate_automation(&l.points, beat as f64, l.target.default_value()))
             };
             let mut shown = Vec::with_capacity(track.sends.len());
@@ -465,6 +490,14 @@ impl TimelineState {
     }
 
     pub fn set_track_pan(&mut self, track_id: &str, pan: f32) {
+        if self
+            .tracks
+            .iter()
+            .find(|t| t.id == track_id)
+            .is_some_and(|t| (t.pan - pan.clamp(-1.0, 1.0)).abs() > 1.0e-5)
+        {
+            self.override_automation(track_id, is_pan);
+        }
         if let Some(t) = self.tracks.iter_mut().find(|t| t.id == track_id) {
             t.pan = pan.clamp(-1.0, 1.0);
         }
@@ -494,6 +527,7 @@ impl TimelineState {
             return false;
         }
         track.pan = next;
+        self.override_automation(track_id, is_pan);
         true
     }
 
@@ -508,6 +542,7 @@ impl TimelineState {
     }
 
     pub fn toggle_track_mute(&mut self, track_id: &str) -> bool {
+        self.override_automation(track_id, is_mute);
         if let Some(t) = self.tracks.iter_mut().find(|t| t.id == track_id) {
             t.muted = !t.muted;
             return true;
@@ -520,6 +555,7 @@ impl TimelineState {
         if let Some(t) = self.tracks.iter_mut().find(|t| t.id == track_id) {
             if t.muted != muted {
                 t.muted = muted;
+                self.override_automation(track_id, is_mute);
                 return true;
             }
         }
@@ -856,4 +892,17 @@ mod listen_state_tests {
             DirectAudio::monitor::ListenMode::Afl
         );
     }
+}
+
+/// Lane targets a manual move of each control overrides.
+fn is_volume(target: &AutomationTarget) -> bool {
+    matches!(target, AutomationTarget::TrackVolume)
+}
+
+fn is_pan(target: &AutomationTarget) -> bool {
+    matches!(target, AutomationTarget::TrackPan)
+}
+
+fn is_mute(target: &AutomationTarget) -> bool {
+    matches!(target, AutomationTarget::TrackMute)
 }

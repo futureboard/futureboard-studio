@@ -1864,8 +1864,10 @@ fn fader_area(
 ) -> impl IntoElement {
     let display_vol = track.display_volume();
     let db_str = volume::format_db(display_vol);
-    let has_volume_automation = track.has_active_volume_automation();
-    let automation_reading = has_volume_automation && track.volume_automation_read;
+    // The "A" shows while the track has a Volume curve: lit while it plays,
+    // grey once the fader was moved by hand (overridden) or read is off.
+    let has_volume_automation = track.has_volume_automation();
+    let automation_reading = track.has_active_volume_automation() && track.volume_automation_read;
     let track_id = track.id.clone();
     let start_cb = callbacks.on_volume_drag_start.clone();
     let start_id = track_id.clone();

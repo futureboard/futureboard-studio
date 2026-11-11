@@ -1309,22 +1309,32 @@ impl Render for Timeline {
                     // Each is one undo step on the track's lanes.
                     AutomationLaneAction::ToggleEnable => {
                         let prev = this.state.capture_automation_lanes(&track_id);
+                        let enabled = this
+                            .state
+                            .automation_lane(&track_id, &lane_id)
+                            .is_some_and(|lane| lane.enabled);
                         if this
                             .state
-                            .cycle_automation_lane_mode(&track_id, &lane_id)
-                            .is_some()
+                            .set_automation_lane_enabled(&track_id, &lane_id, !enabled)
                         {
                             this.record_automation_lanes_edit(&track_id, prev, cx);
                             cx.notify();
                         }
                     }
-                    AutomationLaneAction::SetMode(mode) => {
+                    AutomationLaneAction::SetEnabled(enabled) => {
                         let prev = this.state.capture_automation_lanes(&track_id);
                         if this
                             .state
-                            .set_automation_lane_mode(&track_id, &lane_id, mode)
+                            .set_automation_lane_enabled(&track_id, &lane_id, enabled)
                         {
                             this.record_automation_lanes_edit(&track_id, prev, cx);
+                            cx.notify();
+                        }
+                    }
+                    // Not an undo step: overriding is not one either. The
+                    // layout resends the lanes to the engine.
+                    AutomationLaneAction::ReEnable => {
+                        if this.state.reenable_automation_lane(&track_id, &lane_id) {
                             cx.notify();
                         }
                     }

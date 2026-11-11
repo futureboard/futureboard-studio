@@ -1795,10 +1795,10 @@ impl StudioLayout {
                 lane_id,
                 beat,
             } => {
-                use crate::components::timeline::timeline_state::AutomationCurve;
+                use crate::components::timeline::timeline_state::AutomationCurveShape;
                 let state = &self.timeline.read(cx).state;
                 let selected = state.selected_automation_point_ids(track_id, lane_id).len();
-                let curve = state.selected_automation_curve(track_id, lane_id);
+                let shape = state.selected_automation_shape(track_id, lane_id);
                 let item = |label: &str, command: &str, enabled: bool| {
                     if enabled {
                         ContextMenuEntry::item(label, command)
@@ -1806,22 +1806,21 @@ impl StudioLayout {
                         ContextMenuEntry::disabled_item(label, command)
                     }
                 };
-                let curve_item = |label: &str, command: &str, shape: AutomationCurve| {
+                // Each shape is a starting point: Alt-drag a segment to bend
+                // it further. A segment bent by hand checks none of them.
+                let mut entries = vec![ContextMenuEntry::Header("Curve".to_string())];
+                entries.extend(AutomationCurveShape::ALL.into_iter().map(|each| {
                     if selected == 0 {
-                        ContextMenuEntry::disabled_item(label, command)
+                        ContextMenuEntry::disabled_item(each.label(), each.command())
                     } else {
-                        ContextMenuEntry::checked_item(label, command, curve == Some(shape))
+                        ContextMenuEntry::checked_item(
+                            each.label(),
+                            each.command(),
+                            shape == Some(each),
+                        )
                     }
-                };
-                vec![
-                    ContextMenuEntry::Header("Curve".to_string()),
-                    curve_item("Linear", "automation:curve:linear", AutomationCurve::Linear),
-                    curve_item(
-                        "Hold (step)",
-                        "automation:curve:hold",
-                        AutomationCurve::Hold,
-                    ),
-                    curve_item("Smooth", "automation:curve:smooth", AutomationCurve::Smooth),
+                }));
+                entries.extend([
                     ContextMenuEntry::Separator,
                     item("Copy Points", "automation:copy", selected > 0),
                     item("Cut Points", "automation:cut", selected > 0),
@@ -1839,10 +1838,16 @@ impl StudioLayout {
                     ContextMenuEntry::item("Select All Points", "automation:select-all-points"),
                     ContextMenuEntry::item("Clear Selection", "automation:clear-selection"),
                     ContextMenuEntry::item("Cycle Automation Target", "automation:cycle-target"),
+                    item(
+                        "Re-Enable Automation",
+                        "automation:re-enable",
+                        state.has_overridden_automation(),
+                    ),
                     ContextMenuEntry::Separator,
                     ContextMenuEntry::item(i18n.tr("context.zoom-in"), "view:zoom-in"),
                     ContextMenuEntry::item(i18n.tr("context.zoom-out"), "view:zoom-out"),
-                ]
+                ]);
+                entries
             }
             ContextTarget::Browser(path_opt) => {
                 let mut entries = Vec::new();

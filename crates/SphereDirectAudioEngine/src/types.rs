@@ -645,7 +645,7 @@ pub struct EngineSendSnapshot {
     pub wdw: bool,
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineAutomationTargetSnapshot {
     /// Matches the native UI AutomationTarget tag:
@@ -661,7 +661,7 @@ pub struct EngineAutomationTargetSnapshot {
     pub send_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineAutomationPointSnapshot {
     pub beat: f64,
@@ -678,7 +678,7 @@ pub struct EngineAutomationPointSnapshot {
     pub tension: f32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineAutomationLaneSnapshot {
     pub id: String,

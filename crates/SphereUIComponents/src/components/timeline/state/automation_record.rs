@@ -1,20 +1,24 @@
-//! Write, Touch and Latch: recording a control's movement into its lane
-//! while the transport plays.
+//! Automation recording: with the Automation Arm on and the transport
+//! playing, moving a control writes its lane.
 //!
 //! Driven from the playback tick (UI thread, display rate), not the audio
 //! thread. Each tick reads the control's own value — the base value the user
 //! moves, never the automated one the fader displays — and, while a lane is
 //! writing, replaces its points from where writing reached to the playhead.
 //!
-//! A touch is the control changing. Studio's controls (faders, pans, sends,
-//! switches, plug-in editors) do not all report a held gesture, so a control
-//! counts as touched while it moves and is released after
-//! [`TOUCH_RELEASE_SECONDS`] of standing still. That covers every control the
-//! same way, a plug-in's own editor included.
+//! Writing is touch-style: it starts when the control is grabbed and stops
+//! when it is let go, and the lane plays again from there. Studio's controls
+//! (faders, pans, sends, switches, Studio's parameter editor) do not all
+//! report a held gesture, so a control counts as touched while it moves and is
+//! released after [`TOUCH_RELEASE_SECONDS`] of standing still. A plug-in's own
+//! window does not report its edits to Studio yet, so it records nothing. An
+//! untouched lane
+//! is never written, and a disarmed transport writes nothing at all.
 //!
 //! While a lane writes it is marked `recording`, and the engine snapshot
 //! leaves it out: what is heard is the moving control, and what is written is
-//! what was heard. The whole run is one undo step per track.
+//! what was heard. Writing a lane that was overridden by hand puts it back in
+//! play. The whole run is one undo step per track.
 
 use std::collections::HashMap;
 
@@ -34,6 +38,8 @@ const PUNCH_GAP_BEATS: f32 = 1.0e-3;
 
 #[derive(Debug, Clone)]
 struct LanePass {
+    track_id: String,
+    lane_id: String,
     /// The control's value last tick.
     last_value: f32,
     /// When the control last changed, in seconds on the caller's clock.
@@ -53,10 +59,16 @@ struct LanePass {
 /// ticks; [`AutomationRecorder::finish`] ends the run.
 #[derive(Debug, Default)]
 pub struct AutomationRecorder {
-    passes: HashMap<(String, String), LanePass>,
+    /// Keyed by `(track index or master, lane index)`, so a tick looks a pass
+    /// up without allocating. A pass carries its lane's ids too: a key whose
+    /// lane moved (a track added or removed mid-run) starts a fresh pass.
+    passes: HashMap<(Option<usize>, usize), LanePass>,
     /// Each track's lanes from before the run first wrote to it: one undo
     /// step per track for the whole run.
     before: HashMap<String, Vec<AutomationLaneState>>,
+    /// This tick's lanes and control values, as `(track index or master,
+    /// lane index, value)`. Kept between ticks so a tick does not allocate.
+    work: Vec<(Option<usize>, usize, f32)>,
 }
 
 /// What one tick did.
@@ -84,13 +96,25 @@ impl AutomationRecorder {
         beat: f32,
     ) -> (Vec<(String, Vec<AutomationLaneState>)>, bool) {
         let mut engine_changed = false;
-        for ((track_id, lane_id), pass) in self.passes.drain() {
-            let Some(lane) = state.lane_mut(&track_id, &lane_id) else {
+        for (_, pass) in self.passes.drain() {
+            let Some(lane) = state.lane_mut(&pass.track_id, &pass.lane_id) else {
                 continue;
             };
             if pass.writing {
                 write_value(lane, beat, pass.last_value);
             }
+            if lane.recording {
+                lane.recording = false;
+                engine_changed = true;
+            }
+        }
+        // Backstop: no lane outlives the run marked as being recorded.
+        for lane in state
+            .tracks
+            .iter_mut()
+            .flat_map(|t| t.automation_lanes.iter_mut())
+            .chain(state.master.automation_lanes.iter_mut())
+        {
             if lane.recording {
                 lane.recording = false;
                 engine_changed = true;
@@ -168,7 +192,8 @@ impl TimelineState {
     }
 
     /// One playback tick of recording at `beat`, `now` seconds on any
-    /// monotonic clock. Call only while the transport plays.
+    /// monotonic clock. Call only while the transport plays; does nothing
+    /// unless the Automation Arm is on.
     pub fn automation_record_tick(
         &mut self,
         recorder: &mut AutomationRecorder,
@@ -176,54 +201,82 @@ impl TimelineState {
         now: f64,
     ) -> RecordTick {
         let mut tick = RecordTick::default();
-        // Which lanes record, and what their controls read, before anything
-        // is borrowed mutably.
-        let mut work = Vec::new();
-        for track in &self.tracks {
-            for lane in &track.automation_lanes {
-                if !lane.enabled || !lane.mode.records() {
+        if !self.automation_arm {
+            return tick;
+        }
+        // Which lanes can record, and what their controls read, before
+        // anything is borrowed mutably. Indices, not ids: nothing changes the
+        // track or lane lists during a tick.
+        let mut work = std::mem::take(&mut recorder.work);
+        work.clear();
+        for (track_ix, track) in self.tracks.iter().enumerate() {
+            for (lane_ix, lane) in track.automation_lanes.iter().enumerate() {
+                if !lane.enabled {
                     continue;
                 }
-                let Some(value) = Self::automation_control_value(track, &lane.target) else {
-                    continue;
+                if let Some(value) = Self::automation_control_value(track, &lane.target) {
+                    // A fader mid-drag holds its value in the preview until
+                    // the drag commits; that is what is being heard.
+                    let value = match (&lane.target, self.track_volume_previews.get(&track.id)) {
+                        (AutomationTarget::TrackVolume, Some(preview)) => *preview,
+                        _ => value,
+                    };
+                    work.push((Some(track_ix), lane_ix, value));
+                }
+            }
+        }
+        for (lane_ix, lane) in self.master.automation_lanes.iter().enumerate() {
+            if !lane.enabled {
+                continue;
+            }
+            if let Some(value) = self.master_automation_control_value(&lane.target) {
+                let value = match (&lane.target, self.master_volume_preview) {
+                    (AutomationTarget::TrackVolume, Some(preview)) => preview,
+                    _ => value,
                 };
-                work.push((track.id.clone(), lane.id.clone(), lane.mode, value));
+                work.push((None, lane_ix, value));
             }
         }
-        for lane in &self.master.automation_lanes {
-            if !lane.enabled || !lane.mode.records() {
-                continue;
-            }
-            let Some(value) = self.master_automation_control_value(&lane.target) else {
-                continue;
+        // Passes whose key now names another lane (a track moved or went away
+        // mid-run). Rare, so this only allocates when it happens.
+        let mut retired: Vec<LanePass> = Vec::new();
+        for &(track_ix, lane_ix, value) in &work {
+            let lanes = match track_ix {
+                Some(ix) => &self.tracks[ix].automation_lanes,
+                None => &self.master.automation_lanes,
             };
-            work.push((
-                MASTER_TRACK_ID.to_string(),
-                lane.id.clone(),
-                lane.mode,
-                value,
-            ));
-        }
-        for (track_id, lane_id, mode, value) in work {
-            // Taken only until the run first writes to the track: its undo step
-            // has to put the lanes back as they were before any of it.
-            let lanes_now = (!recorder.before.contains_key(&track_id))
-                .then(|| self.capture_automation_lanes(&track_id));
-            let Some(lane) = self.lane_mut(&track_id, &lane_id) else {
-                continue;
+            let lane = &lanes[lane_ix];
+            let track_id = match track_ix {
+                Some(ix) => self.tracks[ix].id.as_str(),
+                None => MASTER_TRACK_ID,
             };
-            let default = lane.target.default_value();
-            let pass = recorder
+            let key = (track_ix, lane_ix);
+            let known = recorder
                 .passes
-                .entry((track_id.clone(), lane_id.clone()))
-                .or_insert_with(|| LanePass {
-                    last_value: value,
-                    last_change: f64::NEG_INFINITY,
-                    writing: false,
-                    written_to: beat,
-                    last_point: None,
-                    original: lane.points.clone(),
-                });
+                .get(&key)
+                .is_some_and(|pass| pass.lane_id == lane.id && pass.track_id == track_id);
+            // The first tick of a run only learns where each control stands.
+            let Some(pass) = recorder.passes.get_mut(&key).filter(|_| known) else {
+                if let Some(stale) = recorder.passes.remove(&key) {
+                    if stale.writing {
+                        retired.push(stale);
+                    }
+                }
+                recorder.passes.insert(
+                    key,
+                    LanePass {
+                        track_id: track_id.to_string(),
+                        lane_id: lane.id.clone(),
+                        last_value: value,
+                        last_change: f64::NEG_INFINITY,
+                        writing: false,
+                        written_to: beat,
+                        last_point: None,
+                        original: lane.points.clone(),
+                    },
+                );
+                continue;
+            };
             let changed = (value - pass.last_value).abs() > VALUE_EPS;
             if changed {
                 pass.last_change = now;
@@ -235,15 +288,27 @@ impl TimelineState {
                 pass.last_point = None;
             }
             let held = now - pass.last_change < TOUCH_RELEASE_SECONDS;
-            let should_write = match mode {
-                AutomationMode::Write => true,
-                AutomationMode::Latch => pass.writing || changed,
-                AutomationMode::Touch => changed || (pass.writing && held),
-                AutomationMode::Read => false,
+            let should_write = changed || (pass.writing && held);
+            if !should_write && !pass.writing {
+                pass.last_value = value;
+                continue;
+            }
+            let track_id = pass.track_id.clone();
+            // Taken only when the run first writes to the track: its undo step
+            // has to put the lanes back as they were before any of it.
+            let lanes_now =
+                (should_write && !pass.writing && !recorder.before.contains_key(&track_id))
+                    .then(|| self.capture_automation_lanes(&track_id));
+            let lane = match track_ix {
+                Some(ix) => &mut self.tracks[ix].automation_lanes[lane_ix],
+                None => &mut self.master.automation_lanes[lane_ix],
             };
+            let default = lane.target.default_value();
 
             if should_write && !pass.writing {
                 // Punch in: the lane's own value up to here, then the control.
+                // Writing a lane puts an overridden one back in play.
+                lane.overridden = false;
                 if let Some(lanes_now) = lanes_now {
                     recorder.before.entry(track_id.clone()).or_insert(lanes_now);
                 }
@@ -307,6 +372,18 @@ impl TimelineState {
             }
             pass.last_value = value;
         }
+        recorder.work = work;
+        // A retired pass that was writing closes where its lane now is: its
+        // last value is kept and the lane plays again, instead of staying held
+        // back from the engine for the rest of the session.
+        for pass in retired {
+            if let Some(lane) = self.lane_mut(&pass.track_id, &pass.lane_id) {
+                write_value(lane, beat, pass.last_value);
+                lane.recording = false;
+                tick.engine_changed = true;
+                tick.wrote = true;
+            }
+        }
         if tick.wrote {
             self.recompute_effective_volumes(beat, "automation_record");
         }
@@ -318,14 +395,17 @@ impl TimelineState {
 mod tests {
     use super::*;
 
-    fn track_with_lane(mode: AutomationMode) -> (TimelineState, String, String) {
+    /// A track with a Volume lane, the Automation Arm on and the transport
+    /// rolling.
+    fn armed_track_with_lane() -> (TimelineState, String, String) {
         let mut state = TimelineState::default();
         state.tracks.clear();
         let track = state.create_audio_track();
         let lane = state
             .ensure_automation_lane(&track, AutomationTarget::TrackVolume)
             .unwrap();
-        state.lane_mut(&track, &lane).unwrap().mode = mode;
+        state.automation_arm = true;
+        state.transport.playing = true;
         (state, track, lane)
     }
 
@@ -350,24 +430,24 @@ mod tests {
 
     /// The master's Volume records like a track's, from its own fader.
     #[test]
-    fn master_volume_records_in_write() {
+    fn master_volume_records_when_armed() {
         let mut state = TimelineState::default();
         state.tracks.clear();
         let lane = state
             .ensure_automation_lane(MASTER_TRACK_ID, AutomationTarget::TrackVolume)
             .unwrap();
-        state.lane_mut(MASTER_TRACK_ID, &lane).unwrap().mode = AutomationMode::Write;
+        state.automation_arm = true;
+        state.transport.playing = true;
         let mut recorder = AutomationRecorder::default();
         state.master.volume = 0.4;
         let first = state.automation_record_tick(&mut recorder, 0.0, 0.0);
-        assert!(first.wrote);
+        assert!(!first.wrote, "the first tick only learns where it stands");
         state.master.volume = 0.9;
-        state.automation_record_tick(&mut recorder, 2.0, 0.2);
+        assert!(state.automation_record_tick(&mut recorder, 2.0, 0.2).wrote);
         let (before, _) = recorder.finish(&mut state, 3.0);
         assert_eq!(before.len(), 1);
         assert_eq!(before[0].0, MASTER_TRACK_ID);
         let recorded = points(&state, MASTER_TRACK_ID, &lane);
-        assert!(recorded.iter().any(|&(_, v)| (v - 0.4).abs() < 1.0e-4));
         assert_eq!(recorded.last().map(|&(_, v)| v), Some(0.9));
         assert!(
             !state
@@ -377,32 +457,12 @@ mod tests {
         );
     }
 
-    /// Write records from the first tick, holds the lane back from the engine
-    /// while it does, and ends on the control's value when the run finishes.
+    /// Armed, a moved control writes its lane, holds it back from the engine
+    /// while it does, and hands back to the lane once let go: the curve
+    /// after the release is the old one.
     #[test]
-    fn write_records_the_whole_run() {
-        let (mut state, track, lane) = track_with_lane(AutomationMode::Write);
-        let mut recorder = AutomationRecorder::default();
-        set_volume(&mut state, &track, 0.5);
-        let first = state.automation_record_tick(&mut recorder, 0.0, 0.0);
-        assert!(first.engine_changed && first.wrote);
-        assert!(state.automation_lane(&track, &lane).unwrap().recording);
-        state.automation_record_tick(&mut recorder, 1.0, 0.1);
-        set_volume(&mut state, &track, 0.8);
-        state.automation_record_tick(&mut recorder, 2.0, 0.2);
-        let (undo, engine) = recorder.finish(&mut state, 3.0);
-        assert!(engine && undo.len() == 1 && recorder.is_idle());
-        let recorded = points(&state, &track, &lane);
-        assert!((recorded.last().unwrap().1 - 0.8).abs() < 1e-6);
-        assert!(recorded.iter().any(|(_, v)| (v - 0.5).abs() < 1e-6));
-        assert!(!state.automation_lane(&track, &lane).unwrap().recording);
-    }
-
-    /// Touch records only while the control moves, then hands back to the
-    /// lane: the curve after the release is the old one.
-    #[test]
-    fn touch_hands_back_to_the_lane_when_let_go() {
-        let (mut state, track, lane) = track_with_lane(AutomationMode::Touch);
+    fn a_touch_writes_then_hands_back_to_the_lane() {
+        let (mut state, track, lane) = armed_track_with_lane();
         for (beat, value) in [(0.0, 0.2), (16.0, 0.2)] {
             state.add_automation_point(&track, &lane, beat, value);
         }
@@ -411,7 +471,9 @@ mod tests {
         let idle = state.automation_record_tick(&mut recorder, 1.0, 0.0);
         assert!(!idle.wrote, "an untouched control records nothing");
         set_volume(&mut state, &track, 0.9);
-        assert!(state.automation_record_tick(&mut recorder, 2.0, 0.1).wrote);
+        let grab = state.automation_record_tick(&mut recorder, 2.0, 0.1);
+        assert!(grab.wrote && grab.engine_changed);
+        assert!(state.automation_lane(&track, &lane).unwrap().recording);
         state.automation_record_tick(&mut recorder, 3.0, 0.3);
         // Still for longer than the release time: back to the lane.
         let released = state.automation_record_tick(&mut recorder, 5.0, 1.0);
@@ -425,37 +487,16 @@ mod tests {
             (during - 0.9).abs() < 1e-4,
             "the touch was recorded: {during}"
         );
+        let (undo, _) = recorder.finish(&mut state, 9.0);
+        assert_eq!(undo.len(), 1, "one undo step for the run");
+        assert!(recorder.is_idle());
     }
 
-    /// Latch keeps writing the last value after the control stops moving.
+    /// Disarmed, nothing is written however the control moves.
     #[test]
-    fn latch_keeps_writing_after_the_control_stops() {
-        let (mut state, track, lane) = track_with_lane(AutomationMode::Latch);
-        set_volume(&mut state, &track, 0.3);
-        let mut recorder = AutomationRecorder::default();
-        state.automation_record_tick(&mut recorder, 0.0, 0.0);
-        set_volume(&mut state, &track, 0.6);
-        state.automation_record_tick(&mut recorder, 1.0, 0.1);
-        state.automation_record_tick(&mut recorder, 6.0, 5.0);
-        assert!(
-            state.automation_lane(&track, &lane).unwrap().recording,
-            "still latched"
-        );
-        recorder.finish(&mut state, 8.0);
-        let lane_state = state.automation_lane(&track, &lane).unwrap();
-        assert!((evaluate_automation(&lane_state.points, 7.0, 0.0) - 0.6).abs() < 1e-4);
-        // A flat stretch is a couple of points, not one per tick.
-        assert!(
-            lane_state.points.len() <= 5,
-            "{:?}",
-            points(&state, &track, &lane)
-        );
-    }
-
-    /// Read and Off lanes are never written.
-    #[test]
-    fn read_lanes_are_left_alone() {
-        let (mut state, track, lane) = track_with_lane(AutomationMode::Read);
+    fn a_disarmed_transport_writes_nothing() {
+        let (mut state, track, lane) = armed_track_with_lane();
+        state.automation_arm = false;
         let mut recorder = AutomationRecorder::default();
         set_volume(&mut state, &track, 0.1);
         state.automation_record_tick(&mut recorder, 0.0, 0.0);
@@ -464,5 +505,126 @@ mod tests {
         assert_eq!(tick, RecordTick::default());
         assert!(points(&state, &track, &lane).is_empty());
         assert!(recorder.is_idle());
+    }
+
+    /// A switched-off lane is never written.
+    #[test]
+    fn an_off_lane_is_left_alone() {
+        let (mut state, track, lane) = armed_track_with_lane();
+        state.set_automation_lane_enabled(&track, &lane, false);
+        let mut recorder = AutomationRecorder::default();
+        set_volume(&mut state, &track, 0.1);
+        state.automation_record_tick(&mut recorder, 0.0, 0.0);
+        set_volume(&mut state, &track, 0.9);
+        assert!(!state.automation_record_tick(&mut recorder, 1.0, 0.1).wrote);
+        assert!(points(&state, &track, &lane).is_empty());
+    }
+
+    /// Moving an automated control by hand while not recording overrides
+    /// its lane; Re-Enable Automation puts it back. While recording, the
+    /// same move is written instead, and writing clears an override.
+    #[test]
+    fn a_manual_move_overrides_until_re_enabled_and_recording_clears_it() {
+        let (mut state, track, lane) = armed_track_with_lane();
+        state.add_automation_point(&track, &lane, 0.0, 0.3);
+        state.automation_arm = false;
+        state.transport.playing = false;
+
+        state.set_track_volume(&track, 0.8);
+        let lane_state = state.automation_lane(&track, &lane).unwrap();
+        assert!(lane_state.overridden && !lane_state.plays());
+        assert!(state.has_overridden_automation());
+        assert!(state.take_automation_override_change());
+        assert!(!state.take_automation_override_change(), "taken once");
+        assert!(
+            (state.find_track(&track).unwrap().display_volume() - 0.8).abs() < 1e-6,
+            "the fader shows what is heard: the hand-set value"
+        );
+
+        assert!(state.reenable_automation());
+        assert!(!state.has_overridden_automation());
+        assert!(state.take_automation_override_change());
+
+        // Armed and rolling, the same move is a recording, not an override.
+        state.automation_arm = true;
+        state.transport.playing = true;
+        assert!(!state.override_automation(&track, |_| true));
+        let mut recorder = AutomationRecorder::default();
+        state.automation_record_tick(&mut recorder, 1.0, 0.0);
+        state.lane_mut(&track, &lane).unwrap().overridden = true;
+        set_volume(&mut state, &track, 0.5);
+        state.automation_record_tick(&mut recorder, 2.0, 0.1);
+        assert!(
+            !state.automation_lane(&track, &lane).unwrap().overridden,
+            "writing a lane puts it back in play"
+        );
+    }
+
+    /// Grabbing a fader without moving it is not a move: nothing is
+    /// overridden. A value away from the base is.
+    #[test]
+    fn a_grab_without_a_move_does_not_override() {
+        let (mut state, track, lane) = armed_track_with_lane();
+        state.add_automation_point(&track, &lane, 0.0, 0.3);
+        state.automation_arm = false;
+        state.transport.playing = false;
+        set_volume(&mut state, &track, 0.5);
+        state.begin_track_volume_preview(&track, 0.5);
+        assert!(!state.set_track_volume_preview(&track, 0.5));
+        state.commit_track_volume_preview(&track);
+        assert!(!state.automation_lane(&track, &lane).unwrap().overridden);
+        state.set_track_pan(&track, 0.0);
+        assert!(!state.has_overridden_automation());
+
+        state.begin_track_volume_preview(&track, 0.5);
+        state.set_track_volume_preview(&track, 0.6);
+        assert!(state.automation_lane(&track, &lane).unwrap().overridden);
+    }
+
+    /// A lane being written whose track moves mid-run is closed, not left
+    /// held back from the engine.
+    #[test]
+    fn a_lane_written_when_its_track_moves_is_closed() {
+        let (mut state, first, lane) = armed_track_with_lane();
+        let second = state.create_audio_track();
+        state
+            .ensure_automation_lane(&second, AutomationTarget::TrackVolume)
+            .unwrap();
+        let mut recorder = AutomationRecorder::default();
+        set_volume(&mut state, &first, 0.2);
+        state.automation_record_tick(&mut recorder, 0.0, 0.0);
+        set_volume(&mut state, &first, 0.7);
+        state.automation_record_tick(&mut recorder, 1.0, 0.1);
+        assert!(state.automation_lane(&first, &lane).unwrap().recording);
+        state.tracks.swap(0, 1);
+        let tick = state.automation_record_tick(&mut recorder, 2.0, 0.2);
+        assert!(tick.engine_changed);
+        assert!(
+            !state.automation_lane(&first, &lane).unwrap().recording,
+            "the moved lane plays again"
+        );
+        recorder.finish(&mut state, 3.0);
+        assert!(state
+            .tracks
+            .iter()
+            .flat_map(|t| t.automation_lanes.iter())
+            .all(|l| !l.recording));
+    }
+
+    /// Undo carries the current override across instead of the captured one.
+    #[test]
+    fn undo_keeps_the_current_override() {
+        let (mut state, track, lane) = armed_track_with_lane();
+        state.add_automation_point(&track, &lane, 0.0, 0.3);
+        state.automation_arm = false;
+        state.transport.playing = false;
+        let before = state.capture_automation_lanes(&track);
+        state.set_track_volume(&track, 0.9);
+        assert!(state.automation_lane(&track, &lane).unwrap().overridden);
+        state.set_track_automation_lanes(&track, before);
+        assert!(
+            state.automation_lane(&track, &lane).unwrap().overridden,
+            "an undo does not silently re-enable"
+        );
     }
 }

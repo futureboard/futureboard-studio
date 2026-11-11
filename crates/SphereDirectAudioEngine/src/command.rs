@@ -193,6 +193,12 @@ pub enum EngineCommand {
     SetLoopbackRecord(Option<std::sync::Arc<crate::loopback::LoopbackRecorder>>),
     /// Set non-destructive stereo/mono/mid/side monitoring preview.
     SetTrackPreviewMode { track_id: String, value: f32 },
+    /// Replace one track's automation (lanes, plug-in bindings, the lane each
+    /// send and insert reads), prepared on the control thread so the callback
+    /// only swaps. An automation edit used to change the project's structure
+    /// key and rebuild the whole graph, cutting every sounding note. The box
+    /// leaves through the graveyard holding what it replaced.
+    SetTrackAutomation(Box<crate::runtime::TrackAutomationChange>),
     /// Set the sixteen parts of a multitimbral built-in Soundfont Player.
     /// `track_index` is resolved by the control thread and the parts are plain
     /// values, so applying them allocates nothing.

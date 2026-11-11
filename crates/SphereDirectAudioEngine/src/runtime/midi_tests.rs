@@ -852,6 +852,149 @@ fn a_snapshot_send_lane_binds_to_its_send_and_reads() {
     assert!((level - expected).abs() < 1e-5, "{level} vs {expected}");
 }
 
+/// A live automation change swaps a track's lanes in and binds them the way
+/// a build does — and a change prepared against another shape of track (the
+/// graph was rebuilt meanwhile) is refused untouched.
+#[test]
+fn a_live_automation_change_binds_like_a_build_and_refuses_a_stale_shape() {
+    let mut track = automation_track_snapshot(Vec::new());
+    track.sends = vec![crate::types::EngineSendSnapshot {
+        id: "send-1".to_string(),
+        return_track_id: "ret-1".to_string(),
+        level: 1.0,
+        enabled: true,
+        pre_fader: false,
+        wdw: false,
+    }];
+    let mut runtime = automation_runtime(track);
+    let index = runtime
+        .tracks
+        .iter()
+        .position(|t| t.id == "track-1")
+        .expect("track");
+    assert!(runtime.tracks[index].automation_lanes.is_empty());
+
+    let mut lane = empty_lane_snapshot("send-lane", 4);
+    lane.target.send_id = "send-1".to_string();
+    lane.points = vec![crate::types::EngineAutomationPointSnapshot {
+        beat: 0.0,
+        value: volume_db_to_norm(-12.0),
+        curve: 0,
+        tension: 0.0,
+    }];
+    let mut change = TrackAutomationChange::prepare(index, &runtime.tracks[index], &[lane.clone()]);
+    assert!(runtime.install_track_automation(&mut change));
+    assert!(
+        change.lanes.is_empty(),
+        "the replaced lanes went back in the box"
+    );
+    let src = &runtime.tracks[index];
+    assert_eq!(src.automation_lanes.len(), 1);
+    assert_eq!(src.sends[0].level_lane, Some(0));
+    let (_, level) = src.send_state_at(0, 2.0);
+    let expected = volume_norm_to_linear(volume_db_to_norm(-12.0));
+    assert!((level - expected).abs() < 1e-5, "{level} vs {expected}");
+
+    let mut stale = TrackAutomationChange::prepare(index, &runtime.tracks[index], &[]);
+    stale.send_lanes.clear();
+    assert!(!runtime.install_track_automation(&mut stale));
+    assert_eq!(
+        runtime.tracks[index].automation_lanes.len(),
+        1,
+        "a stale change leaves the lanes alone"
+    );
+}
+
+/// The segment search agrees with a straight walk over the points, on the
+/// points, between them, and past both ends.
+#[test]
+fn automation_lookup_matches_a_linear_walk() {
+    let points: Vec<RuntimeAutomationPoint> = (0..40)
+        .map(|i| RuntimeAutomationPoint {
+            beat: f64::from(i) * 0.75,
+            value: ((i * 37) % 11) as f32 / 10.0,
+            curve: RuntimeAutomationCurve::from_tag((i % 3) as u8),
+            tension: ((i % 5) as f32 - 2.0) * 0.3,
+        })
+        .collect();
+    let walk = |beat: f64| {
+        if beat <= points[0].beat {
+            return points[0].value;
+        }
+        for pair in points.windows(2) {
+            let (a, b) = (&pair[0], &pair[1]);
+            if beat >= a.beat && beat <= b.beat {
+                let t = ((beat - a.beat) / (b.beat - a.beat)) as f32;
+                let factor = automation_curve_factor(a.curve.to_tag(), a.tension, t);
+                return a.value + (b.value - a.value) * factor;
+            }
+        }
+        points[points.len() - 1].value
+    };
+    for step in 0..400 {
+        let beat = f64::from(step) * 0.0777 - 1.0;
+        let got = evaluate_automation_points(&points, beat, 0.0);
+        let want = walk(beat.max(0.0));
+        assert!((got - want).abs() < 1e-6, "beat {beat}: {got} vs {want}");
+    }
+}
+
+/// The clock reads every stage at the block beat until stamped, then
+/// offsets each by its lag and the fader's target by the block's span.
+#[test]
+fn automation_clock_offsets_each_stage() {
+    let clock = RuntimeAutomationClock::default();
+    assert_eq!(clock.fader_beat(8.0), 8.0);
+    assert_eq!(clock.fader_end_beat(8.0), 8.0);
+    assert_eq!(clock.chain_beat(8.0), 8.0);
+    let clock = RuntimeAutomationClock {
+        fader_lag_beats: 0.5,
+        chain_lag_beats: 0.25,
+        block_end_beats: 0.125,
+    };
+    assert_eq!(clock.fader_beat(8.0), 7.5);
+    assert_eq!(clock.fader_end_beat(8.0), 7.625);
+    assert_eq!(clock.chain_beat(8.0), 7.75);
+    assert_eq!(clock.fader_beat(0.1), 0.0, "never before the song starts");
+}
+
+/// A Smooth segment bends with tension: 0 is exactly the old smoothstep (so
+/// existing projects sound the same), > 0 sharpens the S, < 0 softens it,
+/// and every tension stays monotonic, pinned at both ends and symmetric
+/// about the midpoint.
+#[test]
+fn smooth_segments_bend_with_tension() {
+    let smooth = |k: f32, t: f32| automation_curve_factor(2, k, t);
+    for i in 0..=20 {
+        let t = i as f32 / 20.0;
+        let smoothstep = t * t * (3.0 - 2.0 * t);
+        assert!((smooth(0.0, t) - smoothstep).abs() < 1e-6, "t={t}");
+    }
+    assert!(
+        smooth(0.6, 0.25) < smooth(0.0, 0.25),
+        "sharper: flatter start"
+    );
+    assert!(
+        smooth(-0.6, 0.25) > smooth(0.0, 0.25),
+        "softer: steeper start"
+    );
+    for k in [-1.0, -0.6, -0.2, 0.2, 0.6, 1.0] {
+        assert!(smooth(k, 0.0).abs() < 1e-6 && (smooth(k, 1.0) - 1.0).abs() < 1e-6);
+        assert!((smooth(k, 0.5) - 0.5).abs() < 1e-6, "k={k}: midpoint");
+        let mut previous = 0.0;
+        for i in 0..=100 {
+            let t = i as f32 / 100.0;
+            let v = smooth(k, t);
+            assert!(v >= previous - 1e-6, "k={k}: monotonic at {t}");
+            assert!(
+                (v + smooth(k, 1.0 - t) - 1.0).abs() < 1e-5,
+                "k={k}: symmetric at {t}"
+            );
+            previous = v;
+        }
+    }
+}
+
 #[test]
 fn automation_evaluator_applies_tension() {
     // A single curved segment 0→1 over beats [0, 4]. With ease-in tension the
@@ -1010,7 +1153,7 @@ fn bridged_instrument_track(id: &str) -> RuntimeTrack {
             kind_tag: RuntimeInsertKind::ExternalBridge,
             enabled: true,
             bypass_lane: None,
-            automation_bypassed: false,
+            automation_bypass: None,
             params: std::sync::Arc::new(HashMap::new()),
             bridge_is_effect: false,
             bridge_is_builtin: false,
@@ -1033,6 +1176,7 @@ fn bridged_instrument_track(id: &str) -> RuntimeTrack {
         sends: Vec::new(),
         automation_lanes: Vec::new(),
         plugin_param_automation: Vec::new(),
+        automation_clock: Default::default(),
         meter: Arc::new(Default::default()),
         meter_peak_l: 0.0,
         meter_peak_r: 0.0,

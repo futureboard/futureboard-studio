@@ -10,7 +10,7 @@
 use gpui::Context;
 
 use crate::components::timeline::timeline_state::{
-    AutomationClipboard, AutomationCurve, MASTER_TRACK_ID,
+    AutomationClipboard, AutomationCurveShape, MASTER_TRACK_ID,
 };
 
 use super::StudioLayout;
@@ -104,11 +104,12 @@ impl StudioLayout {
         changed
     }
 
-    /// Set the curve of the selected points. Returns whether any changed.
-    pub(super) fn set_selected_automation_curve(
+    /// Give the selected points a Curve-menu shape (curve kind and tension).
+    /// One undo step. Returns whether any changed.
+    pub(super) fn set_selected_automation_shape(
         &mut self,
         lane: Option<(String, String)>,
-        curve: AutomationCurve,
+        shape: AutomationCurveShape,
         cx: &mut Context<Self>,
     ) -> bool {
         let Some((track_id, lane_id)) = lane.or_else(|| self.automation_edit_lane(false, cx))
@@ -116,7 +117,7 @@ impl StudioLayout {
             return false;
         };
         self.edit_automation_lanes(&track_id, cx, |state| {
-            state.set_selected_automation_curve(&track_id, &lane_id, curve)
+            state.set_selected_automation_shape(&track_id, &lane_id, shape)
         }) > 0
     }
 
@@ -189,7 +190,51 @@ impl StudioLayout {
 }
 
 impl StudioLayout {
-    /// One playback tick of Write / Touch / Latch recording at `beat`.
+    /// Automation Arm on or off. Disarming mid-run ends the run's recording
+    /// the way stopping does: open lanes close and the run is one undo step.
+    pub(super) fn toggle_automation_arm(&mut self, cx: &mut Context<Self>) {
+        let armed = self.timeline.update(cx, |timeline, cx| {
+            timeline.state.automation_arm = !timeline.state.automation_arm;
+            cx.notify();
+            timeline.state.automation_arm
+        });
+        if !armed {
+            self.finish_automation_recording(cx);
+        }
+        cx.notify();
+    }
+
+    /// Re-Enable Automation: every lane overridden by hand plays again.
+    pub(super) fn reenable_automation(&mut self, cx: &mut Context<Self>) {
+        let changed = self.timeline.update(cx, |timeline, cx| {
+            let changed = timeline.state.reenable_automation();
+            if changed {
+                cx.notify();
+            }
+            changed
+        });
+        if changed {
+            self.sync_automation_overrides(cx);
+            self.push_mixer_snapshot_to_window(cx);
+        }
+        cx.notify();
+    }
+
+    /// Send the engine the lanes again when some were overridden or put back
+    /// in play since it last heard. The engine applies a lane change live
+    /// (`SetTrackAutomation`), so this costs no graph rebuild.
+    pub(super) fn sync_automation_overrides(&mut self, cx: &mut Context<Self>) {
+        let changed = self.timeline.update(cx, |timeline, _| {
+            timeline.state.take_automation_override_change()
+        });
+        if changed {
+            self.audio_bridge.project_dirty = true;
+            self.schedule_audio_project_sync(cx, false, "automation_override");
+            cx.notify();
+        }
+    }
+
+    /// One playback tick of armed automation recording at `beat`.
     pub(super) fn tick_automation_recording(&mut self, beat: f32, cx: &mut Context<Self>) {
         let now = self.automation_record_clock.elapsed().as_secs_f64();
         let mut recorder = std::mem::take(&mut self.automation_recorder);

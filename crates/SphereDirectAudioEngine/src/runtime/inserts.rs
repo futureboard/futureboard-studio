@@ -59,9 +59,12 @@ pub struct RuntimeInsert {
     /// The owning track's Insert Bypass automation lane for this insert,
     /// resolved to an index into its `automation_lanes` off the audio thread.
     pub bypass_lane: Option<usize>,
-    /// Set per block from that lane while playing: the insert is bypassed by
-    /// automation, whatever `enabled` says. Read through [`Self::active`].
-    pub automation_bypassed: bool,
+    /// Set per block from that lane while playing: `Some(true)` bypasses the
+    /// insert and `Some(false)` runs it, whatever `enabled` says — the lane
+    /// owns the switch, both ways, the way an automated device on/off does.
+    /// `None` (no lane, an empty one, or a stopped transport) leaves it to
+    /// `enabled`. Read through [`Self::active`].
+    pub automation_bypass: Option<bool>,
     pub params: std::sync::Arc<HashMap<String, Value>>,
     /// For [`RuntimeInsertKind::ExternalBridge`]: `params["role"] == "effect"`,
     /// resolved at build time so the block path never reads the params map.
@@ -236,10 +239,15 @@ pub(super) fn vsti_output_children_from_params(
 }
 
 impl RuntimeInsert {
-    /// Whether the insert processes this block: switched on, and not bypassed
-    /// by automation.
+    /// Whether the insert processes this block: its bypass lane's word when
+    /// the lane has one, else its own switch — and never while the guard has
+    /// it bypassed.
     #[inline]
     pub fn active(&self) -> bool {
-        self.enabled && !self.automation_bypassed && !self.guard.bypassed
+        let on = match self.automation_bypass {
+            Some(bypassed) => !bypassed,
+            None => self.enabled,
+        };
+        on && !self.guard.bypassed
     }
 }

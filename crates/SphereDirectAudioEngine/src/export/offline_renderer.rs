@@ -180,8 +180,8 @@ impl PluginBridgeSink for OfflineBridgeSink {
     fn push_midi(&self, status: u8, data1: u8, data2: u8, offset: u32) {
         self.live.push_midi(status, data1, data2, offset);
     }
-    fn push_param(&self, id: u32, value: f32, offset: u32) {
-        self.live.push_param(id, value, offset);
+    fn push_param(&self, id: u32, value: f32, offset: u32) -> bool {
+        self.live.push_param(id, value, offset)
     }
     fn write_input(&self, l: &[f32], r: &[f32], frames: usize) {
         self.live.write_input(l, r, frames);

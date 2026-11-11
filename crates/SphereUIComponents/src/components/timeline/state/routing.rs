@@ -796,6 +796,10 @@ impl TimelineState {
             return false;
         }
         send.gain_db = next;
+        self.override_automation(
+            track_id,
+            |target| matches!(target, AutomationTarget::SendLevel { send_id: id } if id == send_id),
+        );
         true
     }
 
@@ -847,6 +851,9 @@ impl TimelineState {
     }
 
     pub fn toggle_send_enabled(&mut self, track_id: &str, send_id: &str) -> Option<bool> {
+        self.override_automation(track_id, |target| {
+            matches!(target, AutomationTarget::SendEnabled { send_id: id } if id == send_id)
+        });
         let track = self.tracks.iter_mut().find(|t| t.id == track_id)?;
         let send = track.sends.iter_mut().find(|s| s.id == send_id)?;
         send.enabled = !send.enabled;

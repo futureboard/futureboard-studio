@@ -14,6 +14,16 @@ impl Render for StudioLayout {
 
         publish_studio_main_hwnd(window);
 
+        // A control moved by hand overrode its lanes in a path that did not
+        // notify the timeline (its observer handles the rest): resend the
+        // lanes after this frame, never from inside it.
+        if self.timeline.read(cx).state.automation_override_pending() {
+            let this = cx.entity().clone();
+            cx.defer(move |cx| {
+                let _ = this.update(cx, |this, cx| this.sync_automation_overrides(cx));
+            });
+        }
+
         // Perf probe: if the MAIN DAW window re-renders while the insert picker is
         // open, that points the typing-stutter at a full StudioLayout repaint
         // rather than the picker window. Gated by the existing picker debug flag.

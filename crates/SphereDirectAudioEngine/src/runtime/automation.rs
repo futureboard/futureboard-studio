@@ -200,17 +200,42 @@ impl RuntimeAutomationLane {
 /// the bounced curve, and the drawn curve agree exactly (no visual-only curves).
 ///
 /// `curve_tag`: `1` = Hold (stepped, holds the left value), `2` = Smooth
-/// (S-curve / smoothstep), anything else = Linear shaped by `tension`.
-/// `tension` in `[-1, 1]`: `0` = straight line; `> 0` eases in (exponential,
-/// slow start); `< 0` eases out (logarithmic, fast start).
+/// (S-curve), anything else = Linear shaped by `tension`.
+///
+/// `tension` in `[-1, 1]`:
+/// - Linear: `0` = straight line; `> 0` eases in (exponential, slow start);
+///   `< 0` eases out (logarithmic, fast start).
+/// - Smooth: `0` = the classic smoothstep S; `> 0` sharpens it (flatter ends,
+///   steeper middle, towards a step at the midpoint); `< 0` softens it
+///   (steeper ends, a flatter middle, an inverted S). Always symmetric about
+///   the segment's midpoint, always monotonic.
+/// - Hold: ignored.
 #[inline]
 pub fn automation_curve_factor(curve_tag: u8, tension: f32, t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     match curve_tag {
         // Hold: stay at the left value for the whole segment (stepped).
         1 => 0.0,
-        // Smooth: symmetric S-curve.
-        2 => t * t * (3.0 - 2.0 * t),
+        // Smooth: smoothstep over a symmetric warp of `t`. The warp is the
+        // identity at tension 0, so a pre-tension project draws and plays
+        // exactly the S it always did.
+        2 => {
+            let k = tension.clamp(-1.0, 1.0);
+            let t = if k.abs() < 1.0e-4 {
+                t
+            } else {
+                // Each half is a power curve mirrored about (0.5, 0.5):
+                // exponent > 1 pulls the ends flat (sharper S), < 1 pushes
+                // them steep (softer, inverted S).
+                let p = 2f32.powf(k * 1.5);
+                if t < 0.5 {
+                    0.5 * (2.0 * t).powf(p)
+                } else {
+                    1.0 - 0.5 * (2.0 * (1.0 - t)).powf(p)
+                }
+            };
+            t * t * (3.0 - 2.0 * t)
+        }
         // Linear / curved: a power curve driven by tension.
         _ => {
             let k = tension.clamp(-1.0, 1.0);
@@ -245,18 +270,206 @@ pub fn evaluate_automation_points(
     if beat >= points[last].beat {
         return points[last].value;
     }
+    // Binary search for the segment: a recorded lane holds thousands of
+    // points, and this runs for every lane of every track on every block, so
+    // a linear scan made playback dearer the further it got into the song.
+    // `ix` is the first point after `beat`; both ends were handled above, so
+    // `1 <= ix <= last`.
+    let ix = points
+        .partition_point(|point| point.beat <= beat)
+        .clamp(1, last);
+    let a = &points[ix - 1];
+    let b = &points[ix];
+    let span = (b.beat - a.beat).max(f64::EPSILON);
+    let t = ((beat - a.beat) / span).clamp(0.0, 1.0) as f32;
+    let factor = automation_curve_factor(a.curve.to_tag(), a.tension, t);
+    a.value + (b.value - a.value) * factor
+}
 
-    for i in 0..last {
-        let a = &points[i];
-        let b = &points[i + 1];
-        if beat >= a.beat && beat <= b.beat {
-            let span = (b.beat - a.beat).max(f64::EPSILON);
-            let t = ((beat - a.beat) / span).clamp(0.0, 1.0) as f32;
-            let factor = automation_curve_factor(a.curve.to_tag(), a.tension, t);
-            return a.value + (b.value - a.value) * factor;
+/// Where on the timeline each automation stage of one track is this block.
+///
+/// A track's audio reaches its fader `track_output_latency` samples after the
+/// timeline position it came from (its plug-ins delay it), so reading its
+/// lanes at the block's own position played every move early by that much.
+/// The render pass fills this per track at the start of each block
+/// (`stamp_automation_clocks`) and every automation read goes through it.
+/// Kept as offsets from the block's beat, so the default (a graph nobody
+/// stamped: tests, a stopped transport) reads every stage at the block beat,
+/// exactly as before.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RuntimeAutomationClock {
+    /// Beats the audio at the fader, sends and mute lags the block's
+    /// position by (the track's output latency).
+    pub fader_lag_beats: f64,
+    /// Beats the audio entering the insert chain lags it by (what a bus's
+    /// feeds were delayed by): plug-in parameter and bypass lanes.
+    pub chain_lag_beats: f64,
+    /// From the block's start to its end, in beats — negative when a loop
+    /// wraps inside the block. The fader ramps to the lane's value at the
+    /// end, so a ramp is followed across the block instead of a block late.
+    pub block_end_beats: f64,
+}
+
+impl RuntimeAutomationClock {
+    /// Where the fader, sends and mute read their lanes this block.
+    #[inline]
+    pub fn fader_beat(&self, block_beat: f64) -> f64 {
+        (block_beat - self.fader_lag_beats).max(0.0)
+    }
+
+    /// What the fader ramps toward: its lanes at the block's end.
+    #[inline]
+    pub fn fader_end_beat(&self, block_beat: f64) -> f64 {
+        (block_beat + self.block_end_beats - self.fader_lag_beats).max(0.0)
+    }
+
+    /// Where plug-in parameter and bypass lanes are read this block.
+    #[inline]
+    pub fn chain_beat(&self, block_beat: f64) -> f64 {
+        (block_beat - self.chain_lag_beats).max(0.0)
+    }
+}
+
+/// A track's automation, prepared on the control thread so the callback
+/// only swaps it in ([`RuntimeProject::install_track_automation`]): the lanes,
+/// their plug-in bindings and the lane each send and insert reads, resolved to
+/// indices. What it replaces goes back into this box and leaves through the
+/// graveyard.
+#[derive(Debug, Default)]
+pub struct TrackAutomationChange {
+    pub track_index: usize,
+    pub lanes: Vec<RuntimeAutomationLane>,
+    pub bindings: Vec<RuntimePluginParamBinding>,
+    /// Per send, in the track's send order: `(level lane, on/off lane)`.
+    pub send_lanes: Vec<(Option<usize>, Option<usize>)>,
+    /// Per insert, in the track's insert order: its bypass lane.
+    pub bypass_lanes: Vec<Option<usize>>,
+}
+
+impl TrackAutomationChange {
+    /// Resolve `lanes` against `track`'s inserts and sends. Control thread.
+    pub fn prepare(
+        track_index: usize,
+        track: &RuntimeTrack,
+        lanes: &[EngineAutomationLaneSnapshot],
+    ) -> Self {
+        let lanes: Vec<RuntimeAutomationLane> = lanes
+            .iter()
+            .map(RuntimeAutomationLane::from_snapshot)
+            .collect();
+        let bindings = plugin_param_bindings(&lanes, &track.inserts);
+        let (send_lanes, bypass_lanes) = lane_indices(&lanes, &track.sends, &track.inserts);
+        Self {
+            track_index,
+            lanes,
+            bindings,
+            send_lanes,
+            bypass_lanes,
         }
     }
-    points[last].value
+}
+
+/// Which lane each send (`(level, on/off)`) and each insert (bypass) reads,
+/// as indices into `lanes`. Off the audio thread.
+pub(crate) fn lane_indices(
+    lanes: &[RuntimeAutomationLane],
+    sends: &[RuntimeSend],
+    inserts: &[RuntimeInsert],
+) -> (Vec<(Option<usize>, Option<usize>)>, Vec<Option<usize>>) {
+    let mut send_lanes = vec![(None, None); sends.len()];
+    let mut bypass_lanes = vec![None; inserts.len()];
+    for (lane_ix, lane) in lanes.iter().enumerate() {
+        match &lane.target {
+            RuntimeAutomationTarget::SendGain { send_id } => {
+                if let Some(s) = sends.iter().position(|s| &s.id == send_id) {
+                    send_lanes[s].0 = Some(lane_ix);
+                }
+            }
+            RuntimeAutomationTarget::SendEnabled { send_id } => {
+                if let Some(s) = sends.iter().position(|s| &s.id == send_id) {
+                    send_lanes[s].1 = Some(lane_ix);
+                }
+            }
+            RuntimeAutomationTarget::InsertBypass { insert_id } => {
+                if let Some(i) = inserts.iter().position(|i| &i.id == insert_id) {
+                    bypass_lanes[i] = Some(lane_ix);
+                }
+            }
+            _ => {}
+        }
+    }
+    (send_lanes, bypass_lanes)
+}
+
+/// Resolve plug-in parameter lanes into compact bindings. Off the audio
+/// thread, so allocation and string parsing are fine. Lanes with no points
+/// are skipped so a freshly added empty lane never forces the parameter to
+/// its default value.
+pub(crate) fn plugin_param_bindings(
+    lanes: &[RuntimeAutomationLane],
+    inserts: &[RuntimeInsert],
+) -> Vec<RuntimePluginParamBinding> {
+    let mut out: Vec<RuntimePluginParamBinding> = Vec::new();
+    for (lane_ix, lane) in lanes.iter().enumerate() {
+        if !lane.enabled || lane.points.is_empty() {
+            continue;
+        }
+        let RuntimeAutomationTarget::PluginParameter {
+            insert_id,
+            parameter_id,
+        } = &lane.target
+        else {
+            continue;
+        };
+        let Some(insert_ix) = inserts.iter().position(|i| &i.id == insert_id) else {
+            continue;
+        };
+        let Ok(param_id) = parameter_id.parse::<u32>() else {
+            continue;
+        };
+        out.push(RuntimePluginParamBinding {
+            insert_ix,
+            lane_ix,
+            param_id,
+            last_value: f32::NAN,
+        });
+    }
+    out
+}
+
+impl RuntimeProject {
+    /// Swap a prepared [`TrackAutomationChange`] into its track. Realtime-safe:
+    /// moves and index writes only; the replaced lanes and bindings go back
+    /// into `change` for the caller to retire. A change prepared against a
+    /// different shape of track (the graph was rebuilt meanwhile) is ignored —
+    /// the rebuild carried the lanes in already.
+    pub fn install_track_automation(&mut self, change: &mut TrackAutomationChange) -> bool {
+        let Some(track) = self.tracks.get_mut(change.track_index) else {
+            return false;
+        };
+        if track.sends.len() != change.send_lanes.len()
+            || track.inserts.len() != change.bypass_lanes.len()
+            || change
+                .bindings
+                .iter()
+                .any(|binding| binding.insert_ix >= track.inserts.len())
+        {
+            return false;
+        }
+        std::mem::swap(&mut track.automation_lanes, &mut change.lanes);
+        std::mem::swap(&mut track.plugin_param_automation, &mut change.bindings);
+        for (send, &(level, enabled)) in track.sends.iter_mut().zip(&change.send_lanes) {
+            send.level_lane = level;
+            send.enabled_lane = enabled;
+        }
+        for (insert, &lane) in track.inserts.iter_mut().zip(&change.bypass_lanes) {
+            insert.bypass_lane = lane;
+            if lane.is_none() {
+                insert.automation_bypass = None;
+            }
+        }
+        true
+    }
 }
 
 pub const AUTOMATION_VOLUME_MIN_DB: f32 = -60.0;
