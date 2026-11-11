@@ -232,6 +232,15 @@ impl TapFade {
         self.disarm();
     }
 
+    /// Ends any running fade on the tap it was heading for, and stays armed:
+    /// the next time change still crossfades. What a cleared line needs, since
+    /// the line refills long before the next Time edit may come.
+    fn settle(&mut self) {
+        self.fading = false;
+        self.from = self.pending;
+        self.to = self.pending;
+    }
+
     /// Drops any running fade; the next target snaps.
     fn disarm(&mut self) {
         self.armed = false;
@@ -373,8 +382,8 @@ impl DelayStage {
         self.body.reset();
         self.fb_l = 0.0;
         self.fb_r = 0.0;
-        self.tap_l.disarm();
-        self.tap_r.disarm();
+        self.tap_l.settle();
+        self.tap_r.settle();
         self.feedback.snap();
         self.feedback_r.snap();
         self.mix.snap();
@@ -402,6 +411,10 @@ impl DelayStage {
             self.voicing = Voicing::for_model(model);
             self.flutter_depth = self.voicing.flutter_s * self.sample_rate;
             self.reset();
+            // The new voicing starts on an empty line: its first time lands
+            // without a fade.
+            self.tap_l.disarm();
+            self.tap_r.disarm();
         }
 
         let samples = |ms: f32| (ms.clamp(40.0, 1_200.0) * 0.001 * self.sample_rate).max(1.0);
@@ -778,6 +791,25 @@ mod tests {
         let (at_l, _) = first_taps(&mut stage, 0.8);
         let want = (SR * 0.713) as usize;
         assert!(at_l.abs_diff(want) < 2, "landed at {at_l}, want {want}");
+    }
+
+    #[test]
+    fn a_time_change_after_a_reset_still_crossfades() {
+        // The delay resuming (or a host reset) clears the line, which then
+        // refills; the next Time edit must fade, not jump the head.
+        let mut stage = DelayStage::new(SR);
+        stage.configure(DelayModel::Digital, 300.0, 0.0, 100.0, 5.0, 300.0, 0.0);
+        stage.reset();
+        for n in 0..(SR as usize) {
+            let x = (n as f32 * 0.1).sin();
+            stage.process(x, x);
+        }
+        stage.configure(DelayModel::Digital, 500.0, 0.0, 100.0, 5.0, 500.0, 0.0);
+        let (_, _, gain) = stage.tap_l.tick();
+        assert!(
+            gain > 0.0 && gain < 0.01,
+            "the first edit after a reset jumped instead of fading: gain {gain}"
+        );
     }
 
     #[test]
