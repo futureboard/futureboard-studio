@@ -51,8 +51,15 @@ impl WavAudio {
     /// One channel's samples, deinterleaved into `out` (resized to fit).
     /// Channels past the end of the file repeat the last one, so a mono file
     /// answers for both sides of a stereo request.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn channel_into(&self, channel: usize, out: &mut Vec<f32>) {
-        let frames = self.frames();
+        self.channel_prefix_into(channel, usize::MAX, out);
+    }
+
+    /// Like [`Self::channel_into`], but only the first `max_frames` frames:
+    /// a caller that keeps a short prefix never holds the whole file twice.
+    pub fn channel_prefix_into(&self, channel: usize, max_frames: usize, out: &mut Vec<f32>) {
+        let frames = self.frames().min(max_frames);
         out.clear();
         out.reserve(frames);
         if self.channels == 0 {

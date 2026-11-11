@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use builtin_dsp_core::make_eq_coefficients;
-use nam_rs::{Model, NamModel};
+use nam_rs::{Model, ModelConfig, NamModel};
 
 use super::StereoBiquad;
 use super::handoff::{HandoffCell, RetireBin, Retired};
@@ -67,13 +67,22 @@ pub(super) const MAX_ADAPTER_LATENCY: usize = 32;
 #[derive(Debug)]
 pub enum NamLoadError {
     Parse(nam_rs::Error),
-    SampleRateMismatch { expected: f64, engine: f64 },
+    SampleRateMismatch {
+        expected: f64,
+        engine: f64,
+    },
+    /// The file describes a network far outside any real capture: building it
+    /// would allocate without bound or abort the host. See [`check_model_size`].
+    TooLarge(String),
 }
 
 impl std::fmt::Display for NamLoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             NamLoadError::Parse(e) => write!(f, "NAM capture failed to load: {e}"),
+            NamLoadError::TooLarge(why) => {
+                write!(f, "NAM capture rejected: {why}, outside any real capture")
+            }
             NamLoadError::SampleRateMismatch { expected, engine } => write!(
                 f,
                 "NAM capture expects {expected} Hz but the engine runs at {engine} Hz — \
@@ -183,6 +192,10 @@ pub fn prepare_nam_runtime(
     full_rig: bool,
 ) -> Result<PreparedNamRuntime, NamLoadError> {
     let nam_model = NamModel::from_json_str(json).map_err(NamLoadError::Parse)?;
+    // Before nam-rs builds anything: it checks the weight count, not the
+    // shape, and a dilation or kernel from a hostile file sizes buffers that
+    // overflow or abort the host (release builds abort on panic).
+    check_model_size(&nam_model, 0).map_err(NamLoadError::TooLarge)?;
     let expected = nam_model.expected_sample_rate();
     let adapter = if (expected - engine_sample_rate).abs() > SAMPLE_RATE_TOLERANCE_HZ {
         Some(
@@ -253,6 +266,121 @@ pub fn prepare_nam_runtime(
         scratch_l: vec![0.0; NAM_BLOCK],
         scratch_r: vec![0.0; NAM_BLOCK],
     })
+}
+
+/// Shape limits for a capture, far above any published NAM model (A1 standard
+/// is 16 channels, dilations to 512, kernel 3; A2 heads use kernels of 16).
+const MAX_CHANNELS: usize = 512;
+const MAX_KERNEL: usize = 4_096;
+const MAX_DILATION: usize = 65_536;
+/// Samples of history the whole network may look back: about 5 s at 48 kHz.
+/// `prewarm_model` runs this many samples on the loading thread.
+const MAX_RECEPTIVE_FIELD: usize = 1 << 18;
+/// Convolution history the network may hold, in floats (64 MB).
+const MAX_HISTORY_FLOATS: usize = 1 << 24;
+const MAX_LSTM_HIDDEN: usize = 1_024;
+const MAX_LSTM_LAYERS: usize = 16;
+const MAX_SUBMODELS: usize = 16;
+/// Nesting of condition DSPs and slimmable submodels.
+const MAX_DEPTH: usize = 4;
+
+/// Rejects a capture whose shape would make nam-rs allocate without bound,
+/// overflow a size, or prewarm for minutes. Pure arithmetic on the parsed
+/// config; checked arithmetic throughout, so the check itself cannot overflow.
+fn check_model_size(model: &NamModel, depth: usize) -> Result<(), String> {
+    if depth > MAX_DEPTH {
+        return Err(format!("models nested more than {MAX_DEPTH} deep"));
+    }
+    match &model.config {
+        ModelConfig::Lstm(c) => {
+            if c.hidden_size == 0 || c.hidden_size > MAX_LSTM_HIDDEN {
+                return Err(format!("LSTM hidden size {}", c.hidden_size));
+            }
+            if c.num_layers == 0 || c.num_layers > MAX_LSTM_LAYERS {
+                return Err(format!("{} LSTM layers", c.num_layers));
+            }
+            if c.input_size > MAX_CHANNELS {
+                return Err(format!("LSTM input size {}", c.input_size));
+            }
+        }
+        ModelConfig::Slimmable(c) => {
+            if c.submodels.is_empty() || c.submodels.len() > MAX_SUBMODELS {
+                return Err(format!("{} submodels", c.submodels.len()));
+            }
+            for sub in &c.submodels {
+                check_model_size(&sub.model, depth + 1)?;
+            }
+        }
+        ModelConfig::WaveNet(c) => {
+            if c.in_channels > MAX_CHANNELS {
+                return Err(format!("{} input channels", c.in_channels));
+            }
+            let mut field = 0usize;
+            let mut history = 0usize;
+            for array in &c.layers {
+                for &width in &[
+                    array.channels,
+                    array.bottleneck,
+                    array.head_size,
+                    array.input_size,
+                    array.condition_size,
+                ] {
+                    if width > MAX_CHANNELS {
+                        return Err(format!("a layer {width} channels wide"));
+                    }
+                }
+                if array.head_kernel_size == 0 || array.head_kernel_size > MAX_KERNEL {
+                    return Err(format!("head kernel size {}", array.head_kernel_size));
+                }
+                if array.kernel_sizes.len() != array.dilations.len() {
+                    return Err("kernel sizes and dilations of different lengths".into());
+                }
+                for (&kernel, &dilation) in array.kernel_sizes.iter().zip(&array.dilations) {
+                    if kernel == 0 || kernel > MAX_KERNEL {
+                        return Err(format!("kernel size {kernel}"));
+                    }
+                    if dilation == 0 || dilation > MAX_DILATION {
+                        return Err(format!("dilation {dilation}"));
+                    }
+                    // `kernel` and `dilation` are bounded above, so this
+                    // product fits a usize; the running sums are checked.
+                    let span = (kernel - 1) * dilation;
+                    let ring = (span + 1) * array.channels.max(array.bottleneck).max(1);
+                    field = field.checked_add(span).ok_or("receptive field overflows")?;
+                    history = history.checked_add(ring).ok_or("history overflows")?;
+                }
+                field = field
+                    .checked_add(array.head_kernel_size - 1)
+                    .ok_or("receptive field overflows")?;
+                if field > MAX_RECEPTIVE_FIELD {
+                    return Err(format!("a receptive field of {field} samples"));
+                }
+                if history > MAX_HISTORY_FLOATS {
+                    return Err(format!("{history} floats of convolution history"));
+                }
+            }
+            if let Some(head) = &c.post_stack_head {
+                if head.channels > MAX_CHANNELS || head.out_channels > MAX_CHANNELS {
+                    return Err(format!("a post-stack head {} channels wide", head.channels));
+                }
+                for &kernel in &head.kernel_sizes {
+                    if kernel == 0 || kernel > MAX_KERNEL {
+                        return Err(format!("head kernel size {kernel}"));
+                    }
+                    field = field
+                        .checked_add(kernel - 1)
+                        .ok_or("receptive field overflows")?;
+                }
+                if field > MAX_RECEPTIVE_FIELD {
+                    return Err(format!("a receptive field of {field} samples"));
+                }
+            }
+            if let Some(condition) = &c.condition_dsp {
+                check_model_size(condition, depth + 1)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn nam_family(nam: &NamModel, slimmable: bool) -> &'static str {
@@ -975,6 +1103,26 @@ mod tests {
         "weights": [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0],
         "sample_rate": 48000.0
     }"#;
+
+    #[test]
+    fn a_capture_shaped_to_exhaust_memory_is_refused_before_it_is_built() {
+        // The weight count does not depend on dilation, so these pass nam-rs'
+        // own check; built, they size a ring buffer by `(kernel-1)*dilation`
+        // and abort the host. Each must come back as an error instead.
+        for (from, to) in [
+            (r#""dilations": [1]"#, r#""dilations": [1000000000000]"#),
+            (r#""channels": 1"#, r#""channels": 100000"#),
+        ] {
+            let hostile = TINY_WAVENET_48K.replace(from, to);
+            assert_ne!(hostile, TINY_WAVENET_48K, "fixture edit {to} missed");
+            let err = prepare_nam_runtime(&hostile, "x".into(), 48_000.0, false, false)
+                .expect_err("a hostile shape must be refused");
+            assert!(matches!(err, NamLoadError::TooLarge(_)), "{to}: {err}");
+        }
+        // A deep but real receptive field still loads.
+        let deep = TINY_WAVENET_48K.replace(r#""dilations": [1]"#, r#""dilations": [512]"#);
+        assert!(prepare_nam_runtime(&deep, "ok".into(), 48_000.0, false, false).is_ok());
+    }
 
     /// A rate mismatch inside the adapter's range builds a runtime that runs
     /// the model at its own rate; only the adapter's own interpolation delay

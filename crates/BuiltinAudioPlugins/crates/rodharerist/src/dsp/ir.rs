@@ -434,19 +434,24 @@ pub fn prepare_ir_runtime(
 
     let source_sample_rate = audio.sample_rate;
     let stereo = audio.channels >= 2;
+    // Only the source frames that can reach the kept length are read and
+    // resampled. Resampling the whole file first let a long, low-rate WAV
+    // inside the size cap grow tenfold (gigabytes) before being cut.
+    let max_frames = ((MAX_IR_SECONDS as f64 * engine_sample_rate) as usize).max(PARTITION);
+    let source_frames = (max_frames as f64 * source_sample_rate / engine_sample_rate).ceil() as usize
+        // Cubic interpolation reads two frames past the last output.
+        + 4;
     let mut left = Vec::new();
-    let mut right = Vec::new();
-    audio.channel_into(0, &mut left);
-    audio.channel_into(1, &mut right);
-
+    audio.channel_prefix_into(0, source_frames, &mut left);
     let mut left = resample_offline(&left, source_sample_rate, engine_sample_rate);
     let mut right = if stereo {
+        let mut right = Vec::new();
+        audio.channel_prefix_into(1, source_frames, &mut right);
         resample_offline(&right, source_sample_rate, engine_sample_rate)
     } else {
         left.clone()
     };
 
-    let max_frames = ((MAX_IR_SECONDS as f64 * engine_sample_rate) as usize).max(PARTITION);
     let truncated =
         truncate_with_fade(&mut left, max_frames) | truncate_with_fade(&mut right, max_frames);
     if left.len() < MIN_IR_FRAMES {
@@ -1330,6 +1335,26 @@ mod tests {
             .info();
         assert!(info.truncated);
         assert_eq!(info.frames, (MAX_IR_SECONDS as f64 * SR) as usize);
+    }
+
+    #[test]
+    fn a_long_low_rate_file_is_cut_before_it_is_resampled() {
+        // 60 s at 4.8 kHz: resampled whole it would be 2.9M frames per side
+        // before the cut. Only the half second that is kept gets resampled,
+        // and the result matches a file that was short to begin with.
+        let rate = 4_800u32;
+        let tone = |n: usize| (n as f32 * 0.37).sin() * 0.5;
+        let long: Vec<f32> = (0..rate as usize * 60).map(tone).collect();
+        let short: Vec<f32> = (0..rate as usize).map(tone).collect();
+        let a = prepare_ir_runtime(&wav_file(&long, 1, rate), "long".into(), SR)
+            .expect("a long low-rate file still loads")
+            .info();
+        let b = prepare_ir_runtime(&wav_file(&short, 1, rate), "short".into(), SR)
+            .expect("a one-second file loads")
+            .info();
+        assert!(a.truncated && b.truncated);
+        assert_eq!(a.frames, (MAX_IR_SECONDS as f64 * SR) as usize);
+        assert_eq!(a.frames, b.frames);
     }
 
     #[test]
