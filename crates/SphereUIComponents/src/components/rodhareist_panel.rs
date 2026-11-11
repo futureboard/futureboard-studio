@@ -58,8 +58,9 @@ const CAPTION_TOP: f32 = 308.0;
 const BLOCK_REF: f32 = 72.0;
 /// Positions the chain shows before it scrolls.
 const CHAIN_VISIBLE: usize = 7;
-/// Taps further apart than this start a new tempo.
-const TAP_WINDOW: Duration = Duration::from_millis(2_000);
+/// Taps further apart than this start a new tempo. Delay A's longest time
+/// (1200 ms, 50 BPM): a slower tap would set a time the delay cannot play.
+const TAP_WINDOW: Duration = Duration::from_millis(1_200);
 const TAP_MIN: Duration = Duration::from_millis(250);
 
 fn accent() -> Rgba {
@@ -1944,7 +1945,7 @@ fn key_control(p: &Params, cx: &mut Cx, s: f32) -> AnyElement {
         .into_any_element()
 }
 
-/// A whole number with its sign, and a plain   at zero: `+3`, `−12`, `0`.
+/// A whole number with its sign, and a plain 0 at zero: `+3`, `−12`, `0`.
 fn signed_whole(value: f32, unit: &str) -> String {
     let whole = value.round();
     if whole == 0.0 {
@@ -2736,7 +2737,7 @@ fn home(
                 .gap(px(10.0 * s))
                 .h(px(96.0 * s))
                 .child(tuner_box(w, p, cx, s))
-                .child(tempo_box(p, cx, s))
+                .child(tempo_box(w, p, cx, s))
                 .child(line2_box(p, cx, s))
                 .child(master_box(p, cx, s)),
         );
@@ -3234,8 +3235,23 @@ fn tuner_page(w: &RodhareistEditorWindow, cx: &mut Cx, s: f32) -> Vec<AnyElement
     vec![page.into_any_element()]
 }
 
-fn tempo_box(p: &Params, cx: &mut Cx, s: f32) -> AnyElement {
-    let bpm = 60_000.0 / p.delay_time_ms.max(1.0);
+fn tempo_box(w: &RodhareistEditorWindow, p: &Params, cx: &mut Cx, s: f32) -> AnyElement {
+    // Synced, Delay A follows the host tempo: show that, and say a tap takes
+    // the delay back to its own time.
+    let synced = p.delay_sync != DelaySync::Free;
+    let bpm = if synced {
+        w.host_tempo().map(|bpm| bpm as f32).unwrap_or(120.0)
+    } else {
+        60_000.0 / p.delay_time_ms.max(1.0)
+    };
+    let (label, tip) = if synced {
+        (
+            "Delay A \u{b7} Sync",
+            "Tap a quarter note: sets Delay A's time and switches it from Sync to Free",
+        )
+    } else {
+        ("Delay A", "Tap a quarter note: sets Delay A's time")
+    };
     tile(s)
         .w(px(190.0 * s))
         .flex()
@@ -3248,7 +3264,7 @@ fn tempo_box(p: &Params, cx: &mut Cx, s: f32) -> AnyElement {
             div()
                 .flex()
                 .flex_col()
-                .child(caption("Delay A", 10.5, 0.1, SOFT, s))
+                .child(caption(label, 10.5, 0.1, SOFT, s))
                 .child(numbers(format!("{}", bpm.round()), 28.0, WHITE, s)),
         )
         .child(
@@ -3267,7 +3283,7 @@ fn tempo_box(p: &Params, cx: &mut Cx, s: f32) -> AnyElement {
                 .text_color(color(WHITE))
                 .cursor(gpui::CursorStyle::PointingHand)
                 .child(plate::tracked("Tap", 0.08))
-                .tooltip(fb_tooltip("Tap a quarter note: sets Delay A's time"))
+                .tooltip(fb_tooltip(tip))
                 .on_click(act(cx, |this, cx| this.tap_tempo(cx))),
         )
         .into_any_element()
@@ -4725,8 +4741,14 @@ fn settings_rows(w: &RodhareistEditorWindow, p: &Params) -> Vec<Row> {
                     help: "Level into the chain, before the first block".into(),
                     control: Control::Stepper(
                         plate::fmt_db(trim),
-                        Box::new(move |this, cx| this.set_wire_value("input_trim", trim - 0.5, cx)),
-                        Box::new(move |this, cx| this.set_wire_value("input_trim", trim + 0.5, cx)),
+                        // The DSP clamps the trim to its range; the stepper
+                        // must too, or the row reads a level that never plays.
+                        Box::new(move |this, cx| {
+                            this.set_wire_value("input_trim", step_trim(trim, -0.5), cx)
+                        }),
+                        Box::new(move |this, cx| {
+                            this.set_wire_value("input_trim", step_trim(trim, 0.5), cx)
+                        }),
                     ),
                 },
                 Row {
@@ -5084,6 +5106,14 @@ pub(crate) fn rodhareist_panel(
         );
     }
     plate_frame(s, children)
+}
+
+/// `trim` moved by `delta` dB, kept inside the input trim's range.
+fn step_trim(trim: f32, delta: f32) -> f32 {
+    match blocks::trim_spec("input_trim", "") {
+        Some(spec) => (trim + delta).clamp(spec.min, spec.max),
+        None => trim + delta,
+    }
 }
 
 /// The tempo two taps `interval` apart give, if they are close enough to

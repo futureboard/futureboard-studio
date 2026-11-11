@@ -235,6 +235,12 @@ fn preset_file_stem(name: &str) -> String {
 /// already has that name. Saving the loaded preset under its own name
 /// updates it, and a name the user was already warned about goes ahead.
 /// Saving under a different name never touches the preset that was loaded.
+/// Whether renaming `from` to `to` changes only letter case. Windows and macOS
+/// file names ignore case, so the two name the same file there.
+fn renames_case_only(from: &str, to: &str) -> bool {
+    from != to && from.to_lowercase() == to.to_lowercase()
+}
+
 fn save_needs_confirm(
     stem: &str,
     exists: bool,
@@ -557,6 +563,11 @@ impl RodhareistEditorWindow {
     pub(crate) fn tap_tempo(&mut self, cx: &mut Context<Self>) {
         let now = std::time::Instant::now();
         if let Some(interval) = tapped_interval(self.ui.last_tap, now) {
+            // A synced delay ignores its free time, so a tap would change
+            // nothing audible: the tap takes it back to Free.
+            if self.params.delay_sync != rodharerist::DelaySync::Free {
+                self.set_wire("delay_sync", rodharerist::DelaySync::Free as u8 as f32, cx);
+            }
             self.set_wire("delay_time", interval.as_secs_f32() * 1_000.0, cx);
         }
         self.ui.last_tap = Some(now);
@@ -989,6 +1000,16 @@ impl RodhareistEditorWindow {
         let dir = user_preset_dir();
         let from = dir.join(format!("{loaded_name}.pst"));
         let to = dir.join(format!("{stem}.pst"));
+        // "Rig" → "rig" names the same file on Windows and macOS: write it in
+        // place and only change the name's case. Treating it as another file
+        // wrote the preset and then deleted the file it had just written.
+        if renames_case_only(&loaded_name, &stem) {
+            self.replace_confirm = None;
+            self.write_preset_file(&from)?;
+            std::fs::rename(&from, &to).map_err(|e| format!("Could not rename the preset: {e}"))?;
+            self.renamed_user_preset(stem);
+            return Ok(());
+        }
         if to.exists() && !preset_file_is_ours(&to) {
             return Err(format!(
                 "A preset named {stem} belongs to another Rodhareist and was left unchanged"
@@ -1010,6 +1031,12 @@ impl RodhareistEditorWindow {
         if from != to && preset_file_is_ours(&from) {
             let _ = std::fs::remove_file(&from);
         }
+        self.renamed_user_preset(stem);
+        Ok(())
+    }
+
+    /// The loaded user preset now lives under `stem`.
+    fn renamed_user_preset(&mut self, stem: String) {
         self.preset = None;
         self.user_preset = Some(LoadedUserPreset {
             name: stem.clone(),
@@ -1017,7 +1044,6 @@ impl RodhareistEditorWindow {
         });
         self.preset_name.set_value(stem);
         self.refresh_user_presets();
-        Ok(())
     }
 
     fn write_preset_file(&self, path: &std::path::Path) -> Result<(), String> {
@@ -1781,6 +1807,36 @@ pub(crate) fn wire_value(params: &Params, id: &str) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_case_only_rename_is_recognised() {
+        assert!(renames_case_only("Rig", "rig"));
+        assert!(renames_case_only("Ébène", "ÉBÈNE"));
+        assert!(!renames_case_only("Rig", "Rig"));
+        assert!(!renames_case_only("Rig", "Rig 2"));
+    }
+
+    #[test]
+    fn a_case_only_rename_keeps_the_file() {
+        // The sequence the rename takes, against a real directory: write the
+        // preset in place under its old name, then rename to the new case.
+        // On a case-insensitive disk the old flow deleted the only copy.
+        let dir =
+            std::env::temp_dir().join(format!("rodhareist-case-rename-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let from = dir.join("Rig.pst");
+        let to = dir.join("rig.pst");
+        std::fs::write(&from, b"old").unwrap();
+        std::fs::write(&from, b"new").unwrap();
+        std::fs::rename(&from, &to).unwrap();
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["rig.pst".to_string()]);
+        assert_eq!(std::fs::read(&to).unwrap(), b"new");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn wire_diff_is_empty_for_identical_params() {
