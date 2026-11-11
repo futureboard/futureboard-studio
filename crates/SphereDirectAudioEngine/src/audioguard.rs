@@ -9,8 +9,10 @@
 //!   A plug-in that takes longer than one period on some blocks is then absorbed
 //!   by the ring instead of being heard as a dropout. As soon as anything turns
 //!   live the guard stops producing, the ring plays out, and the callback goes
-//!   back to rendering every block itself, so a monitored input or a played note
-//!   never waits behind the ring.
+//!   back to rendering every block itself, so a monitored input never waits
+//!   behind the ring. A played note is only seen when its command is drained
+//!   by a render: the first note after a pause can sit behind what the ring
+//!   already holds (at most the render-ahead depth); the ones after it do not.
 //! * **Denormal flushing.** Every thread that renders runs with flush-to-zero
 //!   and denormals-are-zero set, so a reverb or filter tail decaying into the
 //!   denormal range does not cost a hundred times its normal CPU.
@@ -36,7 +38,7 @@
 //! wakes the guard thread (`Thread::unpark`) once per block.
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -120,8 +122,7 @@ impl AudioguardLevel {
 /// Process-wide copy of the level for code that has no [`SharedState`] at
 /// hand (the per-insert checks inside the track chain). Written by
 /// [`set_process_level`], one relaxed load per use.
-static PROCESS_LEVEL: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(AudioguardLevel::Normal as u8);
+static PROCESS_LEVEL: AtomicU8 = AtomicU8::new(AudioguardLevel::Normal as u8);
 
 pub(crate) fn set_process_level(level: AudioguardLevel) {
     PROCESS_LEVEL.store(level as u8, Ordering::Relaxed);
@@ -366,12 +367,51 @@ impl InsertTrip {
 
 /// What the control side reads about one insert. Shared by every clone of
 /// the insert (the callback's graph and the control thread's mirror).
+///
+/// One atomic holds both the trip and whether it was reported, so the render
+/// re-arming an insert and the control thread reporting it cannot interleave
+/// into "reported, not tripped" — which hid the insert's next trip for good.
 #[derive(Debug, Default)]
 pub struct InsertHealth {
-    /// An [`InsertTrip`] as `u8`; set once by the render, never cleared there.
-    pub tripped: std::sync::atomic::AtomicU8,
-    /// The control side has reported the trip.
-    pub reported: AtomicBool,
+    /// An [`InsertTrip`] as `u8`, with [`Self::REPORTED`] set once the control
+    /// side has told the studio.
+    state: AtomicU8,
+}
+
+impl InsertHealth {
+    const REPORTED: u8 = 0x80;
+
+    /// Why the insert is bypassed, reported or not.
+    pub fn trip(&self) -> InsertTrip {
+        InsertTrip::from_u8(self.state.load(Ordering::Relaxed) & !Self::REPORTED)
+    }
+
+    /// Render side: a store, never a wait.
+    #[inline]
+    fn set(&self, trip: InsertTrip) {
+        self.state.store(trip as u8, Ordering::Relaxed);
+    }
+
+    /// The trip nobody has been told about yet, marked told. Control side.
+    /// `None` when there is none, or when the render changed it meanwhile
+    /// (the next poll reads the new state).
+    fn take_unreported(&self) -> Option<InsertTrip> {
+        let state = self.state.load(Ordering::Relaxed);
+        let trip = InsertTrip::from_u8(state);
+        if trip == InsertTrip::None {
+            // Not tripped, or already reported (`from_u8` maps both to None).
+            return None;
+        }
+        self.state
+            .compare_exchange(
+                state,
+                state | Self::REPORTED,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .ok()
+            .map(|_| trip)
+    }
 }
 
 /// An insert Audioguard bypassed, reported once to the studio.
@@ -406,6 +446,8 @@ impl AudioguardStatus {
     pub(crate) fn read(shared: &SharedState) -> Self {
         let rate = shared.sample_rate.load(Ordering::Relaxed).max(1) as f32;
         let engaged = shared.guard_engaged.load(Ordering::Relaxed);
+        // Read once: `overruns` must hold the same misses `ring_misses` shows.
+        let ring_misses = shared.guard_misses.load(Ordering::Relaxed);
         Self {
             level: AudioguardLevel::from_u8(shared.dropout_protection_mode.load(Ordering::Relaxed)),
             rendering_ahead: engaged,
@@ -414,10 +456,12 @@ impl AudioguardStatus {
             } else {
                 0.0
             },
-            ring_misses: shared.guard_misses.load(Ordering::Relaxed),
-            overruns: shared.callback_overruns.load(Ordering::Relaxed)
-                + shared.guard_misses.load(Ordering::Relaxed)
-                + shared.device_xruns.load(Ordering::Relaxed),
+            ring_misses,
+            overruns: shared
+                .callback_overruns
+                .load(Ordering::Relaxed)
+                .saturating_add(ring_misses)
+                .saturating_add(shared.device_xruns.load(Ordering::Relaxed)),
             output_mutes: shared.guard_output_mutes.load(Ordering::Relaxed),
             last_output_reason: OutputGuardReason::from_u8(
                 shared.guard_output_reason.load(Ordering::Relaxed),
@@ -433,11 +477,9 @@ pub(crate) fn take_tripped_inserts(runtime: &RuntimeProject) -> Vec<TrippedInser
     let mut tripped = Vec::new();
     for track in &runtime.tracks {
         for insert in &track.inserts {
-            let health = &insert.guard.health;
-            let reason = InsertTrip::from_u8(health.tripped.load(Ordering::Relaxed));
-            if reason == InsertTrip::None || health.reported.swap(true, Ordering::Relaxed) {
+            let Some(reason) = insert.guard.health.take_unreported() else {
                 continue;
-            }
+            };
             tripped.push(TrippedInsert {
                 track_id: track.id.clone(),
                 insert_id: insert.id.clone(),
@@ -469,22 +511,19 @@ const MISS_SHARE_TO_TRIP: u32 = 4;
 
 impl InsertGuard {
     /// Process again and watch afresh: the user switched the insert back on.
-    /// Realtime-safe (stores only); the old health stays tripped for whoever
-    /// still reads it, a new one would allocate.
+    /// Realtime-safe: stores only. The health is cleared in place (it is
+    /// shared with the control mirror; a new one would allocate).
     pub(crate) fn rearm(&mut self) {
         self.bypassed = false;
         self.invalid_run = 0;
         self.window_blocks = 0;
         self.window_misses = 0;
-        self.health
-            .tripped
-            .store(InsertTrip::None as u8, Ordering::Relaxed);
-        self.health.reported.store(false, Ordering::Relaxed);
+        self.health.set(InsertTrip::None);
     }
 
     fn trip(&mut self, why: InsertTrip) {
         self.bypassed = true;
-        self.health.tripped.store(why as u8, Ordering::Relaxed);
+        self.health.set(why);
     }
 
     /// Check what the insert just wrote. A non-finite block is silenced here,
@@ -680,6 +719,11 @@ struct GuardInner {
     core: Mutex<RenderCore>,
     ring: GuardRing,
     channels: usize,
+    /// The stream's own rate ([`RenderCore::sample_rate`]). Not the shared
+    /// one: that is published only after the stream is open, so its first
+    /// blocks would size the ring and the callback's wait from the previous
+    /// stream's rate, or from zero.
+    sample_rate: u32,
     shared: Arc<SharedState>,
     /// Device block size the callback last asked for (frames).
     block_frames: AtomicUsize,
@@ -706,10 +750,12 @@ impl GuardedRenderer {
     /// channel count; it does not change for the life of the stream.
     pub fn new(core: RenderCore, channels: usize, shared: Arc<SharedState>) -> Self {
         let channels = channels.max(1);
+        let sample_rate = core.sample_rate;
         let inner = Arc::new(GuardInner {
             core: Mutex::new(core),
             ring: GuardRing::new(channels),
             channels,
+            sample_rate,
             shared,
             block_frames: AtomicUsize::new(0),
             stop: AtomicBool::new(false),
@@ -733,12 +779,6 @@ impl GuardedRenderer {
         }
     }
 
-    /// Run `f` on the render state, waiting until the guard finishes the
-    /// block it is on. Never from the device callback.
-    pub fn with_core<R>(&self, f: impl FnOnce(&mut RenderCore) -> R) -> R {
-        f(&mut self.inner.core.lock())
-    }
-
     /// Fill one interleaved device block, in render order.
     ///
     /// Plays what the ring holds; for what is still missing it takes the
@@ -759,6 +799,10 @@ impl GuardedRenderer {
         let channels = inner.channels;
         let shared = &inner.shared;
         let need = out.len() / channels;
+        // Whole frames only. A ragged tail (no backend passes one) is silence
+        // rather than whatever the buffer held when the ring supplies the block.
+        let (out, tail) = out.split_at_mut(need * channels);
+        tail.fill(0.0);
         inner.block_frames.store(need, Ordering::Relaxed);
         let mut filled = take_from_ring(inner, front_offset, next_block, out, 0, need);
         let mut wait_until = None;
@@ -784,7 +828,7 @@ impl GuardedRenderer {
             // needs. Give it part of the period, then fall back to silence.
             let now = Instant::now();
             let until =
-                *wait_until.get_or_insert_with(|| now + block_period(need, shared).mul_f32(0.5));
+                *wait_until.get_or_insert_with(|| now + block_period(need, inner.sample_rate) / 2);
             if now >= until {
                 break;
             }
@@ -884,9 +928,8 @@ impl Drop for GuardedRenderer {
 }
 
 #[inline]
-fn block_period(frames: usize, shared: &SharedState) -> Duration {
-    let rate = shared.sample_rate.load(Ordering::Relaxed).max(1) as u64;
-    Duration::from_nanos(frames as u64 * 1_000_000_000 / rate)
+fn block_period(frames: usize, sample_rate: u32) -> Duration {
+    Duration::from_nanos(frames as u64 * 1_000_000_000 / u64::from(sample_rate.max(1)))
 }
 
 /// How long after the last played note or controller the guard stays off.
@@ -905,119 +948,160 @@ fn shared_allows_render_ahead(shared: &SharedState) -> bool {
         && shared.jam_bus.monitor_publish().is_none()
 }
 
+/// Waits of the guard thread. The device callback unparks it once per block,
+/// so these only bound how long it sleeps through a stalled device, or through
+/// a change of state nothing wakes it for.
+const WAIT_RING_FULL: Duration = Duration::from_millis(2);
+const WAIT_CORE_BUSY: Duration = Duration::from_millis(2);
+const WAIT_LIVE_TRACKS: Duration = Duration::from_millis(5);
+const WAIT_NOT_ALLOWED: Duration = Duration::from_millis(10);
+
+/// Holds render-ahead off for [`LIVE_HOLD`] after each played note or
+/// controller, so a performance is heard as it is played.
+struct LiveHold {
+    seen_events: u64,
+    until: Option<Instant>,
+}
+
+impl LiveHold {
+    fn new(shared: &SharedState) -> Self {
+        Self {
+            seen_events: shared.live_events.load(Ordering::Relaxed),
+            until: None,
+        }
+    }
+
+    /// Whether someone played within the hold. Call once per guard pass.
+    fn poll(&mut self, shared: &SharedState) -> bool {
+        let events = shared.live_events.load(Ordering::Relaxed);
+        if events != self.seen_events {
+            self.seen_events = events;
+            self.until = Some(Instant::now() + LIVE_HOLD);
+        }
+        self.until.is_some_and(|until| Instant::now() < until)
+    }
+}
+
+impl GuardInner {
+    /// The device block size and the ring depth to keep, both in frames, or
+    /// `None` while render-ahead is off: the level, the transport, something
+    /// live, a block too large to hold, or an earlier failure.
+    fn render_ahead_plan(&self, live_hold: bool) -> Option<(usize, usize)> {
+        if live_hold
+            || self.failed.load(Ordering::Relaxed)
+            || !shared_allows_render_ahead(&self.shared)
+        {
+            return None;
+        }
+        let block = self.block_frames.load(Ordering::Relaxed);
+        if block == 0 || block > MAX_GUARD_BLOCK_FRAMES {
+            return None;
+        }
+        let level =
+            AudioguardLevel::from_u8(self.shared.dropout_protection_mode.load(Ordering::Relaxed));
+        let target = level.render_ahead_frames(block, self.sample_rate);
+        (target > 0).then_some((block, target))
+    }
+
+    /// Render one `block`-frame block ahead into the ring, unless the ring
+    /// already holds `target` frames. Returns how long to wait before the next
+    /// pass, or `None` to go straight on to the next block. Guard thread only:
+    /// it is the ring's one producer.
+    fn render_block_ahead(&self, block: usize, target: usize) -> Option<Duration> {
+        let shared = &self.shared;
+        let pending = shared.guard_pending_frames.load(Ordering::Acquire) as usize;
+        if self.ring.len() >= GUARD_SLOTS - 1 || pending >= target {
+            return Some(WAIT_RING_FULL);
+        }
+        // Never wait on the lock: a waiter parked on it would make the
+        // callback's unlock wake it from the audio thread. The callback holds
+        // it only while it renders a block, and unparks this thread after.
+        let Some(mut core) = self.core.try_lock() else {
+            return Some(WAIT_CORE_BUSY);
+        };
+        if core.has_live_tracks() {
+            drop(core);
+            shared.guard_engaged.store(false, Ordering::Relaxed);
+            return Some(WAIT_LIVE_TRACKS);
+        }
+        // Counted as pending before it renders, so the playhead keeps reading
+        // the played cursor while the graph's cursor moves on. The first block
+        // ahead starts from where the device is.
+        if shared.guard_pending_frames.load(Ordering::Acquire) == 0 {
+            shared.guard_played_cursor.store(
+                shared.position_samples.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+        }
+        shared
+            .guard_pending_frames
+            .fetch_add(block as u64, Ordering::AcqRel);
+        let tail = self.ring.tail.load(Ordering::Relaxed);
+        // SAFETY: `tail - head < GUARD_SLOTS - 1` was checked above, this
+        // thread is the only one that moves `tail`, and the consumer only ever
+        // moves `head` forward: the consumer is not reading this slot, and
+        // nothing else writes slots.
+        let slot = unsafe { &mut *self.ring.slots[tail % GUARD_SLOTS].get() };
+        let samples = &mut slot.samples[..block * self.channels];
+        let sequence = core.blocks_rendered;
+        core.local.guard_rendering = true;
+        crate::plugin_bridge::set_render_ahead_grace(block_period(block, self.sample_rate));
+        // Only catches in builds that unwind. The release profile aborts on
+        // panic, there as in the device callback.
+        let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            core.render(samples, self.channels, shared);
+        }));
+        crate::plugin_bridge::set_render_ahead_grace(Duration::ZERO);
+        core.local.guard_rendering = false;
+        if rendered.is_err() {
+            shared
+                .guard_pending_frames
+                .fetch_sub(block as u64, Ordering::AcqRel);
+            self.failed.store(true, Ordering::Relaxed);
+            shared.guard_engaged.store(false, Ordering::Relaxed);
+            eprintln!(
+                "[Audioguard] a render ahead panicked; rendering in the callback from now on"
+            );
+            return None;
+        }
+        slot.frames = block;
+        slot.start = core.local.last_block_start;
+        slot.playing = core.local.last_block_playing;
+        slot.next_position = shared.position_samples.load(Ordering::Relaxed);
+        slot.sequence = sequence;
+        // Published before the render state is let go. Unlocking first left a
+        // window in which the ring looked empty to a callback that already
+        // held the render state: it rendered the next block inline and played
+        // this one after it (audit #408).
+        self.ring
+            .tail
+            .store(tail.wrapping_add(1), Ordering::Release);
+        drop(core);
+        shared.guard_engaged.store(true, Ordering::Relaxed);
+        shared
+            .guard_ahead_frames
+            .store(target as u64, Ordering::Relaxed);
+        None
+    }
+}
+
 fn guard_thread(inner: Arc<GuardInner>) {
     flush_denormals_on_this_thread();
     crate::parallel::promote_audio_thread();
-    let shared = Arc::clone(&inner.shared);
-    let channels = inner.channels;
-    let mut seen_live_events = shared.live_events.load(Ordering::Relaxed);
-    let mut live_until: Option<Instant> = None;
-    loop {
-        if inner.stop.load(Ordering::Acquire) {
-            break;
-        }
-        // Played notes and controllers hold render-ahead off for a while, so
-        // a performance is heard as it is played.
-        let live_events = shared.live_events.load(Ordering::Relaxed);
-        if live_events != seen_live_events {
-            seen_live_events = live_events;
-            live_until = Some(Instant::now() + LIVE_HOLD);
-        }
-        let live_hold = live_until.is_some_and(|until| Instant::now() < until);
-        let level =
-            AudioguardLevel::from_u8(shared.dropout_protection_mode.load(Ordering::Relaxed));
-        let block = inner.block_frames.load(Ordering::Relaxed);
-        let sample_rate = shared.sample_rate.load(Ordering::Relaxed);
-        let target = if block > 0 && block <= MAX_GUARD_BLOCK_FRAMES {
-            level.render_ahead_frames(block, sample_rate)
-        } else {
-            0
+    let shared = &inner.shared;
+    let mut live = LiveHold::new(shared);
+    while !inner.stop.load(Ordering::Acquire) {
+        let live_hold = live.poll(shared);
+        let wait = match inner.render_ahead_plan(live_hold) {
+            Some((block, target)) => inner.render_block_ahead(block, target),
+            None => {
+                shared.guard_engaged.store(false, Ordering::Relaxed);
+                Some(WAIT_NOT_ALLOWED)
+            }
         };
-        let allowed = target > 0
-            && !live_hold
-            && !inner.failed.load(Ordering::Relaxed)
-            && shared_allows_render_ahead(&shared);
-        let pending = shared.guard_pending_frames.load(Ordering::Acquire) as usize;
-        let room = inner.ring.len() < GUARD_SLOTS - 1;
-        if allowed && room && pending < target {
-            // Never wait on the lock: a waiter parked on it would make the
-            // callback's unlock wake it from the audio thread. The callback
-            // holds it only while it renders a block, and unparks this thread
-            // when it is done.
-            let Some(mut core) = inner.core.try_lock() else {
-                std::thread::park_timeout(Duration::from_millis(2));
-                continue;
-            };
-            if core.has_live_tracks() {
-                drop(core);
-                shared.guard_engaged.store(false, Ordering::Relaxed);
-                std::thread::park_timeout(Duration::from_millis(5));
-                continue;
-            }
-            // Counted as pending before it renders, so the playhead keeps
-            // reading the played cursor while the graph's cursor moves on. The
-            // first block ahead starts from where the device is.
-            if shared.guard_pending_frames.load(Ordering::Acquire) == 0 {
-                shared.guard_played_cursor.store(
-                    shared.position_samples.load(Ordering::Relaxed),
-                    Ordering::Relaxed,
-                );
-            }
-            shared
-                .guard_pending_frames
-                .fetch_add(block as u64, Ordering::AcqRel);
-            let tail = inner.ring.tail.load(Ordering::Relaxed);
-            // SAFETY: `tail - head < GUARD_SLOTS - 1` (checked above, and the
-            // consumer only ever moves `head` forward), so the consumer is not
-            // reading this slot; only this thread writes slots.
-            let slot = unsafe { &mut *inner.ring.slots[tail % GUARD_SLOTS].get() };
-            let samples = &mut slot.samples[..block * channels];
-            let sequence = core.blocks_rendered;
-            core.local.guard_rendering = true;
-            let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                crate::plugin_bridge::set_render_ahead_grace(block_period(block, &shared));
-                core.render(samples, channels, &shared);
-                crate::plugin_bridge::set_render_ahead_grace(Duration::ZERO);
-            }));
-            core.local.guard_rendering = false;
-            if rendered.is_err() {
-                crate::plugin_bridge::set_render_ahead_grace(Duration::ZERO);
-                shared
-                    .guard_pending_frames
-                    .fetch_sub(block as u64, Ordering::AcqRel);
-                inner.failed.store(true, Ordering::Relaxed);
-                shared.guard_engaged.store(false, Ordering::Relaxed);
-                eprintln!(
-                    "[Audioguard] a render ahead panicked; rendering in the callback from now on"
-                );
-                continue;
-            }
-            slot.frames = block;
-            slot.start = core.local.last_block_start;
-            slot.playing = core.local.last_block_playing;
-            slot.next_position = shared.position_samples.load(Ordering::Relaxed);
-            slot.sequence = sequence;
-            // Published before the render state is let go. Unlocking first
-            // left a window in which the ring looked empty to a callback that
-            // already held the render state: it rendered the next block inline
-            // and played this one after it (audit #408).
-            inner
-                .ring
-                .tail
-                .store(tail.wrapping_add(1), Ordering::Release);
-            drop(core);
-            shared.guard_engaged.store(true, Ordering::Relaxed);
-            shared
-                .guard_ahead_frames
-                .store(target as u64, Ordering::Relaxed);
-            continue;
+        if let Some(wait) = wait {
+            std::thread::park_timeout(wait);
         }
-        if !allowed {
-            shared.guard_engaged.store(false, Ordering::Relaxed);
-        }
-        // Woken by every device block; the timeout only covers a stalled
-        // device.
-        std::thread::park_timeout(Duration::from_millis(if allowed { 2 } else { 10 }));
     }
     shared.guard_engaged.store(false, Ordering::Relaxed);
 }
@@ -1265,6 +1349,7 @@ mod tests {
             core: Mutex::new(core),
             ring: GuardRing::new(2),
             channels: 2,
+            sample_rate: 48_000,
             shared: Arc::clone(&shared),
             block_frames: AtomicUsize::new(0),
             stop: AtomicBool::new(false),
@@ -1300,11 +1385,18 @@ mod tests {
         let (core, _tx) = playing_core();
         let mut guarded = GuardedRenderer::new(core, 2, Arc::clone(&shared));
         let mut block = vec![0.0f32; BLOCK * 2];
-        for _ in 0..40 {
+        // Until the guard is seen ahead, not at one fixed instant: with the
+        // whole suite running, the guard thread can be late to its turn.
+        let mut ahead = false;
+        for _ in 0..400 {
             std::thread::sleep(Duration::from_millis(1));
             guarded.render(&mut block);
+            if shared.guard_pending_frames.load(Ordering::Acquire) > 0 {
+                ahead = true;
+                break;
+            }
         }
-        assert!(shared.guard_pending_frames.load(Ordering::Acquire) > 0);
+        assert!(ahead, "the guard never rendered ahead");
 
         shared.monitor_enabled_any.store(true, Ordering::Relaxed);
         let mut drained = false;
@@ -1335,19 +1427,91 @@ mod tests {
             guard.check_output(&mut left, &mut right);
         }
         assert!(guard.bypassed);
-        shared_health.reported.store(true, Ordering::Relaxed);
+        assert_eq!(
+            shared_health.take_unreported(),
+            Some(InsertTrip::InvalidOutput)
+        );
+        assert_eq!(shared_health.take_unreported(), None, "reported once");
+        assert_eq!(shared_health.trip(), InsertTrip::InvalidOutput);
         guard.rearm();
         assert!(!guard.bypassed);
-        assert_eq!(
-            InsertTrip::from_u8(shared_health.tripped.load(Ordering::Relaxed)),
-            InsertTrip::None
-        );
-        assert!(!shared_health.reported.load(Ordering::Relaxed));
+        assert_eq!(shared_health.trip(), InsertTrip::None);
+        assert_eq!(shared_health.take_unreported(), None);
         // Watched afresh: one bad block alone does not trip it again.
         let mut left = vec![f32::NAN; 8];
         let mut right = vec![0.0f32; 8];
         guard.check_output(&mut left, &mut right);
         assert!(!guard.bypassed);
+    }
+
+    /// The trip after a re-arm is reported again, whichever way the render's
+    /// re-arm and the control thread's report interleaved. With two atomics a
+    /// report that landed inside the re-arm left "reported, not tripped", and
+    /// the next bypass was never shown in the project.
+    #[test]
+    fn a_trip_after_a_rearm_is_reported_again() {
+        let mut guard = InsertGuard::default();
+        let health = Arc::clone(&guard.health);
+        guard.trip(InsertTrip::InvalidOutput);
+        assert_eq!(health.take_unreported(), Some(InsertTrip::InvalidOutput));
+        guard.rearm();
+        guard.trip(InsertTrip::MissedDeadlines);
+        assert_eq!(health.take_unreported(), Some(InsertTrip::MissedDeadlines));
+        assert_eq!(health.take_unreported(), None);
+
+        // A re-arm between the control side's read and its mark: the stale
+        // report is dropped, and nothing is left marked.
+        guard.trip(InsertTrip::InvalidOutput);
+        let stale = health.state.load(Ordering::Relaxed);
+        guard.rearm();
+        assert!(health
+            .state
+            .compare_exchange(
+                stale,
+                stale | InsertHealth::REPORTED,
+                Ordering::Relaxed,
+                Ordering::Relaxed
+            )
+            .is_err());
+        guard.trip(InsertTrip::InvalidOutput);
+        assert_eq!(health.take_unreported(), Some(InsertTrip::InvalidOutput));
+    }
+
+    /// The ring and the callback's wait are sized from the stream's own rate,
+    /// not the shared one, which is stale or zero until the stream is open.
+    #[test]
+    fn render_ahead_is_planned_from_the_streams_own_rate() {
+        let shared = playing_shared();
+        shared.sample_rate.store(0, Ordering::Relaxed);
+        let (core, _tx) = playing_core();
+        let inner = GuardInner {
+            core: Mutex::new(core),
+            ring: GuardRing::new(2),
+            channels: 2,
+            sample_rate: 48_000,
+            shared: Arc::clone(&shared),
+            block_frames: AtomicUsize::new(256),
+            stop: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+        };
+        assert_eq!(inner.render_ahead_plan(false), Some((256, 768)));
+        assert_eq!(inner.render_ahead_plan(true), None, "held off while played");
+        inner
+            .block_frames
+            .store(MAX_GUARD_BLOCK_FRAMES + 1, Ordering::Relaxed);
+        assert_eq!(inner.render_ahead_plan(false), None);
+        assert_eq!(block_period(480, 48_000), Duration::from_millis(10));
+    }
+
+    /// A buffer that is not whole frames gets its ragged tail silenced.
+    #[test]
+    fn a_ragged_tail_is_silence() {
+        let shared = playing_shared();
+        let (core, _tx) = playing_core();
+        let mut guarded = GuardedRenderer::new(core, 2, Arc::clone(&shared));
+        let mut out = vec![9.0f32; 64 * 2 + 1];
+        guarded.render(&mut out);
+        assert_eq!(out[64 * 2], 0.0);
     }
 
     #[test]
@@ -1366,10 +1530,7 @@ mod tests {
             );
             assert_eq!(guard.bypassed, round + 1 == INVALID_RUN_TO_TRIP);
         }
-        assert_eq!(
-            InsertTrip::from_u8(guard.health.tripped.load(Ordering::Relaxed)),
-            InsertTrip::InvalidOutput
-        );
+        assert_eq!(guard.health.trip(), InsertTrip::InvalidOutput);
         // A single bad block among good ones does not trip a fresh insert.
         let mut fresh = InsertGuard::default();
         let mut l = vec![f32::INFINITY; 8];

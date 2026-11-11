@@ -173,8 +173,11 @@ impl StudioLayout {
         };
         let status = engine.audioguard_status();
 
-        if status.output_mutes > self.audioguard.last_output_mutes {
-            self.audioguard.last_output_mutes = status.output_mutes;
+        // The count belongs to one engine. When it goes down the engine was
+        // replaced: follow it, or every mute up to the old count goes unsaid.
+        let muted_again = status.output_mutes > self.audioguard.last_output_mutes;
+        self.audioguard.last_output_mutes = status.output_mutes;
+        if muted_again {
             let why = match status.last_output_reason {
                 DirectAudio::audioguard::OutputGuardReason::Burst => "a burst far above full scale",
                 _ => "invalid samples",
@@ -219,6 +222,16 @@ impl StudioLayout {
             recent.pop_front();
         }
         let missed: u64 = recent.iter().map(|(_, count)| count).sum();
+        // A dialog the system closed (Alt+F4) never answered: without this the
+        // warning would stay "up" and never show again.
+        if self
+            .audioguard
+            .overload_dialog
+            .is_some_and(|dialog| dialog.update(cx, |_, _, _| ()).is_err())
+        {
+            self.audioguard.overload_dialog = None;
+            self.audioguard.overload_quiet_until = Some(now + OVERLOAD_QUIET);
+        }
         let recording = self.is_recording_active(cx);
         if !is_overloaded(missed, recording)
             || !self.settings.read(cx).current.playback.warn_on_overload
