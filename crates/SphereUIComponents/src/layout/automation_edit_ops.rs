@@ -35,7 +35,7 @@ pub(crate) struct AutomationClipboardState {
 impl StudioLayout {
     /// `(track, lane)` holding the selected points, or — with `for_paste` — the
     /// selected track's active lane when none are selected.
-    fn automation_edit_lane(
+    pub(super) fn automation_edit_lane(
         &self,
         for_paste: bool,
         cx: &Context<Self>,

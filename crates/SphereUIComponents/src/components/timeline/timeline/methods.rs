@@ -382,6 +382,7 @@ impl Timeline {
             ara_notes: Default::default(),
             automation_drag: None,
             automation_curve_drag: None,
+            automation_value_edit: None,
             automation_marquee: None,
             automation_paint: None,
             automation_hover: None,
@@ -492,6 +493,7 @@ impl Timeline {
             ara_notes: Default::default(),
             automation_drag: None,
             automation_curve_drag: None,
+            automation_value_edit: None,
             automation_marquee: None,
             automation_paint: None,
             automation_hover: None,
@@ -3276,6 +3278,8 @@ impl Timeline {
             AutomationCurveDrag, AutomationHover, AutomationMarquee, AutomationPointDrag,
             TrackLaneMode, AUTOMATION_LANE_PAD, AUTOMATION_SUBLANE_HEIGHT,
         };
+        // A press on a lane ends an open value field the way Enter would.
+        self.commit_automation_value_edit(cx);
         self.state.select_track(track_id);
         if self.state.track_lane_mode(track_id) != TrackLaneMode::Automation {
             return;
@@ -3300,6 +3304,11 @@ impl Timeline {
             .state
             .automation_point_at(track_id, &lane_id, hit_beat, value, beat_tol, value_tol)
         {
+            // A double-click on a point types its value instead of dragging it.
+            if double_click && !additive {
+                self.open_automation_value_edit(track_id, &lane_id, point_id, cx);
+                return;
+            }
             // A press on a point that is already part of a selection keeps the
             // selection, so the whole group can be dragged — collapsing it here
             // threw away every marquee the moment a point was grabbed. A click

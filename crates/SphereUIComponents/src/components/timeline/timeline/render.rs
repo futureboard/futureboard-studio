@@ -1283,6 +1283,12 @@ impl Render for Timeline {
                     payload.4,
                 );
                 match action {
+                    AutomationLaneAction::EditPointValue(point_id) => {
+                        this.open_automation_value_edit(&track_id, &lane_id, point_id, cx);
+                    }
+                    AutomationLaneAction::CommitPointValue => {
+                        this.commit_automation_value_edit(cx);
+                    }
                     AutomationLaneAction::PickTarget => {
                         // The lane name is a parameter selector: the same picker
                         // the control row opens, anchored at the click.
@@ -2908,6 +2914,14 @@ impl Render for Timeline {
                 on_automation_control.clone(),
                 self.automation_marquee.as_ref(),
                 self.automation_hover.as_ref(),
+                self.automation_value_edit().map(|edit| {
+                    crate::components::timeline::automation_lane::AutomationValueField {
+                        track_id: &edit.track_id,
+                        lane_id: &edit.lane_id,
+                        point_id: edit.point_id,
+                        input: &edit.input,
+                    }
+                }),
                 match self.arrangement_surface.as_ref() {
                     Some(surface) => gpui::AnyView::from(surface.clone())
                         .cached(

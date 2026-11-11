@@ -7,6 +7,9 @@ pub enum RuntimeAutomationCurve {
     Linear,
     Hold,
     Smooth,
+    /// Steps to the next point's value at the segment's start and holds it:
+    /// Hold's mirror.
+    Jump,
 }
 
 impl RuntimeAutomationCurve {
@@ -15,6 +18,7 @@ impl RuntimeAutomationCurve {
         match tag {
             1 => Self::Hold,
             2 => Self::Smooth,
+            3 => Self::Jump,
             _ => Self::Linear,
         }
     }
@@ -25,6 +29,7 @@ impl RuntimeAutomationCurve {
             Self::Linear => 0,
             Self::Hold => 1,
             Self::Smooth => 2,
+            Self::Jump => 3,
         }
     }
 }
@@ -200,7 +205,9 @@ impl RuntimeAutomationLane {
 /// the bounced curve, and the drawn curve agree exactly (no visual-only curves).
 ///
 /// `curve_tag`: `1` = Hold (stepped, holds the left value), `2` = Smooth
-/// (S-curve), anything else = Linear shaped by `tension`.
+/// (S-curve), `3` = Jump (steps to the right value at once and holds it),
+/// anything else = Linear shaped by `tension`. An unknown tag — a project from
+/// a newer build — plays as Linear.
 ///
 /// `tension` in `[-1, 1]`:
 /// - Linear: `0` = straight line; `> 0` eases in (exponential, slow start);
@@ -209,13 +216,21 @@ impl RuntimeAutomationLane {
 ///   steeper middle, towards a step at the midpoint); `< 0` softens it
 ///   (steeper ends, a flatter middle, an inverted S). Always symmetric about
 ///   the segment's midpoint, always monotonic.
-/// - Hold: ignored.
+/// - Hold, Jump: ignored.
 #[inline]
 pub fn automation_curve_factor(curve_tag: u8, tension: f32, t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     match curve_tag {
         // Hold: stay at the left value for the whole segment (stepped).
         1 => 0.0,
+        // Jump: the right value from the first moment after the left point.
+        3 => {
+            if t > 0.0 {
+                1.0
+            } else {
+                0.0
+            }
+        }
         // Smooth: smoothstep over a symmetric warp of `t`. The warp is the
         // identity at tension 0, so a pre-tension project draws and plays
         // exactly the S it always did.

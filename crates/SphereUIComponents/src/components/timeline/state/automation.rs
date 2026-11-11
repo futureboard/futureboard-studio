@@ -303,6 +303,8 @@ pub enum AutomationCurve {
     /// S-curve, bendable by tension: sharper (`> 0`) or softer (`< 0`). See
     /// `DirectAudio::automation_curve_factor`.
     Smooth,
+    /// Steps to the next point's value at once and holds it: Hold's mirror.
+    Jump,
 }
 
 impl Default for AutomationCurve {
@@ -317,13 +319,16 @@ impl AutomationCurve {
             AutomationCurve::Linear => 0,
             AutomationCurve::Hold => 1,
             AutomationCurve::Smooth => 2,
+            AutomationCurve::Jump => 3,
         }
     }
 
+    /// An unknown tag (a project saved by a newer build) reads as Linear.
     pub fn from_tag(tag: u8) -> Self {
         match tag {
             1 => AutomationCurve::Hold,
             2 => AutomationCurve::Smooth,
+            3 => AutomationCurve::Jump,
             _ => AutomationCurve::Linear,
         }
     }
@@ -333,13 +338,21 @@ impl AutomationCurve {
             AutomationCurve::Linear => "Linear",
             AutomationCurve::Hold => "Hold",
             AutomationCurve::Smooth => "Smooth",
+            AutomationCurve::Jump => "Jump",
         }
+    }
+
+    /// A step: no shape between its points, so tension means nothing.
+    pub fn is_step(self) -> bool {
+        matches!(self, AutomationCurve::Hold | AutomationCurve::Jump)
     }
 }
 
-/// A segment shape the Curve menu offers: a curve kind and its tension. The
-/// segment can still be bent further by dragging it; these are starting
-/// points that cover the common moves.
+/// A segment shape the Curve menu offers: a curve kind and its tension. Every
+/// one is a starting point: dragging the segment (Alt+drag, or a plain drag
+/// with the Pointer) bends it further — an S stays an S and sharpens or
+/// softens, a line curves into an ease in or out, and a step (Hold, Jump)
+/// becomes a curved line, since a step has no shape to bend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutomationCurveShape {
     Linear,
@@ -350,20 +363,28 @@ pub enum AutomationCurveShape {
     SCurve,
     /// A steeper S that holds near both ends.
     SharpS,
+    /// A softened, inverted S: moves fast at both ends, eases through the
+    /// middle.
+    SoftS,
+    /// Holds the value, then steps at the next point.
     Hold,
+    /// Steps to the next value at once, then holds it.
+    Jump,
 }
 
-/// Tension of the Slow, Fast and Sharp S presets.
+/// Tension of the Slow, Fast, Sharp S and Soft S presets.
 const CURVE_PRESET_TENSION: f32 = 0.6;
 
 impl AutomationCurveShape {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 8] = [
         Self::Linear,
         Self::Slow,
         Self::Fast,
         Self::SCurve,
         Self::SharpS,
+        Self::SoftS,
         Self::Hold,
+        Self::Jump,
     ];
 
     /// The curve kind and tension a segment takes for this shape.
@@ -374,16 +395,18 @@ impl AutomationCurveShape {
             Self::Fast => (AutomationCurve::Linear, -CURVE_PRESET_TENSION),
             Self::SCurve => (AutomationCurve::Smooth, 0.0),
             Self::SharpS => (AutomationCurve::Smooth, CURVE_PRESET_TENSION),
+            Self::SoftS => (AutomationCurve::Smooth, -CURVE_PRESET_TENSION),
             Self::Hold => (AutomationCurve::Hold, 0.0),
+            Self::Jump => (AutomationCurve::Jump, 0.0),
         }
     }
 
     /// The shape a segment with `curve` and `tension` is, if it is one of
-    /// these. Hold ignores tension.
+    /// these. A step ignores tension.
     pub fn of(curve: AutomationCurve, tension: f32) -> Option<Self> {
         Self::ALL.into_iter().find(|shape| {
             let (c, t) = shape.curve_and_tension();
-            c == curve && (curve == AutomationCurve::Hold || (t - tension).abs() < 1.0e-3)
+            c == curve && (curve.is_step() || (t - tension).abs() < 1.0e-3)
         })
     }
 
@@ -394,7 +417,9 @@ impl AutomationCurveShape {
             Self::Fast => "Fast (ease out)",
             Self::SCurve => "S-Curve",
             Self::SharpS => "Sharp S",
-            Self::Hold => "Hold (step)",
+            Self::SoftS => "Soft S",
+            Self::Hold => "Hold (step at end)",
+            Self::Jump => "Jump (step at start)",
         }
     }
 
@@ -406,7 +431,9 @@ impl AutomationCurveShape {
             Self::Fast => "automation:curve:fast",
             Self::SCurve => "automation:curve:smooth",
             Self::SharpS => "automation:curve:sharp-s",
+            Self::SoftS => "automation:curve:soft-s",
             Self::Hold => "automation:curve:hold",
+            Self::Jump => "automation:curve:jump",
         }
     }
 
@@ -493,6 +520,108 @@ impl AutomationTarget {
                 if norm >= 0.5 { "Bypassed" } else { "Active" }.to_string()
             }
             AutomationTarget::PluginParameter { .. } => format!("{:.0}%", norm * 100.0),
+        }
+    }
+
+    /// What a point's value field starts with: [`Self::format_value`] without
+    /// the unit, so the text selected on open is just the number to retype.
+    pub fn edit_text(&self, norm: f32) -> String {
+        let norm = norm.clamp(0.0, 1.0);
+        match self {
+            AutomationTarget::TrackVolume | AutomationTarget::SendLevel { .. } => {
+                volume::format_db(norm)
+            }
+            AutomationTarget::PluginParameter { .. } => {
+                let percent = norm * 100.0;
+                if (percent - percent.round()).abs() < 0.05 {
+                    format!("{percent:.0}")
+                } else {
+                    format!("{percent:.1}")
+                }
+            }
+            _ => self.format_value(norm),
+        }
+    }
+
+    /// The normalized value a typed point value stands for, in the target's
+    /// own unit — the inverse of [`Self::format_value`] / [`Self::edit_text`].
+    /// `None` when the text is not a value (nothing is changed then).
+    ///
+    /// - Volume / send level: dB, unit optional (`-6`, `-6 dB`, `+3`, `-inf`),
+    ///   clamped to the fader's range.
+    /// - Pan: `C`, `L32` / `R10` (also `32L`), or a signed number where
+    ///   negative is left (`-32`), in percent of full width.
+    /// - Plug-in parameter: percent, `%` optional.
+    /// - Switches (mute, send on/off, bypass): their own words, or on/off,
+    ///   1/0, yes/no, true/false.
+    pub fn parse_value(&self, text: &str) -> Option<f32> {
+        let text = text.trim();
+        if text.is_empty() {
+            return None;
+        }
+        let lower = text.to_ascii_lowercase();
+        // A finite number with an optional unit suffix.
+        let number = |unit: &str| -> Option<f32> {
+            let digits = lower
+                .strip_suffix(unit)
+                .unwrap_or(&lower)
+                .trim()
+                .replace('\u{2212}', "-");
+            digits.parse::<f32>().ok().filter(|v| v.is_finite())
+        };
+        let switch = |on: &[&str], off: &[&str]| -> Option<f32> {
+            let word = lower.as_str();
+            if on.contains(&word) || matches!(word, "on" | "1" | "yes" | "true") {
+                Some(1.0)
+            } else if off.contains(&word) || matches!(word, "off" | "0" | "no" | "false") {
+                Some(0.0)
+            } else {
+                None
+            }
+        };
+        match self {
+            AutomationTarget::TrackVolume | AutomationTarget::SendLevel { .. } => {
+                let silent = lower.trim_end_matches("db").trim();
+                if matches!(
+                    silent,
+                    "-inf" | "-∞" | "\u{2212}∞" | "-infinity" | "inf" | "∞"
+                ) {
+                    return Some(0.0);
+                }
+                number("db").map(volume::db_to_norm)
+            }
+            AutomationTarget::TrackPan => {
+                if matches!(lower.as_str(), "c" | "center" | "centre" | "0") {
+                    return Some(0.5);
+                }
+                let side = |rest: &str, sign: f32| {
+                    rest.trim()
+                        .trim_end_matches('%')
+                        .trim()
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|v| v.is_finite())
+                        .map(|v| sign * v.abs())
+                };
+                let percent = if let Some(rest) = lower.strip_prefix('l') {
+                    side(rest, -1.0)
+                } else if let Some(rest) = lower.strip_prefix('r') {
+                    side(rest, 1.0)
+                } else if let Some(rest) = lower.strip_suffix('l') {
+                    side(rest, -1.0)
+                } else if let Some(rest) = lower.strip_suffix('r') {
+                    side(rest, 1.0)
+                } else {
+                    number("%")
+                }?;
+                Some(((percent / 100.0).clamp(-1.0, 1.0) + 1.0) * 0.5)
+            }
+            AutomationTarget::PluginParameter { .. } => {
+                number("%").map(|percent| (percent / 100.0).clamp(0.0, 1.0))
+            }
+            AutomationTarget::TrackMute => switch(&["muted", "mute"], &["open", "unmuted"]),
+            AutomationTarget::SendEnabled { .. } => switch(&[], &[]),
+            AutomationTarget::InsertBypass { .. } => switch(&["bypassed", "bypass"], &["active"]),
         }
     }
 
@@ -1490,8 +1619,8 @@ impl TimelineState {
     }
 
     /// Set a segment's tension (clamped to `-1.0..=1.0`). A Smooth segment
-    /// stays an S and bends (sharper or softer); a Hold segment, which has no
-    /// shape to bend, becomes a curved Linear one so the tension is
+    /// stays an S and bends (sharper or softer); a step (Hold, Jump), which
+    /// has no shape to bend, becomes a curved Linear one so the tension is
     /// visible and audible. Committed edit — the caller dirties once on
     /// release.
     pub fn set_automation_segment_tension(
@@ -1534,6 +1663,33 @@ impl TimelineState {
         if changed {
             let playhead = self.transport.playhead_beats;
             self.recompute_effective_volumes(playhead, "curve_reset");
+        }
+        changed
+    }
+
+    /// Set one point's value (normalized, clamped to `0.0..=1.0`), as typed
+    /// into its value field. Committed edit: the caller records the undo step.
+    /// Returns whether the value changed, so retyping the same value is free.
+    pub fn set_automation_point_value(
+        &mut self,
+        track_id: &str,
+        lane_id: &str,
+        point_id: u64,
+        value: f32,
+    ) -> bool {
+        let value = value.clamp(0.0, 1.0);
+        let mut changed = false;
+        if let Some(lane) = self.lane_mut(track_id, lane_id) {
+            if let Some(p) = lane.points.iter_mut().find(|p| p.id == point_id) {
+                if (p.value - value).abs() > f32::EPSILON {
+                    p.value = value;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            let playhead = self.transport.playhead_beats;
+            self.recompute_effective_volumes(playhead, "point_value_edit");
         }
         changed
     }

@@ -87,6 +87,9 @@ pub fn track_list(
     on_automation_control: Option<AutomationControlCallback>,
     automation_marquee: Option<&AutomationMarquee>,
     automation_hover: Option<&AutomationHover>,
+    automation_value_field: Option<
+        crate::components::timeline::automation_lane::AutomationValueField<'_>,
+    >,
     // The arrangement grid layer, built by `Timeline` so it can be a cached
     // view. Passed in rather than built here because a free function has no
     // entity to cache against.
@@ -214,6 +217,7 @@ pub fn track_list(
                         on_automation_delete.clone(),
                         automation_marquee,
                         automation_hover,
+                        automation_value_field,
                     )
                     .into_any_element(),
                 );
@@ -353,6 +357,7 @@ pub fn track_list(
                     on_automation_delete.clone(),
                     automation_marquee,
                     automation_hover,
+                    automation_value_field,
                 )
                 .into_any_element(),
             );

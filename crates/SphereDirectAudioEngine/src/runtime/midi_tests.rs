@@ -617,8 +617,13 @@ fn automation_curve_factor_shapes_match_spec() {
         (reflected - 0.3).abs() < 1e-5,
         "ease-in/out are mirror curves"
     );
+    // Jump: the right value as soon as the segment starts, whatever tension.
+    assert_eq!(automation_curve_factor(3, 0.0, 0.001), 1.0);
+    assert_eq!(automation_curve_factor(3, 0.7, 0.5), 1.0);
+    // An unknown (newer) tag plays as Linear.
+    assert!((automation_curve_factor(9, 0.0, 0.5) - 0.5).abs() < 1e-6);
     // Endpoints are always pinned regardless of shape/tension.
-    for tag in [0u8, 1, 2] {
+    for tag in [0u8, 1, 2, 3] {
         for tension in [-1.0f32, -0.3, 0.0, 0.6, 1.0] {
             assert_eq!(automation_curve_factor(tag, tension, 0.0), 0.0);
             if tag != 1 {

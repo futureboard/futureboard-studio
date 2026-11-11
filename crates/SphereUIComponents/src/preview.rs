@@ -758,6 +758,12 @@ pub fn scenes() -> Vec<Scene> {
             open: master_automation_scene,
         },
         Scene {
+            name: "automation-value-edit",
+            width: 1_100.0,
+            height: 420.0,
+            open: automation_value_edit_scene,
+        },
+        Scene {
             name: "tool-bars",
             width: 1_100.0,
             height: 220.0,
@@ -2414,6 +2420,65 @@ fn automation_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHan
                 }
             }
             state.automation_arm = true;
+            timeline
+        });
+        cx.new(|_| ArrangementMetersPreview { timeline })
+    })?;
+    Ok(handle.into())
+}
+
+/// A Volume lane walking through the curve styles — S, Sharp S, Soft S, a
+/// slow ease, Hold and Jump — with one selected point's value field open.
+fn automation_value_edit_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    use crate::components::timeline::timeline_state::{
+        AutomationCurveShape, AutomationTarget, TrackLaneMode,
+    };
+    let handle = cx.open_window(options, |_, cx| {
+        let timeline = cx.new(|cx| {
+            let mut timeline = crate::components::timeline::Timeline::with_demo_content();
+            let state = &mut timeline.state;
+            let track_id = state.tracks[0].id.clone();
+            let volume = state
+                .ensure_automation_lane(&track_id, AutomationTarget::TrackVolume)
+                .unwrap();
+            // Only this scene's points: the demo track carries some already.
+            if let Some(lane) = state.tracks[0]
+                .automation_lanes
+                .iter_mut()
+                .find(|lane| lane.id == volume)
+            {
+                lane.points.clear();
+            }
+            let shapes = [
+                AutomationCurveShape::SCurve,
+                AutomationCurveShape::SharpS,
+                AutomationCurveShape::SoftS,
+                AutomationCurveShape::Slow,
+                AutomationCurveShape::Hold,
+                AutomationCurveShape::Jump,
+                AutomationCurveShape::Linear,
+            ];
+            for (i, value) in [0.3, 0.8, 0.25, 0.85, 0.2, 0.75, 0.35]
+                .into_iter()
+                .enumerate()
+            {
+                state.add_automation_point(&track_id, &volume, i as f32 * 1.5, value);
+            }
+            let track = state.tracks.iter_mut().find(|t| t.id == track_id).unwrap();
+            track.lane_mode = TrackLaneMode::Automation;
+            let mut edited = 0;
+            for lane in &mut track.automation_lanes {
+                lane.visible = true;
+                if lane.id == volume {
+                    for (point, shape) in lane.points.iter_mut().zip(shapes) {
+                        let (curve, tension) = shape.curve_and_tension();
+                        point.curve = curve;
+                        point.tension = tension;
+                    }
+                    edited = lane.points[3].id;
+                }
+            }
+            timeline.open_automation_value_edit(&track_id, &volume, edited, cx);
             timeline
         });
         cx.new(|_| ArrangementMetersPreview { timeline })

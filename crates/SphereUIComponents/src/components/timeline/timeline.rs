@@ -1,9 +1,11 @@
+mod automation_value_edit;
 mod clip_fades;
 mod clip_move_cancel;
 mod methods;
 mod plugin_drop;
 mod render;
 mod track_rename;
+pub(crate) use automation_value_edit::{AutomationValueEdit, AUTOMATION_VALUE_FIELD_HEIGHT};
 pub use plugin_drop::{resolve_plugin_drop, NewTrackKind, PluginDropTarget};
 pub(crate) use render::*;
 pub(crate) use track_rename::{
@@ -304,6 +306,9 @@ pub struct Timeline {
     /// In-flight automation curve-tension drag (Alt+drag on a segment). Mutated
     /// live; committed once on release. Never moves the points themselves.
     automation_curve_drag: Option<crate::components::timeline::timeline_state::AutomationCurveDrag>,
+    /// The typed value of one automation point, while its field is open; see
+    /// [`AutomationValueEdit`].
+    automation_value_edit: Option<AutomationValueEdit>,
     /// In-flight automation marquee (rubber-band) selection. UI-only.
     automation_marquee: Option<crate::components::timeline::timeline_state::AutomationMarquee>,
     /// Pen-tool freehand stroke across an automation lane, while it is drawn.

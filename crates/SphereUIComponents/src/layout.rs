@@ -3171,11 +3171,23 @@ impl StudioLayout {
             | "automation:curve:fast"
             | "automation:curve:smooth"
             | "automation:curve:sharp-s"
-            | "automation:curve:hold" => {
+            | "automation:curve:soft-s"
+            | "automation:curve:hold"
+            | "automation:curve:jump" => {
                 use crate::components::timeline::timeline_state::AutomationCurveShape;
                 if let Some(shape) = AutomationCurveShape::from_command(command_id) {
                     let lane = self.take_menu_automation_lane(cx);
                     self.set_selected_automation_shape(lane, shape, cx);
+                }
+            }
+            "automation:edit-value" => {
+                let lane = self
+                    .take_menu_automation_lane(cx)
+                    .or_else(|| self.automation_edit_lane(false, cx));
+                if let Some((track_id, lane_id)) = lane {
+                    self.timeline.update(cx, |timeline, cx| {
+                        timeline.open_selected_automation_value_edit(&track_id, &lane_id, cx);
+                    });
                 }
             }
             "edit:deselect-all" | "automation:clear-selection" => {

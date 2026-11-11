@@ -70,6 +70,34 @@ pub enum AutomationLaneAction {
     /// Open the parameter picker for this track: the lane's name is a
     /// selector, so choosing another parameter shows (or adds) its lane.
     PickTarget,
+    /// Open the value field on this point (its value tag was clicked).
+    EditPointValue(u64),
+    /// A press landed outside the open value field: apply it.
+    CommitPointValue,
+}
+
+/// The open value field of one automation point, as the lanes draw it.
+#[derive(Clone, Copy)]
+pub struct AutomationValueField<'a> {
+    pub track_id: &'a str,
+    pub lane_id: &'a str,
+    pub point_id: u64,
+    pub input: &'a crate::components::text_input::TextInputState,
+}
+
+/// Height of a point's value tag.
+const VALUE_TAG_H: f32 = 16.0;
+/// Width of a point's value field: room for `-60.0`, `L100` or `100.0`.
+const VALUE_FIELD_W: f32 = 64.0;
+
+/// Where a point's value tag (or field, `height` tall) sits: above the point
+/// unless that would leave the lane, then below it.
+fn value_tag_top(point_y: f32, lane_height: f32, height: f32) -> f32 {
+    if point_y - height - 6.0 >= 0.0 {
+        point_y - height - 6.0
+    } else {
+        (point_y + 7.0).min(lane_height - height)
+    }
 }
 
 /// Sub-lane mouse-down payload:
@@ -161,9 +189,11 @@ pub fn automation_lane(
     on_automation_delete: Option<AutomationDeleteCallback>,
     marquee: Option<&AutomationMarquee>,
     hover: Option<&AutomationHover>,
+    value_field: Option<AutomationValueField<'_>>,
 ) -> impl IntoElement {
     let track_id = track_id.to_string();
     let lane_id = lane.id.clone();
+    let value_field = value_field.filter(|f| f.track_id == track_id && f.lane_id == lane.id);
     // Hover that targets THIS lane (drives the segment highlight + cursor).
     let lane_hover = hover
         .filter(|h| h.matches_lane(&track_id, &lane_id))
@@ -559,6 +589,102 @@ pub fn automation_lane(
         lane_hover.as_ref(),
     );
 
+    // Value tags that take a click, and the open value field: above the hit
+    // layer, which would otherwise catch every press on the lane. Only the
+    // selected points' tags on the active lane, which stay put while the
+    // pointer moves onto them; a tag shown on hover alone would vanish as the
+    // pointer left the point for it, so those stay in the envelope, passive.
+    let lane_w = state.viewport.viewport_width.max(1.0);
+    let editing_point = value_field.map(|f| f.point_id);
+    let mut value_layer: Vec<gpui::AnyElement> = Vec::new();
+    for p in &lane.points {
+        let editing = editing_point == Some(p.id);
+        if !(editing || (p.selected && is_active)) {
+            continue;
+        }
+        let x = state.beats_to_x(p.beat);
+        if x < -8.0 || x > lane_w + 8.0 {
+            continue;
+        }
+        let y = automation_value_to_y(p.value, lane_height);
+        if let Some(field) = value_field.filter(|_| editing) {
+            let height = crate::components::timeline::timeline::AUTOMATION_VALUE_FIELD_HEIGHT;
+            let commit_cb = on_lane_action.clone();
+            let (tid, lid) = (track_id.clone(), lane_id.clone());
+            let callbacks = crate::components::text_input::TextInputCallbacks {
+                on_mouse_down_out: Some(std::sync::Arc::new(
+                    move |window: &mut gpui::Window, cx: &mut gpui::App| {
+                        if let Some(cb) = commit_cb.as_ref() {
+                            cb(
+                                &(
+                                    tid.clone(),
+                                    lid.clone(),
+                                    AutomationLaneAction::CommitPointValue,
+                                    0.0,
+                                    0.0,
+                                ),
+                                window,
+                                cx,
+                            );
+                        }
+                    },
+                )),
+                ..Default::default()
+            };
+            value_layer.push(
+                div()
+                    .absolute()
+                    .left(px(x + 7.0))
+                    .top(px(value_tag_top(y, lane_height, height)))
+                    .w(px(VALUE_FIELD_W))
+                    .h(px(height))
+                    .id(("automation-value-field", id_num))
+                    // A press in the field edits it; it never reaches the lane.
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(crate::components::text_input::text_field_with_callbacks(
+                        field.input,
+                        true,
+                        callbacks,
+                    ))
+                    .into_any_element(),
+            );
+            continue;
+        }
+        let hovered = lane_hover.as_ref().and_then(|h| h.point_id) == Some(p.id);
+        value_layer.push(
+            div()
+                .absolute()
+                .left(px(x + 7.0))
+                .top(px(value_tag_top(y, lane_height, VALUE_TAG_H)))
+                .h(px(VALUE_TAG_H))
+                .px(px(5.0))
+                .flex()
+                .items_center()
+                .rounded(px(crate::theme::radius::CONTROL))
+                .bg(Colors::surface_raised())
+                .border(px(1.0))
+                .border_color(if hovered {
+                    Colors::with_alpha(accent, 0.7)
+                } else {
+                    border_subtle
+                })
+                .text_size(px(9.0))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .font_features(tabular_numerals())
+                .text_color(Colors::text_primary())
+                .whitespace_nowrap()
+                .id(("automation-value-tag", p.id as usize))
+                .cursor(gpui::CursorStyle::IBeam)
+                .tooltip(lane_tooltip("Click to type a value"))
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    lane_action(AutomationLaneAction::EditPointValue(p.id)),
+                )
+                .child(lane.target.format_value(p.value))
+                .into_any_element(),
+        );
+    }
+
     // Cursor reflects what the hovered region edits: a point handle (pointer) or a
     // curve segment (vertical-resize = drag to shape tension). Built-in OS cursors
     // — no custom-PNG hotspot, so they stay correct at 125% / 150% / 200% DPI.
@@ -702,7 +828,8 @@ pub fn automation_lane(
             Colors::automation_canvas_bg()
         })
         .child(envelope)
-        .children(interaction);
+        .children(interaction)
+        .children(value_layer);
 
     div()
         .flex()
@@ -1158,22 +1285,17 @@ fn lane_envelope(
                 .border(px(1.0))
                 .border_color(ring),
         );
-        // Value tag: the hovered point always; selected points only on the
-        // active lane, so a multi-lane track does not sprout a label per lane.
-        if hovered || (p.selected && is_active) {
-            const TAG_H: f32 = 16.0;
-            // Above the point unless that would leave the lane; then below.
-            let tag_top = if y - TAG_H - 6.0 >= 0.0 {
-                y - TAG_H - 6.0
-            } else {
-                (y + 7.0).min(lane_height - TAG_H)
-            };
+        // Value tag on the hovered point. A selected point on the active lane
+        // has a clickable one in the lane's top layer instead (see
+        // `automation_lane`), so a multi-lane track does not sprout a label
+        // per lane and no point gets two.
+        if hovered && !(p.selected && is_active) {
             value_tags.push(
                 div()
                     .absolute()
                     .left(px(x + 7.0))
-                    .top(px(tag_top))
-                    .h(px(TAG_H))
+                    .top(px(value_tag_top(y, lane_height, VALUE_TAG_H)))
+                    .h(px(VALUE_TAG_H))
                     .px(px(5.0))
                     .flex()
                     .items_center()

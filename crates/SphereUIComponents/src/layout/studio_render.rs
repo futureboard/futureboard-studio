@@ -1121,6 +1121,7 @@ impl Render for StudioLayout {
                 let handled = shortcut_keydown_target.update(cx, |this, cx| {
                     let handled = this.handle_command_palette_key(event, window, cx)
                         || this.handle_track_rename_key(event, window, cx)
+                        || this.handle_automation_value_key(event, window, cx)
                         || this.handle_bpm_edit_key(event, window, cx)
                         || this.handle_ts_edit_key(event, window, cx)
                         || this.handle_settings_dialog_key(event, window, cx)

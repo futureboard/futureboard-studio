@@ -562,6 +562,33 @@ impl StudioLayout {
         }
     }
 
+    /// Routes keys to an automation point's value field while it is open, the
+    /// way the transport's inline editors get theirs: first in the key chain,
+    /// no focus grab, so no arrangement shortcut sees what is typed.
+    pub(super) fn handle_automation_value_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.timeline.read(cx).is_editing_automation_value() {
+            return false;
+        }
+        // Another text field holds focus: the user moved on. Close the value
+        // field as a click away would, and let that field have the key.
+        if self.focused_text_target(window).is_some() {
+            self.timeline
+                .update(cx, |timeline, cx| timeline.commit_automation_value_edit(cx));
+            return false;
+        }
+        if event.is_held && !is_repeatable_edit_key(event) {
+            return true;
+        }
+        self.timeline.update(cx, |timeline, cx| {
+            timeline.handle_automation_value_key(event, cx)
+        })
+    }
+
     /// Routes keys to the inline BPM numeric editor while it is open. Enter
     /// commits, Escape cancels, everything else edits the field. Runs first in
     /// the key chain so it captures input without a GPUI focus grab.
@@ -1822,6 +1849,9 @@ impl StudioLayout {
                 }));
                 entries.extend([
                     ContextMenuEntry::Separator,
+                    // Types the one selected point's value (also: double-click
+                    // the point, or click its value tag).
+                    item("Edit Value…", "automation:edit-value", selected == 1),
                     item("Copy Points", "automation:copy", selected > 0),
                     item("Cut Points", "automation:cut", selected > 0),
                     item(
