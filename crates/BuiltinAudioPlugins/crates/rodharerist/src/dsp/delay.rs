@@ -3,8 +3,9 @@
 //!
 //! All voicings are the same topology — a pair of interpolated delay lines with
 //! a filtered, saturated feedback path — differing in feedback-path colour
-//! (cutoff, low-end body, saturation), wow/flutter depth, time-slew character
-//! and stereo routing. One preallocated buffer set serves every voicing, so a
+//! (cutoff, low-end body, saturation), wow/flutter depth and stereo routing.
+//! A Time change never glides the read head (which bends the repeats' pitch):
+//! it crossfades from the old tap to the new one, see [`TapFade`]. One preallocated buffer set serves every voicing, so a
 //! model change never reallocates and is safe from the control thread.
 //!
 //! Ring buffers are sized up front for the maximum delay time in
@@ -20,6 +21,9 @@ const MAX_DELAY_MS: f32 = 1_300.0; // headroom above the 1200 ms max knob
 
 /// Glide time for feedback/mix edits.
 const SMOOTH_SECONDS: f32 = 0.010;
+
+/// How long a Time change crossfades from the old tap to the new one.
+const TIME_FADE_SECONDS: f32 = 0.050;
 
 /// The Dual voicing's right-hand tap, as a fraction of the Time knob — a
 /// quarter note on the left against a dotted eighth on the right.
@@ -60,10 +64,6 @@ struct Voicing {
     /// smaller values stay effectively linear until well above it (clean
     /// digital repeats) while still bounding a runaway loop.
     drive: f32,
-    /// Slew time for the delay time itself. Long enough on the analogue
-    /// voicings that a Time drag reads as a tape-style pitch glide; short on
-    /// the digital ones, where a glide would be wrong.
-    time_slew_s: f32,
     /// Right-tap fraction of the Time knob. Only [`Routing::Dual`] reads it.
     right_ratio: f32,
     routing: Routing,
@@ -78,7 +78,6 @@ impl Voicing {
                 body_hz: 0.0,
                 flutter_s: 0.000_3,
                 drive: 1.0,
-                time_slew_s: 0.100,
                 right_ratio: 1.0,
                 routing: Routing::Stereo,
             },
@@ -88,7 +87,6 @@ impl Voicing {
                 body_hz: 0.0,
                 flutter_s: 0.0,
                 drive: 0.25,
-                time_slew_s: 0.020,
                 right_ratio: 1.0,
                 routing: Routing::Stereo,
             },
@@ -98,7 +96,6 @@ impl Voicing {
                 body_hz: 160.0,
                 flutter_s: 0.000_08,
                 drive: 1.4,
-                time_slew_s: 0.090,
                 right_ratio: 1.0,
                 routing: Routing::Stereo,
             },
@@ -108,7 +105,6 @@ impl Voicing {
                 body_hz: 0.0,
                 flutter_s: 0.000_05,
                 drive: 0.8,
-                time_slew_s: 0.025,
                 right_ratio: 1.0,
                 routing: Routing::PingPong,
             },
@@ -118,7 +114,6 @@ impl Voicing {
                 body_hz: 0.0,
                 flutter_s: 0.000_12,
                 drive: 0.9,
-                time_slew_s: 0.030,
                 right_ratio: DUAL_RIGHT_RATIO,
                 routing: Routing::Dual,
             },
@@ -128,7 +123,6 @@ impl Voicing {
                 body_hz: 0.0,
                 flutter_s: 0.0,
                 drive: 0.35,
-                time_slew_s: 0.020,
                 right_ratio: 1.0,
                 routing: Routing::Split,
             },
@@ -138,7 +132,6 @@ impl Voicing {
                 body_hz: 0.0,
                 flutter_s: 0.000_02,
                 drive: 0.55,
-                time_slew_s: 0.015,
                 right_ratio: 1.0,
                 routing: Routing::Stereo,
             },
@@ -148,7 +141,6 @@ impl Voicing {
                 body_hz: 240.0,
                 flutter_s: 0.000_9,
                 drive: 1.8,
-                time_slew_s: 0.150,
                 right_ratio: 1.0,
                 routing: Routing::Stereo,
             },
@@ -157,7 +149,6 @@ impl Voicing {
                 body_hz: 320.0,
                 flutter_s: 0.000_15,
                 drive: 1.25,
-                time_slew_s: 0.080,
                 right_ratio: 1.0,
                 routing: Routing::Stereo,
             },
@@ -166,7 +157,6 @@ impl Voicing {
                 body_hz: 180.0,
                 flutter_s: 0.000_18,
                 drive: 0.45,
-                time_slew_s: 0.040,
                 right_ratio: 1.0,
                 routing: Routing::PingPong,
             },
@@ -175,7 +165,6 @@ impl Voicing {
                 body_hz: 80.0,
                 flutter_s: 0.001_4,
                 drive: 1.15,
-                time_slew_s: 0.180,
                 right_ratio: 1.0,
                 routing: Routing::Stereo,
             },
@@ -185,7 +174,6 @@ impl Voicing {
                 body_hz: 0.0,
                 flutter_s: 0.000_06,
                 drive: 0.7,
-                time_slew_s: 0.028,
                 right_ratio: 2.0 / 3.0,
                 routing: Routing::Dual,
             },
@@ -201,6 +189,104 @@ fn saturate(x: f32, drive: f32) -> f32 {
     soft_clip(x * drive) / drive
 }
 
+/// One side's read tap. A new delay time crossfades from the old tap to a
+/// second one at the new time instead of moving the head, so the repeats keep
+/// their pitch. A target that arrives mid-fade waits for the fade to finish and
+/// then fades on from there, so a knob drag steps through the latest values.
+#[derive(Debug, Clone, Copy)]
+struct TapFade {
+    /// The tap that is sounding (the old one while a fade runs).
+    from: f32,
+    /// The tap being faded in.
+    to: f32,
+    /// The latest requested time, picked up when the running fade ends.
+    pending: f32,
+    /// Fade position 0..1, and its per-sample step.
+    phase: f32,
+    step: f32,
+    fading: bool,
+    /// Cleared by a reset: the next target snaps instead of fading, since the
+    /// line holds nothing worth fading from.
+    armed: bool,
+}
+
+impl TapFade {
+    fn new(sample_rate: f32, samples: f32) -> Self {
+        Self {
+            from: samples,
+            to: samples,
+            pending: samples,
+            phase: 0.0,
+            step: Self::step_for(sample_rate),
+            fading: false,
+            armed: false,
+        }
+    }
+
+    fn step_for(sample_rate: f32) -> f32 {
+        1.0 / (TIME_FADE_SECONDS * sample_rate).max(1.0)
+    }
+
+    fn set_sample_rate(&mut self, sample_rate: f32) {
+        self.step = Self::step_for(sample_rate);
+        self.disarm();
+    }
+
+    /// Drops any running fade; the next target snaps.
+    fn disarm(&mut self) {
+        self.armed = false;
+        self.fading = false;
+        self.from = self.pending;
+        self.to = self.pending;
+    }
+
+    fn set_target(&mut self, samples: f32) {
+        self.pending = samples;
+        if !self.armed {
+            self.armed = true;
+            self.from = samples;
+            self.to = samples;
+        }
+    }
+
+    /// The two taps and the new tap's gain (0 when no fade is running, in
+    /// which case only `from` needs reading).
+    #[inline]
+    fn tick(&mut self) -> (f32, f32, f32) {
+        if !self.fading {
+            if (self.pending - self.from).abs() < 0.5 {
+                // A sub-sample move is inaudible; take it without a fade.
+                self.from = self.pending;
+                return (self.from, self.from, 0.0);
+            }
+            self.to = self.pending;
+            self.phase = 0.0;
+            self.fading = true;
+        }
+        self.phase += self.step;
+        if self.phase >= 1.0 {
+            self.from = self.to;
+            self.fading = false;
+            return (self.from, self.from, 0.0);
+        }
+        // Raised cosine: the two gains always sum to one, so a fade can never
+        // push more level into the feedback loop than either tap holds.
+        let gain = 0.5 - 0.5 * (std::f32::consts::PI * self.phase).cos();
+        (self.from, self.to, gain)
+    }
+}
+
+/// Reads one side's tap, mixing in the second tap while a time fade runs.
+#[inline]
+fn read_tap(line: &InterpDelay, (from, to, gain): (f32, f32, f32), offset: f32) -> f32 {
+    let old = line.read_interp(from + offset);
+    if gain > 0.0 {
+        old + (line.read_interp(to + offset) - old) * gain
+    } else {
+        old
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct DelayStage {
     sample_rate: f32,
@@ -208,10 +294,12 @@ pub(super) struct DelayStage {
     voicing: Voicing,
     line_l: InterpDelay,
     line_r: InterpDelay,
-    delay_samples: Smoothed,
+    /// Each side's read tap. The right one carries whatever the routing gives
+    /// that side: the left time, the Dual ratio of it, or its own knob.
+    tap_l: TapFade,
+    tap_r: TapFade,
     feedback: Smoothed,
-    /// The right side's own time and feedback, read by the Split routing.
-    delay_samples_r: Smoothed,
+    /// The right side's own feedback, read by the Split routing.
     feedback_r: Smoothed,
     mix: Smoothed,
     flutter: Lfo,
@@ -242,9 +330,9 @@ impl DelayStage {
             voicing,
             line_l: InterpDelay::new(capacity),
             line_r: InterpDelay::new(capacity),
-            delay_samples: Smoothed::new(sr, voicing.time_slew_s, 0.42 * sr),
+            tap_l: TapFade::new(sr, 0.42 * sr),
+            tap_r: TapFade::new(sr, 0.42 * sr),
             feedback: Smoothed::new(sr, SMOOTH_SECONDS, 0.35),
-            delay_samples_r: Smoothed::new(sr, voicing.time_slew_s, 0.315 * sr),
             feedback_r: Smoothed::new(sr, SMOOTH_SECONDS, 0.35),
             mix: Smoothed::new(sr, SMOOTH_SECONDS, 0.3),
             flutter,
@@ -266,9 +354,9 @@ impl DelayStage {
         self.line_r = InterpDelay::new(capacity);
         self.flutter.set_rate(3.0, sr);
         self.flutter_depth = self.voicing.flutter_s * sr;
-        self.delay_samples.set_time(sr, self.voicing.time_slew_s);
+        self.tap_l.set_sample_rate(sr);
+        self.tap_r.set_sample_rate(sr);
         self.feedback.set_time(sr, SMOOTH_SECONDS);
-        self.delay_samples_r.set_time(sr, self.voicing.time_slew_s);
         self.feedback_r.set_time(sr, SMOOTH_SECONDS);
         self.mix.set_time(sr, SMOOTH_SECONDS);
         // Coefficients are rate-dependent; force a rebuild on the next
@@ -285,9 +373,9 @@ impl DelayStage {
         self.body.reset();
         self.fb_l = 0.0;
         self.fb_r = 0.0;
-        self.delay_samples.snap();
+        self.tap_l.disarm();
+        self.tap_r.disarm();
         self.feedback.snap();
-        self.delay_samples_r.snap();
         self.feedback_r.snap();
         self.mix.snap();
     }
@@ -313,16 +401,17 @@ impl DelayStage {
             self.model = model;
             self.voicing = Voicing::for_model(model);
             self.flutter_depth = self.voicing.flutter_s * self.sample_rate;
-            self.delay_samples
-                .set_time(self.sample_rate, self.voicing.time_slew_s);
-            self.delay_samples_r
-                .set_time(self.sample_rate, self.voicing.time_slew_s);
             self.reset();
         }
 
         let samples = |ms: f32| (ms.clamp(40.0, 1_200.0) * 0.001 * self.sample_rate).max(1.0);
-        self.delay_samples.set_target(samples(time_ms));
-        self.delay_samples_r.set_target(samples(time_r_ms));
+        let left = samples(time_ms);
+        self.tap_l.set_target(left);
+        self.tap_r.set_target(match self.voicing.routing {
+            Routing::Dual => left * self.voicing.right_ratio,
+            Routing::Split => samples(time_r_ms),
+            Routing::Stereo | Routing::PingPong => left,
+        });
         self.feedback.set_target((fb / 100.0).clamp(0.0, 0.95));
         self.feedback_r.set_target((fb_r / 100.0).clamp(0.0, 0.95));
         self.mix.set_target((mix / 100.0).clamp(0.0, 1.0));
@@ -354,25 +443,22 @@ impl DelayStage {
 
     #[inline]
     pub(super) fn process(&mut self, left: f32, right: f32) -> (f32, f32) {
-        // Slewed read position: on the analogue voicings a time-knob change
-        // glides the head (pitch bend) instead of jumping it (click). Wow and
-        // flutter ride on top with opposite modulation per channel for width.
-        let delay_samples = self.delay_samples.tick();
+        // A time change crossfades between taps rather than moving the head,
+        // so the repeats keep their pitch. Wow and flutter ride on top with
+        // opposite modulation per channel for width.
+        let tap_l = self.tap_l.tick();
+        let tap_r = self.tap_r.tick();
         let feedback = self.feedback.tick();
-        let delay_samples_r = self.delay_samples_r.tick();
         let feedback_r = self.feedback_r.tick();
         let mix_amount = self.mix.tick();
         let flut = self.flutter.tick() * self.flutter_depth;
-        let (right_samples, right_feedback) = match self.voicing.routing {
-            Routing::Dual => (delay_samples * self.voicing.right_ratio, feedback),
-            Routing::Split => (delay_samples_r, feedback_r),
-            Routing::Stereo | Routing::PingPong => (delay_samples, feedback),
+        let right_feedback = match self.voicing.routing {
+            Routing::Split => feedback_r,
+            Routing::Stereo | Routing::PingPong | Routing::Dual => feedback,
         };
-        let read_l = delay_samples + flut;
-        let read_r = right_samples - flut;
 
-        let echo_l = self.line_l.read_interp(read_l);
-        let echo_r = self.line_r.read_interp(read_r);
+        let echo_l = read_tap(&self.line_l, tap_l, flut);
+        let echo_r = read_tap(&self.line_r, tap_r, -flut);
 
         // Colour and compress the feedback, then write the lines per routing.
         let (tone_l, tone_r) = self.tone.run(echo_l, echo_r);
@@ -610,6 +696,88 @@ mod tests {
             late_r < 1.0e-3,
             "right regenerated with 0 feedback: {late_r}"
         );
+    }
+
+    /// Worst pitch error of the wet signal, as a fraction, while the Time knob
+    /// jumps from 300 ms to 500 ms under a steady 1 kHz tone. 1 kHz is exactly
+    /// 48 samples at 48 kHz, and both times are whole periods, so a pitch-true
+    /// change keeps every period at 48 samples.
+    fn pitch_error_across_a_time_change(model: DelayModel) -> f32 {
+        let tone = |n: usize| (std::f32::consts::TAU * n as f32 / 48.0).sin();
+        let mut stage = DelayStage::new(SR);
+        stage.configure(model, 300.0, 0.0, 100.0, 5.0, 300.0, 0.0);
+        let warm = (SR * 0.7) as usize;
+        for n in 0..warm {
+            stage.process(tone(n), tone(n));
+        }
+        stage.configure(model, 500.0, 0.0, 100.0, 5.0, 500.0, 0.0);
+        let mut worst = 0.0f32;
+        let mut prev = 0.0f32;
+        let mut last_crossing: Option<f32> = None;
+        for n in warm..warm + (SR * 0.4) as usize {
+            let (l, _) = stage.process(tone(n), tone(n));
+            if prev < 0.0 && l >= 0.0 {
+                let at = (n - 1) as f32 + prev / (prev - l);
+                if let Some(before) = last_crossing {
+                    worst = worst.max(((at - before) - 48.0).abs() / 48.0);
+                }
+                last_crossing = Some(at);
+            }
+            prev = l;
+        }
+        worst
+    }
+
+    #[test]
+    fn a_time_change_keeps_the_pitch_of_the_repeats() {
+        // Wow and flutter are meant to move the pitch; the deepest voicings
+        // would hide the time change behind their own modulation.
+        for &model in DelayModel::ALL {
+            if Voicing::for_model(model).flutter_s > 0.000_5 {
+                continue;
+            }
+            let error = pitch_error_across_a_time_change(model);
+            assert!(error < 0.03, "{model:?} bent the pitch by {error}");
+        }
+    }
+
+    #[test]
+    fn a_time_drag_does_not_click_and_lands_on_the_last_value() {
+        // A block-rate drag from 300 ms to 713 ms under a steady tone: every
+        // step crossfades, so the wet signal never jumps further per sample
+        // than the tone itself does (2π/48 ≈ 0.13).
+        let tone = |n: usize| (std::f32::consts::TAU * n as f32 / 48.0).sin();
+        let mut stage = DelayStage::new(SR);
+        stage.configure(DelayModel::Digital, 300.0, 0.0, 100.0, 5.0, 300.0, 0.0);
+        let mut n = 0usize;
+        while n < (SR * 0.8) as usize {
+            stage.process(tone(n), tone(n));
+            n += 1;
+        }
+        let mut prev = stage.process(tone(n), tone(n)).0;
+        n += 1;
+        let mut worst = 0.0f32;
+        for step in 0..=59 {
+            let time = 300.0 + step as f32 * 7.0;
+            stage.configure(DelayModel::Digital, time, 0.0, 100.0, 5.0, time, 0.0);
+            for _ in 0..256 {
+                let (l, _) = stage.process(tone(n), tone(n));
+                worst = worst.max((l - prev).abs());
+                prev = l;
+                n += 1;
+            }
+        }
+        assert!(worst < 0.2, "the drag clicked: a {worst} step");
+
+        // Settle, clear, and check where an impulse comes back.
+        for _ in 0..(SR * 0.2) as usize {
+            stage.process(0.0, 0.0);
+        }
+        stage.line_l.clear();
+        stage.line_r.clear();
+        let (at_l, _) = first_taps(&mut stage, 0.8);
+        let want = (SR * 0.713) as usize;
+        assert!(at_l.abs_diff(want) < 2, "landed at {at_l}, want {want}");
     }
 
     #[test]
