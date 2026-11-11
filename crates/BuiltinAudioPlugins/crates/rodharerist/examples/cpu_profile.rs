@@ -291,14 +291,80 @@ fn main() {
     }
 
     println!("\n-- denormal check: cost of the decay into silence --");
-    for (stage, _) in stages {
+    for &stage in StageKind::ALL {
         let mut dsp = Dsp::new(SR);
-        dsp.set_params(only(stage));
+        let mut p = only(stage);
+        p.pitch_on = true;
+        dsp.set_params(p);
         measure_decay_ratio(&format!("{stage:?}"), &mut dsp);
     }
     let mut dsp = Dsp::new(SR);
     dsp.set_params(default_params());
     measure_decay_ratio("full chain", &mut dsp);
+    // What a stopped transport feeds a rig with the global transpose on, and
+    // with tempo-synced repeats.
+    let mut dsp = Dsp::new(SR);
+    let mut p = default_params();
+    p.transpose_semi = -2.0;
+    dsp.set_params(p);
+    measure_decay_ratio("full chain, transpose -2", &mut dsp);
+    let mut dsp = Dsp::new(SR);
+    let mut p = default_params();
+    p.delay_sync = rodharerist::DelaySync::DottedEighth;
+    dsp.set_params(p);
+    dsp.set_tempo_bpm(97.0);
+    measure_decay_ratio("full chain, synced delay", &mut dsp);
+
+    // The bridge has one device period to answer a block; a single block over
+    // it is a dropout however cheap the average is. Blocks exactly as the
+    // plug-in host runs them, every factory preset, worst block reported.
+    println!("\n-- worst block, host-style, 256 frames (5.33 ms period) --");
+    const BLOCK: usize = 256;
+    let mut worst_overall = (0.0f64, String::new());
+    for preset in rodharerist::factory_presets() {
+        let mut dsp = Dsp::new(SR);
+        dsp.set_params(preset.params.clone());
+        dsp.set_tempo_bpm(120.0);
+        let mut rng = 0x0dd_ba11u32;
+        let mut times = Vec::with_capacity(800);
+        for block in 0..800 {
+            // Half a second of playing, then silence: the paused case.
+            let loud = block < 100;
+            dsp.begin_block_with_frames(BLOCK);
+            let started = Instant::now();
+            let mut sink = 0.0f32;
+            for _ in 0..BLOCK {
+                let x = if loud { lcg(&mut rng) * 0.3 } else { 0.0 };
+                let (l, r) = dsp.process_stereo(x, x);
+                sink += l + r;
+            }
+            std::hint::black_box(sink);
+            times.push(started.elapsed().as_secs_f64() * 1_000.0);
+        }
+        let mut sorted = times.clone();
+        sorted.sort_by(f64::total_cmp);
+        let p99 = sorted[sorted.len() * 99 / 100];
+        let (worst_at, worst) = times
+            .iter()
+            .copied()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .unwrap_or_default();
+        if worst > worst_overall.0 {
+            worst_overall = (worst, preset.name.to_string());
+        }
+        println!(
+            "{:<34} median {:>5.2} ms  p99 {:>5.2} ms  worst {:>6.2} ms (block {worst_at})",
+            preset.name,
+            sorted[sorted.len() / 2],
+            p99,
+            worst
+        );
+    }
+    println!(
+        "  worst block of any preset: {:.2} ms ({})",
+        worst_overall.0, worst_overall.1
+    );
 
     println!("\n-- nam-rs kernel: per-sample vs block --");
     for (label, arrays) in NAM_SHAPES {
