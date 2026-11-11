@@ -3062,7 +3062,7 @@ impl Held {
 
 /// Longest delay [`BypassDelay`] can apply, plus one. A power of two. It
 /// covers a full NAM chunk, the widest rate adapter, the IR partition, and
-/// a transpose grain at rates through 192 kHz (half of a 40 ms window).
+/// the transpose shifter's reported delay (12 ms) at rates through 192 kHz.
 const BYPASS_LINE: usize = 8192;
 
 const _: () = assert!(BYPASS_LINE.is_power_of_two());
@@ -6511,6 +6511,71 @@ mod tests {
         p.stage_order = [None; PATH_SLOTS];
         dsp.set_params(p);
         dsp
+    }
+
+    /// Rising zero crossings of `samples` per second.
+    fn crossing_rate(samples: &[f32], sample_rate: f32) -> f32 {
+        let rising = samples
+            .windows(2)
+            .filter(|p| p[0] <= 0.0 && p[1] > 0.0)
+            .count();
+        rising as f32 * sample_rate / samples.len() as f32
+    }
+
+    #[test]
+    fn a_transpose_edit_is_heard_within_40_ms() {
+        // Issue #405: the DSP takes a transpose edit on the next sample and
+        // glides to it in ~15 ms. Whatever delay a host adds on top is not
+        // the shifter waiting.
+        let sr = 48_000.0;
+        let mut dsp = bare_dsp();
+        let tone = |n: usize| (n as f32 * std::f32::consts::TAU * 220.0 / sr).sin() * 0.5;
+        let mut n = 0;
+        for _ in 0..4_800 {
+            dsp.process_stereo(tone(n), tone(n));
+            n += 1;
+        }
+        let hear = |dsp: &mut Dsp, semis: f32, n: &mut usize| {
+            assert!(dsp.apply_ui_param("transpose_semi", semis));
+            // Skip 40 ms of glide, then read 60 ms.
+            let mut out = Vec::new();
+            for i in 0..4_800 {
+                let (l, _) = dsp.process_stereo(tone(*n), tone(*n));
+                if i >= 1_920 {
+                    out.push(l);
+                }
+                *n += 1;
+            }
+            crossing_rate(&out, sr)
+        };
+        for (semis, expected) in [(12.0, 440.0), (7.0, 329.6), (-5.0, 164.8), (0.0, 220.0)] {
+            let hz = hear(&mut dsp, semis, &mut n);
+            assert!(
+                (hz - expected).abs() < expected * 0.04,
+                "transpose {semis:+}: {hz} Hz 40 ms after the edit, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn transpose_moves_the_latency_only_leaving_or_reaching_zero() {
+        // What the plug-in forwards to the host: a latency change on every
+        // edit that crosses zero (VST3 restartComponent(kLatencyChanged)),
+        // none for an edit between two non-zero keys.
+        let mut dsp = bare_dsp();
+        assert_eq!(dsp.latency_samples(), 0);
+        dsp.apply_ui_param("transpose_semi", 2.0);
+        let shifted = dsp.latency_samples();
+        assert!(shifted > 0);
+        assert!(shifted <= (48_000.0f32 * 0.015) as usize, "{shifted}");
+        dsp.apply_ui_param("transpose_semi", -3.0);
+        assert_eq!(dsp.latency_samples(), shifted);
+        dsp.apply_ui_param("transpose_cents", 40.0);
+        assert_eq!(dsp.latency_samples(), shifted);
+        dsp.apply_ui_param("transpose_semi", 0.0);
+        assert_eq!(dsp.latency_samples(), shifted, "40 cents is still a shift");
+        dsp.apply_ui_param("transpose_cents", 0.0);
+        assert_eq!(dsp.latency_samples(), 0);
     }
 
     #[test]
