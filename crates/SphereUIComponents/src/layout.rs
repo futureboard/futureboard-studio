@@ -506,7 +506,39 @@ pub(crate) fn build_and_warm_audio_engine(
     // Edition ASIO drivers or their active-session channel counts.
     #[cfg(not(target_os = "macos"))]
     crate::device_registry::scan_audio_for_engine(&engine);
+    // macOS skipped every scan above, which left the registry empty for the
+    // whole session: Audio Connections offered no hardware and the project's
+    // buses loaded as Disconnected while audio played fine. Scan here, before
+    // the project's connections are validated, on a dedicated thread with a
+    // bounded wait so a HAL held by another process can never stall the
+    // workspace mount; a late scan still fills the cache when it returns.
+    #[cfg(target_os = "macos")]
+    scan_audio_bounded(std::time::Duration::from_secs(3));
     Ok((engine, stats))
+}
+
+/// Fill the device registry from CoreAudio without letting a blocked HAL
+/// block the caller longer than `wait`.
+#[cfg(target_os = "macos")]
+fn scan_audio_bounded(wait: std::time::Duration) {
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("audio-device-scan".into())
+        .spawn(move || {
+            crate::device_registry::scan_audio();
+            let _ = done_tx.send(());
+        });
+    match spawned {
+        Ok(_) => {
+            if done_rx.recv_timeout(wait).is_err() {
+                eprintln!(
+                    "[audio] device scan still running after {}ms; continuing without it",
+                    wait.as_millis()
+                );
+            }
+        }
+        Err(error) => eprintln!("[audio] could not start the device scan thread: {error}"),
+    }
 }
 
 /// Per-track clip id for the temporary live-recording preview clip (one

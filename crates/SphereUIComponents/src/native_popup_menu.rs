@@ -20,11 +20,20 @@
 //! The menus take the app theme's appearance (dark or light), not the OS
 //! setting: see [`crate::native_win32_menu::theme_popups_for`].
 //!
+//! ## macOS
+//!
+//! An `NSMenu` popped up with `popUpMenuPositioningItem:atLocation:inView:`
+//! in the window's content view. That call runs AppKit's menu-tracking loop
+//! until the menu closes, so — as on Windows — [`show`] never tracks inside
+//! the GPUI callback that asked for it: it spawns a task on the window, and
+//! the task's first poll (from the main dispatch queue, with nothing in GPUI
+//! borrowed) tracks the menu and then hands the choice back through
+//! `cx.update`. The menu takes the app theme's appearance.
+//!
 //! ## Elsewhere
 //!
 //! [`available`] is false and [`show`] declines, so callers keep drawing their
-//! own menu. macOS keeps its native *menu bar* (`native_macos_menu`); its
-//! context menus are still drawn.
+//! own menu.
 
 use gpui::{App, Bounds, Pixels, Point, Window};
 
@@ -54,7 +63,7 @@ pub type PopupResultCb = Box<dyn FnOnce(Option<String>, &mut Window, &mut App) +
 
 /// Whether this platform shows popup menus natively.
 pub fn available() -> bool {
-    cfg!(target_os = "windows")
+    cfg!(any(target_os = "windows", target_os = "macos"))
 }
 
 /// Whether a native menu opened by [`show`] is still up (or about to come up)
@@ -65,7 +74,11 @@ pub fn is_open(window: &Window) -> bool {
     {
         win32::is_open(window)
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        appkit::is_open(window)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let _ = window;
         false
@@ -91,7 +104,11 @@ pub fn show(
     {
         win32::show(window, cx, position, exclude, items, on_result)
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        appkit::show(window, cx, position, exclude, items, on_result)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let _ = (window, cx, position, exclude, items, on_result);
         false
@@ -439,6 +456,9 @@ mod win32 {
         }
     }
 }
+
+#[cfg(target_os = "macos")]
+mod appkit;
 
 #[cfg(test)]
 mod tests {
