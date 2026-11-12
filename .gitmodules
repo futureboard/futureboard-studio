@@ -19,3 +19,9 @@
 [submodule "external/cpal"]
 	path = external/cpal
 	url = https://github.com/futureboard/cpal
+[submodule "external/clap-wrapper"]
+	path = external/clap-wrapper
+	url = https://github.com/free-audio/clap-wrapper
+[submodule "external/AudioUnitSDK"]
+	path = external/AudioUnitSDK
+	url = https://github.com/apple/AudioUnitSDK

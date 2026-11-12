@@ -457,7 +457,11 @@ mod win32 {
     }
 }
 
+// An explicit path, so the plug-in crates that mount this file with `#[path]`
+// (vstplugins/rodhareist_vst3) find it too: it resolves from this file's
+// directory either way.
 #[cfg(target_os = "macos")]
+#[path = "native_popup_menu/appkit.rs"]
 mod appkit;
 
 #[cfg(test)]

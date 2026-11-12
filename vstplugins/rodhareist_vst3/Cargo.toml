@@ -49,11 +49,20 @@ serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 smallvec = { version = "1.6", features = ["union", "const_new"] }
 unicode-segmentation = "1.10"
+# The editor window's handle (HWND / NSView), for the native popup menu. The
+# version GPUI uses.
+raw-window-handle = "0.6"
 
 [dev-dependencies]
 # `src/entry_point_tests.rs` drives the CLAP entry the way a host does; the same
 # bindings, at the same revision, nih-plug builds the plug-in side with.
 clap-sys = { git = "https://github.com/micahrj/clap-sys.git", rev = "25d7f53fdb6363ad63fbd80049cb7a42a97ac156" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Studio's native popup menu on macOS (`native_popup_menu/appkit.rs`): NSMenu.
+# The versions Studio uses.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSGeometry"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
@@ -70,8 +79,6 @@ windows = { version = "0.61", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
-# The editor window's HWND, for the native popup menu. The version GPUI uses.
-raw-window-handle = "0.6"
 
 [patch."https://github.com/futureboard/gpui-se.git"]
 gpui = { path = "../../crates/gpui" }

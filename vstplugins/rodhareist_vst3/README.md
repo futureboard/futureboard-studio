@@ -1,4 +1,4 @@
-# Rodhareist plug-in (VST2 / VST3 / CLAP)
+# Rodhareist plug-in (VST2 / VST3 / CLAP / AU)
 
 Futureboard's Rodhareist guitar multi-effect for other DAWs, built on the
 repo's vendored nih-plug fork (`external/nihplug_gpui`).
@@ -40,12 +40,22 @@ cargo test --manifest-path vstplugins/rodhareist_vst3/Cargo.toml
 CLAP entry, VST2 `VSTPluginMain`) the way a host does and runs audio through
 it; the debug build aborts on any allocation in `process`.
 
-## AU
+## AU (macOS)
 
-Not built. nih-plug has no Audio Unit wrapper, and an AU can only be built
-and signed on macOS. The route there is
-[clap-wrapper](https://github.com/free-audio/clap-wrapper), which wraps the
-CLAP build as an AUv2 on a Mac.
+nih-plug has no Audio Unit wrapper, so the AU is
+[clap-wrapper](https://github.com/free-audio/clap-wrapper)'s AUv2 shell
+around this plug-in's CLAP build, which it carries at
+`Rodhareist.component/Contents/PlugIns/Rodhareist.clap`: the same binary,
+DSP, parameters, state and editor. After the bundle step above:
+
+```bash
+./packaging/native/build-auv2.sh rodhareist
+```
+
+writes `target/bundled/Rodhareist.component` (effect `aufx`, subtype `Rdhr`,
+manufacturer `Ftbd`). It needs cmake, ninja and the `external/clap-wrapper`
+and `external/AudioUnitSDK` submodules. `packaging/native/build-plugin-pkg.sh
+rodhareist` builds all four formats into one macOS installer.
 
 ## What a session saves
 
