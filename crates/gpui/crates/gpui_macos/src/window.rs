@@ -1866,6 +1866,9 @@ impl PlatformWindow for MacWindow {
     }
 
     fn a11y_init(&self, callbacks: gpui::A11yCallbacks) {
+        if !accesskit_classes_available() {
+            return;
+        }
         let mut lock = self.0.lock();
 
         let activation_handler = A11yActivationHandler {
@@ -3377,4 +3380,34 @@ pub unsafe fn detach_embedded_view(view: *mut c_void) {
         window_state.lock().stop_display_link();
         let _: () = msg_send![view, removeFromSuperview];
     }
+}
+
+/// Whether this binary may register AccessKit's Objective-C classes.
+///
+/// `accesskit_macos` declares `AccessKitSubclassAssociatedObject` and
+/// `AccessKitNode` under fixed names and panics if either already exists.
+/// Objective-C classes are process-global, so when two GPUI binaries share a
+/// process — two Futureboard plug-ins in one host, or a plug-in inside Studio —
+/// the second to open a window aborted the whole host. The names are checked
+/// once, before this binary's own AccessKit has declared anything, so a name
+/// that is already present belongs to another image: this binary then runs its
+/// windows without the AccessKit adapter rather than crash. The first binary
+/// keeps full accessibility.
+fn accesskit_classes_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        let owner = ["AccessKitSubclassAssociatedObject", "AccessKitNode"]
+            .into_iter()
+            .find(|name| Class::get(name).is_some());
+        match owner {
+            Some(name) => {
+                log::warn!(
+                    "accessibility disabled for this module's windows: Objective-C class \
+                     {name} is already registered by another module in this process"
+                );
+                false
+            }
+            None => true,
+        }
+    })
 }
