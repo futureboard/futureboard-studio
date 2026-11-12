@@ -6,7 +6,7 @@ mod plugin_drop;
 mod render;
 mod track_rename;
 pub(crate) use automation_value_edit::{AutomationValueEdit, AUTOMATION_VALUE_FIELD_HEIGHT};
-pub use plugin_drop::{resolve_plugin_drop, NewTrackKind, PluginDropTarget};
+pub use plugin_drop::{insert_index_below, resolve_plugin_drop, NewTrackKind, PluginDropTarget};
 pub(crate) use render::*;
 pub(crate) use track_rename::{
     track_rename_command_policy, TrackRenameChord, TrackRenameCommandPolicy, TrackRenameKeyOutcome,

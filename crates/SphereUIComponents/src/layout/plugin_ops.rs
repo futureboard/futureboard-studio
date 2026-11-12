@@ -5434,10 +5434,13 @@ impl StudioLayout {
     /// A plug-in preset dropped on the arrangement. `track_id` is the track it
     /// landed on, or `None` for the empty space below the last track.
     ///
-    /// An instrument always gets its own new MIDI track (a second instrument
-    /// on an existing track would silently replace the first). An effect goes
-    /// onto the track it was dropped on, or onto a new audio track when it
-    /// was dropped on empty space.
+    /// An instrument preset dropped on an Instrument track loads into that
+    /// track's instrument slot (see
+    /// [`Self::drop_instrument_preset_on_instrument_track`]); anywhere else it
+    /// gets a new Instrument track of its own, right
+    /// below the track it was dropped on. An effect goes onto the track it was
+    /// dropped on, or onto a new audio track when it was dropped on empty
+    /// space.
     pub(super) fn apply_dropped_plugin_preset(
         &mut self,
         track_id: Option<&str>,
@@ -5453,7 +5456,18 @@ impl StudioLayout {
         }
         let (reg, state) = self.read_dropped_plugin_preset(preset_path)?;
         if reg.kind == PluginKind::Instrument {
-            return self.create_instrument_track_from_preset(&reg, state, cx);
+            if let Some(track_id) = track_id {
+                if track_takes_dropped_instrument(&self.timeline.read(cx).state, track_id) {
+                    return self.drop_instrument_preset_on_instrument_track(
+                        track_id,
+                        preset_path,
+                        reg,
+                        state,
+                        cx,
+                    );
+                }
+            }
+            return self.create_instrument_track_from_preset(&reg, state, track_id, cx);
         }
         let track_id = match track_id {
             Some(track_id) => track_id.to_string(),
@@ -5476,9 +5490,160 @@ impl StudioLayout {
             slot_index,
             &reg,
             state,
+            false,
             cx,
             "plugin_preset_drop",
         )
+    }
+
+    /// An instrument preset dropped on an Instrument track that can take it.
+    ///
+    /// - An empty instrument slot just takes it: nothing is lost.
+    /// - A preset saved by the plug-in already loaded there loads into it, the
+    ///   same way (and with the same undo step) as choosing it from the
+    ///   strip's preset menu, which does not ask either.
+    /// - Any other instrument is replaced only after the user confirms; the
+    ///   replacement waits for the answer and is one undo step.
+    fn drop_instrument_preset_on_instrument_track(
+        &mut self,
+        track_id: &str,
+        preset_path: &std::path::Path,
+        reg: SpherePluginHost::RegistryPlugin,
+        state: Option<std::sync::Arc<Vec<u8>>>,
+        cx: &mut Context<Self>,
+    ) -> Option<(String, usize, String)> {
+        let current = {
+            let timeline = self.timeline.read(cx);
+            timeline.state.find_track(track_id).and_then(|track| {
+                track
+                    .inserts
+                    .first()
+                    .filter(|slot| !slot.is_empty())
+                    .map(|slot| {
+                        (
+                            slot.id.clone(),
+                            slot.plugin_id.clone(),
+                            slot.display_name.clone(),
+                            track.name.clone(),
+                        )
+                    })
+            })
+        };
+        let Some((slot_id, current_plugin_id, current_name, track_name)) = current else {
+            return self.bind_preset_to_insert_slot(
+                track_id,
+                0,
+                &reg,
+                state,
+                true,
+                cx,
+                "instrument_preset_drop",
+            );
+        };
+        let (incoming_plugin_id, ..) = Self::registry_insert_descriptor(&reg);
+        if state.is_some() && current_plugin_id.as_deref() == Some(incoming_plugin_id.as_str()) {
+            if let Some(owner) = self.insert_preset_owner(track_id, &slot_id, cx) {
+                if self.load_preset_path(track_id, &slot_id, &owner, preset_path, cx) {
+                    return Some((track_id.to_string(), 0, slot_id));
+                }
+            }
+            eprintln!(
+                "[PluginDrop] preset path={} did not load into insert={slot_id}; asking to \
+                 replace the instrument instead",
+                preset_path.display()
+            );
+        }
+        self.confirm_instrument_replacement(
+            track_id,
+            &slot_id,
+            &track_name,
+            &current_name,
+            preset_path,
+            reg,
+            state,
+            cx,
+        );
+        None
+    }
+
+    /// Ask before an instrument preset replaces `current_name` on the track;
+    /// replace only on Replace, and only if the instrument slot is still the
+    /// one the question was about.
+    #[allow(clippy::too_many_arguments)]
+    fn confirm_instrument_replacement(
+        &mut self,
+        track_id: &str,
+        slot_id: &str,
+        track_name: &str,
+        current_name: &str,
+        preset_path: &std::path::Path,
+        reg: SpherePluginHost::RegistryPlugin,
+        state: Option<std::sync::Arc<Vec<u8>>>,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::components::message_box_dialog::{
+            open_message_box_window, MessageBoxResponseCb, MessageBoxResult,
+        };
+
+        let preset_name = preset_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or(reg.name.as_str());
+        let options =
+            instrument_replacement_question(track_name, current_name, &reg.name, preset_name);
+        let owner_bounds = crate::window_position::resolve_owner_bounds_with_preferred(
+            self.window_hooks.cached_bounds,
+            self.studio_window_bounds(cx),
+            cx,
+        );
+        let studio = cx.entity().clone();
+        let track_id = track_id.to_string();
+        let slot_id = slot_id.to_string();
+        let on_response: MessageBoxResponseCb =
+            std::sync::Arc::new(move |result: MessageBoxResult, _window, cx| {
+                if result.dismissed || result.response != 0 {
+                    return;
+                }
+                let track_id = track_id.clone();
+                let slot_id = slot_id.clone();
+                let reg = reg.clone();
+                let state = state.clone();
+                StudioLayout::defer_update(&studio, cx, move |this, cx| {
+                    if !instrument_slot_unchanged(this, &track_id, &slot_id, cx) {
+                        return;
+                    }
+                    // The loading dialog comes up first: taking the old
+                    // instrument's state and unloading it can take a while
+                    // for a large one, and the window has to paint before
+                    // that work holds the UI thread. The new instance's own
+                    // load entry takes over once it is dispatched.
+                    let pending = format!("replace:{slot_id}");
+                    this.begin_plugin_load_progress(&pending, &reg.name, cx);
+                    cx.spawn(async move |this, cx| {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(80))
+                            .await;
+                        let _ = this.update(cx, |this, cx| {
+                            if instrument_slot_unchanged(this, &track_id, &slot_id, cx) {
+                                let _ = this.bind_preset_to_insert_slot(
+                                    &track_id,
+                                    0,
+                                    &reg,
+                                    state,
+                                    true,
+                                    cx,
+                                    "instrument_preset_drop",
+                                );
+                            }
+                            this.end_plugin_load_progress(&pending, cx);
+                        });
+                    })
+                    .detach();
+                });
+            });
+        if let Err(error) = open_message_box_window(owner_bounds, options, on_response, cx) {
+            eprintln!("[PluginDrop] instrument replacement question unavailable: {error}");
+        }
     }
 
     /// A fresh track for a plug-in dropped where no track was, selected, and
@@ -5543,7 +5708,15 @@ impl StudioLayout {
             );
             return None;
         }
-        self.bind_preset_to_insert_slot(track_id, slot_index, &reg, state, cx, "mixer_preset_drop")
+        self.bind_preset_to_insert_slot(
+            track_id,
+            slot_index,
+            &reg,
+            state,
+            false,
+            cx,
+            "mixer_preset_drop",
+        )
     }
 
     /// The plug-in a dropped one-plug-in `.pst` names, and for a user preset
@@ -5644,6 +5817,7 @@ impl StudioLayout {
         slot_index: usize,
         reg: &SpherePluginHost::RegistryPlugin,
         state: Option<std::sync::Arc<Vec<u8>>>,
+        is_instrument: bool,
         cx: &mut Context<Self>,
         source: &'static str,
     ) -> Option<(String, usize, String)> {
@@ -5713,7 +5887,7 @@ impl StudioLayout {
             );
             timeline
                 .state
-                .set_insert_plugin_role(track_id, &slot_id, false);
+                .set_insert_plugin_role(track_id, &slot_id, is_instrument);
         });
 
         eprintln!(
@@ -5727,13 +5901,20 @@ impl StudioLayout {
         Some((track_id.to_string(), slot_index, slot_id))
     }
 
+    /// A new Instrument track playing the dropped preset's instrument, below
+    /// `below_track_id` (outside its folder) or at the end of the list: the
+    /// same track as Add Track > Instrument with that plug-in, with the
+    /// preset's state seeded before the instance loads.
     fn create_instrument_track_from_preset(
         &mut self,
         reg: &SpherePluginHost::RegistryPlugin,
         state: Option<std::sync::Arc<Vec<u8>>>,
+        below_track_id: Option<&str>,
         cx: &mut Context<Self>,
     ) -> Option<(String, usize, String)> {
-        use crate::components::timeline::timeline_state::TrackType;
+        use crate::components::timeline::timeline_state::{
+            CreateTrackOptions, InputMonitorMode, TrackType,
+        };
 
         let (plugin_id, plugin_path, plugin_format, vendor, display_name) =
             Self::registry_insert_descriptor(reg);
@@ -5743,27 +5924,25 @@ impl StudioLayout {
             cx,
         );
         let created = self.timeline.update(cx, |timeline, _cx| {
-            // A dropped instrument preset must have a MIDI-producing track
-            // before the plugin instance is created. Creating an Instrument
-            // track directly used to race the bridge's MIDI route setup: the
-            // plugin existed, but no MIDI source was available when its first
-            // state/preview request was dispatched. A MIDI track is also a
-            // valid instrument host in the runtime (`bridge_instrument_instance_id`),
-            // and keeps the stable track/insert ownership in one operation.
-            let track_id = timeline.state.create_track(
-                crate::components::timeline::timeline_state::CreateTrackOptions {
-                    track_type: TrackType::Midi,
-                    name: format!("MIDI — {display_name}"),
-                    color: timeline
-                        .state
-                        .track_color_for_index(timeline.state.tracks.len()),
-                    volume: crate::components::timeline::timeline_state::volume::db_to_norm(0.0),
-                    pan: 0.0,
-                    armed: false,
-                    input_monitor:
-                        crate::components::timeline::timeline_state::InputMonitorMode::Off,
-                },
-            );
+            let insert_index = below_track_id.map(|below| {
+                crate::components::timeline::insert_index_below(&timeline.state, below)
+            });
+            let track_id = timeline.state.create_track(CreateTrackOptions {
+                track_type: TrackType::Instrument,
+                name: display_name.clone(),
+                color: timeline
+                    .state
+                    .track_color_for_index(timeline.state.tracks.len()),
+                volume: crate::components::timeline::timeline_state::volume::db_to_norm(0.0),
+                pan: 0.0,
+                armed: false,
+                input_monitor: InputMonitorMode::Off,
+            });
+            if let Some(insert_index) = insert_index {
+                if insert_index < timeline.state.tracks.len() - 1 {
+                    timeline.state.reorder_track(&track_id, insert_index);
+                }
+            }
             let slot_id = timeline.state.add_insert(&track_id)?;
             timeline.state.set_insert_plugin(
                 &track_id,
@@ -5784,7 +5963,7 @@ impl StudioLayout {
         self.commit_track_edit("Add Instrument Track", edit, cx);
 
         eprintln!(
-            "[PluginDrop] midi track created before instrument plugin track={} slot={} plugin={}",
+            "[PluginDrop] instrument track created from preset track={} slot={} plugin={}",
             created.0, created.2, display_name
         );
         self.after_preset_insert_bound(
@@ -5807,13 +5986,24 @@ impl StudioLayout {
         source: &'static str,
     ) {
         use crate::components::timeline::timeline_state::InsertPluginFormat;
-        if matches!(
-            plugin_format,
-            InsertPluginFormat::Vst3
-                | InsertPluginFormat::Vst2
-                | InsertPluginFormat::Clap
-                | InsertPluginFormat::Au
-        ) && super::plugin_bridge_runtime::bridge_enabled()
+        // A built-in's catalog row has no module format, but it still lives
+        // in the plug-in host and needs its load, as from the picker.
+        let is_builtin = self
+            .timeline
+            .read(cx)
+            .state
+            .find_insert_slot(track_id, slot_id)
+            .and_then(|slot| slot.plugin_id.clone())
+            .is_some_and(|id| SpherePluginHost::builtin_audio_bridge_supported(&id));
+        if (is_builtin
+            || matches!(
+                plugin_format,
+                InsertPluginFormat::Vst3
+                    | InsertPluginFormat::Vst2
+                    | InsertPluginFormat::Clap
+                    | InsertPluginFormat::Au
+            ))
+            && super::plugin_bridge_runtime::bridge_enabled()
         {
             let display_name = self
                 .timeline
@@ -5823,13 +6013,6 @@ impl StudioLayout {
                 .map(|slot| slot.display_name.clone())
                 .unwrap_or_else(|| "Plugin".to_string());
             // Built-ins load instantly (see `apply_plugin_pick`) — no dialog.
-            let is_builtin = self
-                .timeline
-                .read(cx)
-                .state
-                .find_insert_slot(track_id, slot_id)
-                .and_then(|slot| slot.plugin_id.clone())
-                .is_some_and(|id| SpherePluginHost::builtin_audio_bridge_supported(&id));
             if !is_builtin {
                 self.begin_plugin_load_progress(slot_id, &display_name, cx);
             }
@@ -6033,7 +6216,7 @@ impl StudioLayout {
 
     /// All inserts whose audio is rendered through the shared-memory bridge,
     /// including Futureboard built-ins that have no module path.
-    fn bridge_audio_insert_slots(&self, cx: &App) -> Vec<(String, String)> {
+    pub(super) fn bridge_audio_insert_slots(&self, cx: &App) -> Vec<(String, String)> {
         let mut slots = self.bridge_hosted_insert_slots(cx);
         if !super::plugin_bridge_runtime::bridge_enabled() {
             return slots;
@@ -7781,6 +7964,76 @@ mod insert_ownership_tests {
     }
 }
 
+/// The question asked before a dropped preset replaces a track's instrument.
+/// Cancel is the default and the Escape answer.
+/// The track's instrument slot is still `slot_id`: the replacement a user
+/// confirmed applies only to the instrument the question named.
+fn instrument_slot_unchanged(
+    this: &StudioLayout,
+    track_id: &str,
+    slot_id: &str,
+    cx: &gpui::App,
+) -> bool {
+    let unchanged = this
+        .timeline
+        .read(cx)
+        .state
+        .find_track(track_id)
+        .and_then(|track| track.inserts.first())
+        .is_some_and(|slot| slot.id == slot_id);
+    if !unchanged {
+        eprintln!(
+            "[PluginDrop] instrument on track={track_id} changed while asking; preset not applied"
+        );
+    }
+    unchanged
+}
+
+fn instrument_replacement_question(
+    track_name: &str,
+    current_name: &str,
+    incoming_name: &str,
+    preset_name: &str,
+) -> crate::components::message_box_dialog::MessageBoxOptions {
+    use crate::components::message_box_dialog::{MessageBoxKind, MessageBoxOptions};
+    MessageBoxOptions {
+        kind: MessageBoxKind::Warning,
+        title: "Replace Instrument".to_string(),
+        message: format!(
+            "Replace \"{current_name}\" on \"{track_name}\" with \"{incoming_name}\"?"
+        ),
+        detail: Some(format!(
+            "The preset \"{preset_name}\" loads into a new {incoming_name}. {current_name} and \
+             its current sound are removed from this track; Undo brings them back."
+        )),
+        buttons: vec!["Replace".to_string(), "Cancel".to_string()],
+        default_id: 1,
+        cancel_id: Some(1),
+    }
+}
+
+/// Whether an instrument preset dropped on `track_id` loads into that track:
+/// an Instrument track whose instrument slot (the first) is empty or holds an
+/// instrument. Any other track, or a first slot known to hold an effect, gets
+/// a new Instrument track instead. A project saved before the role was stored
+/// has no role on the slot; on an Instrument track the first slot is the
+/// instrument (`TrackState::instrument_insert`), so only an explicit effect
+/// role is refused.
+fn track_takes_dropped_instrument(
+    state: &crate::components::timeline::timeline_state::TimelineState,
+    track_id: &str,
+) -> bool {
+    use crate::components::timeline::timeline_state::TrackType;
+    let Some(track) = state.find_track(track_id) else {
+        return false;
+    };
+    track.track_type == TrackType::Instrument
+        && track
+            .inserts
+            .first()
+            .is_none_or(|slot| slot.is_empty() || slot.plugin_is_instrument != Some(false))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -8122,5 +8375,108 @@ mod plugin_state_dirty_tests {
         assert!(!tasks.tasks.contains_key(PLUGIN_STATE_CAPTURE_TASK_ID));
         assert!(tasks.tasks.contains_key("project-autosave"));
         assert!(!forget_plugin_state_capture_report(&mut tasks));
+    }
+}
+
+#[cfg(test)]
+mod instrument_preset_drop_tests {
+    use super::track_takes_dropped_instrument;
+    use crate::components::timeline::timeline_state::{
+        CreateTrackOptions, InputMonitorMode, InsertPluginFormat, TimelineState, TrackType,
+    };
+
+    fn track(state: &mut TimelineState, track_type: TrackType) -> String {
+        state.create_track(CreateTrackOptions {
+            track_type,
+            name: "T".to_string(),
+            color: gpui::Rgba {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 1.0,
+            },
+            volume: 1.0,
+            pan: 0.0,
+            armed: false,
+            input_monitor: InputMonitorMode::Off,
+        })
+    }
+
+    fn bind(state: &mut TimelineState, track_id: &str, instrument: bool) {
+        let slot = state.ensure_insert_slot_at(track_id, 0).expect("slot");
+        state.set_insert_plugin(
+            track_id,
+            &slot,
+            "p".to_string(),
+            Some(std::path::PathBuf::from("/p/P.vst3")),
+            InsertPluginFormat::Vst3,
+            None,
+            "P".to_string(),
+        );
+        state.set_insert_plugin_role(track_id, &slot, instrument);
+    }
+
+    #[test]
+    fn instrument_track_takes_the_preset_into_its_instrument_slot() {
+        let mut state = TimelineState::default();
+        let empty = track(&mut state, TrackType::Instrument);
+        assert!(track_takes_dropped_instrument(&state, &empty));
+        let playing = track(&mut state, TrackType::Instrument);
+        bind(&mut state, &playing, true);
+        assert!(track_takes_dropped_instrument(&state, &playing));
+    }
+
+    /// An older project's instrument slot has no stored role; its first slot
+    /// is still the track's instrument, so a drop asks to replace it rather
+    /// than making another track.
+    #[test]
+    fn a_legacy_instrument_slot_without_a_role_still_takes_the_preset() {
+        let mut state = TimelineState::default();
+        let legacy = track(&mut state, TrackType::Instrument);
+        bind(&mut state, &legacy, true);
+        let slot = state
+            .find_track(&legacy)
+            .and_then(|track| track.inserts.first())
+            .map(|slot| slot.id.clone())
+            .expect("slot");
+        state
+            .insert_slots_mut(&legacy)
+            .and_then(|slots| slots.iter_mut().find(|s| s.id == slot))
+            .expect("slot")
+            .plugin_is_instrument = None;
+        assert!(track_takes_dropped_instrument(&state, &legacy));
+    }
+
+    #[test]
+    fn the_replace_question_names_both_instruments_and_defaults_to_cancel() {
+        let options =
+            super::instrument_replacement_question("Keys", "Old Synth", "New Synth", "Pad");
+        assert_eq!(options.title, "Replace Instrument");
+        assert!(options.message.contains("\"Old Synth\""));
+        assert!(options.message.contains("\"New Synth\""));
+        assert!(options.message.contains("\"Keys\""));
+        assert!(options
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("\"Pad\"")));
+        assert_eq!(
+            options.buttons,
+            vec!["Replace".to_string(), "Cancel".to_string()]
+        );
+        assert_eq!(options.default_id, 1);
+        assert_eq!(options.cancel_id, Some(1));
+    }
+
+    #[test]
+    fn other_tracks_and_effect_first_slots_get_a_new_instrument_track() {
+        let mut state = TimelineState::default();
+        for track_type in [TrackType::Audio, TrackType::Midi] {
+            let id = track(&mut state, track_type);
+            assert!(!track_takes_dropped_instrument(&state, &id));
+        }
+        let effect_first = track(&mut state, TrackType::Instrument);
+        bind(&mut state, &effect_first, false);
+        assert!(!track_takes_dropped_instrument(&state, &effect_first));
+        assert!(!track_takes_dropped_instrument(&state, "missing"));
     }
 }

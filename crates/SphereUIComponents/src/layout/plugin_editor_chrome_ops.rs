@@ -626,7 +626,7 @@ impl StudioLayout {
     /// Loads the preset file at `path` into the insert, as one undoable step.
     /// `false` when the file is not this plug-in's preset or the plug-in
     /// refused it; nothing changes then.
-    fn load_preset_path(
+    pub(super) fn load_preset_path(
         &mut self,
         track_id: &str,
         insert_id: &str,
@@ -1243,7 +1243,7 @@ impl StudioLayout {
         }
     }
 
-    fn insert_preset_owner(
+    pub(super) fn insert_preset_owner(
         &self,
         track_id: &str,
         insert_id: &str,

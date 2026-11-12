@@ -51,5 +51,6 @@ pub use render::{
     TimelineRenderSnapshot, TimelineRenderer, TimelineRendererBackend, TimelineViewport,
 };
 pub use timeline::{
-    resolve_plugin_drop, NewTrackKind, PluginDropTarget, Timeline, TimelineChromeMetrics,
+    insert_index_below, resolve_plugin_drop, NewTrackKind, PluginDropTarget, Timeline,
+    TimelineChromeMetrics,
 };

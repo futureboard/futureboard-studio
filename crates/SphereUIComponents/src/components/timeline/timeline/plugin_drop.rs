@@ -112,7 +112,7 @@ pub fn resolve_plugin_drop(
 /// Index just below `track_id` — below its whole outermost folder when it is
 /// a folder or sits in one, at any depth, so a new track never lands inside a
 /// folder it does not belong to.
-fn insert_index_below(state: &TimelineState, track_id: &str) -> usize {
+pub fn insert_index_below(state: &TimelineState, track_id: &str) -> usize {
     let Some(index) = state.tracks.iter().position(|track| track.id == track_id) else {
         return state.tracks.len();
     };
