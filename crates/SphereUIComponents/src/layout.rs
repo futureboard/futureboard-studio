@@ -1709,9 +1709,10 @@ impl StudioLayout {
     }
 
     fn spawn_audio_engine_warmup(&mut self, cx: &mut Context<Self>) {
-        if self.audio_bridge.engine.is_some() {
+        if self.audio_bridge.engine.is_some() || self.audio_bridge.warmup_in_flight {
             return;
         }
+        self.audio_bridge.warmup_in_flight = true;
         let schema = self.settings.read(cx).current.clone();
         self.audio_bridge.last_error = Some("Initializing audio...".to_string());
         cx.notify();
@@ -1720,6 +1721,7 @@ impl StudioLayout {
                 .background_executor()
                 .spawn(async move { build_and_warm_audio_engine(schema) })
                 .await;
+            let _ = this.update(cx, |this, _cx| this.audio_bridge.warmup_in_flight = false);
             let _ = this.update(cx, |this, cx| match result {
                 Ok((engine, stats)) => {
                     if this.audio_bridge.engine.is_some() {

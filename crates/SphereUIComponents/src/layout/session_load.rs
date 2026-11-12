@@ -81,6 +81,21 @@ fn expected_persisted_track_count(tracks: &[crate::project::ProjectTrack]) -> us
         .count()
 }
 
+/// An insert whose instance lives in a plug-in host and is unloaded there one
+/// by one when the session goes: module plug-ins and the built-ins the host
+/// runs alike. The pre-studio restore loads the same set
+/// (`pre_studio_install::target_from_slot`), so what one session loaded the
+/// next switch unloads.
+fn unloads_through_bridge(
+    slot: &crate::components::timeline::timeline_state::InsertSlotState,
+) -> bool {
+    slot.is_bridge_hosted_external_module()
+        || slot
+            .plugin_id
+            .as_deref()
+            .is_some_and(SpherePluginHost::builtin_audio_bridge_supported)
+}
+
 impl StudioLayout {
     /// Bump the session generation and return the new value. Call this at every
     /// point that tears down or replaces the live session (project reset,
@@ -141,7 +156,67 @@ impl StudioLayout {
         self.session_install_status = crate::app_state::SessionInstallStatus::Ready;
         self.mark_engine_media_dirty();
         self.schedule_audio_project_sync(cx, true, "session_rollback_restore");
+        self.revive_rolled_back_session(cx);
         cx.notify();
+    }
+
+    /// Bring a rolled-back session back to life. A switch that fails after
+    /// the unload half of its queue ran has already stopped this session's
+    /// engine and unloaded its plug-ins; the rollback restores only the
+    /// timeline. Warm an engine if there is none, then load the session's
+    /// plug-ins again, from the state the rollback snapshot holds.
+    pub fn revive_rolled_back_session(&mut self, cx: &mut Context<Self>) {
+        use crate::components::timeline::timeline_state::{
+            PluginRuntimeBackend, PluginRuntimeState,
+        };
+        let runtime_live = self
+            .plugin_editors
+            .bridge_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.lock().ok().map(|r| r.host_pid().is_some()))
+            .unwrap_or(false);
+        if self.audio_bridge.engine.is_some() && runtime_live {
+            return;
+        }
+        session_log!("reviving rolled-back session: engine and plug-ins");
+        let slots = self.bridge_audio_insert_slots(cx);
+        let _ = self.timeline.update(cx, |timeline, _cx| {
+            for (track_id, slot_id) in &slots {
+                timeline.state.set_insert_runtime(
+                    track_id,
+                    slot_id,
+                    PluginRuntimeBackend::ExternalBridge,
+                    PluginRuntimeState::NotLoaded,
+                    None,
+                );
+            }
+        });
+        self.reseed_builtin_state_mirror(cx);
+        if self.audio_bridge.engine.is_some() {
+            self.restore_plugin_inserts_after_project_load(cx);
+            return;
+        }
+        // Plug-ins are prepared at the engine's rate and block size, so they
+        // load once it is up.
+        self.spawn_audio_engine_warmup(cx);
+        cx.spawn(async move |this, cx| {
+            for _ in 0..300 {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(50))
+                    .await;
+                let ready = this
+                    .update(cx, |this, _| this.audio_bridge.engine.is_some())
+                    .unwrap_or(true);
+                if ready {
+                    break;
+                }
+            }
+            let _ = this.update(cx, |this, cx| {
+                this.restore_plugin_inserts_after_project_load(cx);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Install a decoded project into a new studio workspace before the first
@@ -963,7 +1038,7 @@ impl StudioLayout {
                 instrument_track_ids.push(track.id.clone());
             }
             for (index, slot) in track.inserts.iter().enumerate() {
-                if !slot.is_bridge_hosted_external_module() {
+                if !unloads_through_bridge(slot) {
                     continue;
                 }
                 let is_instrument = is_instrument_track
@@ -980,7 +1055,7 @@ impl StudioLayout {
         }
 
         for slot in &state.master.inserts {
-            if !slot.is_bridge_hosted_external_module() {
+            if !unloads_through_bridge(slot) {
                 continue;
             }
             plugin_targets.push(PluginUnloadTarget {

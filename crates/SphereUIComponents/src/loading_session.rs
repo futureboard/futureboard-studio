@@ -258,7 +258,7 @@ impl LoadStage {
 
     pub fn label(self) -> &'static str {
         match self {
-            LoadStage::SessionShutdown => "Closing current session",
+            LoadStage::SessionShutdown => "Unloading session",
             LoadStage::Validate => "Validating project file",
             LoadStage::Decode => "Reading project data",
             LoadStage::SessionInstall => "Preparing session",
@@ -526,6 +526,10 @@ pub struct LoadingSessionWindow {
     /// running transaction and must not expose a way to close it.
     on_dismiss: Option<ReturnToWelcomeCb>,
     transaction: Option<SessionLoadTransaction>,
+    /// Heading for the load half of a switch. A switch is a queue: the live
+    /// session is unloaded first, under its own heading, and only then does
+    /// the window turn to loading the next one.
+    load_heading: SharedString,
 }
 
 impl LoadingSessionWindow {
@@ -536,8 +540,10 @@ impl LoadingSessionWindow {
         transaction: Option<SessionLoadTransaction>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let heading: SharedString = heading.into();
         Self {
-            heading: heading.into(),
+            load_heading: heading.clone(),
+            heading,
             detail: initial_detail.into(),
             progress: initial_progress,
             footer: "This can take a moment for large sessions.".into(),
@@ -594,22 +600,31 @@ impl LoadingSessionWindow {
         transaction: SessionLoadTransaction,
         cx: &mut Context<Self>,
     ) -> Self {
-        let heading = if transaction.shutdown.is_some() {
-            "Switching Project…".to_string()
-        } else {
-            session_name
+        let load_heading = session_name
+            .filter(|name| !name.is_empty())
+            .map(|name| format!("Loading {name}"))
+            .unwrap_or_else(|| "Loading Session…".to_string());
+        let heading = if transaction.stage == LoadStage::SessionShutdown {
+            transaction
+                .rollback
+                .as_ref()
+                .map(|rollback| rollback.session.name.clone())
                 .filter(|name| !name.is_empty())
-                .map(|name| format!("Loading {name}"))
-                .unwrap_or_else(|| "Loading Session…".to_string())
+                .map(|name| format!("Unloading {name}"))
+                .unwrap_or_else(|| "Unloading Session…".to_string())
+        } else {
+            load_heading.clone()
         };
         let stage = transaction.stage;
-        Self::new(
+        let mut window = Self::new(
             heading,
             stage.label(),
             stage.progress(),
             Some(transaction),
             cx,
-        )
+        );
+        window.load_heading = load_heading.into();
+        window
     }
 
     fn set_stage(&mut self, stage: LoadStage, cx: &mut Context<Self>) {
@@ -995,7 +1010,7 @@ impl LoadingSessionWindow {
 
         eprintln!("[SessionLoad] progress sink attached (shutdown)");
         eprintln!("[LoadingSessionUI] presentation=dialog");
-        self.set_detail("Closing current session", cx);
+        self.set_detail("Unloading session", cx);
 
         let this = cx.entity().clone();
         cx.spawn(async move |_view, cx| {
@@ -1020,7 +1035,11 @@ impl LoadingSessionWindow {
                             if let Some(load) = window.transaction.as_mut() {
                                 load.stage = LoadStage::Validate;
                             }
-                            window.set_detail("Reading project", cx);
+                            // Next in the queue: the old session is fully
+                            // gone, its plug-ins unloaded and its hosts shut
+                            // down, before the next one starts loading.
+                            window.heading = window.load_heading.clone();
+                            window.set_detail("Loading session", cx);
                             window.progress = ProgressBarValue::value(0.1);
                             cx.notify();
                             window.schedule_tick(cx);
@@ -1934,6 +1953,8 @@ fn begin_project_session_load_inner(
 
     let rollback_for_headless = rollback.clone();
     let shutdown_for_headless = shutdown.clone();
+    let studio_for_headless = studio;
+    let reason_for_headless = shutdown_reason.unwrap_or(SessionShutdownReason::ProjectSwitch);
     let initial_stage = LoadStage::initial(true, studio.is_some() || shutdown.is_some());
     let transaction = SessionLoadTransaction {
         path: Some(path.clone()),
@@ -1962,6 +1983,29 @@ fn begin_project_session_load_inner(
         }
         Err(err) => {
             session_log!("transaction window unavailable: {err} — loading project headless");
+            if let Some(studio) = studio_for_headless {
+                // The same queue as the window's: unload the live session,
+                // then load and install the next one on a fresh engine and
+                // plug-in host. Loading straight into the live session would
+                // leave its plug-ins and engine running under the new project.
+                run_headless_session_shutdown(studio, reason_for_headless, cx);
+                let install_success: LoadSuccessCb = {
+                    let on_success = on_success.clone();
+                    let on_failure = on_failure.clone();
+                    Arc::new(move |package, cx| {
+                        spawn_session_install(package, on_success.clone(), on_failure.clone(), cx)
+                    })
+                };
+                run_headless_load(
+                    path,
+                    open_options,
+                    rollback_for_headless,
+                    &install_success,
+                    &on_failure,
+                    cx,
+                );
+                return SessionTransactionSurface::Headless;
+            }
             if let Some(snapshot) = shutdown_for_headless {
                 let _ = crate::session_shutdown::run_session_shutdown(snapshot, |_| {});
             }
@@ -1976,6 +2020,52 @@ fn begin_project_session_load_inner(
             SessionTransactionSurface::Headless
         }
     }
+}
+
+/// Unload the live studio session without the transaction window: the same
+/// steps in the same order, run to completion on this thread before anything
+/// of the next session is loaded. Only the fallback when that window cannot
+/// open.
+fn run_headless_session_shutdown(
+    studio: WindowHandle<StudioLayout>,
+    reason: SessionShutdownReason,
+    cx: &mut App,
+) {
+    let snapshot = studio.update(cx, |layout, _window, cx| {
+        for step in UI_SHUTDOWN_STEPS {
+            if *step == SessionLifecycleStep::FlushAutosave {
+                continue;
+            }
+            let _ = layout.run_session_lifecycle_ui_step(*step, false, cx);
+        }
+        layout.capture_session_shutdown_snapshot_for_loading(reason, cx)
+    });
+    let Ok(mut snapshot) = snapshot else {
+        session_log!("headless shutdown: studio window gone");
+        return;
+    };
+    if let (Some(path), Some(project)) = (
+        snapshot.flush_autosave_path.clone(),
+        snapshot.flush_autosave_project.take(),
+    ) {
+        if let Err(error) =
+            flush_autosave_blocking(path, project, SessionLifecycleStep::FlushAutosave.timeout())
+        {
+            session_log!("headless shutdown: autosave flush failed: {error}");
+        }
+    }
+    if let Err(error) = run_session_shutdown(snapshot, |_| {}) {
+        session_log!(
+            "headless shutdown: {} failed: {}",
+            error.step.label(),
+            error.message
+        );
+    }
+    let _ = studio.update(cx, |layout, _window, cx| {
+        for step in POST_SHUTDOWN_UI_STEPS {
+            let _ = layout.run_session_lifecycle_ui_step(*step, false, cx);
+        }
+    });
 }
 
 fn session_transaction_window_options(

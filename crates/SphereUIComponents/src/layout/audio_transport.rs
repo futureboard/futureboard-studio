@@ -300,11 +300,15 @@ pub(crate) struct AudioBridgeState {
     /// Playhead beat captured when the user last pressed Play. Play/Stop and
     /// "return on Stop" seek back here rather than to bar 1.
     pub playback_anchor_beats: Option<f32>,
+    /// A background engine build is running. A second request waits for it
+    /// rather than opening the audio device twice.
+    pub warmup_in_flight: bool,
 }
 
 impl Default for AudioBridgeState {
     fn default() -> Self {
         Self {
+            warmup_in_flight: false,
             engine: None,
             running: false,
             last_error: None,
