@@ -19,6 +19,6 @@ pkgbase = futureboard-studio-bin
 	options = !strip
 	options = !debug
 	source_x86_64 = Futureboard.Studio-2026.11.1-beta2.0.0-x86_64.AppImage::https://github.com/futureboard/futureboard-studio/releases/download/2026.11.1-beta2.0.0/Futureboard.Studio-2026.11.1-beta2.0.0-x86_64.AppImage
-	sha256sums_x86_64 = 0000000000000000000000000000000000000000000000000000000000000000
+	sha256sums_x86_64 = 57d1123c65c5519419a3732ca34faa46f098c7bd3d6029aa04de059b6a4fec50
 
 pkgname = futureboard-studio-bin

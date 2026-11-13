@@ -39,7 +39,7 @@ source_x86_64=("${_appimage}::https://github.com/futureboard/futureboard-studio/
 # Release Build (.github/workflows/release.yml, `aur-checksum`) replaces this
 # with the sha256 of the AppImage it just attached to the release. It is never
 # SKIP; all zeros means no release has been built for `_appver` yet.
-sha256sums_x86_64=('0000000000000000000000000000000000000000000000000000000000000000')
+sha256sums_x86_64=('57d1123c65c5519419a3732ca34faa46f098c7bd3d6029aa04de059b6a4fec50')
 
 prepare() {
   cd "${srcdir}" || exit 1
