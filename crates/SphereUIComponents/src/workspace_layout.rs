@@ -39,6 +39,12 @@ pub struct SavedPanelVisibility {
     pub inspector: bool,
     #[serde(default = "default_true")]
     pub bottom_docked: bool,
+    /// Browser width in logical pixels.
+    #[serde(default = "default_browser_width")]
+    pub browser_width_px: f32,
+    /// Right-dock width in logical pixels.
+    #[serde(default = "default_inspector_width")]
+    pub inspector_width_px: f32,
 }
 
 impl Default for SavedPanelVisibility {
@@ -47,8 +53,18 @@ impl Default for SavedPanelVisibility {
             browser: true,
             inspector: true,
             bottom_docked: true,
+            browser_width_px: default_browser_width(),
+            inspector_width_px: default_inspector_width(),
         }
     }
+}
+
+fn default_browser_width() -> f32 {
+    crate::components::SIDEBAR_WIDTH
+}
+
+fn default_inspector_width() -> f32 {
+    crate::components::panel::INSPECTOR_WIDTH
 }
 
 // ── Saved bottom tab ──────────────────────────────────────────────────────────
@@ -262,6 +278,12 @@ pub fn sanitize_workspace_layout(layout: &mut SavedWorkspaceLayout) {
     if !layout.bottom_panel_height_px.is_finite() {
         layout.bottom_panel_height_px = default_bottom_panel_height();
     }
+    // Side-dock widths: whatever the file says, inside the range the docks
+    // can be dragged to.
+    layout.panels.browser_width_px =
+        crate::layout::DockWidths::clamp_browser(layout.panels.browser_width_px);
+    layout.panels.inspector_width_px =
+        crate::layout::DockWidths::clamp_inspector(layout.panels.inspector_width_px);
     // Mixer section heights.
     if !layout.mixer.insert_section_px.is_finite() || layout.mixer.insert_section_px < 0.0 {
         layout.mixer.insert_section_px = default_mixer_insert_section();

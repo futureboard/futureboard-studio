@@ -116,6 +116,8 @@ pub enum BrowserIcon {
     PresetFile,
     ProjectFile,
     GenericFile,
+    /// The Rigs community site.
+    Rigs,
 }
 
 /// What the browser lists: one tab at a time, chosen from the strip at its
@@ -132,15 +134,19 @@ pub enum BrowserTab {
     Plugins,
     /// The current project, projects and templates.
     Projects,
+    /// rigs.futureboard.studio: shared presets and samples, as a web page in
+    /// a native child view (see `rigs_panel`), not a tree.
+    Rigs,
 }
 
 impl BrowserTab {
-    pub const ALL: [BrowserTab; 5] = [
+    pub const ALL: [BrowserTab; 6] = [
         BrowserTab::Instruments,
         BrowserTab::Samples,
         BrowserTab::Files,
         BrowserTab::Plugins,
         BrowserTab::Projects,
+        BrowserTab::Rigs,
     ];
 
     pub fn label(self) -> &'static str {
@@ -150,6 +156,7 @@ impl BrowserTab {
             BrowserTab::Files => "Files",
             BrowserTab::Plugins => "Plug-ins",
             BrowserTab::Projects => "Projects",
+            BrowserTab::Rigs => "Rigs",
         }
     }
 
@@ -160,6 +167,7 @@ impl BrowserTab {
             BrowserTab::Files => "browser.tab.files",
             BrowserTab::Plugins => "browser.category.plugins",
             BrowserTab::Projects => "browser.category.projects",
+            BrowserTab::Rigs => "browser.tab.rigs",
         }
     }
 
@@ -170,6 +178,7 @@ impl BrowserTab {
             BrowserTab::Files => BrowserIcon::Folder,
             BrowserTab::Plugins => BrowserIcon::Plugins,
             BrowserTab::Projects => BrowserIcon::Projects,
+            BrowserTab::Rigs => BrowserIcon::Rigs,
         }
     }
 }
@@ -731,6 +740,8 @@ impl FileBrowserState {
         let roots = self.roots.clone();
 
         match self.tab {
+            // A web page, not a tree: the sidebar shows the Rigs panel.
+            BrowserTab::Rigs => {}
             BrowserTab::Instruments => self.push_instruments(&mut nodes),
             BrowserTab::Samples => {
                 for (id, label, key, path, icon) in [

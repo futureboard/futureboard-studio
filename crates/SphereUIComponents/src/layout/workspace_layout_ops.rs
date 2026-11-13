@@ -71,6 +71,8 @@ impl StudioLayout {
             browser: self.panels.browser,
             inspector: self.panels.inspector,
             bottom_docked: self.panels.bottom_docked,
+            browser_width_px: self.dock_widths.browser,
+            inspector_width_px: self.dock_widths.inspector,
         };
 
         let bottom_panel_height_px = self.bottom_panel_state.height_px;
@@ -155,6 +157,12 @@ impl StudioLayout {
         self.panels.browser = layout.panels.browser;
         self.panels.inspector = layout.panels.inspector;
         self.panels.bottom_docked = layout.panels.bottom_docked;
+        self.dock_widths = super::studio_state::DockWidths {
+            browser: super::studio_state::DockWidths::clamp_browser(layout.panels.browser_width_px),
+            inspector: super::studio_state::DockWidths::clamp_inspector(
+                layout.panels.inspector_width_px,
+            ),
+        };
 
         // Bottom panel height (clamp inside BottomPanelState limits).
         let clamped_h = layout.bottom_panel_height_px.clamp(

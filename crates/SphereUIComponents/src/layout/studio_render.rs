@@ -959,6 +959,8 @@ impl Render for StudioLayout {
         // nothing here would take it off screen when the dock closes or another
         // tab is selected — it would keep floating over whatever is drawn next.
         self.sync_ara_editor_visibility(cx);
+        // Same for the Rigs page in the browser sidebar.
+        self.sync_rigs_panel_visibility(cx);
         let show_bottom_docked = self.panels.bottom_docked;
         let active_panel = self.active_panel;
 
@@ -1511,7 +1513,12 @@ impl Render for StudioLayout {
                     .cached(shell_regions::AppChromeView::cached_style()),
             )
             .child({
+                let browser_width = self.dock_widths.browser;
+                let inspector_width = self.dock_widths.inspector;
+                crate::components::panel::set_live_inspector_width(inspector_width);
                 let mut main_row = div()
+                    .id("studio-main-row")
+                    .relative()
                     .flex()
                     .flex_row()
                     .flex_1()
@@ -1521,7 +1528,7 @@ impl Render for StudioLayout {
                     // itself changes, not on every playhead/meter frame.
                     main_row = main_row.child(
                         gpui::AnyView::from(self.browser_sidebar.clone())
-                            .cached(shell_regions::BrowserSidebarView::cached_style()),
+                            .cached(shell_regions::BrowserSidebarView::cached_style(browser_width)),
                     );
                 }
                 let classic_tool_bar = self.classic_tool_bar(cx);
@@ -1580,10 +1587,59 @@ impl Render for StudioLayout {
                     // when the playhead or a meter moves.
                     main_row = main_row.child(
                         gpui::AnyView::from(self.right_dock.clone())
-                            .cached(shell_regions::RightDockView::cached_style()),
+                            .cached(shell_regions::RightDockView::cached_style(inspector_width)),
                     );
                 }
+                // Dock edges: thin handles laid over each dock's inner border,
+                // outside the flex flow, so the columns keep exactly the width
+                // the arrangement's coordinate transform is told about. They
+                // sit mostly over the arrangement side, which a native child
+                // in a dock (the Rigs page) cannot cover.
+                let edge = |side: super::studio_state::DockSide, owner: gpui::Entity<Self>| {
+                    div()
+                        .id(match side {
+                            super::studio_state::DockSide::Browser => "dock-edge-browser",
+                            super::studio_state::DockSide::Inspector => "dock-edge-inspector",
+                        })
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .w(px(6.0))
+                        .cursor(gpui::CursorStyle::ResizeLeftRight)
+                        .hover(|style| style.bg(crate::theme::Colors::accent_soft()))
+                        .on_mouse_down(gpui::MouseButton::Left, move |event, _window, cx| {
+                            let x: f32 = event.position.x.into();
+                            let _ = owner.update(cx, |layout, _| layout.begin_dock_resize(side, x));
+                        })
+                        .on_drag(super::studio_state::DockResizeDrag, |_drag, _offset, _window, cx| {
+                            cx.new(|_| super::studio_state::DockResizeDrag)
+                        })
+                };
+                if show_browser {
+                    main_row = main_row.child(
+                        edge(super::studio_state::DockSide::Browser, cx.entity().clone())
+                            .left(px(browser_width - 2.0)),
+                    );
+                }
+                if show_inspector {
+                    main_row = main_row.child(
+                        edge(super::studio_state::DockSide::Inspector, cx.entity().clone())
+                            .right(px(inspector_width - 2.0)),
+                    );
+                }
+                let move_owner = cx.entity().clone();
+                let end_owner = cx.entity().clone();
                 main_row
+                    .on_drag_move::<super::studio_state::DockResizeDrag>(move |event, window, cx| {
+                        let x: f32 = event.event.position.x.into();
+                        let window_width: f32 = window.bounds().size.width.into();
+                        let _ = move_owner.update(cx, |layout, cx| {
+                            layout.update_dock_resize(x, window_width, cx)
+                        });
+                    })
+                    .on_mouse_up(gpui::MouseButton::Left, move |_event, _window, cx| {
+                        let _ = end_owner.update(cx, |layout, cx| layout.end_dock_resize(cx));
+                    })
             })
             .children(if show_bottom_docked {
                 let _s = crate::perf::PerfScope::enter("BottomPanel");

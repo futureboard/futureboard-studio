@@ -305,7 +305,25 @@ impl InspectorCallbacks {
 
 /// Width of the docked Inspector column. Mirrors the constant in
 /// `studio_render.rs` (`INSPECTOR_WIDTH`).
-pub const INSPECTOR_WIDTH: f32 = 292.0;
+pub const INSPECTOR_WIDTH: f32 = 300.0;
+
+thread_local! {
+    /// The right dock's width as last laid out. Overlays anchored to the
+    /// Inspector (combo menus) are positioned from the window's right edge, so
+    /// they need the width the dock really has, not the default. Written by
+    /// the shell on the UI thread every render.
+    static LIVE_INSPECTOR_WIDTH: std::cell::Cell<f32> = const { std::cell::Cell::new(INSPECTOR_WIDTH) };
+}
+
+/// Record the right dock's current width. See [`live_inspector_width`].
+pub fn set_live_inspector_width(width: f32) {
+    LIVE_INSPECTOR_WIDTH.with(|cell| cell.set(width));
+}
+
+/// The right dock's current width, for overlays measured from it.
+pub fn live_inspector_width() -> f32 {
+    LIVE_INSPECTOR_WIDTH.with(std::cell::Cell::get)
+}
 
 /// `FUTUREBOARD_INSPECTOR_DEBUG=1` gates verbose Inspector edit logging.
 pub fn inspector_debug_enabled() -> bool {
@@ -545,7 +563,7 @@ fn inspector_shell(_active: bool, i18n: I18n) -> gpui::Div {
     div()
         .flex()
         .flex_col()
-        .w(px(INSPECTOR_WIDTH))
+        .w_full()
         .h_full()
         .bg(Colors::surface_panel())
         .border_l(px(1.0))
@@ -1399,7 +1417,7 @@ fn routing_combo_trigger(
                 Some(OverlayAnchor {
                     bounds: crate::overlay::inspector_combo_trigger_bounds(
                         window,
-                        INSPECTOR_WIDTH,
+                        live_inspector_width(),
                         event,
                     ),
                 })
@@ -1476,8 +1494,12 @@ pub(crate) fn inspector_routing_combo_overlay(
     // loopback would feed this track its own output.
     all_tracks: &[TrackState],
 ) -> impl IntoElement {
-    let position =
-        inspector_combo_menu_position(anchor, INSPECTOR_WIDTH, ROUTING_COMBO_MENU_HEIGHT, window);
+    let position = inspector_combo_menu_position(
+        anchor,
+        live_inspector_width(),
+        ROUTING_COMBO_MENU_HEIGHT,
+        window,
+    );
 
     let track_id = track.id.clone();
     let menu = match open_combo {

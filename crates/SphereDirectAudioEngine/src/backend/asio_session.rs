@@ -241,6 +241,12 @@ impl AsioDuplexHandle {
         self.events.latencies_changed.swap(false, Ordering::SeqCst)
     }
 
+    /// Consume the number of data-loss resyncs the driver reported since the
+    /// last call.
+    pub fn take_resyncs(&self) -> u64 {
+        self.events.resync_count.swap(0, Ordering::SeqCst)
+    }
+
     /// Drain record sinks the input callback discarded, dropping them here on
     /// the control thread (disconnects their disk writers).
     pub fn drain_trashed_sinks(&self) -> usize {

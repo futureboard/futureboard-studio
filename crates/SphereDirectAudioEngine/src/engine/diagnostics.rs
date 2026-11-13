@@ -96,6 +96,10 @@ pub enum DropoutReason {
     /// The device asked for a block the Audioguard ring did not have ready,
     /// while the guard thread held the graph.
     RenderAheadMiss = 5,
+    /// The ASIO driver reported it lost data (`kAsioResyncRequest`): the
+    /// buffer switch came back too late for the hardware, which is a dropout
+    /// the engine's own timing cannot see.
+    DriverResync = 6,
 }
 
 impl DropoutReason {
@@ -106,6 +110,7 @@ impl DropoutReason {
             3 => Self::DiskCacheMiss,
             4 => Self::PluginOverrun,
             5 => Self::RenderAheadMiss,
+            6 => Self::DriverResync,
             _ => Self::None,
         }
     }
@@ -118,6 +123,7 @@ impl DropoutReason {
             Self::DiskCacheMiss => "disk-cache-miss",
             Self::PluginOverrun => "plugin-overrun",
             Self::RenderAheadMiss => "render-ahead-miss",
+            Self::DriverResync => "driver-resync",
         }
     }
 }

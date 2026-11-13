@@ -1895,7 +1895,20 @@ impl Render for Timeline {
             // Multi-file drops: the first file that lands takes the cursor,
             // every later one a brand-new track, in drop order. Where they
             // land is resolved here, before any MIDI file's parse (#385).
-            let any_imported = this.begin_file_drop(paths.paths(), window, cx);
+            let mut any_imported = this.begin_file_drop(paths.paths(), window, cx);
+            // A `.pst` from outside the app (Explorer, or a preset dragged out
+            // of the Rigs sidebar) lands the way one from the Browser does: on
+            // the track under the cursor, or as a new track. Audio, MIDI and
+            // video have already been taken above; one preset per drop, the
+            // same as a Browser drag.
+            if !any_imported {
+                if let Some(preset) = paths.paths().iter().find(|path| {
+                    path.extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("pst"))
+                }) {
+                    any_imported = this.drop_plugin_preset_at_last_drag(preset, window, cx);
+                }
+            }
             let had_hint = this.file_drop_hint.take().is_some();
             if any_imported {
                 this.last_drag_position = None;

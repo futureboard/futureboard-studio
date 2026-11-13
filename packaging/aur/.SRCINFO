@@ -1,6 +1,6 @@
 pkgbase = futureboard-studio-bin
 	pkgdesc = Futureboard Studio — native Digital Audio Workstation
-	pkgver = 2026.11.1_beta2.0.0
+	pkgver = 2026.11.13_beta2.0.1
 	pkgrel = 1
 	url = https://github.com/futureboard/futureboard-studio
 	install = futureboard-studio-bin.install
@@ -18,7 +18,7 @@ pkgbase = futureboard-studio-bin
 	conflicts = futureboard-studio
 	options = !strip
 	options = !debug
-	source_x86_64 = Futureboard.Studio-2026.11.1-beta2.0.0-x86_64.AppImage::https://github.com/futureboard/futureboard-studio/releases/download/2026.11.1-beta2.0.0/Futureboard.Studio-2026.11.1-beta2.0.0-x86_64.AppImage
+	source_x86_64 = Futureboard.Studio-2026.11.13-beta2.0.1-x86_64.AppImage::https://github.com/futureboard/futureboard-studio/releases/download/2026.11.13-beta2.0.1/Futureboard.Studio-2026.11.13-beta2.0.1-x86_64.AppImage
 	sha256sums_x86_64 = 57d1123c65c5519419a3732ca34faa46f098c7bd3d6029aa04de059b6a4fec50
 
 pkgname = futureboard-studio-bin

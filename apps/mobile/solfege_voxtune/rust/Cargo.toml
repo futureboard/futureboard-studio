@@ -1,6 +1,6 @@
 [package]
 name = "canto_dsp"
-version = "2026.11.1-beta2.0.0"
+version = "2026.11.13-beta2.0.1"
 edition = "2024"
 license = "MIT"
 description = "Solfege Voxtune for Android: FFI, AAudio output and recorder around the sphere_voxtune engine"

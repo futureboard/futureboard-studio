@@ -4801,6 +4801,27 @@ impl Timeline {
         true
     }
 
+    /// Import one audio file at the playhead, on a new audio track.
+    ///
+    /// For a file that arrives without a drop position — a sample added from
+    /// the Rigs sidebar where the platform cannot start a file drag. Same
+    /// import path (and undo step) as a drop onto empty space.
+    pub(crate) fn import_audio_at_playhead(
+        &mut self,
+        path: &std::path::Path,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let placement = crate::components::timeline::drop_batch::DropPlacement {
+            start_beat: self.state.transport.playhead_beats.max(0.0),
+            track_id: None,
+        };
+        let imported = self.import_dropped_audio(path, &placement, cx);
+        if imported {
+            cx.notify();
+        }
+        imported
+    }
+
     pub(super) fn drop_plugin_preset_at_last_drag(
         &mut self,
         path: &std::path::Path,

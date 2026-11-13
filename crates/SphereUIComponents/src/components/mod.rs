@@ -123,6 +123,8 @@ pub mod plate;
 #[cfg(feature = "builtin-plugin-editor")]
 pub mod plate_parts;
 pub mod plugin_content_host;
+pub(crate) mod os_file_drag;
+pub mod rigs_panel;
 pub mod plugin_editor_backend;
 pub mod plugin_editor_chrome;
 pub mod plugin_editor_mac_region;
@@ -228,6 +230,7 @@ pub use app_chrome::{
     BPM_MIN,
 };
 pub use ara_editor_host::AraEditorHost;
+pub use rigs_panel::RigsPanel;
 pub use audio_editor::{AudioEditorCallbacks, AudioEditorHost};
 pub use audio_tools::{
     apply_preview_to_clip, apply_previews_to_snapshot, open_audio_tool_window, AudioToolCommand,

@@ -857,15 +857,120 @@ pub fn register_plugin_scheme_factory(
     Ok(())
 }
 
+/// The one path a remote page may POST to reach the host. Same-origin, so the
+/// page needs no CORS and no other process can address it.
+pub const ORIGIN_BRIDGE_PATH: &str = "/__daw/bridge";
+
+// Answers exactly one request shape on a remote origin — a POST to
+// `ORIGIN_BRIDGE_PATH` — and declines everything else, which CEF then fetches
+// from the network as if no factory were registered.
+wrap_scheme_handler_factory! {
+    pub struct OriginBridgeFactory {
+        tag: String,
+        sink: BridgeSink,
+        _lifetime: ObjectLifetime,
+    }
+
+    impl SchemeHandlerFactory {
+        fn create(
+            &self,
+            _browser: Option<&mut cef::Browser>,
+            _frame: Option<&mut cef::Frame>,
+            _scheme_name: Option<&CefString>,
+            request: Option<&mut cef::Request>,
+        ) -> Option<ResourceHandler> {
+            let request = request?;
+            let url = CefStringUtf16::from(&request.url()).to_string();
+            if !is_origin_bridge_url(&url) {
+                return None;
+            }
+            let method = CefStringUtf16::from(&request.method()).to_string();
+            if !method.eq_ignore_ascii_case("POST") || !cef_ipc_enabled() {
+                return None;
+            }
+            let body = read_post_data(request);
+            // A bridge envelope is a small JSON object; anything larger is not
+            // one and is not worth queueing.
+            if body.len() <= 64 * 1024 {
+                (self.sink)(&self.tag, body);
+            }
+            let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+            Some(make_resource_handler(Some(BRIDGE_ACK), request_id))
+        }
+    }
+}
+
+/// Whether `url` is the bridge path itself: no other path, and no `..` trick
+/// that would make a different path compare equal.
+fn is_origin_bridge_url(url: &str) -> bool {
+    url::Url::parse(url).is_ok_and(|parsed| parsed.path() == ORIGIN_BRIDGE_PATH)
+}
+
+/// Let pages from one remote origin reach the host: POSTs to
+/// `scheme://domain/__daw/bridge` are handed to `sink` under `tag`, and every
+/// other request to that origin goes to the network untouched.
+///
+/// Call once per origin, after `CefRuntime::initialize`. `scheme` is `https`
+/// in release builds; a debug build may register `http` for a local dev
+/// server.
+pub fn register_origin_bridge_factory(
+    scheme: &str,
+    domain: &str,
+    tag: &str,
+    sink: BridgeSink,
+) -> Result<(), SchemeError> {
+    let object_id = NEXT_OBJECT_ID.fetch_add(1, Ordering::Relaxed);
+    let mut factory = OriginBridgeFactory::new(
+        tag.to_owned(),
+        sink,
+        ObjectLifetime::new("cef_scheme_handler_factory_t", object_id),
+    );
+    let ok = cef::register_scheme_handler_factory(
+        Some(&CefString::from(scheme)),
+        Some(&CefString::from(domain)),
+        Some(&mut factory),
+    );
+    if ok == 0 {
+        return Err(SchemeError::RegisterOriginFactoryFailed(format!(
+            "{scheme}://{domain}"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SchemeError {
     #[error("CEF rejected the {PLUGIN_SCHEME} scheme handler factory")]
     RegisterFactoryFailed,
+    #[error("CEF rejected the bridge handler for {0}")]
+    RegisterOriginFactoryFailed(String),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the bridge path itself is intercepted; every page, asset and API
+    /// call on the origin still goes to the network.
+    #[test]
+    fn origin_bridge_matches_only_its_own_path() {
+        assert!(is_origin_bridge_url(
+            "https://rigs.futureboard.studio/__daw/bridge"
+        ));
+        assert!(is_origin_bridge_url(
+            "https://rigs.futureboard.studio/__daw/bridge?x=1"
+        ));
+        for other in [
+            "https://rigs.futureboard.studio/",
+            "https://rigs.futureboard.studio/rigs/",
+            "https://rigs.futureboard.studio/__daw/bridge/more",
+            "https://rigs.futureboard.studio/__daw/bridgex",
+            "https://rigs.futureboard.studio/x/../__daw/bridgex",
+            "not a url",
+        ] {
+            assert!(!is_origin_bridge_url(other), "{other}");
+        }
+    }
 
     #[test]
     fn mock_keychain_switch_is_macos_only_and_has_no_cli_prefix() {

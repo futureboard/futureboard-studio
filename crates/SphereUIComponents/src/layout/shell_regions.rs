@@ -81,9 +81,9 @@ impl BrowserSidebarView {
     /// Root style used while the view is cached. Must match the wrapper
     /// `render_browser_sidebar` builds, or a cached frame lays out differently
     /// from a rendered one.
-    pub fn cached_style() -> gpui::StyleRefinement {
+    pub fn cached_style(width: f32) -> gpui::StyleRefinement {
         gpui::StyleRefinement::default()
-            .w(px(components::SIDEBAR_WIDTH))
+            .w(px(width))
             .h_full()
             .flex_shrink_0()
     }
@@ -395,10 +395,20 @@ impl StudioLayout {
 
         let browser_scroll = self.browser_scroll.clone();
         let search_focused = self.browser_search_input.is_focused(window);
+        let rigs_panel = (self.file_browser.tab
+            == crate::components::file_browser::BrowserTab::Rigs)
+            .then(|| {
+                let owner = cx.entity().clone();
+                let panel = self
+                    .rigs_panel
+                    .get_or_insert_with(|| cx.new(|cx| components::RigsPanel::new(owner, cx)))
+                    .clone();
+                gpui::AnyView::from(panel)
+            });
 
         let owner = cx.entity().clone();
         div()
-            .w(px(components::SIDEBAR_WIDTH))
+            .w(px(self.dock_widths.browser))
             .h_full()
             .flex_shrink_0()
             .on_mouse_down(gpui::MouseButton::Left, move |_event, _window, cx| {
@@ -419,8 +429,100 @@ impl StudioLayout {
                 browser_search_callbacks,
                 browser_callbacks,
                 i18n,
+                rigs_panel,
             ))
             .into_any_element()
+    }
+
+    /// Start dragging a dock's inner edge at window x `x`.
+    pub(super) fn begin_dock_resize(&mut self, side: super::studio_state::DockSide, x: f32) {
+        let start_width = match side {
+            super::studio_state::DockSide::Browser => self.dock_widths.browser,
+            super::studio_state::DockSide::Inspector => self.dock_widths.inspector,
+        };
+        self.dock_resize = Some(super::studio_state::DockResize {
+            side,
+            start_x: x,
+            start_width,
+        });
+    }
+
+    /// Follow the pointer: the browser grows to the right, the right dock to
+    /// the left. Each stays in its own range and leaves the arrangement at
+    /// least `ARRANGEMENT_MIN` wide.
+    pub(super) fn update_dock_resize(&mut self, x: f32, window_width: f32, cx: &mut Context<Self>) {
+        use super::studio_state::{DockSide, DockWidths};
+        let Some(resize) = self.dock_resize else {
+            return;
+        };
+        let delta = x - resize.start_x;
+        let other = |side: DockSide, widths: &DockWidths, panels: &StudioPanelVisibility| match side
+        {
+            DockSide::Browser if panels.inspector => widths.inspector,
+            DockSide::Inspector if panels.browser => widths.browser,
+            _ => 0.0,
+        };
+        let room = (window_width
+            - other(resize.side, &self.dock_widths, &self.panels)
+            - DockWidths::ARRANGEMENT_MIN)
+            .max(0.0);
+        let next = match resize.side {
+            DockSide::Browser => DockWidths::clamp_browser((resize.start_width + delta).min(room)),
+            DockSide::Inspector => {
+                DockWidths::clamp_inspector((resize.start_width - delta).min(room))
+            }
+        };
+        let current = match resize.side {
+            DockSide::Browser => &mut self.dock_widths.browser,
+            DockSide::Inspector => &mut self.dock_widths.inspector,
+        };
+        if (*current - next).abs() < 0.5 {
+            return;
+        }
+        *current = next;
+        // The browser width is the arrangement's origin: hit testing follows
+        // it before the next event lands.
+        self.sync_timeline_chrome_metrics(cx);
+        cx.notify();
+    }
+
+    /// Finish a dock-edge drag and keep the width for the next session.
+    pub(super) fn end_dock_resize(&mut self, cx: &mut Context<Self>) {
+        if self.dock_resize.take().is_some() {
+            self.save_workspace_layout(cx);
+        }
+    }
+
+    /// The Rigs page is a native child window: nothing in the GPUI tree takes
+    /// it off screen when its tab or the sidebar goes away, so the shell does,
+    /// on every render.
+    pub(super) fn sync_rigs_panel_visibility(&mut self, cx: &mut Context<Self>) {
+        let visible = self.panels.browser
+            && self.file_browser.tab == crate::components::file_browser::BrowserTab::Rigs;
+        if visible {
+            return;
+        }
+        if let Some(panel) = self.rigs_panel.clone() {
+            panel.update(cx, |panel, cx| panel.request_detach(cx));
+        }
+    }
+
+    /// Add a file downloaded from Rigs to the project where it cannot be
+    /// dragged there: audio at the playhead on a new track, a `.pst` the way a
+    /// Browser drop onto empty space applies it.
+    pub(crate) fn add_rigs_download(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        let is_preset = path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("pst"));
+        if is_preset {
+            let _ = self.apply_dropped_plugin_preset(None, path, cx);
+        } else {
+            let path = path.to_path_buf();
+            self.timeline.update(cx, |timeline, cx| {
+                timeline.import_audio_at_playhead(&path, cx)
+            });
+        }
+        cx.notify();
     }
 }
 
@@ -456,9 +558,9 @@ impl RightDockView {
     /// Layout-affecting half of the wrapper `render_right_dock` builds. Paint
     /// (border colour, background) is replayed from the cached scene, so only
     /// the box model has to match.
-    pub fn cached_style() -> gpui::StyleRefinement {
+    pub fn cached_style(width: f32) -> gpui::StyleRefinement {
         gpui::StyleRefinement::default()
-            .w(px(crate::components::panel::INSPECTOR_WIDTH))
+            .w(px(width))
             .h_full()
             .flex_shrink_0()
             .flex()
@@ -924,7 +1026,7 @@ impl StudioLayout {
             RightDockTab::LyricEditor => self.lyric_editor_panel.clone().into_any_element(),
         };
         div()
-            .w(px(crate::components::panel::INSPECTOR_WIDTH))
+            .w(px(self.dock_widths.inspector))
             .h_full()
             .flex_shrink_0()
             .flex()
@@ -1143,13 +1245,9 @@ mod tests {
             ))) => f32::from(pixels),
             other => panic!("dock cached width must be absolute pixels, got {other:?}"),
         };
-        assert_eq!(
-            width(BrowserSidebarView::cached_style()),
-            components::SIDEBAR_WIDTH
-        );
-        assert_eq!(
-            width(RightDockView::cached_style()),
-            crate::components::panel::INSPECTOR_WIDTH
-        );
+        for dock in [240.0, components::SIDEBAR_WIDTH, 480.0] {
+            assert_eq!(width(BrowserSidebarView::cached_style(dock)), dock);
+            assert_eq!(width(RightDockView::cached_style(dock)), dock);
+        }
     }
 }

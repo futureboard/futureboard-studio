@@ -1701,6 +1701,41 @@ mod imp {
     pub fn take_global_play_pause_requests(_view_id: ViewId) -> u32 {
         0
     }
+
+    pub fn open_remote_view(
+        _view_id: ViewId,
+        _remote: &super::RemoteView,
+        _parent_hwnd: u64,
+        _rect: ViewRect,
+        _scale_factor: f32,
+    ) -> Result<(), HostAvailability> {
+        Err(HostAvailability::NotCompiledIn)
+    }
+}
+
+/// A page from a remote origin, hosted by the same CEF runtime as the editors:
+/// the Rigs sidebar (`https://rigs.futureboard.studio`).
+///
+/// Navigation is locked to `origin`; a POST to `<origin>/__daw/bridge` is
+/// queued under `tag` for [`take_inbound`], and nothing else on the origin is
+/// intercepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteView {
+    /// Inbound-queue key; also what the registry logs the view as.
+    pub tag: &'static str,
+    /// The page to open.
+    pub url: String,
+    /// `scheme://host[:port]`, no trailing slash.
+    pub origin: String,
+}
+
+impl RemoteView {
+    /// Scheme and host the bridge factory is registered for.
+    fn scheme_and_host(&self) -> Option<(String, String)> {
+        let (scheme, rest) = self.origin.split_once("://")?;
+        let host = rest.split(['/', ':']).next()?;
+        (!host.is_empty()).then(|| (scheme.to_ascii_lowercase(), host.to_ascii_lowercase()))
+    }
 }
 
 #[cfg(feature = "builtin-plugin-editor")]
@@ -1709,7 +1744,9 @@ mod imp {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock};
 
-    use sphere_webview::client::{plugin_browser_client_with_surface, BrowserLifecycle};
+    use sphere_webview::client::{
+        plugin_browser_client_with_surface, remote_browser_client_with_surface, BrowserLifecycle,
+    };
     use sphere_webview::osr::{
         OsrInput, OsrKey, OsrKeyKind, OsrModifiers, OsrMouseButton, OsrSurface,
     };
@@ -1793,6 +1830,10 @@ mod imp {
         /// CefRefPtr is not released on the CEF callback stack.
         deferred_release: Vec<HostedView>,
         warmup: Option<WarmupBrowser>,
+        /// `scheme://host` pairs whose bridge factory is registered. CEF
+        /// takes a factory only after initialize, so a remote origin is
+        /// registered the first time a view opens on it.
+        bridges: std::collections::HashSet<String>,
         runtime: CefRuntime,
         // The exact CefApp passed to execute_process in the browser process.
         // Keep it alive until after the runtime shuts down.
@@ -1806,6 +1847,9 @@ mod imp {
         parent_hwnd: u64,
         rect: ViewRect,
         accelerated_sink: Option<AcceleratedFrameSink>,
+        /// `Some` for a remote page (the Rigs sidebar) instead of a built-in
+        /// editor bundle.
+        remote: Option<super::RemoteView>,
     }
 
     /// Physical rect plus the scale it was measured at. Off-screen browsers are
@@ -2130,6 +2174,7 @@ mod imp {
             fallback_closing_views: Vec::new(),
             deferred_release: Vec::new(),
             warmup: None,
+            bridges: std::collections::HashSet::new(),
             runtime,
             _application: app,
         });
@@ -2325,6 +2370,7 @@ mod imp {
                                     height: 200,
                                 },
                                 accelerated_sink: None,
+                                remote: None,
                             },
                             bounds: PendingBounds {
                                 rect: ViewRect {
@@ -2521,10 +2567,85 @@ mod imp {
                 parent_hwnd,
                 rect,
                 accelerated_sink,
+                remote: None,
             });
             pending.bounds = Some(PendingBounds { rect, scale_factor });
             Ok(())
         })
+    }
+
+    /// Queue a browser for a remote page (see [`super::RemoteView`]) as a
+    /// windowed child of `parent_hwnd`, filling `rect`.
+    ///
+    /// Like [`open_view`], nothing native happens here; [`pump`] creates the
+    /// browser later, outside any GPUI borrow. Bounds, close, events and the
+    /// inbound queue are the same as an editor's, keyed by `view_id`.
+    pub fn open_remote_view(
+        view_id: ViewId,
+        remote: &super::RemoteView,
+        parent_hwnd: u64,
+        rect: ViewRect,
+        scale_factor: f32,
+    ) -> Result<(), HostAvailability> {
+        if crate::boot::has_flag("--disable-cef") {
+            return Err(HostAvailability::RuntimeFailed(
+                "CEF is disabled by --disable-cef".to_owned(),
+            ));
+        }
+        if super::OFFSCREEN_HOSTING {
+            // A remote page is only hosted as a native child; this platform
+            // paints CEF off-screen, which the sidebar has no surface for.
+            return Err(HostAvailability::RuntimeFailed(
+                "an embedded web page is not available on this platform".to_owned(),
+            ));
+        }
+        if remote.scheme_and_host().is_none() {
+            return Err(HostAvailability::RuntimeFailed(format!(
+                "not an origin: {}",
+                remote.origin
+            )));
+        }
+        windowed_fill_bounds(rect, scale_factor)
+            .map_err(|e| HostAvailability::RuntimeFailed(e.to_string()))?;
+        COMMANDS.with(|commands| {
+            let mut commands = commands.borrow_mut();
+            let pending = commands.entry(view_id).or_default();
+            if pending.close {
+                return Err(HostAvailability::RuntimeFailed(
+                    "view is already closing".to_string(),
+                ));
+            }
+            pending.open = Some(PendingOpen {
+                editor_id: remote.tag.to_string(),
+                origin: remote.tag,
+                parent_hwnd,
+                rect,
+                accelerated_sink: None,
+                remote: Some(remote.clone()),
+            });
+            pending.bounds = Some(PendingBounds { rect, scale_factor });
+            Ok(())
+        })
+    }
+
+    /// Install the bridge factory for a remote view's origin, once.
+    fn ensure_remote_bridge(host: &mut Host, remote: &super::RemoteView) -> Result<(), String> {
+        let Some((scheme, domain)) = remote.scheme_and_host() else {
+            return Err(format!("not an origin: {}", remote.origin));
+        };
+        let key = format!("{scheme}://{domain}");
+        if host.bridges.contains(&key) {
+            return Ok(());
+        }
+        sphere_webview::scheme::register_origin_bridge_factory(
+            &scheme,
+            &domain,
+            remote.tag,
+            bridge_sink(),
+        )
+        .map_err(|error| error.to_string())?;
+        host.bridges.insert(key);
+        Ok(())
     }
 
     /// Coalesce a browser resize for the next pump. An unknown id is allowed:
@@ -2974,9 +3095,18 @@ mod imp {
                             scale_factor: 1.0,
                         });
                         let rect = bounds_command.rect;
-                        let url = diagnostic_control_url().unwrap_or_else(|| {
-                            format!("mikoplugin://{}/index.html", open.origin)
-                        });
+                        if let Some(remote) = open.remote.as_ref() {
+                            if let Err(error) = ensure_remote_bridge(host, remote) {
+                                completed.push((view_id, ViewEvent::OpenFailed(error)));
+                                continue;
+                            }
+                        }
+                        let url = match open.remote.as_ref() {
+                            Some(remote) => remote.url.clone(),
+                            None => diagnostic_control_url().unwrap_or_else(|| {
+                                format!("mikoplugin://{}/index.html", open.origin)
+                            }),
+                        };
                         // Windowed: CEF creates its own child window inside
                         // `parent_hwnd` at the physical rect and handles DPI,
                         // painting, and input itself — no surface at all.
@@ -3003,8 +3133,12 @@ mod imp {
                             surface.set_screen_geometry(to_osr_screen_geometry(screen_geometry));
                             surface
                         });
-                        let (mut client, lifecycle) =
-                            plugin_browser_client_with_surface(&url, surface.clone());
+                        let (mut client, lifecycle) = match open.remote.as_ref() {
+                            Some(remote) => {
+                                remote_browser_client_with_surface(&remote.origin, surface.clone())
+                            }
+                            None => plugin_browser_client_with_surface(&url, surface.clone()),
+                        };
                         let result = if surface.is_some() {
                             WindowBounds::new(rect.x, rect.y, rect.width, rect.height)
                         } else {
@@ -3377,10 +3511,11 @@ pub use imp::install_process_app;
 #[cfg(feature = "builtin-plugin-editor")]
 pub use imp::shutdown;
 pub use imp::{
-    availability, browser_holds_native_parent, close_view, init_at_boot, is_view_open, open_view,
-    preload, pump, pump_after_input, reload_view, send_to_view, send_view_input, set_view_bounds,
-    set_view_screen_geometry, take_global_play_pause_requests, take_inbound, take_view_events,
-    view_frame_generation, view_uses_accelerated_osr, with_view_frame,
+    availability, browser_holds_native_parent, close_view, init_at_boot, is_view_open,
+    open_remote_view, open_view, preload, pump, pump_after_input, reload_view, send_to_view,
+    send_view_input, set_view_bounds, set_view_screen_geometry, take_global_play_pause_requests,
+    take_inbound, take_view_events, view_frame_generation, view_uses_accelerated_osr,
+    with_view_frame,
 };
 
 #[cfg(test)]

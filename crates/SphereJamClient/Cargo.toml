@@ -1,6 +1,6 @@
 [package]
 name = "sphere-jam-client"
-version = "2026.11.1-beta2.0.0"
+version = "2026.11.13-beta2.0.1"
 edition = "2021"
 description = "Futureboard Audio Jam client — control plane, media plane, session clock"
 license.workspace = true

@@ -6,9 +6,10 @@
 //! Region contract:
 //!
 //! * **Layout owner** — the shell's main row (`studio_render`), which gives
-//!   this element a fixed [`SIDEBAR_WIDTH`]. The width is load-bearing for the
-//!   arrangement's coordinate transform (`panel_origin_x`), so it is not
-//!   resizable.
+//!   this element its width: [`SIDEBAR_WIDTH`] by default, resizable by
+//!   dragging the dock's edge. The width is load-bearing for the arrangement's
+//!   coordinate transform (`panel_origin_x`), so every change goes through
+//!   `sync_timeline_chrome_metrics`; this element only fills what it is given.
 //! * **Scroll owner and clip owner** — the single `uniform_list`. Nothing else
 //!   in the sidebar scrolls or clips, and the scrollbar thumb is a sibling
 //!   overlay inside the list's `relative()` wrapper.
@@ -181,6 +182,7 @@ pub fn sidebar(
     search_callbacks: TextInputCallbacks,
     callbacks: BrowserCallbacks,
     i18n: I18n,
+    rigs_panel: Option<gpui::AnyView>,
 ) -> impl IntoElement {
     // Which panel has the keyboard is no longer painted: an accent title and
     // an accent rule down the column's edge were loud for what they said.
@@ -274,30 +276,34 @@ pub fn sidebar(
         .border_b(px(1.0))
         .border_color(Colors::border_subtle())
         .bg(chrome_base)
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(space::SNUG))
-                .child(
-                    svg()
-                        .path(assets::ICON_SEARCH_PATH)
-                        .w(px(GLYPH))
-                        .h(px(GLYPH))
-                        .text_color(Colors::text_muted()),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .child(text_field_with_callbacks(
-                            search_input,
-                            search_focused,
-                            search_callbacks,
-                        )),
-                ),
-        )
+        // The tree's filter means nothing to the Rigs page, which has its own
+        // search; a field that filters nothing would be a control that lies.
+        .when(state.tab != BrowserTab::Rigs, |container| {
+            container.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(space::SNUG))
+                    .child(
+                        svg()
+                            .path(assets::ICON_SEARCH_PATH)
+                            .w(px(GLYPH))
+                            .h(px(GLYPH))
+                            .text_color(Colors::text_muted()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .child(text_field_with_callbacks(
+                                search_input,
+                                search_focused,
+                                search_callbacks,
+                            )),
+                    ),
+            )
+        })
         .child(tab_strip(state.tab, callbacks.on_select_tab.clone(), i18n));
 
     // ── Breadcrumb ──────────────────────────────────────────────────
@@ -380,19 +386,24 @@ pub fn sidebar(
         .selected_node()
         .map(|node| details_pane(state, node, &callbacks, i18n));
 
-    div()
+    let column = div()
         .flex()
         .flex_col()
-        .w(px(SIDEBAR_WIDTH))
+        .w_full()
         .h_full()
         .bg(Colors::surface_panel())
         .border_r(px(1.0))
         .border_color(panel_border)
         .child(header)
-        .child(search_container)
-        .children(breadcrumb)
-        .child(listing)
-        .children(details)
+        .child(search_container);
+    // The Rigs tab is a web page: it takes the whole body below the tab strip
+    // in place of the tree, its trail and its details.
+    match rigs_panel {
+        Some(panel) if state.tab == BrowserTab::Rigs => {
+            column.child(div().flex_1().min_h_0().child(panel))
+        }
+        _ => column.children(breadcrumb).child(listing).children(details),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1058,6 +1069,7 @@ fn browser_icon_path(icon: BrowserIcon, expanded: bool) -> &'static str {
         }
         BrowserIcon::Projects | BrowserIcon::ProjectFile => assets::ICON_SAVE_PATH,
         BrowserIcon::Templates => assets::ICON_NEWSPAPER_PATH,
+        BrowserIcon::Rigs => assets::ICON_SHARE_PATH,
         BrowserIcon::MidiFile => assets::ICON_LIST_MUSIC_PATH,
         BrowserIcon::VideoFile => assets::ICON_FILM_PATH,
         BrowserIcon::Drive => assets::ICON_HARD_DRIVE_PATH,

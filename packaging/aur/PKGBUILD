@@ -4,8 +4,8 @@
 # package extracts is the versioned Linux release asset, built by
 # packaging/linux/bundle-appimage.sh.
 pkgname=futureboard-studio-bin
-pkgver=2026.11.1_beta2.0.0
-_appver=2026.11.1-beta2.0.0
+pkgver=2026.11.13_beta2.0.1
+_appver=2026.11.13-beta2.0.1
 pkgrel=1
 pkgdesc="Futureboard Studio — native Digital Audio Workstation"
 arch=('x86_64')

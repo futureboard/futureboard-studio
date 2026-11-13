@@ -475,7 +475,34 @@ fn open_external_https(url: &str) -> bool {
             .is_ok()
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+fn open_external_https(url: &str) -> bool {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    if !is_safe_external_https(url) {
+        return false;
+    }
+    let wide = |text: &str| text.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+    let verb = wide("open");
+    let target = wide(url);
+    // SAFETY: both strings are NUL-terminated and outlive the call; the
+    // remaining pointer arguments are documented as optional.
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // ShellExecute reports success as a value greater than 32.
+    result as isize > 32
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 fn open_external_https(_url: &str) -> bool {
     false
 }
@@ -616,12 +643,39 @@ pub fn plugin_browser_client_with_surface(
     initial_url: &str,
     surface: Option<crate::osr::OsrSurface>,
 ) -> (Client, BrowserLifecycle) {
-    let lifecycle = BrowserLifecycle::default();
     let control_url = (!initial_url
         .to_ascii_lowercase()
         .starts_with(&format!("{PLUGIN_SCHEME}://")))
     .then(|| initial_url.to_string());
     let allowed_origin = plugin_origin(initial_url).unwrap_or_default();
+    browser_client(allowed_origin, control_url, surface)
+}
+
+/// A client for a page served from one remote `https` origin — the Rigs
+/// sidebar, which loads `https://rigs.futureboard.studio`.
+///
+/// The same lock as a plug-in editor, on a different origin: the browser may
+/// move anywhere inside `allowed_origin` (`scheme://host[:port]`, no trailing
+/// slash), a link the user clicks to any other `https` page opens in the
+/// system browser, and everything else is refused. The view never becomes a
+/// general browser.
+pub fn remote_browser_client_with_surface(
+    allowed_origin: &str,
+    surface: Option<crate::osr::OsrSurface>,
+) -> (Client, BrowserLifecycle) {
+    browser_client(
+        allowed_origin.trim_end_matches('/').to_ascii_lowercase(),
+        None,
+        surface,
+    )
+}
+
+fn browser_client(
+    allowed_origin: String,
+    control_url: Option<String>,
+    surface: Option<crate::osr::OsrSurface>,
+) -> (Client, BrowserLifecycle) {
+    let lifecycle = BrowserLifecycle::default();
 
     let request_handler = PluginRequestHandler::new(
         lifecycle.clone(),
@@ -686,6 +740,44 @@ mod tests {
             origin,
             None
         ));
+    }
+
+    /// A remote view (the Rigs sidebar) may move around its own origin; any
+    /// other site, a look-alike host, or a downgrade to http is not that
+    /// origin, and only opens externally when the user clicked it.
+    #[test]
+    fn a_remote_origin_allows_its_own_pages_only() {
+        let origin = "https://rigs.futureboard.studio";
+        for url in [
+            "https://rigs.futureboard.studio/",
+            "https://rigs.futureboard.studio/r/glass-pad",
+            "https://RIGS.futureboard.studio/share/",
+        ] {
+            assert_eq!(
+                navigation_decision(url, origin, None, false),
+                NavigationDecision::Allow,
+                "{url}"
+            );
+        }
+        for url in [
+            "https://rigs.futureboard.studio.evil.example/",
+            "https://futureboard.studio/terms",
+            "http://rigs.futureboard.studio/",
+        ] {
+            assert_ne!(
+                navigation_decision(url, origin, None, false),
+                NavigationDecision::Allow,
+                "{url}"
+            );
+        }
+        assert_eq!(
+            navigation_decision("https://futureboard.studio/terms", origin, None, true),
+            NavigationDecision::OpenExternalHttps
+        );
+        assert_eq!(
+            navigation_decision("file:///C:/x.pst", origin, None, true),
+            NavigationDecision::Block
+        );
     }
 
     #[test]

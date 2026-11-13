@@ -732,6 +732,23 @@ impl EngineInner {
             let Some(handle) = stream_guard.as_ref().and_then(|s| s.as_asio_duplex()) else {
                 return;
             };
+            // A resync is the driver saying it lost data: the buffer switch
+            // returned too late for the hardware. Counted as a dropout like
+            // any other, with its own reason, so a crackle the driver heard
+            // does not show as zero dropouts.
+            let resyncs = handle.take_resyncs();
+            if resyncs > 0 {
+                self.shared
+                    .dropout_count
+                    .fetch_add(resyncs, Ordering::Relaxed);
+                self.shared
+                    .device_xruns
+                    .fetch_add(resyncs, Ordering::Relaxed);
+                self.shared.dropout_last_reason.store(
+                    crate::engine::DropoutReason::DriverResync as u8,
+                    Ordering::Relaxed,
+                );
+            }
             let reset_requested = handle.take_reset_request();
             let latencies_changed = handle.take_latencies_changed();
             let refreshed = if latencies_changed && !reset_requested {

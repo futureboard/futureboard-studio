@@ -110,7 +110,7 @@ use helpers::{
 };
 use project_ops::LifecycleAction;
 pub use studio_state::{
-    ContextTarget, MenuBarUiState, OpenPopover, RightDockTab, StudioPanelVisibility,
+    ContextTarget, DockWidths, MenuBarUiState, OpenPopover, RightDockTab, StudioPanelVisibility,
     WorkspaceActivePanel,
 };
 use studio_state::{TextContextMenu, TextMenuTarget, TransportCommand};
@@ -780,6 +780,13 @@ pub struct StudioLayout {
     /// Browser sidebar, hosted as a cached sibling view so transport
     /// frames stop rebuilding it. See `shell_regions`.
     browser_sidebar: gpui::Entity<shell_regions::BrowserSidebarView>,
+    /// The Rigs tab's embedded page, created the first time the tab is shown.
+    /// See `components::rigs_panel`.
+    rigs_panel: Option<gpui::Entity<components::RigsPanel>>,
+    /// Side-dock widths, resizable and saved with the workspace layout.
+    dock_widths: studio_state::DockWidths,
+    /// The dock edge being dragged, if any.
+    dock_resize: Option<studio_state::DockResize>,
     /// Right dock, cached for the same reason as the browser.
     right_dock: gpui::Entity<shell_regions::RightDockView>,
     /// Title/transport chrome, cached and repainted on its own for the
@@ -1631,6 +1638,9 @@ impl StudioLayout {
             bottom_panel_shell,
             status_bar,
             browser_sidebar,
+            rigs_panel: None,
+            dock_widths: studio_state::DockWidths::default(),
+            dock_resize: None,
             right_dock,
             app_chrome,
             classic_tool_strip,

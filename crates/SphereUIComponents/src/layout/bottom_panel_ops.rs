@@ -303,14 +303,20 @@ impl StudioLayout {
         // `TimelineChromeMetrics.browser_width` → `viewport.panel_origin_x` →
         // every arrangement hit test, so a second copy of the number here is a
         // silent way to break clip hit-testing.
-        use crate::components::SIDEBAR_WIDTH;
-        const INSPECTOR_WIDTH: f32 = 292.0;
         const STATUS_BAR_HEIGHT: f32 = 22.0;
         let show_browser = self.panels.browser;
         let show_inspector = self.panels.inspector;
         let metrics = crate::components::timeline::TimelineChromeMetrics {
-            browser_width: if show_browser { SIDEBAR_WIDTH } else { 0.0 },
-            inspector_width: if show_inspector { INSPECTOR_WIDTH } else { 0.0 },
+            browser_width: if show_browser {
+                self.dock_widths.browser
+            } else {
+                0.0
+            },
+            inspector_width: if show_inspector {
+                self.dock_widths.inspector
+            } else {
+                0.0
+            },
             bottom_panel_height: if self.panels.bottom_docked {
                 self.bottom_panel_state.height_px
             } else {

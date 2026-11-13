@@ -4,7 +4,7 @@ members = [".", "xtask"]
 
 [package]
 name = "rodhareist_vst3"
-version = "2026.11.1-beta2.0.0"
+version = "2026.11.13-beta2.0.1"
 # The editor is Studio's own Rodhareist editor, compiled from its source tree
 # (`src/components`); those files are written against edition 2021.
 edition = "2021"

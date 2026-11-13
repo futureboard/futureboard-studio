@@ -268,6 +268,85 @@ impl Default for StudioPanelVisibility {
     }
 }
 
+/// Widths of the two side docks in logical pixels: the browser on the left and
+/// the right dock (Inspector and its sibling tabs). Each is resized by
+/// dragging its inner edge and saved with the workspace layout.
+///
+/// The browser width is load-bearing beyond its own column: it is the
+/// arrangement's `panel_origin_x`, so every change goes through
+/// `sync_timeline_chrome_metrics` before the next hit test.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DockWidths {
+    pub browser: f32,
+    pub inspector: f32,
+}
+
+impl DockWidths {
+    /// Narrowest browser that still fits its six-tab strip.
+    pub const BROWSER_MIN: f32 = 240.0;
+    pub const BROWSER_MAX: f32 = 640.0;
+    /// The Inspector's rows are laid out for its original width, so the dock
+    /// can grow from there but not shrink below it.
+    pub const INSPECTOR_MIN: f32 = crate::components::panel::INSPECTOR_WIDTH;
+    pub const INSPECTOR_MAX: f32 = 560.0;
+    /// Room the arrangement always keeps when either dock grows.
+    pub const ARRANGEMENT_MIN: f32 = 320.0;
+
+    pub fn clamp_browser(width: f32) -> f32 {
+        if width.is_finite() {
+            width.clamp(Self::BROWSER_MIN, Self::BROWSER_MAX)
+        } else {
+            crate::components::SIDEBAR_WIDTH
+        }
+    }
+
+    pub fn clamp_inspector(width: f32) -> f32 {
+        if width.is_finite() {
+            width.clamp(Self::INSPECTOR_MIN, Self::INSPECTOR_MAX)
+        } else {
+            crate::components::panel::INSPECTOR_WIDTH
+        }
+    }
+}
+
+impl Default for DockWidths {
+    fn default() -> Self {
+        Self {
+            browser: crate::components::SIDEBAR_WIDTH,
+            inspector: crate::components::panel::INSPECTOR_WIDTH,
+        }
+    }
+}
+
+/// Which dock edge is being dragged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockSide {
+    Browser,
+    Inspector,
+}
+
+/// A dock-edge drag in progress: where it started and from what width.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DockResize {
+    pub side: DockSide,
+    pub start_x: f32,
+    pub start_width: f32,
+}
+
+/// Drag payload for a dock edge. Carries nothing: the layout holds the state.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DockResizeDrag;
+
+impl gpui::Render for DockResizeDrag {
+    fn render(
+        &mut self,
+        _window: &mut gpui::Window,
+        _cx: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        gpui::Empty
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(super) enum TransportCommand {
     PlayPause,
