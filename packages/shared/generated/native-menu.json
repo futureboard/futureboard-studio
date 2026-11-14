@@ -2072,6 +2072,20 @@
           "danger": false,
           "description": null,
           "children": []
+        },        {
+          "id": "help.welcome_tour",
+          "kind": "normal",
+          "label": "Welcome Tour",
+          "icon": "compass",
+          "shortcut": null,
+          "command": "help:welcome-tour",
+          "role": null,
+          "enabled": true,
+          "visible": true,
+          "checked": false,
+          "danger": false,
+          "description": null,
+          "children": []
         },
         {
           "id": "help.documentation",

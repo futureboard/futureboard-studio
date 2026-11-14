@@ -104,6 +104,10 @@ pub struct GeneralSettings {
     /// This records that the choice was made, not whether they chose to scan.
     #[serde(default)]
     pub plugin_scan_prompt_answered: bool,
+    /// True once the welcome tour has been finished or skipped. It shows over
+    /// the main window until then; Help ▸ Welcome Tour shows it again.
+    #[serde(default)]
+    pub tour_completed: bool,
     /// User-configured default directory for new projects. When `None` or empty
     /// the platform default ([`crate::project::io::default_projects_dir`]) is
     /// used. Resolve through [`GeneralSettings::resolved_default_project_dir`].
@@ -127,6 +131,7 @@ impl Default for GeneralSettings {
             discord_rpc_enabled: default_true(),
             keymap_profile: default_keymap_profile(),
             plugin_scan_prompt_answered: false,
+            tour_completed: false,
             default_project_directory: None,
             project_defaults: ProjectDefaults::default(),
             autosave: AutosaveSettings::default(),

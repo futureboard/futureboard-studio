@@ -91,6 +91,7 @@ mod studio_render;
 mod studio_state;
 mod tempo_key_ops;
 mod tempo_map_ops;
+mod tour_ops;
 mod track_clip_ops;
 mod track_duplicate_ops;
 mod transport_freeze_debug;
@@ -787,6 +788,13 @@ pub struct StudioLayout {
     dock_widths: studio_state::DockWidths,
     /// The dock edge being dragged, if any.
     dock_resize: Option<studio_state::DockResize>,
+    /// The welcome tour's current step while it is up. See
+    /// `components::welcome_tour` and `layout::tour_ops`.
+    tour_step: Option<usize>,
+    /// Whether this window has decided yet if the tour is owed on first show.
+    tour_checked: bool,
+    /// The main row's measured bounds, for the tour's rings.
+    main_row_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
     /// Right dock, cached for the same reason as the browser.
     right_dock: gpui::Entity<shell_regions::RightDockView>,
     /// Title/transport chrome, cached and repainted on its own for the
@@ -1648,6 +1656,9 @@ impl StudioLayout {
             rigs_panel: None,
             dock_widths: studio_state::DockWidths::default(),
             dock_resize: None,
+            tour_step: None,
+            tour_checked: false,
+            main_row_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
             right_dock,
             app_chrome,
             classic_tool_strip,
@@ -2825,6 +2836,7 @@ impl StudioLayout {
             "help:quick-start" => {
                 crate::user_manual::open_section(crate::user_manual::QUICK_START_FILE);
             }
+            "help:welcome-tour" => self.show_tour(cx),
             "app:about" => {
                 self.open_about_window(owner_bounds, cx);
             }

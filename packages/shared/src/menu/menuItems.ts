@@ -1096,6 +1096,12 @@ export const APP_MENUS: AppMenuGroup[] = [
         action: "help:quick-start",
       },
       {
+        id: "help.welcome_tour",
+        label: "Welcome Tour",
+        icon: "compass",
+        action: "help:welcome-tour",
+      },
+      {
         id: "help.documentation",
         label: "Documentation",
         accelerator: "F1",

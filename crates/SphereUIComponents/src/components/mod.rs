@@ -199,6 +199,7 @@ pub mod voxtune;
 pub mod voxtune_panel;
 #[cfg(feature = "builtin-plugin-editor")]
 pub mod waygate_plate;
+pub mod welcome_tour;
 #[cfg(feature = "builtin-plugin-editor")]
 pub mod white_sharp_meter;
 #[cfg(feature = "builtin-plugin-editor")]

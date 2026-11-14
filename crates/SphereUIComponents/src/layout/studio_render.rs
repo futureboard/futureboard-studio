@@ -963,6 +963,11 @@ impl Render for StudioLayout {
         self.sync_rigs_panel_visibility(cx);
         let show_bottom_docked = self.panels.bottom_docked;
         let active_panel = self.active_panel;
+        // The welcome tour, once, the first time the main window shows.
+        self.begin_tour_if_owed(cx);
+        let tour_overlay = self.render_tour_overlay(window, i18n, cx);
+        let tour_up = self.tour_active();
+        let main_row_bounds = self.main_row_bounds.clone();
 
         let shortcut_target = cx.entity().clone();
         // Docked MIDI editor — consulted in the key handler so Ctrl+A/C/V/X and
@@ -1077,6 +1082,14 @@ impl Render for StudioLayout {
                 }
             })
             .capture_key_down(move |event, window, cx| {
+                // The welcome tour is modal: its keys, and no other.
+                if shortcut_keydown_target.read(cx).tour_active() {
+                    let key = event.keystroke.key.to_ascii_lowercase();
+                    shortcut_keydown_target.update(cx, |this, cx| this.tour_key(&key, cx));
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    return;
+                }
                 let modifiers = event.keystroke.modifiers;
                 if !event.is_held {
                     // A fresh press: nothing from the last one is still owed a
@@ -1523,6 +1536,18 @@ impl Render for StudioLayout {
                     .flex_row()
                     .flex_1()
                     .min_h_0();
+                // Measured only while the tour needs it, for its rings.
+                if tour_up {
+                    let bounds = main_row_bounds.clone();
+                    main_row = main_row.child(
+                        gpui::canvas(
+                            move |measured, _window, _cx| bounds.set(Some(measured)),
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .inset_0(),
+                    );
+                }
                 if show_browser {
                     // Cached: the browser only rebuilds when the shell
                     // itself changes, not on every playhead/meter frame.
@@ -1688,6 +1713,7 @@ impl Render for StudioLayout {
             .children(settings_overlay)
             .children(plugin_picker_overlay_el)
             .children(text_context_overlay)
+            .children(tour_overlay)
             .children({
                 if debug_active_panel_enabled() {
                     Some(
