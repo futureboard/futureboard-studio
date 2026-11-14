@@ -15,7 +15,7 @@ use sphere_ara_host::{
 
 use super::ara_ops::AraSessionKey;
 use crate::components::timeline::timeline_state::{
-    ClipState, ClipType, MidiScale, ScaleKind, TimelineState,
+    AraTrackBinding, ClipState, ClipType, MidiScale, ScaleKind, TimelineState,
 };
 
 /// Native shape of one audio file: sample rate, frames per channel, channels.
@@ -34,6 +34,45 @@ pub struct AraProjectView {
     /// not be probed (offline, moved, unreadable), with the source each one
     /// reads. A saved document may hold state for them that cannot land yet.
     pub offline: Vec<(AraClipKey, AraSourceKey)>,
+}
+
+/// Source keys of a generator's placeholder sources start with this; the rest
+/// is the clip id. See [`placeholder_source_key`].
+pub const PLACEHOLDER_SOURCE_PREFIX: &str = "fb-region:";
+
+/// Sample rate a placeholder source is published at. It has no samples to
+/// read, so the rate only sets how its length is counted.
+const PLACEHOLDER_SAMPLE_RATE: f64 = 48_000.0;
+
+/// A placeholder's length is the clip's rounded up to a whole number of these,
+/// so resizing a clip by less than that leaves its source's shape as it was.
+const PLACEHOLDER_LENGTH_STEP_SECONDS: f64 = 60.0;
+
+/// The silent source a generator's region on `clip_id` reads.
+///
+/// A singing voice synthesizer (VOCALOID, Synthesizer V, VoiSona) makes its own
+/// sound from notes and lyrics it edits itself, but ARA has every playback
+/// region read an audio source. Each of the track's MIDI clips gets a source
+/// of its own, keyed by the clip so it keeps its identity — and with it the
+/// plug-in's edits — when the clip moves or changes length.
+pub fn placeholder_source_key(clip_id: &str) -> AraSourceKey {
+    AraSourceKey(format!("{PLACEHOLDER_SOURCE_PREFIX}{clip_id}"))
+}
+
+/// Whether `source` is a generator's silent placeholder rather than a file.
+pub fn is_placeholder_source(source: &AraSourceKey) -> bool {
+    source.as_str().starts_with(PLACEHOLDER_SOURCE_PREFIX)
+}
+
+/// Whether `clip` is one of the regions of a track bound by `binding`: its
+/// audio clips for a plug-in that processes recordings, its MIDI clips for a
+/// generator.
+pub fn is_region_clip(binding: &AraTrackBinding, clip: &ClipState) -> bool {
+    if binding.generator {
+        matches!(clip.clip_type, ClipType::Midi { .. })
+    } else {
+        matches!(clip.clip_type, ClipType::Audio { .. })
+    }
 }
 
 /// Reads a clip's source id and on-disk path, or `None` when it has neither.
@@ -276,11 +315,59 @@ pub fn document_view(
         // ARA is a track processor, so the plug-in gets every audio clip on
         // the track — not a hand-picked subset. A track bound to a different
         // plug-in contributes nothing to this document.
-        if track
+        let Some(binding) = track
             .ara
             .as_ref()
-            .is_none_or(|binding| binding.plugin_id != key.plugin_id)
-        {
+            .filter(|binding| binding.plugin_id == key.plugin_id)
+        else {
+            continue;
+        };
+
+        if binding.generator {
+            // A generator's regions are the track's MIDI clips, each over a
+            // silent source of its own: there is no recording for it to read.
+            for clip in track
+                .clips
+                .iter()
+                .filter(|clip| is_region_clip(binding, clip))
+            {
+                let start_in_playback = state
+                    .tempo_map
+                    .seconds_at_beat(clip.start_beat.max(0.0) as f64, base_bpm);
+                let end_in_playback = state.tempo_map.seconds_at_beat(
+                    (clip.start_beat.max(0.0) + clip.duration_beats.max(0.0)) as f64,
+                    base_bpm,
+                );
+                let duration_in_playback = (end_in_playback - start_in_playback).max(f64::EPSILON);
+                let steps = (duration_in_playback / PLACEHOLDER_LENGTH_STEP_SECONDS)
+                    .ceil()
+                    .max(1.0);
+                let source_key = placeholder_source_key(&clip.id);
+                sources.insert(
+                    source_key.clone(),
+                    AraAudioSourceDesc {
+                        key: source_key.clone(),
+                        name: clip.name.clone(),
+                        sample_rate: PLACEHOLDER_SAMPLE_RATE,
+                        frame_count: (steps
+                            * PLACEHOLDER_LENGTH_STEP_SECONDS
+                            * PLACEHOLDER_SAMPLE_RATE) as i64,
+                        channel_count: 1,
+                    },
+                );
+                regions.push(AraPlaybackRegionDesc {
+                    key: AraClipKey(clip.id.clone()),
+                    source: source_key,
+                    track: AraTrackKey(track.id.clone()),
+                    name: clip.name.clone(),
+                    start_in_modification: 0.0,
+                    duration_in_modification: duration_in_playback,
+                    start_in_playback,
+                    duration_in_playback,
+                    transform: AraPlaybackTransform::NONE,
+                    color: None,
+                });
+            }
             continue;
         }
 
@@ -386,6 +473,7 @@ mod tests {
             plugin_id: "vst3:melodyne".to_string(),
             plugin_path: "C:/Melodyne.vst3".to_string(),
             class_id: "ABCD".to_string(),
+            generator: false,
         });
         let clip = ClipState {
             id: "clip-1".to_string(),
@@ -494,6 +582,66 @@ mod tests {
         // Nothing was trimmed, so the region starts at the head of the source.
         assert!((region.start_in_modification - 0.0).abs() < 1e-9);
         assert_eq!(view.media_paths.len(), 1);
+    }
+
+    /// A track bound to a generator (a voice synth) with an audio clip and a
+    /// MIDI clip on it.
+    fn timeline_with_voice_synth_track() -> TimelineState {
+        let mut state = timeline_with_ara_track();
+        state.tracks[0].ara.as_mut().unwrap().generator = true;
+        let mut phrase = state.tracks[0].clips[0].clone();
+        phrase.id = "phrase-1".to_string();
+        phrase.name = "Verse".to_string();
+        phrase.start_beat = 8.0;
+        phrase.duration_beats = 16.0;
+        phrase.clip_type = ClipType::Midi {
+            notes: Vec::new(),
+            controller_lanes: Vec::new(),
+            sysex_events: Vec::new(),
+            articulations: Vec::new(),
+        };
+        state.tracks[0].clips.push(phrase);
+        state
+    }
+
+    /// A generator's regions are the track's MIDI clips, each over a silent
+    /// source of its own; the audio clip on the same track is not one, and no
+    /// file is read for anything.
+    #[test]
+    fn a_voice_synth_sings_the_tracks_midi_clips() {
+        let state = timeline_with_voice_synth_track();
+        let mut probed = 0;
+        let mut shape = |_: &str| {
+            probed += 1;
+            Some((48_000.0, 192_000, 2))
+        };
+        let view = project_view(&state, &key(&state), &mut shape);
+
+        assert!(view.graph.validate().is_ok());
+        assert_eq!(view.graph.regions.len(), 1);
+        let region = &view.graph.regions[0];
+        assert_eq!(region.key, AraClipKey::from("phrase-1"));
+        assert_eq!(region.source, placeholder_source_key("phrase-1"));
+        assert!(is_placeholder_source(&region.source));
+        // 8 beats at 120 BPM = 4 s in, 16 beats = 8 s long.
+        assert!((region.start_in_playback - 4.0).abs() < 1e-9);
+        assert!((region.duration_in_playback - 8.0).abs() < 1e-9);
+        assert_eq!(view.graph.sources.len(), 1);
+        assert!(view.media_paths.is_empty());
+        assert_eq!(probed, 0, "a placeholder has no file to probe");
+    }
+
+    /// Lengthening a phrase within the placeholder's step leaves its source's
+    /// shape alone, so the plug-in is not made to drop and re-read it.
+    #[test]
+    fn a_resized_phrase_keeps_its_source() {
+        let mut state = timeline_with_voice_synth_track();
+        let mut shape = |_: &str| None;
+        let before = project_view(&state, &key(&state), &mut shape);
+        state.tracks[0].clips[1].duration_beats = 32.0;
+        let after = project_view(&state, &key(&state), &mut shape);
+        assert_eq!(before.graph.sources, after.graph.sources);
+        assert!((after.graph.regions[0].duration_in_playback - 16.0).abs() < 1e-9);
     }
 
     #[test]

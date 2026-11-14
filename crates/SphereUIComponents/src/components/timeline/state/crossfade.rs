@@ -2069,6 +2069,7 @@ mod tests {
             plugin_id: "melodyne".into(),
             plugin_path: "m.vst3".into(),
             class_id: "c".into(),
+            generator: false,
         });
         ara.selection.selected_clip_ids = vec![left.id, right.id];
         assert!(ara.crossfade_request().is_err());

@@ -1225,7 +1225,9 @@ fn build_engine_project_snapshot_inner(
                     // On an ARA track the plug-in renders every audio clip,
                     // having read the sources out of band; the engine must skip
                     // their files or each clip would play twice.
-                    ara_rendered: track.ara.is_some(),
+                    // A generator (a voice synth) renders the track's MIDI
+                    // clips instead, and its audio clips play as they are.
+                    ara_rendered: track.ara.as_ref().is_some_and(|ara| !ara.generator),
                     fades,
                     stretch: sphere_stretch.clone(),
                     audio_process: Some(EngineClipAudioProcess {
@@ -1300,8 +1302,13 @@ fn build_engine_project_snapshot_inner(
             let track_id = state
                 .effective_instrument_track_id(&track.id)
                 .unwrap_or_else(|| track.id.clone());
+            // On a track bound to an ARA generator (a voice synth) the MIDI
+            // clips are that plug-in's regions: it sings them from its own
+            // notes and lyrics, so their notes do not also play the track's
+            // instruments.
+            let ara_regions = track.ara.as_ref().is_some_and(|ara| ara.generator);
             track.clips.iter().filter_map(move |clip| {
-                if clip.muted {
+                if clip.muted || ara_regions {
                     return None;
                 }
                 let ClipType::Midi {

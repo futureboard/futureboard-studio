@@ -1642,6 +1642,8 @@ impl StudioLayout {
                     entries.extend(self.ara_clip_menu_entries(clip_id, exists, cx));
                 }
                 if is_midi {
+                    // A MIDI clip is a voice synth's region on its track.
+                    entries.extend(self.ara_clip_menu_entries(clip_id, exists, cx));
                     entries.push(menu_item_enabled(
                         i18n.tr("menu.midi-quantize"),
                         "midi:quantize",

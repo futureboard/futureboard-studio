@@ -468,6 +468,7 @@ mod tests {
             plugin_id: "vst3:melodyne".to_string(),
             plugin_path: "/tmp/melodyne.vst3".to_string(),
             class_id: "class".to_string(),
+            generator: false,
         });
         assert!(history.undo(&mut state));
         assert!(!state.tracks[0].muted);

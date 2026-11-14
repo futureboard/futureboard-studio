@@ -3312,11 +3312,13 @@ fn decode_track(r: &mut FbReader, version: u32) -> Result<ProjectTrack, ProjectE
         None
     };
     // v42: the track's ARA plug-in, at the tail of the track block.
-    let ara = if version >= 42 && r.read_u8()? == 1 {
+    let mut ara = if version >= 42 && r.read_u8()? == 1 {
         Some(AraTrackBinding {
             plugin_id: r.read_str()?,
             plugin_path: r.read_str()?,
             class_id: r.read_str()?,
+            // v65, read at the tail of the track block below.
+            generator: false,
         })
     } else {
         None
@@ -5151,6 +5153,7 @@ mod tests {
             plugin_id: "vst3:celemony.melodyne".to_string(),
             plugin_path: "C:/Program Files/Common Files/VST3/Melodyne.vst3".to_string(),
             class_id: "1234ABCD".to_string(),
+            generator: false,
         };
         let mut track = track_with_clip(empty_clip_with_stretch(sample_stretch()));
         track.ara = Some(binding.clone());

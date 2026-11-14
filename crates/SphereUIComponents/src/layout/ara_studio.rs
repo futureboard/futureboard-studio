@@ -23,6 +23,9 @@ pub(crate) struct AraPluginChoice {
     pub name: String,
     pub path: String,
     pub class_id: String,
+    /// An instrument (a voice synth): it binds to the track's MIDI clips,
+    /// see `AraTrackBinding::generator`.
+    pub is_instrument: bool,
 }
 
 /// How long the teardown waits for the plug-in's editor view to come down
@@ -63,6 +66,8 @@ impl StudioLayout {
                     name: plugin.name.clone(),
                     path: plugin.path.to_string_lossy().to_string(),
                     class_id: plugin.class_id.clone()?,
+                    is_instrument: plugin.kind
+                        == SpherePluginHost::registry::PluginKind::Instrument,
                 })
             })
             .collect();
@@ -157,6 +162,7 @@ impl StudioLayout {
             plugin_id: choice.id.clone(),
             plugin_path: choice.path.clone(),
             class_id: choice.class_id.clone(),
+            generator: choice.is_instrument,
         };
         let bound = self.timeline.update(cx, |timeline, cx| {
             let Some(track) = timeline
@@ -193,30 +199,36 @@ impl StudioLayout {
         // already put its reason in `last_error`, and a panel opened on nothing
         // would bury it behind an empty rectangle.
         if self.ara.processor(&key).is_some() {
-            if let Some(clip_id) = self.first_audio_clip_of_track(track_id, cx) {
+            if let Some(clip_id) = self.first_region_clip_of_track(track_id, cx) {
                 self.open_ara_editor(&clip_id, cx);
+            } else if choice.is_instrument {
+                // A voice synth on a track with no MIDI clip yet still has an
+                // editor to show: the panel opens on the selected track.
+                self.timeline.update(cx, |timeline, cx| {
+                    timeline.state.select_track(track_id);
+                    cx.notify();
+                });
+                self.panels.bottom_docked = true;
+                self.set_active_bottom_tab(crate::components::BottomTab::Editor, cx);
             }
         }
         cx.notify();
     }
 
-    /// Earliest audio clip on a track, which is what the ARA editor opens on.
+    /// Earliest region clip on a track — an audio clip, or a MIDI clip for a
+    /// generator — which is what the ARA editor opens on.
     ///
     /// The panel resolves its target from the clip selection, so auto-opening
     /// needs a clip to select; the earliest one is the one the user is looking
     /// at when they bind the track.
-    fn first_audio_clip_of_track(&self, track_id: &str, cx: &gpui::App) -> Option<String> {
+    fn first_region_clip_of_track(&self, track_id: &str, cx: &gpui::App) -> Option<String> {
         let state = &self.timeline.read(cx).state;
         let track = state.tracks.iter().find(|track| track.id == track_id)?;
+        let binding = track.ara.as_ref()?;
         track
             .clips
             .iter()
-            .filter(|clip| {
-                matches!(
-                    clip.clip_type,
-                    crate::components::timeline::timeline_state::ClipType::Audio { .. }
-                )
-            })
+            .filter(|clip| ara_graph::is_region_clip(binding, clip))
             .min_by(|a, b| {
                 a.start_beat
                     .partial_cmp(&b.start_beat)
@@ -424,6 +436,7 @@ impl StudioLayout {
             name,
             path: binding.plugin_path.clone(),
             class_id: binding.class_id.clone(),
+            is_instrument: binding.generator,
         })
     }
 
@@ -900,7 +913,6 @@ impl StudioLayout {
     /// so the plug-in follows clicks as they happen rather than at the next
     /// rebuild.
     fn sync_ara_editor_selection(&mut self, cx: &mut Context<Self>) {
-        use crate::components::timeline::timeline_state::ClipType;
         use sphere_ara_host::AraTrackKey;
         let Some(key) = self.selected_ara_session_key(cx) else {
             return;
@@ -914,7 +926,11 @@ impl StudioLayout {
                 let Some((track, clip)) = state.find_clip(clip_id) else {
                     continue;
                 };
-                if !members.contains(&track.id) || !matches!(clip.clip_type, ClipType::Audio { .. })
+                if !members.contains(&track.id)
+                    || !track
+                        .ara
+                        .as_ref()
+                        .is_some_and(|binding| ara_graph::is_region_clip(binding, clip))
                 {
                     continue;
                 }
@@ -935,7 +951,12 @@ impl StudioLayout {
                     clips = track
                         .clips
                         .iter()
-                        .filter(|clip| matches!(clip.clip_type, ClipType::Audio { .. }))
+                        .filter(|clip| {
+                            track
+                                .ara
+                                .as_ref()
+                                .is_some_and(|binding| ara_graph::is_region_clip(binding, clip))
+                        })
                         .map(|clip| AraClipKey::from(clip.id.as_str()))
                         .collect();
                     tracks.push(AraTrackKey(track.id.clone()));
@@ -1592,6 +1613,7 @@ mod tests {
             plugin_id: "test-ara".to_string(),
             plugin_path: "/tmp/test-ara.vst3".to_string(),
             class_id: "test-class".to_string(),
+            generator: false,
         });
         state.select_track(&track_id);
 

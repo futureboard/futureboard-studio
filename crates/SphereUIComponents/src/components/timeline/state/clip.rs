@@ -80,6 +80,13 @@ pub struct AraTrackBinding {
     pub plugin_path: String,
     /// VST3 audio-module class id inside that module.
     pub class_id: String,
+    /// The plug-in is an instrument that makes its own sound from content it
+    /// edits itself — a singing voice synthesizer such as VOCALOID,
+    /// Synthesizer V or VoiSona — rather than one that processes recordings.
+    /// Its regions are the track's MIDI clips, which give it a place and a
+    /// length on the timeline and no longer play the track's instruments.
+    /// Taken from the catalog's plug-in kind when the track is bound.
+    pub generator: bool,
 }
 
 /// Words a copy or a split adds to the name it was made from.

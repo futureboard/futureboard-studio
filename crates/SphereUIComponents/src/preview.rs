@@ -2376,6 +2376,7 @@ fn ara_notes_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHand
                 plugin_id: "vst3:melodyne".to_string(),
                 plugin_path: "C:/Melodyne.vst3".to_string(),
                 class_id: "ABCD".to_string(),
+                generator: false,
             });
             let clip = track.clips[0].clone();
             let start = clip.start_beat as f64 * seconds_per_beat;

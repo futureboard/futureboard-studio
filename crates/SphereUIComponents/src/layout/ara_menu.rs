@@ -69,7 +69,27 @@ impl StudioLayout {
             // read as a missing feature rather than an unsupported one.
             return Vec::new();
         }
-        let choices = self.ara_plugin_choices();
+        let mut choices = self.ara_plugin_choices();
+        // A MIDI clip is material only for an instrument (a voice synth): it
+        // is where that plug-in's region sits. It offers only those, and says
+        // nothing at all where there are none or the track's plug-in is one
+        // that processes recordings — a MIDI clip there is not part of it.
+        let state = &self.timeline.read(cx).state;
+        let midi = state
+            .tracks
+            .iter()
+            .flat_map(|track| track.clips.iter().map(move |clip| (track, clip)))
+            .find(|(_, clip)| clip.id == clip_id)
+            .filter(|(_, clip)| !is_audio(clip))
+            .map(|(track, _)| track.ara.as_ref().map(|binding| binding.generator));
+        if let Some(bound_generator) = midi {
+            choices.retain(|choice| choice.is_instrument);
+            match bound_generator {
+                Some(false) => return Vec::new(),
+                None if choices.is_empty() => return Vec::new(),
+                _ => {}
+            }
+        }
         let mut entries = vec![
             ContextMenuEntry::Separator,
             ContextMenuEntry::Header("ARA".to_string()),
@@ -147,10 +167,14 @@ impl StudioLayout {
             } else {
                 choice.name.clone()
             };
+            // A plug-in that processes recordings needs one on the track; an
+            // instrument (a voice synth) makes its own sound and works on the
+            // track's MIDI clips, so it can be bound to any track.
+            let has_material = audio_clips > 0 || choice.is_instrument;
             entries.push(entry(
                 label,
                 format!("{ARA_BIND_TRACK_PREFIX}{}", choice.id),
-                track_exists && audio_clips > 0 && !selected,
+                track_exists && has_material && !selected,
             ));
         }
         if bound_plugin.is_some() {

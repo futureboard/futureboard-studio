@@ -209,8 +209,35 @@ impl AudioLibrary {
 
 impl AraAudioAccess for AudioLibrary {
     fn open_reader(&self, source: &AraSourceKey) -> AraResult<Box<dyn AraSampleReader>> {
+        // A generator's region reads no recording: its source is silence of
+        // the length it was published with (the host's reader adapter pads
+        // to that shape), with nothing to decode or keep in memory.
+        if super::ara_graph::is_placeholder_source(source) {
+            return Ok(Box::new(SilentReader));
+        }
         let buffer = self.buffer(source)?;
         Ok(Box::new(BufferReader { buffer }))
+    }
+}
+
+/// The reader of a generator's placeholder source: one channel, no frames, so
+/// every read comes back as silence.
+struct SilentReader;
+
+impl AraSampleReader for SilentReader {
+    fn channel_count(&self) -> usize {
+        1
+    }
+
+    fn frame_count(&self) -> i64 {
+        0
+    }
+
+    fn read_planar_f32(&mut self, _start_frame: i64, out: &mut [&mut [f32]]) -> AraResult<()> {
+        for plane in out.iter_mut() {
+            plane.fill(0.0);
+        }
+        Ok(())
     }
 }
 
