@@ -160,7 +160,15 @@ mod tests {
     fn every_preset_lands_exactly_from_every_other() {
         let bank = presets();
         assert_eq!(bank[0].name, "Default");
-        assert!(bank.len() >= 8);
+        // The editor's bank is the DSP's whole factory list, so every preset
+        // shipped is tried from every other — however many there are.
+        let factory: Vec<&str> = waygate::factory_presets()
+            .iter()
+            .map(|preset| preset.name)
+            .collect();
+        let shown: Vec<&str> = bank.iter().map(|preset| preset.name).collect();
+        assert_eq!(shown, factory);
+        assert!(bank.len() > 1, "landing needs a preset to land from");
         for from in bank.iter() {
             for to in bank.iter() {
                 let before = wire_values(&from.params);
