@@ -837,6 +837,8 @@ fn insert_chip(
 
     let bus_track = track_id_owned.clone();
     let bus_slot = slot_id.clone();
+    let on_insert_context = callbacks.on_insert_context_menu.clone();
+    let context_pair = (track_id_owned.clone(), slot_id.clone());
     let open_target = (track_id_owned, insert_index, slot_id);
 
     // The glyphs forward slot drops to the chip, so a drop released over one
@@ -901,6 +903,23 @@ fn insert_chip(
                 .block_mouse_except_scroll(),
         ))
         .child(div().flex_1().min_w(px(0.0)).truncate().child(display))
+        // A sidechain routed into this insert: a quiet mark, changed from the
+        // chip's right-click menu.
+        .when(slot.sidechain.is_some(), |row| {
+            row.child(
+                div()
+                    .id(gpui::SharedString::from(format!("insert-sc-{}", slot.id)))
+                    .flex_none()
+                    .px(px(2.0))
+                    .text_size(px(type_scale::LABEL))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(Colors::state_monitor())
+                    .tooltip(crate::components::controls::fb_tooltip(
+                        "Sidechain routed — right-click to change",
+                    ))
+                    .child("SC"),
+            )
+        })
         // Shown while the split is live, and for an insert still stored on
         // the W bus after it went away (it runs on Main then), so the user
         // can see that and move it back.

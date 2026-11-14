@@ -56,7 +56,12 @@ pub const BAND_SLOPE: u32 = 0;
 pub const BAND_DYN_MODE: u32 = 1;
 pub const BAND_RATIO: u32 = 2;
 
-pub const PARAM_COUNT: usize = EXT_BASE_INDEX as usize + BAND_COUNT * EXT_STRIDE as usize;
+/// Per-band sidechain source (`0` the insert's own input, `1` the host's
+/// sidechain key), one per band after the extension block for the same
+/// reason that block follows the dynamics one. `SC_BASE_INDEX + band`.
+pub const SC_BASE_INDEX: u32 = EXT_BASE_INDEX + BAND_COUNT as u32 * EXT_STRIDE;
+
+pub const PARAM_COUNT: usize = SC_BASE_INDEX as usize + BAND_COUNT;
 
 // --- value ranges, shared by the wire and restored state --------------------
 
@@ -216,6 +221,14 @@ pub const UI_PARAM_IDS: [&str; PARAM_COUNT] = [
     "band8_slope",
     "band8_dynMode",
     "band8_ratio",
+    "band1_scExternal",
+    "band2_scExternal",
+    "band3_scExternal",
+    "band4_scExternal",
+    "band5_scExternal",
+    "band6_scExternal",
+    "band7_scExternal",
+    "band8_scExternal",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,8 +304,15 @@ pub const fn ext_wire_index(band: usize, field: u32) -> u32 {
     EXT_BASE_INDEX + band as u32 * EXT_STRIDE + field
 }
 
+pub const fn sc_wire_index(band: usize) -> u32 {
+    SC_BASE_INDEX + band as u32
+}
+
 pub fn decode_ext_wire(index: u32) -> Option<(usize, u32)> {
     let offset = index.checked_sub(EXT_BASE_INDEX)?;
+    if index >= SC_BASE_INDEX {
+        return None;
+    }
     let band = (offset / EXT_STRIDE) as usize;
     let field = offset % EXT_STRIDE;
     (band < BAND_COUNT).then_some((band, field))
@@ -385,6 +405,12 @@ pub fn apply_wire_param(params: &mut Params, index: u32, value: f32) -> bool {
                     BAND_RATIO => band.ratio = decode_ratio(value),
                     _ => return false,
                 }
+            } else if let Some(band) = index
+                .checked_sub(SC_BASE_INDEX)
+                .map(|band| band as usize)
+                .filter(|&band| band < BAND_COUNT)
+            {
+                params.bands[band].sc_external = value >= 0.5;
             } else {
                 return false;
             }
@@ -428,6 +454,12 @@ pub fn ui_values(params: &Params) -> Vec<(&'static str, f32)> {
         values.push((UI_PARAM_IDS[base], band.slope));
         values.push((UI_PARAM_IDS[base + 1], band.dyn_mode.to_wire()));
         values.push((UI_PARAM_IDS[base + 2], band.ratio));
+    }
+    for (index, band) in params.bands.iter().enumerate() {
+        values.push((
+            UI_PARAM_IDS[SC_BASE_INDEX as usize + index],
+            f32::from(band.sc_external),
+        ));
     }
     values
 }
@@ -529,15 +561,37 @@ mod tests {
             ui_param_index("band8_ratio"),
             Some(ext_wire_index(BAND_COUNT - 1, BAND_RATIO))
         );
-        assert_eq!(PARAM_COUNT, 108);
+        // The sidechain block is appended after the 108 that came before it.
+        assert_eq!(SC_BASE_INDEX, 108);
+        assert_eq!(ui_param_index("band1_scExternal"), Some(108));
+        assert_eq!(ui_param_index("band8_scExternal"), Some(sc_wire_index(BAND_COUNT - 1)));
+        assert_eq!(PARAM_COUNT, 116);
         for index in 0..PARAM_COUNT as u32 {
             let decoded = [
                 decode_band_wire(index).is_some(),
                 decode_dyn_wire(index).is_some(),
                 decode_ext_wire(index).is_some(),
+                index >= SC_BASE_INDEX,
             ];
             assert!(decoded.iter().filter(|hit| **hit).count() <= 1, "{index}");
         }
+    }
+
+    /// A band's sidechain source rides the wire and the saved state; a state
+    /// saved before it existed loads with the band on its own input.
+    #[test]
+    fn the_band_sidechain_source_round_trips() {
+        let mut params = default_params();
+        assert!(apply_wire_param(&mut params, sc_wire_index(2), 1.0));
+        assert!(params.bands[2].sc_external);
+        assert!(!params.bands[1].sc_external);
+        let json = Equz8State::new(params.clone()).to_json().unwrap();
+        let back = Equz8State::from_json(&json).unwrap();
+        assert!(back.params.bands[2].sc_external);
+        let legacy = json.replace(",\"scExternal\":true", "").replace(",\"scExternal\":false", "");
+        assert!(!legacy.contains("scExternal"));
+        let old = Equz8State::from_json(&legacy).unwrap();
+        assert!(old.params.bands.iter().all(|band| !band.sc_external));
     }
 
     /// A ratio of 0 is the legacy law and must survive a replay over the wire.

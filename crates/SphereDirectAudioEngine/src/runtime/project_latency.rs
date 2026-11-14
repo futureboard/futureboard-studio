@@ -50,19 +50,27 @@ impl RuntimeProject {
         if !insert.enabled {
             return 0;
         }
-        if insert.kind_tag == RuntimeInsertKind::ExternalBridge {
-            return insert.bridge_sink.as_ref().map_or(0, |sink| {
+        // A sidechain whose key arrives late delays the insert's main input
+        // to meet it; that delay is this insert's latency like its own.
+        let sidechain = insert
+            .sidechain
+            .as_deref()
+            .map_or(0, RuntimeSidechain::added_latency_samples);
+        let own = if insert.kind_tag == RuntimeInsertKind::ExternalBridge {
+            insert.bridge_sink.as_ref().map_or(0, |sink| {
                 crate::plugin_bridge::bridged_insert_latency_samples(
                     sink.reported_latency_samples(),
                     bridge_period_frames,
                 )
-            });
-        }
-        insert
-            .vst3
-            .as_ref()
-            .filter(|vst3| vst3.is_ready())
-            .map_or(0, |vst3| vst3.get_latency_samples().max(0) as u32)
+            })
+        } else {
+            insert
+                .vst3
+                .as_ref()
+                .filter(|vst3| vst3.is_ready())
+                .map_or(0, |vst3| vst3.get_latency_samples().max(0) as u32)
+        };
+        own.saturating_add(sidechain)
     }
 
     /// [`Self::track_insert_latency_samples`], also recording on every insert
@@ -158,7 +166,15 @@ impl RuntimeProject {
     /// [`Self::fit_pdc_delay_capacity_realtime`] run without an allocator.
     pub(super) fn ensure_pdc_delay_capacity(&mut self) {
         let frames = Self::pdc_buffer_frames(self.latency_graph.max_path_latency_samples);
-        let reserved = frames.next_power_of_two();
+        // A sidechain's alignment is only known once the audio thread has
+        // observed its latencies, and it lands on the compensation plan then:
+        // reserve room for it now so that replan stays inside capacity.
+        let headroom = if self.has_live_sidechains() {
+            2 * crate::plugin_bridge::MAX_BRIDGE_BLOCK_FRAMES
+        } else {
+            0
+        };
+        let reserved = (frames + headroom).next_power_of_two();
         for track in &mut self.tracks {
             let extra_l = reserved.saturating_sub(track.pdc_delay_l.len());
             let extra_r = reserved.saturating_sub(track.pdc_delay_r.len());
@@ -310,9 +326,14 @@ impl RuntimeProject {
         }
         let scan_count = track_count.min(TRACKS_PER_CALLBACK);
         let scan_start = self.audio_graph.latency_scan_cursor.min(track_count - 1);
-        let mut changed = false;
+        // A sidechain alignment that moved is a latency change on its track:
+        // replan straight away rather than waiting for the scan to reach it.
+        let mut changed = self.update_sidechain_alignment(bridge_period_frames);
         let mut scanned = 0usize;
         for offset in 0..scan_count {
+            if changed {
+                break;
+            }
             let idx = (scan_start + offset) % track_count;
             let observed =
                 Self::track_insert_latency_samples(&self.tracks[idx], bridge_period_frames);

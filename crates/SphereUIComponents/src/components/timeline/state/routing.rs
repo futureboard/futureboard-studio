@@ -1625,6 +1625,71 @@ mod tests {
         assert!(!state.set_insert_signal_bus(&audio, &slot_id, InsertSignalBus::Wdw));
     }
 
+    /// The sidechain picker offers every other track but those the insert's
+    /// track already feeds, and refuses a route that would close a loop.
+    #[test]
+    fn sidechain_sources_exclude_the_track_itself_and_what_it_feeds() {
+        use crate::components::timeline::timeline_state::InsertSidechain;
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let kick = create_track(&mut state, TrackType::Audio, "Kick");
+        let bass = create_track(&mut state, TrackType::Audio, "Bass");
+        let bus = create_track(&mut state, TrackType::Bus, "Low End");
+        assert!(state.set_track_output_routing(
+            &bass,
+            TrackOutputRouting::Bus {
+                bus_id: bus.clone()
+            }
+        ));
+        let load = |state: &mut TimelineState, track: &str| {
+            let insert = state.add_insert(track).expect("insert");
+            let slot = state
+                .tracks
+                .iter_mut()
+                .find(|t| t.id == track)
+                .unwrap()
+                .inserts
+                .iter_mut()
+                .find(|slot| slot.id == insert)
+                .unwrap();
+            slot.plugin_format = Some(InsertPluginFormat::Vst3);
+            slot.plugin_id = Some("vst3:comp".to_string());
+            insert
+        };
+        let bass_comp = load(&mut state, &bass);
+        let kick_comp = load(&mut state, &kick);
+        let route = |source: &str| {
+            Some(InsertSidechain {
+                source_track_id: source.to_string(),
+                post_fader: false,
+            })
+        };
+
+        let ids: Vec<String> = state
+            .sidechain_source_candidates(&bass)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(ids.contains(&kick));
+        assert!(!ids.contains(&bass), "not its own track");
+        assert!(!ids.contains(&bus), "not the bus it feeds");
+
+        assert!(!state.set_insert_sidechain(&bass, &bass_comp, route(&bus)));
+        assert!(state.set_insert_sidechain(&bass, &bass_comp, route(&kick)));
+        assert!(
+            !state.set_insert_sidechain(&bass, &bass_comp, route(&kick)),
+            "no change, no undo step"
+        );
+        // The kick keys the bass now, so the bass cannot key the kick.
+        assert!(!state.set_insert_sidechain(&kick, &kick_comp, route(&bass)));
+        assert!(state.set_insert_sidechain(&bass, &bass_comp, None));
+        assert!(state
+            .find_insert_slot(&bass, &bass_comp)
+            .unwrap()
+            .sidechain
+            .is_none());
+    }
+
     /// #334: a new send never takes the id of a send that is still there,
     /// nor of one removed earlier in the session.
     #[test]

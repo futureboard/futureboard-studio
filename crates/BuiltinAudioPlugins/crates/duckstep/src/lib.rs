@@ -9,9 +9,10 @@
 //! in ─ lookahead ─ [Full | LR4 split: Low or High band] × gain ─ mix ─ monitor ─ output ─ out
 //! ```
 //!
-//! Sidechain mode detects from the insert's own input: the plug-in host has
-//! no sidechain bus, so the External key source is kept in the state but
-//! does nothing. The Shaper restarts on the host's beat grid (the transport
+//! Sidechain mode detects from the insert's own input, or, with the External
+//! source, from the key the host routes to the insert's sidechain input
+//! ([`Dsp::process_stereo_keyed`]); an insert with no key routed falls back
+//! to its own input. The Shaper restarts on the host's beat grid (the transport
 //! the host hands over each block), or when the input crosses a threshold;
 //! effect inserts receive no MIDI, so the MIDI trigger free-runs at the tempo.
 //!
@@ -120,9 +121,9 @@ wire_enum!(
     Mode { Sidechain => "Sidechain", Shaper => "Shaper" }
 );
 wire_enum!(
-    /// The ducker's key. External needs a sidechain bus the host does not
-    /// have yet: it is kept in the state, and the detector listens to the
-    /// insert's own input either way.
+    /// The ducker's key. External listens to the sidechain key the host
+    /// routes to the insert; without one routed the detector listens to the
+    /// insert's own input.
     Source { External => "External key", Internal => "Internal" }
 );
 wire_enum!(
@@ -1223,8 +1224,30 @@ impl StereoEffect for Dsp {
     }
 
     fn process_stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
+        self.process_stereo_keyed(left, right, None)
+    }
+}
+
+impl Dsp {
+    /// One sample with the host's sidechain key (`None`: the insert has no
+    /// key this block). With the External source selected the ducker's
+    /// detector hears the key; otherwise, or without a key, it hears the
+    /// insert's own input, as it always did.
+    pub fn process_stereo_keyed(
+        &mut self,
+        left: f32,
+        right: f32,
+        key: Option<(f32, f32)>,
+    ) -> (f32, f32) {
         let left = if left.is_finite() { left } else { 0.0 };
         let right = if right.is_finite() { right } else { 0.0 };
+        let (key_l, key_r) = match key {
+            Some((l, r)) if self.params.source == Source::External => (
+                if l.is_finite() { l } else { 0.0 },
+                if r.is_finite() { r } else { 0.0 },
+            ),
+            _ => (left, right),
+        };
         self.started = true;
 
         // A new mode, band or lookahead: dip, switch at the bottom, come
@@ -1251,8 +1274,8 @@ impl StereoEffect for Dsp {
         // The detector hears the input now; the audio runs the lookahead
         // behind it.
         let (hpf_on, lpf_on) = (self.control.hpf_on, self.control.lpf_on);
-        let det_l = self.detect[0].run(left, hpf_on, lpf_on);
-        let det_r = self.detect[1].run(right, hpf_on, lpf_on);
+        let det_l = self.detect[0].run(key_l, hpf_on, lpf_on);
+        let det_r = self.detect[1].run(key_r, hpf_on, lpf_on);
         self.ring_l.push(left);
         self.ring_r.push(right);
         self.det_ring_l.push(det_l);
@@ -1586,6 +1609,39 @@ mod tests {
         assert!(
             peak(&out[4_800..]) < 0.05,
             "the high-pass takes the lows out"
+        );
+    }
+
+    /// With the External source the ducker hears the host's key, not the
+    /// track: a loud key ducks a quiet track. Internal ignores the key.
+    #[test]
+    fn an_external_key_drives_the_ducker() {
+        let duck = |source: Source, key_level: f32| {
+            let mut dsp = Dsp::new(SR);
+            let mut p = default_params();
+            p.mode = Mode::Sidechain;
+            p.source = source;
+            p.lookahead_ms = 0.0;
+            dsp.set_params(p);
+            let mut late = 0.0f32;
+            for n in 0..48_000usize {
+                let x = 0.01 * (TAU * 440.0 * n as f32 / SR).sin();
+                let k = key_level * (TAU * 60.0 * n as f32 / SR).sin();
+                let (l, _) = dsp.process_stereo_keyed(x, x, Some((k, k)));
+                if n >= 24_000 {
+                    late = late.max(l.abs());
+                }
+            }
+            late
+        };
+        let silent_key = duck(Source::External, 0.0);
+        let loud_key = duck(Source::External, 1.0);
+        assert!(silent_key > 0.009, "a silent key leaves the track alone: {silent_key}");
+        assert!(loud_key < silent_key * 0.7, "a loud key ducks it: {loud_key} vs {silent_key}");
+        let internal = duck(Source::Internal, 1.0);
+        assert!(
+            (internal - silent_key).abs() < 1.0e-4,
+            "Internal hears the track, not the key: {internal} vs {silent_key}"
         );
     }
 

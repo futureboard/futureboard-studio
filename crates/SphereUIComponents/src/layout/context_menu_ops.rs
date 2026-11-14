@@ -163,6 +163,10 @@ impl StudioLayout {
                 ContextTarget::Mixer(track_id) => state.find_track(track_id).is_some(),
                 ContextTarget::SendPicker { track_id } => state.find_track(track_id).is_some(),
                 ContextTarget::OutputPicker { track_id } => state.find_track(track_id).is_some(),
+                ContextTarget::SidechainPicker {
+                    track_id,
+                    insert_id,
+                } => state.find_insert_slot(track_id, insert_id).is_some(),
                 // The pinned Master/Monitor strips always exist.
                 ContextTarget::MasterOutputPicker | ContextTarget::MonitorOutputPicker => true,
                 ContextTarget::AutomationTargetPicker { track_id } => {

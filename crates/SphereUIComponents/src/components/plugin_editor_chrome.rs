@@ -69,6 +69,12 @@ pub struct PluginEditorChrome {
     /// State copied from an insert of this same plug-in is waiting to be
     /// pasted. Paste is offered only then.
     pub can_paste: bool,
+    /// The insert's sidechain source as the header shows it, or `None` for a
+    /// plug-in with no sidechain input (the control is then left out).
+    pub sidechain_label: Option<String>,
+    /// The sidechain picker's rows — the mixer chip's menu — as
+    /// `(label, command, checked, enabled)`, and `None` for a header row.
+    pub sidechain_rows: Vec<(String, Option<String>, bool, bool)>,
 }
 
 impl PluginEditorChrome {
@@ -1060,6 +1066,8 @@ pub enum PluginEditorAction {
     /// back the last state captured from it; `reset: true` starts it from its
     /// defaults, for a state that is itself what makes it crash.
     ReloadPlugin { reset: bool },
+    /// Run one row of the sidechain picker (its command).
+    Sidechain(String),
 }
 
 /// Small square/pill button used across the chrome.
@@ -1204,6 +1212,7 @@ pub fn render_chrome_tools(
     let emit_menu = emit.clone();
     let emit_save = emit.clone();
     let emit_copy = emit.clone();
+    let emit_sidechain = emit.clone();
     let emit_paste = emit;
 
     // The trigger's rest / hover / pressed fills, resolved before the element
@@ -1345,6 +1354,10 @@ pub fn render_chrome_tools(
                     move |_window, cx| emit_paste(PluginEditorAction::PasteState, cx),
                 )),
         )
+        // Sidechain: where the plug-in's sidechain input listens. The OS
+        // menu, because the plug-in's own window covers everything below
+        // this row.
+        .children(sidechain_trigger(chrome, emit_sidechain))
         // Readouts sit at the far end: they are watched, not operated, so they
         // stay clear of the controls the pointer goes for.
         .child(div().flex_1())
@@ -1354,6 +1367,91 @@ pub fn render_chrome_tools(
             chrome.latency_label(),
         ))
         .into_any_element()
+}
+
+/// The Sidechain trigger: the source the insert's sidechain input listens
+/// to, opening the picker as the platform's popup menu. Nothing where the
+/// plug-in has no sidechain input, or where the platform has no popup menu
+/// to show above the plug-in's window (the mixer chip's menu still works).
+fn sidechain_trigger(
+    chrome: &PluginEditorChrome,
+    emit: impl Fn(PluginEditorAction, &mut App) + Clone + 'static,
+) -> Option<gpui::AnyElement> {
+    use crate::native_popup_menu::{self, PopupItem};
+    let label = chrome.sidechain_label.clone()?;
+    if !native_popup_menu::available() {
+        return None;
+    }
+    let rows = chrome.sidechain_rows.clone();
+    Some(
+        div()
+            .id("plugin-editor-sidechain")
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(theme::space::SNUG))
+            .h(px(CHROME_CONTROL_H))
+            .px(px(theme::space::BASE))
+            .max_w(px(220.0))
+            .rounded(px(theme::radius::CONTROL_SM))
+            .bg(Colors::surface_base())
+            .text_size(px(theme::typography::UI_XS))
+            .font(theme::ui_font())
+            .text_color(Colors::text_secondary())
+            .cursor(gpui::CursorStyle::PointingHand)
+            .occlude()
+            .hover(|style| style.bg(Colors::surface_control_hover()))
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(Colors::text_faint())
+                    .child("Sidechain"),
+            )
+            .child(div().min_w(px(0.0)).truncate().child(label))
+            .child(
+                svg()
+                    .path(assets::ICON_CHEVRON_DOWN_PATH)
+                    .w(px(theme::menu::CHEVRON_SIZE))
+                    .h(px(theme::menu::CHEVRON_SIZE))
+                    .flex_shrink_0()
+                    .text_color(Colors::text_faint()),
+            )
+            .on_click(move |event, window, cx| {
+                let items = rows
+                    .iter()
+                    .map(|(label, command, checked, enabled)| match command {
+                        Some(command) => PopupItem::Command {
+                            label: label.clone(),
+                            command: command.clone(),
+                            shortcut: None,
+                            checked: *checked,
+                            enabled: *enabled,
+                        },
+                        None => PopupItem::Command {
+                            label: label.clone(),
+                            command: String::new(),
+                            shortcut: None,
+                            checked: false,
+                            enabled: false,
+                        },
+                    })
+                    .collect();
+                let emit = emit.clone();
+                native_popup_menu::show(
+                    window,
+                    cx,
+                    event.position(),
+                    None,
+                    items,
+                    Box::new(move |chosen, _window, cx| {
+                        if let Some(command) = chosen.filter(|command| !command.is_empty()) {
+                            emit(PluginEditorAction::Sidechain(command), cx);
+                        }
+                    }),
+                );
+            })
+            .into_any_element(),
+    )
 }
 
 /// The chrome row of a built-in plug-in's editor window: the same row as an

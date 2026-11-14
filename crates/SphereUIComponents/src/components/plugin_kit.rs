@@ -672,6 +672,11 @@ pub struct KitWindow<M: KitModel> {
     meter: ShellMeter,
     /// The `.pst` preset menu in the identity strip.
     presets: Entity<BuiltinPresetMenu>,
+    /// What the identity strip's Sidechain chip reads, refreshed on the
+    /// telemetry tick; `None` hides it (the plug-in has no sidechain input).
+    sidechain_label: Option<String>,
+    /// Where the open sidechain picker sits, window space.
+    sidechain_menu: Option<(f32, f32, Vec<ContextMenuEntry>)>,
     /// Cleared when the window closes, ending the telemetry timer.
     alive: Rc<Cell<bool>>,
 }
@@ -698,6 +703,8 @@ impl<M: KitModel> KitWindow<M> {
             editor,
             meter: ShellMeter::default(),
             presets,
+            sidechain_label: None,
+            sidechain_menu: None,
             alive: Rc::new(Cell::new(true)),
         };
         window.start_telemetry(cx);
@@ -743,6 +750,17 @@ impl<M: KitModel> KitWindow<M> {
             .meter
             .poll(self.host_ops.meter_source.as_ref(), &self.key);
         moved |= self.live.borrow_mut().poll();
+        // The header's sidechain source follows the project (the mixer can
+        // change it while this window is open).
+        let sidechain = self
+            .host_ops
+            .insert_sidechain
+            .as_ref()
+            .and_then(|op| (op.label)(&self.key, cx));
+        if sidechain != self.sidechain_label {
+            self.sidechain_label = sidechain;
+            moved = true;
+        }
         // A filter curve follows the host's rate; a change re-renders the
         // panel, which is rare.
         if let Some(rate) = self.live.borrow().sample_rate() {
@@ -800,6 +818,9 @@ impl<M: KitModel> NativeBuiltinEditor for KitWindow<M> {
             editor.rebind(key.clone(), host_ops.clone(), cx)
         });
         *self.live.borrow_mut() = Live::new(key, &host_ops);
+        // Re-read on the next tick for the insert now shown.
+        self.sidechain_label = None;
+        self.sidechain_menu = None;
         cx.notify();
     }
 }
@@ -853,6 +874,38 @@ impl<M: KitModel> Render for KitWindow<M> {
             )
         });
 
+        let sidechain_menu = self.sidechain_menu.as_ref().map(|(x, y, entries)| {
+            let viewport = window.viewport_size();
+            let run_target = cx.entity().clone();
+            let close_target = cx.entity().clone();
+            context_menu_overlay(
+                entries.clone(),
+                *x,
+                *y,
+                viewport.width.into(),
+                viewport.height.into(),
+                Arc::new(move |command: &String, _window, cx| {
+                    let command = command.clone();
+                    let _ =
+                        run_target.update(cx, |this, cx| this.run_sidechain_command(command, cx));
+                }),
+                Arc::new(move |_: &(), _window, cx| {
+                    let _ = close_target.update(cx, |this, cx| {
+                        this.sidechain_menu = None;
+                        cx.notify();
+                    });
+                }),
+            )
+        });
+        let header_extra = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(crate::theme::space::TIGHT))
+            .children(self.sidechain_chip(cx))
+            .child(self.presets.clone())
+            .into_any_element();
+
         let on_close = self.on_close.clone();
         let editor = self.editor.clone();
         let alive = self.alive.clone();
@@ -897,11 +950,81 @@ impl<M: KitModel> Render for KitWindow<M> {
                     on_close(window, cx);
                     window.remove_window();
                 },
-                Some(self.presets.clone().into_any_element()),
+                Some(header_extra),
                 content,
             ))
             .child(overlay)
             .children(menu)
+            .children(sidechain_menu)
+    }
+}
+
+impl<M: KitModel> KitWindow<M> {
+    /// The identity strip's Sidechain chip: the source the insert listens
+    /// to, opening the same picker as the mixer chip's right-click. Nothing
+    /// for a plug-in with no sidechain input.
+    fn sidechain_chip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use gpui::prelude::FluentBuilder as _;
+        let label = self.sidechain_label.clone()?;
+        let open = self.sidechain_menu.is_some();
+        let rest = Colors::surface_titlebar();
+        let hover = Colors::composite(rest, Colors::state_hover());
+        let selected = Colors::composite(rest, Colors::state_selected());
+        Some(
+            div()
+                .id("kit-sidechain-trigger")
+                .flex()
+                .flex_row()
+                .flex_shrink_0()
+                .items_center()
+                .gap(px(crate::theme::space::TIGHT))
+                .h(px(crate::theme::size::DENSE))
+                .px(px(crate::theme::space::SNUG))
+                .rounded(px(crate::theme::radius::CONTROL_SM))
+                .when(open, |trigger| trigger.bg(selected))
+                .text_size(px(crate::theme::typography::UI_XS))
+                .text_color(Colors::text_secondary())
+                .cursor(gpui::CursorStyle::PointingHand)
+                .hover(move |style| style.bg(hover).text_color(Colors::text_primary()))
+                .child(div().text_color(Colors::text_muted()).child("Sidechain"))
+                .child(div().max_w(px(160.0)).truncate().child(label))
+                .child(
+                    gpui::svg()
+                        .path(crate::assets::ICON_CHEVRON_DOWN_PATH)
+                        .w(px(crate::theme::menu::ICON_SIZE))
+                        .h(px(crate::theme::menu::ICON_SIZE))
+                        .text_color(Colors::text_muted()),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                        cx.stop_propagation();
+                        if this.sidechain_menu.take().is_some() {
+                            cx.notify();
+                            return;
+                        }
+                        let Some(op) = this.host_ops.insert_sidechain.clone() else {
+                            return;
+                        };
+                        let entries = (op.entries)(&this.key, cx);
+                        this.sidechain_menu = Some((
+                            f32::from(event.position.x),
+                            f32::from(event.position.y),
+                            entries,
+                        ));
+                        cx.notify();
+                    }),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn run_sidechain_command(&mut self, command: String, cx: &mut Context<Self>) {
+        self.sidechain_menu = None;
+        if let Some(op) = self.host_ops.insert_sidechain.clone() {
+            (op.run)(&self.key, command, cx);
+        }
+        cx.notify();
     }
 }
 

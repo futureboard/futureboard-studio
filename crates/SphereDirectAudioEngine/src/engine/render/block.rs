@@ -285,6 +285,10 @@ pub(super) fn render_project_block_interleaved_core(
         }
     }
 
+    // Sidechain keys: every keyed insert takes what its source published last
+    // callback, then the taps start this block silent (`crate::runtime::sidechain`).
+    runtime.take_sidechain_keys(frames);
+
     // Track loopback input: another track's post-fader output, as this track's
     // input. What lands here is the block the source rendered in the *previous*
     // callback — see `crate::loopback` for why that is the design and not a

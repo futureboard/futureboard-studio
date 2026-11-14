@@ -75,6 +75,15 @@ pub(super) fn routing_output_silenced(
 /// channel is silent; a channel with nothing to delay can stay skipped.
 #[inline]
 pub(super) fn compensation_delay_running(runtime: &RuntimeProject, track_index: usize) -> bool {
+    // A track another insert keys from keeps rendering while silent too, so a
+    // muted pre-fader key still reaches its insert.
+    if runtime
+        .tracks
+        .get(track_index)
+        .is_some_and(|track| track.sidechain_tap.flags & crate::runtime::SIDECHAIN_TAP_PRE != 0)
+    {
+        return true;
+    }
     if runtime
         .latency_graph
         .track_pdc_delay
@@ -479,6 +488,18 @@ pub(super) fn finish_track_block(
     if emit {
         capture_monitor_taps(runtime, track_index, frames, TapStage::PreFader);
     }
+    // A pre-fader sidechain key is published even while the channel is muted:
+    // a silent track keying another is a deliberate setup. Post-fader keys
+    // follow the fader, mute included.
+    {
+        let track = &mut runtime.tracks[track_index];
+        track.sidechain_tap.capture(
+            crate::runtime::SIDECHAIN_TAP_PRE,
+            &track.block_l,
+            &track.block_r,
+            frames,
+        );
+    }
     let smooth = runtime.fader_smoothing;
     apply_fader(
         &mut runtime.tracks[track_index],
@@ -486,6 +507,15 @@ pub(super) fn finish_track_block(
         if smooth { fader_target_beat } else { beat },
         smooth,
     );
+    if emit {
+        let track = &mut runtime.tracks[track_index];
+        track.sidechain_tap.capture(
+            crate::runtime::SIDECHAIN_TAP_POST,
+            &track.block_l,
+            &track.block_r,
+            frames,
+        );
+    }
     if emit {
         accumulate_block_meter(&mut runtime.tracks[track_index], frames);
         // AFL, a TrackAfterFader source, and a Bus source tap after the fader and

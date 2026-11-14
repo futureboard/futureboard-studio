@@ -6,8 +6,9 @@
 //! Everything moving is real: the history is the host's meter frames (the
 //! detector rides slot 0's input peak), the playhead, the trigger light and
 //! the tempo come from `duckstep::telemetry`, and the curve is
-//! `duckstep::shaper_gain`, the function the DSP runs. What the host cannot
-//! do yet — a sidechain key, MIDI into an effect insert — is shown disabled
+//! `duckstep::shaper_gain`, the function the DSP runs. The External key is
+//! the insert's sidechain input, whose source the window header picks. What
+//! the host cannot do yet — MIDI into an effect insert — is shown disabled
 //! with the reason.
 
 use std::cell::RefCell;
@@ -565,6 +566,7 @@ fn status_text(p: &Params, pads: Option<&[f32; telemetry::SLOTS]>) -> Option<Str
         "No tempo yet".into()
     };
     Some(match p.mode {
+        Mode::Sidechain if p.source == Source::External => format!("External key \u{00B7} {tempo}"),
         Mode::Sidechain => format!("Self-detect \u{00B7} {tempo}"),
         Mode::Shaper => {
             let trigger = match p.trigger {
@@ -1814,7 +1816,9 @@ fn detector_section(e: &KitEditor<DuckstepPlate>, cx: &mut Cx<DuckstepPlate>, s:
         .child("Listen")
         .on_click(e.click_cb(cx, |this, cx| this.toggle("listen", cx)))
         .into_any_element();
-    // Studio has no sidechain bus: the detector always hears the track.
+    // External listens to the insert's sidechain input, chosen in the
+    // header's Sidechain menu (or the mixer chip's); with none routed the
+    // detector hears the track.
     let sources = choices(
         e,
         cx,
@@ -1822,7 +1826,7 @@ fn detector_section(e: &KitEditor<DuckstepPlate>, cx: &mut Cx<DuckstepPlate>, s:
         "source",
         p.source,
         &[
-            (Source::External, "External key", false),
+            (Source::External, "External key", true),
             (Source::Internal, "Internal", true),
         ],
         Source::to_wire,
@@ -1835,8 +1839,10 @@ fn detector_section(e: &KitEditor<DuckstepPlate>, cx: &mut Cx<DuckstepPlate>, s:
             f_hz(p.sc_hpf_hz),
             f_hz(p.sc_lpf_hz)
         )
+    } else if p.source == Source::External {
+        "Sidechain input \u{00B7} pick its source in the header; none hears the track".to_string()
     } else {
-        "Own signal \u{00B7} no sidechain input in Studio yet".to_string()
+        "Own signal".to_string()
     };
     let knobs = vec![
         dial(cx, THRESHOLD, p.threshold_db, true, s),

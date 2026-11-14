@@ -1396,6 +1396,13 @@ impl AudioEngine {
         self.inner.insert_load(track_id, insert_id)
     }
 
+    /// Channels of one insert's sidechain input — see
+    /// [`crate::engine::EngineInner::insert_sidechain_channels`]. Control
+    /// thread only.
+    pub fn insert_sidechain_channels(&self, track_id: &str, insert_id: &str) -> Option<u32> {
+        self.inner.insert_sidechain_channels(track_id, insert_id)
+    }
+
     /// Instantiate a VST3 plug-in in this process for ARA hosting.
     ///
     /// See [`crate::engine::EngineInner::create_ara_processor`] — ARA is the one

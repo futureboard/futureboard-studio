@@ -114,6 +114,9 @@ fn slot_from_preset(slot: &PresetSlot) -> InsertSlotState {
         plugin_is_instrument: slot.is_instrument,
         multiout_collapsed: slot.multiout_collapsed,
         signal_bus: 0,
+        // Routing belongs to the project, not to a chain preset.
+        sidechain_source: String::new(),
+        sidechain_post_fader: false,
         plugin: Some(ProjectPluginInstance {
             instance_id: "preset".to_string(),
             format,

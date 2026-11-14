@@ -341,6 +341,9 @@ pub struct RuntimeTrack {
     /// routing indices ([`crate::latency_graph::resolve_latency_routing_indices`]),
     /// so the render pass and delay compensation read one answer.
     pub wdw_return_index: Option<usize>,
+    /// What this track publishes as a sidechain key for another track's
+    /// insert; empty unless one keys from it. See [`super::sidechain`].
+    pub sidechain_tap: RuntimeSidechainTap,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1016,7 +1016,32 @@ impl BuiltinHostProcessor {
         }
     }
 
+    /// Stereo sidechain inputs of the cores that take a key: Duckstep's
+    /// External source and EQ-Z8's per-band External detector. 0 for the rest.
+    fn sidechain_input_channels(&self) -> u32 {
+        // SAFETY: the dedicated producer thread is the sole DSP accessor.
+        match unsafe { &*self.dsp.get() } {
+            BuiltinDsp::Duckstep(_) | BuiltinDsp::Equz8(_) => 2,
+            _ => 0,
+        }
+    }
+
+    #[cfg(test)]
     fn process_block(&self, in_l: &[f32], in_r: &[f32], interleaved: &mut [f32], frames: usize) {
+        self.process_block_keyed(in_l, in_r, None, interleaved, frames);
+    }
+
+    /// One block, with the insert's sidechain key (`None`: no key this
+    /// block). Cores without a sidechain input ignore the key.
+    fn process_block_keyed(
+        &self,
+        in_l: &[f32],
+        in_r: &[f32],
+        key: Option<(&[f32], &[f32])>,
+        interleaved: &mut [f32],
+        frames: usize,
+    ) {
+        let key = key.filter(|(l, r)| l.len() >= frames && r.len() >= frames);
         // SAFETY: the dedicated producer thread is the sole DSP accessor.
         match unsafe { &mut *self.dsp.get() } {
             BuiltinDsp::Rodhareist(dsp) => {
@@ -1031,7 +1056,8 @@ impl BuiltinHostProcessor {
             }
             BuiltinDsp::Equz8(dsp) => {
                 for i in 0..frames {
-                    let (l, r) = dsp.process_stereo(in_l[i], in_r[i]);
+                    let key = key.map(|(kl, kr)| (kl[i], kr[i]));
+                    let (l, r) = dsp.process_stereo_keyed(in_l[i], in_r[i], key);
                     interleaved[i * 2] = l;
                     interleaved[i * 2 + 1] = r;
                 }
@@ -1152,7 +1178,8 @@ impl BuiltinHostProcessor {
             }
             BuiltinDsp::Duckstep(dsp) => {
                 for i in 0..frames {
-                    let (l, r) = dsp.process_stereo(in_l[i], in_r[i]);
+                    let key = key.map(|(kl, kr)| (kl[i], kr[i]));
+                    let (l, r) = dsp.process_stereo_keyed(in_l[i], in_r[i], key);
                     interleaved[i * 2] = l;
                     interleaved[i * 2 + 1] = r;
                 }
@@ -3470,6 +3497,22 @@ fn service_audio_bridge(
             .audio_in
             .read_deinterleaved(&mut in_l[..frames], &mut in_r[..frames], frames);
     }
+    // The insert's sidechain key, when the engine wrote one with this block's
+    // request: same ownership as `audio_in` above.
+    let mut sc_l = [0.0f32; MAX_BLOCK_FRAMES];
+    let mut sc_r = [0.0f32; MAX_BLOCK_FRAMES];
+    let sidechain_frames = bridge.sidechain_frames.load(Ordering::Relaxed) as usize;
+    let sidechain = if frames > 0 && sidechain_frames >= frames {
+        // SAFETY: the engine owns `audio_in` until it bumps `request_seq`.
+        unsafe {
+            bridge
+                .audio_in
+                .read_sidechain(&mut sc_l[..frames], &mut sc_r[..frames], frames);
+        }
+        Some((&sc_l[..frames], &sc_r[..frames]))
+    } else {
+        None
+    };
     // Analyser capture, before the DSP touches anything: the editor's spectrum
     // overlay shows the signal arriving at the insert. The transport tempo the
     // engine published for this block goes in at the same point, so a built-in
@@ -3492,13 +3535,24 @@ fn service_audio_bridge(
         BlockRuntime::Au(au) => au.output_channels().max(1).min(MAX_CHANNELS as u32) as usize,
     };
     bridge.set_plugin_output_channels(output_channels as u32);
+    // Whether the loaded plug-in takes a sidechain key, for the Studio's
+    // picker. One relaxed store per block; the value only changes on load.
+    let sidechain_channels = match runtime {
+        BlockRuntime::Builtin(builtin) => builtin.sidechain_input_channels(),
+        BlockRuntime::Vst3(Some(voice)) => voice.sidechain_input_channels(),
+        BlockRuntime::Vst3(None) | BlockRuntime::Au(_) => 0,
+    };
+    bridge
+        .sidechain_input_channels
+        .store(sidechain_channels, Ordering::Relaxed);
     let mut interleaved = [0.0f32; AUDIO_BUF_LEN];
     let len = (frames * output_channels).min(AUDIO_BUF_LEN);
     let produced_channels = match runtime {
         BlockRuntime::Builtin(builtin) => {
-            builtin.process_block(
+            builtin.process_block_keyed(
                 &in_l[..frames],
                 &in_r[..frames],
+                sidechain,
                 &mut interleaved[..len],
                 frames,
             );
@@ -3526,6 +3580,7 @@ fn service_audio_bridge(
                     frames,
                     &in_l[..frames],
                     &in_r[..frames],
+                    sidechain,
                     &mut interleaved[..len],
                     output_channels,
                     transport,

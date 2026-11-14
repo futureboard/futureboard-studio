@@ -451,6 +451,34 @@ impl EngineInner {
         Some((share, latency))
     }
 
+    /// Channels of an insert's sidechain input: what the plug-in host reports
+    /// for a bridged insert, or the in-process VST3's aux bus. `None` when the
+    /// insert is not in the graph (or has not loaded) — the UI then cannot
+    /// say yet. Control thread only — it takes the runtime lock.
+    pub fn insert_sidechain_channels(&self, track_id: &str, insert_id: &str) -> Option<u32> {
+        let runtime = self.runtime.lock();
+        let insert = runtime
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)?
+            .inserts
+            .iter()
+            .find(|insert| insert.id == insert_id)?;
+        match insert.kind_tag {
+            crate::runtime::RuntimeInsertKind::ExternalBridge => insert
+                .bridge_sink
+                .as_ref()
+                .filter(|sink| sink.dsp_ready())
+                .map(|sink| sink.sidechain_input_channels()),
+            crate::runtime::RuntimeInsertKind::NativePlugin => insert
+                .vst3
+                .as_ref()
+                .filter(|vst3| vst3.is_ready())
+                .map(|vst3| vst3.sidechain_channel_count()),
+            crate::runtime::RuntimeInsertKind::BuiltIn => Some(0),
+        }
+    }
+
     pub fn focus_insert_editor(
         &self,
         track_id: &str,

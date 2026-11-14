@@ -186,6 +186,12 @@ impl PluginBridgeSink for OfflineBridgeSink {
     fn write_input(&self, l: &[f32], r: &[f32], frames: usize) {
         self.live.write_input(l, r, frames);
     }
+    fn write_sidechain(&self, key: Option<(&[f32], &[f32])>, frames: usize) {
+        self.live.write_sidechain(key, frames);
+    }
+    fn sidechain_input_channels(&self) -> u32 {
+        self.live.sidechain_input_channels()
+    }
     fn request_block(&self, frames: u32) {
         self.live.request_block(frames);
     }
@@ -520,7 +526,14 @@ fn render_offline_impl(
     // we refresh once up front so the warmup below reflects the real latency.
     // Every export block is `block` frames, so that is the bridge period.
     runtime.bridge_period_frames = block as u32;
-    runtime.refresh_runtime_latency_graph(runtime.bridge_period_frames);
+    // Until it settles: a sidechain's alignment is planned from the latencies
+    // around it, and its main-input delay is latency the next pass plans with.
+    // Bounded, because the graph refuses sidechain loops it would never leave.
+    for _ in 0..16 {
+        if !runtime.refresh_runtime_latency_graph(runtime.bridge_period_frames) {
+            break;
+        }
+    }
 
     // Pre-roll / warmup: when Global Latency Sync (PDC) is on, the realtime graph
     // delays every path to the master bus by `max_path_latency` (+ master insert

@@ -806,27 +806,32 @@ fn dynamic_card(e: &KitEditor<Equz8Plate>, cx: &mut Cx<Equz8Plate>, s: f32) -> g
     };
     let above = mode("Above", DynMode::Above, cx);
     let below = mode("Below", DynMode::Below, cx);
-    // The host gives a built-in no sidechain input: the band listens to
-    // itself.
+    // Internal: the band hears the insert's own input. External: the
+    // insert's sidechain input, whose source the window header picks (with
+    // none routed it falls back to the input).
     let internal = pill(
         "equz8-sc-internal",
         "Internal",
-        true,
+        !band.sc_external,
         accent(),
         PillLook::words(26.0, 10.0, 12.0),
         active,
         s,
-        |_, _, _| {},
+        e.click_cb(cx, move |this, cx| {
+            edit_band(this, slot, cx, |b| b.sc_external = false)
+        }),
     );
     let external = pill(
         "equz8-sc-external",
         "External",
-        false,
+        band.sc_external,
         accent(),
         PillLook::words(26.0, 10.0, 12.0),
-        false,
+        active,
         s,
-        |_, _, _| {},
+        e.click_cb(cx, move |this, cx| {
+            edit_band(this, slot, cx, |b| b.sc_external = true)
+        }),
     );
 
     let legacy = band.ratio < 0.5;

@@ -656,6 +656,263 @@ impl StudioLayout {
         cx.notify();
     }
 
+    /// Route `sidechain` into an insert's sidechain input, or clear it. One
+    /// undo step; the engine picks the route up with the project resync.
+    pub(super) fn set_insert_sidechain(
+        &mut self,
+        track_id: &str,
+        insert_id: &str,
+        sidechain: Option<crate::components::timeline::timeline_state::InsertSidechain>,
+        cx: &mut Context<Self>,
+    ) {
+        let edit = self.begin_track_edit(
+            crate::components::timeline::timeline_state::TrackEditScope::channel(track_id),
+            cx,
+        );
+        let changed = self.timeline.update(cx, |timeline, _| {
+            timeline
+                .state
+                .set_insert_sidechain(track_id, insert_id, sidechain)
+        });
+        if !changed {
+            return;
+        }
+        self.commit_track_edit("Sidechain", edit, cx);
+        self.mark_dirty();
+        self.schedule_audio_project_sync(cx, false, "insert_sidechain");
+        self.push_mixer_snapshot_to_window(cx);
+        cx.notify();
+    }
+
+    /// Whether an insert takes a sidechain key: a built-in with a key input,
+    /// or a plug-in whose loaded instance reports one. `None` while a plug-in
+    /// has not reported yet (not loaded, or the engine has not built it).
+    pub(crate) fn insert_has_sidechain_input(
+        &self,
+        track_id: &str,
+        insert_id: &str,
+        cx: &gpui::App,
+    ) -> Option<bool> {
+        let timeline = self.timeline.read(cx);
+        let slot = timeline.state.find_insert_slot(track_id, insert_id)?;
+        let plugin_id = slot.plugin_id.as_deref()?;
+        if let Some(stem) = SpherePluginHost::resolve_builtin_stem(plugin_id) {
+            return Some(builtin_has_sidechain_input(stem));
+        }
+        // A bridged plug-in's host says so in its shared region; the engine's
+        // control-side graph does not see that region (see
+        // `plugin_editor_chrome_for`). An in-process one asks the engine.
+        if let Some(channels) = self
+            .plugin_editors
+            .bridge_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.lock().ok()?.instance_sidechain_channels(insert_id))
+        {
+            return Some(channels > 0);
+        }
+        self.audio_bridge
+            .engine
+            .as_ref()?
+            .insert_sidechain_channels(track_id, insert_id)
+            .map(|channels| channels > 0)
+    }
+}
+
+/// Built-ins whose DSP listens to a sidechain key (the host's
+/// `BuiltinHostProcessor::sidechain_input_channels` agrees).
+pub(crate) fn builtin_has_sidechain_input(stem: &str) -> bool {
+    matches!(stem, "duckstep" | "equz8")
+}
+
+/// The editor-side handle on an insert's sidechain picker (see
+/// [`crate::components::builtin_plugin_editor_window::BuiltinInsertSidechain`]).
+pub(crate) fn sidechain_host_op(
+    owner: gpui::Entity<StudioLayout>,
+) -> crate::components::builtin_plugin_editor_window::BuiltinInsertSidechain {
+    use crate::components::builtin_plugin_editor_window::{
+        BuiltinInsertSidechain, PluginInstanceKey,
+    };
+    let label_owner = owner.clone();
+    let entries_owner = owner.clone();
+    BuiltinInsertSidechain {
+        label: std::sync::Arc::new(move |key: &PluginInstanceKey, cx: &gpui::App| {
+            label_owner
+                .read(cx)
+                .insert_sidechain_label(&key.track_id, &key.insert_id, cx)
+        }),
+        entries: std::sync::Arc::new(move |key: &PluginInstanceKey, cx: &gpui::App| {
+            entries_owner
+                .read(cx)
+                .sidechain_picker_entries(&key.track_id, &key.insert_id, cx)
+        }),
+        run: std::sync::Arc::new(
+            move |_key: &PluginInstanceKey, command: String, cx: &mut gpui::App| {
+                StudioLayout::defer_update(&owner, cx, move |layout, cx| {
+                    layout.dispatch_sidechain_command(&command, cx);
+                });
+            },
+        ),
+    }
+}
+
+/// Command prefix of the sidechain picker's rows:
+/// `{prefix}{track}|{insert}|none`, `…|src|{source}`, `…|tap|pre` / `…|tap|post`.
+pub(crate) const SIDECHAIN_COMMAND_PREFIX: &str = "mixer:sidechain|";
+
+impl StudioLayout {
+    /// What an editor header's Sidechain control reads: `None` (no control)
+    /// for a plug-in without a sidechain input, else the source and its tap,
+    /// or "None". A plug-in that has not reported yet still shows a stored
+    /// route, so it is never hidden from the editor.
+    pub(crate) fn insert_sidechain_label(
+        &self,
+        track_id: &str,
+        insert_id: &str,
+        cx: &gpui::App,
+    ) -> Option<String> {
+        let has_input = self.insert_has_sidechain_input(track_id, insert_id, cx);
+        let state = &self.timeline.read(cx).state;
+        let slot = state.find_insert_slot(track_id, insert_id)?;
+        match (&slot.sidechain, has_input) {
+            (None, Some(true)) => Some("None".to_string()),
+            (None, _) => None,
+            (Some(route), _) => {
+                let name = state
+                    .find_track(&route.source_track_id)
+                    .map(|track| track.name.clone())
+                    .unwrap_or_else(|| "Missing track".to_string());
+                let tap = if route.post_fader { "Post" } else { "Pre" };
+                Some(format!("{name} · {tap}"))
+            }
+        }
+    }
+
+    /// The sidechain picker for one insert: None, every track that can key
+    /// it, and the tap. A plug-in without a sidechain input says so instead
+    /// of offering routes it would ignore.
+    pub(crate) fn sidechain_picker_entries(
+        &self,
+        track_id: &str,
+        insert_id: &str,
+        cx: &gpui::App,
+    ) -> Vec<crate::components::context_menu::ContextMenuEntry> {
+        use crate::components::context_menu::ContextMenuEntry;
+        let state = &self.timeline.read(cx).state;
+        let Some(slot) = state.find_insert_slot(track_id, insert_id) else {
+            return vec![ContextMenuEntry::disabled_item(
+                "Insert unavailable",
+                "noop",
+            )];
+        };
+        let name = slot.display_name.clone();
+        let current = slot.sidechain.clone();
+        let mut entries = vec![ContextMenuEntry::Header(format!("Sidechain · {name}"))];
+        match self.insert_has_sidechain_input(track_id, insert_id, cx) {
+            Some(true) => {}
+            has => {
+                // Keep a stored route visible and clearable even when the
+                // plug-in cannot use it (it was swapped, or has not loaded).
+                entries.push(ContextMenuEntry::disabled_item(
+                    if has.is_none() {
+                        "Waiting for the plug-in to load"
+                    } else {
+                        "This plug-in has no sidechain input"
+                    },
+                    "noop",
+                ));
+                if current.is_some() {
+                    entries.push(ContextMenuEntry::item(
+                        "Clear Sidechain",
+                        format!("{SIDECHAIN_COMMAND_PREFIX}{track_id}|{insert_id}|none"),
+                    ));
+                }
+                return entries;
+            }
+        }
+        entries.push(ContextMenuEntry::checked_item(
+            "None".to_string(),
+            format!("{SIDECHAIN_COMMAND_PREFIX}{track_id}|{insert_id}|none"),
+            current.is_none(),
+        ));
+        let candidates = state.sidechain_source_candidates(track_id);
+        if candidates.is_empty() {
+            entries.push(ContextMenuEntry::disabled_item(
+                "No other track to listen to",
+                "noop",
+            ));
+        }
+        for (source_id, label) in candidates {
+            let checked = current
+                .as_ref()
+                .is_some_and(|route| route.source_track_id == source_id);
+            entries.push(ContextMenuEntry::checked_item(
+                label,
+                format!("{SIDECHAIN_COMMAND_PREFIX}{track_id}|{insert_id}|src|{source_id}"),
+                checked,
+            ));
+        }
+        if let Some(route) = &current {
+            entries.push(ContextMenuEntry::Header("Tap".to_string()));
+            entries.push(ContextMenuEntry::checked_item(
+                "Pre-fader".to_string(),
+                format!("{SIDECHAIN_COMMAND_PREFIX}{track_id}|{insert_id}|tap|pre"),
+                !route.post_fader,
+            ));
+            entries.push(ContextMenuEntry::checked_item(
+                "Post-fader".to_string(),
+                format!("{SIDECHAIN_COMMAND_PREFIX}{track_id}|{insert_id}|tap|post"),
+                route.post_fader,
+            ));
+        }
+        entries
+    }
+
+    /// Run one sidechain picker row. Returns `false` for a command that is
+    /// not one.
+    pub(crate) fn dispatch_sidechain_command(
+        &mut self,
+        command_id: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        use crate::components::timeline::timeline_state::InsertSidechain;
+        let Some(rest) = command_id.strip_prefix(SIDECHAIN_COMMAND_PREFIX) else {
+            return false;
+        };
+        let mut parts = rest.splitn(4, '|');
+        let (Some(track_id), Some(insert_id), Some(verb)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            return true;
+        };
+        let arg = parts.next().unwrap_or_default();
+        let current = self
+            .timeline
+            .read(cx)
+            .state
+            .find_insert_slot(track_id, insert_id)
+            .and_then(|slot| slot.sidechain.clone());
+        let next = match verb {
+            "none" => None,
+            "src" if !arg.is_empty() => Some(InsertSidechain {
+                source_track_id: arg.to_string(),
+                post_fader: current.as_ref().is_some_and(|route| route.post_fader),
+            }),
+            "tap" => match current {
+                Some(route) => Some(InsertSidechain {
+                    post_fader: arg == "post",
+                    ..route
+                }),
+                None => return true,
+            },
+            _ => return true,
+        };
+        let (track_id, insert_id) = (track_id.to_string(), insert_id.to_string());
+        self.set_insert_sidechain(&track_id, &insert_id, next, cx);
+        true
+    }
+}
+
+impl StudioLayout {
     pub(super) fn poll_plugin_bridge_runtime(&mut self, cx: &mut Context<Self>) {
         use crate::components::timeline::timeline_state::{
             PluginRuntimeBackend, PluginRuntimeState,
@@ -3235,7 +3492,37 @@ impl StudioLayout {
                 },
             ) as crate::components::builtin_plugin_editor_window::BuiltinPreviewNote
         });
+        // The editor's Bypass: the project's insert bypass, as the mixer
+        // button flips it.
+        let bypass_owner = cx.entity().clone();
+        let insert_bypass = Some(
+            crate::components::builtin_plugin_editor_window::BuiltinInsertBypass {
+                is_bypassed: std::sync::Arc::new({
+                    let owner = bypass_owner.clone();
+                    move |key: &PluginInstanceKey, cx: &App| {
+                        owner
+                            .read(cx)
+                            .timeline
+                            .read(cx)
+                            .state
+                            .find_insert_slot(&key.track_id, &key.insert_id)
+                            .map(|slot| slot.bypassed || !slot.enabled)
+                    }
+                }),
+                toggle: std::sync::Arc::new(move |key: &PluginInstanceKey, cx: &mut App| {
+                    let (track, insert) = (key.track_id.clone(), key.insert_id.clone());
+                    StudioLayout::defer_update(&bypass_owner, cx, move |layout, cx| {
+                        layout.toggle_insert_bypass_now(&track, &insert, cx);
+                    });
+                }),
+            },
+        );
+        // The editor header's Sidechain picker: the same menu as the mixer
+        // chip's right-click, run through the same layout op.
+        let insert_sidechain = Some(sidechain_host_op(cx.entity().clone()));
         let host_ops = BuiltinEditorHostOps {
+            insert_bypass,
+            insert_sidechain,
             forward_param,
             dispatch_global_command,
             load_nam_capture,

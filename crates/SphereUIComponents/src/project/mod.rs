@@ -364,6 +364,11 @@ pub struct ProjectInsert {
     /// v63: which mix bus this insert processes on. `0` is the track's main
     /// chain. `1` is the wet/dry/wet send/return. Older files load as main.
     pub signal_bus: u8,
+    /// v64: the track keying this insert's sidechain input, and whether it
+    /// taps that track after its fader. Empty: no sidechain. Older files load
+    /// without one.
+    pub sidechain_source: String,
+    pub sidechain_post_fader: bool,
     pub plugin: Option<ProjectPluginInstance>,
 }
 
@@ -378,6 +383,8 @@ impl Default for ProjectInsert {
             plugin_is_instrument: None,
             multiout_collapsed: false,
             signal_bus: 0,
+            sidechain_source: String::new(),
+            sidechain_post_fader: false,
             plugin: None,
         }
     }
@@ -1236,6 +1243,15 @@ fn timeline_insert_to_project(idx: usize, slot: &InsertSlotState) -> ProjectInse
         plugin_is_instrument: slot.plugin_is_instrument,
         multiout_collapsed: slot.multiout_collapsed,
         signal_bus: slot.signal_bus.tag(),
+        sidechain_source: slot
+            .sidechain
+            .as_ref()
+            .map(|route| route.source_track_id.clone())
+            .unwrap_or_default(),
+        sidechain_post_fader: slot
+            .sidechain
+            .as_ref()
+            .is_some_and(|route| route.post_fader),
         plugin,
     }
 }
@@ -1322,6 +1338,12 @@ pub(crate) fn project_insert_to_timeline(pi: &ProjectInsert) -> InsertSlotState 
                 signal_bus: crate::components::timeline::timeline_state::InsertSignalBus::from_tag(
                     pi.signal_bus,
                 ),
+                sidechain: (!pi.sidechain_source.is_empty()).then(|| {
+                    crate::components::timeline::timeline_state::InsertSidechain {
+                        source_track_id: pi.sidechain_source.clone(),
+                        post_fader: pi.sidechain_post_fader,
+                    }
+                }),
                 vst3_state: (!plugin.state.state_bytes.is_empty())
                     .then(|| std::sync::Arc::new(plugin.state.state_bytes.clone())),
             }

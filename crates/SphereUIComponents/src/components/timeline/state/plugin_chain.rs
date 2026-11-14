@@ -325,6 +325,24 @@ impl InsertSignalBus {
     }
 }
 
+/// Where an insert's sidechain input listens: another track's signal, tapped
+/// after that track's inserts (`post_fader == false`) or after its fader.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InsertSidechain {
+    pub source_track_id: String,
+    pub post_fader: bool,
+}
+
+impl InsertSidechain {
+    /// The engine snapshot's `params["sidechain"]`.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "sourceTrackId": self.source_track_id,
+            "tap": if self.post_fader { "post" } else { "pre" },
+        })
+    }
+}
+
 /// UI-side mirror of `project::ProjectInsert`. The runtime owns the
 /// actual plugin processor; this struct only stores descriptor +
 /// transient UI state (bypass, load status, last-seen parameters).
@@ -379,6 +397,9 @@ pub struct InsertSlotState {
     pub pending_open_editor: bool,
     /// Mix bus this insert processes on. Missing project data is [`InsertSignalBus::Main`].
     pub signal_bus: InsertSignalBus,
+    /// The track feeding this insert's sidechain input, or `None`. Saved with
+    /// the project; the engine refuses a source that would close a loop.
+    pub sidechain: Option<InsertSidechain>,
     /// Opaque per-plugin state bytes for project persistence. Despite the
     /// name, this is not VST3-specific: `timeline_insert_to_project` /
     /// `project_insert_to_timeline` round-trip it for *any* `plugin_id`,
@@ -429,6 +450,7 @@ impl InsertSlotState {
             multiout_collapsed: false,
             pending_open_editor: false,
             signal_bus: InsertSignalBus::Main,
+            sidechain: None,
             vst3_state: None,
         }
     }
@@ -703,6 +725,98 @@ impl TimelineState {
         }
         slot.signal_bus = bus;
         true
+    }
+
+    /// Route `source` into an insert's sidechain input, or clear it with
+    /// `None`. Refuses the insert's own track and a source the insert's track
+    /// already feeds — the same loops the engine would refuse — so the picker
+    /// never stores a route the graph will not run. Returns whether it changed.
+    pub fn set_insert_sidechain(
+        &mut self,
+        track_id: &str,
+        insert_id: &str,
+        sidechain: Option<InsertSidechain>,
+    ) -> bool {
+        if let Some(route) = &sidechain {
+            if !self
+                .sidechain_source_candidates(track_id)
+                .iter()
+                .any(|(id, _)| *id == route.source_track_id)
+            {
+                return false;
+            }
+        }
+        let Some(slot) = self
+            .insert_slots_mut(track_id)
+            .and_then(|slots| slots.iter_mut().find(|slot| slot.id == insert_id))
+        else {
+            return false;
+        };
+        if slot.is_empty() || slot.sidechain == sidechain {
+            return false;
+        }
+        slot.sidechain = sidechain;
+        true
+    }
+
+    /// Tracks that can key an insert on `track_id`, as `(id, label)` in
+    /// project order: every track but the master and `track_id` itself, less
+    /// those `track_id` already reaches through its output, a send or another
+    /// sidechain (a loop the engine refuses).
+    pub fn sidechain_source_candidates(&self, track_id: &str) -> Vec<(String, String)> {
+        self.tracks
+            .iter()
+            .filter(|track| {
+                track.id != track_id
+                    && !matches!(track.track_type, TrackType::Master | TrackType::Video)
+            })
+            .filter(|track| !self.track_audio_reaches(track_id, &track.id))
+            .map(|track| {
+                let kind = match track.track_type {
+                    TrackType::Bus => " (Bus)",
+                    TrackType::Return => " (Return)",
+                    TrackType::Group => " (Group)",
+                    _ => "",
+                };
+                (track.id.clone(), format!("{}{kind}", track.name))
+            })
+            .collect()
+    }
+
+    /// Whether audio leaving `from` arrives at `to`: through a main output to
+    /// a bus, a send, or as another insert's sidechain key.
+    fn track_audio_reaches(&self, from: &str, to: &str) -> bool {
+        let mut seen: Vec<&str> = Vec::new();
+        let mut stack = vec![from];
+        while let Some(at) = stack.pop() {
+            if at == to {
+                return true;
+            }
+            if seen.contains(&at) {
+                continue;
+            }
+            seen.push(at);
+            let Some(track) = self.tracks.iter().find(|track| track.id == at) else {
+                continue;
+            };
+            if let TrackOutputRouting::Bus { bus_id } = &track.routing.output {
+                stack.push(bus_id.as_str());
+            }
+            // Switched-off sends count too, as they do for the engine: turning
+            // one on must not close a loop.
+            stack.extend(track.sends.iter().map(|send| send.target_track_id.as_str()));
+            // `at` keys these tracks' inserts.
+            for keyed in &self.tracks {
+                if keyed.inserts.iter().any(|slot| {
+                    slot.sidechain
+                        .as_ref()
+                        .is_some_and(|route| route.source_track_id == at)
+                }) {
+                    stack.push(keyed.id.as_str());
+                }
+            }
+        }
+        false
     }
 
     pub fn track_has_live_wdw_return(&self, track_id: &str) -> bool {

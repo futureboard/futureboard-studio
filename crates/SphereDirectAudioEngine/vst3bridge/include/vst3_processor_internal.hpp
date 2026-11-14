@@ -411,6 +411,25 @@ struct SphereDauxVst3Processor {
   /// Silence for main-input channels past the host's stereo pair (surround,
   /// ambisonic). Re-zeroed per block in case a plug-in writes its inputs.
   std::array<float, kMaxProcessFrames> main_input_silence{};
+  // ── Sidechain (first aux input bus) ────────────────────────────────────────
+  /// Input bus index of the activated sidechain, or -1 when the plug-in has
+  /// none. Only bus 1 is taken: it is where every sidechain-capable plug-in
+  /// puts its key, and binding it needs no placeholder for buses in between.
+  int sidechain_bus_index{-1};
+  /// Channels of that bus as negotiated at setup.
+  int sidechain_channel_count{0};
+  /// The host's key for the next process call only (`set_sidechain_input`),
+  /// cleared after it. Null: the bus hears silence.
+  const float *sidechain_l{nullptr};
+  const float *sidechain_r{nullptr};
+  int sidechain_frames{0};
+  std::array<Steinberg::Vst::AudioBusBuffers, 2> process_input_buses{};
+  std::array<float *, kMaxInputBusChannels> sidechain_ptrs{};
+  std::array<float, kMaxProcessFrames> sidechain_downmix{};
+  std::array<float, kMaxProcessFrames> sidechain_silence{};
+  /// The main input copied onto the sidechain bus while no key is routed.
+  std::array<float, kMaxProcessFrames> sidechain_self_l{};
+  std::array<float, kMaxProcessFrames> sidechain_self_r{};
   Steinberg::Vst::ProcessContext process_context{};
   Steinberg::Vst::ProcessData process_data{};
   int audio_input_bus_count{0};
@@ -737,6 +756,75 @@ struct SphereDauxVst3Processor {
   /// `input_bus` never keeps pointers into a finished block's buffers.
   void bind_idle_main_input() { bind_main_input(&input_l, &input_r, 1); }
 
+  /// Point `process_data.inputs` at the main bus and, when the plug-in has an
+  /// active sidechain bus, at the host's key for this call (or silence),
+  /// shaped like `bind_main_input`. Consumes the key: the next call hears
+  /// silence unless the host binds another. Realtime-safe: preallocated
+  /// planes, at most one pass over `frames`.
+  void bind_process_inputs(int frames) {
+    if (audio_input_bus_count <= 0) {
+      process_data.numInputs = 0;
+      process_data.inputs = nullptr;
+      sidechain_l = sidechain_r = nullptr;
+      return;
+    }
+    if (sidechain_bus_index != 1) {
+      process_data.numInputs = 1;
+      process_data.inputs = &input_bus;
+      sidechain_l = sidechain_r = nullptr;
+      return;
+    }
+    const int n = std::max(0, std::min(frames, kMaxProcessFrames));
+    const int channels =
+        std::max(1, std::min(sidechain_channel_count, kMaxInputBusChannels));
+    const bool keyed = sidechain_l && sidechain_r && sidechain_frames >= n;
+    std::fill(sidechain_silence.begin(), sidechain_silence.begin() + n, 0.0f);
+    if (!keyed) {
+      // No key routed: the bus carries a copy of the main input. The bus is
+      // active on every plug-in that has one, and a plug-in that keys from
+      // its sidechain whenever that bus is active must then hear what it
+      // hears with the bus off — its own input — not silence. A copy, so a
+      // plug-in writing its inputs cannot reach the main bus through it.
+      const float *main_l =
+          input_bus.numChannels > 0 && input_bus.channelBuffers32
+              ? input_bus.channelBuffers32[0]
+              : nullptr;
+      const float *main_r =
+          input_bus.numChannels > 1 && input_bus.channelBuffers32
+              ? input_bus.channelBuffers32[1]
+              : main_l;
+      if (main_l && main_r) {
+        std::copy(main_l, main_l + n, sidechain_self_l.begin());
+        std::copy(main_r, main_r + n, sidechain_self_r.begin());
+        sidechain_l = sidechain_self_l.data();
+        sidechain_r = sidechain_self_r.data();
+      }
+    }
+    const bool fed = sidechain_l && sidechain_r;
+    if (!fed) {
+      for (int ch = 0; ch < channels; ++ch)
+        sidechain_ptrs[ch] = sidechain_silence.data();
+    } else if (channels == 1) {
+      for (int i = 0; i < n; ++i)
+        sidechain_downmix[i] = 0.5f * (sidechain_l[i] + sidechain_r[i]);
+      sidechain_ptrs[0] = sidechain_downmix.data();
+    } else {
+      sidechain_ptrs[0] = const_cast<float *>(sidechain_l);
+      sidechain_ptrs[1] = const_cast<float *>(sidechain_r);
+      for (int ch = 2; ch < channels; ++ch)
+        sidechain_ptrs[ch] = sidechain_silence.data();
+    }
+    process_input_buses[0] = input_bus;
+    process_input_buses[1].numChannels = channels;
+    process_input_buses[1].silenceFlags =
+        fed ? 0 : (channels >= 64 ? ~0ULL : ((1ULL << channels) - 1ULL));
+    process_input_buses[1].channelBuffers32 = sidechain_ptrs.data();
+    process_data.numInputs = 2;
+    process_data.inputs = process_input_buses.data();
+    sidechain_l = sidechain_r = nullptr;
+    sidechain_frames = 0;
+  }
+
   bool setup(double sample_rate) {
     const double sr = sample_rate > 0.0 ? sample_rate : 44100.0;
 
@@ -979,6 +1067,34 @@ struct SphereDauxVst3Processor {
           stderr,
           "[SphereVST3] activate input bus skipped reason=no_audio_inputs\n");
     }
+    // Sidechain: an aux input at bus 1 is activated here, before setActive,
+    // as VST3 requires; the host keys it per block or it hears silence.
+    sidechain_bus_index = -1;
+    sidechain_channel_count = 0;
+    if (audio_input_bus_count > 1) {
+      Steinberg::Vst::BusInfo sc_info{};
+      if (component->getBusInfo(Steinberg::Vst::kAudio, Steinberg::Vst::kInput,
+                                1, sc_info) == Steinberg::kResultOk &&
+          sc_info.busType == Steinberg::Vst::kAux && sc_info.channelCount > 0) {
+        int channels = static_cast<int>(sc_info.channelCount);
+        Steinberg::Vst::SpeakerArrangement sc_arr =
+            Steinberg::Vst::SpeakerArr::kEmpty;
+        if (processor->getBusArrangement(Steinberg::Vst::kInput, 1, sc_arr) ==
+                Steinberg::kResultOk &&
+            Steinberg::Vst::SpeakerArr::getChannelCount(sc_arr) > 0) {
+          channels = Steinberg::Vst::SpeakerArr::getChannelCount(sc_arr);
+        }
+        const auto sc_res = component->activateBus(
+            Steinberg::Vst::kAudio, Steinberg::Vst::kInput, 1, true);
+        if (sc_res == Steinberg::kResultOk) {
+          sidechain_bus_index = 1;
+          sidechain_channel_count = std::min(channels, kMaxInputBusChannels);
+        }
+        std::fprintf(stderr,
+                     "[SphereVST3] sidechain bus=1 channels=%d activate=%d\n",
+                     channels, (int)sc_res);
+      }
+    }
     Steinberg::tresult out_res = audio_output_bus_count > 0
                                      ? Steinberg::kResultOk
                                      : Steinberg::kResultFalse;
@@ -1038,8 +1154,7 @@ struct SphereDauxVst3Processor {
           audio_output_bus_active_after[bus] ? 1 : 0);
     }
 
-    process_data.numInputs = audio_input_bus_count > 0 ? 1 : 0;
-    process_data.inputs = audio_input_bus_count > 0 ? &input_bus : nullptr;
+    bind_process_inputs(1);
     process_data.numOutputs = active_audio_output_bus_count;
     process_data.outputs = nullptr;
 

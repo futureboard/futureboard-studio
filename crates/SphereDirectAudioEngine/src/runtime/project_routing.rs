@@ -261,6 +261,9 @@ impl RuntimeProject {
                 || !track.ara_renderers.is_empty();
         }
         self.audio_graph.active_source_mask = active_source_mask;
+        // After the output/send indices above: a sidechain that would close a
+        // loop through them is refused.
+        self.resolve_sidechains();
         self.resolve_bridge_sinks();
     }
 

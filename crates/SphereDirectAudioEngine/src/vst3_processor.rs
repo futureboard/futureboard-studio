@@ -246,6 +246,19 @@ pub(crate) mod ffi {
         pub(crate) fn sphere_daux_vst3_audio_input_bus_count(
             processor: *mut SphereDauxVst3Processor,
         ) -> i32;
+        /// Bind the plug-in's sidechain (first aux) input to `l`/`r` for the
+        /// next process call only; null pointers feed it silence. The buffers
+        /// must hold that call's frame count and outlive it.
+        pub(crate) fn sphere_daux_vst3_set_sidechain_input(
+            processor: *mut SphereDauxVst3Processor,
+            l: *const c_float,
+            r: *const c_float,
+            frames: i32,
+        );
+        /// Channels of the sidechain input activated at setup; 0 without one.
+        pub(crate) fn sphere_daux_vst3_sidechain_channel_count(
+            processor: *mut SphereDauxVst3Processor,
+        ) -> i32;
         pub(crate) fn sphere_daux_vst3_audio_output_bus_count(
             processor: *mut SphereDauxVst3Processor,
         ) -> i32;
@@ -1009,6 +1022,31 @@ impl Vst3RuntimeProcessor {
             .iter()
             .map(|&c| c.clamp(0, u8::MAX as i32) as u8)
             .collect()
+    }
+
+    /// Feed `key` to the plug-in's sidechain input on the next process call
+    /// (VST3 only: the other bridges have no aux input and ignore it). `None`
+    /// feeds silence. The slices must outlive that call — they are bound by
+    /// pointer, not copied. Realtime-safe: two pointer stores.
+    #[inline]
+    pub fn set_sidechain_input(&mut self, key: Option<(&[f32], &[f32])>) {
+        if self.inner.raw.is_null() || self.inner.format != PluginModuleFormat::Vst3 {
+            return;
+        }
+        let (l, r, frames) = match key {
+            Some((l, r)) => (l.as_ptr(), r.as_ptr(), l.len().min(r.len()) as i32),
+            None => (std::ptr::null(), std::ptr::null(), 0),
+        };
+        unsafe { ffi::sphere_daux_vst3_set_sidechain_input(self.inner.raw, l, r, frames) };
+    }
+
+    /// Channels of the plug-in's sidechain input, or 0 when it has none (or
+    /// is not a VST3).
+    pub fn sidechain_channel_count(&self) -> u32 {
+        if self.inner.raw.is_null() || self.inner.format != PluginModuleFormat::Vst3 {
+            return 0;
+        }
+        unsafe { ffi::sphere_daux_vst3_sidechain_channel_count(self.inner.raw) }.max(0) as u32
     }
 
     #[inline]

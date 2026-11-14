@@ -439,6 +439,11 @@ impl BridgeVoice {
         self.processor.main_audio_output_channel_count().max(1) as u32
     }
 
+    /// Channels of the plug-in's sidechain input; 0 without one.
+    pub fn sidechain_input_channels(&self) -> u32 {
+        self.processor.sidechain_channel_count()
+    }
+
     /// The plug-in's reported processing latency in samples.
     pub fn latency_samples(&self) -> i32 {
         self.processor.get_latency_samples().max(0)
@@ -462,6 +467,7 @@ impl BridgeVoice {
         frames: usize,
         in_l: &[f32],
         in_r: &[f32],
+        sidechain: Option<(&[f32], &[f32])>,
         out_interleaved: &mut [f32],
         output_channels: usize,
         transport: DirectAudio::vst3_processor::RuntimeTransportContext,
@@ -483,6 +489,13 @@ impl BridgeVoice {
         };
         let mut processor = self.processor.clone();
         processor.set_process_context(&transport);
+        // The engine's sidechain key onto the plug-in's aux input, for this
+        // process call only; without one the aux input hears silence.
+        processor.set_sidechain_input(
+            sidechain
+                .filter(|(l, r)| l.len() >= n && r.len() >= n)
+                .map(|(l, r)| (&l[..n], &r[..n])),
+        );
         let got_channels = processor
             .process_main_output_block_with_midi(
                 &in_l[..n],

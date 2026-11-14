@@ -410,6 +410,19 @@ impl BridgeHost {
         Some((Some((micros as f64 / deadline_micros) as f32), latency))
     }
 
+    /// Channels of the hosted plug-in's sidechain input, as its host
+    /// publishes in the shared region once the instance has processed a
+    /// block. `None` without a region (not hosted, or not prepared yet).
+    pub fn instance_sidechain_channels(&self, instance_id: &str) -> Option<u32> {
+        use std::sync::atomic::Ordering;
+        let bridge = self.shared_audio.get(instance_id)?.bridge();
+        // Before its first block the host has not said anything yet.
+        if !bridge.dsp_output_ready() {
+            return None;
+        }
+        Some(bridge.sidechain_input_channels.load(Ordering::Relaxed))
+    }
+
     pub fn loaded_descriptor(&self, instance: &str) -> Option<BridgeLoadedPlugin> {
         self.loaded
             .get(instance)
@@ -1370,6 +1383,11 @@ impl PluginBridgeRuntime {
 
     pub fn loaded_descriptor(&self, instance: &str) -> Option<BridgeLoadedPlugin> {
         self.host_for(instance)?.loaded_descriptor(instance)
+    }
+
+    pub fn instance_sidechain_channels(&self, instance_id: &str) -> Option<u32> {
+        self.host_for(instance_id)?
+            .instance_sidechain_channels(instance_id)
     }
 
     pub fn has_load_request(&self, instance: &str) -> bool {

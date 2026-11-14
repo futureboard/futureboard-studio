@@ -2060,6 +2060,10 @@ impl StudioLayout {
                 ));
                 entries
             }
+            ContextTarget::SidechainPicker {
+                track_id,
+                insert_id,
+            } => self.sidechain_picker_entries(track_id, insert_id, cx),
             ContextTarget::OutputPicker { track_id } => {
                 use crate::components::timeline::timeline_state::TrackOutputRouting;
                 let state = &self.timeline.read(cx).state;

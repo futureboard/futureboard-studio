@@ -124,6 +124,9 @@ pub struct RuntimeInsert {
     /// return: the chain skips it, and the return named by the split send
     /// runs it. Resolved from `params["signalBus"]` when the graph is built.
     pub signal_bus: u8,
+    /// The insert's sidechain key route, from `params["sidechain"]`; `None`
+    /// without one. Boxed: almost no insert has one. See [`super::sidechain`].
+    pub sidechain: Option<Box<RuntimeSidechain>>,
 }
 
 /// Main insert chain. The audio callback compares this, never the param string.

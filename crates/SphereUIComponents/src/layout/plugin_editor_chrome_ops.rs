@@ -95,6 +95,28 @@ fn report_preset_problem(title: &'static str, message: String, cx: &mut Context<
 }
 
 /// Preset names for one plug-in, in list order.
+/// The sidechain picker's entries as the chrome carries them:
+/// `(label, command, checked, enabled)`, with `None` for a header row.
+fn sidechain_popup_rows(
+    entries: Vec<crate::components::context_menu::ContextMenuEntry>,
+) -> Vec<(String, Option<String>, bool, bool)> {
+    use crate::components::context_menu::ContextMenuEntry;
+    entries
+        .into_iter()
+        .filter_map(|entry| match entry {
+            ContextMenuEntry::Header(label) => Some((label, None, false, false)),
+            ContextMenuEntry::Separator => None,
+            ContextMenuEntry::Item {
+                label,
+                command,
+                checked,
+                disabled,
+                ..
+            } => Some((label, Some(command), checked, !disabled)),
+        })
+        .collect()
+}
+
 fn list_presets(owner: &PresetOwner) -> Vec<String> {
     list_preset_files(owner)
         .into_iter()
@@ -211,6 +233,9 @@ impl StudioLayout {
             // Not an insert, so not a slot number. The titlebar drops the
             // "Insert n" suffix for a 0 rather than inventing a position.
             insert_number: 0,
+            // Not an insert either, so no sidechain to route.
+            sidechain_label: None,
+            sidechain_rows: Vec::new(),
             active: true,
             latency_samples: 0,
             sample_rate: 0,
@@ -293,7 +318,15 @@ impl StudioLayout {
             .state_clipboard
             .as_ref()
             .is_some_and(|copied| slot.plugin_id.as_deref() == Some(copied.plugin_id.as_str()));
+        let sidechain_label = self.insert_sidechain_label(track_id, insert_id, cx);
+        let sidechain_rows = if sidechain_label.is_some() {
+            sidechain_popup_rows(self.sidechain_picker_entries(track_id, insert_id, cx))
+        } else {
+            Vec::new()
+        };
         Some(PluginEditorChrome {
+            sidechain_label,
+            sidechain_rows,
             can_paste,
             plugin_name: slot.display_name.clone(),
             track_name,
@@ -572,6 +605,11 @@ impl StudioLayout {
             }
             PluginEditorAction::ReloadPlugin { reset } => {
                 self.reload_crashed_plugin(track_id, insert_id, reset, cx);
+            }
+            // The picker's rows carry the full command, insert included, so
+            // it runs exactly as the mixer chip's menu would.
+            PluginEditorAction::Sidechain(command) => {
+                self.dispatch_sidechain_command(&command, cx);
             }
         }
     }

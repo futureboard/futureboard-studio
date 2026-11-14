@@ -315,6 +315,11 @@ pub struct BandParams {
     /// (what a missing field loads as).
     #[serde(default)]
     pub ratio: f32,
+    /// The dynamic band's detector listens to the insert's sidechain key
+    /// instead of its own input. Without a key routed it falls back to the
+    /// input. Older projects load as `false`.
+    #[serde(default)]
+    pub sc_external: bool,
 }
 
 fn legacy_slope() -> f32 {
@@ -352,6 +357,7 @@ fn flat_band(band_type: BandType, freq: f32, q: f32) -> BandParams {
         slope: legacy_slope(),
         dyn_mode: default_dyn_mode(),
         ratio: DEFAULT_RATIO,
+        sc_external: false,
     }
 }
 
@@ -917,6 +923,19 @@ impl StereoEffect for Dsp {
     }
 
     fn process_stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
+        self.process_stereo_keyed(left, right, None)
+    }
+}
+
+impl Dsp {
+    /// One sample with the host's sidechain key (`None`: no key routed this
+    /// block). Only dynamic bands set to External listen to it.
+    pub fn process_stereo_keyed(
+        &mut self,
+        left: f32,
+        right: f32,
+        key: Option<(f32, f32)>,
+    ) -> (f32, f32) {
         // Fully off and settled: the chain is not run at all, as before.
         if self.power.is_settled() && !self.params.power {
             self.track_peaks(left, right);
@@ -925,7 +944,7 @@ impl StereoEffect for Dsp {
         let on = self.power.next();
         let gain = self.output_gain.next();
         let amount = self.mix.next();
-        let (wet_l, wet_r) = self.process_on(left, right, gain, amount);
+        let (wet_l, wet_r) = self.process_on(left, right, key, gain, amount);
         let out = if on == 1.0 {
             (wet_l, wet_r)
         } else {
@@ -942,7 +961,14 @@ impl Dsp {
     /// The powered chain for one sample, at output `gain` and wet share
     /// `amount` (both already smoothed).
     #[inline]
-    fn process_on(&mut self, left: f32, right: f32, gain: f32, amount: f32) -> (f32, f32) {
+    fn process_on(
+        &mut self,
+        left: f32,
+        right: f32,
+        key: Option<(f32, f32)>,
+        gain: f32,
+        amount: f32,
+    ) -> (f32, f32) {
         // Band solo replaces the chain rather than adding to it, and
         // deliberately ignores Mix: auditioning a band means hearing that
         // frequency region alone, so blending the dry signal back in would
@@ -964,7 +990,15 @@ impl Dsp {
                     continue;
                 }
                 if band.dynamic && band.band_type.has_gain() && band.range_db.abs() > 1.0e-6 {
-                    let detector_in = left.abs().max(right.abs());
+                    // An External band hears the host's sidechain key when
+                    // one is routed, else the insert's own input.
+                    let detector_in = match key {
+                        Some((key_l, key_r)) if band.sc_external => {
+                            let level = key_l.abs().max(key_r.abs());
+                            if level.is_finite() { level } else { 0.0 }
+                        }
+                        _ => left.abs().max(right.abs()),
+                    };
                     let detected = match self.detector[index].as_mut() {
                         Some(filter) => run(filter, detector_in).abs(),
                         None => detector_in,

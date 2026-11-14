@@ -2315,6 +2315,11 @@ impl StudioLayout {
             }
             return;
         }
+        if self.dispatch_sidechain_command(command_id, cx) {
+            self.overlay.open_popover = None;
+            cx.notify();
+            return;
+        }
         if let Some(rest) = command_id.strip_prefix("mixer:set-output:") {
             use crate::components::timeline::timeline_state::TrackOutputRouting;
             let (track_id, output) = if let Some((track_id, bus_id)) = rest.split_once(":bus:") {

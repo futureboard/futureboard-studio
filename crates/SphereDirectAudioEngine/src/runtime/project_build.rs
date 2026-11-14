@@ -262,6 +262,8 @@ impl RuntimeProject {
                     scratch_multi: Vec::new(),
                     chain_latency_samples: 0,
                     signal_bus: signal_bus_from_params(&insert.params),
+                    // Resolved to a source index in `resolve_sidechains`.
+                    sidechain: sidechain_from_params(&insert.params),
                 });
             }
 
@@ -389,6 +391,7 @@ impl RuntimeProject {
                 smoothed_gain_l: init_volume * init_pan_l,
                 smoothed_gain_r: init_volume * init_pan_r,
                 wdw_return_index: None,
+                sidechain_tap: Default::default(),
             });
         }
         let has_solo = tracks.iter().any(|t| t.solo);

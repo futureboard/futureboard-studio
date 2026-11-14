@@ -664,6 +664,15 @@ pub fn apply_insert_block(
     // plugin processes it (same thread, no race with process()).
     vst3.set_process_context(&transport);
 
+    // Sidechain key onto the plug-in's aux input for this one process call,
+    // the main input delayed first when the key is late (see
+    // `crate::runtime::sidechain`). No route: the aux input hears silence.
+    let key = match insert.sidechain.as_deref_mut() {
+        Some(route) => route.align_block(&mut block_l[..frames], &mut block_r[..frames], frames),
+        None => None,
+    };
+    vst3.set_sidechain_input(key);
+
     let handle = vst3.handle_value();
     let process_ok = if let Some(events) = midi_events.filter(|e| !e.is_empty()) {
         vst3.process_stereo_block_with_midi(

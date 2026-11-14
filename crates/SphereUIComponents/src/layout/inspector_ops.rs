@@ -934,28 +934,39 @@ impl StudioLayout {
             let track_id = track_id.clone();
             let insert_id = insert_id.clone();
             StudioLayout::defer_update(&owner, cx, move |this, cx| {
-                let edit = this.begin_track_edit(TrackEditScope::channel(&track_id), cx);
-                let bypassed = this.timeline.update(cx, |timeline, cx| {
-                    let bypassed = timeline
-                        .state
-                        .toggle_insert_bypass(&track_id, &insert_id)
-                        .unwrap_or(false);
-                    cx.notify();
-                    bypassed
-                });
-                this.commit_track_edit("Bypass Plug-in", edit, cx);
-                inspector_debug(&format!(
-                    "insert bypass track={track_id} insert={insert_id} bypass={bypassed}"
-                ));
-                // Live per-block bypass via the runtime "enabled" insert param —
-                // no plugin unload, no graph rebuild (a full `load_project` here
-                // used to stutter playback). View-only dirty persists the flag.
-                this.push_insert_enabled_to_engine(&track_id, &insert_id, cx);
-                this.mark_dirty_view_only();
-                this.push_mixer_snapshot_to_window(cx);
-                cx.notify();
+                this.toggle_insert_bypass_now(&track_id, &insert_id, cx);
             });
         })
+    }
+
+    /// Flips an insert's bypass as one undo step and tells the engine at
+    /// once: the mixer's bypass button and a plug-in editor's Bypass.
+    pub(crate) fn toggle_insert_bypass_now(
+        &mut self,
+        track_id: &str,
+        insert_id: &str,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let edit = self.begin_track_edit(TrackEditScope::channel(track_id), cx);
+        let bypassed = self.timeline.update(cx, |timeline, cx| {
+            let bypassed = timeline
+                .state
+                .toggle_insert_bypass(track_id, insert_id)
+                .unwrap_or(false);
+            cx.notify();
+            bypassed
+        });
+        self.commit_track_edit("Bypass Plug-in", edit, cx);
+        inspector_debug(&format!(
+            "insert bypass track={track_id} insert={insert_id} bypass={bypassed}"
+        ));
+        // Live per-block bypass via the runtime "enabled" insert param —
+        // no plugin unload, no graph rebuild (a full `load_project` here
+        // used to stutter playback). View-only dirty persists the flag.
+        self.push_insert_enabled_to_engine(track_id, insert_id, cx);
+        self.mark_dirty_view_only();
+        self.push_mixer_snapshot_to_window(cx);
+        cx.notify();
     }
 
     fn set_insert_bus_cb(&self, owner: Entity<Self>) -> InsertBusCb {

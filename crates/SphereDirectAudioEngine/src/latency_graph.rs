@@ -629,6 +629,7 @@ mod tests {
             smoothed_gain_l: 1.0,
             smoothed_gain_r: 1.0,
             wdw_return_index: None,
+            sidechain_tap: Default::default(),
         }
     }
 

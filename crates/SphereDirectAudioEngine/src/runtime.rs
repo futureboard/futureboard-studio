@@ -95,6 +95,8 @@ mod project_midi;
 mod project_params;
 mod project_preview;
 mod project_routing;
+mod sidechain;
+pub use self::sidechain::*;
 
 /// `FUTUREBOARD_MIDI_ENGINE_DEBUG=1` enables eprintln traces for MIDI runtime
 /// build + per-block scheduling. Cached on first read so the audio callback

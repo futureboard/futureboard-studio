@@ -176,6 +176,13 @@ pub enum ContextTarget {
     OutputPicker {
         track_id: String,
     },
+    /// Sidechain source picker for one insert, opened from its mixer chip's
+    /// right-click. Lists None plus every track that can key it, then the
+    /// pre/post-fader tap; wired to `set_insert_sidechain`.
+    SidechainPicker {
+        track_id: String,
+        insert_id: String,
+    },
     /// Master Output picker opened from the Master strip. Lists Output Audio
     /// Connections only; selecting one stores nothing but its stable id.
     MasterOutputPicker,

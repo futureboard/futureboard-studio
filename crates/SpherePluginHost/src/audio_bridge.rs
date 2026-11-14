@@ -59,7 +59,7 @@ pub const BRIDGE_MAGIC: u32 = 0x4642_4142;
 /// v14 adds the `midi_out` ring (host → Studio): MIDI a plug-in produces —
 /// an arpeggiator's notes, an instrument's MIDI thru — which other tracks can
 /// take as their MIDI input.
-pub const BRIDGE_LAYOUT_VERSION: u32 = 14;
+pub const BRIDGE_LAYOUT_VERSION: u32 = 15;
 
 /// Rack positions a built-in may publish per-stage telemetry for. Fixed so the
 /// shared region stays a plain-old-data layout.
@@ -146,6 +146,10 @@ pub const MAX_BLOCK_FRAMES: usize = DirectAudio::plugin_bridge::MAX_BRIDGE_BLOCK
 pub const MAX_CHANNELS: usize = 32;
 /// Interleaved samples per audio buffer.
 pub const AUDIO_BUF_LEN: usize = MAX_BLOCK_FRAMES * MAX_CHANNELS;
+/// Where `audio_in`'s sidechain key plane starts: right after the stereo dry
+/// plane. Input is stereo, so the buffer's multichannel room is free for it.
+pub const SIDECHAIN_PLANE_OFFSET: usize = MAX_BLOCK_FRAMES * 2;
+const _: () = assert!(SIDECHAIN_PLANE_OFFSET + MAX_BLOCK_FRAMES * 2 <= AUDIO_BUF_LEN);
 
 /// MIDI ring capacity (power of two).
 pub const MIDI_RING_CAP: usize = 1024;
@@ -512,6 +516,51 @@ impl SharedAudioBuffer {
         n
     }
 
+    /// Copy a stereo sidechain key into the plane after the dry pair
+    /// ([`SIDECHAIN_PLANE_OFFSET`]), engine → host `audio_in`. The dry write
+    /// never clears past its own plane, so the two do not disturb each other.
+    ///
+    /// # Safety
+    /// Same contract as [`Self::write_deinterleaved`].
+    pub unsafe fn write_sidechain(&self, key_l: &[f32], key_r: &[f32], frames: usize) -> usize {
+        let n = frames
+            .min(MAX_BLOCK_FRAMES)
+            .min(key_l.len())
+            .min(key_r.len());
+        let dst = unsafe { (self.samples.as_ptr() as *mut f32).add(SIDECHAIN_PLANE_OFFSET) };
+        for i in 0..n {
+            unsafe {
+                *dst.add(i * 2) = key_l[i];
+                *dst.add(i * 2 + 1) = key_r[i];
+            }
+        }
+        n
+    }
+
+    /// Read `frames` of the sidechain plane into `out_l` / `out_r`.
+    ///
+    /// # Safety
+    /// SPSC contract: only the consuming side (host) while it holds the block.
+    pub unsafe fn read_sidechain(
+        &self,
+        out_l: &mut [f32],
+        out_r: &mut [f32],
+        frames: usize,
+    ) -> usize {
+        let n = frames
+            .min(MAX_BLOCK_FRAMES)
+            .min(out_l.len())
+            .min(out_r.len());
+        let src = unsafe { (self.samples.as_ptr() as *const f32).add(SIDECHAIN_PLANE_OFFSET) };
+        for i in 0..n {
+            unsafe {
+                out_l[i] = *src.add(i * 2);
+                out_r[i] = *src.add(i * 2 + 1);
+            }
+        }
+        n
+    }
+
     /// Copy deinterleaved stereo into the buffer (engine → host `audio_in`).
     ///
     /// # Safety
@@ -657,7 +706,9 @@ pub struct SharedAudioBridge {
     pub pad_levels: [AtomicU32; BUILTIN_PAD_SLOTS],
     /// Bumped after each published set; `0` until the first one.
     pub pad_levels_seq: AtomicU32,
-    pub _pad_pad_levels: AtomicU32,
+    /// Channels of the loaded plug-in's sidechain input (host → engine), 0
+    /// without one. Took the padding slot after the pad levels.
+    pub sidechain_input_channels: AtomicU32,
 
     // --- Per-band gain reduction (host → engine) ---
     /// Decibels each band is taking off, positive, `f32` bits. Published per
@@ -665,7 +716,10 @@ pub struct SharedAudioBridge {
     pub band_reduction: [AtomicU32; REDUCTION_BANDS],
     /// Bumped after each published set; `0` until the first one.
     pub band_reduction_seq: AtomicU32,
-    pub _pad_band_reduction: AtomicU32,
+    /// Frames of sidechain key the engine wrote into `audio_in`'s second
+    /// plane for the current request (engine → host); 0: no key this block.
+    /// Took the padding slot after the band reduction.
+    pub sidechain_frames: AtomicU32,
 
     // --- Lock-free rings (engine → host) ---
     pub midi: SpscRing<SharedMidiEvent, MIDI_RING_CAP>,

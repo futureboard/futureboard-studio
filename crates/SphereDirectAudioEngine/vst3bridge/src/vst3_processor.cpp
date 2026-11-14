@@ -2779,10 +2779,7 @@ sphere_daux_vst3_process_stereo_sample(SphereDauxVst3Processor *processor,
   processor->output_bus.channelBuffers32 = processor->output_channels;
   processor->output_bus.silenceFlags = 0;
   processor->process_data.numSamples = 1;
-  processor->process_data.numInputs =
-      processor->audio_input_bus_count > 0 ? 1 : 0;
-  processor->process_data.inputs =
-      processor->audio_input_bus_count > 0 ? &processor->input_bus : nullptr;
+  processor->bind_process_inputs(1);
   processor->process_data.numOutputs =
       processor->audio_output_bus_count > 0 ? 1 : 0;
   processor->process_data.outputs =
@@ -2840,10 +2837,9 @@ extern "C" int sphere_daux_vst3_process_stereo_block_with_midi(
   // Shaped to the negotiated main-input layout, never a fixed two channels.
   processor->bind_main_input(in_l, in_r, frames);
   processor->process_data.numSamples = frames;
-  processor->process_data.numInputs =
-      processor->audio_input_bus_count > 0 ? 1 : 0;
-  processor->process_data.inputs =
-      processor->audio_input_bus_count > 0 ? &processor->input_bus : nullptr;
+  // Main bus plus, when the plug-in has one, the sidechain key bound for
+  // this call by sphere_daux_vst3_set_sidechain_input.
+  processor->bind_process_inputs(frames);
 
   static thread_local std::array<
       std::array<float, SphereDauxVst3Processor::kMaxProcessFrames>,
@@ -2961,15 +2957,12 @@ extern "C" int sphere_daux_vst3_process_stereo_block_with_midi(
   }
 
   processor->process_data.numSamples = 1;
-  processor->process_data.numInputs =
-      processor->audio_input_bus_count > 0 ? 1 : 0;
   processor->process_data.numOutputs =
       processor->output_bus_count_for_process();
   processor->process_data.inputEvents = nullptr;
   processor->bind_idle_main_input();
   processor->output_bus.channelBuffers32 = processor->output_channels;
-  processor->process_data.inputs =
-      processor->audio_input_bus_count > 0 ? &processor->input_bus : nullptr;
+  processor->bind_process_inputs(1);
   processor->process_data.outputs = nullptr;
 
   if (result != Steinberg::kResultOk)
@@ -2999,10 +2992,9 @@ extern "C" int sphere_daux_vst3_process_main_output_block_with_midi(
   // Shaped to the negotiated main-input layout, never a fixed two channels.
   processor->bind_main_input(in_l, in_r, frames);
   processor->process_data.numSamples = frames;
-  processor->process_data.numInputs =
-      processor->audio_input_bus_count > 0 ? 1 : 0;
-  processor->process_data.inputs =
-      processor->audio_input_bus_count > 0 ? &processor->input_bus : nullptr;
+  // Main bus plus, when the plug-in has one, the sidechain key bound for
+  // this call by sphere_daux_vst3_set_sidechain_input.
+  processor->bind_process_inputs(frames);
 
   // VST3 wants per-channel contiguous buffers. The bridge wire format is
   // interleaved, so process into fixed stack channel planes, then interleave.
@@ -3102,16 +3094,13 @@ extern "C" int sphere_daux_vst3_process_main_output_block_with_midi(
   }
 
   processor->process_data.numSamples = 1;
-  processor->process_data.numInputs =
-      processor->audio_input_bus_count > 0 ? 1 : 0;
   processor->process_data.numOutputs =
       processor->output_bus_count_for_process();
   processor->process_data.inputEvents = nullptr;
   processor->bind_idle_main_input();
   processor->output_bus.numChannels = 2;
   processor->output_bus.channelBuffers32 = processor->output_channels;
-  processor->process_data.inputs =
-      processor->audio_input_bus_count > 0 ? &processor->input_bus : nullptr;
+  processor->bind_process_inputs(1);
   processor->process_data.outputs = nullptr;
 
   if (result != Steinberg::kResultOk)
@@ -3224,6 +3213,26 @@ sphere_daux_vst3_audio_input_bus_count(SphereDauxVst3Processor *processor) {
   if (!processor)
     return 0;
   return processor->audio_input_bus_count;
+}
+
+extern "C" void
+sphere_daux_vst3_set_sidechain_input(SphereDauxVst3Processor *processor,
+                                     const float *l, const float *r,
+                                     int frames) {
+  if (!processor)
+    return;
+  // Consumed by the next process call's bind_process_inputs, same thread.
+  const bool valid = l && r && frames > 0;
+  processor->sidechain_l = valid ? l : nullptr;
+  processor->sidechain_r = valid ? r : nullptr;
+  processor->sidechain_frames = valid ? frames : 0;
+}
+
+extern "C" int
+sphere_daux_vst3_sidechain_channel_count(SphereDauxVst3Processor *processor) {
+  if (!processor || processor->sidechain_bus_index < 0)
+    return 0;
+  return processor->sidechain_channel_count;
 }
 
 extern "C" int

@@ -68,6 +68,12 @@ pub struct MixerCallbacks {
         Option<std::sync::Arc<dyn Fn(&(f32, f32), &mut Window, &mut App) + 'static>>,
     pub on_context_menu:
         Option<std::sync::Arc<dyn Fn(&(String, f32, f32), &mut Window, &mut App) + 'static>>,
+    /// Right-click on an insert chip: open that insert's menu (its sidechain
+    /// source) at `(x, y)`. `(track_id, insert_id, x, y)`. `None` leaves the
+    /// right-click to the strip's own menu.
+    pub on_insert_context_menu: Option<
+        std::sync::Arc<dyn Fn(&(String, String, f32, f32), &mut Window, &mut App) + 'static>,
+    >,
     /// Open the insert plugin picker overlay for the track (Phase 2b). The
     /// slot is created only when the user picks a plugin; an empty registry
     /// offers a stub fallback so the project round-trip stays exercisable.
@@ -201,6 +207,7 @@ pub fn noop_mixer_callbacks() -> MixerCallbacks {
         on_master_volume_drag_preview: noop_master,
         on_master_volume_drag_commit: noop_master_commit,
         on_context_menu: None,
+        on_insert_context_menu: None,
         on_add_insert: noop_track.clone(),
         on_remove_insert: noop_insert_pair.clone(),
         on_toggle_insert_bypass: noop_insert_pair.clone(),

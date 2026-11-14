@@ -92,6 +92,7 @@ fn bridge_effect_track(block: f32) -> RuntimeTrack {
             scratch_multi: Vec::new(),
             chain_latency_samples: 0,
             signal_bus: 0,
+            sidechain: None,
         }],
         sends: Vec::new(),
         automation_lanes: Vec::new(),
@@ -128,6 +129,7 @@ fn bridge_effect_track(block: f32) -> RuntimeTrack {
         smoothed_gain_l: 1.0,
         smoothed_gain_r: 1.0,
         wdw_return_index: None,
+        sidechain_tap: Default::default(),
     }
 }
 
@@ -941,6 +943,7 @@ pub(super) fn bridge_effect_track_with_id(id: &str) -> RuntimeInsert {
         scratch_multi: Vec::new(),
         chain_latency_samples: 0,
         signal_bus: 0,
+        sidechain: None,
     }
 }
 
@@ -1055,6 +1058,7 @@ fn serial_bridge_effect_chain_applies_both_gains() {
         smoothed_gain_l: 1.0,
         smoothed_gain_r: 1.0,
         wdw_return_index: None,
+        sidechain_tap: Default::default(),
     };
     // Pre-seed previous-cycle wet so the first read applies A×2 then B×3.
     let sink_a = Arc::new(MultSink {
@@ -1208,6 +1212,7 @@ fn serial_bridge_effect_chain_bypasses_only_missed_middle_insert() {
         smoothed_gain_l: 1.0,
         smoothed_gain_r: 1.0,
         wdw_return_index: None,
+        sidechain_tap: Default::default(),
     };
     let sink_a = Arc::new(MultSink {
         mult: 2.0,
@@ -1235,4 +1240,201 @@ fn serial_bridge_effect_chain_bypasses_only_missed_middle_insert() {
         "A x2, B missed, C x5 expected 1*2*5=10 got {}",
         track.block_l[0]
     );
+}
+
+// ── Sidechain ───────────────────────────────────────────────────────────────
+
+/// A sink that keeps the last sidechain key it was handed.
+#[derive(Debug, Default)]
+struct KeySink {
+    key: std::sync::Mutex<Option<Vec<f32>>>,
+}
+
+impl PluginBridgeSink for KeySink {
+    fn dsp_ready(&self) -> bool {
+        true
+    }
+
+    fn read_output(&self, out_l: &mut [f32], out_r: &mut [f32], frames: usize) -> usize {
+        out_l[..frames].fill(0.0);
+        out_r[..frames].fill(0.0);
+        frames
+    }
+
+    fn push_midi(&self, _: u8, _: u8, _: u8, _: u32) {}
+
+    fn write_input(&self, _: &[f32], _: &[f32], _: usize) {}
+
+    fn write_sidechain(&self, key: Option<(&[f32], &[f32])>, frames: usize) {
+        *self.key.lock().unwrap() = key.map(|(l, _)| l[..frames].to_vec());
+    }
+
+    fn request_block(&self, _: u32) {}
+}
+
+fn keyed_by(source: &str, tap: &str) -> Option<Box<crate::runtime::RuntimeSidechain>> {
+    let mut params = HashMap::new();
+    params.insert(
+        crate::runtime::SIDECHAIN_PARAM.to_string(),
+        serde_json::json!({ "sourceTrackId": source, "tap": tap }),
+    );
+    crate::runtime::sidechain_from_params(&params)
+}
+
+fn keyed_project(tracks: Vec<RuntimeTrack>) -> RuntimeProject {
+    let audio_graph = crate::audio_graph::plan_runtime_audio_graph(&tracks).unwrap();
+    let mut p = RuntimeProject {
+        spatial: Default::default(),
+        tracks,
+        audio_graph,
+        pdc_enabled: true,
+        ..Default::default()
+    };
+    p.resolve_indices();
+    p
+}
+
+#[test]
+fn sidechain_resolves_its_source_and_refuses_loops() {
+    let mut kick = bridge_effect_track(1.0);
+    kick.id = "kick".to_string();
+    kick.inserts.clear();
+    let mut bass = bridge_effect_track(1.0);
+    bass.id = "bass".to_string();
+    bass.inserts[0].sidechain = keyed_by("kick", "pre");
+    // Keyed by itself: refused.
+    let mut own = bridge_effect_track(1.0);
+    own.id = "own".to_string();
+    own.inserts[0].id = "own-insert".to_string();
+    own.inserts[0].sidechain = keyed_by("own", "pre");
+    // Keyed by the bus it feeds: the key would carry its own output, refused.
+    let mut bus = bridge_effect_track(1.0);
+    bus.id = "bus".to_string();
+    bus.track_type = "bus".to_string();
+    bus.inserts.clear();
+    let mut fed = bridge_effect_track(1.0);
+    fed.id = "fed".to_string();
+    fed.inserts[0].id = "fed-insert".to_string();
+    fed.output_track_id = Some("bus".to_string());
+    fed.inserts[0].sidechain = keyed_by("bus", "post");
+    // Keyed by a track that is gone: nothing.
+    let mut orphan = bridge_effect_track(1.0);
+    orphan.id = "orphan".to_string();
+    orphan.inserts[0].id = "orphan-insert".to_string();
+    orphan.inserts[0].sidechain = keyed_by("deleted", "pre");
+
+    let p = keyed_project(vec![kick, bass, own, bus, fed, orphan]);
+    let source = |track: usize| {
+        p.tracks[track].inserts[0]
+            .sidechain
+            .as_deref()
+            .and_then(|route| route.source_index)
+    };
+    assert_eq!(source(1), Some(0));
+    assert_eq!(source(2), None, "a track cannot key itself");
+    assert_eq!(source(4), None, "a bus the track feeds cannot key it");
+    assert_eq!(source(5), None, "a missing source keys nothing");
+    assert_eq!(
+        p.tracks[0].sidechain_tap.flags,
+        crate::runtime::SIDECHAIN_TAP_PRE
+    );
+    assert_eq!(
+        p.tracks[3].sidechain_tap.flags, 0,
+        "a refused source publishes nothing"
+    );
+    assert!(p.tracks[0].sidechain_tap.pre_l.len() >= 8);
+    assert!(p.tracks[3].sidechain_tap.post_l.is_empty());
+}
+
+#[test]
+fn a_keyed_bridge_insert_gets_last_blocks_source_and_the_taps_restart_silent() {
+    let frames = 4usize;
+    let mut kick = bridge_effect_track(1.0);
+    kick.id = "kick".to_string();
+    kick.inserts.clear();
+    let mut bass = bridge_effect_track(1.0);
+    bass.id = "bass".to_string();
+    bass.inserts[0].sidechain = keyed_by("kick", "pre");
+    let mut p = keyed_project(vec![kick, bass]);
+    let sink = Arc::new(KeySink::default());
+    p.tracks[1].inserts[0].bridge_sink = Some(sink.clone());
+
+    // What the kick published at the end of the previous callback.
+    let block = [0.5f32, -0.25, 0.75, 1.0];
+    p.tracks[0]
+        .sidechain_tap
+        .capture(crate::runtime::SIDECHAIN_TAP_PRE, &block, &block, frames);
+    p.take_sidechain_keys(frames);
+    assert!(
+        p.tracks[0].sidechain_tap.pre_l[..frames]
+            .iter()
+            .all(|s| *s == 0.0),
+        "a source that renders nothing this block publishes silence"
+    );
+
+    apply_track_chain_block(&mut p.tracks[1], frames, RuntimeTransportContext::default());
+    assert_eq!(sink.key.lock().unwrap().as_deref(), Some(&block[..]));
+
+    // An insert without a route tells the host it has no key.
+    p.tracks[1].inserts[0].sidechain = None;
+    apply_track_chain_block(&mut p.tracks[1], frames, RuntimeTransportContext::default());
+    assert_eq!(*sink.key.lock().unwrap(), None);
+}
+
+#[test]
+fn a_late_sidechain_key_delays_the_insert_and_compensation_follows() {
+    let period = 64u32;
+    let mut kick = bridge_effect_track(1.0);
+    kick.id = "kick".to_string();
+    kick.inserts.clear();
+    let mut bass = bridge_effect_track(1.0);
+    bass.id = "bass".to_string();
+    bass.inserts[0].id = "bass-insert".to_string();
+    bass.inserts[0].sidechain = keyed_by("kick", "pre");
+    let mut p = keyed_project(vec![kick, bass]);
+    p.plugin_bridge_sinks.insert(
+        "bass-insert".to_string(),
+        Arc::new(WetEffectSink {
+            done_seq: AtomicU64::new(1),
+            requests: AtomicU64::new(0),
+            latency_samples: 0,
+        }),
+    );
+    p.resolve_bridge_sinks();
+    p.plan_latency_and_pdc();
+
+    let mut replans = 0;
+    while p.refresh_runtime_latency_graph(period) {
+        replans += 1;
+        assert!(replans < 8, "the alignment must settle");
+    }
+    // The key is last callback's kick: one period behind the bass's own
+    // input, which is delayed by that much to meet it.
+    let route = p.tracks[1].inserts[0].sidechain.as_deref().unwrap();
+    assert_eq!(route.align_samples, period as i32);
+    // Bridge handshake plus the alignment, and the kick waits for both.
+    assert_eq!(p.latency_graph.track_plugin_latency[1], 2 * period);
+    assert_eq!(p.latency_graph.track_pdc_delay[0], 2 * period);
+    assert_eq!(p.latency_graph.track_pdc_delay[1], 0);
+}
+
+#[test]
+fn the_alignment_delay_shifts_the_main_input_by_whole_samples() {
+    let mut route = keyed_by("kick", "pre").unwrap();
+    // Resolved by hand: the delay rings exist once the route has a source.
+    let mut tracks = vec![bridge_effect_track(0.0), bridge_effect_track(0.0)];
+    tracks[0].id = "kick".to_string();
+    tracks[0].inserts.clear();
+    tracks[1].inserts[0].sidechain = Some(route.clone());
+    let mut p = keyed_project(tracks);
+    route = p.tracks[1].inserts[0].sidechain.take().unwrap();
+    route.align_samples = 2;
+    let mut l = [1.0f32, 2.0, 3.0, 4.0];
+    let mut r = l;
+    let key = route
+        .align_block(&mut l, &mut r, 4)
+        .map(|(k, _)| k.to_vec());
+    assert_eq!(l, [0.0, 0.0, 1.0, 2.0]);
+    assert_eq!(r, [0.0, 0.0, 1.0, 2.0]);
+    assert_eq!(key.map(|k| k.len()), Some(4));
 }

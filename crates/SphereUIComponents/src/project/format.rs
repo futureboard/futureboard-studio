@@ -679,6 +679,11 @@ fn encode_insert(w: &mut FbWriter, ins: &ProjectInsert, version: u32) {
     if version >= 63 {
         w.write_u8(ins.signal_bus);
     }
+    // v64: sidechain source track (empty: none) and its tap.
+    if version >= 64 {
+        w.write_str(&ins.sidechain_source);
+        w.write_bool(ins.sidechain_post_fader);
+    }
 }
 
 fn encode_automation_lane(w: &mut FbWriter, lane: &AutomationLane, version: u32) {
@@ -2657,6 +2662,11 @@ fn decode_insert(r: &mut FbReader, version: u32) -> Result<ProjectInsert, Projec
         }
     };
     let signal_bus = if version >= 63 { r.read_u8()? } else { 0 };
+    let (sidechain_source, sidechain_post_fader) = if version >= 64 {
+        (r.read_str()?, r.read_bool()?)
+    } else {
+        (String::new(), false)
+    };
     Ok(ProjectInsert {
         id,
         slot_index,
@@ -2666,6 +2676,8 @@ fn decode_insert(r: &mut FbReader, version: u32) -> Result<ProjectInsert, Projec
         plugin_is_instrument,
         multiout_collapsed,
         signal_bus,
+        sidechain_source,
+        sidechain_post_fader,
         plugin,
     })
 }
@@ -4655,6 +4667,8 @@ mod tests {
             plugin_is_instrument: Some(false),
             multiout_collapsed: true,
             signal_bus: 0,
+            sidechain_source: String::new(),
+            sidechain_post_fader: false,
             plugin: None,
         });
 
@@ -4712,6 +4726,33 @@ mod tests {
             !old.tracks[0].routing.sends[0].wdw,
             "a pre-v63 send is not a wet/dry/wet split"
         );
+    }
+
+    /// v64 keeps an insert's sidechain route; a v63 file has none.
+    #[test]
+    fn insert_sidechain_roundtrips_v64_and_is_absent_on_v63() {
+        let mut project = FutureboardProject::new("Sidechain");
+        let mut track = track_with_clip(empty_clip_with_stretch(sample_stretch()));
+        track.clips.clear();
+        track.inserts.push(ProjectInsert {
+            id: "comp".to_string(),
+            signal_bus: 1,
+            sidechain_source: "kick".to_string(),
+            sidechain_post_fader: true,
+            ..ProjectInsert::default()
+        });
+        project.tracks.push(track);
+
+        let decoded = decode_project(&encode_project(&project)).expect("v64 decode");
+        let insert = &decoded.tracks[0].inserts[0];
+        assert_eq!(insert.sidechain_source, "kick");
+        assert!(insert.sidechain_post_fader);
+        assert_eq!(insert.signal_bus, 1, "the field before it still reads");
+
+        let old = decode_project_with_options(&encode_project_as(&project, 63), true)
+            .expect("v63 decode");
+        assert!(old.tracks[0].inserts[0].sidechain_source.is_empty());
+        assert!(!old.tracks[0].inserts[0].sidechain_post_fader);
     }
 
     #[test]

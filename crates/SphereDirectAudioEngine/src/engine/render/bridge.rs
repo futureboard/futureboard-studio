@@ -201,8 +201,18 @@ pub(crate) fn apply_external_bridge_insert_block(
     // overwriting or publishing a second request would race the host's raw read.
     let can_publish_request = got > 0 || !sink.request_in_flight();
     if is_effect && can_publish_request {
+        // A sidechain key travels with the dry block it was aligned to. A
+        // late key delays the dry block here, before the host sees it, which
+        // is the latency `insert_latency_samples` charged for it.
+        let key = match insert.sidechain.as_deref_mut() {
+            Some(route) => {
+                route.align_block(&mut block_l[..frames], &mut block_r[..frames], frames)
+            }
+            None => None,
+        };
         // Current dry (pre-apply). Host will process this after `request_block`.
         sink.write_input(&block_l[..frames], &block_r[..frames], frames);
+        sink.write_sidechain(key, frames);
     }
 
     // Multi-out diagnostic: which plugin output channels actually carry signal

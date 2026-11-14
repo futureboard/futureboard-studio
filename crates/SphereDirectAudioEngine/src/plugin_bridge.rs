@@ -160,6 +160,18 @@ pub trait PluginBridgeSink: Send + Sync + std::fmt::Debug {
     /// raw buffer copy.
     fn write_input(&self, in_l: &[f32], in_r: &[f32], frames: usize);
 
+    /// Write the insert's sidechain key for the same block as
+    /// [`Self::write_input`], under the same ownership rule; `None` tells the
+    /// host the insert has no key this block. Wait-free raw buffer copy.
+    /// Default no-op for sinks without a host (test stubs).
+    fn write_sidechain(&self, _key: Option<(&[f32], &[f32])>, _frames: usize) {}
+
+    /// Channels of the hosted plug-in's sidechain input, as the host reports
+    /// it once the plug-in is loaded; 0 when it has none (or has not said).
+    fn sidechain_input_channels(&self) -> u32 {
+        0
+    }
+
     /// Publish the request for the host to process `frames` next (sets the block
     /// size and bumps the request sequence). Wait-free.
     fn request_block(&self, frames: u32);

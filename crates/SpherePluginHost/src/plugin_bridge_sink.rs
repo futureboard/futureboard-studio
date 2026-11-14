@@ -382,6 +382,31 @@ impl PluginBridgeSink for SharedRegionSink {
         }
     }
 
+    fn write_sidechain(&self, key: Option<(&[f32], &[f32])>, frames: usize) {
+        let bridge = self.region.bridge();
+        // Same ownership rule as `write_input`: never while the host reads.
+        if self.request_in_flight() {
+            return;
+        }
+        let written = match key {
+            // SAFETY: no request in flight (checked above); the host reads the
+            // plane only after `request_block` publishes the next request.
+            Some((l, r)) => unsafe { bridge.audio_in.write_sidechain(l, r, frames) },
+            None => 0,
+        };
+        // Published by the `request_seq` release that follows.
+        bridge
+            .sidechain_frames
+            .store(written as u32, Ordering::Relaxed);
+    }
+
+    fn sidechain_input_channels(&self) -> u32 {
+        self.region
+            .bridge()
+            .sidechain_input_channels
+            .load(Ordering::Relaxed)
+    }
+
     fn reported_latency_samples(&self) -> u32 {
         self.region
             .bridge()

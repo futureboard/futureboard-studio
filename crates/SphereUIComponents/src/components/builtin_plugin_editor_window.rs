@@ -1040,6 +1040,33 @@ pub type BuiltinTransportSource = std::sync::Arc<dyn Fn() -> bool>;
 pub type BuiltinPreviewNote =
     std::sync::Arc<dyn Fn(&PluginInstanceKey, u8, u8, Option<u8>, &mut gpui::App)>;
 
+/// Reads whether an insert is bypassed in the project (`None` when it is
+/// gone), and flips it as the mixer's bypass button does: one undo step, the
+/// engine told at once. Read it from a task tick, not from a render: it reads
+/// the layout's state.
+#[derive(Clone)]
+pub struct BuiltinInsertBypass {
+    pub is_bypassed: std::sync::Arc<dyn Fn(&PluginInstanceKey, &gpui::App) -> Option<bool>>,
+    pub toggle: std::sync::Arc<dyn Fn(&PluginInstanceKey, &mut gpui::App)>,
+}
+
+/// The insert's sidechain source, as the mixer chip's menu sets it: `label`
+/// reads what the header shows (`None`: the plug-in has no sidechain input,
+/// so the header shows nothing), `entries` builds the picker and `run` runs
+/// one of its rows — one undo step, the engine resynced. Read `label` from a
+/// task tick, not a render: it reads the layout's state.
+#[derive(Clone)]
+pub struct BuiltinInsertSidechain {
+    pub label: std::sync::Arc<dyn Fn(&PluginInstanceKey, &gpui::App) -> Option<String>>,
+    pub entries: std::sync::Arc<
+        dyn Fn(
+            &PluginInstanceKey,
+            &gpui::App,
+        ) -> Vec<crate::components::context_menu::ContextMenuEntry>,
+    >,
+    pub run: std::sync::Arc<dyn Fn(&PluginInstanceKey, String, &mut gpui::App)>,
+}
+
 /// Everything the shared editor window can do against the live host, injected
 /// by `plugin_ops.rs` (the owner of the engine handle and bridge runtime this
 /// window deliberately does not hold). Any member may be `None` while the
@@ -1059,6 +1086,8 @@ pub struct BuiltinEditorHostOps {
     pub band_reduction_source: Option<BuiltinBandReductionSource>,
     pub transport_source: Option<BuiltinTransportSource>,
     pub preview_note: Option<BuiltinPreviewNote>,
+    pub insert_bypass: Option<BuiltinInsertBypass>,
+    pub insert_sidechain: Option<BuiltinInsertSidechain>,
 }
 
 impl BuiltinEditorHostOps {
@@ -1076,6 +1105,8 @@ impl BuiltinEditorHostOps {
             && self.band_reduction_source.is_none()
             && self.transport_source.is_none()
             && self.preview_note.is_none()
+            && self.insert_bypass.is_none()
+            && self.insert_sidechain.is_none()
     }
 }
 

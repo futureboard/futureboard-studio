@@ -2116,6 +2116,34 @@ impl StudioLayout {
             })
         };
 
+        // Insert chip right-click: that insert's sidechain picker, anchored at
+        // the click.
+        let on_insert_context_menu: std::sync::Arc<
+            dyn Fn(&(String, String, f32, f32), &mut Window, &mut gpui::App) + 'static,
+        > = {
+            let this = owner.clone();
+            std::sync::Arc::new(
+                move |(track_id, insert_id, x, y): &(String, String, f32, f32), window, cx| {
+                    let (track_id, insert_id, x, y) = (track_id.clone(), insert_id.clone(), *x, *y);
+                    let window_id = window.window_handle().window_id();
+                    StudioLayout::defer_update(&this, cx, move |this, cx| {
+                        this.try_open_context_menu(
+                            ContextMenuRequest::new(
+                                window_id,
+                                x,
+                                y,
+                                ContextMenuTarget::Extended(ContextTarget::SidechainPicker {
+                                    track_id,
+                                    insert_id,
+                                }),
+                            ),
+                            cx,
+                        );
+                    });
+                },
+            )
+        };
+
         // Output-routing dropdown: select the strip, then open the output
         // picker menu anchored at the click. Selection mirrors `on_context_menu`
         // so the picker and the rest of the mixer agree on the primary strip.
@@ -2441,6 +2469,7 @@ impl StudioLayout {
             on_master_output_picker,
             on_monitor_output_picker,
             on_context_menu: Some(on_context_menu),
+            on_insert_context_menu: Some(on_insert_context_menu),
             on_add_insert,
             on_remove_insert,
             on_toggle_insert_bypass,

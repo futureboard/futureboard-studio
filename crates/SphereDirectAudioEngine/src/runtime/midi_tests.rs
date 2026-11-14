@@ -1177,6 +1177,7 @@ fn bridged_instrument_track(id: &str) -> RuntimeTrack {
             scratch_multi: Vec::new(),
             chain_latency_samples: 0,
             signal_bus: 0,
+            sidechain: None,
         }],
         sends: Vec::new(),
         automation_lanes: Vec::new(),
@@ -1213,6 +1214,7 @@ fn bridged_instrument_track(id: &str) -> RuntimeTrack {
         smoothed_gain_l: 1.0,
         smoothed_gain_r: 1.0,
         wdw_return_index: None,
+        sidechain_tap: Default::default(),
     }
 }
 

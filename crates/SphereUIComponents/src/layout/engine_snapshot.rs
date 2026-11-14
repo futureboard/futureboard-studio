@@ -728,6 +728,10 @@ fn build_engine_inserts_for(
                 params.insert("bridge".to_string(), serde_json::json!(true));
                 params.insert("role".to_string(), serde_json::json!(role));
                 params.insert("signalBus".to_string(), signal_bus_json(slot));
+                if let Some(route) = &slot.sidechain {
+                    // The engine reads it as `runtime::SIDECHAIN_PARAM`.
+                    params.insert("sidechain".to_string(), route.to_json());
+                }
 
                 if crate::perf::engine_sync_debug_enabled() {
                     eprintln!(
@@ -793,6 +797,10 @@ fn build_engine_inserts_for(
                 vsti_output_children_json(slot),
             );
             params.insert("signalBus".to_string(), signal_bus_json(slot));
+            if let Some(route) = &slot.sidechain {
+                // The engine reads it as `runtime::SIDECHAIN_PARAM`.
+                params.insert("sidechain".to_string(), route.to_json());
+            }
 
             Some(EngineInsertSnapshot {
                 id: slot.id.clone(),
