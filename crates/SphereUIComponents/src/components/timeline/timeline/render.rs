@@ -4216,6 +4216,79 @@ mod midi_clip_draw_tests {
         DEFAULT_MIDI_CLIP_BEATS, MIN_MIDI_CLIP_BEATS,
     };
 
+    /// Clicks down the window at one x until a press lands on the Tempo lane,
+    /// and returns how many tempo markers the clicks created in total.
+    fn click_down_the_tempo_lane(
+        cx: &mut gpui::TestAppContext,
+        tool: TimelineTool,
+        clicks: usize,
+    ) -> Vec<i32> {
+        let window = cx.open_window(gpui::size(px(1600.0), px(900.0)), move |_, _| {
+            let mut timeline = Timeline::new();
+            timeline.state.show_tempo_track_lane();
+            timeline.state.active_tool = tool;
+            // Whatever the new project starts with, count only what the
+            // clicks add.
+            timeline.state.tempo_map.points.clear();
+            timeline
+        });
+        cx.run_until_parked();
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        let mut created = Vec::new();
+        // Start under the ruler (a press up there has tempo actions of its
+        // own); the global lanes follow it.
+        for y in (80..400).step_by(4) {
+            let position = gpui::point(px(900.0), px(y as f32));
+            for count in 1..=clicks {
+                vcx.simulate_event(gpui::MouseDownEvent {
+                    button: gpui::MouseButton::Left,
+                    position,
+                    modifiers: gpui::Modifiers::default(),
+                    click_count: count,
+                    first_mouse: false,
+                });
+                vcx.simulate_event(gpui::MouseUpEvent {
+                    button: gpui::MouseButton::Left,
+                    position,
+                    modifiers: gpui::Modifiers::default(),
+                    click_count: count,
+                });
+            }
+            vcx.run_until_parked();
+            let n = window
+                .update(&mut vcx, |t, _, _| {
+                    let n = t.state.tempo_map.points.len();
+                    t.state.tempo_map.points.clear();
+                    n
+                })
+                .expect("window is open");
+            if n > 0 {
+                created.push(y);
+            }
+        }
+        created
+    }
+
+    /// One click with the Draw tool adds a tempo marker; one click with the
+    /// pointer only selects, and a double-click still adds.
+    #[gpui::test]
+    fn a_draw_click_on_the_tempo_lane_adds_a_marker(cx: &mut gpui::TestAppContext) {
+        assert!(!click_down_the_tempo_lane(cx, TimelineTool::Pen, 1).is_empty());
+    }
+
+    #[gpui::test]
+    fn a_pointer_click_on_the_tempo_lane_adds_nothing(cx: &mut gpui::TestAppContext) {
+        assert_eq!(
+            click_down_the_tempo_lane(cx, TimelineTool::Pointer, 1),
+            Vec::<i32>::new()
+        );
+    }
+
+    #[gpui::test]
+    fn a_double_click_on_the_tempo_lane_adds_a_marker(cx: &mut gpui::TestAppContext) {
+        assert!(!click_down_the_tempo_lane(cx, TimelineTool::Pointer, 2).is_empty());
+    }
+
     #[gpui::test]
     fn lane_track_index_follows_reorder_insert_and_delete(cx: &mut gpui::TestAppContext) {
         let window = cx.open_window(gpui::size(px(1600.0), px(900.0)), |_, _| {

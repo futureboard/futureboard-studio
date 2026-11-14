@@ -2917,6 +2917,15 @@ impl Timeline {
         };
         let (beat, bpm, click_count) = (down.beat, down.bpm, down.click_count);
 
+        // The Draw tool adds a marker with one click anywhere off a marker —
+        // on the ramp line too, which is exactly where one gets drawn — the
+        // same as a double-click with the other tools.
+        let draw = self.state.active_tool == TimelineTool::Pen;
+        if draw && down.point_id.is_none() && !down.alt {
+            self.add_tempo_marker_and_drag(beat, bpm, cx);
+            return;
+        }
+
         // On the drawn line between two markers: bend that ramp. Alt +
         // double-click straightens it again.
         if let (Some(left_id), None) = (down.segment_left_id.clone(), down.point_id.as_ref()) {
@@ -2963,19 +2972,7 @@ impl Timeline {
 
         if click_count >= 2 {
             if down.point_id.is_none() {
-                let origin = self.capture_tempo_state();
-                self.tempo_gesture_linear_anchors = self.state.capture_linear_clip_anchors();
-                if let Some(id) = self.state.add_tempo_point(beat, bpm) {
-                    self.state.select_tempo_point(&id);
-                    // The double-click both creates the marker and starts a
-                    // drag: keep the pre-create snapshot as the gesture origin
-                    // so the release records ONE entry covering both.
-                    self.tempo_gesture_origin = Some(("Add Tempo Marker", origin));
-                    self.tempo_drag = Some(TempoLaneDrag::Point(TempoPointDrag {
-                        point_id: id,
-                        moved: true,
-                    }));
-                }
+                self.add_tempo_marker_and_drag(beat, bpm, cx);
             }
             cx.notify();
             return;
@@ -2994,6 +2991,26 @@ impl Timeline {
         }
 
         self.state.clear_tempo_point_selection();
+        cx.notify();
+    }
+
+    /// Adds a tempo marker at `beat`/`bpm` and arms a drag on it, so the press
+    /// that created it can also place it.
+    fn add_tempo_marker_and_drag(&mut self, beat: f64, bpm: f64, cx: &mut Context<Self>) {
+        use crate::components::timeline::timeline_state::{TempoLaneDrag, TempoPointDrag};
+        let origin = self.capture_tempo_state();
+        self.tempo_gesture_linear_anchors = self.state.capture_linear_clip_anchors();
+        if let Some(id) = self.state.add_tempo_point(beat, bpm) {
+            self.state.select_tempo_point(&id);
+            // The press both creates the marker and starts a drag: keep the
+            // pre-create snapshot as the gesture origin so the release records
+            // ONE entry covering both.
+            self.tempo_gesture_origin = Some(("Add Tempo Marker", origin));
+            self.tempo_drag = Some(TempoLaneDrag::Point(TempoPointDrag {
+                point_id: id,
+                moved: true,
+            }));
+        }
         cx.notify();
     }
 
