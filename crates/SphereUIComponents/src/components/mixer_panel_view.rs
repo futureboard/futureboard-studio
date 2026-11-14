@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use gpui::{
     div, px, App, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
-    StatefulInteractiveElement, Styled, Window,
+    StatefulInteractiveElement, Styled, Subscription, Window,
 };
 
 use crate::components::mixer_master_strip_view::{
@@ -40,6 +40,9 @@ pub struct MixerPanelView {
     last_structure_key: u64,
     last_master_display_sig: u64,
     last_channel_display_sig: u64,
+    /// Selection and live control previews are view state, so they do not use
+    /// the persisted-edit callbacks that invalidate the mixer strips.
+    _timeline_observer: Subscription,
 }
 
 impl MixerPanelView {
@@ -49,7 +52,39 @@ impl MixerPanelView {
         tree_sidebar: Entity<MixerTreeSidebar>,
         master_strip: Entity<MixerMasterStripView>,
         meter_layout: SharedMeterLayout,
+        cx: &mut Context<Self>,
     ) -> Self {
+        let state = &timeline.read(cx).state;
+        let mut selected_track_id = state.selection.selected_track_id.clone();
+        let mut selected_track_ids = state.selection.selected_track_ids.clone();
+        let mut volume_previews = state.track_volume_previews.clone();
+        let mut master_volume_preview = state.master_volume_preview;
+        let mut track_structure = (state.tracks.len(), state.track_names_revision);
+        let mut pan_gesture_active = !state.track_pan_gesture_origin.is_empty();
+        let _timeline_observer = cx.observe(&timeline, move |_, timeline, cx| {
+            let state = &timeline.read(cx).state;
+            let next_structure = (state.tracks.len(), state.track_names_revision);
+            // Pan previews update track.pan directly. Keep both surfaces live
+            // during the gesture and repaint once more on release/cancel.
+            let next_pan_gesture_active = !state.track_pan_gesture_origin.is_empty();
+            if selected_track_id == state.selection.selected_track_id
+                && selected_track_ids == state.selection.selected_track_ids
+                && volume_previews == state.track_volume_previews
+                && master_volume_preview == state.master_volume_preview
+                && track_structure == next_structure
+                && !pan_gesture_active
+                && !next_pan_gesture_active
+            {
+                return;
+            }
+            selected_track_id.clone_from(&state.selection.selected_track_id);
+            selected_track_ids.clone_from(&state.selection.selected_track_ids);
+            volume_previews.clone_from(&state.track_volume_previews);
+            master_volume_preview = state.master_volume_preview;
+            track_structure = next_structure;
+            pan_gesture_active = next_pan_gesture_active;
+            cx.notify();
+        });
         Self {
             owner,
             timeline,
@@ -59,6 +94,7 @@ impl MixerPanelView {
             last_structure_key: u64::MAX,
             last_master_display_sig: u64::MAX,
             last_channel_display_sig: u64::MAX,
+            _timeline_observer,
         }
     }
 

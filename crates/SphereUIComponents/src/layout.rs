@@ -1056,13 +1056,14 @@ impl StudioLayout {
                 components::master_transport_meter::inert_master_volume_callbacks(),
             )
         });
-        let mixer_panel = cx.new(|_cx| {
+        let mixer_panel = cx.new(|cx| {
             components::MixerPanelView::new(
                 studio_entity.clone(),
                 timeline.clone(),
                 mixer_tree_sidebar.clone(),
                 mixer_master_strip.clone(),
                 mixer_meter_layout.clone(),
+                cx,
             )
         });
         let effect_editor_tab = cx
@@ -1243,10 +1244,13 @@ impl StudioLayout {
                     // path. Deferred for the same nested-update reason as the
                     // project-changed callback below; view-only dirty so the
                     // audio poll never rebuilds the graph for it.
+                    // Invalidate the strips directly: a hidden ClipEditorPanel
+                    // no longer forwards timeline notifications to the dock.
                     let target = target.clone();
                     cx.defer(move |cx| {
-                        let _ = target.update(cx, |this, _cx| {
+                        let _ = target.update(cx, |this, cx| {
                             this.mark_dirty_view_only();
+                            this.mixer_panel.update(cx, |_, cx| cx.notify());
                         });
                     });
                 })));
@@ -1265,10 +1269,13 @@ impl StudioLayout {
                     // after the current update stack unwinds, which is safe for
                     // both call paths (dirty is a flag the audio poll reads on
                     // its own cadence). See PART B of the shortcuts task.
+                    // Edits (including undo/redo) still refresh the strips;
+                    // timeline viewport notifications do not use this path.
                     let target = target.clone();
                     cx.defer(move |cx| {
-                        let _ = target.update(cx, |this, _cx| {
+                        let _ = target.update(cx, |this, cx| {
                             this.mark_dirty();
+                            this.mixer_panel.update(cx, |_, cx| cx.notify());
                         });
                     });
                 })));

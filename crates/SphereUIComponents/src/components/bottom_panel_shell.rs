@@ -41,7 +41,9 @@ pub struct BottomPanelShell {
     _owner_observer: gpui::Subscription,
     /// The Editor surface has its own ARA/Audio Editor sub-tabs. Observe it so
     /// the shell can update the ARA pop-out affordance when that sub-tab
-    /// changes, even though the shell itself is not the tab state owner.
+    /// changes while Editor is visible. A hidden editor follows every timeline
+    /// notification too; forwarding those would rebuild the visible Mixer on
+    /// every arrangement scroll, bypassing the shell's cached view.
     _clip_editor_observer: gpui::Subscription,
 }
 
@@ -54,7 +56,14 @@ impl BottomPanelShell {
         cx: &mut Context<Self>,
     ) -> Self {
         let _owner_observer = cx.observe(&owner, |_, _, cx| cx.notify());
-        let _clip_editor_observer = cx.observe(&clip_editor, |_, _, cx| cx.notify());
+        let _clip_editor_observer = cx.observe(&clip_editor, |shell, _, cx| {
+            let owner = shell.owner.read(cx);
+            // EffectEditor currently routes to ClipEditorPanel too; see
+            // render_active_tab's persisted-layout fallback.
+            if owner.bottom_panel_docked() && owner.active_bottom_tab() != BottomTab::Mixer {
+                cx.notify();
+            }
+        });
         Self {
             owner,
             mixer_panel,
