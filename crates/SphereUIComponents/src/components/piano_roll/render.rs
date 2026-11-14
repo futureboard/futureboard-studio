@@ -553,6 +553,25 @@ impl Render for PianoRoll {
             }
             self.last_editing_clip = clip_id.clone();
             self.fitted_clip_id = None;
+            // A DrumStep track's clips open on the step grid, and leaving one
+            // for any other track goes back to the piano roll. Only a change
+            // of kind switches the view, so a view picked by hand stays while
+            // the user moves between clips of the same kind.
+            let drum_step = clip_id.as_deref().is_some_and(|cid| {
+                self.timeline
+                    .read(cx)
+                    .state
+                    .find_clip(cid)
+                    .is_some_and(|(track, _)| track.drum_step)
+            });
+            if drum_step != self.on_drum_step_track {
+                self.on_drum_step_track = drum_step;
+                if drum_step {
+                    self.set_step_mode(true, cx);
+                } else {
+                    self.set_drum_mode(false, cx);
+                }
+            }
         }
 
         // The frame every conversion is measured in, resolved *before* the fit
@@ -1159,12 +1178,63 @@ impl PianoRoll {
                 "pr-mode-drum",
                 assets::ICON_DRUM_PATH,
                 "Drum editor: lanes by sound, one hit per step".into(),
-                drum_mode,
+                drum_mode && !self.step_mode,
                 cx.listener(|this, _, _w, cx| {
                     this.cancel_active_gesture(cx);
+                    // Step → MIDI: the step view back to the drum lanes.
                     this.set_drum_mode(true, cx);
                 }),
+            ))
+            .child(tool_segment(
+                "pr-mode-step",
+                assets::ICON_SQUARE_PATH,
+                "MIDI → Step: edit this clip as a step sequencer (the notes stay the clip's MIDI)"
+                    .into(),
+                self.step_mode,
+                cx.listener(|this, _, _w, cx| {
+                    this.cancel_active_gesture(cx);
+                    this.set_step_mode(true, cx);
+                }),
             ));
+        if self.step_mode {
+            // Note repeat: how many hits a new step plays, and what Alt-click
+            // rewrites a step to.
+            let current = self.step_repeat;
+            for repeat in step_grid::STEP_REPEATS {
+                editor_mode = editor_mode.child(tool_text_segment(
+                    ("pr-step-repeat", usize::from(repeat)),
+                    format!("×{repeat}"),
+                    if repeat == 1 {
+                        "One hit per step".to_string()
+                    } else {
+                        format!(
+                            "Note repeat: {repeat} hits per step. New steps play it; \
+                             Alt-click a step to give it this count"
+                        )
+                    }
+                    .into(),
+                    repeat == current,
+                    cx.listener(move |this, _, _w, cx| this.set_step_repeat(repeat, cx)),
+                ));
+            }
+            let off_grid = self.step_off_grid_count(cx);
+            if off_grid > 0 {
+                editor_mode = editor_mode.child(tool_text_segment(
+                    ("pr-step-snap", 0usize),
+                    format!("Snap {off_grid} off-grid"),
+                    format!(
+                        "{off_grid} note(s) sit between the step lines (amber). \
+                         Move them onto the nearest step — one undo"
+                    )
+                    .into(),
+                    false,
+                    cx.listener(|this, _, _w, cx| {
+                        this.cancel_active_gesture(cx);
+                        this.snap_steps_to_grid(cx);
+                    }),
+                ));
+            }
+        }
         if drum_mode {
             // Which lanes: the whole kit, or only what the clip plays.
             let lanes = self.drum_lanes;
@@ -1786,7 +1856,11 @@ impl PianoRoll {
         ruler.extend(self.build_stretch_band(cx, clip_id));
         // Under the editable notes and over the grid: context, not content.
         let context_notes = self.build_context_notes(cx, view_w, view_h);
-        let notes_geo = self.build_note_elements(cx, clip_id, track_color);
+        let notes_geo = if self.step_mode {
+            self.build_step_cells(cx, clip_id, track_color, clip_len)
+        } else {
+            self.build_note_elements(cx, clip_id, track_color)
+        };
         let stretch_handles = self.build_stretch_handles(cx, clip_id);
         let quantize_preview = self.build_quantize_preview(cx, clip_id);
         let marquee_overlay = self.build_marquee_overlay();
@@ -1806,7 +1880,11 @@ impl PianoRoll {
                 .justify_center()
                 .text_size(px(typography::UI_XS))
                 .text_color(Colors::text_muted())
-                .child("Draw notes with the Draw tool, or record onto this clip")
+                .child(if self.step_mode {
+                    "Click a step to add a hit; Alt-click a hit to give it the Repeat count"
+                } else {
+                    "Draw notes with the Draw tool, or record onto this clip"
+                })
                 .into_any_element()
         });
         let note_inspector = self
@@ -3707,6 +3785,110 @@ impl PianoRoll {
                 }),
             )
             .into_any_element()
+    }
+
+    /// The step view's grid: every step of every visible lane as a cell,
+    /// filled where the clip plays one. Painted in one canvas — a 64-step
+    /// pattern over a kit is a few thousand cells, too many for an element
+    /// each. Clicks are handled by the grid (`press_step`), not by the cells.
+    pub(super) fn build_step_cells(
+        &self,
+        cx: &Context<Self>,
+        clip_id: &str,
+        track_color: gpui::Rgba,
+        clip_len: f32,
+    ) -> Vec<gpui::AnyElement> {
+        let (view_w, view_h) = self.grid_view_size();
+        let row_h = self.note_row_h();
+        let step = self.step_view_beats();
+        let steps = step_grid::step_count(clip_len, step);
+        let step_w = (self.clip_beat_to_x(step) - self.clip_beat_to_x(0.0)).max(0.0);
+        if steps == 0 || step_w < 1.0 {
+            return Vec::new();
+        }
+        // A cell is inset so neighbours read as separate pads.
+        let gap = (step_w * 0.12).clamp(1.0, 3.0);
+        let notes: Vec<MidiNoteState> = self
+            .timeline
+            .read(cx)
+            .state
+            .midi_clip_notes(clip_id)
+            .map(|notes| notes.to_vec())
+            .unwrap_or_default();
+        let beats_per_bar = self.bar_beats().max(step);
+        let first_step = ((self.x_to_clip_beat(0.0) / step).floor().max(0.0)) as usize;
+        let last_step =
+            (((self.x_to_clip_beat(view_w) / step).ceil().max(0.0)) as usize + 1).min(steps);
+
+        // (x, y, w, h, colour) per quad, resolved here so the paint closure
+        // only walks a list.
+        let mut quads: Vec<(f32, f32, f32, f32, gpui::Rgba)> = Vec::new();
+        let empty = Colors::with_alpha(Colors::text_primary(), 0.05);
+        let empty_beat = Colors::with_alpha(Colors::text_primary(), 0.09);
+        let warning = Colors::status_warning();
+        for row in self.visible_drum_rows(view_h) {
+            let Some(&pitch) = self.drum_rows.get(row) else {
+                continue;
+            };
+            let y = row as f32 * row_h - self.scroll_y + gap;
+            let h = (row_h - 2.0 * gap).max(1.0);
+            let cells = step_grid::lane_cells(&notes, pitch, step);
+            for index in first_step..last_step {
+                let x = self.clip_beat_to_x(index as f32 * step) + gap * 0.5;
+                let w = (step_w - gap).max(1.0);
+                let beat = index as f32 * step;
+                let on_beat = (beat - beat.round()).abs() < 1e-4;
+                let on_bar = (beat / beats_per_bar - (beat / beats_per_bar).round()).abs() < 1e-4;
+                let Some(cell) = cells.iter().find(|cell| cell.index == index) else {
+                    quads.push((
+                        x,
+                        y,
+                        w,
+                        h,
+                        if on_bar || on_beat { empty_beat } else { empty },
+                    ));
+                    continue;
+                };
+                // Velocity is the fill's strength; a muted step is faint and
+                // an off-grid one amber, so it is found before it is snapped.
+                let mut color = if cell.on_grid { track_color } else { warning };
+                color.a = if cell.muted {
+                    0.2
+                } else {
+                    0.45 + 0.55 * (f32::from(cell.velocity) / 127.0)
+                };
+                quads.push((x, y, w, h, color));
+                // A ratchet: one notch per extra hit, so ×4 reads as four.
+                if cell.repeat > 1 && cell.on_grid {
+                    let notch = Colors::with_alpha(Colors::surface_canvas(), 0.85);
+                    for hit in 1..cell.repeat {
+                        let nx = x + w * f32::from(hit) / f32::from(cell.repeat);
+                        quads.push((nx - 0.5, y + h * 0.25, 1.0, h * 0.5, notch));
+                    }
+                }
+            }
+        }
+        let scale = self.window_scale;
+        vec![gpui::canvas(
+            |_, _, _| {},
+            move |bounds, (), window, _| {
+                let origin = bounds.origin;
+                for (x, y, w, h, color) in &quads {
+                    let rect = gpui::Bounds::new(
+                        origin
+                            + gpui::point(
+                                px(grid_render::snap(*x, scale)),
+                                px(grid_render::snap(*y, scale)),
+                            ),
+                        gpui::size(px(*w), px(*h)),
+                    );
+                    window.paint_quad(gpui::fill(rect, *color).corner_radii(px(2.0)));
+                }
+            },
+        )
+        .absolute()
+        .inset_0()
+        .into_any_element()]
     }
 
     pub(super) fn build_note_elements(

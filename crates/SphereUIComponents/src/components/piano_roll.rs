@@ -53,7 +53,8 @@ mod native_menus;
 pub mod playhead;
 mod render;
 pub mod scope;
-pub use drum_map::DrumLanes;
+mod step_grid;
+pub use drum_map::{DrumLanes, DrumOrder};
 mod stretch;
 mod tools_panel;
 
@@ -1573,8 +1574,23 @@ pub struct PianoRoll {
     /// Drum editor mode: the pitch axis is a list of drum lanes rather than
     /// 128 keys, notes are hits, and the Draw tool toggles a hit per step.
     drum_mode: bool,
+    /// Step sequencer view (always in drum mode): each lane is a row of steps
+    /// read from the clip's notes, and a click fills or clears a step. The
+    /// notes stay the clip's only data — see [`step_grid`].
+    step_mode: bool,
+    /// How many hits a step plays when one is added or re-repeated (a
+    /// ratchet), one of [`step_grid::STEP_REPEATS`].
+    step_repeat: u8,
+    /// Whether the clip being edited is on a DrumStep track, so the view
+    /// switches only when the editor moves to a track of the other kind.
+    on_drum_step_track: bool,
     /// Which lanes drum mode lists.
     drum_lanes: DrumLanes,
+    /// Which way the lanes run: kick at the top, or reversed.
+    drum_order: DrumOrder,
+    /// The lane under the pointer, in the lane list or the grid. It lights
+    /// that row in both, so a hit reads against its sound's name.
+    drum_hover_lane: Option<u8>,
     /// The lanes, top to bottom, refreshed each render from the edited clip
     /// (see [`Self::refresh_drum_rows`]). Every drum-mode row mapping reads it.
     drum_rows: Vec<u8>,
@@ -1893,7 +1909,12 @@ impl PianoRoll {
             ppb: 80.0,
             row_h: DEFAULT_ROW_H,
             drum_mode: false,
+            step_mode: false,
+            step_repeat: 1,
+            on_drum_step_track: false,
             drum_lanes: DrumLanes::Kit,
+            drum_order: DrumOrder::LowFirst,
+            drum_hover_lane: None,
             drum_rows: Vec::new(),
             drum_names: std::collections::HashMap::new(),
             snap_on: true,
@@ -2792,7 +2813,14 @@ impl PianoRoll {
     /// Switch between the piano roll and the drum editor. The view keeps the
     /// same notes; the row under the middle of the view is kept in view.
     pub fn set_drum_mode(&mut self, on: bool, cx: &mut Context<Self>) {
+        // Leaving the drum editor leaves the step view with it; going back to
+        // the drum lanes from the step view is a mode change too.
+        let leaving_steps = self.step_mode;
+        self.step_mode = false;
         if self.drum_mode == on {
+            if leaving_steps {
+                cx.notify();
+            }
             return;
         }
         self.drum_mode = on;
@@ -2804,6 +2832,191 @@ impl PianoRoll {
         } else {
             self.scroll_to_pitch(60);
         }
+        cx.notify();
+    }
+
+    pub fn step_mode(&self) -> bool {
+        self.step_mode
+    }
+
+    /// MIDI → Step: show the clip on the step grid (over the drum lanes).
+    /// Nothing in the clip changes; notes off the grid are flagged, not moved.
+    pub fn set_step_mode(&mut self, on: bool, cx: &mut Context<Self>) {
+        if !on {
+            // Step → MIDI: back to the drum lanes the steps are drawn over.
+            if self.step_mode {
+                self.step_mode = false;
+                cx.notify();
+            }
+            return;
+        }
+        if !self.drum_mode {
+            self.set_drum_mode(true, cx);
+        }
+        self.step_mode = true;
+        cx.notify();
+    }
+
+    pub fn step_repeat(&self) -> u8 {
+        self.step_repeat
+    }
+
+    pub fn set_step_repeat(&mut self, repeat: u8, cx: &mut Context<Self>) {
+        let repeat = if step_grid::STEP_REPEATS.contains(&repeat) {
+            repeat
+        } else {
+            1
+        };
+        if self.step_repeat != repeat {
+            self.step_repeat = repeat;
+            cx.notify();
+        }
+    }
+
+    /// The step length the step view uses: the editor's grid when it is a
+    /// note value, a sixteenth when the grid is a bar, free or adaptive —
+    /// none of which is a step a drum pattern is written in.
+    pub(super) fn step_view_beats(&self) -> f32 {
+        match self.grid_res {
+            GridRes::Quarter
+            | GridRes::Eighth
+            | GridRes::Sixteenth
+            | GridRes::ThirtySecond
+            | GridRes::SixtyFourth
+            | GridRes::QuarterTriplet
+            | GridRes::EighthTriplet
+            | GridRes::SixteenthTriplet => self.grid_res.fixed_beats(),
+            _ => GridRes::Sixteenth.fixed_beats(),
+        }
+    }
+
+    /// Fills or clears the step under (`lx`, `ly`). `apply_repeat` (Alt)
+    /// rewrites a filled step with the current repeat count instead of
+    /// clearing it. One undo entry either way.
+    fn press_step(&mut self, lx: f32, ly: f32, apply_repeat: bool, cx: &mut Context<Self>) {
+        let Some(clip_id) = self.editing_clip_id(cx) else {
+            return;
+        };
+        let Some(pitch) =
+            drum_map::drum_row_at(&self.drum_rows, ly, self.scroll_y, self.note_row_h())
+        else {
+            return;
+        };
+        let step = self.step_view_beats();
+        let Some(index) = step_grid::step_index(self.x_to_clip_beat(lx), step) else {
+            return;
+        };
+        let notes: Vec<MidiNoteState> = self
+            .timeline
+            .read(cx)
+            .state
+            .midi_clip_notes(&clip_id)
+            .map(|notes| notes.to_vec())
+            .unwrap_or_default();
+        let cell = step_grid::lane_cells(&notes, pitch, step)
+            .into_iter()
+            .find(|cell| cell.index == index);
+        let removed: Vec<MidiNoteState> = cell
+            .as_ref()
+            .map(|cell| {
+                notes
+                    .iter()
+                    .filter(|n| cell.ids.contains(&n.id))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let (label, added) = match &cell {
+            None => {
+                let channel = self.active_note_channel(cx);
+                self.begin_preview_note(pitch, step_grid::STEP_VELOCITY, "step_add", cx);
+                (
+                    "Add Step",
+                    step_grid::step_notes(
+                        pitch,
+                        index,
+                        step,
+                        self.step_repeat,
+                        step_grid::STEP_VELOCITY,
+                        channel,
+                    ),
+                )
+            }
+            Some(cell) if apply_repeat => (
+                "Repeat Step",
+                step_grid::step_notes(
+                    pitch,
+                    index,
+                    step,
+                    self.step_repeat,
+                    cell.velocity,
+                    cell.channel,
+                ),
+            ),
+            Some(_) => ("Clear Step", Vec::new()),
+        };
+        self.selection
+            .retain(|id| !removed.iter().any(|n| n.id == *id));
+        self.run_edit_command(
+            EditCommand::ReplaceMidiNotes {
+                label,
+                clip_id,
+                removed,
+                added,
+            },
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// How many of the edited clip's notes sit off the step grid.
+    pub(super) fn step_off_grid_count(&self, cx: &Context<Self>) -> usize {
+        let Some(clip_id) = self.editing_clip_id(cx) else {
+            return 0;
+        };
+        self.timeline
+            .read(cx)
+            .state
+            .midi_clip_notes(&clip_id)
+            .map(|notes| step_grid::off_grid_count(notes, self.step_view_beats()))
+            .unwrap_or(0)
+    }
+
+    /// Moves every off-grid note onto its nearest step line — what the step
+    /// view flags but never does on its own. One undo entry.
+    pub(super) fn snap_steps_to_grid(&mut self, cx: &mut Context<Self>) {
+        let Some(clip_id) = self.editing_clip_id(cx) else {
+            return;
+        };
+        let notes: Vec<MidiNoteState> = self
+            .timeline
+            .read(cx)
+            .state
+            .midi_clip_notes(&clip_id)
+            .map(|notes| notes.to_vec())
+            .unwrap_or_default();
+        let (moved, dropped) = step_grid::snap_off_grid(&notes, self.step_view_beats());
+        if moved.is_empty() && dropped.is_empty() {
+            return;
+        }
+        let mut removed: Vec<MidiNoteState> = dropped.clone();
+        removed.extend(
+            notes
+                .iter()
+                .filter(|n| moved.iter().any(|m| m.id == n.id))
+                .cloned(),
+        );
+        self.selection
+            .retain(|id| !dropped.iter().any(|n| n.id == *id));
+        self.run_edit_command(
+            EditCommand::ReplaceMidiNotes {
+                label: "Snap to Steps",
+                clip_id,
+                removed,
+                added: moved,
+            },
+            cx,
+        );
         cx.notify();
     }
 
@@ -3981,6 +4194,13 @@ impl PianoRoll {
         let Some(clip_id) = self.editing_clip_id(cx) else {
             return;
         };
+
+        // The step view: a click fills or clears the step under it, whatever
+        // the tool; Alt rewrites a filled step with the current repeat count.
+        if self.step_mode {
+            self.press_step(lx, ly, event.modifiers.alt, cx);
+            return;
+        }
 
         let marquee_modifier = (event.modifiers.shift && self.tool != PianoTool::Draw)
             || event.modifiers.control
@@ -7129,6 +7349,55 @@ fn tool_segment(
         } else {
             Colors::text_muted()
         }))
+}
+
+/// [`tool_segment`] with a short label instead of an icon (the step view's
+/// "×2" repeat counts), sized to its text.
+fn tool_text_segment(
+    id: impl Into<gpui::ElementId>,
+    label: String,
+    tip: gpui::SharedString,
+    active: bool,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    use crate::theme::{radius, size, space, typography};
+    let track = Colors::surface_input();
+    let rest = if active {
+        Colors::composite(track, Colors::state_selected())
+    } else {
+        Colors::with_alpha(track, 0.0)
+    };
+    let hover = Colors::composite(if active { rest } else { track }, Colors::state_hover());
+    let pressed = Colors::composite(if active { rest } else { track }, Colors::state_recessed());
+    div()
+        .id(id)
+        .role(gpui::Role::Button)
+        .aria_label(tip.clone())
+        .aria_toggled(if active {
+            gpui::Toggled::True
+        } else {
+            gpui::Toggled::False
+        })
+        .flex()
+        .items_center()
+        .justify_center()
+        .min_w(px(size::DENSE))
+        .px(px(space::TIGHT))
+        .h(px(size::DENSE))
+        .rounded(px(radius::inner(radius::CONTROL, space::HAIR)))
+        .bg(rest)
+        .cursor(gpui::CursorStyle::PointingHand)
+        .hover(move |s| s.bg(hover))
+        .active(move |s| s.bg(pressed))
+        .tooltip(crate::components::controls::fb_tooltip(tip))
+        .on_click(on_click)
+        .text_size(px(typography::DENSE_LABEL))
+        .text_color(if active {
+            Colors::accent_primary()
+        } else {
+            Colors::text_muted()
+        })
+        .child(label)
 }
 
 /// The inset strip the tool segments sit in.

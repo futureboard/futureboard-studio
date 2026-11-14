@@ -345,6 +345,10 @@ pub struct TrackState {
     pub takes_expanded: bool,
     /// Set while the track is frozen. Saved with the track (v60).
     pub freeze: Option<TrackFreeze>,
+    /// A DrumStep track: an Instrument track made for drum patterns, whose
+    /// MIDI clips open in the MIDI editor's step sequencer. Its clips are
+    /// ordinary MIDI clips — this only picks the editor's view. Saved (v66).
+    pub drum_step: bool,
 }
 
 impl TrackState {
@@ -586,6 +590,7 @@ impl TimelineState {
             takes: Vec::new(),
             takes_expanded: false,
             freeze: None,
+            drum_step: false,
             instrument_plugin_instance_id: None,
             builtin_soundfont_player: false,
             soundfont_path: None,

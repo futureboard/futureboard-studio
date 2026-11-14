@@ -1149,6 +1149,7 @@ mod tests {
             takes: Vec::new(),
             takes_expanded: false,
             freeze: None,
+            drum_step: false,
         });
 
         let entries = collect_waveform_restore_entries(&project, Path::new("/tmp/unused"));
@@ -1191,6 +1192,7 @@ mod tests {
             takes: Vec::new(),
             takes_expanded: false,
             freeze: None,
+            drum_step: false,
         });
 
         let root = PathBuf::from("/proj");
@@ -1233,6 +1235,7 @@ mod tests {
             takes: Vec::new(),
             takes_expanded: false,
             freeze: None,
+            drum_step: false,
         });
 
         let entries = collect_waveform_restore_entries(&project, Path::new("/tmp"));

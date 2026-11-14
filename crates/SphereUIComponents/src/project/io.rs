@@ -2137,6 +2137,7 @@ mod tests {
             takes: Vec::new(),
             takes_expanded: false,
             freeze: None,
+            drum_step: false,
         });
 
         let project_file = root.join("Portable.fbproj");
@@ -2219,6 +2220,7 @@ mod tests {
             takes: Vec::new(),
             takes_expanded: false,
             freeze: None,
+            drum_step: false,
         }
     }
 
@@ -3911,6 +3913,7 @@ mod tests {
             takes: Vec::new(),
             takes_expanded: false,
             freeze: None,
+            drum_step: false,
         });
 
         let archive = root.join("My Song.zip");
@@ -4007,6 +4010,7 @@ mod tests {
             takes: Vec::new(),
             takes_expanded: false,
             freeze: None,
+            drum_step: false,
         });
 
         let archive = root.join("FilmScore.zip");
@@ -4119,6 +4123,7 @@ mod tests {
             takes: Vec::new(),
             takes_expanded: false,
             freeze: None,
+            drum_step: false,
         });
 
         let file_a = root_a.join("ProjectA.fbproj");
@@ -4201,6 +4206,7 @@ mod tests {
             takes: Vec::new(),
             takes_expanded: false,
             freeze: None,
+            drum_step: false,
         });
 
         let archive = root.join("MissingVid.zip");
@@ -4264,6 +4270,7 @@ mod tests {
             takes: Vec::new(),
             takes_expanded: false,
             freeze: None,
+            drum_step: false,
         });
 
         let project_file = project_dir.join("MyProject.fbproj");

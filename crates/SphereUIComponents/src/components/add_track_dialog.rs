@@ -119,6 +119,9 @@ type StringCb = Arc<dyn Fn(&String, &mut Window, &mut App) + 'static>;
 pub enum AddTrackKind {
     Audio,
     Instrument,
+    /// An Instrument track with the built-in Drum Sampler, whose clips open
+    /// in the MIDI editor's step sequencer.
+    DrumStep,
     Midi,
     Automation,
     Folder,
@@ -191,6 +194,7 @@ impl AddTrackKind {
         match self {
             Self::Audio => "add-track.kind.audio",
             Self::Instrument => "add-track.kind.instrument",
+            Self::DrumStep => "add-track.kind.drumstep",
             Self::Midi => "add-track.kind.midi",
             Self::Plugin => "add-track.kind.plugin",
             Self::Bus => "add-track.kind.bus",
@@ -206,6 +210,7 @@ impl AddTrackKind {
         match self {
             Self::Audio => "add-track.description.audio",
             Self::Instrument => "add-track.description.instrument",
+            Self::DrumStep => "add-track.description.drumstep",
             Self::Midi => "add-track.description.midi",
             Self::Plugin => "add-track.description.plugin",
             Self::Bus => "add-track.description.bus",
@@ -221,6 +226,7 @@ impl AddTrackKind {
         match self {
             Self::Audio => "Audio",
             Self::Instrument => "Instrument",
+            Self::DrumStep => "Step",
             Self::Midi => "MIDI",
             Self::Automation => "Automation",
             Self::Folder => "Folder",
@@ -237,6 +243,7 @@ impl AddTrackKind {
         match self {
             Self::Audio => "add-track.tab.audio",
             Self::Instrument => "add-track.tab.instrument",
+            Self::DrumStep => "add-track.tab.drumstep",
             Self::Midi => "add-track.tab.midi",
             Self::Plugin => "add-track.tab.plugin",
             Self::Bus => "add-track.tab.bus",
@@ -252,6 +259,7 @@ impl AddTrackKind {
         match self {
             Self::Audio => "Audio Track",
             Self::Instrument => "Instrument Track",
+            Self::DrumStep => "DrumStep",
             Self::Midi => "MIDI Track",
             Self::Automation => "Automation Track",
             Self::Folder => "Folder Track",
@@ -267,6 +275,7 @@ impl AddTrackKind {
         match self {
             Self::Audio => assets::ICON_MIC_PATH,
             Self::Instrument => assets::ICON_CPU_PATH,
+            Self::DrumStep => assets::ICON_DRUM_PATH,
             Self::Midi => assets::ICON_MUSIC_PATH,
             Self::Automation => assets::ICON_AUTOMATION_PATH,
             Self::Folder => assets::ICON_FOLDER_PATH,
@@ -281,7 +290,7 @@ impl AddTrackKind {
     pub fn native_track_type(self) -> Option<TrackType> {
         match self {
             Self::Audio => Some(TrackType::Audio),
-            Self::Instrument => Some(TrackType::Instrument),
+            Self::Instrument | Self::DrumStep => Some(TrackType::Instrument),
             Self::Midi => Some(TrackType::Midi),
             Self::Bus => Some(TrackType::Bus),
             Self::Return => Some(TrackType::Return),
@@ -292,7 +301,7 @@ impl AddTrackKind {
 
     pub fn default_input(self) -> &'static str {
         match self {
-            Self::Midi | Self::Instrument => "All MIDI Inputs",
+            Self::Midi | Self::Instrument | Self::DrumStep => "All MIDI Inputs",
             // An Audio track starts with no input: creating one must never
             // open a capture device the user did not choose.
             Self::Audio => NO_AUDIO_INPUT_LABEL,
@@ -305,6 +314,7 @@ impl AddTrackKind {
         &[
             Self::Audio,
             Self::Instrument,
+            Self::DrumStep,
             Self::Midi,
             Self::Bus,
             Self::Automation,
@@ -1376,9 +1386,12 @@ fn type_fields(
                 ))
                 .into_any_element()
         }
-        AddTrackKind::Instrument => {
+        AddTrackKind::Instrument | AddTrackKind::DrumStep => {
+            // A DrumStep track is an Instrument track whose instrument is
+            // always the built-in Drum Sampler: the same form, the instrument
+            // fixed and no mode to pick.
+            let drum_step = state.selected_kind == AddTrackKind::DrumStep;
             let asc_in = callbacks.on_ascending_input.clone();
-            let instrument_cb = callbacks.on_instrument_plugin.clone();
             let solfege_cb = callbacks.on_solfege_model.clone();
             let toggle_instrument = callbacks.on_toggle_select.clone();
             let toggle_solfege = callbacks.on_toggle_select.clone();
@@ -1391,42 +1404,36 @@ fn type_fields(
                 .flex()
                 .flex_col()
                 .gap(px(space::SNUG))
-                .child(fb_form_row(
-                    "Mode",
-                    instrument_mode_selector(state.instrument_mode, callbacks),
-                ))
+                .when(!drum_step, |col| {
+                    col.child(fb_form_row(
+                        "Mode",
+                        instrument_mode_selector(state.instrument_mode, callbacks),
+                    ))
+                })
                 .child(fb_form_row(
                     "Instrument",
-                    if state.instrument_mode == InstrumentMode::Vsti {
-                        let search_header = match (
-                            instrument_search_input,
-                            instrument_search_callbacks,
-                            instrument_search_ime,
-                        ) {
-                            (Some(input), Some(cbs), Some(ime)) => Some(plugin_search_header(
-                                input,
-                                instrument_search_focused,
-                                cbs,
-                                ime,
-                            )),
-                            _ => None,
-                        };
-                        select_with_placement_and_header(
+                    if drum_step {
+                        locked_select_box("Built-in Drum Sampler · step sequencer".to_string())
+                            .into_any_element()
+                    } else if state.instrument_mode == InstrumentMode::Vsti {
+                        // Search, Vendor/Name/Format grouping and the tree are
+                        // built by the window, which owns their state; the
+                        // shared select supplies the trigger and anchoring.
+                        select_with_menu(
                             "add-track-instrument-plugin-select",
-                            state.instrument_plugin_id.as_deref().or(Some("")),
-                            "Select instrument...",
-                            filtered_instrument_plugin_options(
+                            selected_instrument_label(
                                 instrument_plugins,
-                                instrument_plugin_query,
+                                state.instrument_plugin_id.as_deref(),
                             ),
                             add_track_select_open(open_select, AddTrackSelectId::InstrumentPlugin),
                             false,
                             SelectMenuPlacement::Below,
-                            search_header,
+                            move || {
+                                instrument_menu.unwrap_or_else(|| Empty.into_any_element())
+                            },
                             Arc::new(move |_, w, cx| {
                                 toggle_instrument(&AddTrackSelectId::InstrumentPlugin, w, cx)
                             }),
-                            Arc::new(move |value, w, cx| instrument_cb(value, w, cx)),
                         )
                         .into_any_element()
                     } else if state.instrument_mode == InstrumentMode::SoundfontPlayer {
@@ -1453,11 +1460,14 @@ fn type_fields(
                         .into_any_element()
                     },
                 ))
-                .when(state.instrument_mode == InstrumentMode::SolfegeEngine, |col| {
+                .when(
+                    !drum_step && state.instrument_mode == InstrumentMode::SolfegeEngine,
+                    |col| {
                     col.child(disabled_hint(
                         "SFM and FBMX models are loaded from Documents/Futureboard Studio/Utilities/Model/Solfage.",
                     ))
-                })
+                    },
+                )
                 .child(fb_form_row(
                     i18n.tr("add-track.routing.midi-in"),
                     add_track_select(

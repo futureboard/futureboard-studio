@@ -678,6 +678,36 @@ pub fn scenes() -> Vec<Scene> {
             open: midi_drums_used_scene,
         },
         Scene {
+            name: "midi-drums-reversed",
+            width: 1_200.0,
+            height: 760.0,
+            open: midi_drums_reversed_scene,
+        },
+        Scene {
+            name: "midi-steps",
+            width: 1_200.0,
+            height: 760.0,
+            open: midi_steps_scene,
+        },
+        Scene {
+            name: "welcome-tour",
+            width: 1_440.0,
+            height: 860.0,
+            open: welcome_tour_scene,
+        },
+        Scene {
+            name: "welcome-tour-th",
+            width: 1_440.0,
+            height: 860.0,
+            open: welcome_tour_th_scene,
+        },
+        Scene {
+            name: "welcome-tour-ja",
+            width: 1_440.0,
+            height: 860.0,
+            open: welcome_tour_start_ja_scene,
+        },
+        Scene {
             name: "midi-tools-pitch",
             width: 1_200.0,
             height: 760.0,
@@ -871,7 +901,137 @@ pub fn scenes() -> Vec<Scene> {
             height: 460.0,
             open: mixer::mixer,
         },
+        Scene {
+            name: "add-track-instruments-vendor",
+            width: crate::components::add_track_dialog::ADD_TRACK_WINDOW_WIDTH,
+            height: 640.0,
+            open: |o, cx| add_track_instruments(o, cx, "vendor", ""),
+        },
+        Scene {
+            name: "add-track-instruments-format",
+            width: crate::components::add_track_dialog::ADD_TRACK_WINDOW_WIDTH,
+            height: 640.0,
+            open: |o, cx| add_track_instruments(o, cx, "format", ""),
+        },
+        Scene {
+            name: "add-track-instruments-name",
+            width: crate::components::add_track_dialog::ADD_TRACK_WINDOW_WIDTH,
+            height: 640.0,
+            open: |o, cx| add_track_instruments(o, cx, "name", ""),
+        },
+        Scene {
+            name: "add-track-instruments-search",
+            width: crate::components::add_track_dialog::ADD_TRACK_WINDOW_WIDTH,
+            height: 640.0,
+            open: |o, cx| add_track_instruments(o, cx, "vendor", "ample"),
+        },
+        Scene {
+            name: "add-track-drumstep",
+            width: crate::components::add_track_dialog::ADD_TRACK_WINDOW_WIDTH,
+            height: 640.0,
+            open: add_track_drumstep,
+        },
     ]
+}
+
+// ── Add Track instrument picker ─────────────────────────────────────────────
+
+/// A scanned library shaped like a real one: several vendors, instruments in
+/// more than one format, one without a vendor.
+fn preview_instrument_library() -> Vec<SpherePluginHost::RegistryPlugin> {
+    use SpherePluginHost::{
+        PluginFormat as F, PluginKind, PluginScanStatus, PluginStatus, RegistryPlugin,
+    };
+    let entries: [(&str, &str, F); 14] = [
+        ("Addictive Drums 2", "XLN Audio", F::Vst3),
+        ("Addictive Drums 2", "XLN Audio", F::Vst2),
+        ("Addictive Keys", "XLN Audio", F::Vst3),
+        ("Ample Guitar LP", "Ample Sound", F::Vst3),
+        ("Ample Guitar LP", "Ample Sound", F::Vst2),
+        ("Ample Guitar M", "Ample Sound", F::Vst3),
+        ("Ample Guitar M", "Ample Sound", F::Vst2),
+        ("Ample Bass P", "Ample Sound", F::Vst3),
+        ("Surge XT", "Surge Synth Team", F::Clap),
+        ("Surge XT", "Surge Synth Team", F::Vst3),
+        ("Vital", "Vital Audio", F::Vst3),
+        ("Dexed", "Digital Suburban", F::Vst3),
+        ("Odin 2", "TheWaveWarden", F::Clap),
+        ("Sketch Synth", "", F::Vst3),
+    ];
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, (name, vendor, format))| RegistryPlugin {
+            id: format!("preview.instrument.{index}"),
+            name: name.to_string(),
+            vendor: vendor.to_string(),
+            format: *format,
+            category: "Instrument".to_string(),
+            raw_category: None,
+            sub_categories: None,
+            kind: PluginKind::Instrument,
+            path: std::path::PathBuf::new(),
+            class_id: None,
+            version: None,
+            sdk_metadata_loaded: true,
+            is_ara: false,
+            preset_path: std::path::PathBuf::new(),
+            scanned_at_ms: 0,
+            status: PluginStatus::PresetReady,
+            scan_status: PluginScanStatus::Success,
+            error_message: None,
+        })
+        .collect()
+}
+
+/// The Add Track dialog on its Instrument tab with the instrument popover
+/// open in `grouping`, filtered by `query`, with Ample Guitar LP selected.
+fn add_track_instruments(
+    options: WindowOptions,
+    cx: &mut App,
+    grouping: &'static str,
+    query: &'static str,
+) -> Result<AnyWindowHandle> {
+    use crate::components::add_track_dialog::{AddTrackDialogState, AddTrackKind, AddTrackWindow};
+    let handle = cx.open_window(options, move |_, cx| {
+        cx.new(|cx| {
+            let mut state = AddTrackDialogState::open_for(3, true);
+            state.set_kind(AddTrackKind::Instrument);
+            state.track_name = "Instrument 4".to_string();
+            let mut view = AddTrackWindow::new(
+                state,
+                "en-US",
+                preview_instrument_library(),
+                Vec::new(),
+                Arc::new(|_, _, _| {}),
+                cx,
+            );
+            view.preview_instrument_picker(grouping, query, Some("preview.instrument.3"));
+            view
+        })
+    })?;
+    Ok(handle.into())
+}
+
+/// Add Track on its DrumStep tab: the instrument fixed to the Drum Sampler.
+fn add_track_drumstep(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    use crate::components::add_track_dialog::{AddTrackDialogState, AddTrackKind, AddTrackWindow};
+    let handle = cx.open_window(options, move |_, cx| {
+        cx.new(|cx| {
+            let mut state = AddTrackDialogState::open_for(3, true);
+            state.set_kind(AddTrackKind::DrumStep);
+            state.track_name = "DrumStep".to_string();
+            AddTrackWindow::new(
+                state,
+                "en-US",
+                preview_instrument_library(),
+                Vec::new(),
+                Arc::new(|_, _, _| {}),
+                cx,
+            )
+        })
+    })?;
+    Ok(handle.into())
 }
 
 mod mixer;
@@ -2153,6 +2313,178 @@ fn open_midi_drums_with(
 
 fn midi_drums_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
     open_midi_drums(options, cx, false)
+}
+
+fn midi_drums_reversed_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_midi_drums_with(options, cx, true, true)
+}
+
+/// The drum pattern on the step grid, with a snare roll written as a ×4
+/// ratchet, a ×2 hat, and one hit played between the lines (amber, waiting to
+/// be snapped). The repeat selector is on ×4.
+fn midi_steps_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    use crate::components::piano_roll::{DrumLanes, PianoRoll};
+    use crate::components::timeline::timeline::Timeline;
+    let handle = cx.open_window(options, move |_, cx| {
+        let timeline = cx.new(|_| {
+            let mut timeline = Timeline::new();
+            let state = &mut timeline.state;
+            let track = state.create_midi_track();
+            if let Some(clip) = state.create_midi_clip(&track, 0.0, 4.0) {
+                for kick in [0.0, 1.5, 2.0] {
+                    state.add_midi_note(&clip, 36, kick, 0.25, 118);
+                }
+                state.add_midi_note(&clip, 38, 1.0, 0.25, 104);
+                // A ×4 snare roll on the last step of the bar.
+                for hit in 0..4 {
+                    state.add_midi_note(&clip, 38, 3.75 + hit as f32 * 0.0625, 0.0625, 96);
+                }
+                for step in 0..8 {
+                    let accent = if step % 2 == 0 { 96 } else { 60 };
+                    state.add_midi_note(&clip, 42, step as f32 * 0.5, 0.25, accent);
+                }
+                // A ×2 hat.
+                state.add_midi_note(&clip, 42, 2.25, 0.125, 80);
+                state.add_midi_note(&clip, 42, 2.375, 0.125, 80);
+                // Played a little late, between the lines.
+                state.add_midi_note(&clip, 39, 3.05, 0.2, 90);
+                state.select_clip(&clip);
+            }
+            timeline
+        });
+        cx.new(|cx| {
+            let mut roll = PianoRoll::new(timeline, cx);
+            roll.set_step_mode(true, cx);
+            roll.set_drum_lanes(DrumLanes::Used, cx);
+            roll.set_step_repeat(4, cx);
+            roll
+        })
+    })?;
+    Ok(handle.into())
+}
+
+/// The welcome tour over a stand-in Studio: a browser column, the demo
+/// arrangement and an inspector column under a title bar.
+struct TourPreview {
+    timeline: gpui::Entity<crate::components::timeline::Timeline>,
+    step: usize,
+    locale: &'static str,
+    main_row: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
+}
+
+const TOUR_PREVIEW_BROWSER_W: f32 = 280.0;
+const TOUR_PREVIEW_INSPECTOR_W: f32 = 300.0;
+
+impl gpui::Render for TourPreview {
+    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl gpui::IntoElement {
+        use crate::components::welcome_tour::{self, TourActions, TourRegions, TourVisibility};
+        use crate::theme::Colors;
+        use gpui::{div, px, ParentElement, Styled};
+        let column = |w: f32, label: &'static str| {
+            div()
+                .w(px(w))
+                .h_full()
+                .flex_none()
+                .p(px(12.0))
+                .bg(Colors::surface_panel())
+                .text_size(px(12.0))
+                .text_color(Colors::text_muted())
+                .child(label)
+        };
+        let bounds = self.main_row.clone();
+        let viewport = window.viewport_size();
+        let steps = welcome_tour::steps_for(TourVisibility {
+            browser: true,
+            inspector: true,
+            bottom_panel: false,
+        });
+        let regions = TourRegions {
+            window_w: viewport.width.into(),
+            window_h: viewport.height.into(),
+            main_row: self.main_row.get(),
+            browser_w: TOUR_PREVIEW_BROWSER_W,
+            inspector_w: TOUR_PREVIEW_INSPECTOR_W,
+            bottom_h: None,
+        };
+        let noop =
+            || Box::new(|_: &mut Window, _: &mut App| {}) as Box<dyn Fn(&mut Window, &mut App)>;
+        let tour = welcome_tour::render_tour(
+            &steps,
+            self.step,
+            &regions,
+            crate::i18n::I18n::new(self.locale),
+            TourActions {
+                on_back: noop(),
+                on_next: noop(),
+                on_skip: noop(),
+            },
+        );
+        div()
+            .size_full()
+            .relative()
+            .flex()
+            .flex_col()
+            .bg(Colors::surface_base())
+            .child(
+                div()
+                    .h(px(44.0))
+                    .w_full()
+                    .flex_none()
+                    .bg(Colors::surface_window()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .relative()
+                    .flex()
+                    .flex_row()
+                    .child(
+                        gpui::canvas(move |b, _, _| bounds.set(Some(b)), |_, _, _, _| {})
+                            .absolute()
+                            .inset_0(),
+                    )
+                    .child(column(TOUR_PREVIEW_BROWSER_W, "Browser"))
+                    .child(
+                        div().flex_1().min_w_0().h_full().child(
+                            gpui::AnyView::from(self.timeline.clone())
+                                .cached(crate::components::timeline::Timeline::cached_style()),
+                        ),
+                    )
+                    .child(column(TOUR_PREVIEW_INSPECTOR_W, "Inspector")),
+            )
+            .children(tour)
+    }
+}
+
+fn open_tour(
+    options: WindowOptions,
+    cx: &mut App,
+    step: usize,
+    locale: &'static str,
+) -> Result<AnyWindowHandle> {
+    let handle = cx.open_window(options, move |_, cx| {
+        let timeline = cx.new(|_| crate::components::timeline::Timeline::with_demo_content());
+        cx.new(|_| TourPreview {
+            timeline,
+            step,
+            locale,
+            main_row: std::rc::Rc::new(std::cell::Cell::new(None)),
+        })
+    })?;
+    Ok(handle.into())
+}
+
+fn welcome_tour_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_tour(options, cx, 1, "en-US")
+}
+
+fn welcome_tour_th_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_tour(options, cx, 2, "th-TH")
+}
+
+fn welcome_tour_start_ja_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_tour(options, cx, 0, "ja-JP")
 }
 
 fn midi_drums_used_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {

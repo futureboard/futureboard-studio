@@ -322,6 +322,16 @@ pub enum EditCommand {
         clip_id: String,
         notes: Vec<MidiNoteState>,
     },
+    /// Some notes taken out and others put in, as one undo entry: a step
+    /// sequencer edit (a step's repeat count rewritten, off-grid hits snapped
+    /// onto the step lines). A note may be in both lists — removed as it was
+    /// and added as it is now — so a snapped hit keeps its id.
+    ReplaceMidiNotes {
+        label: &'static str,
+        clip_id: String,
+        removed: Vec<MidiNoteState>,
+        added: Vec<MidiNoteState>,
+    },
     /// Set the muted flag on a set of notes. `prev` snapshots each note's
     /// original muted state so undo restores it exactly.
     SetMidiNotesMuted {
@@ -613,6 +623,7 @@ impl EditCommand {
             EditCommand::CreateMidiNote { .. }
             | EditCommand::CreateMidiNotes { .. }
             | EditCommand::DeleteMidiNotes { .. }
+            | EditCommand::ReplaceMidiNotes { .. }
             | EditCommand::SetMidiNotesMuted { .. }
             | EditCommand::EditMidiNotes { .. }
             | EditCommand::TransformMidiNotes { .. }
@@ -870,6 +881,7 @@ impl EditCommand {
             EditCommand::CreateMidiNote { .. } => "Create MIDI Note",
             EditCommand::CreateMidiNotes { .. } => "Add MIDI Notes",
             EditCommand::DeleteMidiNotes { .. } => "Delete MIDI Notes",
+            EditCommand::ReplaceMidiNotes { label, .. } => label,
             EditCommand::SetMidiNotesMuted { muted, .. } => {
                 if *muted {
                     "Mute Notes"
@@ -1043,6 +1055,23 @@ impl EditCommand {
             EditCommand::DeleteMidiNotes { clip_id, notes } => {
                 let ids: Vec<u64> = notes.iter().map(|n| n.id).collect();
                 state.delete_midi_notes(clip_id, &ids);
+            }
+            EditCommand::ReplaceMidiNotes {
+                clip_id,
+                removed,
+                added,
+                ..
+            } => {
+                let ids: Vec<u64> = removed.iter().map(|n| n.id).collect();
+                state.delete_midi_notes(clip_id, &ids);
+                if let Some(existing) = state.midi_clip_notes_mut(clip_id) {
+                    for note in added {
+                        if !existing.iter().any(|n| n.id == note.id) {
+                            existing.push(note.clone());
+                        }
+                    }
+                }
+                state.expand_clip_to_contain_notes(clip_id);
             }
             EditCommand::SetMidiNotesMuted {
                 clip_id,
@@ -1268,6 +1297,22 @@ impl EditCommand {
             EditCommand::DeleteMidiNotes { clip_id, notes } => {
                 if let Some(existing) = state.midi_clip_notes_mut(clip_id) {
                     for note in notes {
+                        if !existing.iter().any(|n| n.id == note.id) {
+                            existing.push(note.clone());
+                        }
+                    }
+                }
+            }
+            EditCommand::ReplaceMidiNotes {
+                clip_id,
+                removed,
+                added,
+                ..
+            } => {
+                let ids: Vec<u64> = added.iter().map(|n| n.id).collect();
+                state.delete_midi_notes(clip_id, &ids);
+                if let Some(existing) = state.midi_clip_notes_mut(clip_id) {
+                    for note in removed {
                         if !existing.iter().any(|n| n.id == note.id) {
                             existing.push(note.clone());
                         }
@@ -2085,6 +2130,48 @@ mod articulation_command_tests {
         assert_eq!(history.redo_label(), Some("Strum"));
         assert!(history.redo(&mut state));
         assert!((state.midi_clip_notes(&clip_id).unwrap()[0].start - 0.1).abs() < 1e-6);
+    }
+
+    /// A step rewritten as a ratchet: the old hit out, three new ones in, one
+    /// undo entry — and a note in both lists (a snapped hit) keeps its id.
+    #[test]
+    fn replace_midi_notes_is_one_undo_step_both_ways() {
+        let (mut state, clip_id) = midi_state();
+        let hit = state.add_midi_note(&clip_id, 36, 0.0, 0.25, 100).unwrap();
+        let stray = state.add_midi_note(&clip_id, 38, 0.3, 0.1, 90).unwrap();
+        let notes = state.midi_clip_notes(&clip_id).unwrap().to_vec();
+        let old_hit = notes.iter().find(|n| n.id == hit).unwrap().clone();
+        let old_stray = notes.iter().find(|n| n.id == stray).unwrap().clone();
+        let mut snapped = old_stray.clone();
+        snapped.start = 0.25;
+        let ratchet: Vec<MidiNoteState> = (0..3)
+            .map(|i| MidiNoteState::new(36, i as f32 / 12.0, 1.0 / 12.0, 100))
+            .collect();
+        let mut added = ratchet.clone();
+        added.push(snapped);
+        let cmd = EditCommand::ReplaceMidiNotes {
+            label: "Repeat Step",
+            clip_id: clip_id.clone(),
+            removed: vec![old_hit.clone(), old_stray.clone()],
+            added,
+        };
+        let mut history = EditHistory::new(8);
+        cmd.execute(&mut state);
+        history.push(cmd);
+        let now = state.midi_clip_notes(&clip_id).unwrap().to_vec();
+        assert_eq!(now.len(), 4);
+        assert!(!now.iter().any(|n| n.id == hit));
+        assert_eq!(now.iter().find(|n| n.id == stray).unwrap().start, 0.25);
+
+        assert_eq!(history.undo_label(), Some("Repeat Step"));
+        assert!(history.undo(&mut state));
+        let back = state.midi_clip_notes(&clip_id).unwrap().to_vec();
+        assert_eq!(back.len(), 2);
+        assert_eq!(back.iter().find(|n| n.id == stray).unwrap().start, 0.3);
+        assert!(back.iter().any(|n| n.id == hit));
+
+        assert!(history.redo(&mut state));
+        assert_eq!(state.midi_clip_notes(&clip_id).unwrap().len(), 4);
     }
 
     #[test]

@@ -2187,6 +2187,7 @@ impl TimelineState {
                     takes: Vec::new(),
                     takes_expanded: false,
                     freeze: None,
+                    drum_step: false,
                 },
             );
             insert_at += 1;

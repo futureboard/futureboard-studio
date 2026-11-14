@@ -627,6 +627,8 @@ pub struct ProjectTrack {
     pub takes_expanded: bool,
     /// The track's freeze bounce, when it is frozen (v60+).
     pub freeze: Option<crate::components::timeline::timeline_state::TrackFreeze>,
+    /// A DrumStep track, whose clips open in the step sequencer (v66+).
+    pub drum_step: bool,
 }
 
 /// One persisted recorded take. See
@@ -1630,6 +1632,7 @@ impl From<&TimelineState> for FutureboardProject {
                         .collect(),
                     takes_expanded: t.takes_expanded,
                     freeze: t.freeze.clone(),
+                    drum_step: t.drum_step,
                 }
             })
             .collect();
@@ -2463,6 +2466,7 @@ pub fn apply_to_timeline(
                     .collect(),
                 takes_expanded: pt.takes_expanded,
                 freeze: pt.freeze.clone(),
+                drum_step: pt.drum_step,
                 solfege: pt.solfege.as_ref().map(|state| SolfegeTrackState {
                     model_path: state
                         .model_path
@@ -3415,7 +3419,7 @@ mod v33_routing_adapter_tests {
         let bytes = crate::project::format::encode_project(&FutureboardProject::new("current"));
         let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
         assert_eq!(version, crate::project::format::PROJECT_VERSION);
-        assert_eq!(crate::project::format::PROJECT_VERSION, 63);
+        assert_eq!(crate::project::format::PROJECT_VERSION, 66);
     }
 
     // ── v35 Master / Monitor output routing ─────────────────────────────────

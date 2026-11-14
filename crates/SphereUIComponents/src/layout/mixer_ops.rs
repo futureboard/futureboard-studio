@@ -3018,6 +3018,7 @@ fn clone_track_for_mixer_detail(track: &TrackState, include_detail: bool) -> Tra
         takes: _,
         takes_expanded: _,
         freeze,
+        drum_step,
     } = track;
     TrackState {
         // Preserved, not reset: the mixer strip renders its PFL/AFL buttons
@@ -3049,6 +3050,7 @@ fn clone_track_for_mixer_detail(track: &TrackState, include_detail: bool) -> Tra
         takes: Vec::new(),
         takes_expanded: false,
         freeze: freeze.clone(),
+        drum_step: *drum_step,
         automation_lanes: if include_detail {
             automation_lanes.clone()
         } else {

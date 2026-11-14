@@ -48,6 +48,9 @@ fn add_track_instrument_plugins_from_catalog(
         .unwrap_or_default()
 }
 
+/// The instrument a DrumStep track is created with: the built-in Drum Sampler.
+const DRUM_STEP_INSTRUMENT_ID: &str = "builtin:drumsampler";
+
 fn dialog_audio_format(format: AudioFormat) -> TrackAudioFormat {
     match format {
         AudioFormat::Mono => TrackAudioFormat::Mono,
@@ -1362,15 +1365,21 @@ impl StudioLayout {
                                     _ => timeline_state::InputMonitorMode::Off,
                                 },
                             });
-                            if dialog.selected_kind == AddTrackKind::Instrument
-                                || dialog.selected_kind == AddTrackKind::Midi
-                            {
+                            if matches!(
+                                dialog.selected_kind,
+                                AddTrackKind::Instrument
+                                    | AddTrackKind::DrumStep
+                                    | AddTrackKind::Midi
+                            ) {
                                 let midi_input = dialog_midi_input_routing(&dialog.input_label);
                                 timeline.state.set_track_midi_input(&id, midi_input);
                             }
                             if matches!(
                                 dialog.selected_kind,
-                                AddTrackKind::Audio | AddTrackKind::Instrument | AddTrackKind::Midi
+                                AddTrackKind::Audio
+                                    | AddTrackKind::Instrument
+                                    | AddTrackKind::DrumStep
+                                    | AddTrackKind::Midi
                             ) {
                                 let output = dialog_audio_output_routing(
                                     &dialog.output_label,
@@ -1389,10 +1398,27 @@ impl StudioLayout {
                                     .state
                                     .set_track_audio_input_connection(&id, connection_id);
                             }
-                            if dialog.selected_kind == AddTrackKind::Instrument
+                            // A DrumStep track always gets the built-in Drum
+                            // Sampler; an Instrument track the VSTi picked.
+                            let hosted_instrument = if dialog.selected_kind
+                                == AddTrackKind::DrumStep
+                            {
+                                Some(DRUM_STEP_INSTRUMENT_ID)
+                            } else if dialog.selected_kind == AddTrackKind::Instrument
                                 && dialog.instrument_mode == InstrumentMode::Vsti
                             {
-                                if let Some(plugin_id) = dialog.instrument_plugin_id.as_deref() {
+                                dialog.instrument_plugin_id.as_deref()
+                            } else {
+                                None
+                            };
+                            if dialog.selected_kind == AddTrackKind::DrumStep {
+                                if let Some(track) =
+                                    timeline.state.tracks.iter_mut().find(|t| t.id == id)
+                                {
+                                    track.drum_step = true;
+                                }
+                            }
+                            if let Some(plugin_id) = hosted_instrument {
                                     let instrument_registry =
                                         add_track_instrument_plugins_from_catalog(
                                             &this.plugin_catalog,
@@ -1474,7 +1500,6 @@ impl StudioLayout {
                                             }
                                         }
                                     }
-                                }
                             } else if dialog.selected_kind == AddTrackKind::Instrument
                                 && matches!(
                                     dialog.instrument_mode,

@@ -735,6 +735,7 @@ mod metadata_tests {
             takes: Vec::new(),
             takes_expanded: false,
             freeze: None,
+            drum_step: false,
         };
         track.clips.push(ProjectClip {
             id: "c1".to_string(),

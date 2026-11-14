@@ -172,7 +172,15 @@ pub const PROJECT_MAGIC: &[u8; 8] = b"FBSTUD1\0";
 /// v63 appends each insert's mix bus (`0` main, `1` wet/dry/wet) after its
 /// plugin blob, and a flag on each send for the wet/dry/wet split. A pre-v63
 /// insert is on the main bus and no send is a split send.
-pub const PROJECT_VERSION: u32 = 63;
+/// v64 appends each insert's sidechain route after its mix bus: the source
+/// track id (empty for none) and a post-fader flag. A pre-v64 insert has no
+/// sidechain.
+/// v65 appends a flag to the end of each track block: the track's ARA plug-in
+/// is a generator (a voice synth) whose regions are the track's MIDI clips. A
+/// pre-v65 binding is not one.
+/// v66 appends a flag after it: the track is a DrumStep track (an Instrument
+/// track whose MIDI clips open in the step sequencer). A pre-v66 track is not.
+pub const PROJECT_VERSION: u32 = 66;
 
 /// Oldest on-disk format version whose migration to the current one is
 /// supported (see [`super::migrate`]): v30, which introduced arrangement
@@ -1229,6 +1237,14 @@ fn encode_track(w: &mut FbWriter, t: &ProjectTrack, version: u32) {
             }
             None => w.write_bool(false),
         }
+    }
+    // v65: whether the track's ARA plug-in is a generator (a voice synth).
+    if version >= 65 {
+        w.write_bool(t.ara.as_ref().is_some_and(|ara| ara.generator));
+    }
+    // v66: a DrumStep track, whose clips open in the step sequencer.
+    if version >= 66 {
+        w.write_bool(t.drum_step);
     }
 }
 
@@ -3393,6 +3409,17 @@ fn decode_track(r: &mut FbReader, version: u32) -> Result<ProjectTrack, ProjectE
         None
     };
 
+    // v65: the ARA plug-in is a generator. A pre-v65 binding processes
+    // recordings, the only kind there was.
+    if version >= 65 && r.read_bool()? {
+        if let Some(ara) = ara.as_mut() {
+            ara.generator = true;
+        }
+    }
+
+    // v66: a DrumStep track. A pre-v66 track is not one.
+    let drum_step = version >= 66 && r.read_bool()?;
+
     // v55: folder members play through their folder (see `PROJECT_VERSION`).
     if version < 55
         && !matches!(
@@ -3434,6 +3461,7 @@ fn decode_track(r: &mut FbReader, version: u32) -> Result<ProjectTrack, ProjectE
         takes,
         takes_expanded,
         freeze,
+        drum_step,
     })
 }
 
@@ -5172,6 +5200,61 @@ mod tests {
         );
     }
 
+    /// v65: a voice synth's binding comes back as one; written as v64 it is
+    /// read as a plug-in that processes recordings, the only kind v64 knew.
+    #[test]
+    fn a_generator_binding_roundtrips_v65_and_is_plain_on_v64() {
+        let mut project = FutureboardProject::new("voice");
+        let binding = AraTrackBinding {
+            plugin_id: "vst3:voice-synth".to_string(),
+            plugin_path: "C:/Program Files/Common Files/VST3/Voice.vst3".to_string(),
+            class_id: "ABCD1234".to_string(),
+            generator: true,
+        };
+        let mut track = track_with_clip(empty_clip_with_stretch(sample_stretch()));
+        track.ara = Some(binding.clone());
+        project.tracks.push(track.clone());
+        project
+            .tracks
+            .push(track_with_clip(empty_clip_with_stretch(sample_stretch())));
+
+        let decoded = decode_project(&encode_project(&project)).unwrap();
+        assert_eq!(decoded.tracks[0].ara, Some(binding.clone()));
+        assert_eq!(decoded.tracks[1].ara, None);
+        assert_eq!(
+            decoded.tracks[1].clips.len(),
+            1,
+            "the next track stays aligned"
+        );
+
+        let old = decode_project_with_options(&encode_project_as(&project, 64), true).unwrap();
+        let old_binding = old.tracks[0].ara.clone().expect("still bound");
+        assert!(!old_binding.generator);
+        assert_eq!(old.tracks[1].clips.len(), 1);
+    }
+
+    /// v66: a DrumStep track comes back as one; written as v65 it is a plain
+    /// Instrument track, and the track after it still reads in place.
+    #[test]
+    fn a_drum_step_track_roundtrips_v66_and_is_plain_on_v65() {
+        let mut project = FutureboardProject::new("beats");
+        let mut drums = track_with_clip(empty_clip_with_stretch(sample_stretch()));
+        drums.drum_step = true;
+        project.tracks.push(drums);
+        project
+            .tracks
+            .push(track_with_clip(empty_clip_with_stretch(sample_stretch())));
+
+        let decoded = decode_project(&encode_project(&project)).unwrap();
+        assert!(decoded.tracks[0].drum_step);
+        assert!(!decoded.tracks[1].drum_step);
+        assert_eq!(decoded.tracks[1].clips.len(), 1);
+
+        let old = decode_project_with_options(&encode_project_as(&project, 65), true).unwrap();
+        assert!(!old.tracks[0].drum_step);
+        assert_eq!(old.tracks[1].clips.len(), 1);
+    }
+
     #[test]
     fn a_v41_clip_binding_is_consumed_and_the_body_stays_aligned() {
         // v41 wrote an ARA presence byte per clip. v42 no longer writes it, but
@@ -5455,6 +5538,7 @@ mod tests {
             takes: Vec::new(),
             takes_expanded: false,
             freeze: None,
+            drum_step: false,
         }
     }
 
