@@ -37,9 +37,10 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    div, point, px, size, App, AppContext, Bounds, Context, FocusHandle, InteractiveElement,
-    IntoElement, ParentElement, Pixels, Point, Render, Size, StatefulInteractiveElement, Styled,
-    Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind,
+    div, point, prelude::FluentBuilder as _, px, size, App, AppContext, Bounds, Context,
+    FocusHandle, InteractiveElement, IntoElement, ParentElement, Pixels, Point, Render, Size,
+    StatefulInteractiveElement, Styled, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowHandle, WindowKind,
 };
 
 use crate::components::plugin_content_host::{ContentChildHwnd, ContentRect};
@@ -187,8 +188,26 @@ fn build_host_backend(
 /// plug-in's surface.
 const CHROME_H: f32 = 26.0;
 
-/// Logical-pixel height reserved above the plug-in: titlebar, tabs, chrome row.
+/// Logical-pixel height reserved above the plug-in when the window draws its
+/// own titlebar: titlebar, tabs, chrome row.
 const HEADER_H: f32 = TITLEBAR_HEIGHT + TAB_STRIP_H + CHROME_H;
+
+/// Whether the editor window takes the platform's own frame — on Windows a
+/// native caption with its own buttons — instead of a drawn titlebar.
+fn native_frame() -> bool {
+    crate::platform_chrome::native_tool_window_frame()
+}
+
+/// Logical-pixel height of the client area above the plug-in. With a native
+/// frame the caption is outside the client area, so only the tabs and the
+/// chrome row are left.
+fn header_h() -> f32 {
+    if native_frame() {
+        TAB_STRIP_H + CHROME_H
+    } else {
+        HEADER_H
+    }
+}
 
 /// How long a click on the preset trigger is ignored after the list dismissed
 /// itself.
@@ -664,6 +683,8 @@ pub struct PluginEditorWindow {
     window_bounds: Bounds<Pixels>,
     window_viewport: Size<Pixels>,
     window_scale: f32,
+    /// The title last put in the native caption, so it is set only on change.
+    native_title: Option<String>,
     /// This window's native handle, so the preset list can be owned by it.
     window_hwnd: Option<u64>,
     /// Every plug-in open on this channel, in slot order.
@@ -759,6 +780,7 @@ impl PluginEditorWindow {
             },
             window_viewport: size(px(0.0), px(0.0)),
             window_scale: 1.0,
+            native_title: None,
             window_hwnd: None,
             tabs: Vec::new(),
             released_for_close: false,
@@ -809,7 +831,7 @@ impl PluginEditorWindow {
         let viewport = window.viewport_size();
         let w: f32 = viewport.width.into();
         let h: f32 = viewport.height.into();
-        let header_px = HEADER_H * scale;
+        let header_px = header_h() * scale;
         // A fixed-size editor gets exactly its own size and the window is sized
         // around it. A resizable one follows the window, so the user dragging
         // the frame actually reaches the plug-in instead of being overridden by
@@ -881,7 +903,7 @@ impl PluginEditorWindow {
         // anchor: still inside the editor, still under the header, and derived
         // from the layout rather than from a constant nobody maintains.
         let anchor = self.preset_anchor.get().unwrap_or(Bounds {
-            origin: point(px(0.0), px(TITLEBAR_HEIGHT + TAB_STRIP_H)),
+            origin: point(px(0.0), px(header_h() - CHROME_H)),
             size: size(self.window_viewport.width, px(CHROME_H)),
         });
         let resolved = crate::overlay::resolve_popup_placement(
@@ -1479,7 +1501,7 @@ impl PluginEditorWindow {
 
         let scale = window.scale_factor().max(0.5);
         let shell_w = (content_w as f32 / scale).max(EDITOR_WINDOW_MIN_WIDTH);
-        let shell_h = ((content_h as f32 / scale) + HEADER_H).max(EDITOR_WINDOW_MIN_HEIGHT);
+        let shell_h = ((content_h as f32 / scale) + header_h()).max(EDITOR_WINDOW_MIN_HEIGHT);
         window.resize(size(px(shell_w), px(shell_h)));
 
         let region = self.host_region_for(window);
@@ -1642,7 +1664,7 @@ impl PluginEditorWindow {
                 let scale = window.scale_factor().max(0.5);
                 let shell_w = (plugin_size.0 as f32 / scale).max(EDITOR_WINDOW_MIN_WIDTH);
                 let shell_h =
-                    ((plugin_size.1 as f32 / scale) + HEADER_H).max(EDITOR_WINDOW_MIN_HEIGHT);
+                    ((plugin_size.1 as f32 / scale) + header_h()).max(EDITOR_WINDOW_MIN_HEIGHT);
                 window.resize(size(px(shell_w), px(shell_h)));
                 if plugin_view_debug() {
                     eprintln!(
@@ -2790,7 +2812,7 @@ impl PluginEditorWindow {
         let viewport = window.viewport_size();
         let w: f32 = viewport.width.into();
         let h: f32 = viewport.height.into();
-        let header_px = HEADER_H * scale;
+        let header_px = header_h() * scale;
         (
             (w * scale).round().max(1.0) as i32,
             ((h * scale) - header_px).round().max(1.0) as i32,
@@ -2830,7 +2852,7 @@ impl PluginEditorWindow {
         self.editor_content_size = Some((content_w, content_h));
         let scale = window.scale_factor().max(0.5);
         let shell_w = (content_w as f32 / scale).max(EDITOR_WINDOW_MIN_WIDTH);
-        let shell_h = ((content_h as f32 / scale) + HEADER_H).max(EDITOR_WINDOW_MIN_HEIGHT);
+        let shell_h = ((content_h as f32 / scale) + header_h()).max(EDITOR_WINDOW_MIN_HEIGHT);
         let viewport = window.viewport_size();
         let current_w: f32 = viewport.width.into();
         let current_h: f32 = viewport.height.into();
@@ -2838,7 +2860,7 @@ impl PluginEditorWindow {
             "[editor-size] plugin preferred size = {}x{}",
             content_w, content_h
         );
-        eprintln!("[editor-size] titlebar height = {:.0}", HEADER_H * scale);
+        eprintln!("[editor-size] titlebar height = {:.0}", header_h() * scale);
         eprintln!("[editor-size] client rect = {}x{}", content_w, content_h);
         eprintln!(
             "[editor-size] shell outer target = {:.0}x{:.0}",
@@ -3193,6 +3215,15 @@ impl Render for PluginEditorWindow {
         self.window_viewport = window.viewport_size();
         self.window_scale = window.scale_factor();
         self.window_hwnd = Self::native_parent_handle(window);
+        // With the platform's frame the channel and plug-in name go in its
+        // caption, kept current as tabs switch and tracks are renamed.
+        if native_frame() {
+            let title = self.window_title();
+            if self.native_title.as_deref() != Some(title.as_str()) {
+                window.set_window_title(&title);
+                self.native_title = Some(title);
+            }
+        }
         if self.preset_menu_refocus {
             self.preset_menu_refocus = false;
             window.focus(&self.focus_handle, cx);
@@ -3278,7 +3309,7 @@ impl Render for PluginEditorWindow {
                     Some(
                         div()
                             .absolute()
-                            .top(px(HEADER_H))
+                            .top(px(header_h()))
                             .left_0()
                             .right_0()
                             .bottom_0()
@@ -3306,23 +3337,28 @@ impl Render for PluginEditorWindow {
             .font(theme::ui_font())
             .overflow_hidden()
             .child(div().w(px(0.0)).h(px(0.0)).track_focus(&self.focus_handle))
-            .child(crate::components::title_bar::external_window_titlebar(
-                self.window_title(),
-                "plugin-editor-window-close",
-                {
-                    // The view is let go of, and the preset list (a window of
-                    // its own) closed, before the window goes.
-                    let this = cx.entity().downgrade();
-                    move |window, cx| {
-                        if this
-                            .update(cx, |editor, cx| editor.close_window(window, cx))
-                            .is_err()
-                        {
-                            window.remove_window();
+            // With a native frame the OS caption carries the title and the
+            // close button (which goes through `on_window_should_close`), so
+            // nothing is drawn for it here.
+            .when(!native_frame(), |root| {
+                root.child(crate::components::title_bar::external_window_titlebar(
+                    self.window_title(),
+                    "plugin-editor-window-close",
+                    {
+                        // The view is let go of, and the preset list (a window
+                        // of its own) closed, before the window goes.
+                        let this = cx.entity().downgrade();
+                        move |window, cx| {
+                            if this
+                                .update(cx, |editor, cx| editor.close_window(window, cx))
+                                .is_err()
+                            {
+                                window.remove_window();
+                            }
                         }
-                    }
-                },
-            ))
+                    },
+                ))
+            })
             .child(render_tab_strip(&self.tabs, &self.insert_id, {
                 let this = cx.entity().downgrade();
                 move |action, cx| {
@@ -3372,7 +3408,7 @@ impl Render for PluginEditorWindow {
             .child(
                 div()
                     .absolute()
-                    .top(px(HEADER_H))
+                    .top(px(header_h()))
                     .left_0()
                     .right_0()
                     .bottom_0()
@@ -3383,7 +3419,7 @@ impl Render for PluginEditorWindow {
             root = root.child(
                 div()
                     .absolute()
-                    .top(px(HEADER_H))
+                    .top(px(header_h()))
                     .left_0()
                     .right_0()
                     .bottom_0()
@@ -3445,6 +3481,17 @@ pub(crate) fn open_plugin_editor_window(
     };
 
     let mut options = crate::platform_chrome::external_dialog_window_options_partial();
+    if native_frame() {
+        // The platform's own frame: a native caption with the window's title
+        // and buttons, the same as the Mixer and the MIDI Editor. The title is
+        // kept current by the render (`sync_native_title`).
+        options.titlebar = Some(gpui::TitlebarOptions {
+            title: Some(display_name.clone().into()),
+            appears_transparent: false,
+            traffic_light_position: None,
+        });
+        options.window_decorations = None;
+    }
     options.window_bounds = Some(WindowBounds::Windowed(Bounds {
         origin,
         size: size(px(EDITOR_WINDOW_WIDTH), px(EDITOR_WINDOW_HEIGHT)),
