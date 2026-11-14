@@ -202,9 +202,11 @@ impl DelayMode {
         self != Self::Mono
     }
 
-    /// Whether `crossFeedback` does anything.
+    /// Whether `crossFeedback` does anything. Ping-Pong already sends every
+    /// repeat across; a cross share there would keep some on the side it
+    /// came from, smearing the bounce into both sides.
     pub fn uses_cross(self) -> bool {
-        self != Self::Mono
+        self == Self::Stereo
     }
 }
 
@@ -634,7 +636,7 @@ pub fn echo_pattern(
         // Where this tap goes next, by the DSP's routing.
         let (own, other) = match params.mode {
             DelayMode::Stereo => (norm, norm * cross),
-            DelayMode::PingPong => (norm * cross, norm),
+            DelayMode::PingPong => (0.0, fb),
             DelayMode::Mono => (fb, 0.0),
         };
         for (target, share) in [(line, own), (1 - line, other)] {
@@ -862,13 +864,9 @@ fn route(
             ],
             taps,
         ),
-        DelayMode::PingPong => (
-            [
-                mono_in * input_gain + (taps[1] + cross * taps[0]) * norm,
-                (taps[0] + cross * taps[1]) * norm,
-            ],
-            taps,
-        ),
+        // Every repeat crosses: what left plays is written into right, and
+        // what right plays comes back into left alongside the input.
+        DelayMode::PingPong => ([mono_in * input_gain + taps[1] * fb, taps[0] * fb], taps),
         DelayMode::Mono => (
             [mono_in * input_gain + taps[0] * fb, 0.0],
             [taps[0], taps[0]],
@@ -1513,6 +1511,38 @@ mod tests {
                     echo.gain
                 );
             }
+        }
+    }
+
+    /// The Cross knob is still at its 65 % default when a Stereo insert is
+    /// switched to Ping-Pong; the repeats must alternate anyway.
+    #[test]
+    fn ping_pong_ignores_cross_and_never_repeats_on_the_same_side() {
+        let mut params = plain(DelayMode::PingPong);
+        params.time_ms_l = 100.0;
+        params.time_ms_r = 100.0;
+        params.feedback = 50.0;
+        params.cross_feedback = 100.0;
+        let mut dsp = dsp_with(params.clone());
+        let (left, right) = burst_response(&mut dsp, (SR * 0.45) as usize);
+        for (at, on_left) in [(100.0, true), (200.0, false), (300.0, true), (400.0, false)] {
+            let (here, there) = if on_left {
+                (&left, &right)
+            } else {
+                (&right, &left)
+            };
+            assert!(burst_level(here, at) > 0.1, "no repeat at {at} ms");
+            assert!(
+                burst_level(there, at) < 0.01,
+                "repeat at {at} ms leaked across"
+            );
+        }
+        let echoes = echo_pattern(&params, 120.0, SR, -60.0, 8);
+        for pair in echoes.windows(2) {
+            assert_ne!(
+                pair[0].right, pair[1].right,
+                "pattern repeats a side: {echoes:?}"
+            );
         }
     }
 
