@@ -12,6 +12,9 @@ license.workspace = true
 name = "sphere_ui_components"
 path = "src/lib.rs"
 
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+
 [[bin]]
 name = "preview"
 path = "src/bin/preview.rs"

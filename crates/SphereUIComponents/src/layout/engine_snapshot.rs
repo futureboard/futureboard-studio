@@ -464,6 +464,7 @@ fn apply_auto_crossfades(state: &TimelineState, clips: &mut [EngineClipSnapshot]
         .collect();
     for track in &state.tracks {
         let crossfades = state.engine_crossfades(track);
+        let fade_index = crossfades.index();
         for clip in &track.clips {
             if !matches!(
                 clip.clip_type,
@@ -474,7 +475,7 @@ fn apply_auto_crossfades(state: &TimelineState, clips: &mut [EngineClipSnapshot]
             let Some(&slot) = slots.get(&clip.id) else {
                 continue;
             };
-            let fades = state.effective_clip_fades(clip, &crossfades);
+            let fades = state.effective_clip_fades_indexed(clip, &fade_index);
             clips[slot].fades =
                 (fades.in_seconds > 0.0 || fades.out_seconds > 0.0).then(|| EngineFadeSnapshot {
                     in_duration: fades.in_seconds,

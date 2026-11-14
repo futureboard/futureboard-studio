@@ -20,6 +20,8 @@
 //!   draws audio crossfades only.
 
 use super::*;
+use std::collections::{BTreeMap, HashMap};
+use std::ops::Bound::Excluded;
 
 /// Shortest crossfade the planner leaves, so a drag cannot remove one.
 pub const MIN_CROSSFADE_SECONDS: f64 = 0.001;
@@ -66,6 +68,25 @@ pub struct TrackCrossfades {
 }
 
 impl TrackCrossfades {
+    /// Build once for a lane/snapshot that asks about many clip edges. A scan
+    /// per clip would turn C clips and F crossfades into O(C * F) work.
+    pub(crate) fn index(&self) -> CrossfadeIndex<'_> {
+        let mut index = CrossfadeIndex::default();
+        for crossfade in &self.crossfades {
+            index
+                .fade_in
+                .entry(crossfade.right_id.as_str())
+                .and_modify(|seconds| *seconds = seconds.max(crossfade.right_seconds))
+                .or_insert(crossfade.right_seconds);
+            index
+                .fade_out
+                .entry(crossfade.left_id.as_str())
+                .and_modify(|seconds| *seconds = seconds.max(crossfade.left_seconds))
+                .or_insert(crossfade.left_seconds);
+        }
+        index
+    }
+
     /// The crossfade length that replaces `clip_id`'s fade-in, if an earlier
     /// clip overlaps its start. With several, the longest covers the edge.
     pub fn fade_in_override(&self, clip_id: &str) -> Option<f64> {
@@ -88,6 +109,89 @@ impl TrackCrossfades {
     pub fn is_empty(&self) -> bool {
         self.crossfades.is_empty()
     }
+}
+
+#[derive(Default)]
+pub(crate) struct CrossfadeIndex<'a> {
+    fade_in: HashMap<&'a str, f64>,
+    fade_out: HashMap<&'a str, f64>,
+}
+
+/// Ordered end beats for the sweep. Valid spans have end > start >= 0, but
+/// total_cmp also keeps the ordering contract explicit for all f64 values.
+#[derive(Clone, Copy, Debug)]
+struct CrossfadeEnd(f64);
+
+impl PartialEq for CrossfadeEnd {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+impl Eq for CrossfadeEnd {}
+impl PartialOrd for CrossfadeEnd {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for CrossfadeEnd {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+/// Spans are sorted by start, then original clip order. Query only active ends
+/// strictly between the new clip's start and end: containment never enters the
+/// candidate loop. O(C log C + K), where K is the number of staggered overlaps,
+/// instead of examining every nested pair even when there are no crossfades.
+/// Buckets per left span preserve the old left-then-right output order without
+/// sorting K results (which would add O(K log K)).
+fn staggered_overlaps(spans: &[(f64, f64, usize)]) -> Vec<Vec<usize>> {
+    let mut active: BTreeMap<CrossfadeEnd, Vec<usize>> = BTreeMap::new();
+    let mut by_left = vec![Vec::new(); spans.len()];
+    let mut first = 0;
+    while first < spans.len() {
+        let start = spans[first].0;
+        let mut end = first + 1;
+        while end < spans.len() && spans[end].0 == start {
+            end += 1;
+        }
+        while active
+            .first_key_value()
+            .is_some_and(|(key, _)| key.0 <= start)
+        {
+            active.pop_first();
+        }
+        // Equal-start spans must not crossfade with one another. Query the
+        // whole group before adding any of it to the active set.
+        for right in first..end {
+            let right_end = spans[right].1;
+            if !(start < right_end) {
+                continue;
+            }
+            for lefts in active
+                .range((
+                    Excluded(CrossfadeEnd(start)),
+                    Excluded(CrossfadeEnd(right_end)),
+                ))
+                .map(|(_, indices)| indices)
+            {
+                for &left in lefts {
+                    by_left[left].push(right);
+                }
+            }
+        }
+        for index in first..end {
+            // Zero/negative/NaN spans could never satisfy the old predicate.
+            if start < spans[index].1 {
+                active
+                    .entry(CrossfadeEnd(spans[index].1))
+                    .or_default()
+                    .push(index);
+            }
+        }
+        first = end;
+    }
+    by_left
 }
 
 /// The fades a clip actually plays, in seconds of its own playing time.
@@ -561,25 +665,30 @@ impl TimelineState {
         }
         spans.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.2.cmp(&b.2)));
 
+        // Common arrangements are disjoint, or stacked at exactly one start.
+        // Neither can contain a crossfade, so avoid allocating the sweep here.
+        if spans.first().map(|span| span.0) == spans.last().map(|span| span.0)
+            || spans.windows(2).all(|pair| pair[0].1 <= pair[1].0)
+        {
+            return TrackCrossfades::default();
+        }
+
+        let overlaps = staggered_overlaps(&spans);
         let tempo = self.tempo_lookup();
         let mut crossfades = Vec::new();
-        for (i, &(a_start, a_end, a_index)) in spans.iter().enumerate() {
-            for &(b_start, b_end, b_index) in &spans[i + 1..] {
-                // Sorted by start: nothing later reaches back into `a`.
-                if b_start >= a_end {
-                    break;
-                }
-                // Equal starts and containment make no crossfade.
-                if !(a_start < b_start && a_end < b_end) {
-                    continue;
-                }
+        for (i, &(_, a_end, a_index)) in spans.iter().enumerate() {
+            if overlaps[i].is_empty() {
+                continue;
+            }
+            let left = &track.clips[a_index];
+            let left_time = self.clip_time_axis_in(tempo.clone(), left);
+            for &right_index in &overlaps[i] {
+                let (b_start, _, b_index) = spans[right_index];
                 let seconds = tempo.seconds_at_beat(a_end) - tempo.seconds_at_beat(b_start);
                 if seconds < CROSSFADE_MIN_OVERLAP_SECONDS {
                     continue;
                 }
-                let left = &track.clips[a_index];
                 let right = &track.clips[b_index];
-                let left_time = self.clip_time_axis_in(tempo.clone(), left);
                 let left_seconds = (left_time.local_seconds_at_beat(a_end)
                     - left_time.local_seconds_at_beat(b_start))
                 .max(0.0);
@@ -607,9 +716,30 @@ impl TimelineState {
         clip: &ClipState,
         crossfades: &TrackCrossfades,
     ) -> EffectiveFades {
-        let played = self.clip_played_seconds(clip);
         let crossfade_in = crossfades.fade_in_override(&clip.id);
         let crossfade_out = crossfades.fade_out_override(&clip.id);
+        self.effective_clip_fades_with_overrides(clip, crossfade_in, crossfade_out)
+    }
+
+    pub(crate) fn effective_clip_fades_indexed(
+        &self,
+        clip: &ClipState,
+        crossfades: &CrossfadeIndex<'_>,
+    ) -> EffectiveFades {
+        self.effective_clip_fades_with_overrides(
+            clip,
+            crossfades.fade_in.get(clip.id.as_str()).copied(),
+            crossfades.fade_out.get(clip.id.as_str()).copied(),
+        )
+    }
+
+    fn effective_clip_fades_with_overrides(
+        &self,
+        clip: &ClipState,
+        crossfade_in: Option<f64>,
+        crossfade_out: Option<f64>,
+    ) -> EffectiveFades {
+        let played = self.clip_played_seconds(clip);
         let (in_seconds, out_seconds) = resolve_effective_fades(
             clip.stretch.fade_in_ms as f64 / 1000.0,
             clip.stretch.fade_out_ms as f64 / 1000.0,
@@ -992,6 +1122,172 @@ impl TimelineState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The original nested traversal is the ordering/edge-case oracle, not the
+    // implementation used by production. Keep it for randomized parity and
+    // side-by-side scaling measurements in a single release test binary.
+    fn quadratic_overlaps(spans: &[(f64, f64, usize)]) -> Vec<Vec<usize>> {
+        let mut by_left = vec![Vec::new(); spans.len()];
+        for (i, &(start, end, _)) in spans.iter().enumerate() {
+            for (j, &(right_start, right_end, _)) in spans.iter().enumerate().skip(i + 1) {
+                if right_start >= end {
+                    break;
+                }
+                if start < right_start && end < right_end {
+                    by_left[i].push(j);
+                }
+            }
+        }
+        by_left
+    }
+
+    fn sorted_spans(mut spans: Vec<(f64, f64, usize)>) -> Vec<(f64, f64, usize)> {
+        spans.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.2.cmp(&b.2)));
+        spans
+    }
+
+    #[test]
+    fn crossfade_sweep_matches_nested_pairs_and_order() {
+        let cases = [
+            vec![],
+            vec![(0.0, 1.0, 0)],
+            vec![
+                (0.0, 4.0, 0),
+                (0.0, 8.0, 1),
+                (1.0, 4.0, 2),
+                (2.0, 6.0, 3),
+                (4.0, 8.0, 4),
+            ],
+            vec![(-0.0, 2.0, 0), (0.0, 3.0, 1), (1.0, 4.0, 2)],
+            vec![
+                (0.0, f64::NAN, 0),
+                (0.5, 3.0, 1),
+                (1.0, 0.0, 2),
+                (2.0, f64::INFINITY, 3),
+                (3.0, 3.0, 4),
+            ],
+        ];
+        for case in cases {
+            let spans = sorted_spans(case);
+            assert_eq!(staggered_overlaps(&spans), quadratic_overlaps(&spans));
+        }
+        let mut seed = 0x5522_4141_0123_u64;
+        for _ in 0..100 {
+            let spans = sorted_spans(
+                (0..160)
+                    .map(|index| {
+                        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        let start = ((seed >> 32) % 80) as f64 * 0.25;
+                        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        let end = start + ((seed >> 32) % 120) as f64 * 0.25;
+                        (start, end, index)
+                    })
+                    .collect(),
+            );
+            assert_eq!(staggered_overlaps(&spans), quadratic_overlaps(&spans));
+        }
+    }
+
+    #[test]
+    fn indexed_crossfade_edges_match_the_scans_for_every_clip() {
+        for ramped in [false, true] {
+            let mut state = state_with(
+                (0..30)
+                    .map(|i| {
+                        let mut clip =
+                            audio_clip(&format!("edge-{i}"), i as f32 * 0.5, 3.0 + (i % 4) as f64);
+                        clip.stretch.fade_in_ms = 100.0;
+                        clip.stretch.fade_out_ms = 200.0;
+                        clip
+                    })
+                    .collect(),
+            );
+            if ramped {
+                ramp(&mut state);
+            }
+            let track = &state.tracks[0];
+            let fades = state.audio_crossfades(track);
+            let index = fades.index();
+            for clip in &track.clips {
+                assert_eq!(
+                    state.effective_clip_fades(clip, &fades),
+                    state.effective_clip_fades_indexed(clip, &index)
+                );
+                assert_eq!(
+                    fades.fade_in_override(&clip.id),
+                    index.fade_in.get(clip.id.as_str()).copied()
+                );
+                assert_eq!(
+                    fades.fade_out_override(&clip.id),
+                    index.fade_out.get(clip.id.as_str()).copied()
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "scaling measurement; run release with --ignored --nocapture"]
+    fn crossfade_scaling_cost() {
+        use std::{hint::black_box, time::Instant};
+        fn median_us(mut f: impl FnMut()) -> u128 {
+            f();
+            let mut times = Vec::new();
+            for _ in 0..5 {
+                let start = Instant::now();
+                f();
+                times.push(start.elapsed().as_micros());
+            }
+            times.sort_unstable();
+            times[2]
+        }
+        for count in [200, 1_000, 4_000] {
+            let spans: Vec<_> = (0..count)
+                .map(|i| (i as f64, (count * 2 - i) as f64, i))
+                .collect();
+            assert_eq!(staggered_overlaps(&spans), quadratic_overlaps(&spans));
+            let old = median_us(|| {
+                black_box(quadratic_overlaps(black_box(&spans)));
+            });
+            let new = median_us(|| {
+                black_box(staggered_overlaps(black_box(&spans)));
+            });
+            println!("crossfade-scaling nested_clips={count} quadratic_us={old} sweep_us={new}");
+
+            let ids: Vec<_> = (0..count).map(|i| format!("clip-{i}")).collect();
+            let crossfades = TrackCrossfades {
+                crossfades: (0..count - 1)
+                    .map(|i| AudioCrossfade {
+                        left_id: ids[i].clone(),
+                        right_id: ids[i + 1].clone(),
+                        start_beat: i as f64,
+                        end_beat: i as f64 + 0.25,
+                        seconds: 0.125,
+                        left_seconds: 0.125,
+                        right_seconds: 0.125,
+                    })
+                    .collect(),
+            };
+            let old = median_us(|| {
+                let crossfades = black_box(&crossfades);
+                let mut sum = 0.0;
+                for id in &ids {
+                    sum += crossfades.fade_in_override(id).unwrap_or(0.0)
+                        + crossfades.fade_out_override(id).unwrap_or(0.0);
+                }
+                black_box(sum);
+            });
+            let new = median_us(|| {
+                let index = black_box(&crossfades).index();
+                let mut sum = 0.0;
+                for id in &ids {
+                    sum += index.fade_in.get(id.as_str()).copied().unwrap_or(0.0)
+                        + index.fade_out.get(id.as_str()).copied().unwrap_or(0.0);
+                }
+                black_box(sum);
+            });
+            println!("crossfade-scaling edge_clips={count} crossfades={} scans_us={old} index_build_and_lookup_us={new}", crossfades.crossfades.len());
+        }
+    }
 
     fn audio_clip(id: &str, start_beat: f32, seconds: f64) -> ClipState {
         let mut clip = ClipState {

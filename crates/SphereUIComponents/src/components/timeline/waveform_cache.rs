@@ -1231,6 +1231,22 @@ pub fn geometry_cache_put(key: u64, bars: Arc<WaveformBars>) {
     }
 }
 
+/// One lock for a clip's visible tiles. Never aggregate peaks under this lock.
+pub(super) fn geometry_cache_get_many(keys: &[u64]) -> Vec<Option<Arc<WaveformBars>>> {
+    let cache = geometry_cache().lock().ok();
+    keys.iter()
+        .map(|key| cache.as_ref().and_then(|cache| cache.get(*key)))
+        .collect()
+}
+
+pub(super) fn geometry_cache_put_many(entries: impl IntoIterator<Item = (u64, Arc<WaveformBars>)>) {
+    if let Ok(mut cache) = geometry_cache().lock() {
+        for (key, bars) in entries {
+            cache.insert(key, bars);
+        }
+    }
+}
+
 pub fn pick_lod<'a>(
     preview: &'a WaveformPreview,
     samples_per_pixel: f32,
@@ -1532,6 +1548,21 @@ mod tests {
         let got = geometry_cache_get(key).expect("cached bars present");
         assert_eq!(got.as_slice(), &[(1.0, 2.0, 3.0)]);
         assert!(geometry_cache_get(0x0123_4567_89AB_CDEF).is_none());
+    }
+
+    #[test]
+    fn geometry_cache_batches_preserve_key_order_and_missing_tiles() {
+        let first = Arc::new(vec![(0.0, -0.5, 0.5)]);
+        let second = Arc::new(vec![(256.0, -0.8, 0.8)]);
+        let keys = [0x1919_2525_3636_0101, 0x1919_2525_3636_0202];
+        geometry_cache_put_many([
+            (keys[0], Arc::clone(&first)),
+            (keys[1], Arc::clone(&second)),
+        ]);
+        let found = geometry_cache_get_many(&[keys[1], 0x1919_2525_3636_FFFF, keys[0]]);
+        assert!(Arc::ptr_eq(found[0].as_ref().unwrap(), &second));
+        assert!(found[1].is_none());
+        assert!(Arc::ptr_eq(found[2].as_ref().unwrap(), &first));
     }
 
     #[test]

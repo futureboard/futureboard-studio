@@ -1893,12 +1893,24 @@ impl Timeline {
     /// Called by the cached [`crate::components::timeline::track_lane_view::TrackLaneView`],
     /// which renders during the prepaint of the tree `render` just returned —
     /// so `frame_lane_ctx` is always this frame's.
-    pub(crate) fn render_track_lane(&self, track_id: &str) -> gpui::AnyElement {
+    pub(crate) fn render_track_lane(
+        &self,
+        track_id: &str,
+        lane_id: gpui::EntityId,
+    ) -> gpui::AnyElement {
         use gpui::{IntoElement, ParentElement, Styled};
         let Some(ctx) = self.frame_lane_ctx.as_ref() else {
             return gpui::div().into_any_element();
         };
-        let Some(index) = self.state.tracks.iter().position(|t| t.id == track_id) else {
+        let Some(&index) = ctx.track_indices.get(&lane_id) else {
+            return gpui::div().into_any_element();
+        };
+        let Some(track) = self
+            .state
+            .tracks
+            .get(index)
+            .filter(|track| track.id == track_id)
+        else {
             return gpui::div().into_any_element();
         };
         let Some(row) = ctx.row_layout.row_for_index(index) else {
@@ -1912,7 +1924,7 @@ impl Timeline {
         gpui::div()
             .size_full()
             .child(crate::components::timeline::track_lane::track_lane(
-                &self.state.tracks[index],
+                track,
                 index,
                 &self.state,
                 &ctx.gesture,
