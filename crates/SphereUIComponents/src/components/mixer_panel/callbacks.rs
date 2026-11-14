@@ -1,5 +1,11 @@
 use gpui::{App, Window};
 
+/// `insert_index` of a `.pst` let go on a channel strip rather than on one of
+/// its slots: the preset goes to the channel the way a drop on its track in
+/// the arrangement does — an effect on the end of the chain, an instrument
+/// into the instrument slot, a chain or track bundle as its own load.
+pub const PRESET_TO_CHANNEL: usize = usize::MAX;
+
 /// Bundle of mixer interactions hooked up from the layout. Closures land in
 /// the same TimelineState mutation methods used by the TrackHeader so the two
 /// views can never disagree.
@@ -115,7 +121,8 @@ pub struct MixerCallbacks {
     /// drag = one undo entry (shared with the Inspector's `on_drop_insert`).
     pub on_drop_insert: crate::components::reorder::InsertDropCb,
     /// Drop a `.pst` plug-in preset from the browser into a concrete insert slot.
-    /// `(preset_path, track_id, insert_index)` uses the full insert-chain index.
+    /// `(preset_path, track_id, insert_index)` uses the full insert-chain index,
+    /// or [`PRESET_TO_CHANNEL`] for a preset let go on the strip itself.
     pub on_drop_plugin_preset: std::sync::Arc<
         dyn Fn(&(std::path::PathBuf, String, usize), &mut Window, &mut App) + 'static,
     >,

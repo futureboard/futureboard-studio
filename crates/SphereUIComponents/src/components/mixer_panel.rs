@@ -1011,14 +1011,41 @@ fn insert_chip(
         .pb(px(SLOT_GAP))
         .cursor(gpui::CursorStyle::PointingHand)
         .drag_over::<BrowserDragItem>(|style, _drag, _window, _cx| drop_over_highlight(style))
-        .on_drop::<BrowserDragItem>(move |item, window, cx| {
-            if is_plugin_preset_path(&item.path) {
-                drop_plugin_preset(
-                    &(item.path.clone(), preset_track.clone(), preset_slot),
-                    window,
-                    cx,
-                );
+        .drag_over::<gpui::ExternalPaths>(|style, paths, _window, _cx| {
+            preset_drop_highlight(style, paths)
+        })
+        .on_drop::<BrowserDragItem>({
+            let drop_plugin_preset = drop_plugin_preset.clone();
+            let preset_track = preset_track.clone();
+            move |item, window, cx| {
+                if is_plugin_preset_path(&item.path) {
+                    drop_plugin_preset(
+                        &(item.path.clone(), preset_track.clone(), preset_slot),
+                        window,
+                        cx,
+                    );
+                }
             }
+        })
+        // A `.pst` dragged in from outside the app — Explorer, or a preset
+        // dragged out of the Rigs sidebar — lands the same way.
+        .on_drop::<gpui::ExternalPaths>(move |paths, window, cx| {
+            if let Some(path) = first_plugin_preset(paths) {
+                drop_plugin_preset(&(path, preset_track.clone(), preset_slot), window, cx);
+            }
+        })
+        // Right-click: this insert's own menu (its sidechain source) rather
+        // than the strip's. Stops here so the strip menu does not open too.
+        .when_some(on_insert_context, move |chip, cb| {
+            chip.on_mouse_down(
+                gpui::MouseButton::Right,
+                move |event: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    let x: f32 = event.position.x.into();
+                    let y: f32 = event.position.y.into();
+                    cb(&(context_pair.0.clone(), context_pair.1.clone(), x, y), window, cx);
+                },
+            )
         })
         .on_click(move |_e, w, cx| {
             eprintln!(
@@ -1044,11 +1071,37 @@ fn insert_chip(
     }
 }
 
-/// `can_drop` answer for a browser `.pst` preset.
+/// `can_drop` answer for a `.pst` preset: one dragged from the Browser, or
+/// a file dragged in from outside the app.
 fn accepts_plugin_preset(dragged: &dyn std::any::Any) -> bool {
+    if let Some(item) = dragged.downcast_ref::<BrowserDragItem>() {
+        return is_plugin_preset_path(&item.path);
+    }
     dragged
-        .downcast_ref::<BrowserDragItem>()
-        .is_some_and(|item| is_plugin_preset_path(&item.path))
+        .downcast_ref::<gpui::ExternalPaths>()
+        .is_some_and(|paths| first_plugin_preset(paths).is_some())
+}
+
+/// The first `.pst` among files dragged in from outside the app. One preset
+/// per drop, the same as a Browser drag.
+fn first_plugin_preset(paths: &gpui::ExternalPaths) -> Option<std::path::PathBuf> {
+    paths
+        .paths()
+        .iter()
+        .find(|path| is_plugin_preset_path(path))
+        .cloned()
+}
+
+/// The drop line, shown only while the files being dragged include a preset.
+fn preset_drop_highlight(
+    style: gpui::StyleRefinement,
+    paths: &gpui::ExternalPaths,
+) -> gpui::StyleRefinement {
+    if first_plugin_preset(paths).is_some() {
+        drop_over_highlight(style)
+    } else {
+        style
+    }
 }
 
 /// Trailing drop zone for the end of a chain, rendered for an empty chain too
@@ -1106,13 +1159,25 @@ fn add_insert_button(
                 .text_color(Colors::text_secondary())
         })
         .drag_over::<BrowserDragItem>(|style, _drag, _window, _cx| drop_over_highlight(style))
-        .on_drop::<BrowserDragItem>(move |item, window, cx| {
-            if is_plugin_preset_path(&item.path) {
-                drop_plugin_preset(
-                    &(item.path.clone(), drop_track.clone(), next_slot),
-                    window,
-                    cx,
-                );
+        .drag_over::<gpui::ExternalPaths>(|style, paths, _window, _cx| {
+            preset_drop_highlight(style, paths)
+        })
+        .on_drop::<BrowserDragItem>({
+            let drop_plugin_preset = drop_plugin_preset.clone();
+            let drop_track = drop_track.clone();
+            move |item, window, cx| {
+                if is_plugin_preset_path(&item.path) {
+                    drop_plugin_preset(
+                        &(item.path.clone(), drop_track.clone(), next_slot),
+                        window,
+                        cx,
+                    );
+                }
+            }
+        })
+        .on_drop::<gpui::ExternalPaths>(move |paths, window, cx| {
+            if let Some(path) = first_plugin_preset(paths) {
+                drop_plugin_preset(&(path, drop_track.clone(), next_slot), window, cx);
             }
         })
         .child(
@@ -2537,9 +2602,38 @@ fn channel_strip(
         buttons: button_row(track, callbacks, id_num, false, base).into_any_element(),
     };
 
+    // A `.pst` let go anywhere else on the strip — the fader, the name, the
+    // space between racks — goes to the channel, the same as one dropped on
+    // its track in the arrangement. The slots and "+ Insert" take it first.
+    let append_slot = callbacks::PRESET_TO_CHANNEL;
+    let on_external_preset = {
+        let drop_plugin_preset = callbacks.on_drop_plugin_preset.clone();
+        let track_id = track.id.clone();
+        move |paths: &gpui::ExternalPaths, window: &mut gpui::Window, cx: &mut gpui::App| {
+            if let Some(path) = first_plugin_preset(paths) {
+                drop_plugin_preset(&(path, track_id.clone(), append_slot), window, cx);
+            }
+        }
+    };
+    let on_browser_preset = {
+        let drop_plugin_preset = callbacks.on_drop_plugin_preset.clone();
+        let track_id = track.id.clone();
+        move |item: &BrowserDragItem, window: &mut gpui::Window, cx: &mut gpui::App| {
+            if is_plugin_preset_path(&item.path) {
+                drop_plugin_preset(
+                    &(item.path.clone(), track_id.clone(), append_slot),
+                    window,
+                    cx,
+                );
+            }
+        }
+    };
+
     strip_shell(base, gpu_decor)
         .relative()
         .id(("mix-strip", id_num))
+        .on_drop::<gpui::ExternalPaths>(on_external_preset)
+        .on_drop::<BrowserDragItem>(on_browser_preset)
         // Select during capture so occluding child controls (racks, pan and
         // fader) cannot delay or swallow channel selection. The child still
         // receives the same event and performs its own action normally.

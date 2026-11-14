@@ -2285,15 +2285,20 @@ impl StudioLayout {
                     let track_id = track_id.clone();
                     let insert_index = *insert_index;
                     StudioLayout::defer_update(&this, cx, move |this, cx| {
-                        if this
-                            .apply_dropped_plugin_preset_to_slot(
-                                &track_id,
-                                insert_index,
-                                &preset_path,
-                                cx,
-                            )
-                            .is_some()
-                        {
+                        let bound =
+                            if insert_index == crate::components::mixer_panel::PRESET_TO_CHANNEL {
+                                // Let go on the strip itself: the same landing
+                                // as a drop on the channel's track header.
+                                this.apply_dropped_plugin_preset(Some(&track_id), &preset_path, cx)
+                            } else {
+                                this.apply_dropped_plugin_preset_to_slot(
+                                    &track_id,
+                                    insert_index,
+                                    &preset_path,
+                                    cx,
+                                )
+                            };
+                        if bound.is_some() {
                             this.push_mixer_snapshot_to_window(cx);
                             cx.notify();
                         }
