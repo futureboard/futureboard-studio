@@ -302,6 +302,16 @@ impl Collector {
             "[ui-prof] fps={:.1} frame_ms={:.2} min={:.2}ms max={:.2}ms root_renders/s={} dominant_reason={}({:.0}%)",
             fps, avg_ms, min_ms, self.frame_max_ms, self.frame_count, dominant_reason.0, reason_pct
         );
+        // The app scopes alone cannot explain time spent in GPUI's tree walk,
+        // accessibility update or platform/GPU handoff. Last completed frame,
+        // sampled only in this environment-gated one-second diagnostic dump.
+        let gpui_frame = gpui::frame_profile::frame_profile();
+        let gpui_details = format!(
+            "gpui_draw_ms={:.3} gpui_prepaint_ms={:.3} gpui_paint_ms={:.3} gpui_a11y_ms={:.3} gpui_present_ms={:.3} primitives={} layout_nodes={}",
+            gpui_frame.draw_ms(), gpui_frame.prepaint_ms(), gpui_frame.paint_ms(),
+            gpui_frame.a11y_ms(), gpui_frame.present_ms(), gpui_frame.scene_primitives, gpui_frame.layout_nodes,
+        );
+        eprintln!("[ui-gpui] {gpui_details}");
 
         let mut scopes: Vec<_> = self.scopes.iter().filter(|(_, a)| a.count > 0).collect();
         scopes.sort_by(|a, b| b.1.total_ns.cmp(&a.1.total_ns));
@@ -424,7 +434,7 @@ impl Collector {
         // `target/ui-perf-last.txt` next to the build artifacts.
         let log_path = std::env::var("FUTUREBOARD_UI_PERF_LOG")
             .unwrap_or_else(|_| "target/ui-perf-last.txt".to_string());
-        let payload = format!(
+        let mut payload = format!(
             "fps={:.1}\navg_ms={:.2}\nmax_ms={:.2}\nrepaint_per_s={}\ndominant_reason={} ({}/{} frames)\nverdict={}\n\nranked:\n{}\n\ncounts:\n{}\n",
             fps,
             avg_ms,
@@ -455,6 +465,7 @@ impl Collector {
                 .collect::<Vec<_>>()
                 .join("\n"),
         );
+        payload.push_str(&format!("\nlast_completed_frame: {gpui_details}\n"));
         // Best-effort write — we don't want a missing target/ dir to
         // crash the render thread. log_err equivalent: ignore.
         let _ = std::fs::write(&log_path, payload);

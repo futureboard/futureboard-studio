@@ -197,6 +197,24 @@ pub struct FolderPlacement {
 
 impl FolderPlacement {
     pub fn of(state: &TimelineState, tree: &GroupTree, index: usize) -> Self {
+        let members = if state
+            .tracks
+            .get(index)
+            .is_some_and(|track| track.track_type == TrackType::Group)
+        {
+            tree.member_count(index)
+        } else {
+            0
+        };
+        Self::with_members(state, tree, index, members)
+    }
+
+    pub(crate) fn with_members(
+        state: &TimelineState,
+        tree: &GroupTree,
+        index: usize,
+        members: usize,
+    ) -> Self {
         let rails = tree
             .ancestors(index)
             .into_iter()
@@ -209,11 +227,7 @@ impl FolderPlacement {
             .is_some_and(|track| track.track_type == TrackType::Group);
         Self {
             rails,
-            members: if is_folder {
-                tree.member_count(index)
-            } else {
-                0
-            },
+            members: if is_folder { members } else { 0 },
         }
     }
 

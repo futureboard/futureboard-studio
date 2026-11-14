@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use gpui::{fill, point, px, Bounds, PathBuilder, Pixels, Rgba, Window};
+use gpui::{fill, point, px, Bounds, Path, PathBuilder, Pixels, Rgba, Window};
 
 use super::geometry::{ClipMap, Viewport};
 use super::EditorAudio;
@@ -118,6 +118,12 @@ pub fn lane_rect(index: usize, lanes: usize, top: f32, height: f32) -> (f32, f32
 }
 
 pub fn paint_lanes(bounds: Bounds<Pixels>, frame: &LaneFrame, window: &mut Window) {
+    // A short dock can leave this canvas with no visible body. Canvas paint
+    // callbacks still run there; reject it before peak queries or tessellation.
+    if bounds.intersect(&window.content_mask().bounds).is_empty() {
+        return;
+    }
+    let _scope = crate::perf::PerfScope::enter("AudioEditor:lanes");
     let ox: f32 = bounds.origin.x.into();
     let oy: f32 = bounds.origin.y.into();
     let w: f32 = bounds.size.width.into();
@@ -164,6 +170,12 @@ pub fn paint_lanes(bounds: Bounds<Pixels>, frame: &LaneFrame, window: &mut Windo
 
     for lane in 0..frame.lanes.max(1) {
         let (top, lane_h) = lane_rect(lane, frame.lanes, oy, h);
+        if rect(ox, top, w, lane_h)
+            .intersect(&window.content_mask().bounds)
+            .is_empty()
+        {
+            continue;
+        }
         let center = top + lane_h * 0.5;
         window.paint_quad(fill(
             rect(ox + clip_x0, center, clip_x1 - clip_x0, 1.0),
@@ -325,22 +337,49 @@ fn paint_channel(
         tops.push((ox + x as f32, y_top));
         bottoms.push((ox + x as f32, y_bot));
     }
-    if tops.is_empty() {
-        return;
-    }
-    let mut path = PathBuilder::fill();
-    path.move_to(point(px(tops[0].0), px(tops[0].1)));
-    for &(x, y) in tops.iter().skip(1) {
-        path.line_to(point(px(x + 1.0), px(y)));
-    }
-    for &(x, y) in bottoms.iter().rev() {
-        path.line_to(point(px(x + 1.0), px(y)));
-    }
-    path.line_to(point(px(bottoms[0].0), px(bottoms[0].1)));
-    path.close();
-    if let Ok(path) = path.build() {
+    if let Some(path) = envelope_path(&tops, &bottoms) {
         window.paint_path(path, color);
     }
+}
+
+/// Triangulate the same filled envelope as the old whole-polygon painter.
+/// After the leading edge, the two boundaries share increasing x coordinates:
+/// each adjacent pair is a trapezoid with no interior overlap. Emit its two
+/// triangles directly, O(P), without running a general fill sweep over 2P
+/// vertices on every frame. Peak resolution, slopes and subpixel edges stay
+/// unchanged.
+fn envelope_path(tops: &[(f32, f32)], bottoms: &[(f32, f32)]) -> Option<Path<Pixels>> {
+    let _scope = crate::perf::PerfScope::enter("AudioEditor:envelope_mesh");
+    let &(x0, top0) = tops.first()?;
+    debug_assert_eq!(tops.len(), bottoms.len());
+    let &(_, bottom0) = bottoms.first()?;
+
+    // Preserve the original leading edge verbatim: the first top is at x0,
+    // the following tops at x+1, and the first bottom has BOTH x0 and x0+1.
+    // This small cap can be concave (or cross itself), so let the existing
+    // fill tessellator handle just its at-most-five vertices in constant work.
+    let mut cap = PathBuilder::fill();
+    cap.move_to(point(px(x0), px(top0)));
+    if tops.len() > 1 {
+        cap.line_to(point(px(tops[1].0 + 1.0), px(tops[1].1)));
+        cap.line_to(point(px(bottoms[1].0 + 1.0), px(bottoms[1].1)));
+    }
+    cap.line_to(point(px(bottoms[0].0 + 1.0), px(bottom0)));
+    cap.line_to(point(px(bottoms[0].0), px(bottom0)));
+    cap.close();
+    let mut path = cap.build().ok()?;
+    path.vertices
+        .reserve(tops.len().saturating_sub(2).saturating_mul(6));
+    let fill = (point(0.0, 1.0), point(0.0, 1.0), point(0.0, 1.0));
+    for (top, bottom) in tops.windows(2).zip(bottoms.windows(2)).skip(1) {
+        let tl = point(px(top[0].0 + 1.0), px(top[0].1));
+        let tr = point(px(top[1].0 + 1.0), px(top[1].1));
+        let bl = point(px(bottom[0].0 + 1.0), px(bottom[0].1));
+        let br = point(px(bottom[1].0 + 1.0), px(bottom[1].1));
+        path.push_triangle((tl, tr, br), fill);
+        path.push_triangle((tl, br, bl), fill);
+    }
+    Some(path)
 }
 
 fn paint_fades(
@@ -484,6 +523,10 @@ pub fn paint_overview(
     palette: &Palette,
     window: &mut Window,
 ) {
+    if bounds.intersect(&window.content_mask().bounds).is_empty() {
+        return;
+    }
+    let _scope = crate::perf::PerfScope::enter("AudioEditor:overview");
     let ox: f32 = bounds.origin.x.into();
     let oy: f32 = bounds.origin.y.into();
     let w: f32 = bounds.size.width.into();
@@ -495,28 +538,34 @@ pub fn paint_overview(
         let center = oy + h * 0.5;
         let half = h * 0.5 - 2.0;
         let columns = w.max(1.0) as usize;
-        for x in 0..columns {
-            let a = duration * x as f64 / columns as f64;
-            let b = duration * (x + 1) as f64 / columns as f64;
-            let (f0, mut f1) = map.source_range(a, b);
-            if f1 <= f0 {
-                f1 = f0 + 1;
-            }
-            let mut peak = 0.0f32;
-            for ch in 0..pcm.channels.max(1) {
-                if let Some(mm) = audio
-                    .peaks
-                    .range(&pcm.samples, ch, f0 as usize, f1 as usize)
-                {
-                    peak = peak.max(mm.max.abs()).max(mm.min.abs());
+        // Adjacent columns do not overlap. One layer gives the waveform one
+        // draw-order lookup, instead of inserting P ordered columns into the
+        // scene's bounds tree (which degenerates for this monotonic input).
+        // Keep the background and viewport frame outside, in their old order.
+        window.paint_layer(bounds, |window| {
+            for x in 0..columns {
+                let a = duration * x as f64 / columns as f64;
+                let b = duration * (x + 1) as f64 / columns as f64;
+                let (f0, mut f1) = map.source_range(a, b);
+                if f1 <= f0 {
+                    f1 = f0 + 1;
                 }
+                let mut peak = 0.0f32;
+                for ch in 0..pcm.channels.max(1) {
+                    if let Some(mm) = audio
+                        .peaks
+                        .range(&pcm.samples, ch, f0 as usize, f1 as usize)
+                    {
+                        peak = peak.max(mm.max.abs()).max(mm.min.abs());
+                    }
+                }
+                let bar = (peak.min(1.0) * half).max(0.5);
+                window.paint_quad(fill(
+                    rect(ox + x as f32, center - bar, 1.0, bar * 2.0),
+                    palette.wave_dim,
+                ));
             }
-            let bar = (peak.min(1.0) * half).max(0.5);
-            window.paint_quad(fill(
-                rect(ox + x as f32, center - bar, 1.0, bar * 2.0),
-                palette.wave_dim,
-            ));
-        }
+        });
     }
     let x0 = (view.scroll / duration * w as f64) as f32;
     let x1 = ((view.scroll + view.visible_beats()) / duration * w as f64) as f32;
@@ -574,6 +623,149 @@ pub fn paint_ruler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reference_envelope_path(
+        tops: &[(f32, f32)],
+        bottoms: &[(f32, f32)],
+    ) -> Option<Path<Pixels>> {
+        let &(x, y) = tops.first()?;
+        let mut path = PathBuilder::fill();
+        path.move_to(point(px(x), px(y)));
+        for &(x, y) in tops.iter().skip(1) {
+            path.line_to(point(px(x + 1.0), px(y)));
+        }
+        for &(x, y) in bottoms.iter().rev() {
+            path.line_to(point(px(x + 1.0), px(y)));
+        }
+        path.line_to(point(px(bottoms[0].0), px(bottoms[0].1)));
+        path.close();
+        path.build().ok()
+    }
+
+    fn cross(a: (f32, f32), b: (f32, f32), p: (f32, f32)) -> f64 {
+        let (ax, ay, bx, by, x, y) = (
+            a.0 as f64, a.1 as f64, b.0 as f64, b.1 as f64, p.0 as f64, p.1 as f64,
+        );
+        (bx - ax) * (y - ay) - (by - ay) * (x - ax)
+    }
+
+    fn covering_triangles(path: &Path<Pixels>, p: (f32, f32), strict: bool) -> usize {
+        path.vertices
+            .chunks_exact(3)
+            .filter(|vertices| {
+                let xy = |i: usize| {
+                    let p = vertices[i].xy_position;
+                    (f32::from(p.x), f32::from(p.y))
+                };
+                let (a, b, c) = (xy(0), xy(1), xy(2));
+                if cross(a, b, c).abs() < 1e-8 {
+                    return false;
+                }
+                let edges = [cross(a, b, p), cross(b, c, p), cross(c, a, p)];
+                let tolerance = if strict { 1e-5 } else { -1e-5 };
+                edges.iter().all(|v| *v >= tolerance) || edges.iter().all(|v| -*v >= tolerance)
+            })
+            .count()
+    }
+
+    fn assert_same_fill(tops: &[(f32, f32)], bottoms: &[(f32, f32)]) {
+        let reference = reference_envelope_path(tops, bottoms).unwrap();
+        let mesh = envelope_path(tops, bottoms).unwrap();
+        assert!(mesh.vertices.len() <= tops.len() * 6 + 12);
+        let x0 = tops[0].0.floor() as i32 - 1;
+        let x1 = (tops.last().unwrap().0 + 2.0).ceil() as i32;
+        let y0 = tops
+            .iter()
+            .map(|p| p.1)
+            .fold(f32::INFINITY, f32::min)
+            .floor() as i32
+            - 1;
+        let y1 = bottoms
+            .iter()
+            .map(|p| p.1)
+            .fold(f32::NEG_INFINITY, f32::max)
+            .ceil() as i32
+            + 1;
+        for x in x0 * 2..x1 * 2 {
+            for y in y0 * 2..y1 * 2 {
+                let p = (x as f32 * 0.5 + 0.413, y as f32 * 0.5 + 0.271);
+                assert_eq!(
+                    covering_triangles(&mesh, p, false) > 0,
+                    covering_triangles(&reference, p, false) > 0,
+                    "different coverage at {p:?}, tops={tops:?}, bottoms={bottoms:?}"
+                );
+                assert!(
+                    covering_triangles(&mesh, p, true) <= 1,
+                    "overlapping fill would change alpha at {p:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn envelope_mesh_preserves_the_original_cap_gaps_and_subpixel_fill() {
+        assert!(envelope_path(&[], &[]).is_none());
+        assert_same_fill(&[(0.0, 2.0)], &[(0.0, 8.0)]);
+        // The old first top/bottom edges can cross. Keep their fill rule too.
+        assert_same_fill(&[(0.0, 2.0), (1.0, 10.0)], &[(0.0, 3.0), (1.0, 14.0)]);
+        let mut seed = 0x1a2b_3c4d_u64;
+        for count in 2..18 {
+            let mut tops = Vec::new();
+            let mut bottoms = Vec::new();
+            let mut x = -19.375;
+            for _ in 0..count {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let top = 418.125 + (seed >> 48) as f32 / 65535.0 * 20.0;
+                let height = 1.0 + ((seed >> 32) & 15) as f32 * 0.25;
+                tops.push((x, top));
+                bottoms.push((x, top + height));
+                x += if seed & 7 == 0 { 3.0 } else { 1.0 };
+            }
+            assert_same_fill(&tops, &bottoms);
+        }
+    }
+
+    #[test]
+    #[ignore = "release measurement; run with --ignored --nocapture"]
+    fn audio_editor_envelope_mesh_cost() {
+        use std::{hint::black_box, time::Instant};
+        for columns in [800, 1800, 3600] {
+            for lane_height in [0.5_f32, 120.0] {
+                let half = lane_height * 0.5 - 2.0;
+                let center = 1000.0 + lane_height * 0.5;
+                let mut tops = Vec::new();
+                let mut bottoms = Vec::new();
+                for i in 0..columns {
+                    let max = 0.1 + (i * 17 % 97) as f32 / 108.0;
+                    let min = -(0.1 + (i * 29 % 89) as f32 / 100.0);
+                    let (mut top, mut bottom) = (center - max * half, center - min * half);
+                    if bottom - top < 1.0 {
+                        let c = (top + bottom) * 0.5;
+                        top = c - 0.5;
+                        bottom = c + 0.5;
+                    }
+                    tops.push((i as f32, top));
+                    bottoms.push((i as f32, bottom));
+                }
+                let mut old = Vec::new();
+                let mut new = Vec::new();
+                for _ in 0..7 {
+                    let start = Instant::now();
+                    black_box(reference_envelope_path(
+                        black_box(&tops),
+                        black_box(&bottoms),
+                    ));
+                    old.push(start.elapsed().as_micros());
+                    let start = Instant::now();
+                    black_box(envelope_path(black_box(&tops), black_box(&bottoms)));
+                    new.push(start.elapsed().as_micros());
+                }
+                old.sort_unstable();
+                new.sort_unstable();
+                println!("editor-mesh columns={columns} lane_height={lane_height} reference_p50_us={} direct_p50_us={}", old[3], new[3]);
+            }
+        }
+    }
 
     #[test]
     fn envelope_mapping_round_trips() {

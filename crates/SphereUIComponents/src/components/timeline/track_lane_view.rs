@@ -37,6 +37,9 @@ pub type TrackLaneViews = std::collections::HashMap<String, Entity<TrackLaneView
 /// publishing them costs one `Rc` and a handful of `Arc` clones, and lets a
 /// dirty lane rebuild itself without re-deriving the frame.
 pub struct LaneFrameContext {
+    /// Built once with the frame; each lane resolves its track without an
+    /// O(total_tracks) id scan. Entity ids survive track reordering.
+    pub track_indices: std::collections::HashMap<gpui::EntityId, usize>,
     pub gesture: std::rc::Rc<TimelineGestureContext>,
     pub row_layout: std::rc::Rc<TrackRowLayout>,
     pub on_select_track: Arc<dyn Fn(&String, &mut gpui::Window, &mut gpui::App) + 'static>,
@@ -95,6 +98,8 @@ impl Render for TrackLaneView {
         let Some(timeline) = self.timeline.upgrade() else {
             return div().into_any_element();
         };
-        timeline.read(cx).render_track_lane(&self.track_id)
+        timeline
+            .read(cx)
+            .render_track_lane(&self.track_id, cx.entity_id())
     }
 }

@@ -3,6 +3,7 @@ mod font_features;
 mod line;
 mod line_layout;
 mod line_wrapper;
+mod width_cache;
 
 pub use font_fallbacks::*;
 pub use font_features::*;
@@ -55,6 +56,7 @@ pub struct TextSystem {
     raster_bounds: RwLock<FxHashMap<RenderGlyphParams, Bounds<DevicePixels>>>,
     wrapper_pool: Mutex<FxHashMap<FontIdWithSize, Vec<LineWrapper>>>,
     font_runs_pool: Mutex<Vec<Vec<FontRun>>>,
+    string_width_cache: width_cache::StringWidthCache,
     fallback_font_stack: SmallVec<[Font; 2]>,
 }
 
@@ -75,6 +77,7 @@ impl TextSystem {
             font_ids_by_font: RwLock::default(),
             wrapper_pool: Mutex::default(),
             font_runs_pool: Mutex::default(),
+            string_width_cache: width_cache::StringWidthCache::default(),
             fallback_font_stack: smallvec![
                 // TODO: Remove this when Linux have implemented setting fallbacks.
                 font(".ZedMono"),
@@ -107,7 +110,9 @@ impl TextSystem {
 
     /// Add a font's data to the text system.
     pub fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
-        self.platform_text_system.add_fonts(fonts)
+        self.platform_text_system.add_fonts(fonts)?;
+        self.string_width_cache.clear();
+        Ok(())
     }
 
     /// Get the FontId for the configure font family and style.
@@ -243,16 +248,22 @@ impl TextSystem {
         if text.is_empty() {
             return px(0.0);
         }
-        self.platform_text_system
-            .layout_line(
-                text,
-                font_size,
-                &[FontRun {
-                    len: text.len(),
-                    font_id,
-                }],
-            )
-            .width
+        // Truncating labels are measured in several Taffy passes and rebuilt
+        // on scroll. Keep the exact platform-shaped width (including complex
+        // scripts), without reshaping unchanged labels for every measurement.
+        self.string_width_cache
+            .get_or_measure(font_id, font_size, text, || {
+                self.platform_text_system
+                    .layout_line(
+                        text,
+                        font_size,
+                        &[FontRun {
+                            len: text.len(),
+                            font_id,
+                        }],
+                    )
+                    .width
+            })
     }
 
     /// Returns the width of an `em`.

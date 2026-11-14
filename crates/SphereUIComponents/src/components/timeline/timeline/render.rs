@@ -1779,6 +1779,17 @@ impl Render for Timeline {
         );
         self.frame_lane_ctx = Some(std::rc::Rc::new(
             crate::components::timeline::track_lane_view::LaneFrameContext {
+                track_indices: self
+                    .state
+                    .tracks
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, track)| {
+                        self.track_lanes
+                            .get(track.id.as_str())
+                            .map(|lane| (lane.entity_id(), index))
+                    })
+                    .collect(),
                 gesture: lane_gesture.clone(),
                 row_layout: row_layout.clone(),
                 on_select_track: on_select_track.clone(),
@@ -4191,6 +4202,48 @@ mod midi_clip_draw_tests {
     use crate::components::timeline::timeline_state::{
         DEFAULT_MIDI_CLIP_BEATS, MIN_MIDI_CLIP_BEATS,
     };
+
+    #[gpui::test]
+    fn lane_track_index_follows_reorder_insert_and_delete(cx: &mut gpui::TestAppContext) {
+        let window = cx.open_window(gpui::size(px(1600.0), px(900.0)), |_, _| {
+            let mut timeline = Timeline::new();
+            timeline.state.tracks.clear();
+            for _ in 0..4 {
+                timeline.state.create_audio_track();
+            }
+            timeline
+        });
+        cx.run_until_parked();
+        for operation in 0..4 {
+            window
+                .update(cx, |timeline, _, cx| {
+                    match operation {
+                        0 => {}
+                        1 => timeline.state.tracks.swap(0, 3),
+                        2 => {
+                            timeline.state.tracks.remove(1);
+                        }
+                        _ => {
+                            timeline.state.create_audio_track();
+                        }
+                    }
+                    cx.notify();
+                })
+                .expect("window is open");
+            cx.run_until_parked();
+            window
+                .update(cx, |timeline, _, _| {
+                    let frame = timeline.frame_lane_ctx.as_ref().expect("frame published");
+                    assert_eq!(frame.track_indices.len(), timeline.state.tracks.len());
+                    assert_eq!(timeline.track_lanes.len(), timeline.state.tracks.len());
+                    for (index, track) in timeline.state.tracks.iter().enumerate() {
+                        let lane = timeline.track_lanes.get(&track.id).expect("lane exists");
+                        assert_eq!(frame.track_indices.get(&lane.entity_id()), Some(&index));
+                    }
+                })
+                .expect("window is open");
+        }
+    }
 
     /// Ctrl + wheel up must zoom *in*. Regression guard: the exponent was
     /// negated, so wheel up produced a factor below 1 and zoomed out.

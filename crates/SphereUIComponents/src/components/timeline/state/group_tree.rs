@@ -13,7 +13,7 @@
 //! passes on through the outer one ([`folder_output`]).
 
 use super::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// The group structure of a track list, indexed like it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -47,23 +47,46 @@ impl GroupTree {
             depth: vec![0; tracks.len()],
             hidden: vec![false; tracks.len()],
         };
+        // Iterative three-colour traversal of this parent graph. Each track is
+        // entered/finalized once; resolved ancestors supply depth/visibility in
+        // O(1). Rewalking every ancestor chain, with contains at each step, was
+        // O(T * D²), cubic for a deeply nested folder chain.
+        let mut visited = vec![0_u8; tracks.len()]; // 0 unseen, 1 on path, 2 resolved
+        let mut valid = vec![false; tracks.len()];
+        let mut path = Vec::new();
         for index in 0..tracks.len() {
-            // Walk up at most once around the list: a chain longer than that
-            // is a loop a hand-edited project could hold, and a track in a
-            // loop is treated as top level rather than hanging the UI.
-            let mut chain = Vec::new();
-            let mut at = named_parent[index];
-            while let Some(parent) = at {
-                if parent == index || chain.contains(&parent) || chain.len() >= tracks.len() {
-                    chain.clear();
+            if visited[index] == 2 {
+                continue;
+            }
+            path.clear();
+            let mut at = Some(index);
+            let mut valid_chain = true;
+            while let Some(node) = at {
+                if visited[node] == 2 {
+                    valid_chain = valid[node];
                     break;
                 }
-                chain.push(parent);
-                at = named_parent[parent];
+                if visited[node] == 1 {
+                    valid_chain = false;
+                    break;
+                }
+                visited[node] = 1;
+                path.push(node);
+                at = named_parent[node];
             }
-            tree.parent[index] = chain.first().copied();
-            tree.depth[index] = chain.len();
-            tree.hidden[index] = chain.iter().any(|&group| tracks[group].group_collapsed);
+            for &node in path.iter().rev() {
+                if valid_chain {
+                    tree.parent[node] = named_parent[node];
+                    if let Some(parent) = named_parent[node] {
+                        tree.depth[node] = tree.depth[parent] + 1;
+                        tree.hidden[node] = tree.hidden[parent] || tracks[parent].group_collapsed;
+                    }
+                }
+                // Every descendant of a cycle is top level too, matching the
+                // old chain.clear() fallback for corrupted/hand-edited files.
+                valid[node] = valid_chain;
+                visited[node] = 2;
+            }
         }
         tree
     }
@@ -98,9 +121,10 @@ impl GroupTree {
     /// The folders enclosing `index`, innermost first.
     pub fn ancestors(&self, index: usize) -> Vec<usize> {
         let mut out = Vec::new();
+        let mut seen = HashSet::new();
         let mut at = self.parent.get(index).copied().flatten();
         while let Some(parent) = at {
-            if out.contains(&parent) {
+            if !seen.insert(parent) {
                 break;
             }
             out.push(parent);
@@ -115,6 +139,17 @@ impl GroupTree {
             .iter()
             .filter(|parent| **parent == Some(index))
             .count()
+    }
+
+    /// All direct-child counts in one pass, for a frame drawing many folders.
+    pub fn member_counts(&self) -> Vec<usize> {
+        let mut counts = vec![0; self.parent.len()];
+        for &parent in self.parent.iter().flatten() {
+            if let Some(count) = counts.get_mut(parent) {
+                *count += 1;
+            }
+        }
+        counts
     }
 }
 
@@ -364,6 +399,129 @@ fn track_plays_audio_out(track: &TrackState) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reference_tree(tracks: &[TrackState]) -> GroupTree {
+        let ids: HashMap<&str, usize> = tracks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.id.as_str(), i))
+            .collect();
+        let parents: Vec<_> = tracks
+            .iter()
+            .enumerate()
+            .map(|(i, track)| {
+                let parent = *ids.get(track.parent_group_id.as_deref()?)?;
+                (parent != i && tracks[parent].track_type == TrackType::Group).then_some(parent)
+            })
+            .collect();
+        let mut tree = GroupTree {
+            parent: vec![None; tracks.len()],
+            depth: vec![0; tracks.len()],
+            hidden: vec![false; tracks.len()],
+        };
+        for index in 0..tracks.len() {
+            let mut chain = Vec::new();
+            let mut at = parents[index];
+            while let Some(parent) = at {
+                if parent == index || chain.contains(&parent) || chain.len() >= tracks.len() {
+                    chain.clear();
+                    break;
+                }
+                chain.push(parent);
+                at = parents[parent];
+            }
+            tree.parent[index] = chain.first().copied();
+            tree.depth[index] = chain.len();
+            tree.hidden[index] = chain.iter().any(|&i| tracks[i].group_collapsed);
+        }
+        tree
+    }
+
+    fn nested_tracks(count: usize) -> Vec<TrackState> {
+        let template = state_with(&[("template", TrackType::Group, None)])
+            .tracks
+            .remove(0);
+        (0..count)
+            .map(|i| {
+                let mut track = template.clone();
+                track.id = format!("folder-{i}");
+                track.parent_group_id = i.checked_sub(1).map(|parent| format!("folder-{parent}"));
+                track.group_collapsed = i == 10;
+                track
+            })
+            .collect()
+    }
+
+    #[test]
+    fn linear_group_tree_matches_parent_walks_for_arbitrary_graphs() {
+        let mut tracks = nested_tracks(128);
+        assert_eq!(GroupTree::of(&tracks), reference_tree(&tracks));
+        let mut seed = 0x1818_1414_u64;
+        for _ in 0..100 {
+            for track in &mut tracks {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let parent = ((seed >> 32) % 145) as usize;
+                track.parent_group_id = (parent % 11 != 0).then(|| format!("folder-{parent}"));
+                track.track_type = if parent % 7 == 0 {
+                    TrackType::Audio
+                } else {
+                    TrackType::Group
+                };
+                track.group_collapsed = parent % 5 == 0;
+            }
+            let tree = GroupTree::of(&tracks);
+            assert_eq!(tree, reference_tree(&tracks));
+            let counts = tree.member_counts();
+            for (index, count) in counts.into_iter().enumerate() {
+                assert_eq!(count, tree.member_count(index));
+            }
+        }
+    }
+
+    #[test]
+    fn deeply_nested_groups_are_iterative_and_cycle_descendants_stay_top_level() {
+        let mut tracks = nested_tracks(10_000);
+        let tree = GroupTree::of(&tracks);
+        assert_eq!(tree.depth[9_999], 9_999);
+        assert!(tree.hidden[9_999]);
+        assert!(
+            !tree.hidden[10],
+            "the folder's own collapse hides its children, not itself"
+        );
+        assert_eq!(tree.ancestors(9_999).len(), 9_999);
+        // A cycle at the root invalidates every descendant's parent chain.
+        tracks[0].parent_group_id = Some(tracks[1].id.clone());
+        let tree = GroupTree::of(&tracks);
+        assert!(tree.parent.iter().all(Option::is_none));
+        assert!(tree.depth.iter().all(|depth| *depth == 0));
+        assert!(tree.hidden.iter().all(|hidden| !hidden));
+    }
+
+    #[test]
+    #[ignore = "scaling measurement; run release with --ignored --nocapture"]
+    fn group_tree_scaling_cost() {
+        use std::{hint::black_box, time::Instant};
+        for count in [100, 300, 1_000] {
+            let tracks = nested_tracks(count);
+            assert_eq!(GroupTree::of(&tracks), reference_tree(&tracks));
+            let mut old = Vec::new();
+            let mut new = Vec::new();
+            for _ in 0..5 {
+                let start = Instant::now();
+                black_box(reference_tree(black_box(&tracks)));
+                old.push(start.elapsed().as_micros());
+                let start = Instant::now();
+                black_box(GroupTree::of(black_box(&tracks)));
+                new.push(start.elapsed().as_micros());
+            }
+            old.sort_unstable();
+            new.sort_unstable();
+            println!(
+                "group-scaling tracks={count} parent_walks_us={} linear_us={}",
+                old[2], new[2]
+            );
+        }
+    }
 
     fn state_with(tracks: &[(&str, TrackType, Option<&str>)]) -> TimelineState {
         let mut state = TimelineState::default();

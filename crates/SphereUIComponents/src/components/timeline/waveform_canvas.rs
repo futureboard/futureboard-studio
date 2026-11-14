@@ -13,6 +13,8 @@ use gpui::{
     canvas, div, fill, point, px, size, Bounds, IntoElement, ParentElement, Pixels, Styled,
 };
 
+mod paint;
+
 pub fn resolve_waveform_source_range(
     clip: &ClipState,
     total_source_frames: u64,
@@ -261,9 +263,10 @@ impl ColumnWindow {
     }
 }
 
-/// A clip's on-screen bars: the tiles covering the visible columns, each with
-/// the range of its bars that is on screen.
-type VisibleBars = Vec<(Arc<WaveformBars>, Range<usize>)>;
+/// A clip's on-screen bars: each tile, its visible range, and whether geometry
+/// was reused. Preparing paint runs pays off only on reused tiles: a continuous
+/// zoom creates new geometry every frame, so cold tiles use the column painter.
+type VisibleBars = Vec<(Arc<WaveformBars>, Range<usize>, bool)>;
 
 fn tile_key(base: &DefaultHasher, phase: f32, cols: &Range<usize>) -> u64 {
     let mut hasher = base.clone();
@@ -294,38 +297,40 @@ fn tiled_bars(
         let (mut built, _) = build(std::slice::from_ref(&whole));
         let bars = Arc::new(built.pop().unwrap_or_default());
         let range = window.visible_slice(&bars);
-        return (vec![(bars, range)], false);
+        return (vec![(bars, range, false)], false);
     };
     let tiles: Vec<Range<usize>> = window.tiles().collect();
     let keys: Vec<u64> = tiles
         .iter()
         .map(|cols| tile_key(base, window.phase, cols))
         .collect();
-    let mut found: Vec<Option<Arc<WaveformBars>>> = keys
-        .iter()
-        .map(|key| waveform_cache::geometry_cache_get(*key))
-        .collect();
+    let mut found = waveform_cache::geometry_cache_get_many(&keys);
     let missing: Vec<usize> = (0..tiles.len()).filter(|i| found[*i].is_none()).collect();
     let all_hit = missing.is_empty();
     if !all_hit {
         let ranges: Vec<Range<usize>> = missing.iter().map(|i| tiles[*i].clone()).collect();
         let (built, publish) = build(&ranges);
-        for (i, bars) in missing.into_iter().zip(built) {
+        for (i, bars) in missing.iter().copied().zip(built) {
             let bars = Arc::new(bars);
-            if publish {
-                waveform_cache::geometry_cache_put(keys[i], Arc::clone(&bars));
-            }
             found[i] = Some(bars);
+        }
+        if publish {
+            waveform_cache::geometry_cache_put_many(
+                missing
+                    .iter()
+                    .filter_map(|&i| found[i].as_ref().map(|bars| (keys[i], Arc::clone(bars)))),
+            );
         }
     }
     let visible = found
         .into_iter()
-        .flatten()
-        .map(|bars| {
+        .enumerate()
+        .filter_map(|(index, bars)| bars.map(|bars| (index, bars)))
+        .map(|(index, bars)| {
             let range = window.visible_slice(&bars);
-            (bars, range)
+            (bars, range, missing.binary_search(&index).is_err())
         })
-        .filter(|(_, range)| !range.is_empty())
+        .filter(|(_, range, _)| !range.is_empty())
         .collect();
     (visible, all_hit)
 }
@@ -612,7 +617,7 @@ fn draw_chunk_waveform(
     let element = canvas(
         |_bounds, _window, _cx| {},
         move |bounds: Bounds<Pixels>, (), window, _cx| {
-            paint_waveform_bars(bounds, &bars, waveform_color, clip_gain, zoom, window);
+            paint_waveform_bars(bounds, &bars, waveform_color, clip_gain, zoom, true, window);
         },
     )
     .absolute()
@@ -884,11 +889,20 @@ fn draw_preview_waveform(
 
     let waveform_color = Colors::timeline_audio_clip_waveform(color);
     let zoom = state.waveform_zoom;
+    let cacheable = identity.is_some();
 
     let element = canvas(
         |_b, _w, _cx| {},
         move |bounds: Bounds<Pixels>, (), window, _cx| {
-            paint_waveform_bars(bounds, &bars, waveform_color, clip_gain, zoom, window);
+            paint_waveform_bars(
+                bounds,
+                &bars,
+                waveform_color,
+                clip_gain,
+                zoom,
+                cacheable,
+                window,
+            );
         },
     )
     .absolute()
@@ -920,38 +934,74 @@ fn paint_waveform_bars(
     color: gpui::Rgba,
     gain: f32,
     zoom: f32,
+    cacheable: bool,
     window: &mut gpui::Window,
 ) {
+    let _scope = crate::perf::PerfScope::enter("Waveform:paint");
     let h: f32 = bounds.size.height.into();
     if h < 1.0 {
         return;
     }
-    let gain = gain.max(0.0);
-    let zoom = zoom.max(1.0);
-    let center = h / 2.0;
+    let style = paint::PaintStyle {
+        height: h,
+        gain: gain.max(0.0),
+        zoom: zoom.max(1.0),
+        origin_y: bounds.origin.y.into(),
+        scale: window.scale_factor(),
+    };
     let overload_color = Colors::meter_high();
     // One scene layer for the clip's bars. Outside a layer every quad claims
     // its own draw order from the scene's bounds tree — a tree insert per
     // pixel column. The bars never overlap one another, so they can share the
     // layer's single order; the layer is the canvas's own bounds, so it orders
-    // against every other element exactly as the bars did. The quads are
-    // unchanged, so the pixels are too.
+    // against every other element exactly as the bars did. Paint runs merge
+    // only adjacent columns with identical snapped edges and overload color.
     window.paint_layer(bounds, |window| {
-        for (tile, range) in bars {
-            for (x, mn, mx) in &tile[range.clone()] {
-                let scaled_mx = mx * gain;
-                let scaled_mn = mn * gain;
-                let clipped = scaled_mx > 1.0 || scaled_mn < -1.0;
-                let top = center - (scaled_mx * zoom).clamp(-1.0, 1.0) * center;
-                let bottom = center - (scaled_mn * zoom).clamp(-1.0, 1.0) * center;
-                let bar_h = (bottom - top).max(1.0);
+        let mut columns = 0;
+        let mut rectangles = 0;
+        for (tile, range, reused) in bars {
+            columns += range.len();
+            if !cacheable || !reused {
+                // Fresh zoom geometry and live takes usually paint just once.
+                // Don't pay a second per-column pass and a paint-cache insert
+                // for data that the next zoom/record tick will replace.
+                for &(x, min, max) in &tile[range.clone()] {
+                    let (top, height, clipped) = style.column(min, max);
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            bounds.origin + point(px(x), px(top)),
+                            size(px(1.0), px(height)),
+                        ),
+                        if clipped { overload_color } else { color },
+                    ));
+                    rectangles += 1;
+                }
+                continue;
+            }
+            let runs =
+                paint::prepared_runs(tile, style, cacheable, |y| window.pixel_snap(px(y)).into());
+            let first_run = runs.partition_point(|run| run.columns.end <= range.start);
+            for run in &runs[first_run..] {
+                if run.columns.start >= range.end {
+                    break;
+                }
+                let first = run.columns.start.max(range.start);
+                let end = run.columns.end.min(range.end);
+                // Derive the two ends independently, just like individual
+                // columns. In particular, do not add a large clip-local width
+                // to a far-offscreen origin and lose subpixel precision.
+                let left = bounds.origin.x + px(tile[first].0);
+                let right = (bounds.origin.x + px(tile[end - 1].0)) + px(1.0);
                 let r = Bounds::new(
-                    bounds.origin + point(px(*x), px(top)),
-                    size(px(1.0), px(bar_h)),
+                    point(left, bounds.origin.y + px(run.top)),
+                    size(right - left, px(run.height)),
                 );
-                window.paint_quad(fill(r, if clipped { overload_color } else { color }));
+                window.paint_quad(fill(r, if run.clipped { overload_color } else { color }));
+                rectangles += 1;
             }
         }
+        crate::perf::count("waveform_paint_columns", columns as u64);
+        crate::perf::count("waveform_paint_rectangles", rectangles);
     });
 }
 
@@ -986,6 +1036,119 @@ mod tests {
 
     const SAMPLE_RATE: u32 = 48_000;
     const VIEWPORT_W: f32 = 1600.0;
+
+    /// The production waveform path, including peak aggregation and GPUI scene
+    /// emission. TestPlatform measures CPU draw phases, not GPU execution or
+    /// display cadence. Run alone so the process-wide frame counters are ours.
+    #[gpui::test]
+    #[ignore = "release measurement; run alone with --ignored --nocapture"]
+    fn waveform_scroll_zoom_frame_cost(cx: &mut gpui::TestAppContext) {
+        use gpui::{Context, ParentElement, Render, Window};
+        struct Harness {
+            state: TimelineState,
+            clips: Vec<ClipState>,
+        }
+        impl Render for Harness {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let mut root = div().size_full().flex().flex_col();
+                for clip in &self.clips {
+                    let (left, width) = self.state.clip_lane_x_span(clip);
+                    root = root.child(
+                        div()
+                            .w_full()
+                            .h(px(64.0))
+                            .flex_none()
+                            .relative()
+                            .overflow_hidden()
+                            .child(div().absolute().left(px(left)).w(px(width)).h_full().child(
+                                waveform_canvas(
+                                    clip,
+                                    gpui::rgba(0x44bbccff),
+                                    &self.state,
+                                    left,
+                                    width,
+                                ),
+                            )),
+                    );
+                }
+                root
+            }
+        }
+        for count in [1, 7, 16] {
+            let clips: Vec<_> = (0..count)
+                .map(|i| {
+                    let key = format!("frame-bench-{count}-{i}");
+                    // Phrase-level amplitude changes plus deterministic fine noise,
+                    // rather than a flat full-scale envelope that merges trivially.
+                    let fine = fine_peaks(fine_count(600.0), i as u64 + 71)
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, mut peak)| {
+                            let envelope = 0.25 + 0.65 * ((index / 256) % 32) as f32 / 31.0;
+                            peak.min *= envelope;
+                            peak.max *= envelope;
+                            peak
+                        })
+                        .collect();
+                    waveform_cache::install_ready(
+                        &key,
+                        Arc::new(WaveformPreview {
+                            sample_rate: SAMPLE_RATE,
+                            channels: 1,
+                            duration_seconds: 600.0,
+                            total_frames: frames(600.0),
+                            lods: ladder(fine),
+                        }),
+                    );
+                    audio_clip(&key, 0.0, 600.0)
+                })
+                .collect();
+            let window = cx.open_window(size(px(VIEWPORT_W), px(64.0 * count as f32)), |_, _| {
+                Harness {
+                    state: timeline(8.0, false),
+                    clips,
+                }
+            });
+            cx.run_until_parked();
+            for zooming in [false, true] {
+                let mut draw = Vec::new();
+                let mut paint = Vec::new();
+                let mut prepaint = Vec::new();
+                let mut primitives = 0;
+                for frame in 0..140 {
+                    window
+                        .update(cx, |view, _, cx| {
+                            view.state.viewport.scroll_x = 300.0 + frame as f32 * 8.0;
+                            view.state.viewport.pixels_per_second = if zooming {
+                                8.0 + frame as f32 * 0.2
+                            } else {
+                                8.0
+                            };
+                            view.state.sync_pixels_per_beat();
+                            cx.notify();
+                        })
+                        .expect("benchmark window is open");
+                    cx.run_until_parked();
+                    if frame >= 20 {
+                        let p = gpui::frame_profile::frame_profile();
+                        draw.push(p.draw_us);
+                        paint.push(p.paint_us);
+                        prepaint.push(p.prepaint_us);
+                        primitives = primitives.max(p.scene_primitives);
+                    }
+                }
+                draw.sort_unstable();
+                paint.sort_unstable();
+                prepaint.sort_unstable();
+                println!("waveform-frame clips={count} gesture={} draw_p50_us={} draw_p95_us={} prepaint_p50_us={} paint_p50_us={} primitives_max={primitives}",
+                    if zooming { "zoom" } else { "scroll" }, draw[60], draw[114], prepaint[60], paint[60]);
+            }
+            window
+                .update(cx, |_, window, _| window.remove_window())
+                .expect("benchmark window is open");
+            cx.run_until_parked();
+        }
+    }
 
     /// Deterministic noise peaks at the finest level, with silent stretches so
     /// the skip-silence path is exercised too.
@@ -1151,7 +1314,7 @@ mod tests {
 
     fn flatten(bars: &VisibleBars) -> Vec<(f32, f32, f32)> {
         bars.iter()
-            .flat_map(|(tile, range)| tile[range.clone()].iter().copied())
+            .flat_map(|(tile, range, _)| tile[range.clone()].iter().copied())
             .collect()
     }
 
@@ -1332,8 +1495,12 @@ mod tests {
                 hit,
                 "scrolling to {scroll} inside the same tiles missed the cache"
             );
-            for ((a, _), (b, _)) in first.iter().zip(&again) {
+            for ((a, _, _), (b, _, reused)) in first.iter().zip(&again) {
                 assert!(Arc::ptr_eq(a, b), "scroll {scroll} rebuilt a tile");
+                assert!(
+                    *reused,
+                    "a reused geometry tile should reuse its paint runs"
+                );
             }
         }
     }
@@ -1345,6 +1512,29 @@ mod tests {
         let mut state = timeline(40.0, false);
         let clip = audio_clip(key, 0.0, 120.0);
         assert_one_pixel_scroll_hits(key, &mut state, &clip);
+    }
+
+    #[test]
+    fn cold_zoom_and_live_tiles_skip_paint_preparation_until_reused() {
+        let key = "tile-test-paint-admission";
+        install_ready(key, 120.0, 29);
+        let mut state = timeline(40.0, false);
+        let clip = audio_clip(key, 0.0, 120.0);
+        let (cold, _) = tiled(key, &clip, &state);
+        assert!(cold.iter().all(|(_, _, reused)| !reused));
+        let (warm, _) = tiled(key, &clip, &state);
+        assert!(warm.iter().all(|(_, _, reused)| *reused));
+        state.viewport.pixels_per_second *= 1.1;
+        state.sync_pixels_per_beat();
+        let (zoomed, _) = tiled(key, &clip, &state);
+        assert!(zoomed.iter().all(|(_, _, reused)| !reused));
+
+        let window = ColumnWindow::visible(0.0, 500.0, 200.0).unwrap();
+        for _ in 0..2 {
+            let (live, hit) = tiled_bars(&window, None, |_| (vec![vec![(0.0, -0.5, 0.5)]], false));
+            assert!(!hit);
+            assert!(live.iter().all(|(_, _, reused)| !reused));
+        }
     }
 
     /// The miss the tiles fixed hardest: with tempo automation the old key held
@@ -1373,7 +1563,7 @@ mod tests {
         assert!(!hit);
         let reused = after
             .iter()
-            .filter(|(tile, _)| before.iter().any(|(old, _)| Arc::ptr_eq(old, tile)))
+            .filter(|(tile, _, _)| before.iter().any(|(old, _, _)| Arc::ptr_eq(old, tile)))
             .count();
         assert_eq!(
             reused,

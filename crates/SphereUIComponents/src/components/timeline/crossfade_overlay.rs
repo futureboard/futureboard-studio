@@ -145,6 +145,18 @@ impl Render for CrossfadeHandleDrag {
 /// Height of an audio clip's name strip, which the curves stop above.
 const CLIP_STRIP_H: f32 = 20.0;
 
+/// Shared cull bounds, including the handle's hit-area overscan. Lanes can
+/// reject an offscreen overlay before resolving its endpoints and fade axes.
+pub(crate) fn visible_crossfade_bounds(
+    crossfade: &AudioCrossfade,
+    state: &TimelineState,
+) -> Option<(f32, f32)> {
+    let x0 = state.beats_to_x(crossfade.start_beat as f32);
+    let x1 = state.beats_to_x(crossfade.end_beat as f32);
+    let viewport_w = state.viewport.viewport_width.max(1.0);
+    (!(x1 < -FADE_HANDLE_HIT || x0 > viewport_w + FADE_HANDLE_HIT)).then_some((x0, x1))
+}
+
 /// The overlay for `crossfade` on a lane `row_height` tall, or `None` when it
 /// is out of view. `strip` says whether the clips draw their name strip (the
 /// curves stop above it); `handle` what its handle does. On an ARA track the
@@ -161,12 +173,7 @@ pub fn crossfade_overlay(
     ara: bool,
     on_gesture: Option<CrossfadeGestureCb>,
 ) -> Option<gpui::AnyElement> {
-    let x0 = state.beats_to_x(crossfade.start_beat as f32);
-    let x1 = state.beats_to_x(crossfade.end_beat as f32);
-    let viewport_w = state.viewport.viewport_width.max(1.0);
-    if x1 < -FADE_HANDLE_HIT || x0 > viewport_w + FADE_HANDLE_HIT {
-        return None;
-    }
+    let (x0, x1) = visible_crossfade_bounds(crossfade, state)?;
     let width = (x1 - x0).max(0.0);
     let top = CLIP_LANE_PAD + CLIP_BORDER;
     let height = (row_height - 2.0 * (CLIP_LANE_PAD + CLIP_BORDER)).max(0.0);

@@ -160,6 +160,7 @@ pub fn track_list(
 
     // Read once for every row this frame draws.
     let group_tree = state.group_tree();
+    let group_members = group_tree.member_counts();
     for (offset, track) in state.tracks[visible_start..visible_end].iter().enumerate() {
         // `row_layout.rows` is 1:1 with `state.tracks`, so the row is an index
         // lookup rather than an id scan. The scan was O(track_count) per visible
@@ -253,7 +254,12 @@ pub fn track_list(
                                 index,
                                 state,
                                 row_height,
-                                &FolderPlacement::of(state, &group_tree, index),
+                                &FolderPlacement::with_members(
+                                    state,
+                                    &group_tree,
+                                    index,
+                                    group_members[index],
+                                ),
                                 header_callbacks.clone(),
                                 meters,
                             ))
