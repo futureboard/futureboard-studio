@@ -17,6 +17,9 @@ pub struct PluginPickerPrefs {
     pub window_width: f32,
     pub window_height: f32,
     pub show_details: bool,
+    /// Grouping of the Add Track instrument picker: "vendor", "name" or
+    /// "format". Empty (older files) means vendor.
+    pub instrument_grouping: String,
 }
 
 impl PluginPickerPrefs {
@@ -44,6 +47,7 @@ impl PluginPickerPrefs {
             window_width: 860.0,
             window_height: 560.0,
             show_details: true,
+            instrument_grouping: String::new(),
         }
     }
 

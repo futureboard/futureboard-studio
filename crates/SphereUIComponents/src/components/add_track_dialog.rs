@@ -17,8 +17,8 @@ use crate::components::controls::{
     fb_button, fb_checkbox, fb_form_row, fb_stepper_button, FbButtonKind,
 };
 use crate::components::form::{
-    select_dismiss_backdrop, select_with_placement, select_with_placement_and_header,
-    SelectMenuPlacement, SelectOption,
+    select_dismiss_backdrop, select_with_menu, select_with_placement, SelectMenuPlacement,
+    SelectOption,
 };
 use crate::components::text_input::{
     bind_mouse_selection, text_field_with_callbacks, text_field_with_callbacks_and_ime,
@@ -31,6 +31,13 @@ use crate::i18n::I18n;
 use crate::theme::{self, radius, size, space, typography, Colors};
 use crate::window_position::{apply_owner_display, centered_window_bounds};
 use SpherePluginHost::{PluginFormat, RegistryPlugin};
+
+mod instrument_tree;
+
+use instrument_tree::{
+    effective_highlight, instrument_tree_menu, selected_instrument_label, InstrumentGrouping,
+    InstrumentRow, InstrumentTreeCallbacks, InstrumentTreeState,
+};
 
 const MAX_TRACK_COUNT: u32 = 128;
 /// Measured width of the form's label column — a layout constant, not spacing.
@@ -685,107 +692,6 @@ fn plugin_format_label(format: PluginFormat) -> &'static str {
     }
 }
 
-fn instrument_plugin_options(plugins: &[RegistryPlugin]) -> Vec<SelectOption> {
-    if plugins.is_empty() {
-        return vec![SelectOption::new("", "No Instrument")
-            .description("Open Plugin Manager to scan instruments")];
-    }
-    // Prefer VST3 when the same instrument ships in several formats: identical
-    // display names made the dropdown pick CLAP first during Surge XT testing,
-    // and VST3 is the most exercised of the hosted bridges.
-    let mut sorted: Vec<&RegistryPlugin> = plugins.iter().collect();
-    sorted.sort_by(|a, b| {
-        let fmt_rank = |f: PluginFormat| match f {
-            PluginFormat::Vst3 => 0u8,
-            PluginFormat::Clap => 1,
-            PluginFormat::Au => 2,
-            // Below the rest: when the same instrument ships in several
-            // formats, VST2 is the legacy one and should only win if nothing
-            // else exists.
-            PluginFormat::Vst2 => 3,
-            PluginFormat::Lv2 => 4,
-            PluginFormat::Unknown => 5,
-        };
-        a.name
-            .to_ascii_lowercase()
-            .cmp(&b.name.to_ascii_lowercase())
-            .then_with(|| fmt_rank(a.format).cmp(&fmt_rank(b.format)))
-            .then_with(|| a.id.cmp(&b.id))
-    });
-    let mut name_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    for plugin in &sorted {
-        *name_counts
-            .entry(plugin.name.to_ascii_lowercase())
-            .or_default() += 1;
-    }
-    let mut options = vec![SelectOption::new("", "No Instrument")];
-    options.extend(sorted.into_iter().map(|plugin| {
-        let vendor = plugin.vendor.trim();
-        let fmt = plugin_format_label(plugin.format);
-        let description = if vendor.is_empty() {
-            fmt.to_string()
-        } else {
-            format!("{vendor} / {fmt}")
-        };
-        let label = if name_counts
-            .get(&plugin.name.to_ascii_lowercase())
-            .copied()
-            .unwrap_or(0)
-            > 1
-        {
-            format!("{} ({fmt})", plugin.name)
-        } else {
-            plugin.name.clone()
-        };
-        SelectOption::new(plugin.id.clone(), label).description(description)
-    }));
-    options
-}
-
-fn filtered_instrument_plugin_options(
-    plugins: &[RegistryPlugin],
-    query: &str,
-) -> Vec<SelectOption> {
-    let query = query.trim().to_lowercase();
-    let options = instrument_plugin_options(plugins);
-    if query.is_empty() {
-        return options;
-    }
-    let filtered: Vec<_> = options
-        .into_iter()
-        .filter(|option| {
-            option.label.to_lowercase().contains(&query)
-                || option
-                    .description
-                    .as_deref()
-                    .is_some_and(|description| description.to_lowercase().contains(&query))
-        })
-        .collect();
-    if filtered.is_empty() {
-        vec![SelectOption::new("__no_instrument_results", "No matching instruments").disabled(true)]
-    } else {
-        filtered
-    }
-}
-
-fn plugin_search_header(
-    search_input: &TextInputState,
-    search_focused: bool,
-    search_callbacks: TextInputCallbacks,
-    ime_target: Entity<AddTrackWindow>,
-) -> gpui::AnyElement {
-    div()
-        .mb(px(space::TIGHT))
-        .child(text_field_with_callbacks_and_ime(
-            search_input,
-            search_focused,
-            search_callbacks,
-            ime_target,
-        ))
-        .into_any_element()
-}
-
 fn find_instrument_plugin<'a>(
     plugins: &'a [RegistryPlugin],
     value: &str,
@@ -1359,11 +1265,7 @@ fn type_fields(
     callbacks: &AddTrackDialogCallbacks,
     open_select: Option<AddTrackSelectId>,
     instrument_plugins: &[RegistryPlugin],
-    instrument_plugin_query: &str,
-    instrument_search_input: Option<&TextInputState>,
-    instrument_search_focused: bool,
-    instrument_search_callbacks: Option<TextInputCallbacks>,
-    instrument_search_ime: Option<Entity<AddTrackWindow>>,
+    instrument_menu: Option<gpui::AnyElement>,
     midi_input_devices: &[String],
     i18n: I18n,
 ) -> gpui::AnyElement {
@@ -1743,11 +1645,7 @@ pub fn add_track_dialog_body(
     count_callbacks: TextInputCallbacks,
     open_select: Option<AddTrackSelectId>,
     instrument_plugins: &[RegistryPlugin],
-    instrument_plugin_query: &str,
-    instrument_search_input: Option<&TextInputState>,
-    instrument_search_focused: bool,
-    instrument_search_callbacks: Option<TextInputCallbacks>,
-    instrument_search_ime: Option<Entity<AddTrackWindow>>,
+    instrument_menu: Option<gpui::AnyElement>,
     midi_input_devices: &[String],
     color_ui: AddTrackColorUi,
     callbacks: AddTrackDialogCallbacks,
@@ -1819,11 +1717,7 @@ pub fn add_track_dialog_body(
                     &callbacks,
                     open_select,
                     instrument_plugins,
-                    instrument_plugin_query,
-                    instrument_search_input,
-                    instrument_search_focused,
-                    instrument_search_callbacks,
-                    instrument_search_ime,
+                    instrument_menu,
                     midi_input_devices,
                     i18n,
                 ))),
@@ -1913,6 +1807,9 @@ pub struct AddTrackWindow {
     text_context_menu: Option<AddTrackTextMenu>,
     instrument_plugin_query: String,
     instrument_search_input: TextInputState,
+    /// Grouping, folder toggles, keyboard target and scroll of the instrument
+    /// tree popover.
+    instrument_tree: InstrumentTreeState,
     instrument_plugins: Vec<RegistryPlugin>,
     /// Real detected MIDI input device names (Preferences โ’ MIDI enabled
     /// inputs), refreshed whenever the dialog opens or devices change.
@@ -1998,6 +1895,7 @@ impl AddTrackWindow {
             text_context_menu: None,
             instrument_plugin_query: String::new(),
             instrument_search_input,
+            instrument_tree: InstrumentTreeState::new(),
             instrument_plugins,
             midi_input_devices,
             focus_handle: cx.focus_handle(),
@@ -2162,10 +2060,101 @@ impl AddTrackWindow {
     fn clear_instrument_search(&mut self) {
         self.instrument_plugin_query.clear();
         self.instrument_search_input.set_value("");
+        self.instrument_tree.reset();
     }
 
     fn sync_instrument_search_query(&mut self) {
-        self.instrument_plugin_query = self.instrument_search_input.value.clone();
+        if self.instrument_plugin_query != self.instrument_search_input.value {
+            self.instrument_plugin_query = self.instrument_search_input.value.clone();
+            // A new query re-targets the keyboard at its first match.
+            self.instrument_tree.highlight = None;
+        }
+    }
+
+    fn instrument_rows(&self) -> Vec<InstrumentRow> {
+        self.instrument_tree.rows(
+            &self.instrument_plugins,
+            &self.instrument_plugin_query,
+            self.state.instrument_plugin_id.as_deref(),
+        )
+    }
+
+    fn instrument_searching(&self) -> bool {
+        !self.instrument_plugin_query.trim().is_empty()
+    }
+
+    /// Apply a pick from the instrument popover ("" = No Instrument) and
+    /// close it. Shared by clicks and Enter.
+    fn select_instrument_plugin(&mut self, value: &str) {
+        if value.is_empty() {
+            self.state.instrument_plugin_id = None;
+            self.state.instrument_plugin_name = None;
+        } else {
+            let selected = find_instrument_plugin(&self.instrument_plugins, value);
+            let plugin_id = selected
+                .map(|plugin| plugin.id.clone())
+                .unwrap_or_else(|| value.to_string());
+            let plugin_name = selected
+                .map(|plugin| plugin.name.clone())
+                .unwrap_or_else(|| value.to_string());
+            self.state.instrument_plugin_id = Some(plugin_id);
+            self.state.instrument_plugin_name = Some(plugin_name.clone());
+            self.state.track_name = plugin_name;
+            self.track_name_input
+                .set_value(self.state.track_name.clone());
+            self.track_name_input.select_all();
+        }
+        self.open_select = None;
+        self.clear_instrument_search();
+    }
+
+    fn toggle_instrument_group(&mut self, key: &str) {
+        self.instrument_tree.toggle_group(key);
+        // Keep the keyboard target on the folder that was just flipped.
+        self.instrument_tree.highlight = self.instrument_rows().iter().position(
+            |row| matches!(row, InstrumentRow::Group { key: row_key, .. } if row_key == key),
+        );
+    }
+
+    /// Arrow keys and Enter inside the open instrument popover. Returns true
+    /// when the key was handled.
+    fn handle_instrument_tree_key(&mut self, key: &str) -> bool {
+        let delta = match key {
+            "up" => -1,
+            "down" => 1,
+            "pageup" => -10,
+            "pagedown" => 10,
+            "enter" | "numpad_enter" => 0,
+            _ => return false,
+        };
+        let rows = self.instrument_rows();
+        let searching = self.instrument_searching();
+        let selected = self.state.instrument_plugin_id.clone();
+        if delta != 0 {
+            self.instrument_tree
+                .move_highlight(&rows, selected.as_deref(), searching, delta);
+            return true;
+        }
+        let target = effective_highlight(
+            &rows,
+            self.instrument_tree.highlight,
+            selected.as_deref(),
+            searching,
+        )
+        .and_then(|index| rows.get(index));
+        match target {
+            Some(InstrumentRow::NoInstrument { .. }) => self.select_instrument_plugin(""),
+            Some(InstrumentRow::Plugin { id, .. }) => {
+                let id = id.clone();
+                self.select_instrument_plugin(&id);
+            }
+            Some(InstrumentRow::Group { key, .. }) => {
+                let key = key.clone();
+                self.toggle_instrument_group(&key);
+            }
+            Some(InstrumentRow::NoMatches) | None => {}
+        }
+        true
     }
 
     fn handle_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -2180,6 +2169,11 @@ impl AddTrackWindow {
             if self.instrument_search_input.is_focused(window)
                 || !self.track_name_input.is_focused(window)
             {
+                if self.handle_instrument_tree_key(event.keystroke.key.as_str()) {
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
                 let action = self
                     .instrument_search_input
                     .handle_key_with_clipboard(event, Some(cx));
@@ -2644,26 +2638,7 @@ impl Render for AddTrackWindow {
                 move |value: &String, _w, cx| {
                     let value = value.clone();
                     let _ = target.update(cx, |this, cx| {
-                        if value.is_empty() {
-                            this.state.instrument_plugin_id = None;
-                            this.state.instrument_plugin_name = None;
-                        } else {
-                            let selected = find_instrument_plugin(&this.instrument_plugins, &value);
-                            let plugin_id = selected
-                                .map(|plugin| plugin.id.clone())
-                                .unwrap_or_else(|| value.clone());
-                            let plugin_name = selected
-                                .map(|plugin| plugin.name.clone())
-                                .unwrap_or_else(|| value.clone());
-                            this.state.instrument_plugin_id = Some(plugin_id);
-                            this.state.instrument_plugin_name = Some(plugin_name.clone());
-                            this.state.track_name = plugin_name;
-                            this.track_name_input
-                                .set_value(this.state.track_name.clone());
-                            this.track_name_input.select_all();
-                        }
-                        this.open_select = None;
-                        this.clear_instrument_search();
+                        this.select_instrument_plugin(&value);
                         cx.notify();
                     });
                 }
@@ -2949,6 +2924,55 @@ impl Render for AddTrackWindow {
             })),
         };
 
+        // The instrument popover body, built only while it is open.
+        let instrument_menu = (self.open_select == Some(AddTrackSelectId::InstrumentPlugin)
+            && self.state.instrument_mode == InstrumentMode::Vsti)
+            .then(|| {
+                let search_field = text_field_with_callbacks_and_ime(
+                    &self.instrument_search_input,
+                    instrument_search_focused,
+                    instrument_search_callbacks,
+                    cx.entity().clone(),
+                )
+                .into_any_element();
+                let on_select = callbacks.on_instrument_plugin.clone();
+                let tree_callbacks = InstrumentTreeCallbacks {
+                    on_grouping: Arc::new({
+                        let target = target.clone();
+                        move |grouping: &InstrumentGrouping, window, cx| {
+                            let grouping = *grouping;
+                            let _ = target.update(cx, |this, cx| {
+                                this.instrument_tree.set_grouping(grouping);
+                                // The segment took focus on click; typing
+                                // should keep filtering.
+                                this.instrument_search_input.focus_handle.focus(window, cx);
+                                cx.notify();
+                            });
+                        }
+                    }),
+                    on_toggle_group: Arc::new({
+                        let target = target.clone();
+                        move |key: &String, _window, cx| {
+                            let _ = target.update(cx, |this, cx| {
+                                this.toggle_instrument_group(key);
+                                cx.notify();
+                            });
+                        }
+                    }),
+                    on_select: Arc::new(move |value: &String, window, cx| {
+                        on_select(value, window, cx)
+                    }),
+                };
+                instrument_tree_menu(
+                    search_field,
+                    &self.instrument_tree,
+                    self.instrument_rows(),
+                    self.state.instrument_plugin_id.as_deref(),
+                    self.instrument_searching(),
+                    tree_callbacks,
+                )
+            });
+
         // Cut/Copy/Paste for this window's text fields. Entries and enablement
         // come from the same `text_input_context_entries` the studio shell uses,
         // so the two menus cannot drift apart.
@@ -3022,11 +3046,7 @@ impl Render for AddTrackWindow {
                 count_callbacks,
                 self.open_select,
                 &self.instrument_plugins,
-                &self.instrument_plugin_query,
-                Some(&self.instrument_search_input),
-                instrument_search_focused,
-                Some(instrument_search_callbacks),
-                Some(cx.entity().clone()),
+                instrument_menu,
                 &self.midi_input_devices,
                 color_ui,
                 callbacks,
@@ -3035,6 +3055,30 @@ impl Render for AddTrackWindow {
             .children(dismiss_backdrop)
             .children(color_backdrop)
             .children(text_context_overlay)
+    }
+}
+
+#[cfg(feature = "ui-preview")]
+impl AddTrackWindow {
+    /// Preview only: open the instrument popover in `grouping` ("vendor",
+    /// "name" or "format") with `query` typed and `selected` chosen. Sets the
+    /// grouping directly so a preview render never rewrites the user's prefs.
+    pub(crate) fn preview_instrument_picker(
+        &mut self,
+        grouping: &str,
+        query: &str,
+        selected: Option<&str>,
+    ) {
+        self.instrument_tree.grouping = match grouping {
+            "name" => InstrumentGrouping::Name,
+            "format" => InstrumentGrouping::Format,
+            _ => InstrumentGrouping::Vendor,
+        };
+        self.state.instrument_mode = InstrumentMode::Vsti;
+        self.state.instrument_plugin_id = selected.map(str::to_string);
+        self.open_select = Some(AddTrackSelectId::InstrumentPlugin);
+        self.instrument_search_input.set_value(query);
+        self.sync_instrument_search_query();
     }
 }
 

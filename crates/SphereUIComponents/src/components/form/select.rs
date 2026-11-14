@@ -132,203 +132,243 @@ pub fn select_with_placement_and_header(
         .and_then(|selected| options.iter().find(|option| option.id == selected))
         .map(|option| option.label.clone());
     let label = selected_label.unwrap_or(placeholder);
-    let toggle = on_toggle.clone();
 
-    div()
-        .relative()
-        .w_full()
-        .child(
-            div()
-                .id(id)
-                .h(px(28.0))
-                .w_full()
-                .min_w(px(0.0))
-                .rounded(px(crate::theme::radius::CONTROL))
-                .border(px(1.0))
-                .border_color(if open {
-                    Colors::border_focus()
-                } else {
-                    Colors::border_subtle()
-                })
-                .bg(if open {
-                    Colors::surface_card()
-                } else {
-                    Colors::surface_input()
-                })
-                .px(px(8.0))
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap(px(8.0))
-                .opacity(if disabled { 0.48 } else { 1.0 })
-                .cursor(if disabled {
-                    gpui::CursorStyle::Arrow
-                } else {
-                    gpui::CursorStyle::PointingHand
-                })
-                .hover(|s| {
-                    if disabled {
-                        s
+    select_trigger(id, label, open, disabled, on_toggle).when(open && !disabled, move |root| {
+        if crate::ui_debug_enabled() {
+            eprintln!("[ui-popup] render kind=select id={id} placement={placement:?} z=overlay");
+        }
+        let menu = select_menu_shell(id)
+            .overflow_y_scroll()
+            .children(menu_header)
+            .children(options.into_iter().enumerate().map(move |(index, option)| {
+                let active = selected_id == Some(option.id.as_str());
+                let disabled = option.disabled;
+                let value = option.id.clone();
+                let on_change = on_change.clone();
+                div()
+                    .id(("select-option", index))
+                    .min_h(px(if option.description.is_some() {
+                        34.0
                     } else {
-                        s.bg(Colors::surface_control_hover())
-                            .border_color(Colors::border_strong())
-                    }
-                })
-                .on_mouse_down(gpui::MouseButton::Left, move |_event, window, cx| {
-                    cx.stop_propagation();
-                    if !disabled {
-                        toggle(&(), window, cx);
-                    }
-                    window.prevent_default();
-                })
-                .child(
-                    div()
-                        .min_w(px(0.0))
-                        .flex_1()
-                        .truncate()
-                        .text_size(px(11.0))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(Colors::text_primary())
-                        .child(label),
-                )
-                .child(
-                    svg()
-                        .path(assets::ICON_CHEVRON_DOWN_PATH)
-                        .w(px(10.0))
-                        .h(px(10.0))
-                        .flex_shrink_0()
-                        .text_color(Colors::text_faint()),
-                ),
-        )
-        .when(open && !disabled, move |root| {
-            if crate::ui_debug_enabled() {
-                eprintln!(
-                    "[ui-popup] render kind=select id={id} placement={placement:?} z=overlay"
-                );
-            }
-            let menu = div()
-                .rounded(px(crate::theme::radius::CONTROL))
-                .border(px(1.0))
-                .border_color(Colors::border_default())
-                .bg(Colors::surface_panel_raised())
-                .shadow(vec![gpui::BoxShadow {
-                    color: Colors::surface_overlay().into(),
-                    offset: gpui::point(px(0.0), px(2.0)),
-                    blur_radius: px(24.0),
-                    spread_radius: px(0.0),
-                    inset: false,
-                }])
-                .p(px(4.0))
-                .id((gpui::ElementId::from(id), "menu"))
-                .overflow_y_scroll()
-                .occlude()
-                .on_mouse_down(gpui::MouseButton::Left, |_, _window, cx| {
-                    cx.stop_propagation();
-                })
-                .children(menu_header)
-                .children(options.into_iter().enumerate().map(move |(index, option)| {
-                    let active = selected_id == Some(option.id.as_str());
-                    let disabled = option.disabled;
-                    let value = option.id.clone();
-                    let on_change = on_change.clone();
-                    div()
-                        .id(("select-option", index))
-                        .min_h(px(if option.description.is_some() {
-                            34.0
+                        24.0
+                    }))
+                    .w_full()
+                    .rounded(px(crate::theme::radius::CONTROL))
+                    .px(px(8.0))
+                    .py(px(4.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.0))
+                    .bg(if active {
+                        Colors::accent_muted()
+                    } else {
+                        gpui::transparent_black().into()
+                    })
+                    .opacity(if disabled { 0.45 } else { 1.0 })
+                    .cursor(if disabled {
+                        gpui::CursorStyle::Arrow
+                    } else {
+                        gpui::CursorStyle::PointingHand
+                    })
+                    .hover(|s| {
+                        if disabled {
+                            s
                         } else {
-                            24.0
-                        }))
-                        .w_full()
-                        .rounded(px(crate::theme::radius::CONTROL))
-                        .px(px(8.0))
-                        .py(px(4.0))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .justify_between()
-                        .gap(px(8.0))
-                        .bg(if active {
-                            Colors::accent_muted()
-                        } else {
-                            gpui::transparent_black().into()
-                        })
-                        .opacity(if disabled { 0.45 } else { 1.0 })
-                        .cursor(if disabled {
-                            gpui::CursorStyle::Arrow
-                        } else {
-                            gpui::CursorStyle::PointingHand
-                        })
-                        .hover(|s| {
-                            if disabled {
-                                s
-                            } else {
-                                s.bg(Colors::surface_control_hover())
+                            s.bg(Colors::surface_control_hover())
+                        }
+                    })
+                    .on_click(move |_, window, cx| {
+                        if !disabled {
+                            cx.stop_propagation();
+                            if crate::ui_debug_enabled() {
+                                eprintln!("[ui-select] selected id={id} value={value}");
+                                eprintln!("[ui-select] close id={id} reason=option_selected");
                             }
-                        })
-                        .on_click(move |_, window, cx| {
-                            if !disabled {
-                                cx.stop_propagation();
-                                if crate::ui_debug_enabled() {
-                                    eprintln!("[ui-select] selected id={id} value={value}");
-                                    eprintln!("[ui-select] close id={id} reason=option_selected");
-                                }
-                                on_change(&value, window, cx);
-                            }
-                        })
-                        .child(
-                            div()
-                                .min_w(px(0.0))
-                                .flex_1()
-                                .flex()
-                                .flex_col()
-                                .gap(px(1.0))
-                                .child(
-                                    div()
-                                        .truncate()
-                                        .text_size(px(10.5))
-                                        .font_weight(if active {
-                                            gpui::FontWeight::SEMIBOLD
-                                        } else {
-                                            gpui::FontWeight::NORMAL
-                                        })
-                                        .text_color(if active {
-                                            Colors::text_primary()
-                                        } else {
-                                            Colors::text_secondary()
-                                        })
-                                        .child(option.label),
-                                )
-                                .children(option.description.map(|description| {
-                                    div()
-                                        .truncate()
-                                        .text_size(px(9.0))
-                                        .text_color(Colors::text_faint())
-                                        .child(description)
-                                })),
-                        )
-                        .children(active.then(|| {
-                            svg()
-                                .path(assets::ICON_CHECK_PATH)
-                                .w(px(11.0))
-                                .h(px(11.0))
-                                .flex_shrink_0()
-                                .text_color(Colors::accent_primary())
-                        }))
-                }));
-            // Defer the menu so it paints after every sibling row and the
-            // dialog footer, and escapes any parent scroll container's clip.
-            // The anchor covers the trigger, so the menu keeps its width and
-            // is fitted against the window once the trigger is placed.
-            root.child(
-                deferred(SelectMenuAnchor {
-                    menu: Some(menu),
-                    preferred: placement,
-                    menu_element: None,
-                })
-                .with_priority(SELECT_MENU_PRIORITY),
+                            on_change(&value, window, cx);
+                        }
+                    })
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap(px(1.0))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(10.5))
+                                    .font_weight(if active {
+                                        gpui::FontWeight::SEMIBOLD
+                                    } else {
+                                        gpui::FontWeight::NORMAL
+                                    })
+                                    .text_color(if active {
+                                        Colors::text_primary()
+                                    } else {
+                                        Colors::text_secondary()
+                                    })
+                                    .child(option.label),
+                            )
+                            .children(option.description.map(|description| {
+                                div()
+                                    .truncate()
+                                    .text_size(px(9.0))
+                                    .text_color(Colors::text_faint())
+                                    .child(description)
+                            })),
+                    )
+                    .children(active.then(|| {
+                        svg()
+                            .path(assets::ICON_CHECK_PATH)
+                            .w(px(11.0))
+                            .h(px(11.0))
+                            .flex_shrink_0()
+                            .text_color(Colors::accent_primary())
+                    }))
+            }));
+        root.child(anchored_select_menu(menu, placement))
+    })
+}
+
+/// A select whose open menu is supplied by the caller instead of being built
+/// from a flat [`SelectOption`] list, for pickers that need a richer body (a
+/// search field, grouping controls, a collapsible tree) while keeping the same
+/// trigger, menu surface, and window-fitted anchoring as every other select.
+///
+/// The menu surface does not scroll itself: `menu_body` owns its scroll
+/// region, so a header can stay pinned while the list under it scrolls. The
+/// body is only built while the menu is open.
+pub fn select_with_menu(
+    id: &'static str,
+    label: impl Into<String>,
+    open: bool,
+    disabled: bool,
+    placement: SelectMenuPlacement,
+    menu_body: impl FnOnce() -> AnyElement,
+    on_toggle: Arc<dyn Fn(&(), &mut Window, &mut App) + 'static>,
+) -> impl IntoElement {
+    select_trigger(id, label.into(), open, disabled, on_toggle).when(open && !disabled, |root| {
+        let menu = select_menu_shell(id)
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .child(menu_body());
+        root.child(anchored_select_menu(menu, placement))
+    })
+}
+
+/// The closed-state control every select shares: the value, a chevron, and
+/// the open/hover treatment.
+fn select_trigger(
+    id: &'static str,
+    label: String,
+    open: bool,
+    disabled: bool,
+    on_toggle: Arc<dyn Fn(&(), &mut Window, &mut App) + 'static>,
+) -> Div {
+    div().relative().w_full().child(
+        div()
+            .id(id)
+            .h(px(28.0))
+            .w_full()
+            .min_w(px(0.0))
+            .rounded(px(crate::theme::radius::CONTROL))
+            .border(px(1.0))
+            .border_color(if open {
+                Colors::border_focus()
+            } else {
+                Colors::border_subtle()
+            })
+            .bg(if open {
+                Colors::surface_card()
+            } else {
+                Colors::surface_input()
+            })
+            .px(px(8.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap(px(8.0))
+            .opacity(if disabled { 0.48 } else { 1.0 })
+            .cursor(if disabled {
+                gpui::CursorStyle::Arrow
+            } else {
+                gpui::CursorStyle::PointingHand
+            })
+            .hover(|s| {
+                if disabled {
+                    s
+                } else {
+                    s.bg(Colors::surface_control_hover())
+                        .border_color(Colors::border_strong())
+                }
+            })
+            .on_mouse_down(gpui::MouseButton::Left, move |_event, window, cx| {
+                cx.stop_propagation();
+                if !disabled {
+                    on_toggle(&(), window, cx);
+                }
+                window.prevent_default();
+            })
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .flex_1()
+                    .truncate()
+                    .text_size(px(11.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(Colors::text_primary())
+                    .child(label),
             )
+            .child(
+                svg()
+                    .path(assets::ICON_CHEVRON_DOWN_PATH)
+                    .w(px(10.0))
+                    .h(px(10.0))
+                    .flex_shrink_0()
+                    .text_color(Colors::text_faint()),
+            ),
+    )
+}
+
+/// The floating menu surface: raised plane, hairline, popover shadow, and a
+/// click occluder so presses inside never reach the dismiss backdrop.
+fn select_menu_shell(id: &'static str) -> Stateful<Div> {
+    div()
+        .rounded(px(crate::theme::radius::CONTROL))
+        .border(px(1.0))
+        .border_color(Colors::border_default())
+        .bg(Colors::surface_panel_raised())
+        .shadow(vec![gpui::BoxShadow {
+            color: Colors::surface_overlay().into(),
+            offset: gpui::point(px(0.0), px(2.0)),
+            blur_radius: px(24.0),
+            spread_radius: px(0.0),
+            inset: false,
+        }])
+        .p(px(4.0))
+        .id((gpui::ElementId::from(id), "menu"))
+        .occlude()
+        .on_mouse_down(gpui::MouseButton::Left, |_, _window, cx| {
+            cx.stop_propagation();
         })
+}
+
+/// Defer the menu so it paints after every sibling row and the dialog footer,
+/// and escapes any parent scroll container's clip. The anchor covers the
+/// trigger, so the menu keeps its width and is fitted against the window once
+/// the trigger is placed.
+fn anchored_select_menu(menu: Stateful<Div>, placement: SelectMenuPlacement) -> impl IntoElement {
+    deferred(SelectMenuAnchor {
+        menu: Some(menu),
+        preferred: placement,
+        menu_element: None,
+    })
+    .with_priority(SELECT_MENU_PRIORITY)
 }
 
 /// Places the open menu next to the trigger and keeps it inside the window:
