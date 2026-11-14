@@ -12,6 +12,8 @@ pub mod icons {
     pub const TYPE: &str = include_str!("../../../packages/shared/lucide/icons/type.svg");
     pub const LIST_MUSIC: &str =
         include_str!("../../../packages/shared/lucide/icons/list-music.svg");
+    pub const ARROW_DOWN_UP: &str =
+        include_str!("../../../packages/shared/lucide/icons/arrow-down-up.svg");
     pub const GAUGE: &str = include_str!("../../../packages/shared/lucide/icons/gauge.svg");
     pub const REPEAT2: &str = include_str!("../../../packages/shared/lucide/icons/repeat-2.svg");
     pub const TIMER: &str = include_str!("../../../packages/shared/lucide/icons/timer.svg");
@@ -179,6 +181,7 @@ pub const ICON_MOVE_HORIZONTAL_PATH: &str = "icons/move-horizontal.svg";
 pub const ICON_MOVE_VERTICAL_PATH: &str = "icons/move-vertical.svg";
 pub const ICON_TYPE_PATH: &str = "icons/type.svg";
 pub const ICON_LIST_MUSIC_PATH: &str = "icons/list-music.svg";
+pub const ICON_ARROW_DOWN_UP_PATH: &str = "icons/arrow-down-up.svg";
 pub const ICON_GAUGE_PATH: &str = "icons/gauge.svg";
 pub const ICON_GIT_MERGE_PATH: &str = "icons/git-merge.svg";
 pub const ICON_GIT_FORK_PATH: &str = "icons/git-fork.svg";

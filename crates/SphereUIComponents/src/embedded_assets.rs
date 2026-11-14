@@ -82,6 +82,7 @@ impl AssetSource for EmbeddedAssets {
             assets::ICON_MOVE_VERTICAL_PATH => Some(assets::icons::MOVE_VERTICAL.as_bytes()),
             assets::ICON_TYPE_PATH => Some(assets::icons::TYPE.as_bytes()),
             assets::ICON_LIST_MUSIC_PATH => Some(assets::icons::LIST_MUSIC.as_bytes()),
+            assets::ICON_ARROW_DOWN_UP_PATH => Some(assets::icons::ARROW_DOWN_UP.as_bytes()),
             assets::ICON_GAUGE_PATH => Some(assets::icons::GAUGE.as_bytes()),
             assets::ICON_REPEAT2_PATH => Some(assets::icons::REPEAT2.as_bytes()),
             assets::ICON_TIMER_PATH => Some(assets::icons::TIMER.as_bytes()),

@@ -2091,6 +2091,17 @@ fn preview_midi_timeline(
 /// The MIDI editor in drum mode, on a two-bar beat; `used` lists only the
 /// sounds the clip plays instead of the whole kit.
 fn open_midi_drums(options: WindowOptions, cx: &mut App, used: bool) -> Result<AnyWindowHandle> {
+    open_midi_drums_with(options, cx, used, false)
+}
+
+/// [`open_midi_drums`], with the lanes reversed and the snare lane lit as
+/// if hovered when `reversed_hover` is set.
+fn open_midi_drums_with(
+    options: WindowOptions,
+    cx: &mut App,
+    used: bool,
+    reversed_hover: bool,
+) -> Result<AnyWindowHandle> {
     use crate::components::piano_roll::{DrumLanes, PianoRoll};
     use crate::components::timeline::timeline::Timeline;
     let handle = cx.open_window(options, move |_, cx| {
@@ -2129,6 +2140,10 @@ fn open_midi_drums(options: WindowOptions, cx: &mut App, used: bool) -> Result<A
             roll.set_drum_mode(true, cx);
             if used {
                 roll.set_drum_lanes(DrumLanes::Used, cx);
+            }
+            if reversed_hover {
+                roll.reverse_drum_order(cx);
+                roll.preview_hover_drum_lane(38);
             }
             roll
         })

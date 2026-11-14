@@ -2,7 +2,7 @@
 //!
 //! In drum mode the pitch axis is a list of lanes, not 128 keys. A lane is a
 //! MIDI note, top to bottom in ascending order — kick first, as a drum map
-//! lists its kit — named by the General MIDI percussion map unless the track's
+//! lists its kit — or reversed ([`DrumOrder`]), named by the General MIDI percussion map unless the track's
 //! own instrument says otherwise (the built-in Drum Sampler's pads, by their
 //! samples). Every row mapping the editor does in drum mode goes through here,
 //! so the lane list, the grid rows, the hits and hit-testing agree.
@@ -83,16 +83,39 @@ pub enum DrumLanes {
     Used,
 }
 
-/// The lanes, top to bottom: ascending notes. `used` is every note the clip
+/// Which way the lanes run, top to bottom.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DrumOrder {
+    /// Low notes first: the kick at the top, as a drum map lists its kit.
+    #[default]
+    LowFirst,
+    /// High notes first: cymbals at the top, kick at the bottom, the way the
+    /// piano roll runs its keys.
+    HighFirst,
+}
+
+impl DrumOrder {
+    pub fn reversed(self) -> Self {
+        match self {
+            Self::LowFirst => Self::HighFirst,
+            Self::HighFirst => Self::LowFirst,
+        }
+    }
+}
+
+/// The lanes, top to bottom, in `order`. `used` is every note the clip
 /// plays; none of them is ever left without a lane, so no hit is hidden.
-pub(super) fn drum_rows(lanes: DrumLanes, used: &[u8]) -> Vec<u8> {
+pub(super) fn drum_rows(lanes: DrumLanes, order: DrumOrder, used: &[u8]) -> Vec<u8> {
     let mut rows: BTreeSet<u8> = used.iter().copied().collect();
     match lanes {
         DrumLanes::Kit => rows.extend(GM_FIRST..=GM_LAST),
         DrumLanes::Used if rows.is_empty() => rows.extend(CORE_KIT),
         DrumLanes::Used => {}
     }
-    rows.into_iter().collect()
+    match order {
+        DrumOrder::LowFirst => rows.into_iter().collect(),
+        DrumOrder::HighFirst => rows.into_iter().rev().collect(),
+    }
 }
 
 /// The lane under a grid-local y, clamped to the first and last lane.
@@ -137,13 +160,33 @@ mod tests {
     /// empty clip in Used mode still has a kit to draw on.
     #[test]
     fn every_played_note_has_a_lane() {
-        let kit = drum_rows(DrumLanes::Kit, &[20, 36, 100]);
+        let kit = drum_rows(DrumLanes::Kit, DrumOrder::LowFirst, &[20, 36, 100]);
         assert_eq!(kit.first(), Some(&20));
         assert_eq!(kit.last(), Some(&100));
         assert_eq!(kit.len(), 47 + 2);
 
-        assert_eq!(drum_rows(DrumLanes::Used, &[42, 36, 42]), vec![36, 42]);
-        assert_eq!(drum_rows(DrumLanes::Used, &[]), CORE_KIT.to_vec());
+        assert_eq!(
+            drum_rows(DrumLanes::Used, DrumOrder::LowFirst, &[42, 36, 42]),
+            vec![36, 42]
+        );
+        assert_eq!(
+            drum_rows(DrumLanes::Used, DrumOrder::LowFirst, &[]),
+            CORE_KIT.to_vec()
+        );
+    }
+
+    /// Reversed, the same lanes run the other way, and a move down still goes
+    /// to the lane drawn below.
+    #[test]
+    fn reversed_order_runs_high_notes_first() {
+        let rows = drum_rows(DrumLanes::Used, DrumOrder::HighFirst, &[36, 42, 38]);
+        assert_eq!(rows, vec![42, 38, 36]);
+        assert_eq!(drum_move(&rows, 42, 1), 38);
+        assert_eq!(drum_row_at(&rows, 0.0, 0.0, 20.0), Some(42));
+        let kit = drum_rows(DrumLanes::Kit, DrumOrder::HighFirst, &[]);
+        assert_eq!(kit.first(), Some(&GM_LAST));
+        assert_eq!(kit.last(), Some(&GM_FIRST));
+        assert_eq!(DrumOrder::HighFirst.reversed(), DrumOrder::LowFirst);
     }
 
     #[test]

@@ -1995,6 +1995,7 @@ impl PianoRoll {
             self.hover_beat = None;
             self.hover_pitch = None;
             self.hover_note_status = None;
+            self.drum_hover_lane = None;
             self.drag_value_status = None;
             self.fitted_clip_id = None;
             return;
@@ -2816,6 +2817,52 @@ impl PianoRoll {
         cx.notify();
     }
 
+    pub fn drum_order(&self) -> DrumOrder {
+        self.drum_order
+    }
+
+    /// Run the lanes the other way. The view is mirrored too, so the lanes
+    /// that were on screen stay on screen.
+    pub fn reverse_drum_order(&mut self, cx: &mut Context<Self>) {
+        self.drum_order = self.drum_order.reversed();
+        let (_, view_h) = self.grid_view_size();
+        let content_h = self.drum_rows.len() as f32 * self.note_row_h();
+        self.refresh_drum_rows(cx);
+        self.scroll_y = (content_h - view_h - self.scroll_y).clamp(0.0, self.max_scroll_y());
+        cx.notify();
+    }
+
+    /// Light the lane under the pointer. Repaints only when the lane changes,
+    /// not on every move within one.
+    fn update_drum_hover(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        let lane = if self.drum_mode {
+            self.key_lane_pitch_at(position)
+                .or_else(|| self.grid_lane_at(position))
+        } else {
+            None
+        };
+        if self.drum_hover_lane != lane {
+            self.drum_hover_lane = lane;
+            cx.notify();
+        }
+    }
+
+    /// Light a lane as if the pointer were on it, for a still render.
+    #[cfg(feature = "ui-preview")]
+    pub fn preview_hover_drum_lane(&mut self, pitch: u8) {
+        self.drum_hover_lane = Some(pitch);
+    }
+
+    /// The drum lane under a window point inside the note grid.
+    fn grid_lane_at(&self, position: gpui::Point<Pixels>) -> Option<u8> {
+        let bounds = self.grid_bounds.get()?;
+        if !bounds.contains(&position) {
+            return None;
+        }
+        let (_, ly) = self.grid_local(position)?;
+        Some(self.y_to_pitch(ly))
+    }
+
     /// Rebuild the lanes from the edited clip: every note it plays has one.
     /// Names come from the track's Drum Sampler pads where it has one. Cheap
     /// enough per render: one pass over the clip's notes, only in drum mode.
@@ -2833,7 +2880,7 @@ impl PianoRoll {
                     .map(|notes| notes.iter().map(|note| note.pitch).collect())
             })
             .unwrap_or_default();
-        self.drum_rows = drum_map::drum_rows(self.drum_lanes, &used);
+        self.drum_rows = drum_map::drum_rows(self.drum_lanes, self.drum_order, &used);
         self.drum_names = self.drum_sampler_names(cx);
     }
 
@@ -4816,6 +4863,7 @@ impl PianoRoll {
     }
 
     fn on_move(&mut self, event: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.update_drum_hover(event.position, cx);
         // Piano-key lane drag-scrub: audition whichever key is under the cursor.
         // Driven from this root-level move handler (not a per-key one) so fast
         // vertical drags keep tracking even as the cursor crosses key edges. It

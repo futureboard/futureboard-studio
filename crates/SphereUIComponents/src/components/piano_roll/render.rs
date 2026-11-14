@@ -612,6 +612,14 @@ impl Render for PianoRoll {
                 this.accept_active_tool(cx);
             }))
             .on_mouse_move(cx.listener(Self::on_move))
+            // Moves stop reaching the editor once the pointer leaves it; the
+            // lit drum lane goes out with it.
+            .id("piano-roll-root")
+            .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                if !*hovered && this.drum_hover_lane.take().is_some() {
+                    cx.notify();
+                }
+            }))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_up))
             .on_mouse_up(MouseButton::Right, cx.listener(Self::on_up))
@@ -1174,6 +1182,22 @@ impl PianoRoll {
                     "Show only the sounds this clip plays".into(),
                     lanes == DrumLanes::Used,
                     cx.listener(|this, _, _w, cx| this.set_drum_lanes(DrumLanes::Used, cx)),
+                ))
+                // Which way the lanes run. Lit while reversed (high notes at
+                // the top), so the default order reads as the rest state.
+                .child(tool_segment(
+                    "pr-drum-order",
+                    assets::ICON_ARROW_DOWN_UP_PATH,
+                    match self.drum_order {
+                        DrumOrder::LowFirst => "Reverse lanes: high notes at the top",
+                        DrumOrder::HighFirst => "Reverse lanes: kick at the top",
+                    }
+                    .into(),
+                    self.drum_order == DrumOrder::HighFirst,
+                    cx.listener(|this, _, _w, cx| {
+                        this.cancel_active_gesture(cx);
+                        this.reverse_drum_order(cx);
+                    }),
                 ));
         }
 
@@ -1733,6 +1757,8 @@ impl PianoRoll {
             last_pitch,
             clip_len,
         );
+        // Under the hits, over the lane bands: the hovered lane across the bar.
+        let drum_hover_grid = self.drum_hover_band("pr-drum-hover-grid");
         let clip_bounds = self.build_clip_bounds_overlay(view_w, view_h);
         let loop_overlay = self.build_loop_overlay(loop_region, view_w, view_h);
         // The playhead is its own entity, not a child of this render. Building
@@ -2101,6 +2127,7 @@ impl PianoRoll {
                             .cursor(grid_cursor)
                             .child(grid_canvas)
                             .children(grid_lines)
+                            .children(drum_hover_grid)
                             .children(clip_bounds)
                             .children(context_notes)
                             .children(loop_overlay)
@@ -2140,6 +2167,41 @@ impl PianoRoll {
         first..last.max(first)
     }
 
+    /// The drum lane under the pointer, lit across `scope` (the lane list or
+    /// the grid) with the hover state layer. It fades in over
+    /// `motion::MICRO_MS` each time the pointer reaches a new lane, keyed by
+    /// lane, so moving within one lane does not restart it. Paints nothing
+    /// and takes no pointer events: hit-testing is unchanged under it.
+    fn drum_hover_band(&self, scope: &'static str) -> Option<gpui::AnyElement> {
+        if !self.drum_mode {
+            return None;
+        }
+        let pitch = self.drum_hover_lane?;
+        // A lane being auditioned already shows as pressed.
+        if self.key_lane_pressed_pitch == Some(pitch) {
+            return None;
+        }
+        let index = super::drum_map::drum_row_index(&self.drum_rows, pitch)?;
+        let row_h = self.note_row_h();
+        let y = index as f32 * row_h - self.scroll_y;
+        Some(
+            div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .top(px(y))
+                .h(px(row_h))
+                .bg(Colors::state_hover())
+                .with_animation(
+                    gpui::ElementId::NamedInteger(scope.into(), pitch as u64),
+                    Animation::new(Duration::from_millis(crate::theme::motion::MICRO_MS))
+                        .with_easing(gpui::ease_out_quint()),
+                    |band, t| band.opacity(t),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// The drum editor's lane list in place of the keyboard: each lane's
     /// name, and its note quieter beside it. A press auditions the lane.
     fn build_drum_lane(&self) -> Vec<gpui::AnyElement> {
@@ -2147,6 +2209,7 @@ impl PianoRoll {
         let row_h = self.note_row_h();
         let (_, view_h) = self.grid_view_size();
         let pressed = self.key_lane_pressed_pitch;
+        let hovered = self.drum_hover_lane;
         let band = Colors::with_alpha(Colors::surface_base(), 0.35);
         let press = Colors::with_alpha(Colors::accent_primary(), 0.32);
         let seam = Colors::with_alpha(Colors::text_primary(), 0.06);
@@ -2168,41 +2231,57 @@ impl PianoRoll {
             if row_h < 10.0 {
                 continue;
             }
-            labels.push(
-                div()
-                    .absolute()
-                    .left(px(space::SNUG))
-                    .right(px(space::SNUG))
-                    .top(px(y))
-                    .h(px(row_h))
-                    .flex()
-                    .items_center()
-                    .gap(px(space::TIGHT))
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_size(px(typography::DENSE_LABEL))
-                            .text_color(if is_pressed {
-                                Colors::text_primary()
-                            } else {
-                                Colors::text_secondary()
-                            })
-                            .child(self.drum_lane_name(pitch)),
+            let is_hovered = hovered == Some(pitch) && !is_pressed;
+            let label = div()
+                .absolute()
+                .left(px(space::SNUG))
+                .right(px(space::SNUG))
+                .top(px(y))
+                .h(px(row_h))
+                .flex()
+                .items_center()
+                .gap(px(space::TIGHT))
+                .overflow_hidden()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_size(px(typography::DENSE_LABEL))
+                        .text_color(if is_pressed || is_hovered {
+                            Colors::text_primary()
+                        } else {
+                            Colors::text_secondary()
+                        })
+                        .child(self.drum_lane_name(pitch)),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(typography::DENSE_CAPTION))
+                        .text_color(if is_hovered {
+                            Colors::text_secondary()
+                        } else {
+                            Colors::text_faint()
+                        })
+                        .child(note_name(pitch as i32)),
+                );
+            // The lit lane's name eases a hair to the right as it comes up,
+            // with the band behind it: the lane answers the pointer.
+            labels.push(if is_hovered {
+                label
+                    .with_animation(
+                        gpui::ElementId::NamedInteger("pr-drum-hover-label".into(), pitch as u64),
+                        Animation::new(Duration::from_millis(crate::theme::motion::MICRO_MS))
+                            .with_easing(gpui::ease_out_quint()),
+                        |label, t| label.left(px(space::SNUG + space::HAIR * t)),
                     )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(px(typography::DENSE_CAPTION))
-                            .text_color(Colors::text_faint())
-                            .child(note_name(pitch as i32)),
-                    )
-                    .into_any_element(),
-            );
+                    .into_any_element()
+            } else {
+                label.into_any_element()
+            });
         }
 
         let rows = canvas(
@@ -2237,8 +2316,9 @@ impl PianoRoll {
         .inset_0()
         .into_any_element();
 
-        let mut out = Vec::with_capacity(labels.len() + 1);
+        let mut out = Vec::with_capacity(labels.len() + 2);
         out.push(rows);
+        out.extend(self.drum_hover_band("pr-drum-hover-lane"));
         out.extend(labels);
         out
     }
