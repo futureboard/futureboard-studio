@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 pub use ipc::{UI_PARAM_IDS, ui_param_id, ui_param_index};
 pub use params::{
     BeatDivision, DEFAULT_FIRST_KEY, MAX_SAMPLE_BPM, MAX_SLICES, MIN_EQUAL_SLICES, MIN_SAMPLE_BPM,
-    SliceMode, SlicerParams, sanitize_bpm,
+    SLICE_GAIN_MAX_DB, SLICE_GAIN_MIN_DB, SLICE_PITCH_RANGE, SliceMode, SlicerParams, sanitize_bpm,
 };
 pub use quicksampler::{MeterFrame, SampleData, SampleLoader};
 
@@ -107,18 +107,19 @@ impl Dsp {
             self.note_off_channel(channel, note);
             return;
         }
-        let Some((start, end)) = self
+        let Some((index, region)) = self
             .slicer
             .slice_for_note(note)
-            .and_then(|index| self.slicer.slice_region(index))
+            .and_then(|index| Some((index, self.slicer.slice_region(index)?)))
         else {
             return;
         };
         if self.slicer.choke {
             self.voices.choke();
         }
+        let shape = self.slicer.slice_shape(index);
         self.voices
-            .note_on_region(channel, note, velocity, start, end);
+            .note_on_slice(channel, note, velocity, region, shape);
     }
 
     pub fn note_off(&mut self, note: u8) {
@@ -217,6 +218,14 @@ mod tests {
         dsp.note_on(DEFAULT_FIRST_KEY - 1, 127);
         dsp.note_on(DEFAULT_FIRST_KEY + 4, 127);
         assert_eq!(dsp.active_voice_count(), 0);
+    }
+
+    #[test]
+    fn a_slice_plays_at_its_own_level() {
+        let mut dsp = loaded(|p| p.slice_gain_db[2] = -6.020_6);
+        dsp.note_on(DEFAULT_FIRST_KEY + 2, 127);
+        let left = render(&mut dsp, 4_000);
+        assert!((left[2_000] - 0.15).abs() < 1.0e-3, "{}", left[2_000]);
     }
 
     #[test]

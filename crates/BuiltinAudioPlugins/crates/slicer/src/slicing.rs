@@ -9,7 +9,8 @@ use crate::{BeatDivision, MAX_SLICES, SlicerParams};
 
 /// `p` cut at `points`: put in order, closer ones than `min_gap` merged, at
 /// most [`MAX_SLICES`] kept. Unused entries are reset, so two cuts that play
-/// the same compare equal.
+/// the same compare equal. A new cut starts every slice plain: its own pitch,
+/// level and direction belonged to the old slices.
 pub fn with_points(p: SlicerParams, points: &[f32], min_gap: f32) -> SlicerParams {
     let mut sorted: Vec<f32> = points
         .iter()
@@ -31,6 +32,7 @@ pub fn with_points(p: SlicerParams, points: &[f32], min_gap: f32) -> SlicerParam
     next.slices = [1.0; MAX_SLICES];
     next.slices[..kept.len()].copy_from_slice(&kept);
     next.slice_count = kept.len() as u8;
+    next.clear_slice_settings();
     next
 }
 
@@ -108,7 +110,16 @@ pub fn insert_point(p: SlicerParams, fraction: f32, min_gap: f32) -> Option<Slic
     }
     let mut next: Vec<f32> = points.to_vec();
     next.push(fraction);
-    Some(with_points(p, &next, 0.0))
+    // The new slice is cut from the one it lands in and plays like it; the
+    // ones after it move up a key and keep their settings.
+    let at = points.iter().filter(|point| **point < fraction).count();
+    let mut cut = with_points(p, &next, 0.0);
+    cut.carry_slice_settings(&p, |index| match index {
+        i if i < at => Some(i),
+        i if i == at => Some(at.saturating_sub(1)),
+        i => Some(i - 1),
+    });
+    Some(cut)
 }
 
 /// `p` without slice point `index`; the slice before it takes its audio. The
@@ -120,7 +131,9 @@ pub fn remove_point(p: SlicerParams, index: usize) -> Option<SlicerParams> {
     }
     let mut next = points.to_vec();
     next.remove(index);
-    Some(with_points(p, &next, 0.0))
+    let mut joined = with_points(p, &next, 0.0);
+    joined.carry_slice_settings(&p, |i| Some(if i < index { i } else { i + 1 }));
+    Some(joined)
 }
 
 /// `p` with slice point `index` moved towards `fraction`, kept `min_gap` clear
@@ -149,6 +162,24 @@ mod tests {
 
     fn cut(points: &[f32]) -> SlicerParams {
         with_points(SlicerParams::default(), points, 0.0)
+    }
+
+    #[test]
+    fn slice_settings_follow_their_slices_through_a_cut_and_a_join() {
+        let mut p = cut(&[0.0, 0.25, 0.5]);
+        p.slice_pitch[1] = 5.0;
+        p.slice_gain_db[2] = -3.0;
+        // Cutting the second slice: both halves play like it, the third
+        // moves up a key with its own level.
+        let split = insert_point(p, 0.3, 0.01).unwrap();
+        assert_eq!(&split.slice_pitch[..4], &[0.0, 5.0, 5.0, 0.0]);
+        assert_eq!(split.slice_gain_db[3], -3.0);
+        // Joining it again keeps the first half's settings.
+        let joined = remove_point(split, 2).unwrap();
+        assert_eq!(&joined.slice_pitch[..3], &[0.0, 5.0, 0.0]);
+        assert_eq!(joined.slice_gain_db[2], -3.0);
+        // A fresh cut starts plain.
+        assert_eq!(with_points(joined, &[0.0, 0.5], 0.0).slice_pitch[1], 0.0);
     }
 
     #[test]

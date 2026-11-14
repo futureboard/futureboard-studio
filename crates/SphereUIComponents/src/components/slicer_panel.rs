@@ -8,14 +8,21 @@ use std::sync::Arc;
 use gpui::{App, Window};
 
 use crate::components::quick_sampler_panel::{
-    I32Cb, NoteCb, SampleSummary, VoidCb, FLAG_H, KEYBOARD_HIGHEST_ROOT,
+    I32Cb, NoteCb, NoteVelocityCb, SampleSummary, VoidCb, KEYBOARD_HIGHEST_ROOT,
 };
 use slicer::SlicerParams;
 
 pub const SLICER_TITLE: &str = "Slicer";
 
-/// A slice flag: wide enough for two digits.
-pub(crate) const SLICE_FLAG_W: f32 = 18.0;
+/// The numbered markers' bar along the top of the display, at the design
+/// size.
+pub const SLICE_MARKER_H: f32 = 22.0;
+
+/// A slice marker's width for its number, at the design size.
+pub fn marker_width(index: usize) -> f32 {
+    let digits = (index + 1).to_string().len() as f32;
+    (8.0 + 6.6 * digits).max(18.0)
+}
 /// How near a press must land to a flag's line to grab it, in pixels.
 pub const GRAB_PX: f32 = 8.0;
 /// A slice sounding in the plug-in, from whatever played it — the editor,
@@ -31,16 +38,16 @@ pub struct SoundingSlice {
 }
 
 /// The slice point under a pointer at `(x, y)`, measured from the display's
-/// top-left corner across a display `width` wide: on its numbered flag, or
-/// within [`GRAB_PX`] of its line. A later flag is drawn over an earlier
-/// one, so it wins where they overlap.
-pub fn point_under(p: &SlicerParams, x: f32, y: f32, width: f32) -> Option<usize> {
+/// top-left corner across a display `width` wide drawn at scale `k`: on its
+/// numbered marker, or within [`GRAB_PX`] of its line. A later marker is
+/// drawn over an earlier one, so it wins where they overlap.
+pub fn point_under(p: &SlicerParams, x: f32, y: f32, width: f32, k: f32) -> Option<usize> {
     let points = p.points();
     let line_x = |point: f32| point.clamp(0.0, 1.0) * width;
-    if (0.0..=FLAG_H).contains(&y) {
-        let on_flag = points.iter().rposition(|point| {
+    if (0.0..=SLICE_MARKER_H * k).contains(&y) {
+        let on_flag = points.iter().enumerate().rposition(|(index, point)| {
             let left = line_x(*point);
-            x >= left - GRAB_PX * 0.5 && x <= left + SLICE_FLAG_W
+            x >= left - GRAB_PX * 0.5 && x <= left + marker_width(index) * k
         });
         if on_flag.is_some() {
             return on_flag;
@@ -104,7 +111,6 @@ impl SlicerPanelState {
     }
 }
 
-pub type SlicerParamsCb = Arc<dyn Fn(&SlicerParams, &mut Window, &mut App) + 'static>;
 /// A press on the display: window-space x and y, and the click count.
 pub type DisplayPressCb = Arc<dyn Fn(&(f32, f32, usize), &mut Window, &mut App) + 'static>;
 /// A right-press on the display: window-space x and y.
@@ -113,17 +119,22 @@ pub type DisplayRightPressCb = Arc<dyn Fn(&(f32, f32), &mut Window, &mut App) + 
 #[derive(Clone)]
 pub struct SlicerCallbacks {
     pub on_browse: VoidCb,
-    /// One complete params value, sent as it is.
-    pub on_set_params: SlicerParamsCb,
-    /// Params whose slicing settings changed: the window cuts the sample
-    /// again with them.
-    pub on_reslice: SlicerParamsCb,
     pub on_display_press: DisplayPressCb,
     pub on_display_right_press: DisplayRightPressCb,
-    pub on_note_on: NoteCb,
+    /// A key or pad pressed: pitch and velocity.
+    pub on_note_on: NoteVelocityCb,
     pub on_note_off: NoteCb,
-    pub on_shift_octave: I32Cb,
+    /// The previous (−1) or next (+1) sample in the plug-in's Samples folder.
+    pub on_step_sample: I32Cb,
+    /// Bypass the insert, or bring it back.
+    pub on_bypass: VoidCb,
+    /// The Slices (0) or Voice (1) page.
+    pub on_page: UsizeCb,
+    /// The pads' page: slices 1–16, 17–32, …
+    pub on_pad_page: UsizeCb,
 }
+
+pub type UsizeCb = Arc<dyn Fn(&usize, &mut Window, &mut App) + 'static>;
 
 #[cfg(test)]
 mod tests {
@@ -151,13 +162,15 @@ mod tests {
         };
         p.slices[..3].copy_from_slice(&[0.0, 0.5, 0.505]);
         // On the number, well right of the line.
-        assert_eq!(point_under(&p, 14.0, 6.0, 1_000.0), Some(0));
-        // Two overlapping flags: the one drawn on top.
-        assert_eq!(point_under(&p, 512.0, 6.0, 1_000.0), Some(2));
-        // Below the flags only the line counts.
-        assert_eq!(point_under(&p, 14.0, 80.0, 1_000.0), None);
-        assert_eq!(point_under(&p, 497.0, 80.0, 1_000.0), Some(1));
-        assert_eq!(point_under(&p, 300.0, 80.0, 1_000.0), None);
+        assert_eq!(point_under(&p, 14.0, 6.0, 1_000.0, 1.0), Some(0));
+        // Two overlapping markers: the one drawn on top.
+        assert_eq!(point_under(&p, 512.0, 6.0, 1_000.0, 1.0), Some(2));
+        // Below the markers only the line counts.
+        assert_eq!(point_under(&p, 14.0, 80.0, 1_000.0, 1.0), None);
+        assert_eq!(point_under(&p, 497.0, 80.0, 1_000.0, 1.0), Some(1));
+        assert_eq!(point_under(&p, 300.0, 80.0, 1_000.0, 1.0), None);
+        // Drawn at twice the size, the marker bar is twice as tall.
+        assert_eq!(point_under(&p, 14.0, 40.0, 1_000.0, 2.0), Some(0));
     }
 
     #[test]

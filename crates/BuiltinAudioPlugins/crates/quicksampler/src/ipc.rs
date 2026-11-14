@@ -9,7 +9,7 @@ pub const STATE_VERSION: u32 = 1;
 
 /// Wire index *is* the position in this table. Append only: a shipped id
 /// keeps its index forever, because projects and the param ring carry indices.
-pub const UI_PARAM_IDS: [&str; 23] = [
+pub const UI_PARAM_IDS: [&str; 25] = [
     "rootNote",
     "transpose",
     "fineCents",
@@ -33,6 +33,8 @@ pub const UI_PARAM_IDS: [&str; 23] = [
     "velocity",
     "polyphony",
     "bendRange",
+    "oneShot",
+    "glide",
 ];
 
 pub const PARAM_COUNT: usize = UI_PARAM_IDS.len();
@@ -146,6 +148,8 @@ pub fn apply_wire_param(p: &mut QuickSamplerParams, index: u32, value: f32) -> b
         20 => p.velocity = value,
         21 => p.polyphony = value.round().clamp(0.0, 255.0) as u8,
         22 => p.pitch_bend_range = value.round().clamp(0.0, 255.0) as u8,
+        23 => p.one_shot = on,
+        24 => p.glide_ms = value,
         _ => return false,
     }
     *p = p.sanitized();
@@ -180,6 +184,8 @@ pub fn ui_values(p: &QuickSamplerParams) -> Vec<(&'static str, f32)> {
         p.velocity,
         p.polyphony as f32,
         p.pitch_bend_range as f32,
+        flag(p.one_shot),
+        p.glide_ms,
     ];
     UI_PARAM_IDS.iter().copied().zip(values).collect()
 }
@@ -236,6 +242,8 @@ mod tests {
             velocity: 0.25,
             polyphony: 1,
             pitch_bend_range: 7,
+            one_shot: true,
+            glide_ms: 80.0,
         };
         let mut rebuilt = QuickSamplerParams::default();
         for (id, value) in ui_values(&saved) {

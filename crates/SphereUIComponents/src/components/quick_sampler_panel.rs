@@ -30,6 +30,15 @@ pub struct SampleSummary {
     pub peaks: Arc<Vec<(f32, f32)>>,
 }
 
+/// Where on the display a press lands: the loop bar along the top, the
+/// Start and End handles along the foot, or the waveform between.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkerBand {
+    Loop,
+    Region,
+    Any,
+}
+
 /// The four markers on the waveform.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SampleMarker {
@@ -56,11 +65,19 @@ impl SampleMarker {
 
     /// The marker nearest `fraction` among those drawn for `params`.
     pub fn nearest(params: &QuickSamplerParams, fraction: f32) -> SampleMarker {
-        let mut candidates = vec![
-            (SampleMarker::Start, params.start),
-            (SampleMarker::End, params.end),
-        ];
-        if params.loop_mode != QuickSamplerLoop::Off {
+        Self::in_band(params, fraction, MarkerBand::Any)
+    }
+
+    /// The marker nearest `fraction` among those in `band`: a press on the
+    /// loop bar takes a loop handle, one on the foot Start or End.
+    pub fn in_band(params: &QuickSamplerParams, fraction: f32, band: MarkerBand) -> SampleMarker {
+        let looping = params.loop_mode != QuickSamplerLoop::Off && !params.one_shot;
+        let mut candidates = Vec::with_capacity(4);
+        if band != MarkerBand::Loop || !looping {
+            candidates.push((SampleMarker::Start, params.start));
+            candidates.push((SampleMarker::End, params.end));
+        }
+        if looping && band != MarkerBand::Region {
             candidates.push((SampleMarker::LoopStart, params.loop_start));
             candidates.push((SampleMarker::LoopEnd, params.loop_end));
         }
@@ -115,24 +132,27 @@ pub(crate) type VoidCb = Arc<dyn Fn(&mut Window, &mut App) + 'static>;
 pub(crate) type ParamsCb = Arc<dyn Fn(&QuickSamplerParams, &mut Window, &mut App) + 'static>;
 pub(crate) type NoteCb = Arc<dyn Fn(&u8, &mut Window, &mut App) + 'static>;
 pub(crate) type I32Cb = Arc<dyn Fn(&i32, &mut Window, &mut App) + 'static>;
-pub(crate) type F32Cb = Arc<dyn Fn(&f32, &mut Window, &mut App) + 'static>;
+pub(crate) type NoteVelocityCb = Arc<dyn Fn(&(u8, u8), &mut Window, &mut App) + 'static>;
 pub(crate) type PointCb = Arc<dyn Fn(&(f32, f32), &mut Window, &mut App) + 'static>;
 
 #[derive(Clone)]
 pub struct QuickSamplerCallbacks {
     pub on_browse: VoidCb,
-    /// One complete params value, so a knob drag cannot land a partial edit.
-    pub on_set_params: ParamsCb,
-    /// A press on the waveform, at this window-space x. The window picks the
-    /// nearest marker and drags it until the button comes up.
-    pub on_waveform_press: F32Cb,
+    /// A press on the waveform, at this window-space point. The window picks
+    /// the marker under it — the loop handles along the top, Start and End
+    /// along the foot, the nearest elsewhere — and drags it until the button
+    /// comes up.
+    pub on_waveform_press: PointCb,
     /// A right-click on the waveform, at this window-space point: the
     /// window opens its menu there.
     pub on_waveform_menu: PointCb,
-    pub on_note_on: NoteCb,
+    /// A key pressed: pitch and velocity.
+    pub on_note_on: NoteVelocityCb,
     pub on_note_off: NoteCb,
-    pub on_all_notes_off: VoidCb,
-    pub on_shift_octave: I32Cb,
+    /// The previous (−1) or next (+1) sample in the plug-in's Samples folder.
+    pub on_step_sample: I32Cb,
+    /// Bypass the insert, or bring it back.
+    pub on_bypass: VoidCb,
 }
 
 /// Four octaves from C2: a bass line and a lead both fit under the hands.

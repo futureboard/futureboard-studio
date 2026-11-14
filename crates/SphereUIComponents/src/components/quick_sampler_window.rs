@@ -13,7 +13,11 @@
 //! * a sample is copied into the plug-in's Samples folder and sent as bytes
 //!   with `load_pad_sample` (slot 0); the host decodes it, hands it to the
 //!   audio thread, and answers through [`QuickSamplerEditorWindow::notify_sample_result`];
-//! * the keyboard plays through `preview_note`, the engine's plug-in preview.
+//! * the keyboard plays through `preview_note`, the engine's plug-in preview,
+//!   from the mouse or the computer keyboard (A W S E D … P, Z and X for the
+//!   octave);
+//! * Bypass flips the insert's bypass in the project through `insert_bypass`,
+//!   as the mixer's button does.
 //!
 //! The window decodes the sample itself only to draw it, off the UI thread.
 
@@ -40,10 +44,14 @@ use crate::components::native_plugin_shell::{
 };
 use crate::components::plate;
 use crate::components::quick_sampler_panel::{
-    QuickSamplerCallbacks, QuickSamplerPanelState, SampleMarker, SampleSummary,
+    MarkerBand, QuickSamplerCallbacks, QuickSamplerPanelState, SampleMarker, SampleSummary,
+    KEYBOARD_HIGHEST_ROOT,
 };
-use crate::components::quick_sampler_plate::{quick_sampler_plate, SetParams};
-use quicksampler::{LoopMode, QuickSamplerParams};
+use crate::components::quick_sampler_plate::{
+    quick_sampler_plate, QuickSamplerView, LOOP_BAR_H, REGION_HANDLE_H,
+};
+use crate::components::sampler_plate::{self, SetVoice, DISPLAY_H};
+use quicksampler::{FilterMode, LoopMode, QuickSamplerParams};
 
 /// The plate's standard window: the whole design at its own size. Resized,
 /// the plate scales to fit; nothing scrolls.
@@ -53,6 +61,40 @@ pub const QUICK_SAMPLER_WINDOW_MIN_WIDTH: f32 = plate::MIN_WINDOW_SIZE.0;
 pub const QUICK_SAMPLER_WINDOW_MIN_HEIGHT: f32 = plate::MIN_WINDOW_SIZE.1;
 
 const PREVIEW_VELOCITY: u8 = 100;
+
+/// The audio files in `dir`, by name, in the order a file browser lists
+/// them: what the header's sample stepper steps through. Control side only.
+pub(crate) fn list_samples(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+        .filter(|name| {
+            Path::new(name)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| SAMPLE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+        })
+        .collect();
+    names.sort_by_key(|name| name.to_lowercase());
+    names
+}
+
+/// `current`'s place in `names`, and the name `delta` steps from it (round
+/// the ends).
+pub(crate) fn step_in(names: &[String], current: Option<&str>, delta: i32) -> Option<String> {
+    if names.is_empty() {
+        return None;
+    }
+    let count = names.len() as i32;
+    let at = current
+        .and_then(|name| names.iter().position(|n| n == name))
+        .map_or(if delta < 0 { 0 } else { -1 }, |at| at as i32);
+    Some(names[(at + delta).rem_euclid(count) as usize].clone())
+}
 /// Columns of waveform overview read from a decoded sample.
 const WAVEFORM_BUCKETS: usize = 1_600;
 /// File types the Load Sample dialog offers: what the host's decoder reads.
@@ -90,6 +132,7 @@ mod menu_command {
     pub const LOOP_PINGPONG: &str = "loop-pingpong";
     pub const REVERSE: &str = "reverse";
     pub const NORMALIZE: &str = "normalize";
+    pub const KEYTRACK: &str = "keytrack";
 }
 
 /// The waveform's right-click menu: load another file, put the markers
@@ -145,6 +188,7 @@ fn waveform_menu_entries(p: &QuickSamplerParams, has_sample: bool) -> Vec<Contex
         ContextMenuEntry::Separator,
         ContextMenuEntry::checked_item("Reverse", menu_command::REVERSE, p.reverse),
         ContextMenuEntry::checked_item("Normalize", menu_command::NORMALIZE, p.normalize),
+        ContextMenuEntry::checked_item("Key Tracking", menu_command::KEYTRACK, p.keytrack),
     ]
 }
 
@@ -171,6 +215,17 @@ pub struct QuickSamplerEditorWindow {
     presets: gpui::Entity<BuiltinPresetMenu>,
     /// Bumped when the window closes, ending the meter timer.
     alive: Rc<Cell<bool>>,
+    /// The plug-in's Samples folder, by name: what the header steps through.
+    sample_files: Vec<String>,
+    /// A preview set the list itself: the folder's listing must not replace it.
+    files_pinned: bool,
+    /// The type a switched-off filter comes back on as.
+    filter_memory: FilterMode,
+    /// The insert's bypass, as the last meter tick read it.
+    bypassed: Option<bool>,
+    /// The first key the computer keyboard plays, and the notes it holds.
+    computer_base: u8,
+    computer_held: Vec<(String, u8)>,
 }
 
 impl QuickSamplerEditorWindow {
@@ -197,8 +252,15 @@ impl QuickSamplerEditorWindow {
             meter: ShellMeter::default(),
             presets,
             alive: Rc::new(Cell::new(true)),
+            sample_files: Vec::new(),
+            files_pinned: false,
+            filter_memory: FilterMode::LowPass,
+            bypassed: None,
+            computer_base: 48,
+            computer_held: Vec::new(),
         };
         plate::ensure_fonts(cx);
+        window.list_sample_files(cx);
         window.sync_from_mirror(cx);
         window.start_meter(cx);
         window
@@ -214,6 +276,132 @@ impl QuickSamplerEditorWindow {
         self.panel.sample = Some(sample);
         self.panel.loading = false;
         self.panel.params = params.sanitized();
+        if self.panel.params.filter != FilterMode::Off {
+            self.filter_memory = self.panel.params.filter;
+        }
+    }
+
+    /// The UI preview's scenes: the header's place among the samples, and a
+    /// bypassed insert.
+    #[cfg(feature = "ui-preview")]
+    pub fn preview_header(&mut self, files: Vec<String>, bypassed: Option<bool>) {
+        self.shown_sample = self.panel.sample.as_ref().map(|s| s.file_name.clone());
+        self.sample_files = files;
+        self.files_pinned = true;
+        self.bypassed = bypassed;
+    }
+
+    /// Re-reads the Samples folder, off the UI thread.
+    fn list_sample_files(&mut self, cx: &mut Context<Self>) {
+        let dir = self.samples_dir();
+        cx.spawn(async move |this, cx| {
+            let names = cx.background_spawn(async move { list_samples(&dir) }).await;
+            let _ = this.update(cx, |this, cx| {
+                if !this.files_pinned {
+                    this.sample_files = names;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The previous (−1) or next (+1) sample in the Samples folder, loaded
+    /// as if it were dropped: the region and loop start over, the shaping
+    /// stays.
+    fn step_sample(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let Some(name) = step_in(&self.sample_files, self.shown_sample.as_deref(), delta) else {
+            return;
+        };
+        if Some(name.as_str()) == self.shown_sample.as_deref() {
+            return;
+        }
+        self.panel.loading = true;
+        self.panel.status = None;
+        self.load_generation = self.load_generation.wrapping_add(1);
+        let generation = self.load_generation;
+        let path = self.samples_dir().join(&name);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let bytes = std::fs::read(&path)
+                        .map_err(|error| format!("{} is missing: {error}", path.display()))?;
+                    let summary = describe_sample(&name, &bytes)?;
+                    Ok::<_, String>((name, bytes, summary))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.load_generation != generation {
+                    return;
+                }
+                match result {
+                    Ok((name, bytes, summary)) => this.adopt_sample(name, bytes, summary, cx),
+                    Err(error) => this.apply_summary(Err(error)),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The header's Bypass: the insert's bypass in the project.
+    fn toggle_bypass(&mut self, cx: &mut Context<Self>) {
+        let Some(bypass) = self.host_ops.insert_bypass.clone() else {
+            return;
+        };
+        (bypass.toggle)(&self.key, cx);
+        self.bypassed = self.bypassed.map(|on| !on);
+        cx.notify();
+    }
+
+    /// The computer keyboard: A W S E D F T G Y H U J K O L P play sixteen
+    /// keys from the base, Z and X move it an octave. `true` when the key
+    /// was one of them.
+    fn computer_key_down(&mut self, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        let modifiers = event.keystroke.modifiers;
+        if modifiers.control || modifiers.alt || modifiers.platform || modifiers.function {
+            return false;
+        }
+        let key = event.keystroke.key.as_str();
+        if key == "z" || key == "x" {
+            if !event.is_held {
+                self.release_computer_keys(cx);
+                let octaves = if key == "z" { -1 } else { 1 };
+                self.computer_base =
+                    sampler_plate::shifted_computer_base(self.computer_base, octaves);
+                self.panel.keyboard_root = sampler_plate::keyboard_low_for(
+                    self.panel.keyboard_root,
+                    self.computer_base,
+                    KEYBOARD_HIGHEST_ROOT,
+                );
+                cx.notify();
+            }
+            return true;
+        }
+        let Some(offset) = sampler_plate::computer_key_offset(key) else {
+            return false;
+        };
+        if !event.is_held && !self.computer_held.iter().any(|(k, _)| k == key) {
+            let pitch = self.computer_base.saturating_add(offset).min(127);
+            self.computer_held.push((key.to_string(), pitch));
+            self.note_on(pitch, PREVIEW_VELOCITY, cx);
+        }
+        true
+    }
+
+    fn computer_key_up(&mut self, event: &gpui::KeyUpEvent, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        if let Some(at) = self.computer_held.iter().position(|(k, _)| k == key) {
+            let (_, pitch) = self.computer_held.remove(at);
+            self.note_off(pitch, cx);
+        }
+    }
+
+    fn release_computer_keys(&mut self, cx: &mut Context<Self>) {
+        for (_, pitch) in std::mem::take(&mut self.computer_held) {
+            self.note_off(pitch, cx);
+        }
     }
 
     /// Re-reads the insert's params from Studio's state mirror — after an
@@ -383,6 +571,10 @@ impl QuickSamplerEditorWindow {
                 bytes,
             },
         );
+        if !self.sample_files.contains(&name) {
+            self.sample_files.push(name.clone());
+            self.sample_files.sort_by_key(|name| name.to_lowercase());
+        }
         self.shown_sample = Some(name);
         self.apply_summary(Ok(summary));
         let defaults = QuickSamplerParams::default();
@@ -409,6 +601,9 @@ impl QuickSamplerEditorWindow {
     /// project's dirty flag through `forward_param`.
     fn set_params(&mut self, next: QuickSamplerParams, cx: &mut Context<Self>) {
         let next = next.sanitized();
+        if next.filter != FilterMode::Off {
+            self.filter_memory = next.filter;
+        }
         let edits = quicksampler::ipc::wire_diff(&self.panel.params, &next);
         self.panel.params = next;
         if let Some(forward) = self.host_ops.forward_param.clone() {
@@ -458,6 +653,10 @@ impl QuickSamplerEditorWindow {
                 normalize: !p.normalize,
                 ..p
             }),
+            menu_command::KEYTRACK => Some(QuickSamplerParams {
+                keytrack: !p.keytrack,
+                ..p
+            }),
             _ => None,
         };
         if let Some(next) = next {
@@ -473,11 +672,23 @@ impl QuickSamplerEditorWindow {
         Some(((x - left) / width).clamp(0.0, 1.0))
     }
 
-    fn press_waveform(&mut self, x: f32, cx: &mut Context<Self>) {
-        let Some(fraction) = self.fraction_at(x) else {
+    /// A press on the display: on the loop bar a loop handle, on the foot
+    /// Start or End, elsewhere the nearest marker — dragged from there.
+    fn press_waveform(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
+        let (Some(fraction), Some(bounds)) = (self.fraction_at(x), self.waveform_bounds.get())
+        else {
             return;
         };
-        self.panel.dragging = Some(SampleMarker::nearest(&self.panel.params, fraction));
+        let top = f32::from(bounds.origin.y);
+        let k = f32::from(bounds.size.height) / DISPLAY_H;
+        let band = if y - top <= LOOP_BAR_H * k {
+            MarkerBand::Loop
+        } else if y >= top + f32::from(bounds.size.height) - REGION_HANDLE_H * k {
+            MarkerBand::Region
+        } else {
+            MarkerBand::Any
+        };
+        self.panel.dragging = Some(SampleMarker::in_band(&self.panel.params, fraction, band));
         self.drag_marker_to(x, cx);
     }
 
@@ -503,12 +714,12 @@ impl QuickSamplerEditorWindow {
         }
     }
 
-    fn note_on(&mut self, pitch: u8, cx: &mut Context<Self>) {
+    fn note_on(&mut self, pitch: u8, velocity: u8, cx: &mut Context<Self>) {
         if !self.panel.is_playable() || self.panel.active_notes.contains(&pitch) {
             return;
         }
         self.panel.active_notes.push(pitch);
-        self.preview(pitch, Some(PREVIEW_VELOCITY), cx);
+        self.preview(pitch, Some(velocity.clamp(1, 127)), cx);
         cx.notify();
     }
 
@@ -522,6 +733,7 @@ impl QuickSamplerEditorWindow {
     }
 
     fn release_all(&mut self, cx: &mut App) {
+        self.computer_held.clear();
         for pitch in std::mem::take(&mut self.panel.active_notes) {
             self.preview(pitch, None, cx);
         }
@@ -539,6 +751,15 @@ impl QuickSamplerEditorWindow {
                     if this.meter.poll(this.host_ops.meter_source.as_ref(), &key) {
                         cx.notify();
                     }
+                    let bypassed = this
+                        .host_ops
+                        .insert_bypass
+                        .as_ref()
+                        .and_then(|bypass| (bypass.is_bypassed)(&key, cx));
+                    if bypassed != this.bypassed {
+                        this.bypassed = bypassed;
+                        cx.notify();
+                    }
                 });
                 if keep.is_err() {
                     break;
@@ -550,7 +771,7 @@ impl QuickSamplerEditorWindow {
 
     /// Every edit on the plate: one whole params value, through the wire
     /// path.
-    fn param_setter(&self, cx: &mut Context<Self>) -> SetParams {
+    fn param_setter(&self, cx: &mut Context<Self>) -> SetVoice {
         let entity = cx.entity().clone();
         Rc::new(move |params: QuickSamplerParams, app: &mut App| {
             let _ = entity.update(app, |this, cx| this.set_params(params, cx));
@@ -581,25 +802,19 @@ impl QuickSamplerEditorWindow {
         }
         QuickSamplerCallbacks {
             on_browse: void(&entity, |this, cx| this.browse_sample(cx)),
-            on_set_params: with(&entity, |this, params: QuickSamplerParams, cx| {
-                this.set_params(params, cx)
+            on_waveform_press: with(&entity, |this, (x, y): (f32, f32), cx| {
+                this.press_waveform(x, y, cx)
             }),
-            on_waveform_press: with(&entity, |this, x: f32, cx| this.press_waveform(x, cx)),
             on_waveform_menu: with(&entity, |this, point: (f32, f32), cx| {
                 this.menu = Some(point);
                 cx.notify();
             }),
-            on_note_on: with(&entity, |this, pitch: u8, cx| this.note_on(pitch, cx)),
+            on_note_on: with(&entity, |this, (pitch, velocity): (u8, u8), cx| {
+                this.note_on(pitch, velocity, cx)
+            }),
             on_note_off: with(&entity, |this, pitch: u8, cx| this.note_off(pitch, cx)),
-            on_all_notes_off: void(&entity, |this, cx| {
-                this.release_all(cx);
-                cx.notify();
-            }),
-            on_shift_octave: with(&entity, |this, delta: i32, cx| {
-                this.release_all(cx);
-                this.panel.shift_keyboard_octave(delta);
-                cx.notify();
-            }),
+            on_step_sample: with(&entity, |this, delta: i32, cx| this.step_sample(delta, cx)),
+            on_bypass: void(&entity, |this, cx| this.toggle_bypass(cx)),
         }
     }
 }
@@ -627,8 +842,20 @@ impl Render for QuickSamplerEditorWindow {
         let alive = self.alive.clone();
         let viewport = window.viewport_size();
         let s = plate::plate_scale((f32::from(viewport.width), f32::from(viewport.height)));
+        let position = self.shown_sample.as_ref().and_then(|name| {
+            self.sample_files
+                .iter()
+                .position(|n| n == name)
+                .map(|at| (at, self.sample_files.len()))
+        });
         let content = quick_sampler_plate(
-            &self.panel,
+            QuickSamplerView {
+                panel: &self.panel,
+                bypassed: self.host_ops.insert_bypass.as_ref().and(self.bypassed),
+                position,
+                filter_memory: self.filter_memory,
+                computer_base: self.computer_base,
+            },
             self.callbacks(cx),
             self.param_setter(cx),
             self.waveform_bounds.clone(),
@@ -672,7 +899,26 @@ impl Render for QuickSamplerEditorWindow {
                     }
                 }
             })
-            .on_key_up(|_event, window, cx| swallow_editor_transport_key_up(window, cx))
+            .on_key_down({
+                let entity = entity.clone();
+                let presets = self.presets.clone();
+                move |event: &gpui::KeyDownEvent, window, cx| {
+                    if presets.read(cx).owns_keyboard(window) {
+                        return;
+                    }
+                    let played = entity.update(cx, |this, cx| this.computer_key_down(event, cx));
+                    if played {
+                        cx.stop_propagation();
+                    }
+                }
+            })
+            .on_key_up({
+                let entity = entity.clone();
+                move |event: &gpui::KeyUpEvent, window, cx| {
+                    let _ = entity.update(cx, |this, cx| this.computer_key_up(event, cx));
+                    swallow_editor_transport_key_up(window, cx)
+                }
+            })
             // A marker drag follows the pointer anywhere in the window and
             // ends wherever the button comes up.
             .on_mouse_move({
@@ -794,6 +1040,17 @@ mod tests {
             Some(false),
             "nothing to reset without a sample"
         );
+    }
+
+    #[test]
+    fn the_sample_stepper_goes_round_the_folder() {
+        let names: Vec<String> = ["a.wav", "b.wav", "c.wav"].map(String::from).to_vec();
+        assert_eq!(step_in(&names, Some("c.wav"), 1).as_deref(), Some("a.wav"));
+        assert_eq!(step_in(&names, Some("a.wav"), -1).as_deref(), Some("c.wav"));
+        // A sample not in the folder steps to its first or last.
+        assert_eq!(step_in(&names, None, 1).as_deref(), Some("a.wav"));
+        assert_eq!(step_in(&names, Some("x.wav"), -1).as_deref(), Some("c.wav"));
+        assert_eq!(step_in(&[], None, 1), None);
     }
 
     #[test]

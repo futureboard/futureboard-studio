@@ -343,3 +343,80 @@ fn sounding_voices_are_listed_newest_first_with_their_positions() {
     sampler.choke();
     assert_eq!(sampler.sounding(&mut out), 0);
 }
+
+#[test]
+fn a_one_shot_ignores_the_note_off_and_plays_to_the_end() {
+    let p = QuickSamplerParams {
+        one_shot: true,
+        loop_mode: LoopMode::Forward,
+        sustain: 0.0,
+        decay_ms: 5.0,
+        ..params()
+    };
+    let mut sampler = QuickSampler::new(SR, Some(sine(440.0, 0.2)), p);
+    sampler.note_on(0, 60, 127);
+    render(&mut sampler, 480);
+    sampler.note_off(0, 60);
+    // Decay and sustain do not apply: still at full level 100 ms in.
+    let (left, _) = render(&mut sampler, 4_320);
+    let peak = left[3_800..].iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    assert!(peak > 0.45, "{peak}");
+    // And it does not loop: silent once the 0.2 s sample has played.
+    render(&mut sampler, 5_000);
+    assert_eq!(sampler.active_voice_count(), 0);
+}
+
+#[test]
+fn mono_glide_slides_from_the_last_note() {
+    let p = QuickSamplerParams {
+        polyphony: 1,
+        glide_ms: 100.0,
+        ..params()
+    };
+    let mut sampler = QuickSampler::new(SR, Some(sine(440.0, 2.0)), p);
+    sampler.note_on(0, 60, 127);
+    render(&mut sampler, 2_400);
+    sampler.note_on(0, 72, 127);
+    // Halfway through the glide the pitch is between the two notes...
+    let (left, _) = render(&mut sampler, 2_400);
+    let early = frequency(&left[1_400..2_400]);
+    assert!(early > 470.0 && early < 860.0, "{early}");
+    // ...and once it lands, at the new note.
+    render(&mut sampler, 4_800);
+    let (left, _) = render(&mut sampler, 4_800);
+    let hz = frequency(&left);
+    assert!((hz - 880.0).abs() < 2.0, "{hz}");
+}
+
+#[test]
+fn a_slice_shape_moves_pitch_level_and_direction() {
+    let mut plain = QuickSampler::new(SR, Some(sine(440.0, 1.0)), params());
+    plain.note_on_region(0, 60, 127, 0.0, 1.0);
+    let (reference, _) = render(&mut plain, 4_800);
+
+    let mut shaped = QuickSampler::new(SR, Some(sine(440.0, 1.0)), params());
+    let shape = SliceShape {
+        semitones: 12.0,
+        gain: 0.5,
+        reverse: false,
+    };
+    shaped.note_on_slice(0, 60, 127, 0.0, 1.0, shape);
+    let (left, _) = render(&mut shaped, 4_800);
+    let hz = frequency(&left[200..]);
+    assert!((hz - 880.0).abs() < 2.0, "{hz}");
+    let peak = |s: &[f32]| s[200..].iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    assert!((peak(&left) / peak(&reference) - 0.5).abs() < 0.02);
+
+    let mut reversed = QuickSampler::new(SR, Some(ramp(48_000)), params());
+    let back = SliceShape {
+        reverse: true,
+        ..SliceShape::PLAIN
+    };
+    reversed.note_on_slice(0, 60, 127, 0.0, 1.0, back);
+    let (left, _) = render(&mut reversed, 480);
+    assert!(
+        left[400] > 0.9,
+        "a reversed slice starts at its end: {}",
+        left[400]
+    );
+}

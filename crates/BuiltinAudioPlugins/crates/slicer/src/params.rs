@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use quicksampler::QuickSamplerParams;
+use quicksampler::{QuickSamplerParams, SliceShape};
 
 /// Most slices one sample is cut into — and keys they take, from
 /// [`SlicerParams::first_key`] up.
@@ -18,6 +18,11 @@ pub const DEFAULT_FIRST_KEY: u8 = 48;
 pub const MIN_SAMPLE_BPM: f32 = 40.0;
 pub const MAX_SAMPLE_BPM: f32 = 300.0;
 pub const MIN_EQUAL_SLICES: u8 = 2;
+/// A slice's own level, in decibels on top of the voice's.
+pub const SLICE_GAIN_MIN_DB: f32 = -24.0;
+pub const SLICE_GAIN_MAX_DB: f32 = 12.0;
+/// A slice's own pitch, semitones either way on top of the voice's transpose.
+pub const SLICE_PITCH_RANGE: f32 = 24.0;
 
 /// How the editor cuts a sample when asked to slice it again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -30,16 +35,24 @@ pub enum SliceMode {
     Beat,
     /// Into equal lengths.
     Equal,
+    /// Only where it is cut by hand: slicing again leaves the cut alone.
+    Manual,
 }
 
 impl SliceMode {
-    pub const ALL: [SliceMode; 3] = [SliceMode::Transient, SliceMode::Beat, SliceMode::Equal];
+    pub const ALL: [SliceMode; 4] = [
+        SliceMode::Transient,
+        SliceMode::Beat,
+        SliceMode::Equal,
+        SliceMode::Manual,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             SliceMode::Transient => "Transient",
             SliceMode::Beat => "Beat",
             SliceMode::Equal => "Equal",
+            SliceMode::Manual => "Manual",
         }
     }
 }
@@ -108,6 +121,16 @@ pub struct SlicerParams {
     /// `slice_count` are unused.
     #[serde(with = "slice_points")]
     pub slices: [f32; MAX_SLICES],
+    /// Each slice's own level, in decibels on top of the voice's; entry `n`
+    /// is slice `n`'s.
+    #[serde(with = "slice_values")]
+    pub slice_gain_db: [f32; MAX_SLICES],
+    /// Each slice's own pitch, in whole semitones on top of the voice's
+    /// transpose.
+    #[serde(with = "slice_values")]
+    pub slice_pitch: [f32; MAX_SLICES],
+    /// Bit `n` set: slice `n` plays the other way round from the voice.
+    pub slice_reverse: u64,
 }
 
 impl Default for SlicerParams {
@@ -129,6 +152,9 @@ impl Default for SlicerParams {
             sample_bpm: 0.0,
             slice_count: 1,
             slices,
+            slice_gain_db: [0.0; MAX_SLICES],
+            slice_pitch: [0.0; MAX_SLICES],
+            slice_reverse: 0,
         }
     }
 }
@@ -159,6 +185,22 @@ impl SlicerParams {
         for point in slices.iter_mut() {
             *point = unit(*point, 1.0);
         }
+        let mut slice_gain_db = self.slice_gain_db;
+        for gain in slice_gain_db.iter_mut() {
+            *gain = if gain.is_finite() {
+                gain.clamp(SLICE_GAIN_MIN_DB, SLICE_GAIN_MAX_DB)
+            } else {
+                0.0
+            };
+        }
+        let mut slice_pitch = self.slice_pitch;
+        for pitch in slice_pitch.iter_mut() {
+            *pitch = if pitch.is_finite() {
+                pitch.round().clamp(-SLICE_PITCH_RANGE, SLICE_PITCH_RANGE)
+            } else {
+                0.0
+            };
+        }
         Self {
             voice: self.voice.sanitized(),
             first_key: self.first_key.min(127),
@@ -171,6 +213,61 @@ impl SlicerParams {
             sample_bpm: sanitize_bpm(self.sample_bpm),
             slice_count: self.slice_count.min(MAX_SLICES as u8),
             slices,
+            slice_gain_db,
+            slice_pitch,
+            slice_reverse: self.slice_reverse,
+        }
+    }
+
+    /// Whether slice `index` plays the other way round from the voice.
+    pub fn slice_reversed(&self, index: usize) -> bool {
+        index < MAX_SLICES && self.slice_reverse & (1 << index) != 0
+    }
+
+    pub fn set_slice_reversed(&mut self, index: usize, on: bool) {
+        if index < MAX_SLICES {
+            if on {
+                self.slice_reverse |= 1 << index;
+            } else {
+                self.slice_reverse &= !(1 << index);
+            }
+        }
+    }
+
+    /// How slice `index` plays on top of the voice: its own pitch, level and
+    /// direction. Arithmetic only — safe on the audio thread.
+    pub fn slice_shape(&self, index: usize) -> SliceShape {
+        if index >= MAX_SLICES {
+            return SliceShape::PLAIN;
+        }
+        SliceShape {
+            semitones: self.slice_pitch[index],
+            gain: 10.0_f32.powf(self.slice_gain_db[index] / 20.0),
+            reverse: self.slice_reversed(index),
+        }
+    }
+
+    /// Every slice back to the voice's own pitch, level and direction.
+    pub fn clear_slice_settings(&mut self) {
+        self.slice_gain_db = [0.0; MAX_SLICES];
+        self.slice_pitch = [0.0; MAX_SLICES];
+        self.slice_reverse = 0;
+    }
+
+    /// Each slice's own settings taken from `from`: slice `n` here gets the
+    /// settings of slice `source(n)` there, or plain ones for `None`.
+    pub fn carry_slice_settings(
+        &mut self,
+        from: &SlicerParams,
+        source: impl Fn(usize) -> Option<usize>,
+    ) {
+        self.clear_slice_settings();
+        for index in 0..MAX_SLICES {
+            if let Some(old) = source(index).filter(|old| *old < MAX_SLICES) {
+                self.slice_gain_db[index] = from.slice_gain_db[old];
+                self.slice_pitch[index] = from.slice_pitch[old];
+                self.set_slice_reversed(index, from.slice_reversed(old));
+            }
         }
     }
 
@@ -197,6 +294,31 @@ impl SlicerParams {
     pub fn note_for_slice(&self, index: usize) -> Option<u8> {
         let note = self.first_key as usize + index;
         (note <= 127).then_some(note as u8)
+    }
+}
+
+/// A per-slice value travels as a list too; missing entries are 0.
+mod slice_values {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::MAX_SLICES;
+
+    pub fn serialize<S: Serializer>(
+        values: &[f32; MAX_SLICES],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        values.as_slice().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<[f32; MAX_SLICES], D::Error> {
+        let list = Vec::<f32>::deserialize(deserializer)?;
+        let mut values = [0.0; MAX_SLICES];
+        for (value, saved) in values.iter_mut().zip(list) {
+            *value = saved;
+        }
+        Ok(values)
     }
 }
 
@@ -266,5 +388,25 @@ mod tests {
         assert_eq!(s.sample_bpm, MAX_SAMPLE_BPM);
         assert_eq!(s.first_key, 127);
         assert_eq!(s.sanitized(), s);
+    }
+
+    #[test]
+    fn each_slice_keeps_its_own_pitch_level_and_direction() {
+        let mut p = SlicerParams::default();
+        p.slice_gain_db[2] = 100.0;
+        p.slice_pitch[2] = 3.4;
+        p.slice_pitch[3] = f32::NAN;
+        p.set_slice_reversed(2, true);
+        let s = p.sanitized();
+        assert_eq!(s.slice_gain_db[2], SLICE_GAIN_MAX_DB);
+        assert_eq!(s.slice_pitch[2], 3.0);
+        assert_eq!(s.slice_pitch[3], 0.0);
+        let shape = s.slice_shape(2);
+        assert!(shape.reverse && shape.semitones == 3.0);
+        assert!((shape.gain - 10.0_f32.powf(0.6)).abs() < 1.0e-4);
+        assert_eq!(s.slice_shape(1), SliceShape::PLAIN);
+        let mut off = s;
+        off.set_slice_reversed(2, false);
+        assert!(!off.slice_reversed(2));
     }
 }

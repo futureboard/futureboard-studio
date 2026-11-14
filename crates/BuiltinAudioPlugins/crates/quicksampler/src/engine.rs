@@ -36,12 +36,35 @@ const END_DECLICK_MS: f32 = 2.0;
 /// spin on one sample.
 const MIN_LOOP_FRAMES: f64 = 16.0;
 
+/// How one slice plays on top of the voice settings: its own pitch, level and
+/// direction.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SliceShape {
+    /// Semitones added to the voice's transpose.
+    pub semitones: f32,
+    /// Linear gain on the voice's level.
+    pub gain: f32,
+    /// Plays the slice the other way round from the voice's direction.
+    pub reverse: bool,
+}
+
+impl SliceShape {
+    /// The voice settings as they are.
+    pub const PLAIN: SliceShape = SliceShape {
+        semitones: 0.0,
+        gain: 1.0,
+        reverse: false,
+    };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stage {
     Idle,
     Attack,
     Decay,
     Sustain,
+    /// A one-shot after its attack: full level until the region ends.
+    Hold,
     Release,
 }
 
@@ -70,6 +93,12 @@ struct Voice {
     dir: f64,
     /// Pitch offset from the sample's own pitch, before pitch bend.
     semitones: f32,
+    /// Plays to the end of its region; the note-off does not release it.
+    one_shot: bool,
+    /// Glide still to go, in semitones on top of `semitones`, and how much of
+    /// it each output sample takes off.
+    glide: f32,
+    glide_step: f32,
     age: u64,
     ic1: [f32; 2],
     ic2: [f32; 2],
@@ -92,6 +121,9 @@ impl Voice {
         looping: false,
         dir: 1.0,
         semitones: 0.0,
+        one_shot: false,
+        glide: 0.0,
+        glide_step: 0.0,
         age: 0,
         ic1: [0.0; 2],
         ic2: [0.0; 2],
@@ -118,6 +150,7 @@ struct Derived {
     decay_step: f32,
     release_samples: f32,
     steal_samples: f32,
+    glide_samples: f32,
     declick_samples: f64,
     gain_l: f32,
     gain_r: f32,
@@ -206,6 +239,7 @@ impl QuickSampler {
             },
             release_samples: samples(p.release_ms),
             steal_samples: samples(STEAL_MS),
+            glide_samples: (p.glide_ms * 0.001 * sr).max(1.0),
             declick_samples: (END_DECLICK_MS * 0.001 * sr) as f64,
             filter: p.filter,
             ..Derived::default()
@@ -266,7 +300,9 @@ impl QuickSampler {
             velocity,
             (d.region_start, d.region_end),
             keyed,
-            true,
+            !p.one_shot,
+            p.one_shot,
+            SliceShape::PLAIN,
         );
     }
 
@@ -274,6 +310,20 @@ impl QuickSampler {
     /// sample's own pitch, moved only by transpose, fine tune and pitch bend:
     /// a slice. It never loops. Velocity 0 is a note-off.
     pub fn note_on_region(&mut self, channel: u8, note: u8, velocity: u8, start: f32, end: f32) {
+        self.note_on_slice(channel, note, velocity, start, end, SliceShape::PLAIN);
+    }
+
+    /// [`Self::note_on_region`], with the slice's own pitch, level and
+    /// direction on top of the voice settings.
+    pub fn note_on_slice(
+        &mut self,
+        channel: u8,
+        note: u8,
+        velocity: u8,
+        start: f32,
+        end: f32,
+        shape: SliceShape,
+    ) {
         if velocity == 0 {
             self.note_off(channel, note);
             return;
@@ -283,7 +333,16 @@ impl QuickSampler {
         };
         let from = (start.clamp(0.0, 1.0) as f64 * frames).floor();
         let to = (end.clamp(0.0, 1.0) as f64 * frames).ceil().min(frames);
-        self.start_voice(channel, note, velocity, (from, to), 0.0, false);
+        self.start_voice(
+            channel,
+            note,
+            velocity,
+            (from, to),
+            0.0,
+            false,
+            false,
+            shape,
+        );
     }
 
     /// Cuts every sounding voice in a few milliseconds, so the next note
@@ -301,6 +360,7 @@ impl QuickSampler {
 
     /// Starts a voice on `region` (frames), `keyed` semitones from the
     /// sample's pitch before transpose and fine tune.
+    #[allow(clippy::too_many_arguments)]
     fn start_voice(
         &mut self,
         channel: u8,
@@ -309,6 +369,8 @@ impl QuickSampler {
         (start, end): (f64, f64),
         keyed: f32,
         looping: bool,
+        one_shot: bool,
+        shape: SliceShape,
     ) {
         let channel = channel & 0x0F;
         let d = self.derived;
@@ -316,6 +378,20 @@ impl QuickSampler {
             return;
         }
         let p = self.params;
+        let semitones = keyed + shape.semitones + p.transpose as f32 + p.fine_cents / 100.0;
+        let reverse = p.reverse != shape.reverse;
+
+        // Mono glide: the new note starts at the pitch of the newest one it
+        // takes over and slides to its own.
+        let glide = if p.polyphony == 1 && p.glide_ms > 0.0 {
+            self.voices
+                .iter()
+                .filter(|v| v.active() && !v.stolen)
+                .max_by_key(|v| v.age)
+                .map_or(0.0, |v| v.semitones + v.glide - semitones)
+        } else {
+            0.0
+        };
 
         // Make room: past the polyphony, the oldest notes fade out — the ones
         // already releasing first.
@@ -363,13 +439,16 @@ impl QuickSampler {
             held: true,
             sustained: false,
             stolen: false,
-            velocity_gain: 1.0 - p.velocity + p.velocity * velocity,
-            pos: if p.reverse { end - 1.0 } else { start },
+            velocity_gain: (1.0 - p.velocity + p.velocity * velocity) * shape.gain,
+            pos: if reverse { end - 1.0 } else { start },
             start,
             end,
             looping,
-            dir: if p.reverse { -1.0 } else { 1.0 },
-            semitones: keyed + p.transpose as f32 + p.fine_cents / 100.0,
+            dir: if reverse { -1.0 } else { 1.0 },
+            semitones,
+            one_shot,
+            glide,
+            glide_step: glide / d.glide_samples,
             age: self.clock,
             ic1: [0.0; 2],
             ic2: [0.0; 2],
@@ -383,6 +462,9 @@ impl QuickSampler {
         for voice in self.voices.iter_mut() {
             if voice.active() && voice.held && voice.channel == channel && voice.note == note {
                 voice.held = false;
+                if voice.one_shot {
+                    continue;
+                }
                 if pedal {
                     voice.sustained = true;
                 } else {
@@ -524,18 +606,30 @@ impl QuickSampler {
         let last = sample.frames().saturating_sub(1);
         for voice in self.voices.iter_mut().filter(|v| v.active()) {
             let semitones = voice.semitones + self.bend[voice.channel as usize];
-            let step = d.rate_ratio * 2.0_f64.powf(semitones as f64 / 12.0);
+            let pitch = |glide: f32| d.rate_ratio * 2.0_f64.powf((semitones + glide) as f64 / 12.0);
+            let mut step = pitch(voice.glide);
             let looping = d.loop_on && voice.looping;
             for i in 0..frames {
+                // Glide, sample by sample until it lands.
+                if voice.glide != 0.0 {
+                    let next = voice.glide - voice.glide_step;
+                    voice.glide = if next * voice.glide <= 0.0 { 0.0 } else { next };
+                    step = pitch(voice.glide);
+                }
                 // Envelope.
                 match voice.stage {
                     Stage::Attack => {
                         voice.level += d.attack_step;
                         if voice.level >= 1.0 {
                             voice.level = 1.0;
-                            voice.stage = Stage::Decay;
+                            voice.stage = if voice.one_shot {
+                                Stage::Hold
+                            } else {
+                                Stage::Decay
+                            };
                         }
                     }
+                    Stage::Hold => voice.level = 1.0,
                     Stage::Decay => {
                         voice.level -= d.decay_step;
                         if voice.level <= sustain {

@@ -17,6 +17,8 @@ pub const CUTOFF_MIN_HZ: f32 = 20.0;
 pub const CUTOFF_MAX_HZ: f32 = 20_000.0;
 pub const TRANSPOSE_RANGE: i8 = 48;
 pub const PITCH_BEND_MAX: u8 = 24;
+/// Longest mono glide, in milliseconds.
+pub const GLIDE_MAX_MS: f32 = 2_000.0;
 
 /// How the sample repeats while a note is held.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -155,6 +157,13 @@ pub struct QuickSamplerParams {
     pub polyphony: u8,
     /// Pitch-bend range, semitones either way.
     pub pitch_bend_range: u8,
+    /// A note plays its region from start to end whatever its length: the
+    /// note-off is ignored, the region does not loop, and the envelope holds
+    /// at full level after the attack.
+    pub one_shot: bool,
+    /// Mono glide, in milliseconds (0 is off): with one voice, a new note
+    /// slides in from the pitch of the note it takes over.
+    pub glide_ms: f32,
 }
 
 impl Default for QuickSamplerParams {
@@ -183,6 +192,8 @@ impl Default for QuickSamplerParams {
             velocity: 1.0,
             polyphony: 16,
             pitch_bend_range: 2,
+            one_shot: false,
+            glide_ms: 0.0,
         }
     }
 }
@@ -225,6 +236,8 @@ impl QuickSamplerParams {
             velocity: unit(self.velocity, d.velocity),
             polyphony: self.polyphony.clamp(1, MAX_POLYPHONY),
             pitch_bend_range: self.pitch_bend_range.min(PITCH_BEND_MAX),
+            one_shot: self.one_shot,
+            glide_ms: finite_or(self.glide_ms, 0.0).clamp(0.0, GLIDE_MAX_MS),
         }
     }
 }
@@ -247,6 +260,7 @@ mod tests {
             cutoff_hz: 1.0e9,
             polyphony: 0,
             pitch_bend_range: 99,
+            glide_ms: 1.0e9,
             ..QuickSamplerParams::default()
         }
         .sanitized();
@@ -259,6 +273,7 @@ mod tests {
         assert_eq!(wild.cutoff_hz, CUTOFF_MAX_HZ);
         assert_eq!(wild.polyphony, 1);
         assert_eq!(wild.pitch_bend_range, PITCH_BEND_MAX);
+        assert_eq!(wild.glide_ms, GLIDE_MAX_MS);
         assert_eq!(wild.sanitized(), wild);
     }
 

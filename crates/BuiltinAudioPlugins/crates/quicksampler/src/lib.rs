@@ -29,11 +29,12 @@ use serde::{Deserialize, Serialize};
 
 pub use engine::{
     CONTROLLER_CHANNEL_PRESSURE, CONTROLLER_PITCH_BEND, CONTROLLER_PROGRAM_CHANGE, QuickSampler,
+    SliceShape,
 };
 pub use ipc::{UI_PARAM_IDS, ui_param_id, ui_param_index};
 pub use params::{
-    CUTOFF_MAX_HZ, CUTOFF_MIN_HZ, ENVELOPE_MAX_MS, FilterMode, LoopMode, MAX_POLYPHONY,
-    PITCH_BEND_MAX, QuickSamplerParams, TRANSPOSE_RANGE,
+    CUTOFF_MAX_HZ, CUTOFF_MIN_HZ, ENVELOPE_MAX_MS, FilterMode, GLIDE_MAX_MS, LoopMode,
+    MAX_POLYPHONY, PITCH_BEND_MAX, QuickSamplerParams, TRANSPOSE_RANGE,
 };
 pub use sample::{SampleData, load_cached};
 
@@ -203,6 +204,20 @@ impl Dsp {
     pub fn note_on_region(&mut self, channel: u8, note: u8, velocity: u8, start: f32, end: f32) {
         self.sampler
             .note_on_region(channel, note, velocity, start, end);
+    }
+
+    /// A slice with its own pitch, level and direction: see
+    /// [`QuickSampler::note_on_slice`].
+    pub fn note_on_slice(
+        &mut self,
+        channel: u8,
+        note: u8,
+        velocity: u8,
+        (start, end): (f32, f32),
+        shape: SliceShape,
+    ) {
+        self.sampler
+            .note_on_slice(channel, note, velocity, start, end, shape);
     }
 
     /// Cuts every sounding voice quickly: see [`QuickSampler::choke`].

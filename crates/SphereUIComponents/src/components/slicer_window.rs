@@ -42,13 +42,17 @@ use crate::components::native_plugin_shell::{
     NativeBuiltinEditor, ShellIdentity, ShellMeter, SHELL_METER_INTERVAL,
 };
 use crate::components::plate;
-use crate::components::quick_sampler_panel::SampleSummary;
-use crate::components::quick_sampler_window::SAMPLE_EXTENSIONS;
+use crate::components::quick_sampler_panel::{SampleSummary, KEYBOARD_HIGHEST_ROOT};
+use crate::components::quick_sampler_window::{list_samples, step_in, SAMPLE_EXTENSIONS};
+use crate::components::sampler_plate::{self, DISPLAY_H};
 use crate::components::slicer_panel::{
     point_under, SlicerCallbacks, SlicerPanelState, SoundingSlice,
 };
-use crate::components::slicer_plate::{slicer_plate, SetSlicer};
+use crate::components::slicer_plate::{
+    slicer_plate, SetSlicer, SlicerPage, SlicerView, PADS_PER_PAGE,
+};
 use crate::components::timeline::timeline_state::detect_tempo_from_mono;
+use quicksampler::FilterMode;
 use slicer::{slicing, SliceMode, SlicerParams};
 
 /// The plate's standard window: the whole design at its own size. Resized,
@@ -232,6 +236,8 @@ fn attack_onset(mono: &[f32], frame: usize, sample_rate: u32) -> usize {
 /// it found none). Background thread only.
 fn cut_points(p: &SlicerParams, source: &SliceSource) -> (Vec<f32>, Option<f32>) {
     match p.slice_mode {
+        // A hand-made cut is kept as it is.
+        SliceMode::Manual => (p.points().to_vec(), None),
         SliceMode::Equal => (slicing::equal_points(p.equal_slices as usize), None),
         SliceMode::Beat => {
             let (bpm, measured) = if p.sample_bpm > 0.0 {
@@ -313,6 +319,22 @@ pub struct SlicerEditorWindow {
     presets: gpui::Entity<BuiltinPresetMenu>,
     /// Cleared when the window closes, ending the meter timer.
     alive: Rc<Cell<bool>>,
+    /// The Controls section's page, and the pads' page.
+    page: SlicerPage,
+    pad_page: usize,
+    /// The plug-in's Samples folder, by name: what the header steps through.
+    sample_files: Vec<String>,
+    /// A preview set the list itself: the folder's listing must not replace it.
+    files_pinned: bool,
+    /// The type a switched-off filter comes back on as.
+    filter_memory: FilterMode,
+    /// The insert's bypass, as the last meter tick read it.
+    bypassed: Option<bool>,
+    /// The first key the computer keyboard plays, and the notes it holds.
+    computer_base: u8,
+    computer_held: Vec<(String, u8)>,
+    /// A hand edit just switched the slicing to Manual.
+    switched_to_manual: bool,
 }
 
 impl SlicerEditorWindow {
@@ -344,8 +366,18 @@ impl SlicerEditorWindow {
             meter: ShellMeter::default(),
             presets,
             alive: Rc::new(Cell::new(true)),
+            page: SlicerPage::Slices,
+            pad_page: 0,
+            sample_files: Vec::new(),
+            files_pinned: false,
+            filter_memory: FilterMode::LowPass,
+            bypassed: None,
+            computer_base: slicer::DEFAULT_FIRST_KEY,
+            computer_held: Vec::new(),
+            switched_to_manual: false,
         };
         plate::ensure_fonts(cx);
+        window.list_sample_files(cx);
         window.sync_from_mirror(cx);
         window.start_meter(cx);
         window
@@ -369,6 +401,151 @@ impl SlicerEditorWindow {
         self.panel.loading = false;
         self.panel.params = params.sanitized();
         self.panel.selected = selected;
+        if self.panel.params.voice.filter != FilterMode::Off {
+            self.filter_memory = self.panel.params.voice.filter;
+        }
+    }
+
+    /// The UI preview's scenes: the page shown, the header's place among the
+    /// samples, and slices sounding.
+    #[cfg(feature = "ui-preview")]
+    pub fn preview_state(
+        &mut self,
+        page: SlicerPage,
+        files: Vec<String>,
+        sounding: Vec<SoundingSlice>,
+    ) {
+        self.page = page;
+        self.shown_sample = self.panel.sample.as_ref().map(|s| s.file_name.clone());
+        self.sample_files = files;
+        self.files_pinned = true;
+        self.panel.sounding = sounding;
+    }
+
+    /// Re-reads the Samples folder, off the UI thread.
+    fn list_sample_files(&mut self, cx: &mut Context<Self>) {
+        let dir = self.samples_dir();
+        cx.spawn(async move |this, cx| {
+            let names = cx.background_spawn(async move { list_samples(&dir) }).await;
+            let _ = this.update(cx, |this, cx| {
+                if !this.files_pinned {
+                    this.sample_files = names;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The previous (−1) or next (+1) sample in the Samples folder, loaded
+    /// and cut as if it were dropped.
+    fn step_sample(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let Some(name) = step_in(&self.sample_files, self.shown_sample.as_deref(), delta) else {
+            return;
+        };
+        if Some(name.as_str()) == self.shown_sample.as_deref() {
+            return;
+        }
+        self.panel.loading = true;
+        self.panel.status = None;
+        self.load_generation = self.load_generation.wrapping_add(1);
+        let generation = self.load_generation;
+        let path = self.samples_dir().join(&name);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let bytes = std::fs::read(&path)
+                        .map_err(|error| format!("{} is missing: {error}", path.display()))?;
+                    let described = describe_sample(&name, &bytes)?;
+                    Ok::<_, String>((name, bytes, described))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.load_generation != generation {
+                    return;
+                }
+                match result {
+                    Ok((name, bytes, described)) => this.adopt_sample(name, bytes, described, cx),
+                    Err(error) => this.apply_summary(Err(error)),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The header's Bypass: the insert's bypass in the project.
+    fn toggle_bypass(&mut self, cx: &mut Context<Self>) {
+        let Some(bypass) = self.host_ops.insert_bypass.clone() else {
+            return;
+        };
+        (bypass.toggle)(&self.key, cx);
+        self.bypassed = self.bypassed.map(|on| !on);
+        cx.notify();
+    }
+
+    /// The computer keyboard, as Quick Sampler's: sixteen keys from the
+    /// base, Z and X for the octave. `true` when the key was one of them.
+    fn computer_key_down(&mut self, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        let modifiers = event.keystroke.modifiers;
+        if modifiers.control || modifiers.alt || modifiers.platform || modifiers.function {
+            return false;
+        }
+        let key = event.keystroke.key.as_str();
+        if key == "z" || key == "x" {
+            if !event.is_held {
+                self.release_computer_keys(cx);
+                let octaves = if key == "z" { -1 } else { 1 };
+                self.computer_base =
+                    sampler_plate::shifted_computer_base(self.computer_base, octaves);
+                self.panel.keyboard_root = sampler_plate::keyboard_low_for(
+                    self.panel.keyboard_root,
+                    self.computer_base,
+                    KEYBOARD_HIGHEST_ROOT,
+                );
+                cx.notify();
+            }
+            return true;
+        }
+        let Some(offset) = sampler_plate::computer_key_offset(key) else {
+            return false;
+        };
+        if !event.is_held && !self.computer_held.iter().any(|(k, _)| k == key) {
+            let pitch = self.computer_base.saturating_add(offset).min(127);
+            self.computer_held.push((key.to_string(), pitch));
+            self.note_on(pitch, PREVIEW_VELOCITY, cx);
+        }
+        true
+    }
+
+    fn computer_key_up(&mut self, event: &gpui::KeyUpEvent, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        if let Some(at) = self.computer_held.iter().position(|(k, _)| k == key) {
+            let (_, pitch) = self.computer_held.remove(at);
+            self.note_off(pitch, cx);
+        }
+    }
+
+    fn release_computer_keys(&mut self, cx: &mut Context<Self>) {
+        for (_, pitch) in std::mem::take(&mut self.computer_held) {
+            self.note_off(pitch, cx);
+        }
+    }
+
+    /// A cut made by hand — a marker moved, added or removed. A detected cut
+    /// would be redone over it, so the slicing turns Manual and the line
+    /// under the display says so.
+    fn hand_edit(&mut self, next: SlicerParams, cx: &mut Context<Self>) {
+        let mut next = next;
+        if next.slice_mode != SliceMode::Manual {
+            next.slice_mode = SliceMode::Manual;
+            self.switched_to_manual = true;
+            // A cut still being worked out must not land over the edit.
+            self.slice_generation = self.slice_generation.wrapping_add(1);
+            self.panel.analysing = false;
+        }
+        self.set_params(next, cx);
     }
 
     /// Re-reads the insert's params from Studio's state mirror — after an
@@ -547,13 +724,22 @@ impl SlicerEditorWindow {
                 bytes,
             },
         );
+        if !self.sample_files.contains(&name) {
+            self.sample_files.push(name.clone());
+            self.sample_files.sort_by_key(|name| name.to_lowercase());
+        }
         self.shown_sample = Some(name);
         self.apply_summary(Ok(described));
         self.panel.selected = None;
+        self.pad_page = 0;
         // A new file has a tempo of its own, measured when the beat grid
         // needs it.
         let mut next = self.panel.params;
         next.sample_bpm = 0.0;
+        if next_is_manual(&next) {
+            // A new file has no hand-made cut: find its hits.
+            next.slice_mode = SliceMode::Transient;
+        }
         self.reslice(next, cx);
     }
 
@@ -572,6 +758,9 @@ impl SlicerEditorWindow {
     /// project's dirty flag through `forward_param`.
     fn set_params(&mut self, next: SlicerParams, cx: &mut Context<Self>) {
         let next = next.sanitized();
+        if next.voice.filter != FilterMode::Off {
+            self.filter_memory = next.voice.filter;
+        }
         let edits = slicer::ipc::wire_diff(&self.panel.params, &next);
         self.panel.params = next;
         if let Some(forward) = self.host_ops.forward_param.clone() {
@@ -586,7 +775,11 @@ impl SlicerEditorWindow {
     /// UI thread. The settings are sent at once; the slices when the cut
     /// lands — unless a newer cut or another sample has replaced it.
     fn reslice(&mut self, next: SlicerParams, cx: &mut Context<Self>) {
+        self.switched_to_manual = false;
         self.set_params(next, cx);
+        if next.slice_mode == SliceMode::Manual {
+            return;
+        }
         let Some(source) = self.source.clone() else {
             return;
         };
@@ -644,6 +837,7 @@ impl SlicerEditorWindow {
             x - f32::from(bounds.origin.x),
             y - f32::from(bounds.origin.y),
             f32::from(bounds.size.width).max(1.0),
+            f32::from(bounds.size.height) / DISPLAY_H,
         )
     }
 
@@ -663,7 +857,7 @@ impl SlicerEditorWindow {
                 .flatten();
             if let Some(next) = inserted {
                 self.panel.selected = slicing::slice_at(&next, fraction);
-                self.set_params(next, cx);
+                self.hand_edit(next, cx);
             }
             return;
         }
@@ -677,7 +871,7 @@ impl SlicerEditorWindow {
             self.panel.selected = Some(index);
             self.stop_audition(cx);
             if let Some(pitch) = p.note_for_slice(index) {
-                self.note_on(pitch, cx);
+                self.note_on(pitch, PREVIEW_VELOCITY, cx);
                 self.audition = Some(pitch);
             }
             cx.notify();
@@ -713,7 +907,7 @@ impl SlicerEditorWindow {
         match command {
             menu_command::PLAY => {
                 if let Some(pitch) = menu.slice.and_then(|slice| p.note_for_slice(slice)) {
-                    self.note_on(pitch, cx);
+                    self.note_on(pitch, PREVIEW_VELOCITY, cx);
                     self.note_off(pitch, cx);
                 }
             }
@@ -721,7 +915,7 @@ impl SlicerEditorWindow {
                 if let Some(next) = slicing::insert_point(p, menu.fraction, min_gap(self.seconds()))
                 {
                     self.panel.selected = slicing::slice_at(&next, menu.fraction);
-                    self.set_params(next, cx);
+                    self.hand_edit(next, cx);
                 }
             }
             menu_command::JOIN => {
@@ -729,10 +923,16 @@ impl SlicerEditorWindow {
                     self.remove_slice_point(point, cx);
                 }
             }
-            menu_command::AGAIN => self.reslice(p, cx),
+            menu_command::AGAIN => {
+                let mut next = p;
+                if next_is_manual(&next) {
+                    next.slice_mode = SliceMode::Transient;
+                }
+                self.reslice(next, cx)
+            }
             menu_command::ONE => {
                 self.panel.selected = Some(0);
-                self.set_params(slicing::with_points(p, &[0.0], 0.0), cx);
+                self.hand_edit(slicing::with_points(p, &[0.0], 0.0), cx);
             }
             _ => {}
         }
@@ -745,7 +945,7 @@ impl SlicerEditorWindow {
         if let Some(next) = slicing::remove_point(self.panel.params, index) {
             self.panel.selected = index.checked_sub(1);
             self.panel.dragging = None;
-            self.set_params(next, cx);
+            self.hand_edit(next, cx);
         }
     }
 
@@ -771,7 +971,7 @@ impl SlicerEditorWindow {
         };
         let next = slicing::move_point(self.panel.params, index, fraction, min_gap(self.seconds()));
         if next != self.panel.params {
-            self.set_params(next, cx);
+            self.hand_edit(next, cx);
         }
     }
 
@@ -794,15 +994,16 @@ impl SlicerEditorWindow {
         }
     }
 
-    fn note_on(&mut self, pitch: u8, cx: &mut Context<Self>) {
+    fn note_on(&mut self, pitch: u8, velocity: u8, cx: &mut Context<Self>) {
         if !self.panel.is_playable() || self.panel.active_notes.contains(&pitch) {
             return;
         }
         self.panel.active_notes.push(pitch);
         if let Some(index) = self.panel.params.slice_for_note(pitch) {
             self.panel.selected = Some(index);
+            self.pad_page = index / PADS_PER_PAGE;
         }
-        self.preview(pitch, Some(PREVIEW_VELOCITY), cx);
+        self.preview(pitch, Some(velocity.clamp(1, 127)), cx);
         cx.notify();
     }
 
@@ -817,6 +1018,7 @@ impl SlicerEditorWindow {
 
     fn release_all(&mut self, cx: &mut App) {
         self.audition = None;
+        self.computer_held.clear();
         for pitch in std::mem::take(&mut self.panel.active_notes) {
             self.preview(pitch, None, cx);
         }
@@ -832,7 +1034,14 @@ impl SlicerEditorWindow {
                 let keep = this.update(cx, |this, cx| {
                     let key = this.key.clone();
                     let meter = this.meter.poll(this.host_ops.meter_source.as_ref(), &key);
-                    if this.poll_sounding() || meter {
+                    let bypassed = this
+                        .host_ops
+                        .insert_bypass
+                        .as_ref()
+                        .and_then(|bypass| (bypass.is_bypassed)(&key, cx));
+                    let bypass_moved = bypassed != this.bypassed;
+                    this.bypassed = bypassed;
+                    if this.poll_sounding() || meter || bypass_moved {
                         cx.notify();
                     }
                 });
@@ -921,15 +1130,10 @@ impl SlicerEditorWindow {
             })
         }
         let browse = entity.clone();
+        let bypass = entity.clone();
         SlicerCallbacks {
             on_browse: Arc::new(move |_window, app: &mut App| {
                 let _ = browse.update(app, |this, cx| this.browse_sample(cx));
-            }),
-            on_set_params: with(&entity, |this, params: SlicerParams, cx| {
-                this.set_params(params, cx)
-            }),
-            on_reslice: with(&entity, |this, params: SlicerParams, cx| {
-                this.reslice(params, cx)
             }),
             on_display_press: with(&entity, |this, (x, y, clicks): (f32, f32, usize), cx| {
                 this.press_display(x, y, clicks, cx)
@@ -937,11 +1141,24 @@ impl SlicerEditorWindow {
             on_display_right_press: with(&entity, |this, (x, y): (f32, f32), cx| {
                 this.right_press_display(x, y, cx)
             }),
-            on_note_on: with(&entity, |this, pitch: u8, cx| this.note_on(pitch, cx)),
+            on_note_on: with(&entity, |this, (pitch, velocity): (u8, u8), cx| {
+                this.note_on(pitch, velocity, cx)
+            }),
             on_note_off: with(&entity, |this, pitch: u8, cx| this.note_off(pitch, cx)),
-            on_shift_octave: with(&entity, |this, delta: i32, cx| {
-                this.release_all(cx);
-                this.panel.shift_keyboard_octave(delta);
+            on_step_sample: with(&entity, |this, delta: i32, cx| this.step_sample(delta, cx)),
+            on_bypass: Arc::new(move |_window, app: &mut App| {
+                let _ = bypass.update(app, |this, cx| this.toggle_bypass(cx));
+            }),
+            on_page: with(&entity, |this, page: usize, cx| {
+                this.page = if page == 1 {
+                    SlicerPage::Voice
+                } else {
+                    SlicerPage::Slices
+                };
+                cx.notify();
+            }),
+            on_pad_page: with(&entity, |this, page: usize, cx| {
+                this.pad_page = page;
                 cx.notify();
             }),
         }
@@ -972,8 +1189,23 @@ impl Render for SlicerEditorWindow {
         let viewport = window.viewport_size();
         let s = plate::plate_scale((f32::from(viewport.width), f32::from(viewport.height)));
         let (set, reslice) = self.param_setters(cx);
+        let position = self.shown_sample.as_ref().and_then(|name| {
+            self.sample_files
+                .iter()
+                .position(|n| n == name)
+                .map(|at| (at, self.sample_files.len()))
+        });
         let content = slicer_plate(
-            &self.panel,
+            SlicerView {
+                panel: &self.panel,
+                page: self.page,
+                pad_page: self.pad_page,
+                bypassed: self.host_ops.insert_bypass.as_ref().and(self.bypassed),
+                position,
+                filter_memory: self.filter_memory,
+                computer_base: self.computer_base,
+                switched_to_manual: self.switched_to_manual,
+            },
             self.callbacks(cx),
             set,
             reslice,
@@ -1011,14 +1243,29 @@ impl Render for SlicerEditorWindow {
             .track_focus(&self.focus_handle)
             .on_key_down({
                 let entity = entity.clone();
+                let presets = self.presets.clone();
                 move |event: &gpui::KeyDownEvent, window, cx| {
+                    if presets.read(cx).owns_keyboard(window) {
+                        return;
+                    }
                     if claim_editor_transport_key(event, window, cx) {
+                        return;
+                    }
+                    let played = entity.update(cx, |this, cx| this.computer_key_down(event, cx));
+                    if played {
+                        cx.stop_propagation();
                         return;
                     }
                     let _ = entity.update(cx, |this, cx| this.on_key_down(event, cx));
                 }
             })
-            .on_key_up(|_event, window, cx| swallow_editor_transport_key_up(window, cx))
+            .on_key_up({
+                let entity = entity.clone();
+                move |event: &gpui::KeyUpEvent, window, cx| {
+                    let _ = entity.update(cx, |this, cx| this.computer_key_up(event, cx));
+                    swallow_editor_transport_key_up(window, cx)
+                }
+            })
             // A flag drag follows the pointer anywhere in the window and ends
             // wherever the button comes up — as does a slice being heard.
             .on_mouse_move({
@@ -1068,6 +1315,11 @@ impl Render for SlicerEditorWindow {
             // The right-click menu, over everything.
             .children(menu)
     }
+}
+
+/// Whether `p` is cut by hand.
+fn next_is_manual(p: &SlicerParams) -> bool {
+    p.slice_mode == SliceMode::Manual
 }
 
 pub fn open_slicer_editor(

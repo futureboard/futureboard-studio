@@ -790,6 +790,8 @@ pub struct KnobCell {
     pub value_size: f32,
     /// The label under the knob rather than over it.
     pub label_below: bool,
+    /// The label as written (sentence case, untracked) instead of a caption.
+    pub plain_label: bool,
 }
 
 impl KnobCell {
@@ -802,6 +804,15 @@ impl KnobCell {
             label_ink: SOFT,
             value_size,
             label_below: false,
+            plain_label: false,
+        }
+    }
+
+    /// The label in sentence case, as the sampler designs print it.
+    pub const fn plain_label(self) -> Self {
+        Self {
+            plain_label: true,
+            ..self
         }
     }
 
@@ -1097,13 +1108,17 @@ fn knob_body(
         .flex_shrink_0()
         .w(px(cell.width * s))
         .gap(px(cell.gap * s));
-    let label = caption(
-        dial.label,
-        cell.label_size,
-        cell.label_em,
-        cell.label_ink,
-        s,
-    );
+    let label = if cell.plain_label {
+        words(dial.label, cell.label_size, cell.label_ink, s)
+    } else {
+        caption(
+            dial.label,
+            cell.label_size,
+            cell.label_em,
+            cell.label_ink,
+            s,
+        )
+    };
     let reading = numbers(
         readout.unwrap_or_else(|| dial.text(value)),
         cell.value_size,

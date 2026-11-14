@@ -618,6 +618,30 @@ pub fn scenes() -> Vec<Scene> {
             open: |o, cx| slicer_loop_by(o, cx, slicer::SliceMode::Beat),
         },
         Scene {
+            name: "slicer-manual",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: |o, cx| slicer_loop_by(o, cx, slicer::SliceMode::Manual),
+        },
+        Scene {
+            name: "slicer-voice",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: slicer_voice,
+        },
+        Scene {
+            name: "quick-sampler-oneshot",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: quick_sampler_oneshot,
+        },
+        Scene {
+            name: "quick-sampler-bypassed",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: quick_sampler_bypassed,
+        },
+        Scene {
             name: "mixer",
             width: 1_680.0,
             height: 760.0,
@@ -4245,10 +4269,62 @@ fn preview_sample(
     }
 }
 
+/// Host ops for the samplers' previews: a Bypass that reads `bypassed`, and
+/// — for the Slicer — `sounding` slices published as its telemetry.
+fn sampler_host_ops(bypassed: bool, sounding: Vec<(u8, u64, f32)>) -> BuiltinEditorHostOps {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let seq = Arc::new(AtomicU32::new(1));
+    let encoded = slicer::telemetry::encode(&sounding);
+    let mut block = [0.0_f32; SpherePluginHost::audio_bridge::BUILTIN_PAD_SLOTS];
+    block[..encoded.len()].copy_from_slice(&encoded);
+    BuiltinEditorHostOps {
+        insert_bypass: Some(
+            crate::components::builtin_plugin_editor_window::BuiltinInsertBypass {
+                is_bypassed: Arc::new(move |_, _| Some(bypassed)),
+                toggle: Arc::new(|_, _| {}),
+            },
+        ),
+        pad_level_source: (!sounding.is_empty()).then(|| {
+            Arc::new(move |_: &PluginInstanceKey| {
+                Some((seq.fetch_add(1, Ordering::Relaxed), block))
+            }) as crate::components::builtin_plugin_editor_window::BuiltinPadLevelSource
+        }),
+        ..preview_host_ops()
+    }
+}
+
+/// The Samples folder the previews' headers step through.
+fn preview_sample_files(current: &str) -> Vec<String> {
+    let mut files: Vec<String> = ["808 C2.wav", "Break 94 BPM.wav"]
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+    files.push(current.to_string());
+    files.sort_by_key(|name| name.to_lowercase());
+    files
+}
+
 /// Quick Sampler with a held note loaded — a swell, a sustain with some
 /// vibrato, a tail — looping forward over its steady part, through a
 /// resonant low-pass and a slow envelope.
 fn quick_sampler_loop(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    quick_sampler_scene(options, cx, false, false)
+}
+
+fn quick_sampler_oneshot(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    quick_sampler_scene(options, cx, true, false)
+}
+
+fn quick_sampler_bypassed(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    quick_sampler_scene(options, cx, false, true)
+}
+
+fn quick_sampler_scene(
+    options: WindowOptions,
+    cx: &mut App,
+    one_shot: bool,
+    bypassed: bool,
+) -> Result<AnyWindowHandle> {
     let sample = preview_sample("Choir Ah C4.wav", 3.69, |t| {
         let swell = (t / 0.08).min(1.0);
         let body = 0.62 + 0.08 * (t * 70.0).sin() + 0.25 * (-(t - 0.08).max(0.0) * 9.0).exp();
@@ -4268,18 +4344,23 @@ fn quick_sampler_loop(options: WindowOptions, cx: &mut App) -> Result<AnyWindowH
         decay_ms: 380.0,
         sustain: 0.6,
         release_ms: 900.0,
+        one_shot,
+        polyphony: if one_shot { 1 } else { 16 },
+        glide_ms: if one_shot { 120.0 } else { 0.0 },
         ..Default::default()
     };
+    let files = preview_sample_files(&sample.file_name);
     let handle = cx.open_window(options, move |_, cx| {
         cx.new(|cx| {
             let mut window = crate::components::quick_sampler_window::QuickSamplerEditorWindow::new(
                 key("quicksampler"),
                 identity("Quick Sampler"),
-                preview_host_ops(),
+                sampler_host_ops(bypassed, Vec::new()),
                 no_close(),
                 cx,
             );
             window.show_for_preview(sample, params);
+            window.preview_header(files, Some(bypassed));
             window
         })
     })?;
@@ -4293,6 +4374,29 @@ fn slicer_loop_by(
     options: WindowOptions,
     cx: &mut App,
     mode: slicer::SliceMode,
+) -> Result<AnyWindowHandle> {
+    slicer_scene(
+        options,
+        cx,
+        mode,
+        crate::components::slicer_plate::SlicerPage::Slices,
+    )
+}
+
+fn slicer_voice(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    slicer_scene(
+        options,
+        cx,
+        slicer::SliceMode::Transient,
+        crate::components::slicer_plate::SlicerPage::Voice,
+    )
+}
+
+fn slicer_scene(
+    options: WindowOptions,
+    cx: &mut App,
+    mode: slicer::SliceMode,
+    page: crate::components::slicer_plate::SlicerPage,
 ) -> Result<AnyWindowHandle> {
     const HITS: [(f32, f32); 8] = [
         (0.0, 1.0),
@@ -4319,17 +4423,28 @@ fn slicer_loop_by(
         sample_bpm: 136.0,
         ..Default::default()
     };
-    let params = slicer::slicing::with_points(cut, &points, 0.0);
+    let mut params = slicer::slicing::with_points(cut, &points, 0.0);
+    params.voice.filter = quicksampler::FilterMode::HighPass;
+    params.voice.cutoff_hz = 180.0;
+    params.voice.resonance = 0.35;
+    params.voice.release_ms = 120.0;
+    params.slice_pitch[2] = -3.0;
+    params.slice_gain_db[2] = -4.5;
+    params.set_slice_reversed(2, true);
+    let files = preview_sample_files(&sample.file_name);
+    // The fifth slice sounding, a third of the way through.
+    let sounding = vec![(slicer::DEFAULT_FIRST_KEY + 4, 7, 0.54)];
     let handle = cx.open_window(options, move |_, cx| {
         cx.new(|cx| {
             let mut window = crate::components::slicer_window::SlicerEditorWindow::new(
                 key("slicer"),
                 identity("Slicer"),
-                preview_host_ops(),
+                sampler_host_ops(false, sounding),
                 no_close(),
                 cx,
             );
             window.show_for_preview(sample, params, Some(2));
+            window.preview_state(page, files, Vec::new());
             window
         })
     })?;
