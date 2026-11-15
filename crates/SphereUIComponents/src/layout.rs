@@ -84,6 +84,7 @@ mod project_switch;
 mod recording_ops;
 pub(crate) mod routing_warnings;
 mod sample_rate_ops;
+mod sampler_rack_ops;
 mod session_load;
 mod shell_regions;
 mod stretch_tempo_ops;
@@ -1178,6 +1179,28 @@ impl StudioLayout {
             });
             let _ = piano_roll_floating.update(cx, |roll, _cx| {
                 roll.set_midi_preview_handler(Some(preview_handler));
+            });
+        }
+        {
+            // The step view's Sampler Rack: new rows, instrument editors,
+            // samples and live channel controls. Deferred like every child
+            // callback here, so the editor never updates its parent mid-update.
+            let target = cx.entity().clone();
+            let rack_handler: Arc<
+                dyn Fn(components::piano_roll::RackRequest, &mut Window, &mut gpui::App),
+            > = Arc::new(move |request, window, cx| {
+                StudioLayout::defer_update_in_window(
+                    &target,
+                    window,
+                    cx,
+                    move |this, window, cx| this.handle_rack_request(request, window, cx),
+                );
+            });
+            let _ = piano_roll.update(cx, |roll, _cx| {
+                roll.set_rack_request_handler(Some(rack_handler.clone()));
+            });
+            let _ = piano_roll_floating.update(cx, |roll, _cx| {
+                roll.set_rack_request_handler(Some(rack_handler));
             });
         }
         {

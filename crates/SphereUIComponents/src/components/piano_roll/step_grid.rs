@@ -453,6 +453,12 @@ pub(crate) struct StepDrag {
     pub added: Vec<MidiNoteState>,
     /// Ramp and nudge: every note the gesture may change, as it was.
     pub prev: Vec<MidiNoteState>,
+    /// The clip the gesture edits: the edited clip, or in the Sampler Rack
+    /// the pressed row's.
+    pub clip_id: String,
+    /// The gesture made `clip_id` (a rack row that had no clip over these
+    /// bars), so releasing records the clip itself and cancelling removes it.
+    pub created_clip: bool,
 }
 
 impl StepDrag {
@@ -473,6 +479,8 @@ impl StepDrag {
             removed: Vec::new(),
             added: Vec::new(),
             prev: Vec::new(),
+            clip_id: String::new(),
+            created_clip: false,
         }
     }
 

@@ -63,12 +63,12 @@ impl PianoRoll {
     /// A drum lane's menu: quick pattern actions on that lane's steps.
     pub(super) fn open_native_lane_menu(
         &mut self,
-        pitch: u8,
+        row: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
         let items = vec![
-            PopupItem::Header(self.drum_lane_name(pitch).to_string()),
+            PopupItem::Header(self.step_row_name(row).to_string()),
             command("Fill Every 2 Steps", "fill:2", false),
             command("Fill Every 4 Steps", "fill:4", false),
             command("Randomize Velocity (±15%)", "random", false),
@@ -85,7 +85,7 @@ impl PianoRoll {
                     "clear" => LaneAction::Clear,
                     _ => return,
                 };
-                editor.run_lane_action(pitch, action, cx);
+                editor.run_lane_action(row, action, cx);
             },
             window,
             cx,

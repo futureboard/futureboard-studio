@@ -24,7 +24,7 @@ use SpherePluginHost::{PluginFormat as RegistryPluginFormat, PluginKind};
 use super::helpers::{cleaned_track_name, numbered_name_stem};
 use super::{ContextMenuTarget, OpenPopover, StudioLayout};
 
-fn add_track_instrument_plugins_from_catalog(
+pub(super) fn add_track_instrument_plugins_from_catalog(
     catalog: &super::plugin_ops::PluginCatalogState,
 ) -> Vec<SpherePluginHost::RegistryPlugin> {
     catalog

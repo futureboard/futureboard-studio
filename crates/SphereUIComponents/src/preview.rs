@@ -690,6 +690,12 @@ pub fn scenes() -> Vec<Scene> {
             open: midi_steps_scene,
         },
         Scene {
+            name: "midi-rack",
+            width: 1_280.0,
+            height: 600.0,
+            open: midi_rack_scene,
+        },
+        Scene {
             name: "welcome-tour",
             width: 1_440.0,
             height: 860.0,
@@ -2322,6 +2328,78 @@ fn midi_drums_reversed_scene(options: WindowOptions, cx: &mut App) -> Result<Any
 /// The drum pattern on the step grid, with a snare roll written as a ×4
 /// ratchet, a ×2 hat, and one hit played between the lines (amber, waiting to
 /// be snapped). The repeat selector is on ×4.
+/// The step view's Sampler Rack: a group of four sampler tracks, each a row
+/// with its own pattern, colour, mute/solo and faders. Clap is muted, Hat
+/// panned right and quieter; Perc has no clip over these bars yet.
+fn midi_rack_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    use crate::components::piano_roll::{PianoRoll, StepSource};
+    use crate::components::timeline::timeline::Timeline;
+    use crate::components::timeline::timeline_state::{
+        CreateTrackOptions, InputMonitorMode, TrackType,
+    };
+    let handle = cx.open_window(options, move |_, cx| {
+        let timeline = cx.new(|_| {
+            let mut timeline = Timeline::new();
+            let state = &mut timeline.state;
+            state.tracks.clear();
+            let make = |state: &mut crate::components::timeline::timeline_state::TimelineState,
+                        kind,
+                        name: &str| {
+                state.create_track(CreateTrackOptions {
+                    track_type: kind,
+                    name: name.to_string(),
+                    color: state.track_color_for_index(state.tracks.len()),
+                    volume: 0.8,
+                    pan: 0.0,
+                    armed: false,
+                    input_monitor: InputMonitorMode::Off,
+                })
+            };
+            let group = make(state, TrackType::Group, "Sampler Rack");
+            let patterns: [(&str, &[f32]); 4] = [
+                ("Kick", &[0.0, 1.0, 2.0, 2.75, 3.0]),
+                ("Snare", &[1.0, 3.0]),
+                ("Hat", &[0.5, 1.5, 2.5, 3.5]),
+                ("Clap", &[1.0, 3.0, 3.75]),
+            ];
+            let mut first_clip = None;
+            for (name, hits) in patterns {
+                let id = make(state, TrackType::Instrument, name);
+                state.assign_track_to_group(&id, &group);
+                let clip = state.create_midi_clip(&id, 0.0, 4.0).expect("clip");
+                for hit in hits {
+                    state.add_midi_note(&clip, 60, *hit, 0.25, 100);
+                }
+                first_clip.get_or_insert(clip);
+                match name {
+                    "Hat" => {
+                        state.set_track_pan(&id, 0.45);
+                        state.set_track_volume(&id, 0.6);
+                    }
+                    "Clap" => {
+                        state.set_track_mute(&id, true);
+                    }
+                    _ => {}
+                }
+            }
+            let perc = make(state, TrackType::Instrument, "Perc");
+            state.assign_track_to_group(&perc, &group);
+            if let Some(clip) = first_clip {
+                state.select_clip(&clip);
+            }
+            timeline
+        });
+        cx.new(|cx| {
+            let mut roll = PianoRoll::new(timeline, cx);
+            roll.set_step_mode(true, cx);
+            roll.set_step_source(StepSource::SamplerRack, cx);
+            roll.preview_hover_rack_step(2, 6);
+            roll
+        })
+    })?;
+    Ok(handle.into())
+}
+
 fn midi_steps_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
     use crate::components::piano_roll::{DrumLanes, PianoRoll};
     use crate::components::timeline::timeline::Timeline;

@@ -3,7 +3,7 @@
 //! piano-roll vocabulary (struct fields via the type, consts, free fns).
 
 use super::*;
-use gpui::{PathBuilder, PathStyle, StrokeOptions};
+use gpui::{ExternalPaths, PathBuilder, PathStyle, StrokeOptions};
 use std::collections::HashMap;
 
 impl PianoRoll {
@@ -445,7 +445,7 @@ impl PianoRoll {
                     .pb(px(2.0))
                     .text_size(px(8.5))
                     .text_color(Colors::text_faint())
-                    .child(self.drum_lane_name(pitch)),
+                    .child(self.step_row_name(pitch)),
             )
             .child(row(
                 0,
@@ -609,6 +609,7 @@ impl Render for PianoRoll {
         }
 
         self.refresh_drum_rows(cx);
+        self.refresh_rack_rows(cx);
         let clip_id = self.editing_clip_id(cx);
         if clip_id != self.last_editing_clip && !matches!(self.drag, PianoDrag::None) {
             self.cancel_active_gesture(cx);
@@ -1288,6 +1289,35 @@ impl PianoRoll {
                 }),
             ));
         if self.step_mode {
+            // What the rows are: one clip's drum lanes, or a rack of tracks.
+            let source = self.step_source();
+            for (slot, (label, tip, value)) in [
+                (
+                    "Drum Sampler",
+                    "Drum Sampler: one row per drum sound of this clip",
+                    StepSource::DrumSampler,
+                ),
+                (
+                    "Sampler Rack",
+                    "Sampler Rack: one row per instrument track in this track's group, \
+                     each with its own sampler, mute, solo, volume and pan",
+                    StepSource::SamplerRack,
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                editor_mode = editor_mode.child(tool_text_segment(
+                    ("pr-step-source", slot),
+                    label.to_string(),
+                    tip.into(),
+                    source == value,
+                    cx.listener(move |this, _, _w, cx| {
+                        this.cancel_active_gesture(cx);
+                        this.set_step_source(value, cx);
+                    }),
+                ));
+            }
             // Note repeat: how many hits a new step plays, what Shift-click
             // gives a step, and what the selected steps are rewritten to.
             let current = self.step_repeat;
@@ -1931,7 +1961,11 @@ impl PianoRoll {
         let project_start = self.x_to_project_beat(0.0);
         let project_end = self.x_to_project_beat(view_w);
 
-        let keys = self.build_key_lane(first_pitch, last_pitch);
+        let keys = if self.rack_active() {
+            self.build_rack_lane(cx)
+        } else {
+            self.build_key_lane(first_pitch, last_pitch)
+        };
 
         let grid_lines = self.build_grid_lines(
             project_start,
@@ -1986,7 +2020,11 @@ impl PianoRoll {
         // Empty clip: the musical canvas (ruler, keys, grid) stays, with one
         // quiet hint naming the gesture that actually creates a note. Nothing
         // here is a status readout — the counts live in the footer.
-        let grid_empty_hint = (note_count_for_clip(cx, &self.timeline, clip_id) == 0).then(|| {
+        // In the rack the other rows have their own clips; the hint is only
+        // for an editor with nothing in it at all.
+        let grid_empty_hint = (note_count_for_clip(cx, &self.timeline, clip_id) == 0
+            && !self.rack_active())
+        .then(|| {
             div()
                 .absolute()
                 .inset_0()
@@ -2256,6 +2294,10 @@ impl PianoRoll {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, ev: &MouseDownEvent, _window, cx| {
+                                    // The rack's headers are controls, not keys.
+                                    if this.rack_active() {
+                                        return;
+                                    }
                                     let Some(raw) = this.key_lane_pitch_at(ev.position) else {
                                         return;
                                     };
@@ -2283,11 +2325,17 @@ impl PianoRoll {
                                     if !this.drum_mode {
                                         return;
                                     }
-                                    let Some(pitch) = this.key_lane_pitch_at(ev.position) else {
+                                    let row = if this.rack_active() {
+                                        this.key_lane_row_at(ev.position)
+                                    } else {
+                                        this.key_lane_pitch_at(ev.position)
+                                            .and_then(|pitch| this.drum_row_of(pitch))
+                                    };
+                                    let Some(row) = row else {
                                         return;
                                     };
                                     cx.stop_propagation();
-                                    this.open_lane_menu_at(pitch, ev.position, window, cx);
+                                    this.open_lane_menu_at(row, ev.position, window, cx);
                                 }),
                             )
                             .child(key_lane_canvas)
@@ -2376,7 +2424,7 @@ impl PianoRoll {
     /// The drum lanes inside a view `view_h` tall, by index from the top.
     pub(super) fn visible_drum_rows(&self, view_h: f32) -> std::ops::Range<usize> {
         let row_h = self.note_row_h().max(0.0001);
-        let count = self.drum_rows.len();
+        let count = self.lane_count();
         let first = ((self.scroll_y / row_h).floor().max(0.0) as usize).min(count);
         let last = (((self.scroll_y + view_h) / row_h).ceil().max(0.0) as usize + 1).min(count);
         first..last.max(first)
@@ -2388,7 +2436,7 @@ impl PianoRoll {
     /// lane, so moving within one lane does not restart it. Paints nothing
     /// and takes no pointer events: hit-testing is unchanged under it.
     fn drum_hover_band(&self, scope: &'static str) -> Option<gpui::AnyElement> {
-        if !self.drum_mode {
+        if !self.drum_mode || self.rack_active() {
             return None;
         }
         let pitch = self.drum_hover_lane?;
@@ -2535,6 +2583,348 @@ impl PianoRoll {
         out.push(rows);
         out.extend(self.drum_hover_band("pr-drum-hover-lane"));
         out.extend(labels);
+        out
+    }
+
+    /// The Sampler Rack's row headers in place of the lane names, one per
+    /// track: its name (opens its instrument), its sample (loads one, or
+    /// takes a dropped file), mute, solo, volume and pan. "Add Sampler" sits
+    /// under the last row. Right-click a row for its pattern actions.
+    fn build_rack_lane(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+        use crate::theme::{space, typography};
+        let row_h = self.note_row_h();
+        let (_, view_h) = self.grid_view_size();
+        let hovered_row = self.step_hover.map(|(row, _)| row);
+        let seam = Colors::with_alpha(Colors::text_primary(), 0.06);
+        let band = Colors::with_alpha(Colors::surface_base(), 0.35);
+        let drop_target = Colors::with_alpha(Colors::accent_primary(), 0.14);
+        let mut out: Vec<gpui::AnyElement> = Vec::new();
+
+        let toggle = |id: (&'static str, usize), label: &'static str, on: bool, hue: gpui::Rgba| {
+            div()
+                .id(id)
+                .flex_none()
+                .w(px(16.0))
+                .h(px(14.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(crate::theme::radius::CONTROL_SM))
+                .text_size(px(typography::DENSE_CAPTION))
+                .font_weight(gpui::FontWeight::BOLD)
+                // The track header's latch: tinted ground, its hue as text.
+                .bg(if on {
+                    Colors::latched(Colors::surface_panel_alt(), hue).0
+                } else {
+                    Colors::button_bg()
+                })
+                .text_color(if on { hue } else { Colors::text_muted() })
+                .cursor(gpui::CursorStyle::PointingHand)
+                .child(label)
+        };
+        // A fader as a thin bar: dragged sideways, read by its fill.
+        let bar = |id: (&'static str, usize), width: f32, from: f32, to: f32, fill: gpui::Rgba| {
+            div()
+                .id(id)
+                .flex_none()
+                .w(px(width))
+                .h(px(12.0))
+                .flex()
+                .items_center()
+                .cursor(gpui::CursorStyle::ResizeLeftRight)
+                .child(
+                    div()
+                        .relative()
+                        .w_full()
+                        .h(px(4.0))
+                        .rounded(px(2.0))
+                        .bg(Colors::with_alpha(Colors::text_primary(), 0.12))
+                        .child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .bottom_0()
+                                .left(px(width * from.min(to)))
+                                .w(px((width * (to - from).abs()).max(1.0)))
+                                .rounded(px(2.0))
+                                .bg(fill),
+                        ),
+                )
+        };
+
+        for index in self.visible_drum_rows(view_h) {
+            let Some(row) = self.rack_rows.get(index) else {
+                continue;
+            };
+            let y = index as f32 * row_h - self.scroll_y;
+            let (sample, loads) = self.rack_sample_label(row, cx);
+            let track_id = row.track_id.clone();
+            let lit = hovered_row == Some(index);
+            let volume_fill = Colors::with_alpha(Colors::text_primary(), 0.65);
+            let pan = row.pan.clamp(-1.0, 1.0);
+            let header = div()
+                .id(("pr-rack-row", index))
+                .absolute()
+                .left_0()
+                .right_0()
+                .top(px(y))
+                .h(px(row_h))
+                .flex()
+                .items_center()
+                .gap(px(space::TIGHT))
+                .px(px(space::SNUG))
+                .border_b(px(1.0))
+                .border_color(seam)
+                .when(index % 2 == 1, |b| b.bg(band))
+                .when(lit, |b| b.bg(Colors::state_hover()))
+                .drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(drop_target))
+                .on_drop(cx.listener({
+                    let track_id = track_id.clone();
+                    move |this, paths: &ExternalPaths, window, cx| {
+                        if let Some(path) = paths.paths().first() {
+                            this.send_rack_request(
+                                RackRequest::LoadSample {
+                                    track_id: track_id.clone(),
+                                    path: Some(path.clone()),
+                                },
+                                window,
+                                cx,
+                            );
+                        }
+                    }
+                }))
+                // Which track: its colour, as on its arrangement header.
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(3.0))
+                        .h(px((row_h - 6.0).max(4.0)))
+                        .rounded(px(1.5))
+                        .bg(row.color),
+                )
+                .child(
+                    div()
+                        .id(("pr-rack-name", index))
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_size(px(typography::DENSE_LABEL))
+                        .text_color(if lit || row.solo {
+                            Colors::text_primary()
+                        } else {
+                            Colors::text_secondary()
+                        })
+                        .cursor(gpui::CursorStyle::PointingHand)
+                        .tooltip(crate::components::controls::fb_tooltip(format!(
+                            "Open {}'s instrument",
+                            row.name
+                        )))
+                        .on_click(cx.listener({
+                            let track_id = track_id.clone();
+                            move |this, _: &gpui::ClickEvent, window, cx| {
+                                this.send_rack_request(
+                                    RackRequest::OpenEditor {
+                                        track_id: track_id.clone(),
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            }
+                        }))
+                        .child(row.name.clone()),
+                )
+                .child(
+                    div()
+                        .id(("pr-rack-sample", index))
+                        .flex_none()
+                        .w(px(84.0))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_size(px(typography::DENSE_CAPTION))
+                        .text_color(Colors::text_faint())
+                        .when(loads, |b| {
+                            b.cursor(gpui::CursorStyle::PointingHand)
+                                .hover(|s| s.text_color(Colors::text_secondary()))
+                                .tooltip(crate::components::controls::fb_tooltip(
+                                    "Load a sample (or drop an audio file on the row)",
+                                ))
+                                .on_click(cx.listener({
+                                    let track_id = track_id.clone();
+                                    move |this, _: &gpui::ClickEvent, window, cx| {
+                                        this.send_rack_request(
+                                            RackRequest::LoadSample {
+                                                track_id: track_id.clone(),
+                                                path: None,
+                                            },
+                                            window,
+                                            cx,
+                                        );
+                                    }
+                                }))
+                        })
+                        .child(sample),
+                )
+                .child(
+                    toggle(
+                        ("pr-rack-mute", index),
+                        "M",
+                        row.muted,
+                        Colors::state_mute(),
+                    )
+                    .tooltip(crate::components::controls::fb_tooltip("Mute"))
+                    .on_click(cx.listener({
+                        let track_id = track_id.clone();
+                        move |this, _: &gpui::ClickEvent, window, cx| {
+                            this.toggle_rack_row(&track_id, false, window, cx);
+                        }
+                    })),
+                )
+                .child(
+                    toggle(("pr-rack-solo", index), "S", row.solo, Colors::state_solo())
+                        .tooltip(crate::components::controls::fb_tooltip("Solo"))
+                        .on_click(cx.listener({
+                            let track_id = track_id.clone();
+                            move |this, _: &gpui::ClickEvent, window, cx| {
+                                this.toggle_rack_row(&track_id, true, window, cx);
+                            }
+                        })),
+                )
+                .child(
+                    bar(
+                        ("pr-rack-volume", index),
+                        36.0,
+                        0.0,
+                        row.volume,
+                        volume_fill,
+                    )
+                    .tooltip(crate::components::controls::fb_tooltip(format!(
+                        "Volume {:+.1} dB (drag sideways)",
+                        crate::components::timeline::timeline_state::volume::norm_to_db(row.volume)
+                    )))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener({
+                            let track_id = track_id.clone();
+                            move |this, ev: &MouseDownEvent, _w, cx| {
+                                cx.stop_propagation();
+                                this.begin_rack_mixer(
+                                    &track_id,
+                                    RackControl::Volume,
+                                    ev.position.x.into(),
+                                    cx,
+                                );
+                            }
+                        }),
+                    ),
+                )
+                .child(
+                    bar(
+                        ("pr-rack-pan", index),
+                        26.0,
+                        0.5,
+                        0.5 + pan * 0.5,
+                        volume_fill,
+                    )
+                    .tooltip(crate::components::controls::fb_tooltip(
+                        "Pan (drag sideways)",
+                    ))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener({
+                            let track_id = track_id.clone();
+                            move |this, ev: &MouseDownEvent, _w, cx| {
+                                cx.stop_propagation();
+                                this.begin_rack_mixer(
+                                    &track_id,
+                                    RackControl::Pan,
+                                    ev.position.x.into(),
+                                    cx,
+                                );
+                            }
+                        }),
+                    ),
+                );
+            out.push(header.into_any_element());
+        }
+
+        // A new row: another sampler track in this rack.
+        let add_y = self.rack_rows.len() as f32 * row_h - self.scroll_y;
+        if add_y < view_h {
+            let editing_track = self.editing_clip_id(cx).and_then(|clip_id| {
+                self.timeline
+                    .read(cx)
+                    .state
+                    .find_clip(&clip_id)
+                    .map(|(track, _)| track.id.clone())
+            });
+            if let Some(track_id) = editing_track {
+                out.push(
+                    div()
+                        .id("pr-rack-add")
+                        .absolute()
+                        .left(px(space::SNUG))
+                        .top(px(add_y + 2.0))
+                        .h(px((row_h - 4.0).max(14.0)))
+                        .px(px(space::SNUG))
+                        .flex()
+                        .items_center()
+                        .rounded(px(crate::theme::radius::CONTROL_SM))
+                        .text_size(px(typography::DENSE_LABEL))
+                        .text_color(Colors::text_secondary())
+                        .hover(|s| {
+                            s.bg(Colors::state_hover())
+                                .text_color(Colors::text_primary())
+                        })
+                        .cursor(gpui::CursorStyle::PointingHand)
+                        .tooltip(crate::components::controls::fb_tooltip(
+                            "Add a row: a new track with the Quick Sampler, in this rack's group",
+                        ))
+                        .on_click(cx.listener(move |this, _: &gpui::ClickEvent, window, cx| {
+                            this.send_rack_request(
+                                RackRequest::AddRow {
+                                    track_id: track_id.clone(),
+                                },
+                                window,
+                                cx,
+                            );
+                        }))
+                        .child("+ Add Sampler")
+                        .into_any_element(),
+                );
+            }
+        }
+
+        // A fader drag follows the pointer anywhere in the window.
+        if matches!(self.drag, PianoDrag::RackMixer { .. }) {
+            let this = cx.weak_entity();
+            out.push(
+                gpui::canvas(
+                    |_, _, _| {},
+                    move |_, (), window, _| {
+                        let moved = this.clone();
+                        window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                            if phase == gpui::DispatchPhase::Bubble {
+                                let _ = moved.update(cx, |this, cx| {
+                                    this.on_rack_mixer_move(event, window, cx)
+                                });
+                            }
+                        });
+                        let released = this.clone();
+                        window.on_mouse_event(move |_: &MouseUpEvent, phase, _window, cx| {
+                            if phase == gpui::DispatchPhase::Bubble {
+                                let _ = released.update(cx, |this, cx| this.on_rack_mixer_up(cx));
+                            }
+                        });
+                    },
+                )
+                .absolute()
+                .size_0()
+                .into_any_element(),
+            );
+        }
         out
     }
 
@@ -3999,17 +4389,40 @@ impl PianoRoll {
             }
         }
 
+        let targets = self.step_rows(cx);
+        let rack = self.rack_active();
         for row in rows {
-            let Some(&pitch) = self.drum_rows.get(row) else {
+            let Some(target) = targets.get(row) else {
                 continue;
             };
+            let pitch = target.pitch;
+            // In the rack every row is its own track: its own clip, drawn in
+            // its own colour.
+            let (track_color, slab) = match self.rack_rows.get(row).filter(|_| rack) {
+                Some(rack_row) => {
+                    let mut faint = rack_row.color;
+                    faint.a = 0.22;
+                    (rack_row.color, faint)
+                }
+                None => (track_color, slab),
+            };
+            // A muted rack row plays nothing: its steps read like muted notes.
+            let row_muted = rack && self.rack_rows.get(row).is_some_and(|r| r.muted);
             let y = row as f32 * row_h - self.scroll_y + gap;
             let h = (row_h - 2.0 * gap).max(1.0);
-            let cells = step_grid::lane_cells(&notes, pitch, step);
+            let cells = if rack {
+                target
+                    .clip_id
+                    .as_deref()
+                    .map(|id| step_grid::lane_cells(&self.clip_notes(id, cx), pitch, step))
+                    .unwrap_or_default()
+            } else {
+                step_grid::lane_cells(&notes, pitch, step)
+            };
             for index in first_step..last_step {
                 let line_x = self.clip_beat_to_x(index as f32 * step) + gap * 0.5;
                 let w = (step_w - gap).max(1.0);
-                let hovered = self.step_hover == Some((pitch, index));
+                let hovered = self.step_hover == Some((row, index));
                 let Some(cell) = cells.iter().find(|cell| cell.index == index) else {
                     quads.push(StepQuad::fill(
                         line_x,
@@ -4021,11 +4434,12 @@ impl PianoRoll {
                     ));
                     continue;
                 };
+                let muted = cell.muted || row_muted;
                 // Where the step plays: its line plus its nudge.
                 let x = line_x + cell.offset * px_per_beat;
                 if !cell.even {
                     let mut color = uneven;
-                    color.a = if cell.muted { 0.25 } else { 0.85 };
+                    color.a = if muted { 0.25 } else { 0.85 };
                     quads.push(StepQuad::fill(x, y, w, h, color, 2.0));
                 } else if cell.repeat > 1 {
                     // One bar per hit, its height that hit's velocity, on a
@@ -4033,7 +4447,7 @@ impl PianoRoll {
                     quads.push(StepQuad::fill(x, y, w, h, slab, 2.0));
                     let slice = w / f32::from(cell.repeat);
                     let mut bar = track_color;
-                    bar.a = if cell.muted { 0.3 } else { 0.95 };
+                    bar.a = if muted { 0.3 } else { 0.95 };
                     for (i, velocity) in cell.velocities.iter().enumerate() {
                         let bar_h = (h * f32::from(*velocity) / 127.0).max(2.0);
                         quads.push(StepQuad::fill(
@@ -4048,7 +4462,7 @@ impl PianoRoll {
                 } else {
                     // Velocity is the fill's strength; a muted step is faint.
                     let mut color = track_color;
-                    color.a = if cell.muted {
+                    color.a = if muted {
                         0.2
                     } else {
                         0.45 + 0.55 * (f32::from(cell.velocity) / 127.0)

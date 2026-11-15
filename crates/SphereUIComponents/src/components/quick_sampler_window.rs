@@ -493,7 +493,7 @@ impl QuickSamplerEditorWindow {
         }
     }
 
-    fn browse_sample(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn browse_sample(&mut self, cx: &mut Context<Self>) {
         #[cfg(feature = "native-dialogs")]
         {
             cx.spawn(async move |this, cx| {
@@ -521,7 +521,7 @@ impl QuickSamplerEditorWindow {
     /// host, and draws it. The play region and loop start over on the new
     /// file; how it plays (pitch, envelope, filter, output) is kept, so
     /// swapping one kick for another keeps the shaping.
-    fn import_sample(&mut self, source: PathBuf, cx: &mut Context<Self>) {
+    pub(crate) fn import_sample(&mut self, source: PathBuf, cx: &mut Context<Self>) {
         self.panel.loading = true;
         self.panel.status = None;
         self.load_generation = self.load_generation.wrapping_add(1);
