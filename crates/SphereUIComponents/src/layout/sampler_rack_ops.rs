@@ -119,25 +119,18 @@ impl StudioLayout {
         cx: &mut Context<Self>,
     ) {
         let Some(path) = path else {
-            #[cfg(feature = "native-dialogs")]
-            cx.spawn(async move |this, cx| {
-                let Some(handle) = rfd::AsyncFileDialog::new()
-                    .set_title("Load Sample")
-                    .add_filter(
-                        "Audio",
-                        &crate::components::quick_sampler_window::SAMPLE_EXTENSIONS,
-                    )
-                    .pick_file()
-                    .await
-                else {
-                    return;
-                };
-                let path = handle.path().to_path_buf();
-                let _ = this.update(cx, |this, cx| {
-                    this.load_rack_pad_sample(insert_id, pad, Some(path), cx)
-                });
-            })
-            .detach();
+            // Picked in the Browser, not a file dialog (see `browser_pick`).
+            let studio = cx.weak_entity();
+            crate::browser_pick::request(
+                cx,
+                format!("Sampler Rack · Pad {}", pad + 1),
+                &crate::components::quick_sampler_window::SAMPLE_EXTENSIONS,
+                move |path, cx| {
+                    let _ = studio.update(cx, |this, cx| {
+                        this.load_rack_pad_sample(insert_id, pad, Some(path), cx)
+                    });
+                },
+            );
             return;
         };
         #[cfg(feature = "builtin-plugin-editor")]

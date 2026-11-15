@@ -640,42 +640,32 @@ impl SoundfontPlayerWindow {
             .any(|preset| preset.bank == bank && preset.patch == patch)
     }
 
+    /// "Browse…": the `.sf2` is picked in the studio's Browser (see
+    /// `browser_pick`).
     fn browse_soundfont(&mut self, cx: &mut Context<Self>) {
-        #[cfg(feature = "native-dialogs")]
-        {
-            self.panel.status = None;
-            let entity = cx.entity().clone();
-            cx.spawn(async move |_this, cx| {
-                let Some(handle) = rfd::AsyncFileDialog::new()
-                    .set_title("Load SoundFont")
-                    .add_filter("SoundFont", &["sf2"])
-                    .pick_file()
-                    .await
-                else {
-                    return;
-                };
-                let path = handle.path().to_path_buf();
-                let _ = entity.update(cx, |this, cx| {
-                    this.panel.loading = true;
-                    cx.notify();
-                });
-                let result = cx
-                    .background_spawn({
-                        let path = path.clone();
-                        async move { read_font_info(&path) }
-                    })
-                    .await;
-                let _ = entity.update(cx, |this, cx| {
-                    this.adopt_font(path.to_string_lossy().into_owned(), result, cx);
-                });
-            })
-            .detach();
-        }
-        #[cfg(not(feature = "native-dialogs"))]
-        {
-            self.panel.status = Some("Native file dialogs are unavailable in this build.".into());
-            cx.notify();
-        }
+        self.panel.status = None;
+        let entity = cx.weak_entity();
+        crate::browser_pick::request(cx, "Soundfont Player", &["sf2"], move |path, cx| {
+            let _ = entity.update(cx, |this, cx| this.load_soundfont_path(path, cx));
+        });
+    }
+
+    /// Reads the picked font off the UI thread and puts it on the track.
+    fn load_soundfont_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.panel.loading = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn({
+                    let path = path.clone();
+                    async move { read_font_info(&path) }
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.adopt_font(path.to_string_lossy().into_owned(), result, cx);
+            });
+        })
+        .detach();
     }
 
     /// Puts a freshly read font on the track: the player keeps a preset the

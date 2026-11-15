@@ -2762,6 +2762,23 @@ impl PianoRoll {
                         this.load_rack_pad(pad, Some(path.clone()), window, cx);
                     }
                 }))
+                // A file dragged from the studio's Browser (the docked
+                // editor shares its window).
+                .drag_over::<crate::components::sidebar::BrowserDragItem>(move |style, _, _, _| {
+                    style.bg(drop_target)
+                })
+                .on_drop(cx.listener(
+                    move |this, item: &crate::components::sidebar::BrowserDragItem, window, cx| {
+                        if super::super::quick_sampler_window::SAMPLE_EXTENSIONS.iter().any(|ext| {
+                            item.path
+                                .extension()
+                                .and_then(|e| e.to_str())
+                                .is_some_and(|e| e.eq_ignore_ascii_case(ext))
+                        }) {
+                            this.load_rack_pad(pad, Some(item.path.clone()), window, cx);
+                        }
+                    },
+                ))
                 // The pad's note: drag it up or down to change it.
                 .child(
                     div()

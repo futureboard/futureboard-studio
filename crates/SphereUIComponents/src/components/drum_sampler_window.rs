@@ -406,31 +406,19 @@ impl DrumSamplerEditorWindow {
         .detach();
     }
 
+    /// "Browse…" for the selected pad: the sample is picked in the studio's
+    /// Browser (see `browser_pick`) and placed on that pad, as a drop is.
     fn browse(&mut self, cx: &mut Context<Self>) {
-        #[cfg(feature = "native-dialogs")]
-        {
-            let index = self.panel.selected;
-            cx.spawn(async move |this, cx| {
-                let Some(handle) = rfd::AsyncFileDialog::new()
-                    .set_title("Load Sample")
-                    .add_filter("Audio", &SAMPLE_EXTENSIONS)
-                    .pick_file()
-                    .await
-                else {
-                    return;
-                };
-                let path = handle.path().to_path_buf();
-                let _ = this.update(cx, |this, cx| this.place_files(Some(index), vec![path], cx));
-            })
-            .detach();
-        }
-        #[cfg(not(feature = "native-dialogs"))]
-        {
-            self.show_note(
-                "Native file dialogs are unavailable in this build.".into(),
-                cx,
-            );
-        }
+        let index = self.panel.selected;
+        let editor = cx.weak_entity();
+        crate::browser_pick::request(
+            cx,
+            format!("Drum Sampler · Pad {}", index + 1),
+            &SAMPLE_EXTENSIONS,
+            move |path, cx| {
+                let _ = editor.update(cx, |this, cx| this.place_files(Some(index), vec![path], cx));
+            },
+        );
     }
 
     /// Files dropped (or browsed): stored in the Samples folder, and loaded

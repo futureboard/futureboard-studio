@@ -493,28 +493,13 @@ impl QuickSamplerEditorWindow {
         }
     }
 
+    /// "Browse…": the sample is picked in the studio's Browser (see
+    /// `browser_pick`), which hands it to [`Self::import_sample`].
     fn browse_sample(&mut self, cx: &mut Context<Self>) {
-        #[cfg(feature = "native-dialogs")]
-        {
-            cx.spawn(async move |this, cx| {
-                let Some(handle) = rfd::AsyncFileDialog::new()
-                    .set_title("Load Sample")
-                    .add_filter("Audio", &SAMPLE_EXTENSIONS)
-                    .pick_file()
-                    .await
-                else {
-                    return;
-                };
-                let path = handle.path().to_path_buf();
-                let _ = this.update(cx, |this, cx| this.import_sample(path, cx));
-            })
-            .detach();
-        }
-        #[cfg(not(feature = "native-dialogs"))]
-        {
-            self.panel.status = Some("Native file dialogs are unavailable in this build.".into());
-            cx.notify();
-        }
+        let editor = cx.weak_entity();
+        crate::browser_pick::request(cx, "Quick Sampler", &SAMPLE_EXTENSIONS, move |path, cx| {
+            let _ = editor.update(cx, |this, cx| this.import_sample(path, cx));
+        });
     }
 
     /// Copies `source` into the plug-in's Samples folder, sends it to the

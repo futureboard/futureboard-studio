@@ -747,6 +747,7 @@ impl StudioLayout {
             // Escape belongs to the tree only; in the search field it still
             // cancels the edit through the text-input tail below.
             "escape" if tree_focused && !search_focused => {
+                crate::browser_pick::cancel(cx);
                 self.file_browser.clear_type_ahead();
                 self.stop_browser_audition();
                 cx.notify();
@@ -763,6 +764,11 @@ impl StudioLayout {
                         if expanded {
                             self.drain_browser_directory_loads(cx);
                         }
+                    } else if crate::browser_pick::activate(cx, &selected_path)
+                        != crate::browser_pick::Activation::Normal
+                    {
+                        // A "Browse…" took it (or is waiting for another
+                        // kind of file): it is not imported.
                     } else {
                         let ext = selected_path
                             .extension()

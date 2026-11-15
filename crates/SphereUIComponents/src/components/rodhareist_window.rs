@@ -1344,66 +1344,52 @@ impl RodhareistEditorWindow {
         }
     }
 
-    /// Picks a capture or an IR, keeps a copy in Rodhareist's own folder —
-    /// what the project names and what Studio reloads it from — and sends
-    /// it to the host. The host's answer arrives through
+    /// Asks the studio's Browser for a capture or an IR. The picked file is
+    /// kept in Rodhareist's own folder — what the project names and what
+    /// Studio reloads it from — and sent to the host
+    /// ([`Self::load_file_path`]). The host's answer arrives through
     /// [`Self::notify_nam_capture_result`] / [`Self::notify_ir_load_result`].
     fn start_file_load(&mut self, file: RodhareistFile, cx: &mut Context<Self>) {
-        #[cfg(feature = "native-dialogs")]
-        {
-            let (title, filter, extensions): (&str, &str, &[&str]) = match file {
-                RodhareistFile::Capture => ("Load NAM Capture", "Neural Amp Modeler", &["nam"]),
-                RodhareistFile::Impulse => {
-                    ("Load Impulse Response", "Cabinet IR", &["wav", "wave"])
-                }
-            };
-            *self.status_mut(file) = LoadStatus {
-                loading: true,
-                ..LoadStatus::default()
-            };
-            cx.notify();
-            cx.spawn(async move |this, cx| {
-                let Some(handle) = rfd::AsyncFileDialog::new()
-                    .set_title(title)
-                    .add_filter(filter, extensions)
-                    .pick_file()
-                    .await
-                else {
-                    let _ = this.update(cx, |this, cx| {
-                        this.status_mut(file).loading = false;
-                        cx.notify();
-                    });
-                    return;
-                };
-                let path: PathBuf = handle.path().to_path_buf();
-                let stored = cx
-                    .background_spawn(async move { store_user_file(file, &path) })
-                    .await;
-                let _ = this.update(cx, |this, cx| {
-                    match stored {
-                        Ok((name, bytes)) => {
-                            if file == RodhareistFile::Impulse {
-                                this.engage_ir_cab(cx);
-                            }
-                            this.send_file(file, name, bytes);
+        let (label, extensions): (&str, &'static [&'static str]) = match file {
+            RodhareistFile::Capture => ("Rodhareist · NAM capture", &["nam"]),
+            RodhareistFile::Impulse => ("Rodhareist · Cabinet IR", &["wav", "wave"]),
+        };
+        // Picked in the studio's Browser (see `browser_pick`).
+        let editor = cx.weak_entity();
+        crate::browser_pick::request(cx, label, extensions, move |path, cx| {
+            let _ = editor.update(cx, |this, cx| this.load_file_path(file, path, cx));
+        });
+    }
+
+    /// The picked capture or IR: stored in Rodhareist's folder and sent.
+    fn load_file_path(&mut self, file: RodhareistFile, path: PathBuf, cx: &mut Context<Self>) {
+        *self.status_mut(file) = LoadStatus {
+            loading: true,
+            ..LoadStatus::default()
+        };
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let stored = cx
+                .background_spawn(async move { store_user_file(file, &path) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match stored {
+                    Ok((name, bytes)) => {
+                        if file == RodhareistFile::Impulse {
+                            this.engage_ir_cab(cx);
                         }
-                        Err(error) => {
-                            let status = this.status_mut(file);
-                            status.loading = false;
-                            status.error = Some(error);
-                        }
+                        this.send_file(file, name, bytes);
                     }
-                    cx.notify();
-                });
-            })
-            .detach();
-        }
-        #[cfg(not(feature = "native-dialogs"))]
-        {
-            self.status_mut(file).error =
-                Some("Native file dialogs are unavailable in this build.".into());
-            cx.notify();
-        }
+                    Err(error) => {
+                        let status = this.status_mut(file);
+                        status.loading = false;
+                        status.error = Some(error);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// The cabinet convolution is `CabModel::Ir`. Choosing a `.wav` selects

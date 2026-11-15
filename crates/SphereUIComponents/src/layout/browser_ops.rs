@@ -76,6 +76,42 @@ impl StudioLayout {
         }
     }
 
+    /// A "Browse…" request arrived (or ended): show the Browser on the tab
+    /// that lists such files and give it the keyboard, so the pick happens
+    /// there. Nothing else in the studio changes.
+    pub(super) fn on_browser_pick_changed(&mut self, cx: &mut Context<Self>) {
+        use crate::components::file_browser::BrowserTab;
+        let Some((_, audio)) = crate::browser_pick::pending(cx) else {
+            cx.notify();
+            return;
+        };
+        self.panels.browser = true;
+        self.set_active_panel(super::WorkspaceActivePanel::Browser, cx);
+        let lists_them = match self.file_browser.tab {
+            BrowserTab::Files => true,
+            BrowserTab::Samples => audio,
+            _ => false,
+        };
+        if !lists_them {
+            let tab = if audio {
+                BrowserTab::Samples
+            } else {
+                BrowserTab::Files
+            };
+            if self.file_browser.set_tab(tab) {
+                self.spawn_browser_instruments_load(cx);
+            }
+            self.drain_browser_directory_loads(cx);
+            self.browser_scroll
+                .scroll_to_item(0, gpui::ScrollStrategy::Top);
+        }
+        self.browser_sidebar.update(cx, |view, cx| {
+            view.focus_requested = true;
+            cx.notify();
+        });
+        cx.notify();
+    }
+
     /// Expand every ancestor of `path` and select it — the breadcrumb jump.
     pub(crate) fn reveal_browser_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.file_browser.reveal_path(&path);

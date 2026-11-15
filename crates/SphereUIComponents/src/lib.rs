@@ -42,6 +42,7 @@ pub mod audio_routing_compile;
 pub mod auth;
 pub mod auth_dialog;
 pub mod boot;
+pub mod browser_pick;
 pub mod color;
 pub mod components;
 pub mod deeplink;

@@ -1777,6 +1777,12 @@ impl StudioLayout {
         });
         // The tool bar style applies live: a change in Settings moves the tools
         // between the floating bar and the docked strip straight away.
+        // "Browse…" in a plug-in or the Sampler Rack: show the Browser and
+        // pick there (see `browser_pick`).
+        cx.observe_global::<crate::browser_pick::PendingBrowserPick>(|this, cx| {
+            this.on_browser_pick_changed(cx)
+        })
+        .detach();
         cx.observe(&layout.settings, |this, _, cx| this.sync_tool_bar_style(cx))
             .detach();
         layout.sync_tool_bar_style(cx);

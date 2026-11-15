@@ -56,6 +56,10 @@ pub struct BrowserSidebarView {
     /// only worked while the *search field* was focused — clicking a row
     /// killed the keyboard.
     pub tree_focus: gpui::FocusHandle,
+    /// A "Browse…" request wants the keyboard here: focused (and the main
+    /// window brought forward) on the next render, the first place with the
+    /// window at hand.
+    pub focus_requested: bool,
     /// Keeps the region repainting on every shell change, exactly as it did
     /// when the shell rendered it inline.
     _observers: Vec<gpui::Subscription>,
@@ -74,6 +78,7 @@ impl BrowserSidebarView {
         Self {
             owner,
             tree_focus: cx.focus_handle(),
+            focus_requested: false,
             _observers,
         }
     }
@@ -86,6 +91,8 @@ impl BrowserSidebarView {
             .w(px(width))
             .h_full()
             .flex_shrink_0()
+            .flex()
+            .flex_col()
     }
 }
 
@@ -96,6 +103,10 @@ impl Render for BrowserSidebarView {
         // that tree's prepaint.
         let owner = self.owner.clone();
         let tree_focus = self.tree_focus.clone();
+        if std::mem::take(&mut self.focus_requested) {
+            window.activate_window();
+            window.focus(&tree_focus, cx);
+        }
         owner.update(cx, |layout, cx| {
             layout.render_browser_sidebar(&tree_focus, window, cx)
         })
@@ -220,6 +231,13 @@ impl StudioLayout {
             let timeline = self.timeline.clone();
             let layout = cx.entity().clone();
             std::sync::Arc::new(move |path: &PathBuf, window, cx| {
+                // A "Browse…" is waiting for a file: this one goes there (or,
+                // not a kind it takes, nowhere), never onto the timeline.
+                if crate::browser_pick::activate(cx, path)
+                    != crate::browser_pick::Activation::Normal
+                {
+                    return;
+                }
                 // Filter on extension before mutating timeline state so
                 // double-clicking a non-audio file (e.g. .txt, .png) does
                 // not create a phantom clip with the 8-bar fallback
@@ -406,11 +424,15 @@ impl StudioLayout {
                 gpui::AnyView::from(panel)
             });
 
+        let pick_bar = self.browser_pick_bar(cx);
         let owner = cx.entity().clone();
         div()
             .w(px(self.dock_widths.browser))
             .h_full()
             .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .children(pick_bar)
             .on_mouse_down(gpui::MouseButton::Left, move |_event, _window, cx| {
                 let _ = owner.update(cx, |layout, cx| {
                     layout.set_active_panel(WorkspaceActivePanel::Browser, cx);
@@ -419,7 +441,7 @@ impl StudioLayout {
             // `&self.file_browser`, not a clone: `FileBrowserState` owns the
             // whole directory index, and deep-copying it once per render was
             // the single largest allocation in this region.
-            .child(components::sidebar(
+            .child(div().flex_1().min_h_0().child(components::sidebar(
                 &self.file_browser,
                 browser_scroll,
                 tree_focus,
@@ -430,8 +452,72 @@ impl StudioLayout {
                 browser_callbacks,
                 i18n,
                 rigs_panel,
-            ))
+            )))
             .into_any_element()
+    }
+
+    /// The bar over the Browser while a "Browse…" waits for a file: what it
+    /// is for, how to pick, and Cancel.
+    fn browser_pick_bar(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        use crate::theme::{space, typography, Colors};
+        let (label, _) = crate::browser_pick::pending(cx)?;
+        Some(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(space::SNUG))
+                .px(px(space::BASE))
+                .py(px(space::TIGHT))
+                .bg(Colors::surface_raised())
+                .border_b(px(1.0))
+                .border_color(Colors::border_subtle())
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_size(px(typography::DENSE_LABEL))
+                                .text_color(Colors::text_primary())
+                                .child(format!("Choose a file for {label}")),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(typography::DENSE_CAPTION))
+                                .text_color(Colors::text_muted())
+                                .child("Double-click or press Enter on it"),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("browser-pick-cancel")
+                        .flex_none()
+                        .px(px(space::SNUG))
+                        .py(px(2.0))
+                        .rounded(px(crate::theme::radius::CONTROL_SM))
+                        .text_size(px(typography::DENSE_LABEL))
+                        .text_color(Colors::text_secondary())
+                        .bg(Colors::button_bg())
+                        .hover(|s| {
+                            s.bg(Colors::composite(
+                                Colors::button_bg(),
+                                Colors::state_hover(),
+                            ))
+                        })
+                        .cursor(gpui::CursorStyle::PointingHand)
+                        .on_click(|_, _window, cx| {
+                            crate::browser_pick::cancel(cx);
+                        })
+                        .child("Cancel"),
+                )
+                .into_any_element(),
+        )
     }
 
     /// Start dragging a dock's inner edge at window x `x`.
