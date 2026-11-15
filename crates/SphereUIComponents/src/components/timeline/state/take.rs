@@ -154,9 +154,27 @@ impl TimelineState {
         duration_seconds: f64,
         record_loop: Option<RecordLoop>,
     ) -> Vec<RecordedPass> {
+        self.audio_record_passes_trimmed(placed_beat, 0.0, duration_seconds, record_loop)
+    }
+
+    /// [`Self::audio_record_passes`] for a file whose first `trim_seconds`
+    /// belong before the project start (see [`Self::place_recorded_take`]):
+    /// frame `trim_seconds` lands on `placed_beat`. Empty when the whole file
+    /// is before the start.
+    pub fn audio_record_passes_trimmed(
+        &self,
+        placed_beat: f32,
+        trim_seconds: f64,
+        duration_seconds: f64,
+        record_loop: Option<RecordLoop>,
+    ) -> Vec<RecordedPass> {
+        let trim = trim_seconds.max(0.0);
+        if trim > 0.0 && trim >= duration_seconds {
+            return Vec::new();
+        }
         let whole = RecordedPass {
             start_beat: placed_beat,
-            source_start_seconds: 0.0,
+            source_start_seconds: trim,
             source_end_seconds: duration_seconds,
             complete: true,
         };
@@ -168,7 +186,7 @@ impl TimelineState {
         let loop_start_s = tempo.seconds_at_beat(record_loop.start as f64);
         let loop_end_s = tempo.seconds_at_beat(record_loop.end as f64);
         let loop_len = loop_end_s - loop_start_s;
-        let first_end = loop_end_s - placed_s;
+        let first_end = trim + loop_end_s - placed_s;
         if loop_len <= 0.0 || duration_seconds <= first_end + MIN_PASS_SECONDS {
             return vec![whole];
         }
@@ -188,6 +206,34 @@ impl TimelineState {
             start = end;
         }
         passes
+    }
+
+    /// Where a recorded file's first frame lands: the engine's compensated
+    /// `engine_start_beat` (negative when the take began within the latency
+    /// of beat 0) moved by `shift_seconds` (the manual Recording Offset minus
+    /// a jam's arrival latency).
+    ///
+    /// The shift is real time, so it goes through the tempo map at the take,
+    /// not the project's base tempo. A take that lands before the project
+    /// start begins at 0 with the frames before it trimmed: clamping the
+    /// start instead would leave the whole take late by that much.
+    ///
+    /// Returns `(start_beat, trim_seconds)`.
+    pub fn place_recorded_take(&self, engine_start_beat: f64, shift_seconds: f64) -> (f32, f64) {
+        let tempo = self.tempo_lookup();
+        let start_seconds = if engine_start_beat >= 0.0 {
+            tempo.seconds_at_beat(engine_start_beat)
+        } else {
+            // Before the project start, at the tempo it opens with.
+            let seconds_per_beat = tempo.seconds_at_beat(1.0) - tempo.seconds_at_beat(0.0);
+            engine_start_beat * seconds_per_beat
+        };
+        let placed_seconds = start_seconds + shift_seconds;
+        if placed_seconds >= 0.0 {
+            (tempo.beat_at_seconds(placed_seconds) as f32, 0.0)
+        } else {
+            (0.0, -placed_seconds)
+        }
     }
 }
 
@@ -1022,6 +1068,78 @@ mod tests {
         assert_eq!(state.audio_record_passes(9.0, 8.0, record_loop).len(), 1);
         // Stopped before the first wrap: one pass.
         assert_eq!(state.audio_record_passes(2.0, 2.5, record_loop).len(), 1);
+    }
+
+    fn at_120_bpm() -> TimelineState {
+        let mut state = TimelineState::default();
+        state.bpm = 120.0;
+        state.tempo_map.points.clear();
+        state
+    }
+
+    /// Recorded from bar 1, the compensated start is before the project
+    /// start. The take begins at 0 with those frames cut, instead of the
+    /// whole take sitting late by the latency.
+    #[test]
+    fn a_take_from_bar_one_is_trimmed_not_placed_late() {
+        let state = at_120_bpm();
+        // 10 ms of latency at 120 bpm is 0.02 beats.
+        let (start, trim) = state.place_recorded_take(-0.02, 0.0);
+        assert_eq!(start, 0.0);
+        assert!((trim - 0.010).abs() < 1e-9, "{trim}");
+
+        let passes = state.audio_record_passes_trimmed(start, trim, 5.0, None);
+        assert_eq!(passes.len(), 1);
+        assert!((passes[0].source_start_seconds - 0.010).abs() < 1e-9);
+        assert_eq!(passes[0].source_end_seconds, 5.0);
+
+        // A negative manual offset works the same way at the start.
+        let (start, trim) = state.place_recorded_take(0.0, -0.025);
+        assert_eq!(start, 0.0);
+        assert!((trim - 0.025).abs() < 1e-9);
+        // Past the start nothing is trimmed.
+        let (start, trim) = state.place_recorded_take(4.0, -0.5);
+        assert!((start - 3.0).abs() < 1e-6, "{start}");
+        assert_eq!(trim, 0.0);
+    }
+
+    /// A take entirely before the project start leaves nothing to place.
+    #[test]
+    fn a_take_wholly_before_the_start_has_no_passes() {
+        let state = at_120_bpm();
+        assert!(state
+            .audio_record_passes_trimmed(0.0, 2.0, 1.5, None)
+            .is_empty());
+    }
+
+    /// The manual Recording Offset is time, so under a tempo change it moves
+    /// the take by the beats that time covers there, not at the base tempo.
+    #[test]
+    fn the_recording_offset_follows_the_tempo_map() {
+        let mut state = at_120_bpm();
+        state.tempo_map.points.push(super::super::TempoPoint::new(
+            8.0,
+            60.0,
+            super::super::TempoCurve::Hold,
+        ));
+        // At 60 bpm half a second is half a beat (at 120 bpm it would be one).
+        let (start, trim) = state.place_recorded_take(16.0, 0.5);
+        assert!((start - 16.5).abs() < 1e-4, "{start}");
+        assert_eq!(trim, 0.0);
+    }
+
+    /// A trimmed loop take still wraps where the loop ends in time: the
+    /// first pass is the trim plus the time from its start to the loop end.
+    #[test]
+    fn a_trimmed_loop_take_wraps_at_the_loop_end() {
+        let state = at_120_bpm();
+        let record_loop = RecordLoop::of(true, 0.0, 4.0);
+        let passes = state.audio_record_passes_trimmed(0.0, 0.010, 0.010 + 2.0 + 2.0, record_loop);
+        assert_eq!(passes.len(), 2);
+        assert!((passes[0].source_start_seconds - 0.010).abs() < 1e-9);
+        assert!((passes[0].source_end_seconds - 2.010).abs() < 1e-9);
+        assert!((passes[1].source_start_seconds - 2.010).abs() < 1e-9);
+        assert_eq!(passes[1].start_beat, 0.0);
     }
 
     #[test]

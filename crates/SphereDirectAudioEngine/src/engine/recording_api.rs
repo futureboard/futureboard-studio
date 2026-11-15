@@ -667,7 +667,10 @@ impl EngineInner {
                 runtime
                     .tempo_map
                     .beats_for_sample_span(place_beat, offset_samples, sample_rate);
-            result.start_beat = (place_beat - offset_beats).max(0.0);
+            // Not clamped at 0: a take started at bar 1 lands before it by the
+            // latency, and clamping would leave the whole take that late. The
+            // host trims the part before the project start instead.
+            result.start_beat = place_beat - offset_beats;
         }
         drop(runtime);
 

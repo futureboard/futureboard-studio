@@ -1254,7 +1254,6 @@ impl StudioLayout {
                 audio.auto_offset_from_jam,
             )
         };
-        let recording_offset_beats = recording_offset_ms as f32 / 1000.0 * bpm / 60.0;
         // Playing along to a jam, the performer is late by however long the
         // remote audio took to reach them; the take moves back by that much so
         // the part lines up with the performers it was played to.
@@ -1263,7 +1262,9 @@ impl StudioLayout {
         } else {
             None
         };
-        let jam_offset_beats = jam_offset_ms.unwrap_or(0.0) as f32 / 1000.0 * bpm / 60.0;
+        // Both move the take in real time; `place_recorded_take` turns that
+        // into beats through the tempo map at the take.
+        let shift_seconds = (recording_offset_ms as f64 - jam_offset_ms.unwrap_or(0.0)) / 1000.0;
         let mut import_paths: Vec<(PathBuf, String)> = Vec::new();
         let mut failed_tracks: Vec<String> = Vec::new();
         // One stamp for the whole pass, so every track's take from this Record
@@ -1304,28 +1305,30 @@ impl StudioLayout {
                 // round trip (`latency_seconds`) and plug-in delay. On top of
                 // that: the jam's arrival latency, then the manual
                 // `recording_offset_ms` for per-rig fine-tuning (it may be
-                // negative or positive).
-                let placed_beat =
-                    (result.start_beat as f32 - jam_offset_beats + recording_offset_beats)
-                        .max(0.0);
+                // negative or positive). A take landing before the project
+                // start is trimmed there, not placed late.
+                let (placed_beat, trim_seconds) = timeline
+                    .state
+                    .place_recorded_take(result.start_beat, shift_seconds);
                 if jam_offset_ms.is_some()
                     || std::env::var_os("FUTUREBOARD_RECORDING_DEBUG").is_some()
                 {
                     eprintln!(
-                        "[recording] placement track={} engine_start={:.3} (round trip {:.1} ms applied) jam_offset={:.1} ms (-{:.3} beats) manual_offset={:.3} beats -> start={:.3}",
+                        "[recording] placement track={} engine_start={:.3} (round trip {:.1} ms applied) jam_offset={:.1} ms manual_offset={} ms -> start={:.3} trim={:.1} ms",
                         result.track_id,
                         result.start_beat,
                         result.latency_seconds * 1000.0,
                         jam_offset_ms.unwrap_or(0.0),
-                        jam_offset_beats,
-                        recording_offset_beats,
-                        placed_beat
+                        recording_offset_ms,
+                        placed_beat,
+                        trim_seconds * 1000.0
                     );
                 }
                 // One clip per pass: a loop recording's file holds every pass
                 // end to end, and each pass's clip plays its own part of it.
-                let passes = timeline.state.audio_record_passes(
+                let passes = timeline.state.audio_record_passes_trimmed(
                     placed_beat,
+                    trim_seconds,
                     result.duration_seconds,
                     record_loop,
                 );

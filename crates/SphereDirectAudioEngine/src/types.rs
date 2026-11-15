@@ -882,7 +882,9 @@ pub struct JsRecordingResult {
     pub relative_path: String,
     /// Transport beat the take's audio belongs at, with the capture start and
     /// the round-trip and plug-in delay compensation already applied by the
-    /// engine (see `latency_seconds`).
+    /// engine (see `latency_seconds`). Negative when the take began within
+    /// the latency of beat 0: its first frames belong before the project
+    /// start, and the host trims them rather than placing the take late.
     pub start_beat: f64,
     pub duration_seconds: f64,
     pub sample_rate: u32,
