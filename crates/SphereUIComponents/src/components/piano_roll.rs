@@ -1224,8 +1224,8 @@ impl GridRes {
     }
 }
 
-/// Width of the Sampler Rack's row headers: name, sample, mute, solo,
-/// volume and pan side by side.
+/// Width of the Sampler Rack's row headers: name, sample, mute, solo, gain
+/// and pan side by side.
 const RACK_LANE_W: f32 = 300.0;
 
 /// What the step view's rows are.
@@ -1235,32 +1235,46 @@ pub enum StepSource {
     /// any instrument played by note.
     #[default]
     DrumSampler,
-    /// One row per instrument track in the edited track's group, each its
-    /// own instrument and mixer strip (see `sampler_rack`).
+    /// A rack of samplers in this one track: a row per pad of the track's
+    /// Drum Sampler, each with its own sample, mute, solo, gain and pan (see
+    /// `sampler_rack`).
     SamplerRack,
 }
 
+/// A pad control the Sampler Rack's row headers set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PadControl {
+    /// `1.0` muted, `0.0` playing.
+    Mute,
+    /// `1.0` soloed.
+    Solo,
+    /// dB, −60 … +12.
+    Gain,
+    /// −1 … +1.
+    Pan,
+}
+
 /// Something the Sampler Rack asks the studio to do: what needs the plug-in
-/// host, the audio engine or new tracks, none of which the editor owns.
+/// host or the audio engine, neither of which the editor owns.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RackRequest {
-    /// A new row after the rack's last: an Instrument track with the
-    /// built-in Quick Sampler, in the rack's group (made around `track_id`
-    /// when it has none).
-    AddRow { track_id: String },
-    /// Open the row's instrument editor.
+    /// Open the track's Drum Sampler.
     OpenEditor { track_id: String },
-    /// Load a sample into the row's Quick Sampler: `path`, or one picked in
-    /// a file dialog when `None`.
-    LoadSample {
+    /// Load a sample onto `pad`: `path`, or one picked in a file dialog
+    /// when `None`.
+    LoadPadSample {
         track_id: String,
+        insert_id: String,
+        pad: usize,
         path: Option<std::path::PathBuf>,
     },
-    /// Send a channel control the rack just changed to the engine, live.
-    TrackParam {
+    /// Set one of `pad`'s controls, heard at once.
+    SetPad {
         track_id: String,
-        param: &'static str,
-        value: f64,
+        insert_id: String,
+        pad: usize,
+        control: PadControl,
+        value: f32,
     },
 }
 
@@ -1268,16 +1282,8 @@ pub enum RackRequest {
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct StepRow {
     pub pitch: u8,
-    /// `None`: a rack row with no clip over the pattern's bars yet.
-    pub clip_id: Option<String>,
+    pub clip_id: String,
     pub track_id: String,
-}
-
-/// A rack row's fader being dragged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum RackControl {
-    Volume,
-    Pan,
 }
 
 /// A drum lane menu row: a quick pattern action on one lane.
@@ -1382,11 +1388,11 @@ enum PianoDrag {
     /// nudge. Its edits are written live and recorded as one undo entry on
     /// release (see [`step_grid::StepDrag`]).
     Steps(step_grid::StepDrag),
-    /// A rack row's volume or pan dragged sideways from its header. Applied
-    /// live, recorded once on release.
+    /// A rack row's gain or pan dragged sideways from its header: the pad's
+    /// own control, applied live.
     RackMixer {
-        track_id: String,
-        control: RackControl,
+        pad: usize,
+        control: PadControl,
         start_x: f32,
         prev: f32,
     },
@@ -1676,14 +1682,15 @@ pub struct PianoRoll {
     /// and where it opened, window space.
     open_lane_menu: Option<(usize, gpui::Point<Pixels>)>,
     /// What the step view's rows are: the edited clip's drum lanes, or the
-    /// Sampler Rack's tracks.
+    /// Sampler Rack's pads.
     step_source: StepSource,
-    /// The Sampler Rack's rows, read from the timeline each render: what the
-    /// row headers and the row count draw from. Gestures read the timeline
-    /// afresh, so a clip one of them just made is never missed.
+    /// The Sampler Rack's rows and the Drum Sampler they are pads of, read
+    /// each render: what the row headers and the row count draw from.
     rack_rows: Vec<sampler_rack::RackRow>,
-    /// The track a rack gesture auditions, while one is held.
-    step_preview_track: Option<String>,
+    rack_target: Option<sampler_rack::RackTarget>,
+    /// Pads "+ Add Sampler" made rows this session, `(insert id, pad)`, so an
+    /// empty pad waiting for its sample stays shown.
+    rack_added: Vec<(String, usize)>,
     on_rack_request: Option<std::sync::Arc<dyn Fn(RackRequest, &mut Window, &mut gpui::App)>>,
     /// Which lanes drum mode lists.
     drum_lanes: DrumLanes,
@@ -2018,7 +2025,8 @@ impl PianoRoll {
             open_lane_menu: None,
             step_source: StepSource::DrumSampler,
             rack_rows: Vec::new(),
-            step_preview_track: None,
+            rack_target: None,
+            rack_added: Vec::new(),
             on_rack_request: None,
             drum_lanes: DrumLanes::Kit,
             drum_order: DrumOrder::LowFirst,
@@ -2581,21 +2589,6 @@ impl PianoRoll {
     fn preview_target(&self, cx: &Context<Self>) -> Option<(String, u8)> {
         use crate::components::timeline::timeline_state::{ClipType, TrackType};
         let tl = self.timeline.read(cx);
-        if let Some(track) = self
-            .step_preview_track
-            .as_deref()
-            .and_then(|id| tl.state.find_track(id))
-        {
-            let channel = track
-                .routing
-                .midi_channel
-                .map(|ch| ch.saturating_sub(1).min(15))
-                .unwrap_or(0);
-            return tl
-                .state
-                .effective_instrument_track_id(&track.id)
-                .map(|target| (target, channel));
-        }
         let channel_for = |track: &crate::components::timeline::timeline_state::TrackState| {
             track
                 .routing
@@ -3078,10 +3071,8 @@ impl PianoRoll {
     fn step_clip_ids(&self, cx: &Context<Self>) -> Vec<String> {
         let mut ids: Vec<String> = Vec::new();
         for row in self.step_rows(cx) {
-            if let Some(id) = row.clip_id {
-                if !ids.contains(&id) {
-                    ids.push(id);
-                }
+            if !ids.contains(&row.clip_id) {
+                ids.push(row.clip_id);
             }
         }
         ids
@@ -3153,19 +3144,43 @@ impl PianoRoll {
         }
     }
 
-    /// Re-read the rack's rows from the timeline (render does, every frame
-    /// the rack shows).
+    /// The rack the step view shows now, read afresh: the edited track's
+    /// Drum Sampler and its rows. `None` when the track's instrument is
+    /// something else.
+    pub(super) fn current_rack(
+        &self,
+        cx: &Context<Self>,
+    ) -> Option<(sampler_rack::RackTarget, Vec<sampler_rack::RackRow>)> {
+        let clip_id = self.editing_clip_id(cx)?;
+        let state = &self.timeline.read(cx).state;
+        let target = sampler_rack::rack_target(state, &clip_id)?;
+        let notes = state
+            .midi_clip_notes(&clip_id)
+            .map(|notes| notes.as_slice())
+            .unwrap_or(&[]);
+        let added: Vec<usize> = self
+            .rack_added
+            .iter()
+            .filter(|(insert, _)| *insert == target.insert_id)
+            .map(|(_, pad)| *pad)
+            .collect();
+        let rows =
+            sampler_rack::rack_rows(&sampler_rack::pads_of(&target.insert_id), notes, &added);
+        Some((target, rows))
+    }
+
+    /// Re-read the rack's rows (render does, every frame the rack shows).
     pub(super) fn refresh_rack_rows(&mut self, cx: &Context<Self>) {
-        self.rack_rows = if self.rack_active() {
-            self.editing_clip_id(cx)
-                .and_then(|clip_id| {
-                    sampler_rack::rack_for_clip(&self.timeline.read(cx).state, &clip_id)
-                })
-                .map(|(_, rows)| rows)
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        match self.rack_active().then(|| self.current_rack(cx)).flatten() {
+            Some((target, rows)) => {
+                self.rack_target = Some(target);
+                self.rack_rows = rows;
+            }
+            None => {
+                self.rack_target = None;
+                self.rack_rows.clear();
+            }
+        }
     }
 
     /// The step view's rows, top first, read from the timeline now.
@@ -3173,21 +3188,23 @@ impl PianoRoll {
         let Some(clip_id) = self.editing_clip_id(cx) else {
             return Vec::new();
         };
-        let state = &self.timeline.read(cx).state;
         if self.rack_active() {
-            return sampler_rack::rack_for_clip(state, &clip_id)
-                .map(|(_, rows)| {
-                    rows.into_iter()
-                        .map(|row| StepRow {
-                            pitch: row.pitch,
-                            clip_id: row.clip_id,
-                            track_id: row.track_id,
-                        })
-                        .collect()
+            let Some((target, rows)) = self.current_rack(cx) else {
+                return Vec::new();
+            };
+            return rows
+                .into_iter()
+                .map(|row| StepRow {
+                    pitch: row.state.note,
+                    clip_id: clip_id.clone(),
+                    track_id: target.track_id.clone(),
                 })
-                .unwrap_or_default();
+                .collect();
         }
-        let track_id = state
+        let track_id = self
+            .timeline
+            .read(cx)
+            .state
             .find_clip(&clip_id)
             .map(|(track, _)| track.id.clone())
             .unwrap_or_default();
@@ -3195,7 +3212,7 @@ impl PianoRoll {
             .iter()
             .map(|pitch| StepRow {
                 pitch: *pitch,
-                clip_id: Some(clip_id.clone()),
+                clip_id: clip_id.clone(),
                 track_id: track_id.clone(),
             })
             .collect()
@@ -3219,43 +3236,6 @@ impl PianoRoll {
             .midi_clip_notes(clip_id)
             .map(|notes| notes.to_vec())
             .unwrap_or_default()
-    }
-
-    /// The clip a gesture on `row` edits: its own, or a new one over the
-    /// pattern's bars for a rack row that has none, made without recording
-    /// it (the gesture records it on release). `(clip_id, created)`.
-    fn ensure_row_clip(&mut self, row: &StepRow, cx: &mut Context<Self>) -> Option<(String, bool)> {
-        if let Some(clip_id) = &row.clip_id {
-            return Some((clip_id.clone(), false));
-        }
-        let pattern_clip = self.editing_clip_id(cx)?;
-        let (start, length) = {
-            let state = &self.timeline.read(cx).state;
-            let (_, clip) = state.find_clip(&pattern_clip)?;
-            (clip.start_beat, clip.duration_beats)
-        };
-        let track_id = row.track_id.clone();
-        let mut made = None;
-        self.with_timeline_silent(cx, |tl, _| {
-            if let Some(clip) = tl.state.build_midi_clip(&track_id, start, length) {
-                let id = clip.id.clone();
-                if let Some(track) = tl.state.tracks.iter_mut().find(|t| t.id == track_id) {
-                    track.clips.push(clip);
-                    made = Some(id);
-                }
-            }
-        });
-        made.map(|id| (id, true))
-    }
-
-    /// Take a clip a cancelled or empty rack gesture made back out.
-    fn remove_made_clip(&mut self, clip_id: &str, cx: &mut Context<Self>) {
-        let clip_id = clip_id.to_string();
-        self.with_timeline_silent(cx, |tl, _| {
-            for track in &mut tl.state.tracks {
-                track.clips.retain(|clip| clip.id != clip_id);
-            }
-        });
     }
 
     /// The edited clip's notes, owned, and its id.
@@ -3341,24 +3321,13 @@ impl PianoRoll {
         if index >= self.step_total(cx) {
             return;
         }
-        // Only painting can start on a rack row with no clip: it makes one.
-        let paints = !right && !modifiers.alt && !(modifiers.control || modifiers.platform);
-        let (clip_id, created_clip) = if row.clip_id.is_some() || paints {
-            match self.ensure_row_clip(&row, cx) {
-                Some(made) => made,
-                None => return,
-            }
-        } else {
-            return;
-        };
-        self.step_preview_track = self.rack_active().then(|| row.track_id.clone());
+        let clip_id = row.clip_id.clone();
         let notes = self.clip_notes(&clip_id, cx);
         let cell = step_grid::cell_at(&notes, pitch, index, step);
         let beat = self.x_to_clip_beat(lx);
         let drag = |gesture| {
             let mut session = step_grid::StepDrag::new(gesture, pitch, index, ly, beat);
             session.clip_id = clip_id.clone();
-            session.created_clip = created_clip;
             session
         };
 
@@ -3520,7 +3489,7 @@ impl PianoRoll {
                 let under = self
                     .step_row_at(ly)
                     .and_then(|row| self.step_rows(cx).into_iter().nth(row))
-                    .filter(|row| row.clip_id.as_deref() == Some(clip_id.as_str()))
+                    .filter(|row| row.clip_id == clip_id)
                     .map(|row| row.pitch);
                 if let Some(pitch) = under {
                     let indices = if pitch == session.pitch {
@@ -3653,7 +3622,6 @@ impl PianoRoll {
     /// The release: record the gesture as one undo entry.
     fn finish_step_gesture(&mut self, mut session: step_grid::StepDrag, cx: &mut Context<Self>) {
         self.drag_value_status = None;
-        self.step_preview_track = None;
         let clip_id = session.clip_id.clone();
         let notes = self.clip_notes(&clip_id, cx);
         // A Shift-click that never became a drag: the toolbar's count.
@@ -3666,32 +3634,6 @@ impl PianoRoll {
             let repeat = self.step_repeat;
             let step = self.step_view_beats();
             self.restep_live(&clip_id, &mut session, repeat, curve, step, cx);
-        }
-        // A rack row's new clip is recorded as itself, notes and all: one
-        // undo takes the clip away. Left empty, it was never wanted.
-        if session.created_clip {
-            let made = self
-                .timeline
-                .read(cx)
-                .state
-                .find_clip(&clip_id)
-                .map(|(track, clip)| {
-                    (
-                        track.id.clone(),
-                        clip.clone(),
-                        self.clip_notes(&clip_id, cx).is_empty(),
-                    )
-                });
-            match made {
-                Some((track_id, clip, false)) => {
-                    self.timeline.update(cx, |tl, tcx| {
-                        tl.record_executed_command(EditCommand::CreateClip { track_id, clip }, tcx);
-                    });
-                }
-                _ => self.remove_made_clip(&clip_id, cx),
-            }
-            cx.notify();
-            return;
         }
         let command = match session.gesture {
             step_grid::StepGesture::Repeat { .. } => {
@@ -3760,11 +3702,6 @@ impl PianoRoll {
     /// A step gesture interrupted (Escape, focus lost): put the clip back as
     /// it was before the press, with nothing recorded.
     fn revert_step_gesture(&mut self, session: &step_grid::StepDrag, cx: &mut Context<Self>) {
-        self.step_preview_track = None;
-        if session.created_clip {
-            self.remove_made_clip(&session.clip_id, cx);
-            return;
-        }
         let clip_id = session.clip_id.clone();
         // The inverse of the live writes: what was added goes, what was taken
         // out comes back, what was changed returns to its snapshot.
@@ -3802,20 +3739,17 @@ impl PianoRoll {
         let Some(row) = self.step_rows(cx).into_iter().nth(row) else {
             return Vec::new();
         };
-        let Some(clip_id) = row.clip_id else {
-            return Vec::new();
-        };
         self.timeline
             .read(cx)
             .state
-            .midi_clip_notes(&clip_id)
+            .midi_clip_notes(&row.clip_id)
             .and_then(|notes| step_grid::cell_at(notes, row.pitch, index, self.step_view_beats()))
             .map(|cell| cell.ids)
             .unwrap_or_default()
     }
 
     /// One of the lane menu's actions on row `row_index`. One undo entry
-    /// each; filling a rack row with no clip makes the clip, in that entry.
+    /// each.
     pub(super) fn run_lane_action(
         &mut self,
         row_index: usize,
@@ -3827,15 +3761,7 @@ impl PianoRoll {
             return;
         };
         let pitch = target.pitch;
-        if target.clip_id.is_none() {
-            if let LaneAction::FillEvery(every) = action {
-                self.fill_new_row_clip(&target, every, cx);
-            }
-            return;
-        }
-        let Some((clip_id, _)) = self.ensure_row_clip(&target, cx) else {
-            return;
-        };
+        let clip_id = target.clip_id;
         let notes = self.clip_notes(&clip_id, cx);
         let step = self.step_view_beats();
         let steps = self.step_total(cx);
@@ -3891,33 +3817,6 @@ impl PianoRoll {
         cx.notify();
     }
 
-    /// "Fill Every N" on a rack row with no clip yet: a new clip holding the
-    /// filled steps, recorded as one Create Clip.
-    fn fill_new_row_clip(&mut self, target: &StepRow, every: usize, cx: &mut Context<Self>) {
-        let step = self.step_view_beats();
-        let steps = self.step_total(cx);
-        let Some((clip_id, true)) = self.ensure_row_clip(target, cx) else {
-            return;
-        };
-        let channel = self.active_note_channel(cx);
-        let added = step_grid::fill_every(
-            &[],
-            target.pitch,
-            every,
-            steps,
-            step,
-            self.step_repeat,
-            self.step_curve,
-            channel,
-        );
-        self.write_steps_live(&clip_id, &[], &added, &[], cx);
-        let mut session =
-            step_grid::StepDrag::new(step_grid::StepGesture::Paint, target.pitch, 0, 0.0, 0.0);
-        session.clip_id = clip_id;
-        session.created_clip = true;
-        self.finish_step_gesture(session, cx);
-    }
-
     /// The row under a window point in the key column.
     pub(super) fn key_lane_row_at(&self, position: gpui::Point<Pixels>) -> Option<usize> {
         let bounds = self.key_lane_bounds.get()?;
@@ -3926,38 +3825,6 @@ impl PianoRoll {
         }
         let local: f32 = (position.y - bounds.origin.y).into();
         self.step_row_at(local)
-    }
-
-    /// What a rack row's sample cell says, and whether it loads samples: the
-    /// Quick Sampler's file, or the row instrument's name.
-    pub(super) fn rack_sample_label(
-        &self,
-        row: &sampler_rack::RackRow,
-        cx: &gpui::App,
-    ) -> (String, bool) {
-        let state = &self.timeline.read(cx).state;
-        let Some(slot) = state
-            .find_track(&row.track_id)
-            .and_then(|t| t.instrument_insert())
-        else {
-            return ("No instrument".to_string(), false);
-        };
-        let quick = slot
-            .plugin_id
-            .as_deref()
-            .is_some_and(|id| id.contains("quicksampler"));
-        if !quick {
-            return (slot.display_name.clone(), false);
-        }
-        let name = crate::components::builtin_plugin_editor::builtin_sample_names(
-            "quicksampler",
-            &slot.id,
-        )
-        .into_iter()
-        .next()
-        .map(|(_, name)| name)
-        .unwrap_or_else(|| "Load sample".to_string());
-        (name, true)
     }
 
     /// The row a lane name or rack header shows, for a drum lane `pitch`.
@@ -3971,7 +3838,7 @@ impl PianoRoll {
             return self
                 .rack_rows
                 .get(row_index)
-                .map(|row| SharedString::from(row.name.clone()))
+                .map(|row| SharedString::from(row.name()))
                 .unwrap_or_default();
         }
         self.drum_rows
@@ -3998,37 +3865,73 @@ impl PianoRoll {
         cx.notify();
     }
 
-    /// A rack row's mute or solo toggled: one undo entry, heard at once.
-    pub(super) fn toggle_rack_row(
+    /// Set one of pad `pad`'s controls. Heard at once; the studio folds it
+    /// into the Drum Sampler's state, which the next frame draws from.
+    fn set_rack_pad(
+        &self,
+        pad: usize,
+        control: PadControl,
+        value: f32,
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) {
+        let Some(target) = self.rack_target.clone() else {
+            return;
+        };
+        self.send_rack_request(
+            RackRequest::SetPad {
+                track_id: target.track_id,
+                insert_id: target.insert_id,
+                pad,
+                control,
+                value,
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// A rack row's mute or solo pressed: the pad's own, like its switch in
+    /// the Drum Sampler.
+    pub(super) fn toggle_rack_pad(
         &mut self,
-        track_id: &str,
-        solo: bool,
+        pad: usize,
+        control: PadControl,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        use crate::components::timeline::timeline_state::TrackEditScope;
-        let id = track_id.to_string();
-        let value = self.timeline.update(cx, |tl, tcx| {
-            let edit = tl.begin_track_edit(TrackEditScope::tracks(vec![id.clone()]));
-            if solo {
-                tl.state.toggle_track_solo(&id);
-            } else {
-                tl.state.toggle_track_mute(&id);
-            }
-            let on = tl
-                .state
-                .find_track(&id)
-                .map(|t| if solo { t.solo } else { t.muted })
-                .unwrap_or(false);
-            tl.commit_track_edit(if solo { "Solo" } else { "Mute" }, edit, false, tcx);
-            tcx.notify();
-            on
-        });
+        let Some(row) = self.rack_rows.iter_mut().find(|row| row.pad == pad) else {
+            return;
+        };
+        let flag = match control {
+            PadControl::Mute => &mut row.state.muted,
+            PadControl::Solo => &mut row.state.solo,
+            PadControl::Gain | PadControl::Pan => return,
+        };
+        *flag = !*flag;
+        let value = if *flag { 1.0 } else { 0.0 };
+        self.set_rack_pad(pad, control, value, window, cx);
+        cx.notify();
+    }
+
+    /// "+ Add Sampler": the first pad not yet a row becomes one, and a file
+    /// dialog asks for its sample.
+    pub(super) fn add_rack_pad(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self.rack_target.clone() else {
+            return;
+        };
+        let Some(pad) = sampler_rack::next_free_pad(&self.rack_rows, sampler_rack::PAD_COUNT)
+        else {
+            return;
+        };
+        self.rack_added.push((target.insert_id.clone(), pad));
+        self.refresh_rack_rows(cx);
         self.send_rack_request(
-            RackRequest::TrackParam {
-                track_id: track_id.to_string(),
-                param: if solo { "solo" } else { "muted" },
-                value: if value { 1.0 } else { 0.0 },
+            RackRequest::LoadPadSample {
+                track_id: target.track_id,
+                insert_id: target.insert_id,
+                pad,
+                path: None,
             },
             window,
             cx,
@@ -4036,28 +3939,47 @@ impl PianoRoll {
         cx.notify();
     }
 
-    /// Press on a rack row's volume or pan: the drag that follows moves it.
+    /// Load a sample onto pad `pad`: `path`, or one picked in a dialog.
+    pub(super) fn load_rack_pad(
+        &mut self,
+        pad: usize,
+        path: Option<std::path::PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target) = self.rack_target.clone() else {
+            return;
+        };
+        self.send_rack_request(
+            RackRequest::LoadPadSample {
+                track_id: target.track_id,
+                insert_id: target.insert_id,
+                pad,
+                path,
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Press on a rack row's gain or pan: the drag that follows moves it.
     pub(super) fn begin_rack_mixer(
         &mut self,
-        track_id: &str,
-        control: RackControl,
+        pad: usize,
+        control: PadControl,
         x: f32,
         cx: &mut Context<Self>,
     ) {
-        let Some(prev) = self
-            .timeline
-            .read(cx)
-            .state
-            .find_track(track_id)
-            .map(|t| match control {
-                RackControl::Volume => t.volume,
-                RackControl::Pan => t.pan,
-            })
-        else {
+        let Some(row) = self.rack_rows.iter().find(|row| row.pad == pad) else {
             return;
         };
+        let prev = match control {
+            PadControl::Gain => row.state.gain_db,
+            PadControl::Pan => row.state.pan,
+            PadControl::Mute | PadControl::Solo => return,
+        };
         self.drag = PianoDrag::RackMixer {
-            track_id: track_id.to_string(),
+            pad,
             control,
             start_x: x,
             prev,
@@ -4077,11 +3999,11 @@ impl PianoRoll {
         cx: &mut Context<Self>,
     ) {
         let PianoDrag::RackMixer {
-            track_id,
+            pad,
             control,
             start_x,
             prev,
-        } = self.drag.clone()
+        } = self.drag
         else {
             return;
         };
@@ -4092,20 +4014,18 @@ impl PianoRoll {
         let x: f32 = event.position.x.into();
         let travel = (x - start_x) / Self::RACK_FADER_TRAVEL_PX;
         let value = match control {
-            RackControl::Volume => (prev + travel).clamp(0.0, 1.0),
-            RackControl::Pan => (prev + travel * 2.0).clamp(-1.0, 1.0),
+            PadControl::Gain => (prev + travel * 72.0).clamp(-60.0, 12.0),
+            _ => (prev + travel * 2.0).clamp(-1.0, 1.0),
         };
-        let id = track_id.clone();
-        self.with_timeline_silent(cx, |tl, _| match control {
-            RackControl::Volume => tl.state.set_track_volume(&id, value),
-            RackControl::Pan => tl.state.set_track_pan(&id, value),
-        });
+        if let Some(row) = self.rack_rows.iter_mut().find(|row| row.pad == pad) {
+            match control {
+                PadControl::Gain => row.state.gain_db = value,
+                _ => row.state.pan = value,
+            }
+        }
         self.drag_value_status = Some(match control {
-            RackControl::Volume => format!(
-                "Volume {:+.1} dB",
-                crate::components::timeline::timeline_state::volume::norm_to_db(value)
-            ),
-            RackControl::Pan => {
+            PadControl::Gain => format!("Gain {value:+.1} dB"),
+            _ => {
                 if value.abs() < 0.005 {
                     "Pan C".to_string()
                 } else if value < 0.0 {
@@ -4115,59 +4035,18 @@ impl PianoRoll {
                 }
             }
         });
-        self.send_rack_request(
-            RackRequest::TrackParam {
-                track_id,
-                param: match control {
-                    RackControl::Volume => "volume",
-                    RackControl::Pan => "pan",
-                },
-                value: f64::from(value),
-            },
-            window,
-            cx,
-        );
+        self.set_rack_pad(pad, control, value, window, cx);
         cx.notify();
     }
 
-    /// The release of a rack fader drag: one Set Volume / Set Pan entry.
+    /// The release of a rack fader drag. A pad control lives in the Drum
+    /// Sampler's own state, like its knob in the Drum Sampler window.
     pub(super) fn on_rack_mixer_up(&mut self, cx: &mut Context<Self>) {
-        let PianoDrag::RackMixer {
-            track_id,
-            control,
-            prev,
-            ..
-        } = std::mem::replace(&mut self.drag, PianoDrag::None)
-        else {
-            return;
-        };
-        self.drag_value_status = None;
-        let next = self
-            .timeline
-            .read(cx)
-            .state
-            .find_track(&track_id)
-            .map(|t| match control {
-                RackControl::Volume => t.volume,
-                RackControl::Pan => t.pan,
-            });
-        if let Some(next) = next.filter(|next| (next - prev).abs() > 1.0e-5) {
-            let command = match control {
-                RackControl::Volume => EditCommand::SetTrackVolume {
-                    track_id,
-                    prev,
-                    next,
-                },
-                RackControl::Pan => EditCommand::SetTrackPan {
-                    track_id,
-                    prev,
-                    next,
-                },
-            };
-            self.timeline
-                .update(cx, |tl, tcx| tl.record_executed_command(command, tcx));
+        if matches!(self.drag, PianoDrag::RackMixer { .. }) {
+            self.drag = PianoDrag::None;
+            self.drag_value_status = None;
+            cx.notify();
         }
-        cx.notify();
     }
 
     /// How many notes the step view's rows read sit off the step grid.
@@ -4268,6 +4147,19 @@ impl PianoRoll {
             self.step_hover = Some((row, index));
         }
         self.drum_hover_lane = Some(pitch);
+    }
+
+    /// Add a rack row the way "+ Add Sampler" does, without its file
+    /// dialog, for a still render.
+    #[cfg(feature = "ui-preview")]
+    pub fn preview_add_rack_pad(&mut self, cx: &Context<Self>) {
+        self.refresh_rack_rows(cx);
+        if let (Some(target), Some(pad)) = (
+            self.rack_target.clone(),
+            sampler_rack::next_free_pad(&self.rack_rows, sampler_rack::PAD_COUNT),
+        ) {
+            self.rack_added.push((target.insert_id, pad));
+        }
     }
 
     /// Hover rack row `row`'s step `index`, for a still render.
@@ -10525,54 +10417,57 @@ mod step_view_gesture_tests {
         assert!(!rig.undo(), "nothing was recorded");
     }
 
-    /// The Sampler Rack: rows are tracks, each step lands in its own track's
-    /// clip, and the row headers drive real mixer state.
+    /// The Sampler Rack: one track, its Drum Sampler's pads as rows. Every
+    /// step lands in the one clip, at its pad's note; the row headers set the
+    /// pads' own controls through the studio.
     mod rack {
         use super::*;
         use crate::components::timeline::timeline_state::{
-            CreateTrackOptions, InputMonitorMode, TrackType,
+            CreateTrackOptions, InputMonitorMode, InsertPluginFormat, TrackType,
         };
         use std::sync::{Arc, Mutex};
 
         struct RackRig {
             rig: Rig,
-            /// Kick (the edited clip's track) and Snare (no clip yet).
-            kick: String,
-            snare: String,
             requests: Arc<Mutex<Vec<RackRequest>>>,
         }
 
-        fn rack_rig(cx: &mut TestAppContext) -> RackRig {
-            let ids: Arc<Mutex<(String, String)>> = Arc::default();
+        /// One Instrument track with the Drum Sampler; its clip plays a
+        /// kick (pad 1, note 36) and a snare (pad 3, note 38).
+        fn rack_rig(cx: &mut TestAppContext, instrument: &str) -> RackRig {
             let requests: Arc<Mutex<Vec<RackRequest>>> = Arc::default();
+            let instrument = instrument.to_string();
             let window = {
-                let ids = ids.clone();
                 let requests = requests.clone();
                 cx.open_window(gpui::size(px(1200.0), px(760.0)), move |_, cx| {
                     let timeline = cx.new(|_| {
                         let mut timeline = Timeline::new();
                         let state = &mut timeline.state;
                         state.tracks.clear();
-                        let make = |state: &mut TimelineState, kind, name: &str| {
-                            state.create_track(CreateTrackOptions {
-                                track_type: kind,
-                                name: name.to_string(),
-                                color: state.track_color_for_index(state.tracks.len()),
-                                volume: 0.8,
-                                pan: 0.0,
-                                armed: false,
-                                input_monitor: InputMonitorMode::Off,
-                            })
-                        };
-                        let group = make(state, TrackType::Group, "Rack");
-                        let kick = make(state, TrackType::Instrument, "Kick");
-                        let snare = make(state, TrackType::Instrument, "Snare");
-                        state.assign_track_to_group(&kick, &group);
-                        state.assign_track_to_group(&snare, &group);
-                        let clip = state.create_midi_clip(&kick, 0.0, 4.0).expect("clip");
-                        state.add_midi_note(&clip, 60, 0.0, 0.25, 100);
+                        let track = state.create_track(CreateTrackOptions {
+                            track_type: TrackType::Instrument,
+                            name: "Drums".to_string(),
+                            color: state.track_color_for_index(0),
+                            volume: 0.8,
+                            pan: 0.0,
+                            armed: false,
+                            input_monitor: InputMonitorMode::Off,
+                        });
+                        let slot = state.add_insert(&track).expect("slot");
+                        state.set_insert_plugin(
+                            &track,
+                            &slot,
+                            instrument.clone(),
+                            None,
+                            InsertPluginFormat::Unknown,
+                            None,
+                            "Instrument".to_string(),
+                        );
+                        state.set_insert_plugin_role(&track, &slot, true);
+                        let clip = state.create_midi_clip(&track, 0.0, 4.0).expect("clip");
+                        state.add_midi_note(&clip, 36, 0.0, 0.25, 100);
+                        state.add_midi_note(&clip, 38, 1.0, 0.25, 100);
                         state.select_clip(&clip);
-                        *ids.lock().unwrap() = (kick, snare);
                         timeline
                     });
                     let mut roll = PianoRoll::new(timeline, cx);
@@ -10594,14 +10489,11 @@ mod step_view_gesture_tests {
                 })
                 .expect("window");
             cx.run_until_parked();
-            let (kick, snare) = ids.lock().unwrap().clone();
             RackRig {
                 rig: Rig {
                     window,
                     cx: VisualTestContext::from_window(window.into(), cx),
                 },
-                kick,
-                snare,
                 requests,
             }
         }
@@ -10635,170 +10527,122 @@ mod step_view_gesture_tests {
                 self.rig.release(at, MouseButton::Left, none());
             }
 
-            /// `(clip start, note starts)` of every MIDI clip on `track_id`.
-            fn clips(&mut self, track_id: &str) -> Vec<(f32, Vec<f32>)> {
-                let id = track_id.to_string();
+            /// The rows' pads.
+            fn pads(&mut self) -> Vec<usize> {
                 self.rig
-                    .window
-                    .update(&mut self.rig.cx, |roll, _, cx| {
-                        let state = &roll.timeline.read(cx).state;
-                        state
-                            .find_track(&id)
-                            .map(|track| {
-                                track
-                                    .clips
-                                    .iter()
-                                    .map(|clip| {
-                                        let notes = state
-                                            .midi_clip_notes(&clip.id)
-                                            .map(|notes| notes.iter().map(|n| n.start).collect())
-                                            .unwrap_or_default();
-                                        (clip.start_beat, notes)
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default()
-                    })
-                    .expect("window")
+                    .roll(|roll, _| roll.rack_rows.iter().map(|row| row.pad).collect())
             }
 
-            fn track<R>(
-                &mut self,
-                id: &str,
-                f: impl FnOnce(&crate::components::timeline::timeline_state::TrackState) -> R,
-            ) -> R {
-                let id = id.to_string();
-                self.rig
-                    .window
-                    .update(&mut self.rig.cx, |roll, _, cx| {
-                        f(roll.timeline.read(cx).state.find_track(&id).expect("track"))
-                    })
-                    .expect("window")
+            fn last_request(&self) -> Option<RackRequest> {
+                self.requests.lock().unwrap().last().cloned()
             }
         }
 
         #[gpui::test]
-        fn the_rack_shows_one_row_per_track_of_the_group(cx: &mut TestAppContext) {
-            let mut rack = rack_rig(cx);
-            let (rows, width) = rack
-                .rig
-                .window
-                .update(&mut rack.rig.cx, |roll, _, _| {
-                    (
-                        roll.rack_rows
-                            .iter()
-                            .map(|row| row.name.clone())
-                            .collect::<Vec<_>>(),
-                        roll.key_column_w(),
-                    )
-                })
-                .expect("window");
-            assert_eq!(rows, vec!["Kick".to_string(), "Snare".to_string()]);
+        fn the_rack_is_the_tracks_drum_sampler_pads(cx: &mut TestAppContext) {
+            let mut rack = rack_rig(cx, "builtin:drumsampler");
+            assert_eq!(rack.pads(), vec![0, 2], "the pads the clip plays");
+            let width = rack.rig.roll(|roll, _| roll.key_column_w());
             assert_eq!(width, RACK_LANE_W);
         }
 
-        /// A step on a row with no clip makes the clip over the pattern's
-        /// bars, on that row's own track; one undo takes the clip away.
+        /// A step on a row is a note at that pad's note, in the one clip.
         #[gpui::test]
-        fn painting_a_row_without_a_clip_makes_one_on_its_track(cx: &mut TestAppContext) {
-            let mut rack = rack_rig(cx);
-            let snare = rack.snare.clone();
-            assert!(rack.clips(&snare).is_empty());
-            rack.click(1, 4);
-            assert_eq!(rack.clips(&snare), vec![(0.0, vec![1.0])]);
-            // The kick's own clip is untouched.
-            let kick = rack.kick.clone();
-            assert_eq!(rack.clips(&kick), vec![(0.0, vec![0.0])]);
-            assert!(rack.rig.undo());
-            assert!(
-                rack.clips(&snare).is_empty(),
-                "undo removes the clip it made"
-            );
-        }
-
-        /// The next step on that row goes into the clip the first one made.
-        #[gpui::test]
-        fn a_rows_later_steps_land_in_its_clip(cx: &mut TestAppContext) {
-            let mut rack = rack_rig(cx);
-            let snare = rack.snare.clone();
-            rack.click(1, 4);
+        fn a_rack_step_is_a_note_at_its_pads_note(cx: &mut TestAppContext) {
+            let mut rack = rack_rig(cx, "builtin:drumsampler");
             rack.click(1, 6);
-            assert_eq!(rack.clips(&snare), vec![(0.0, vec![1.0, 1.5])]);
+            assert_eq!(starts(&rack.rig.lane(38)), vec![1.0, 1.5]);
+            assert_eq!(
+                starts(&rack.rig.lane(36)),
+                vec![0.0],
+                "the kick row is untouched"
+            );
             assert!(rack.rig.undo());
-            assert_eq!(rack.clips(&snare), vec![(0.0, vec![1.0])]);
+            assert_eq!(starts(&rack.rig.lane(38)), vec![1.0]);
         }
 
-        /// Escape while painting a clipless row takes the new clip back out.
+        /// "+ Add Sampler" makes the next free pad a row and asks for its
+        /// sample; a step on it plays that pad.
         #[gpui::test]
-        fn escape_takes_back_a_clip_the_gesture_made(cx: &mut TestAppContext) {
-            let mut rack = rack_rig(cx);
-            let snare = rack.snare.clone();
-            let at = rack.at(1, 2);
-            rack.rig.press(at, MouseButton::Left, none());
-            rack.rig.cx.run_until_parked();
-            assert_eq!(rack.clips(&snare).len(), 1);
-            rack.rig.roll(|roll, cx| roll.cancel_active_gesture(cx));
-            assert!(rack.clips(&snare).is_empty());
-            assert!(!rack.rig.undo(), "nothing was recorded");
-        }
-
-        /// Mute from a row header: the track's own mute, one undo entry, and
-        /// the engine is told at once.
-        #[gpui::test]
-        fn a_row_mute_is_the_tracks_mute_and_undoes(cx: &mut TestAppContext) {
-            let mut rack = rack_rig(cx);
-            let snare = rack.snare.clone();
-            let id = snare.clone();
+        fn add_sampler_takes_the_next_pad(cx: &mut TestAppContext) {
+            let mut rack = rack_rig(cx, "builtin:drumsampler");
             rack.rig
                 .window
                 .update(&mut rack.rig.cx, |roll, window, cx| {
-                    roll.toggle_rack_row(&id, false, window, cx)
+                    roll.add_rack_pad(window, cx)
                 })
                 .expect("window");
-            assert!(rack.track(&snare, |t| t.muted));
-            assert_eq!(
-                rack.requests.lock().unwrap().last(),
-                Some(&RackRequest::TrackParam {
-                    track_id: snare.clone(),
-                    param: "muted",
-                    value: 1.0
-                })
-            );
-            assert!(rack.rig.undo());
-            assert!(!rack.track(&snare, |t| t.muted));
-        }
-
-        /// Dragging a row's volume bar sideways sets the track's volume live
-        /// and records one Set Volume on release.
-        #[gpui::test]
-        fn dragging_a_row_volume_sets_the_track_volume(cx: &mut TestAppContext) {
-            let mut rack = rack_rig(cx);
-            let kick = rack.kick.clone();
-            let id = kick.clone();
-            rack.rig
-                .roll(|roll, cx| roll.begin_rack_mixer(&id, RackControl::Volume, 100.0, cx));
-            let to = gpui::point(px(100.0 - PianoRoll::RACK_FADER_TRAVEL_PX * 0.4), px(50.0));
-            rack.rig.drag_to(to, MouseButton::Left, none());
             rack.rig.cx.run_until_parked();
-            let live = rack.track(&kick, |t| t.volume);
-            assert!((live - 0.4).abs() < 1e-4, "{live}");
-            rack.rig.release(to, MouseButton::Left, none());
+            assert_eq!(rack.pads(), vec![0, 1, 2]);
             assert!(matches!(
-                rack.requests.lock().unwrap().last(),
-                Some(RackRequest::TrackParam {
-                    param: "volume",
+                rack.last_request(),
+                Some(RackRequest::LoadPadSample {
+                    pad: 1,
+                    path: None,
                     ..
                 })
             ));
-            assert!(rack.rig.undo());
-            assert!((rack.track(&kick, |t| t.volume) - 0.8).abs() < 1e-4);
+            rack.click(1, 2);
+            assert_eq!(starts(&rack.rig.lane(37)), vec![0.5]);
         }
 
-        /// Back to Drum Sampler mode, the rows are the edited clip's lanes
-        /// again and a step never reaches another track.
+        /// Mute on a row is the pad's mute: the studio is asked to set it.
         #[gpui::test]
-        fn drum_sampler_mode_edits_only_the_clips_own_lanes(cx: &mut TestAppContext) {
-            let mut rack = rack_rig(cx);
+        fn a_row_mute_sets_its_pads_mute(cx: &mut TestAppContext) {
+            let mut rack = rack_rig(cx, "builtin:drumsampler");
+            rack.rig
+                .window
+                .update(&mut rack.rig.cx, |roll, window, cx| {
+                    roll.toggle_rack_pad(2, PadControl::Mute, window, cx)
+                })
+                .expect("window");
+            assert!(matches!(
+                rack.last_request(),
+                Some(RackRequest::SetPad {
+                    pad: 2,
+                    control: PadControl::Mute,
+                    value,
+                    ..
+                }) if value == 1.0
+            ));
+        }
+
+        /// Dragging a row's gain bar sets the pad's gain live, in dB.
+        #[gpui::test]
+        fn dragging_a_row_gain_sets_its_pads_gain(cx: &mut TestAppContext) {
+            let mut rack = rack_rig(cx, "builtin:drumsampler");
+            rack.rig
+                .roll(|roll, cx| roll.begin_rack_mixer(0, PadControl::Gain, 100.0, cx));
+            let to = gpui::point(px(100.0 - PianoRoll::RACK_FADER_TRAVEL_PX * 0.25), px(50.0));
+            rack.rig.drag_to(to, MouseButton::Left, none());
+            rack.rig.cx.run_until_parked();
+            match rack.last_request() {
+                Some(RackRequest::SetPad {
+                    pad: 0,
+                    control: PadControl::Gain,
+                    value,
+                    ..
+                }) => assert!((value + 18.0).abs() < 1e-3, "{value}"),
+                other => panic!("no gain request: {other:?}"),
+            }
+            rack.rig.release(to, MouseButton::Left, none());
+            let idle = rack
+                .rig
+                .roll(|roll, _| matches!(roll.drag, PianoDrag::None));
+            assert!(idle, "the release ends the drag");
+        }
+
+        /// Another instrument has no pads: the rack says so and has no rows.
+        #[gpui::test]
+        fn another_instrument_has_no_rack(cx: &mut TestAppContext) {
+            let mut rack = rack_rig(cx, "builtin:quicksampler");
+            assert!(rack.pads().is_empty());
+        }
+
+        /// Back to Drum Sampler mode, the rows are the clip's drum lanes again.
+        #[gpui::test]
+        fn drum_sampler_mode_shows_the_lanes_again(cx: &mut TestAppContext) {
+            let mut rack = rack_rig(cx, "builtin:drumsampler");
             rack.rig
                 .roll(|roll, cx| roll.set_step_source(StepSource::DrumSampler, cx));
             let width = rack.rig.roll(|roll, _| roll.key_column_w());
@@ -10806,9 +10650,7 @@ mod step_view_gesture_tests {
             let at = rack.rig.at(KICK, 4, 0.0, 0.0);
             rack.rig.press(at, MouseButton::Left, none());
             rack.rig.release(at, MouseButton::Left, none());
-            let snare = rack.snare.clone();
-            assert!(rack.clips(&snare).is_empty());
-            assert_eq!(starts(&rack.rig.lane(KICK)), vec![1.0]);
+            assert_eq!(starts(&rack.rig.lane(KICK)), vec![0.0, 1.0]);
         }
     }
 }

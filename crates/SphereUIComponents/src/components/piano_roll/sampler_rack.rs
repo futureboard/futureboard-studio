@@ -1,245 +1,203 @@
-//! The step view's Sampler Rack: one row per instrument track.
+//! The step view's Sampler Rack: one track, one Drum Sampler, a row per pad.
 //!
-//! Where Drum Sampler mode reads the lanes of one clip (one pitch per pad of
-//! the kit on the clip's own track), the rack reads several tracks at once.
-//! A rack is a track Group: every Instrument track in the group of the track
-//! being edited is a row, in track order, each with its own instrument,
-//! mixer strip and clip. A row's steps are the notes of that track's MIDI
-//! clip over the same bars as the clip being edited, at the pitch the row
-//! plays. Nothing is stored for the rack itself: membership is the group,
-//! the pattern is the clips, so it saves, undoes and plays like any tracks.
+//! Every row is a sampler of its own — a Drum Sampler pad, with its sample,
+//! region, tune, filter, envelope, gain, pan, mute, solo and output — and all
+//! of them live in the one instrument on the one track. A row's steps are
+//! the edited clip's notes at the pad's note, so the pattern is that clip:
+//! it plays, saves, undoes and exports like any other.
+//!
+//! Which pads are rows: every pad with a sample, every pad the clip plays,
+//! and any the user added this session (an empty pad, waiting for a sample).
+//! Nothing is stored for the rack itself; the pads are the Drum Sampler's
+//! own state.
 
-use crate::components::timeline::timeline_state::{
-    ClipState, ClipType, MidiNoteState, TimelineState, TrackType,
-};
+use crate::components::timeline::timeline_state::{MidiNoteState, TimelineState};
 
-/// The note a row writes when its clip has none yet: middle C, which a
-/// sampler plays at the sample's own pitch.
-pub(crate) const ROW_PITCH: u8 = 60;
+/// How many pads a Drum Sampler has (`drumsampler::PADS`).
+pub(crate) const PAD_COUNT: usize = 64;
 
-/// How close a clip's start must be to the pattern's to be the row's clip,
-/// in beats.
-const SAME_START_BEATS: f32 = 0.001;
+/// The note pad `index` answers to until it is changed: the Drum Sampler's
+/// default kit layout, General MIDI's kick upwards.
+pub(crate) fn default_note(index: usize) -> u8 {
+    (36 + index).min(127) as u8
+}
 
-/// One row of the rack.
+/// What the rack shows of one pad.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct RackRow {
-    pub track_id: String,
-    pub name: String,
-    pub color: gpui::Rgba,
-    /// The row's clip over the pattern's bars, if it has one yet.
-    pub clip_id: Option<String>,
-    /// The note the row's steps are written at.
-    pub pitch: u8,
+pub(crate) struct PadState {
+    pub note: u8,
+    /// The sample's file name, if one is loaded.
+    pub sample: Option<String>,
     pub muted: bool,
     pub solo: bool,
-    /// Fader position, `0.0..=1.0` (see `TrackState::volume`).
-    pub volume: f32,
+    /// −60 … +12 dB.
+    pub gain_db: f32,
+    /// −1 (left) … +1 (right).
     pub pan: f32,
-    /// The track's instrument insert, for its editor and sample.
-    pub instrument_insert_id: Option<String>,
 }
 
-/// The pattern the rack edits: where it sits and how long it is.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct RackPattern {
-    pub start_beat: f32,
-    pub length_beats: f32,
-}
-
-/// The rack around `clip_id`: its pattern and its rows. `None` when the clip
-/// is not a MIDI clip on an Instrument track.
-pub(crate) fn rack_for_clip(
-    state: &TimelineState,
-    clip_id: &str,
-) -> Option<(RackPattern, Vec<RackRow>)> {
-    let (track, clip) = state.find_clip(clip_id)?;
-    if !plays_notes(track.track_type) || !matches!(clip.clip_type, ClipType::Midi { .. }) {
-        return None;
+impl PadState {
+    pub(crate) fn empty(index: usize) -> Self {
+        Self {
+            note: default_note(index),
+            sample: None,
+            muted: false,
+            solo: false,
+            gain_db: 0.0,
+            pan: 0.0,
+        }
     }
-    let pattern = RackPattern {
-        start_beat: clip.start_beat,
-        length_beats: clip.duration_beats,
-    };
-    let members: Vec<_> = match track.parent_group_id.as_deref() {
-        Some(group) => state
-            .tracks
-            .iter()
-            .filter(|t| plays_notes(t.track_type) && t.parent_group_id.as_deref() == Some(group))
-            .collect(),
-        None => vec![track],
-    };
-    let rows = members
-        .into_iter()
-        .map(|member| {
-            let clip = if member.id == track.id {
-                Some(clip)
-            } else {
-                row_clip(&member.clips, pattern)
-            };
-            RackRow {
-                track_id: member.id.clone(),
-                name: member.name.clone(),
-                color: member.color,
-                clip_id: clip.map(|clip| clip.id.clone()),
-                pitch: clip.and_then(row_pitch).unwrap_or(ROW_PITCH),
-                muted: member.muted,
-                solo: member.solo,
-                volume: member.volume,
-                pan: member.pan,
-                instrument_insert_id: member.instrument_plugin_instance_id.clone(),
-            }
+}
+
+/// One row of the rack: a pad.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RackRow {
+    pub pad: usize,
+    pub state: PadState,
+}
+
+impl RackRow {
+    /// The row's name: its sample's name without the extension, or the pad.
+    pub(crate) fn name(&self) -> String {
+        match &self.state.sample {
+            Some(file) => std::path::Path::new(file)
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_else(|| file.clone()),
+            None => format!("Pad {}", self.pad + 1),
+        }
+    }
+}
+
+/// The Drum Sampler a rack plays: the edited clip's track and its
+/// instrument insert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RackTarget {
+    pub track_id: String,
+    pub insert_id: String,
+}
+
+/// Whether `plugin_id` names the built-in Drum Sampler.
+pub(crate) fn is_drum_sampler(plugin_id: &str) -> bool {
+    plugin_id.rsplit(':').next() == Some("drumsampler")
+}
+
+/// The Drum Sampler of the track `clip_id` is on, when that is the track's
+/// instrument. `None` for any other instrument: the rack is its pads.
+pub(crate) fn rack_target(state: &TimelineState, clip_id: &str) -> Option<RackTarget> {
+    let (track, _) = state.find_clip(clip_id)?;
+    let slot = track.instrument_insert()?;
+    slot.plugin_id
+        .as_deref()
+        .is_some_and(is_drum_sampler)
+        .then(|| RackTarget {
+            track_id: track.id.clone(),
+            insert_id: slot.id.clone(),
         })
-        .collect();
-    Some((pattern, rows))
 }
 
-/// Tracks a rack row can be: the ones whose clips are notes for an
-/// instrument (an Instrument track's own, or a MIDI track's).
-fn plays_notes(track_type: TrackType) -> bool {
-    matches!(track_type, TrackType::Instrument | TrackType::Midi)
-}
-
-/// A track's MIDI clip that starts where the pattern does.
-fn row_clip(clips: &[ClipState], pattern: RackPattern) -> Option<&ClipState> {
-    clips.iter().find(|clip| {
-        matches!(clip.clip_type, ClipType::Midi { .. })
-            && (clip.start_beat - pattern.start_beat).abs() <= SAME_START_BEATS
-    })
-}
-
-/// The pitch a row's clip plays most, lowest on a tie: what its steps read
-/// and write.
-fn row_pitch(clip: &ClipState) -> Option<u8> {
-    let ClipType::Midi { notes, .. } = &clip.clip_type else {
-        return None;
-    };
-    most_played_pitch(notes)
-}
-
-pub(crate) fn most_played_pitch(notes: &[MidiNoteState]) -> Option<u8> {
-    let mut counts = [0usize; 128];
-    for note in notes {
-        counts[usize::from(note.pitch.min(127))] += 1;
-    }
-    let (pitch, count) = counts
-        .iter()
+/// The rows: pads with a sample, pads `notes` play, and the `added` ones, in
+/// pad order. A note several pads answer to shows each of them.
+pub(crate) fn rack_rows(
+    pads: &[PadState],
+    notes: &[MidiNoteState],
+    added: &[usize],
+) -> Vec<RackRow> {
+    pads.iter()
         .enumerate()
-        .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(&a.0)))?;
-    (*count > 0).then_some(pitch as u8)
+        .filter(|(index, pad)| {
+            pad.sample.is_some()
+                || added.contains(index)
+                || notes.iter().any(|note| note.pitch == pad.note)
+        })
+        .map(|(pad, state)| RackRow {
+            pad,
+            state: state.clone(),
+        })
+        .collect()
+}
+
+/// The first pad not already a row: where "+ Add Sampler" puts the next one.
+pub(crate) fn next_free_pad(rows: &[RackRow], pads: usize) -> Option<usize> {
+    (0..pads).find(|pad| !rows.iter().any(|row| row.pad == *pad))
+}
+
+/// The Drum Sampler's pads on `insert_id`, as its state mirror holds them;
+/// the default kit when the mirror has nothing yet (a fresh instrument).
+#[cfg(feature = "builtin-plugin-editor")]
+pub(crate) fn pads_of(insert_id: &str) -> Vec<PadState> {
+    let params = crate::components::builtin_plugin_editor::builtin_drum_sampler_params(insert_id)
+        .unwrap_or_else(drumsampler::default_params);
+    params
+        .pads
+        .iter()
+        .map(|pad| PadState {
+            note: pad.note,
+            sample: pad.sample_name.clone(),
+            muted: pad.muted,
+            solo: pad.solo,
+            gain_db: pad.gain_db,
+            pan: pad.pan,
+        })
+        .collect()
+}
+
+/// Without the built-in editors there is no pad state to read: the default
+/// kit layout.
+#[cfg(not(feature = "builtin-plugin-editor"))]
+pub(crate) fn pads_of(_insert_id: &str) -> Vec<PadState> {
+    (0..PAD_COUNT).map(PadState::empty).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::components::timeline::timeline_state::{CreateTrackOptions, InputMonitorMode};
 
     fn note(pitch: u8, start: f32) -> MidiNoteState {
         MidiNoteState::new(pitch, start, 0.25, 100)
     }
 
-    fn track(state: &mut TimelineState, track_type: TrackType, name: &str) -> String {
-        state.create_track(CreateTrackOptions {
-            track_type,
-            name: name.to_string(),
-            color: state.track_color_for_index(state.tracks.len()),
-            volume: 0.8,
-            pan: 0.0,
-            armed: false,
-            input_monitor: InputMonitorMode::Off,
-        })
+    fn kit() -> Vec<PadState> {
+        (0..PAD_COUNT).map(PadState::empty).collect()
     }
 
-    /// Kick and Snare in a group (with an audio track and a nested folder
-    /// that are not rows), Hat outside it. The pattern is Kick's clip at
-    /// bar 2; Snare has a clip there playing D.
-    fn rack() -> (TimelineState, String, [String; 3]) {
-        let mut state = TimelineState::default();
-        state.tracks.clear();
-        let group = track(&mut state, TrackType::Group, "Rack");
-        let kick = track(&mut state, TrackType::Instrument, "Kick");
-        let snare = track(&mut state, TrackType::Instrument, "Snare");
-        let audio = track(&mut state, TrackType::Audio, "Loop");
-        let hat = track(&mut state, TrackType::Instrument, "Hat");
-        for member in [&kick, &snare, &audio] {
-            assert!(state.assign_track_to_group(member, &group));
-        }
-        let pattern = state.create_midi_clip(&kick, 4.0, 4.0).expect("clip");
-        let snare_clip = state.create_midi_clip(&snare, 4.0, 4.0).expect("clip");
-        state.add_midi_note(&snare_clip, 62, 0.0, 0.25, 100);
-        // Another of Snare's clips, elsewhere: not this pattern's.
-        state.create_midi_clip(&snare, 12.0, 4.0).expect("clip");
-        (state, pattern, [kick, snare, hat])
+    /// Rows are the pads that hold something: a sample, a note the clip
+    /// plays, or an added one; in pad order.
+    #[test]
+    fn the_rows_are_the_pads_in_use() {
+        let mut pads = kit();
+        pads[5].sample = Some("clap_09.wav".into());
+        let notes = [note(38, 0.0), note(36, 1.0), note(36, 2.0)];
+        let rows = rack_rows(&pads, &notes, &[9]);
+        let indices: Vec<usize> = rows.iter().map(|row| row.pad).collect();
+        assert_eq!(indices, vec![0, 2, 5, 9]);
+        assert_eq!(rows[2].name(), "clap_09");
+        assert_eq!(rows[0].name(), "Pad 1");
+        // A pad's note follows the pad, not its position.
+        pads[3].note = 38;
+        let rows = rack_rows(&pads, &notes, &[]);
+        assert!(rows.iter().any(|row| row.pad == 3));
     }
 
     #[test]
-    fn the_rows_are_the_note_tracks_of_the_edited_tracks_group() {
-        let (state, pattern, [kick, snare, _hat]) = rack();
-        let (span, rows) = rack_for_clip(&state, &pattern).expect("rack");
-        assert_eq!(
-            span,
-            RackPattern {
-                start_beat: 4.0,
-                length_beats: 4.0
-            }
-        );
-        let ids: Vec<&str> = rows.iter().map(|row| row.track_id.as_str()).collect();
-        assert_eq!(
-            ids,
-            vec![kick.as_str(), snare.as_str()],
-            "audio and outside tracks are not rows"
-        );
-        assert_eq!(rows[0].clip_id.as_deref(), Some(pattern.as_str()));
-        // Snare's row is its clip at the same bars, at the pitch it plays.
-        let snare_row = &rows[1];
-        assert!(snare_row.clip_id.is_some());
-        assert_eq!(snare_row.pitch, 62);
-        assert_eq!(snare_row.name, "Snare");
-    }
-
-    /// A row with no clip over the pattern's bars has none (the editor makes
-    /// one when a step is painted) and writes middle C.
-    #[test]
-    fn a_row_without_a_clip_at_the_pattern_has_none_yet() {
-        let (mut state, pattern, [_kick, snare, _]) = rack();
-        let ids: Vec<String> = state
-            .find_track(&snare)
-            .unwrap()
-            .clips
-            .iter()
-            .map(|clip| clip.id.clone())
+    fn add_sampler_takes_the_first_pad_not_shown() {
+        let pads = kit();
+        let rows = rack_rows(&pads, &[note(36, 0.0), note(37, 0.0)], &[]);
+        assert_eq!(next_free_pad(&rows, PAD_COUNT), Some(2));
+        let full: Vec<RackRow> = (0..PAD_COUNT)
+            .map(|pad| RackRow {
+                pad,
+                state: PadState::empty(pad),
+            })
             .collect();
-        for id in ids {
-            if state
-                .find_clip(&id)
-                .is_some_and(|(_, clip)| clip.start_beat == 4.0)
-            {
-                state.delete_clip(&id);
-            }
-        }
-        let (_, rows) = rack_for_clip(&state, &pattern).unwrap();
-        assert_eq!(rows[1].clip_id, None);
-        assert_eq!(rows[1].pitch, ROW_PITCH);
-    }
-
-    /// A track in no group is a rack of one.
-    #[test]
-    fn a_track_outside_any_group_is_a_rack_of_one() {
-        let (mut state, _, [_, _, hat]) = rack();
-        let clip = state.create_midi_clip(&hat, 0.0, 4.0).unwrap();
-        let (_, rows) = rack_for_clip(&state, &clip).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].track_id, hat);
+        assert_eq!(next_free_pad(&full, PAD_COUNT), None);
     }
 
     #[test]
-    fn a_row_reads_the_pitch_its_clip_plays_most() {
-        assert_eq!(
-            most_played_pitch(&[note(62, 0.0), note(60, 1.0), note(62, 2.0)]),
-            Some(62)
-        );
-        // A tie goes to the lower note; nothing played is no pitch.
-        assert_eq!(most_played_pitch(&[note(64, 0.0), note(48, 1.0)]), Some(48));
-        assert_eq!(most_played_pitch(&[]), None);
+    fn only_the_drum_sampler_makes_a_rack() {
+        assert!(is_drum_sampler("builtin:drumsampler"));
+        assert!(is_drum_sampler("drumsampler"));
+        assert!(!is_drum_sampler("builtin:quicksampler"));
+        assert!(!is_drum_sampler("com.vendor.drumsamplerpro"));
     }
 }

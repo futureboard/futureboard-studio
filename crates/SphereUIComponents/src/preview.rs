@@ -2325,74 +2325,69 @@ fn midi_drums_reversed_scene(options: WindowOptions, cx: &mut App) -> Result<Any
     open_midi_drums_with(options, cx, true, true)
 }
 
-/// The drum pattern on the step grid, with a snare roll written as a ×4
-/// ratchet, a ×2 hat, and one hit played between the lines (amber, waiting to
-/// be snapped). The repeat selector is on ×4.
-/// The step view's Sampler Rack: a group of four sampler tracks, each a row
-/// with its own pattern, colour, mute/solo and faders. Clap is muted, Hat
-/// panned right and quieter; Perc has no clip over these bars yet.
+/// The step view's Sampler Rack: one track with the Drum Sampler, a row per
+/// pad it plays, each with its own sample, mute/solo and faders. The clap
+/// pad is muted, the hat panned right and quieter, and Perc is an empty pad
+/// added with "+ Add Sampler", waiting for its sample.
 fn midi_rack_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    use crate::components::builtin_plugin_editor::{builtin_state_apply, builtin_state_set_sample};
     use crate::components::piano_roll::{PianoRoll, StepSource};
     use crate::components::timeline::timeline::Timeline;
     use crate::components::timeline::timeline_state::{
-        CreateTrackOptions, InputMonitorMode, TrackType,
+        CreateTrackOptions, InputMonitorMode, InsertPluginFormat, TrackType,
     };
+    const PLUGIN: &str = "builtin:drumsampler";
     let handle = cx.open_window(options, move |_, cx| {
         let timeline = cx.new(|_| {
             let mut timeline = Timeline::new();
             let state = &mut timeline.state;
             state.tracks.clear();
-            let make = |state: &mut crate::components::timeline::timeline_state::TimelineState,
-                        kind,
-                        name: &str| {
-                state.create_track(CreateTrackOptions {
-                    track_type: kind,
-                    name: name.to_string(),
-                    color: state.track_color_for_index(state.tracks.len()),
-                    volume: 0.8,
-                    pan: 0.0,
-                    armed: false,
-                    input_monitor: InputMonitorMode::Off,
-                })
-            };
-            let group = make(state, TrackType::Group, "Sampler Rack");
-            let patterns: [(&str, &[f32]); 4] = [
-                ("Kick", &[0.0, 1.0, 2.0, 2.75, 3.0]),
-                ("Snare", &[1.0, 3.0]),
-                ("Hat", &[0.5, 1.5, 2.5, 3.5]),
-                ("Clap", &[1.0, 3.0, 3.75]),
+            let track = state.create_track(CreateTrackOptions {
+                track_type: TrackType::Instrument,
+                name: "Beat".to_string(),
+                color: state.track_color_for_index(2),
+                volume: 0.8,
+                pan: 0.0,
+                armed: false,
+                input_monitor: InputMonitorMode::Off,
+            });
+            let slot = state.add_insert(&track).expect("slot");
+            state.set_insert_plugin(
+                &track,
+                &slot,
+                PLUGIN.to_string(),
+                None,
+                InsertPluginFormat::Unknown,
+                None,
+                "Drum Sampler".to_string(),
+            );
+            state.set_insert_plugin_role(&track, &slot, true);
+            // Pads 1-4 (notes 36-39), each a sampler with its own sample.
+            let kit: [(usize, &str, &[f32]); 4] = [
+                (0, "kick_808.wav", &[0.0, 1.0, 2.0, 2.75, 3.0]),
+                (2, "snare_tight.wav", &[1.0, 3.0]),
+                (3, "clap_stack.wav", &[1.0, 3.0, 3.75]),
+                (6, "hat_closed.wav", &[0.5, 1.5, 2.5, 3.5]),
             ];
-            let mut first_clip = None;
-            for (name, hits) in patterns {
-                let id = make(state, TrackType::Instrument, name);
-                state.assign_track_to_group(&id, &group);
-                let clip = state.create_midi_clip(&id, 0.0, 4.0).expect("clip");
+            let clip = state.create_midi_clip(&track, 0.0, 4.0).expect("clip");
+            for (pad, sample, hits) in kit {
+                builtin_state_set_sample(PLUGIN, &slot, pad, Some(sample.to_string()));
                 for hit in hits {
-                    state.add_midi_note(&clip, 60, *hit, 0.25, 100);
-                }
-                first_clip.get_or_insert(clip);
-                match name {
-                    "Hat" => {
-                        state.set_track_pan(&id, 0.45);
-                        state.set_track_volume(&id, 0.6);
-                    }
-                    "Clap" => {
-                        state.set_track_mute(&id, true);
-                    }
-                    _ => {}
+                    state.add_midi_note(&clip, 36 + pad as u8, *hit, 0.25, 100);
                 }
             }
-            let perc = make(state, TrackType::Instrument, "Perc");
-            state.assign_track_to_group(&perc, &group);
-            if let Some(clip) = first_clip {
-                state.select_clip(&clip);
-            }
+            let wire = |name: &str| drumsampler::ui_param_index(name).expect("pad param");
+            builtin_state_apply(PLUGIN, &slot, wire("pad3Mute"), 1.0);
+            builtin_state_apply(PLUGIN, &slot, wire("pad6Pan"), 0.45);
+            builtin_state_apply(PLUGIN, &slot, wire("pad6Gain"), -9.0);
+            state.select_clip(&clip);
             timeline
         });
         cx.new(|cx| {
             let mut roll = PianoRoll::new(timeline, cx);
             roll.set_step_mode(true, cx);
             roll.set_step_source(StepSource::SamplerRack, cx);
+            roll.preview_add_rack_pad(cx);
             roll.preview_hover_rack_step(2, 6);
             roll
         })
@@ -2400,6 +2395,9 @@ fn midi_rack_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHand
     Ok(handle.into())
 }
 
+/// The drum pattern on the step grid, with a snare roll written as a ×4
+/// ratchet, a ×2 hat, and one hit played between the lines (amber, waiting to
+/// be snapped). The repeat selector is on ×4.
 fn midi_steps_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
     use crate::components::piano_roll::{DrumLanes, PianoRoll};
     use crate::components::timeline::timeline::Timeline;

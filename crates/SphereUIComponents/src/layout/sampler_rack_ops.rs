@@ -1,23 +1,14 @@
 //! What the MIDI editor's Sampler Rack asks the studio for (see
-//! `components::piano_roll::RackRequest`): new rows, instrument editors,
-//! samples and live channel controls. The editor owns the pattern; these need
-//! the plug-in host, the audio engine or new tracks.
+//! `components::piano_roll::RackRequest`): the rack is the pads of one
+//! track's Drum Sampler, so its rows open that instrument, load samples onto
+//! its pads and set the pads' own mute, solo, gain and pan. The plug-in
+//! host and the engine live here, not in the editor.
 
 use gpui::{Context, Window};
 
 use crate::components::piano_roll::RackRequest;
-use crate::components::timeline::timeline_state::{
-    self, CreateTrackOptions, InputMonitorMode, InsertPluginFormat, TrackEditScope, TrackType,
-};
-use SpherePluginHost::PluginFormat as RegistryPluginFormat;
 
 use super::StudioLayout;
-
-/// The instrument a new rack row gets: the built-in Quick Sampler.
-const RACK_ROW_INSTRUMENT_ID: &str = "builtin:quicksampler";
-
-/// Name of the group made around a track that starts a rack.
-const RACK_GROUP_NAME: &str = "Sampler Rack";
 
 impl StudioLayout {
     pub(super) fn handle_rack_request(
@@ -27,139 +18,167 @@ impl StudioLayout {
         cx: &mut Context<Self>,
     ) {
         match request {
-            RackRequest::AddRow { track_id } => self.add_rack_row(&track_id, cx),
             RackRequest::OpenEditor { track_id } => {
                 self.open_track_instrument(&track_id, window, cx);
             }
-            RackRequest::LoadSample { track_id, path } => {
-                self.load_rack_row_sample(&track_id, path, window, cx);
-            }
-            RackRequest::TrackParam {
+            RackRequest::LoadPadSample {
+                insert_id,
+                pad,
+                path,
+                ..
+            } => self.load_rack_pad_sample(insert_id, pad, path, cx),
+            RackRequest::SetPad {
                 track_id,
-                param,
+                insert_id,
+                pad,
+                control,
                 value,
-            } => {
-                // Mute, solo, volume and pan are live controls: the engine
-                // takes them per block, never through a graph rebuild.
-                self.mark_dirty_view_only();
-                if let Some(engine) = self.audio_bridge.engine.as_ref() {
-                    let _ = engine.update_track_param(&track_id, param, value);
-                }
-                self.push_mixer_snapshot_to_window(cx);
-            }
+            } => self.set_rack_pad(&track_id, &insert_id, pad, control, value, cx),
         }
     }
 
-    /// A new rack row after the last: an Instrument track with the Quick
-    /// Sampler in `track_id`'s group, which is made around `track_id` first
-    /// when it has none. One undo step.
-    fn add_rack_row(&mut self, track_id: &str, cx: &mut Context<Self>) {
-        let catalog =
-            super::window_ops::add_track_instrument_plugins_from_catalog(&self.plugin_catalog);
-        let Some(reg) = catalog
-            .iter()
-            .find(|p| {
-                p.id == RACK_ROW_INSTRUMENT_ID
-                    || p.class_id.as_deref() == Some(RACK_ROW_INSTRUMENT_ID)
-            })
-            .cloned()
-        else {
-            eprintln!("[SamplerRack] the Quick Sampler is not in the plug-in catalog");
+    /// One pad control, the way the Drum Sampler's own knob sets it: to the
+    /// DSP through the engine's realtime path, then into the state mirror
+    /// that saves with the project and replays into a restarted host.
+    #[cfg(feature = "builtin-plugin-editor")]
+    fn set_rack_pad(
+        &mut self,
+        track_id: &str,
+        insert_id: &str,
+        pad: usize,
+        control: crate::components::piano_roll::PadControl,
+        value: f32,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::components::piano_roll::PadControl;
+        let field = match control {
+            PadControl::Mute => "Mute",
+            PadControl::Solo => "Solo",
+            PadControl::Gain => "Gain",
+            PadControl::Pan => "Pan",
+        };
+        let Some(index) = drumsampler::ui_param_index(&format!("pad{pad}{field}")) else {
             return;
         };
-        let edit = self.begin_track_edit(TrackEditScope::track_list(), cx);
-        let made = self.timeline.update(cx, |timeline, cx| {
-            let state = &mut timeline.state;
-            let group_id = match state.find_track(track_id)?.parent_group_id.clone() {
-                Some(group) => group,
-                None => {
-                    state.select_track(track_id);
-                    state.group_selected_tracks(RACK_GROUP_NAME.to_string())?
-                }
-            };
-            let rows = state
-                .tracks
-                .iter()
-                .filter(|t| t.parent_group_id.as_deref() == Some(group_id.as_str()))
-                .count();
-            let id = state.create_track(CreateTrackOptions {
-                track_type: TrackType::Instrument,
-                name: format!("Sampler {}", rows + 1),
-                color: state.track_color_for_index(state.tracks.len()),
-                volume: timeline_state::volume::db_to_norm(0.0),
-                pan: 0.0,
-                armed: false,
-                input_monitor: InputMonitorMode::Off,
-            });
-            state.assign_track_to_group(&id, &group_id);
-            let slot_id = state.add_insert(&id)?;
-            let format = match reg.format {
-                RegistryPluginFormat::Vst3 => InsertPluginFormat::Vst3,
-                RegistryPluginFormat::Vst2 => InsertPluginFormat::Vst2,
-                RegistryPluginFormat::Clap => InsertPluginFormat::Clap,
-                RegistryPluginFormat::Au => InsertPluginFormat::Au,
-                RegistryPluginFormat::Lv2 => InsertPluginFormat::Lv2,
-                RegistryPluginFormat::Unknown => InsertPluginFormat::Unknown,
-            };
-            state.set_insert_plugin(
-                &id,
-                &slot_id,
-                reg.class_id.clone().unwrap_or_else(|| reg.id.clone()),
-                Some(reg.path.clone()),
-                format,
-                Some(reg.vendor.clone()).filter(|vendor| !vendor.trim().is_empty()),
-                reg.name.clone(),
-            );
-            state.set_insert_plugin_role(&id, &slot_id, true);
-            cx.notify();
-            Some((id, slot_id))
-        });
-        self.commit_track_edit("Add Sampler Row", edit, cx);
-        let Some((id, slot_id)) = made else {
+        let plugin_id = self
+            .timeline
+            .read(cx)
+            .state
+            .find_track(track_id)
+            .and_then(|track| track.inserts.iter().find(|slot| slot.id == insert_id))
+            .and_then(|slot| slot.plugin_id.clone());
+        let Some(plugin_id) = plugin_id else {
             return;
         };
-        // A built-in instrument lives in the plug-in host: without a load
-        // request its editor has no instance to send samples or notes to.
-        if !self.load_bridge_insert_for_slot(&id, &slot_id, cx) {
-            self.audio_bridge.project_dirty = true;
-            self.schedule_audio_project_sync(cx, true, "sampler_rack_add_row");
+        if let Some(engine) = self.audio_bridge.engine.as_ref() {
+            if let Err(error) = engine.set_insert_param(
+                track_id.to_string(),
+                insert_id.to_string(),
+                index.to_string(),
+                value,
+            ) {
+                eprintln!("[SamplerRack] pad {pad} {field} not sent: {error}");
+            }
         }
-        self.mark_dirty();
+        crate::components::builtin_plugin_editor::builtin_state_apply(
+            &plugin_id, insert_id, index, value,
+        );
+        self.note_plugin_state_edited(cx);
         cx.notify();
     }
 
-    /// Opens the row's Quick Sampler and loads `path` into it, or asks for a
-    /// file when there is none: the editor's own load, which copies the file
-    /// into the plug-in's Samples folder and sends it to the host.
-    fn load_rack_row_sample(
+    #[cfg(not(feature = "builtin-plugin-editor"))]
+    fn set_rack_pad(
         &mut self,
-        track_id: &str,
+        _track_id: &str,
+        _insert_id: &str,
+        _pad: usize,
+        _control: crate::components::piano_roll::PadControl,
+        _value: f32,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
+    /// Loads `path` (or a file picked now) onto `pad`: copied into the Drum
+    /// Sampler's Samples folder and sent to its instance in the plug-in
+    /// host, the way a file dropped on the pad in the Drum Sampler is. The
+    /// host's answer records the sample's name on the pad.
+    fn load_rack_pad_sample(
+        &mut self,
+        insert_id: String,
+        pad: usize,
         path: Option<std::path::PathBuf>,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_track_instrument(track_id, window, cx);
+        let Some(path) = path else {
+            #[cfg(feature = "native-dialogs")]
+            cx.spawn(async move |this, cx| {
+                let Some(handle) = rfd::AsyncFileDialog::new()
+                    .set_title("Load Sample")
+                    .add_filter(
+                        "Audio",
+                        &crate::components::quick_sampler_window::SAMPLE_EXTENSIONS,
+                    )
+                    .pick_file()
+                    .await
+                else {
+                    return;
+                };
+                let path = handle.path().to_path_buf();
+                let _ = this.update(cx, |this, cx| {
+                    this.load_rack_pad_sample(insert_id, pad, Some(path), cx)
+                });
+            })
+            .detach();
+            return;
+        };
         #[cfg(feature = "builtin-plugin-editor")]
         {
-            let insert_id = self
-                .timeline
-                .read(cx)
-                .state
-                .find_track(track_id)
-                .and_then(|track| track.instrument_insert())
-                .map(|slot| slot.id.clone());
-            let Some(handle) = insert_id
-                .and_then(|id| self.plugin_editors.quick_sampler.get(&id))
-                .copied()
-            else {
+            use crate::components::builtin_plugin_files::{self as files, BuiltinFileKind};
+            let Some(runtime) = self.plugin_editors.bridge_runtime.clone() else {
+                eprintln!("[SamplerRack] the plug-in host is not running yet");
                 return;
             };
-            let _ = handle.update(cx, |editor, _window, cx| match path {
-                Some(path) => editor.import_sample(path, cx),
-                None => editor.browse_sample(cx),
-            });
+            let samples_dir = files::plugin_files_root(drumsampler::PLUGIN_NAME)
+                .join(BuiltinFileKind::Samples.dir_name());
+            cx.spawn(async move |_this, cx| {
+                let stored = cx
+                    .background_executor()
+                    .spawn(async move {
+                        crate::components::builtin_plugin_editor_window::read_dropped_sample(
+                            &samples_dir,
+                            &path,
+                        )
+                    })
+                    .await;
+                let (name, bytes) = match stored {
+                    Ok(stored) => stored,
+                    Err(error) => {
+                        eprintln!("[SamplerRack] pad {pad}: {error}");
+                        return;
+                    }
+                };
+                use base64::Engine as _;
+                let command = SpherePluginHost::ipc::HostCommand::LoadBuiltinDrumSample {
+                    plugin_instance_id: insert_id.clone(),
+                    pad_index: pad as u32,
+                    name,
+                    audio_b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                };
+                match runtime.lock() {
+                    Ok(mut bridge) => {
+                        if let Err(error) = bridge.send_raw(&command) {
+                            eprintln!(
+                                "[SamplerRack] pad {pad} load not sent insert={insert_id}: {error}"
+                            );
+                        }
+                    }
+                    Err(_) => eprintln!("[SamplerRack] pad load dropped: bridge runtime poisoned"),
+                }
+            })
+            .detach();
         }
         #[cfg(not(feature = "builtin-plugin-editor"))]
-        let _ = path;
+        let _ = (insert_id, pad, path, cx);
     }
 }

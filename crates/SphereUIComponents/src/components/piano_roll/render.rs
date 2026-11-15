@@ -2587,17 +2587,34 @@ impl PianoRoll {
     }
 
     /// The Sampler Rack's row headers in place of the lane names, one per
-    /// track: its name (opens its instrument), its sample (loads one, or
-    /// takes a dropped file), mute, solo, volume and pan. "Add Sampler" sits
-    /// under the last row. Right-click a row for its pattern actions.
+    /// pad of the track's Drum Sampler: its name (opens the Drum Sampler), its
+    /// sample (loads one, or takes a dropped file), mute, solo, gain and pan,
+    /// all the pad's own. "+ Add Sampler" sits under the last row. Right-click
+    /// a row for its pattern actions.
     fn build_rack_lane(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         use crate::theme::{space, typography};
         let row_h = self.note_row_h();
         let (_, view_h) = self.grid_view_size();
+        let Some(target) = self.rack_target.clone() else {
+            // Another instrument: the rack is the Drum Sampler's pads.
+            return vec![div()
+                .absolute()
+                .left(px(space::SNUG))
+                .right(px(space::SNUG))
+                .top(px(space::SNUG))
+                .text_size(px(typography::DENSE_LABEL))
+                .text_color(Colors::text_muted())
+                .child(
+                    "The Sampler Rack plays the Drum Sampler on this track. \
+                     Its instrument is something else; use Drum Sampler mode.",
+                )
+                .into_any_element()];
+        };
         let hovered_row = self.step_hover.map(|(row, _)| row);
         let seam = Colors::with_alpha(Colors::text_primary(), 0.06);
         let band = Colors::with_alpha(Colors::surface_base(), 0.35);
         let drop_target = Colors::with_alpha(Colors::accent_primary(), 0.14);
+        let fader_fill = Colors::with_alpha(Colors::text_primary(), 0.65);
         let mut out: Vec<gpui::AnyElement> = Vec::new();
 
         let toggle = |id: (&'static str, usize), label: &'static str, on: bool, hue: gpui::Rgba| {
@@ -2623,7 +2640,7 @@ impl PianoRoll {
                 .child(label)
         };
         // A fader as a thin bar: dragged sideways, read by its fill.
-        let bar = |id: (&'static str, usize), width: f32, from: f32, to: f32, fill: gpui::Rgba| {
+        let bar = |id: (&'static str, usize), width: f32, from: f32, to: f32| {
             div()
                 .id(id)
                 .flex_none()
@@ -2647,7 +2664,7 @@ impl PianoRoll {
                                 .left(px(width * from.min(to)))
                                 .w(px((width * (to - from).abs()).max(1.0)))
                                 .rounded(px(2.0))
-                                .bg(fill),
+                                .bg(fader_fill),
                         ),
                 )
         };
@@ -2656,14 +2673,15 @@ impl PianoRoll {
             let Some(row) = self.rack_rows.get(index) else {
                 continue;
             };
+            let pad = row.pad;
+            let state = &row.state;
             let y = index as f32 * row_h - self.scroll_y;
-            let (sample, loads) = self.rack_sample_label(row, cx);
-            let track_id = row.track_id.clone();
             let lit = hovered_row == Some(index);
-            let volume_fill = Colors::with_alpha(Colors::text_primary(), 0.65);
-            let pan = row.pan.clamp(-1.0, 1.0);
+            let gain = ((state.gain_db + 60.0) / 72.0).clamp(0.0, 1.0);
+            let pan = state.pan.clamp(-1.0, 1.0);
+            let track_id = target.track_id.clone();
             let header = div()
-                .id(("pr-rack-row", index))
+                .id(("pr-rack-row", pad))
                 .absolute()
                 .left_0()
                 .right_0()
@@ -2678,223 +2696,165 @@ impl PianoRoll {
                 .when(index % 2 == 1, |b| b.bg(band))
                 .when(lit, |b| b.bg(Colors::state_hover()))
                 .drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(drop_target))
-                .on_drop(cx.listener({
-                    let track_id = track_id.clone();
-                    move |this, paths: &ExternalPaths, window, cx| {
-                        if let Some(path) = paths.paths().first() {
-                            this.send_rack_request(
-                                RackRequest::LoadSample {
-                                    track_id: track_id.clone(),
-                                    path: Some(path.clone()),
-                                },
-                                window,
-                                cx,
-                            );
-                        }
+                .on_drop(cx.listener(move |this, paths: &ExternalPaths, window, cx| {
+                    if let Some(path) = paths.paths().first() {
+                        this.load_rack_pad(pad, Some(path.clone()), window, cx);
                     }
                 }))
-                // Which track: its colour, as on its arrangement header.
+                // The pad's note, as the Drum Sampler numbers it.
                 .child(
                     div()
                         .flex_none()
-                        .w(px(3.0))
-                        .h(px((row_h - 6.0).max(4.0)))
-                        .rounded(px(1.5))
-                        .bg(row.color),
+                        .w(px(26.0))
+                        .text_size(px(typography::DENSE_CAPTION))
+                        .text_color(Colors::text_faint())
+                        .child(note_name(i32::from(state.note))),
                 )
                 .child(
                     div()
-                        .id(("pr-rack-name", index))
+                        .id(("pr-rack-name", pad))
                         .flex_1()
                         .min_w_0()
                         .overflow_hidden()
                         .whitespace_nowrap()
                         .text_ellipsis()
                         .text_size(px(typography::DENSE_LABEL))
-                        .text_color(if lit || row.solo {
+                        .text_color(if lit || state.solo {
                             Colors::text_primary()
                         } else {
                             Colors::text_secondary()
                         })
                         .cursor(gpui::CursorStyle::PointingHand)
-                        .tooltip(crate::components::controls::fb_tooltip(format!(
-                            "Open {}'s instrument",
-                            row.name
-                        )))
-                        .on_click(cx.listener({
-                            let track_id = track_id.clone();
-                            move |this, _: &gpui::ClickEvent, window, cx| {
-                                this.send_rack_request(
-                                    RackRequest::OpenEditor {
-                                        track_id: track_id.clone(),
-                                    },
-                                    window,
-                                    cx,
-                                );
-                            }
-                        }))
-                        .child(row.name.clone()),
-                )
-                .child(
-                    div()
-                        .id(("pr-rack-sample", index))
-                        .flex_none()
-                        .w(px(84.0))
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .text_size(px(typography::DENSE_CAPTION))
-                        .text_color(Colors::text_faint())
-                        .when(loads, |b| {
-                            b.cursor(gpui::CursorStyle::PointingHand)
-                                .hover(|s| s.text_color(Colors::text_secondary()))
-                                .tooltip(crate::components::controls::fb_tooltip(
-                                    "Load a sample (or drop an audio file on the row)",
-                                ))
-                                .on_click(cx.listener({
-                                    let track_id = track_id.clone();
-                                    move |this, _: &gpui::ClickEvent, window, cx| {
-                                        this.send_rack_request(
-                                            RackRequest::LoadSample {
-                                                track_id: track_id.clone(),
-                                                path: None,
-                                            },
-                                            window,
-                                            cx,
-                                        );
-                                    }
-                                }))
-                        })
-                        .child(sample),
-                )
-                .child(
-                    toggle(
-                        ("pr-rack-mute", index),
-                        "M",
-                        row.muted,
-                        Colors::state_mute(),
-                    )
-                    .tooltip(crate::components::controls::fb_tooltip("Mute"))
-                    .on_click(cx.listener({
-                        let track_id = track_id.clone();
-                        move |this, _: &gpui::ClickEvent, window, cx| {
-                            this.toggle_rack_row(&track_id, false, window, cx);
-                        }
-                    })),
-                )
-                .child(
-                    toggle(("pr-rack-solo", index), "S", row.solo, Colors::state_solo())
-                        .tooltip(crate::components::controls::fb_tooltip("Solo"))
-                        .on_click(cx.listener({
-                            let track_id = track_id.clone();
-                            move |this, _: &gpui::ClickEvent, window, cx| {
-                                this.toggle_rack_row(&track_id, true, window, cx);
-                            }
-                        })),
-                )
-                .child(
-                    bar(
-                        ("pr-rack-volume", index),
-                        36.0,
-                        0.0,
-                        row.volume,
-                        volume_fill,
-                    )
-                    .tooltip(crate::components::controls::fb_tooltip(format!(
-                        "Volume {:+.1} dB (drag sideways)",
-                        crate::components::timeline::timeline_state::volume::norm_to_db(row.volume)
-                    )))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener({
-                            let track_id = track_id.clone();
-                            move |this, ev: &MouseDownEvent, _w, cx| {
-                                cx.stop_propagation();
-                                this.begin_rack_mixer(
-                                    &track_id,
-                                    RackControl::Volume,
-                                    ev.position.x.into(),
-                                    cx,
-                                );
-                            }
-                        }),
-                    ),
-                )
-                .child(
-                    bar(
-                        ("pr-rack-pan", index),
-                        26.0,
-                        0.5,
-                        0.5 + pan * 0.5,
-                        volume_fill,
-                    )
-                    .tooltip(crate::components::controls::fb_tooltip(
-                        "Pan (drag sideways)",
-                    ))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener({
-                            let track_id = track_id.clone();
-                            move |this, ev: &MouseDownEvent, _w, cx| {
-                                cx.stop_propagation();
-                                this.begin_rack_mixer(
-                                    &track_id,
-                                    RackControl::Pan,
-                                    ev.position.x.into(),
-                                    cx,
-                                );
-                            }
-                        }),
-                    ),
-                );
-            out.push(header.into_any_element());
-        }
-
-        // A new row: another sampler track in this rack.
-        let add_y = self.rack_rows.len() as f32 * row_h - self.scroll_y;
-        if add_y < view_h {
-            let editing_track = self.editing_clip_id(cx).and_then(|clip_id| {
-                self.timeline
-                    .read(cx)
-                    .state
-                    .find_clip(&clip_id)
-                    .map(|(track, _)| track.id.clone())
-            });
-            if let Some(track_id) = editing_track {
-                out.push(
-                    div()
-                        .id("pr-rack-add")
-                        .absolute()
-                        .left(px(space::SNUG))
-                        .top(px(add_y + 2.0))
-                        .h(px((row_h - 4.0).max(14.0)))
-                        .px(px(space::SNUG))
-                        .flex()
-                        .items_center()
-                        .rounded(px(crate::theme::radius::CONTROL_SM))
-                        .text_size(px(typography::DENSE_LABEL))
-                        .text_color(Colors::text_secondary())
-                        .hover(|s| {
-                            s.bg(Colors::state_hover())
-                                .text_color(Colors::text_primary())
-                        })
-                        .cursor(gpui::CursorStyle::PointingHand)
                         .tooltip(crate::components::controls::fb_tooltip(
-                            "Add a row: a new track with the Quick Sampler, in this rack's group",
+                            "Open the Drum Sampler (this pad's sample, tune, filter and envelope)",
                         ))
                         .on_click(cx.listener(move |this, _: &gpui::ClickEvent, window, cx| {
                             this.send_rack_request(
-                                RackRequest::AddRow {
+                                RackRequest::OpenEditor {
                                     track_id: track_id.clone(),
                                 },
                                 window,
                                 cx,
                             );
                         }))
-                        .child("+ Add Sampler")
-                        .into_any_element(),
+                        .child(row.name()),
+                )
+                .child(
+                    div()
+                        .id(("pr-rack-sample", pad))
+                        .flex_none()
+                        .w(px(64.0))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_size(px(typography::DENSE_CAPTION))
+                        .text_color(Colors::text_faint())
+                        .cursor(gpui::CursorStyle::PointingHand)
+                        .hover(|s| s.text_color(Colors::text_secondary()))
+                        .tooltip(crate::components::controls::fb_tooltip(
+                            "Load a sample onto this pad (or drop an audio file on the row)",
+                        ))
+                        .on_click(cx.listener(move |this, _: &gpui::ClickEvent, window, cx| {
+                            this.load_rack_pad(pad, None, window, cx);
+                        }))
+                        .child(if state.sample.is_some() {
+                            "Replace…"
+                        } else {
+                            "Load sample"
+                        }),
+                )
+                .child(
+                    toggle(
+                        ("pr-rack-mute", pad),
+                        "M",
+                        state.muted,
+                        Colors::state_mute(),
+                    )
+                    .tooltip(crate::components::controls::fb_tooltip("Mute this pad"))
+                    .on_click(cx.listener(
+                        move |this, _: &gpui::ClickEvent, window, cx| {
+                            this.toggle_rack_pad(pad, PadControl::Mute, window, cx);
+                        },
+                    )),
+                )
+                .child(
+                    toggle(("pr-rack-solo", pad), "S", state.solo, Colors::state_solo())
+                        .tooltip(crate::components::controls::fb_tooltip("Solo this pad"))
+                        .on_click(cx.listener(move |this, _: &gpui::ClickEvent, window, cx| {
+                            this.toggle_rack_pad(pad, PadControl::Solo, window, cx);
+                        })),
+                )
+                .child(
+                    bar(("pr-rack-gain", pad), 34.0, 0.0, gain)
+                        .tooltip(crate::components::controls::fb_tooltip(format!(
+                            "Gain {:+.1} dB (drag sideways)",
+                            state.gain_db
+                        )))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
+                                cx.stop_propagation();
+                                this.begin_rack_mixer(
+                                    pad,
+                                    PadControl::Gain,
+                                    ev.position.x.into(),
+                                    cx,
+                                );
+                            }),
+                        ),
+                )
+                .child(
+                    bar(("pr-rack-pan", pad), 26.0, 0.5, 0.5 + pan * 0.5)
+                        .tooltip(crate::components::controls::fb_tooltip(
+                            "Pan (drag sideways)",
+                        ))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
+                                cx.stop_propagation();
+                                this.begin_rack_mixer(
+                                    pad,
+                                    PadControl::Pan,
+                                    ev.position.x.into(),
+                                    cx,
+                                );
+                            }),
+                        ),
                 );
-            }
+            out.push(header.into_any_element());
+        }
+
+        // Another sampler in this track: the next free pad.
+        let add_y = self.rack_rows.len() as f32 * row_h - self.scroll_y;
+        let room = sampler_rack::next_free_pad(&self.rack_rows, sampler_rack::PAD_COUNT).is_some();
+        if add_y < view_h && room {
+            out.push(
+                div()
+                    .id("pr-rack-add")
+                    .absolute()
+                    .left(px(space::SNUG))
+                    .top(px(add_y + 2.0))
+                    .h(px((row_h - 4.0).max(14.0)))
+                    .px(px(space::SNUG))
+                    .flex()
+                    .items_center()
+                    .rounded(px(crate::theme::radius::CONTROL_SM))
+                    .text_size(px(typography::DENSE_LABEL))
+                    .text_color(Colors::text_secondary())
+                    .hover(|s| {
+                        s.bg(Colors::state_hover())
+                            .text_color(Colors::text_primary())
+                    })
+                    .cursor(gpui::CursorStyle::PointingHand)
+                    .tooltip(crate::components::controls::fb_tooltip(
+                        "Add a sampler: the next free pad of this track's Drum Sampler",
+                    ))
+                    .on_click(cx.listener(move |this, _: &gpui::ClickEvent, window, cx| {
+                        this.add_rack_pad(window, cx);
+                    }))
+                    .child("+ Add Sampler")
+                    .into_any_element(),
+            );
         }
 
         // A fader drag follows the pointer anywhere in the window.
@@ -4396,29 +4356,11 @@ impl PianoRoll {
                 continue;
             };
             let pitch = target.pitch;
-            // In the rack every row is its own track: its own clip, drawn in
-            // its own colour.
-            let (track_color, slab) = match self.rack_rows.get(row).filter(|_| rack) {
-                Some(rack_row) => {
-                    let mut faint = rack_row.color;
-                    faint.a = 0.22;
-                    (rack_row.color, faint)
-                }
-                None => (track_color, slab),
-            };
-            // A muted rack row plays nothing: its steps read like muted notes.
-            let row_muted = rack && self.rack_rows.get(row).is_some_and(|r| r.muted);
+            // A muted pad plays nothing: its steps read like muted notes.
+            let row_muted = rack && self.rack_rows.get(row).is_some_and(|r| r.state.muted);
             let y = row as f32 * row_h - self.scroll_y + gap;
             let h = (row_h - 2.0 * gap).max(1.0);
-            let cells = if rack {
-                target
-                    .clip_id
-                    .as_deref()
-                    .map(|id| step_grid::lane_cells(&self.clip_notes(id, cx), pitch, step))
-                    .unwrap_or_default()
-            } else {
-                step_grid::lane_cells(&notes, pitch, step)
-            };
+            let cells = step_grid::lane_cells(&notes, pitch, step);
             for index in first_step..last_step {
                 let line_x = self.clip_beat_to_x(index as f32 * step) + gap * 0.5;
                 let w = (step_w - gap).max(1.0);
