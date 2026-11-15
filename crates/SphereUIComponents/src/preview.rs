@@ -2335,10 +2335,13 @@ fn midi_steps_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHan
                     state.add_midi_note(&clip, 36, kick, 0.25, 118);
                 }
                 state.add_midi_note(&clip, 38, 1.0, 0.25, 104);
-                // A ×4 snare roll on the last step of the bar.
-                for hit in 0..4 {
-                    state.add_midi_note(&clip, 38, 3.75 + hit as f32 * 0.0625, 0.0625, 96);
+                // A ×4 snare roll on the last step of the bar, building up:
+                // each slice's bar shows its own velocity.
+                for (hit, velocity) in [52u8, 72, 94, 120].into_iter().enumerate() {
+                    state.add_midi_note(&clip, 38, 3.75 + hit as f32 * 0.0625, 0.0625, velocity);
                 }
+                // A kick nudged a little late for groove (Ctrl-drag).
+                state.add_midi_note(&clip, 36, 3.03, 0.25, 110);
                 for step in 0..8 {
                     let accent = if step % 2 == 0 { 96 } else { 60 };
                     state.add_midi_note(&clip, 42, step as f32 * 0.5, 0.25, accent);
@@ -2357,6 +2360,7 @@ fn midi_steps_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHan
             roll.set_step_mode(true, cx);
             roll.set_drum_lanes(DrumLanes::Used, cx);
             roll.set_step_repeat(4, cx);
+            roll.preview_hover_step(38, 15);
             roll
         })
     })?;

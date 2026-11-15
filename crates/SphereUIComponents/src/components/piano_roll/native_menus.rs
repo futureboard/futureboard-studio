@@ -9,7 +9,7 @@
 
 use gpui::{Context, Window};
 
-use super::{plural, CcCurveKind, PianoRoll, VelocityOperation};
+use super::{plural, CcCurveKind, LaneAction, PianoRoll, VelocityOperation};
 use crate::native_popup_menu::{self, PopupItem};
 
 fn command(label: impl Into<String>, id: impl Into<String>, checked: bool) -> PopupItem {
@@ -57,6 +57,38 @@ impl PianoRoll {
                     cx.notify();
                 });
             }),
+        )
+    }
+
+    /// A drum lane's menu: quick pattern actions on that lane's steps.
+    pub(super) fn open_native_lane_menu(
+        &mut self,
+        pitch: u8,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let items = vec![
+            PopupItem::Header(self.drum_lane_name(pitch).to_string()),
+            command("Fill Every 2 Steps", "fill:2", false),
+            command("Fill Every 4 Steps", "fill:4", false),
+            command("Randomize Velocity (±15%)", "random", false),
+            PopupItem::Separator,
+            command("Clear Row", "clear", false),
+        ];
+        self.show_native_menu(
+            items,
+            move |editor, chosen, cx| {
+                let action = match chosen {
+                    "fill:2" => LaneAction::FillEvery(2),
+                    "fill:4" => LaneAction::FillEvery(4),
+                    "random" => LaneAction::RandomizeVelocity,
+                    "clear" => LaneAction::Clear,
+                    _ => return,
+                };
+                editor.run_lane_action(pitch, action, cx);
+            },
+            window,
+            cx,
         )
     }
 

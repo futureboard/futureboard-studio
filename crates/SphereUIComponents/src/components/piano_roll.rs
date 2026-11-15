@@ -1221,6 +1221,17 @@ impl GridRes {
     }
 }
 
+/// A drum lane menu row: a quick pattern action on one lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LaneAction {
+    /// Fill every N-th step that is empty.
+    FillEvery(usize),
+    /// Take every hit of the lane out.
+    Clear,
+    /// Move each hit's velocity by up to ±15% of itself.
+    RandomizeVelocity,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PianoSelectMenu {
     Grid,
@@ -1308,6 +1319,10 @@ impl VelocityCurve {
 #[derive(Debug, Clone)]
 enum PianoDrag {
     None,
+    /// A press-drag in the step view: paint, clear, erase, velocity ramp or
+    /// nudge. Its edits are written live and recorded as one undo entry on
+    /// release (see [`step_grid::StepDrag`]).
+    Steps(step_grid::StepDrag),
     /// Move the selected notes. `prev` snapshots each affected note's original
     /// (id, start, pitch); `ids` is the same set, hashed, so the per-note
     /// geometry lookup every frame is O(1) rather than a scan of `prev`.
@@ -1584,6 +1599,12 @@ pub struct PianoRoll {
     /// Whether the clip being edited is on a DrumStep track, so the view
     /// switches only when the editor moves to a track of the other kind.
     on_drum_step_track: bool,
+    /// The step under the pointer in the step view: `(pitch, step index)`.
+    /// Lights its row and its velocity stalks.
+    step_hover: Option<(u8, usize)>,
+    /// The drawn lane menu (platforms without native popup menus): the lane's
+    /// pitch and where it opened, window space.
+    open_lane_menu: Option<(u8, gpui::Point<Pixels>)>,
     /// Which lanes drum mode lists.
     drum_lanes: DrumLanes,
     /// Which way the lanes run: kick at the top, or reversed.
@@ -1912,6 +1933,8 @@ impl PianoRoll {
             step_mode: false,
             step_repeat: 1,
             on_drum_step_track: false,
+            step_hover: None,
+            open_lane_menu: None,
             drum_lanes: DrumLanes::Kit,
             drum_order: DrumOrder::LowFirst,
             drum_hover_lane: None,
@@ -2082,7 +2105,9 @@ impl PianoRoll {
             | PianoDrag::CcSelect { .. }
             | PianoDrag::ArtMove { .. }
             | PianoDrag::RulerSeek
-            | PianoDrag::Pan { .. } => false,
+            | PianoDrag::Pan { .. }
+            // A step gesture's notes are its own to add and remove.
+            | PianoDrag::Steps(_) => false,
             PianoDrag::Move { prev, ids, .. } => {
                 prev.retain(|(id, _, _)| valid_note_ids.contains(id));
                 ids.retain(|id| valid_note_ids.contains(id));
@@ -2232,6 +2257,7 @@ impl PianoRoll {
                 }
             }
             PianoDrag::Pan { .. } => "Pan".to_string(),
+            PianoDrag::Steps(_) => self.drag_value_status.clone().unwrap_or(pointer),
             PianoDrag::None => self.hover_note_status.clone().unwrap_or(pointer),
         }
     }
@@ -2890,82 +2916,492 @@ impl PianoRoll {
         }
     }
 
-    /// Fills or clears the step under (`lx`, `ly`). `apply_repeat` (Alt)
-    /// rewrites a filled step with the current repeat count instead of
-    /// clearing it. One undo entry either way.
-    fn press_step(&mut self, lx: f32, ly: f32, apply_repeat: bool, cx: &mut Context<Self>) {
-        let Some(clip_id) = self.editing_clip_id(cx) else {
-            return;
-        };
-        let Some(pitch) =
-            drum_map::drum_row_at(&self.drum_rows, ly, self.scroll_y, self.note_row_h())
-        else {
-            return;
-        };
-        let step = self.step_view_beats();
-        let Some(index) = step_grid::step_index(self.x_to_clip_beat(lx), step) else {
-            return;
-        };
-        let notes: Vec<MidiNoteState> = self
+    /// The edited clip's notes, owned, and its id.
+    fn step_clip_notes(&self, cx: &Context<Self>) -> Option<(String, Vec<MidiNoteState>)> {
+        let clip_id = self.editing_clip_id(cx)?;
+        let notes = self
             .timeline
             .read(cx)
             .state
             .midi_clip_notes(&clip_id)
             .map(|notes| notes.to_vec())
             .unwrap_or_default();
-        let cell = step_grid::lane_cells(&notes, pitch, step)
-            .into_iter()
-            .find(|cell| cell.index == index);
-        let removed: Vec<MidiNoteState> = cell
-            .as_ref()
-            .map(|cell| {
-                notes
-                    .iter()
-                    .filter(|n| cell.ids.contains(&n.id))
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default();
-        let (label, added) = match &cell {
-            None => {
-                let channel = self.active_note_channel(cx);
-                self.begin_preview_note(pitch, step_grid::STEP_VELOCITY, "step_add", cx);
-                (
-                    "Add Step",
-                    step_grid::step_notes(
-                        pitch,
-                        index,
-                        step,
-                        self.step_repeat,
-                        step_grid::STEP_VELOCITY,
-                        channel,
-                    ),
-                )
+        Some((clip_id, notes))
+    }
+
+    /// How many steps the edited clip holds at the step view's step length.
+    fn step_total(&self, cx: &Context<Self>) -> usize {
+        let clip_len = self
+            .editing_clip_id(cx)
+            .and_then(|clip_id| self.timeline.read(cx).state.clip_duration_beats(&clip_id))
+            .unwrap_or(0.0);
+        step_grid::step_count(clip_len, self.step_view_beats())
+    }
+
+    /// The lane and step under grid point (`lx`, `ly`).
+    fn step_at(&self, lx: f32, ly: f32) -> Option<(u8, usize)> {
+        let pitch = drum_map::drum_row_at(&self.drum_rows, ly, self.scroll_y, self.note_row_h())?;
+        let index = step_grid::step_index(self.x_to_clip_beat(lx), self.step_view_beats())?;
+        Some((pitch, index))
+    }
+
+    /// Writes a step edit to the clip without recording it: the gesture
+    /// records itself once, on release.
+    fn write_steps_live(
+        &mut self,
+        clip_id: &str,
+        removed: &[MidiNoteState],
+        added: &[MidiNoteState],
+        changed: &[MidiNoteState],
+        cx: &mut Context<Self>,
+    ) {
+        let clip_id = clip_id.to_string();
+        let removed_ids: Vec<u64> = removed.iter().map(|n| n.id).collect();
+        let added = added.to_vec();
+        let changed = changed.to_vec();
+        self.with_timeline_silent(cx, |tl, _| {
+            tl.state.delete_midi_notes(&clip_id, &removed_ids);
+            if let Some(notes) = tl.state.midi_clip_notes_mut(&clip_id) {
+                for note in added {
+                    if !notes.iter().any(|n| n.id == note.id) {
+                        notes.push(note);
+                    }
+                }
             }
-            Some(cell) if apply_repeat => (
-                "Repeat Step",
-                step_grid::step_notes(
+            if !changed.is_empty() {
+                tl.state.overwrite_midi_notes(&clip_id, &changed);
+            }
+        });
+    }
+
+    /// A press in the step view. Left: fill the step (or clear it, when it is
+    /// filled) and keep doing so along the row while dragging. Right: erase
+    /// what the pointer crosses. Alt: ramp the row's velocities. Ctrl/Cmd:
+    /// nudge the step early or late. Shift: give the step the current repeat
+    /// count.
+    fn begin_step_gesture(
+        &mut self,
+        lx: f32,
+        ly: f32,
+        modifiers: gpui::Modifiers,
+        right: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((pitch, index)) = self.step_at(lx, ly) else {
+            return;
+        };
+        let Some((clip_id, notes)) = self.step_clip_notes(cx) else {
+            return;
+        };
+        let step = self.step_view_beats();
+        if index >= self.step_total(cx) {
+            return;
+        }
+        let cell = step_grid::cell_at(&notes, pitch, index, step);
+        let beat = self.x_to_clip_beat(lx);
+        let drag = |gesture| step_grid::StepDrag::new(gesture, pitch, index, ly, beat);
+
+        if right {
+            let mut session = drag(step_grid::StepGesture::Erase);
+            let removed = step_grid::clear_steps(&notes, pitch, &[index], step);
+            self.write_steps_live(&clip_id, &removed, &[], &[], cx);
+            session.take_out(removed);
+            self.drag = PianoDrag::Steps(session);
+            cx.notify();
+            return;
+        }
+        if modifiers.shift {
+            // One step rewritten with the current repeat count, at its own
+            // velocity: a single edit, nothing to drag.
+            if let Some(cell) = cell {
+                let removed = step_grid::notes_with(&notes, &cell.ids);
+                let added = step_grid::step_notes(
                     pitch,
                     index,
                     step,
                     self.step_repeat,
                     cell.velocity,
                     cell.channel,
-                ),
-            ),
-            Some(_) => ("Clear Step", Vec::new()),
+                );
+                self.selection
+                    .retain(|id| !removed.iter().any(|n| n.id == *id));
+                self.run_edit_command(
+                    EditCommand::ReplaceMidiNotes {
+                        label: "Repeat Step",
+                        clip_id,
+                        removed,
+                        added,
+                    },
+                    cx,
+                );
+            }
+            cx.notify();
+            return;
+        }
+        if modifiers.alt {
+            let from_velocity = cell
+                .as_ref()
+                .map(|cell| cell.velocity)
+                .unwrap_or(step_grid::STEP_VELOCITY);
+            let mut session = drag(step_grid::StepGesture::VelocityRamp { from_velocity });
+            session.prev = notes.iter().filter(|n| n.pitch == pitch).cloned().collect();
+            self.drag = PianoDrag::Steps(session);
+            cx.notify();
+            return;
+        }
+        if modifiers.control || modifiers.platform {
+            // Only a played step has anything to nudge.
+            let Some(cell) = cell else {
+                return;
+            };
+            let mut session = drag(step_grid::StepGesture::Nudge {
+                offset: cell.offset,
+            });
+            session.prev = step_grid::notes_with(&notes, &cell.ids);
+            self.drag = PianoDrag::Steps(session);
+            cx.notify();
+            return;
+        }
+        match cell {
+            Some(_) => {
+                let mut session = drag(step_grid::StepGesture::Clear);
+                let removed = step_grid::clear_steps(&notes, pitch, &[index], step);
+                self.selection
+                    .retain(|id| !removed.iter().any(|n| n.id == *id));
+                self.write_steps_live(&clip_id, &removed, &[], &[], cx);
+                session.take_out(removed);
+                self.drag = PianoDrag::Steps(session);
+            }
+            None => {
+                let mut session = drag(step_grid::StepGesture::Paint);
+                let channel = self.active_note_channel(cx);
+                let added = step_grid::paint_steps(
+                    &notes,
+                    pitch,
+                    &[index],
+                    self.step_total(cx),
+                    step,
+                    self.step_repeat,
+                    channel,
+                );
+                self.write_steps_live(&clip_id, &[], &added, &[], cx);
+                session.added.extend(added);
+                self.begin_preview_note(pitch, step_grid::STEP_VELOCITY, "step_paint", cx);
+                self.drag = PianoDrag::Steps(session);
+            }
+        }
+        cx.notify();
+    }
+
+    /// The pointer moved during a step gesture: carry it on to (`lx`, `ly`).
+    fn update_step_gesture(&mut self, lx: f32, ly: f32, cx: &mut Context<Self>) {
+        let PianoDrag::Steps(session) = &self.drag else {
+            return;
         };
-        self.selection
-            .retain(|id| !removed.iter().any(|n| n.id == *id));
-        self.run_edit_command(
-            EditCommand::ReplaceMidiNotes {
-                label,
-                clip_id,
-                removed,
-                added,
-            },
+        let mut session = session.clone();
+        let Some((clip_id, notes)) = self.step_clip_notes(cx) else {
+            return;
+        };
+        let step = self.step_view_beats();
+        let steps = self.step_total(cx);
+        let beat = self.x_to_clip_beat(lx);
+        let index = step_grid::step_index(beat, step)
+            .unwrap_or(0)
+            .min(steps.saturating_sub(1));
+        match session.gesture.clone() {
+            step_grid::StepGesture::Paint => {
+                let channel = self.active_note_channel(cx);
+                let crossed = session.crossed(index);
+                let added = step_grid::paint_steps(
+                    &notes,
+                    session.pitch,
+                    &crossed,
+                    steps,
+                    step,
+                    self.step_repeat,
+                    channel,
+                );
+                self.write_steps_live(&clip_id, &[], &added, &[], cx);
+                session.added.extend(added);
+                session.last_index = index;
+            }
+            step_grid::StepGesture::Clear => {
+                let crossed = session.crossed(index);
+                let removed = step_grid::clear_steps(&notes, session.pitch, &crossed, step);
+                self.selection
+                    .retain(|id| !removed.iter().any(|n| n.id == *id));
+                self.write_steps_live(&clip_id, &removed, &[], &[], cx);
+                session.take_out(removed);
+                session.last_index = index;
+            }
+            step_grid::StepGesture::Erase => {
+                // Any row: whatever lane is under the pointer now.
+                if let Some(pitch) =
+                    drum_map::drum_row_at(&self.drum_rows, ly, self.scroll_y, self.note_row_h())
+                {
+                    let indices = if pitch == session.pitch {
+                        session.crossed(index)
+                    } else {
+                        vec![index]
+                    };
+                    let removed = step_grid::clear_steps(&notes, pitch, &indices, step);
+                    self.selection
+                        .retain(|id| !removed.iter().any(|n| n.id == *id));
+                    self.write_steps_live(&clip_id, &removed, &[], &[], cx);
+                    session.take_out(removed);
+                    session.pitch = pitch;
+                    session.last_index = index;
+                }
+            }
+            step_grid::StepGesture::VelocityRamp { from_velocity } => {
+                let to_velocity = step_grid::ramp_target(from_velocity, session.start_y, ly);
+                let next = step_grid::ramp_velocities(
+                    &session.prev,
+                    session.pitch,
+                    step,
+                    session.start_index,
+                    index,
+                    from_velocity,
+                    to_velocity,
+                );
+                self.write_steps_live(&clip_id, &[], &[], &next, cx);
+                self.drag_value_status = Some(format!("Velocity {from_velocity} → {to_velocity}"));
+            }
+            step_grid::StepGesture::Nudge { offset } => {
+                let cells = step_grid::lane_cells(&session.prev, session.pitch, step);
+                if let Some(cell) = cells.first() {
+                    let target = offset + (beat - session.start_beat);
+                    let next = step_grid::nudged(&session.prev, cell, step, target);
+                    let applied = next
+                        .first()
+                        .map(|n| n.start - cell.index as f32 * step)
+                        .unwrap_or(0.0);
+                    self.write_steps_live(&clip_id, &[], &[], &next, cx);
+                    self.drag_value_status =
+                        Some(format!("Nudge {:+.0}% of a step", applied / step * 100.0));
+                }
+            }
+        }
+        self.drag = PianoDrag::Steps(session);
+        cx.notify();
+    }
+
+    /// Every pointer move while a step gesture is held, window-wide: a velocity
+    /// ramp is dragged up past the grid's top edge, and a paint or erase may
+    /// overshoot the end of the clip. A move with no button held means the
+    /// release happened where no listener saw it, so the gesture ends there.
+    pub(super) fn on_step_pointer_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if !matches!(self.drag, PianoDrag::Steps(_)) {
+            return;
+        }
+        if event.pressed_button.is_none() {
+            self.on_step_pointer_up(cx);
+            return;
+        }
+        if let Some((lx, ly)) = self.grid_local(event.position) {
+            self.update_step_gesture(lx, ly, cx);
+        }
+    }
+
+    /// The release of a step gesture, wherever it happens.
+    pub(super) fn on_step_pointer_up(&mut self, cx: &mut Context<Self>) {
+        if let PianoDrag::Steps(session) = std::mem::replace(&mut self.drag, PianoDrag::None) {
+            self.end_preview_note("step_release", cx);
+            self.finish_step_gesture(session, cx);
+        }
+    }
+
+    /// The release: record the gesture as one undo entry.
+    fn finish_step_gesture(&mut self, session: step_grid::StepDrag, cx: &mut Context<Self>) {
+        self.drag_value_status = None;
+        let Some((clip_id, notes)) = self.step_clip_notes(cx) else {
+            return;
+        };
+        let command = match session.gesture {
+            step_grid::StepGesture::Paint
+            | step_grid::StepGesture::Clear
+            | step_grid::StepGesture::Erase => {
+                if session.removed.is_empty() && session.added.is_empty() {
+                    None
+                } else {
+                    Some(EditCommand::ReplaceMidiNotes {
+                        label: match session.gesture {
+                            step_grid::StepGesture::Paint => "Paint Steps",
+                            step_grid::StepGesture::Clear => "Clear Steps",
+                            _ => "Erase Steps",
+                        },
+                        clip_id,
+                        removed: session.removed,
+                        added: session.added,
+                    })
+                }
+            }
+            step_grid::StepGesture::VelocityRamp { .. } | step_grid::StepGesture::Nudge { .. } => {
+                // `next` in `prev`'s order, so an unchanged gesture compares
+                // equal and records nothing. A note gone since the press has
+                // no `next`; it is left out of both.
+                let (prev, next): (Vec<MidiNoteState>, Vec<MidiNoteState>) = session
+                    .prev
+                    .into_iter()
+                    .filter_map(|before| {
+                        let now = notes.iter().find(|n| n.id == before.id)?.clone();
+                        Some((before, now))
+                    })
+                    .unzip();
+                (prev != next).then_some(EditCommand::TransformMidiNotes {
+                    label: if matches!(session.gesture, step_grid::StepGesture::VelocityRamp { .. })
+                    {
+                        "Velocity Ramp"
+                    } else {
+                        "Nudge Step"
+                    },
+                    clip_id,
+                    prev,
+                    next,
+                    prev_clip_beats: None,
+                    next_clip_beats: None,
+                })
+            }
+        };
+        if let Some(command) = command {
+            self.timeline.update(cx, |tl, tcx| {
+                tl.record_executed_command(command, tcx);
+            });
+        }
+        cx.notify();
+    }
+
+    /// A step gesture interrupted (Escape, focus lost): put the clip back as
+    /// it was before the press, with nothing recorded.
+    fn revert_step_gesture(&mut self, session: &step_grid::StepDrag, cx: &mut Context<Self>) {
+        let Some(clip_id) = self.editing_clip_id(cx) else {
+            return;
+        };
+        // The inverse of the live writes: what was added goes, what was taken
+        // out comes back, what was changed returns to its snapshot.
+        self.write_steps_live(
+            &clip_id,
+            &session.added,
+            &session.removed,
+            &session.prev,
             cx,
         );
+    }
+
+    /// Keeps the hovered step current; repaints only when it changes.
+    fn update_step_hover(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        let (view_w, view_h) = self.grid_view_size();
+        let hover = if self.step_mode && matches!(self.drag, PianoDrag::None | PianoDrag::Steps(_))
+        {
+            self.grid_local(position)
+                .filter(|(lx, ly)| *lx >= 0.0 && *ly >= 0.0 && *lx < view_w && *ly < view_h)
+                .and_then(|(lx, ly)| self.step_at(lx, ly))
+        } else {
+            None
+        };
+        if hover != self.step_hover {
+            self.step_hover = hover;
+            cx.notify();
+        }
+    }
+
+    /// The ids of the notes of the hovered step, for the velocity lane.
+    pub(super) fn hovered_step_ids(&self, cx: &Context<Self>) -> Vec<u64> {
+        let Some((pitch, index)) = self.step_hover else {
+            return Vec::new();
+        };
+        let Some(clip_id) = self.editing_clip_id(cx) else {
+            return Vec::new();
+        };
+        self.timeline
+            .read(cx)
+            .state
+            .midi_clip_notes(&clip_id)
+            .and_then(|notes| step_grid::cell_at(notes, pitch, index, self.step_view_beats()))
+            .map(|cell| cell.ids)
+            .unwrap_or_default()
+    }
+
+    /// One of the drum lane menu's row actions on lane `pitch`. One undo
+    /// entry each.
+    pub(super) fn run_lane_action(
+        &mut self,
+        pitch: u8,
+        action: LaneAction,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_lane_menu = None;
+        let Some((clip_id, notes)) = self.step_clip_notes(cx) else {
+            return;
+        };
+        let step = self.step_view_beats();
+        let steps = self.step_total(cx);
+        let row: Vec<MidiNoteState> = notes.iter().filter(|n| n.pitch == pitch).cloned().collect();
+        let channel = self.active_note_channel(cx);
+        let command = match action {
+            LaneAction::FillEvery(every) => {
+                let added = step_grid::fill_every(
+                    &notes,
+                    pitch,
+                    every,
+                    steps,
+                    step,
+                    self.step_repeat,
+                    channel,
+                );
+                (!added.is_empty()).then(|| EditCommand::ReplaceMidiNotes {
+                    label: match every {
+                        2 => "Fill Every 2 Steps",
+                        4 => "Fill Every 4 Steps",
+                        _ => "Fill Steps",
+                    },
+                    clip_id,
+                    removed: Vec::new(),
+                    added,
+                })
+            }
+            LaneAction::Clear => (!row.is_empty()).then(|| {
+                self.selection.retain(|id| !row.iter().any(|n| n.id == *id));
+                EditCommand::ReplaceMidiNotes {
+                    label: "Clear Row",
+                    clip_id,
+                    removed: row.clone(),
+                    added: Vec::new(),
+                }
+            }),
+            LaneAction::RandomizeVelocity => {
+                let next = step_grid::randomized_velocities(&row, rand::random());
+                (next != row).then(|| EditCommand::TransformMidiNotes {
+                    label: "Randomize Velocity",
+                    clip_id,
+                    prev: row.clone(),
+                    next,
+                    prev_clip_beats: None,
+                    next_clip_beats: None,
+                })
+            }
+        };
+        if let Some(command) = command {
+            self.run_edit_command(command, cx);
+        }
+        cx.notify();
+    }
+
+    /// Right-click on a drum lane's name: its row actions, as a native menu
+    /// where the platform has one and the drawn one otherwise.
+    pub(super) fn open_lane_menu_at(
+        &mut self,
+        pitch: u8,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_note_menu = None;
+        self.open_select_menu = None;
+        if self.open_native_lane_menu(pitch, window, cx) {
+            return;
+        }
+        self.open_lane_menu = Some((pitch, position));
         cx.notify();
     }
 
@@ -3063,6 +3499,14 @@ impl PianoRoll {
     /// Light a lane as if the pointer were on it, for a still render.
     #[cfg(feature = "ui-preview")]
     pub fn preview_hover_drum_lane(&mut self, pitch: u8) {
+        self.drum_hover_lane = Some(pitch);
+    }
+
+    /// Hover a step as if the pointer were on it, for a still render: its
+    /// outline, its lane and its velocity stalks.
+    #[cfg(feature = "ui-preview")]
+    pub fn preview_hover_step(&mut self, pitch: u8, index: usize) {
+        self.step_hover = Some((pitch, index));
         self.drum_hover_lane = Some(pitch);
     }
 
@@ -3380,6 +3824,11 @@ impl PianoRoll {
                         tl.state.set_midi_articulations(&clip_id, prev);
                     });
                 }
+            }
+            PianoDrag::Steps(session) => {
+                let session = session.clone();
+                self.revert_step_gesture(&session, cx);
+                self.drag_value_status = None;
             }
             _ => {}
         }
@@ -4195,10 +4644,10 @@ impl PianoRoll {
             return;
         };
 
-        // The step view: a click fills or clears the step under it, whatever
-        // the tool; Alt rewrites a filled step with the current repeat count.
+        // The step view: every left press is a step gesture, whatever the
+        // tool (see `begin_step_gesture`).
         if self.step_mode {
-            self.press_step(lx, ly, event.modifiers.alt, cx);
+            self.begin_step_gesture(lx, ly, event.modifiers, false, cx);
             return;
         }
 
@@ -4286,6 +4735,10 @@ impl PianoRoll {
         let Some((lx, ly)) = self.grid_local(event.position) else {
             return;
         };
+        if self.step_mode {
+            self.begin_step_gesture(lx, ly, event.modifiers, true, cx);
+            return;
+        }
         let Some(clip_id) = self.editing_clip_id(cx) else {
             return;
         };
@@ -5084,6 +5537,12 @@ impl PianoRoll {
 
     fn on_move(&mut self, event: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
         self.update_drum_hover(event.position, cx);
+        self.update_step_hover(event.position, cx);
+        // A step gesture follows the pointer from a window-level listener
+        // (`on_step_pointer_move`), so it keeps tracking past the grid's edge.
+        if matches!(self.drag, PianoDrag::Steps(_)) {
+            return;
+        }
         // Piano-key lane drag-scrub: audition whichever key is under the cursor.
         // Driven from this root-level move handler (not a per-key one) so fast
         // vertical drags keep tracking even as the cursor crosses key edges. It
@@ -5323,7 +5782,7 @@ impl PianoRoll {
         let snap_enabled = self.snap_on && !self.grid_res.is_free();
         let snap_step = self.step_beats();
         match &mut self.drag {
-            PianoDrag::None => {}
+            PianoDrag::None | PianoDrag::Steps(_) => {}
             PianoDrag::Move { .. } | PianoDrag::Resize { .. } => {}
             PianoDrag::Stretch {
                 start_x,
@@ -5473,6 +5932,12 @@ impl PianoRoll {
         if self.end_cc_drag(cx) {
             return;
         }
+        if matches!(self.drag, PianoDrag::Steps(_)) {
+            // The same release as the window-level listener's, whichever
+            // sees it first: it also ends the paint's audition note.
+            self.on_step_pointer_up(cx);
+            return;
+        }
         if matches!(self.drag, PianoDrag::ArtMove { .. }) {
             self.drag = PianoDrag::None;
             self.drag_value_status = None;
@@ -5522,7 +5987,7 @@ impl PianoRoll {
             return;
         };
         match drag {
-            PianoDrag::None => return,
+            PianoDrag::None | PianoDrag::Steps(_) => return,
             PianoDrag::Move {
                 prev,
                 travel,
@@ -5801,7 +6266,9 @@ impl PianoRoll {
             }
             "escape" => {
                 cx.stop_propagation();
-                if self.open_note_menu.take().is_some() || self.open_velocity_menu.take().is_some()
+                if self.open_note_menu.take().is_some()
+                    || self.open_velocity_menu.take().is_some()
+                    || self.open_lane_menu.take().is_some()
                 {
                     cx.notify();
                 } else if !matches!(self.drag, PianoDrag::None) {
@@ -8794,5 +9261,317 @@ mod click_vs_drag_tests {
         assert_eq!(rows, -1);
         assert_eq!((beats, rows), grab.delta_to(now));
         assert!(!move_release_is_click(travel));
+    }
+}
+
+/// The step view's gestures driven through real mouse events on a window:
+/// what a user's press, drag and release do to the clip, and that each is one
+/// undo entry.
+#[cfg(test)]
+mod step_view_gesture_tests {
+    use super::*;
+    use gpui::{Modifiers, TestAppContext, VisualTestContext, WindowHandle};
+
+    const KICK: u8 = 36;
+    const SNARE: u8 = 38;
+    const HAT: u8 = 42;
+
+    struct Rig {
+        window: WindowHandle<PianoRoll>,
+        cx: VisualTestContext,
+    }
+
+    /// A four-beat clip in the step view, with `notes` as `(pitch, start,
+    /// velocity)`.
+    fn rig(cx: &mut TestAppContext, notes: &[(u8, f32, u8)]) -> Rig {
+        let notes = notes.to_vec();
+        let window = cx.open_window(gpui::size(px(1200.0), px(760.0)), move |_, cx| {
+            let timeline = cx.new(|_| {
+                let mut timeline = Timeline::new();
+                let state = &mut timeline.state;
+                let track = state.create_midi_track();
+                let clip = state.create_midi_clip(&track, 0.0, 4.0).expect("clip");
+                for (pitch, start, velocity) in &notes {
+                    state.add_midi_note(&clip, *pitch, *start, 0.25, *velocity);
+                }
+                state.select_clip(&clip);
+                timeline
+            });
+            let mut roll = PianoRoll::new(timeline, cx);
+            roll.set_step_mode(true, cx);
+            roll
+        });
+        cx.run_until_parked();
+        // Opening fits the view to the notes; put the clip's first step and
+        // the kit's first lanes on screen so every test can address them.
+        window
+            .update(cx, |roll, _, cx| {
+                roll.scroll_x = 0.0;
+                roll.scroll_y = 0.0;
+                cx.notify();
+            })
+            .expect("window");
+        cx.run_until_parked();
+        let cx = VisualTestContext::from_window(window.into(), cx);
+        Rig { window, cx }
+    }
+
+    impl Rig {
+        /// Window position of the middle of step `index` on lane `pitch`,
+        /// moved by `dx`/`dy` pixels.
+        fn at(&mut self, pitch: u8, index: usize, dx: f32, dy: f32) -> gpui::Point<Pixels> {
+            self.window
+                .update(&mut self.cx, |roll, _, _| {
+                    let bounds = roll.grid_bounds.get().expect("the grid has painted");
+                    let row = drum_map::drum_row_index(&roll.drum_rows, pitch).expect("lane");
+                    let step = roll.step_view_beats();
+                    let x = roll.clip_beat_to_x((index as f32 + 0.5) * step);
+                    let row_h = roll.note_row_h();
+                    let y = row as f32 * row_h - roll.scroll_y + row_h * 0.5;
+                    let ox: f32 = bounds.origin.x.into();
+                    let oy: f32 = bounds.origin.y.into();
+                    gpui::point(px(ox + x + dx), px(oy + y + dy))
+                })
+                .expect("window")
+        }
+
+        fn press(&mut self, at: gpui::Point<Pixels>, button: MouseButton, modifiers: Modifiers) {
+            self.cx.simulate_event(MouseDownEvent {
+                button,
+                position: at,
+                modifiers,
+                click_count: 1,
+                first_mouse: false,
+            });
+        }
+
+        fn drag_to(&mut self, at: gpui::Point<Pixels>, button: MouseButton, modifiers: Modifiers) {
+            self.cx.simulate_event(MouseMoveEvent {
+                position: at,
+                pressed_button: Some(button),
+                modifiers,
+            });
+        }
+
+        fn release(&mut self, at: gpui::Point<Pixels>, button: MouseButton, modifiers: Modifiers) {
+            self.cx.simulate_event(MouseUpEvent {
+                button,
+                position: at,
+                modifiers,
+                click_count: 1,
+            });
+            self.cx.run_until_parked();
+        }
+
+        /// The clip's notes on `pitch`, `(start, velocity)`, in start order.
+        fn lane(&mut self, pitch: u8) -> Vec<(f32, u8)> {
+            self.window
+                .update(&mut self.cx, |roll, _, cx| {
+                    let clip = roll.editing_clip_id(cx).expect("clip");
+                    let mut out: Vec<(f32, u8)> = roll
+                        .timeline
+                        .read(cx)
+                        .state
+                        .midi_clip_notes(&clip)
+                        .into_iter()
+                        .flatten()
+                        .filter(|n| n.pitch == pitch)
+                        .map(|n| (n.start, n.velocity))
+                        .collect();
+                    out.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    out
+                })
+                .expect("window")
+        }
+
+        fn undo(&mut self) -> bool {
+            self.window
+                .update(&mut self.cx, |roll, _, cx| {
+                    roll.timeline.update(cx, |tl, cx| tl.undo_edit(cx))
+                })
+                .expect("window")
+        }
+    }
+
+    fn none() -> Modifiers {
+        Modifiers::default()
+    }
+
+    fn starts(lane: &[(f32, u8)]) -> Vec<f32> {
+        lane.iter().map(|(start, _)| *start).collect()
+    }
+
+    /// Press an empty step and drag: every step crossed is filled; the hit
+    /// already there keeps its velocity; one undo takes the whole paint back.
+    #[gpui::test]
+    fn a_left_drag_paints_along_the_row_and_undoes_as_one(cx: &mut TestAppContext) {
+        let mut rig = rig(cx, &[(KICK, 0.5, 70)]);
+        let from = rig.at(KICK, 0, 0.0, 0.0);
+        let to = rig.at(KICK, 3, 0.0, 0.0);
+        rig.press(from, MouseButton::Left, none());
+        rig.drag_to(to, MouseButton::Left, none());
+        rig.release(to, MouseButton::Left, none());
+        let lane = rig.lane(KICK);
+        assert_eq!(starts(&lane), vec![0.0, 0.25, 0.5, 0.75]);
+        assert_eq!(lane[2].1, 70, "the hit already there is untouched");
+        assert!(rig.undo());
+        assert_eq!(starts(&rig.lane(KICK)), vec![0.5]);
+    }
+
+    /// Press a filled step: it clears, and the drag clears what it crosses.
+    #[gpui::test]
+    fn a_left_drag_from_a_hit_clears_along_the_row(cx: &mut TestAppContext) {
+        let mut rig = rig(cx, &[(KICK, 0.0, 100), (KICK, 0.25, 100), (KICK, 1.0, 100)]);
+        let from = rig.at(KICK, 0, 0.0, 0.0);
+        let to = rig.at(KICK, 2, 0.0, 0.0);
+        rig.press(from, MouseButton::Left, none());
+        rig.drag_to(to, MouseButton::Left, none());
+        rig.release(to, MouseButton::Left, none());
+        assert_eq!(starts(&rig.lane(KICK)), vec![1.0]);
+    }
+
+    /// Right-drag erases across rows, without the Erase tool.
+    #[gpui::test]
+    fn a_right_drag_erases_across_rows(cx: &mut TestAppContext) {
+        let mut rig = rig(
+            cx,
+            &[(KICK, 0.25, 100), (SNARE, 0.25, 100), (SNARE, 2.0, 100)],
+        );
+        let from = rig.at(KICK, 1, 0.0, 0.0);
+        let to = rig.at(SNARE, 1, 0.0, 0.0);
+        rig.press(from, MouseButton::Right, none());
+        rig.drag_to(to, MouseButton::Right, none());
+        rig.release(to, MouseButton::Right, none());
+        assert!(rig.lane(KICK).is_empty());
+        assert_eq!(starts(&rig.lane(SNARE)), vec![2.0]);
+        assert!(rig.undo());
+        assert_eq!(rig.lane(KICK).len(), 1);
+        assert_eq!(rig.lane(SNARE).len(), 2);
+    }
+
+    /// Alt-drag right and up across a hat row ramps its velocities up from
+    /// the pressed step's.
+    #[gpui::test]
+    fn an_alt_drag_ramps_velocity_across_the_row(cx: &mut TestAppContext) {
+        let hats: Vec<(u8, f32, u8)> = (0..5).map(|i| (HAT, i as f32 * 0.25, 40)).collect();
+        let mut rig = rig(cx, &hats);
+        let alt = Modifiers {
+            alt: true,
+            ..Modifiers::default()
+        };
+        let from = rig.at(HAT, 0, 0.0, 0.0);
+        let to = rig.at(HAT, 4, 0.0, -100.0);
+        rig.press(from, MouseButton::Left, alt);
+        rig.drag_to(to, MouseButton::Left, alt);
+        rig.release(to, MouseButton::Left, alt);
+        let velocities: Vec<u8> = rig.lane(HAT).iter().map(|(_, v)| *v).collect();
+        assert_eq!(velocities[0], 40);
+        assert!(velocities.windows(2).all(|w| w[1] > w[0]), "{velocities:?}");
+        assert_eq!(velocities[4], step_grid::ramp_target(40, 0.0, -100.0));
+        assert!(rig.undo());
+        assert!(rig.lane(HAT).iter().all(|(_, v)| *v == 40));
+    }
+
+    /// Ctrl-drag slides a hit late, and never further than just under half a
+    /// step; one undo puts it back on its line.
+    #[gpui::test]
+    fn a_ctrl_drag_nudges_a_hit_within_half_a_step(cx: &mut TestAppContext) {
+        let mut rig = rig(cx, &[(KICK, 1.0, 100)]);
+        let ctrl = Modifiers {
+            control: true,
+            ..Modifiers::default()
+        };
+        let limit = 1.0 + 0.25 * step_grid::NUDGE_LIMIT;
+        let from = rig.at(KICK, 4, 0.0, 0.0);
+        let near = rig.at(KICK, 4, 4.0, 0.0);
+        rig.press(from, MouseButton::Left, ctrl);
+        rig.drag_to(near, MouseButton::Left, ctrl);
+        rig.release(near, MouseButton::Left, ctrl);
+        let nudged = rig.lane(KICK)[0].0;
+        assert!(nudged > 1.0 && nudged < limit, "{nudged}");
+        assert!(rig.undo());
+        assert_eq!(starts(&rig.lane(KICK)), vec![1.0]);
+
+        let far = rig.at(KICK, 6, 0.0, 0.0);
+        rig.press(from, MouseButton::Left, ctrl);
+        rig.drag_to(far, MouseButton::Left, ctrl);
+        rig.release(far, MouseButton::Left, ctrl);
+        let clamped = rig.lane(KICK)[0].0;
+        assert!((clamped - limit).abs() < 1e-4, "{clamped}");
+    }
+
+    /// Escape in the middle of a paint puts the clip back, with no undo entry.
+    #[gpui::test]
+    fn escape_mid_drag_reverts_the_gesture(cx: &mut TestAppContext) {
+        let mut rig = rig(cx, &[(SNARE, 3.0, 100)]);
+        let from = rig.at(KICK, 0, 0.0, 0.0);
+        let to = rig.at(KICK, 5, 0.0, 0.0);
+        rig.press(from, MouseButton::Left, none());
+        rig.drag_to(to, MouseButton::Left, none());
+        assert_eq!(rig.lane(KICK).len(), 6, "painted live");
+        rig.window
+            .update(&mut rig.cx, |roll, _, cx| roll.cancel_active_gesture(cx))
+            .expect("window");
+        rig.release(to, MouseButton::Left, none());
+        assert!(rig.lane(KICK).is_empty());
+        assert!(!rig.undo(), "nothing was recorded");
+    }
+
+    /// The lane menu's actions, each one undo entry.
+    #[gpui::test]
+    fn lane_actions_fill_randomize_and_clear(cx: &mut TestAppContext) {
+        let mut rig = rig(cx, &[(HAT, 0.5, 100)]);
+        rig.window
+            .update(&mut rig.cx, |roll, _, cx| {
+                roll.run_lane_action(HAT, LaneAction::FillEvery(4), cx)
+            })
+            .expect("window");
+        assert_eq!(starts(&rig.lane(HAT)), vec![0.0, 0.5, 1.0, 2.0, 3.0]);
+        rig.window
+            .update(&mut rig.cx, |roll, _, cx| {
+                roll.run_lane_action(HAT, LaneAction::RandomizeVelocity, cx)
+            })
+            .expect("window");
+        assert!(rig.lane(HAT).iter().all(|(_, v)| (85..=115).contains(v)));
+        rig.window
+            .update(&mut rig.cx, |roll, _, cx| {
+                roll.run_lane_action(HAT, LaneAction::Clear, cx)
+            })
+            .expect("window");
+        assert!(rig.lane(HAT).is_empty());
+        assert!(rig.undo());
+        assert_eq!(rig.lane(HAT).len(), 5);
+    }
+
+    /// Hovering a step names exactly that step's notes for the velocity lane.
+    #[gpui::test]
+    fn hovering_a_step_names_its_notes_for_the_velocity_lane(cx: &mut TestAppContext) {
+        let mut rig = rig(cx, &[(KICK, 0.0, 100), (SNARE, 0.0, 90)]);
+        let at = rig.at(SNARE, 0, 0.0, 0.0);
+        rig.cx.simulate_event(MouseMoveEvent {
+            position: at,
+            pressed_button: None,
+            modifiers: none(),
+        });
+        rig.cx.run_until_parked();
+        let (hover, ids, snare_ids) = rig
+            .window
+            .update(&mut rig.cx, |roll, _, cx| {
+                let clip = roll.editing_clip_id(cx).expect("clip");
+                let snare: Vec<u64> = roll
+                    .timeline
+                    .read(cx)
+                    .state
+                    .midi_clip_notes(&clip)
+                    .into_iter()
+                    .flatten()
+                    .filter(|n| n.pitch == SNARE)
+                    .map(|n| n.id)
+                    .collect();
+                (roll.step_hover, roll.hovered_step_ids(cx), snare)
+            })
+            .expect("window");
+        assert_eq!(hover, Some((SNARE, 0)));
+        assert_eq!(ids, snare_ids);
     }
 }

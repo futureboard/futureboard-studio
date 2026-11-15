@@ -394,6 +394,97 @@ impl PianoRoll {
         )
     }
 
+    /// The drum lane menu, drawn, where the platform has no native popup
+    /// menus: the lane's row actions at the right-click. A press outside it
+    /// or Escape closes it.
+    fn build_lane_menu(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let (pitch, position) = self.open_lane_menu?;
+        let row = |id: usize, label: &'static str, destructive: bool, action: LaneAction| {
+            let hover = Colors::composite(Colors::surface_card(), Colors::state_hover());
+            div()
+                .id(("pr-lane-menu", id))
+                .flex()
+                .items_center()
+                .h(px(22.0))
+                .px(px(8.0))
+                .rounded(px(crate::theme::radius::CONTROL_SM))
+                .text_size(px(10.0))
+                .text_color(if destructive {
+                    Colors::status_error()
+                } else {
+                    Colors::text_secondary()
+                })
+                .hover(move |s| s.bg(hover))
+                .cursor(gpui::CursorStyle::PointingHand)
+                .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _w, cx| {
+                    this.run_lane_action(pitch, action, cx);
+                }))
+                .child(label)
+        };
+        let panel = div()
+            .id("pr-lane-menu")
+            .w(px(176.0))
+            .flex()
+            .flex_col()
+            .p(px(3.0))
+            .gap(px(1.0))
+            .rounded(px(crate::theme::radius::CONTROL))
+            .bg(Colors::surface_card())
+            .border(px(1.0))
+            .border_color(Colors::border_subtle())
+            .shadow_lg()
+            .occlude()
+            .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _w, cx| {
+                this.open_lane_menu = None;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .px(px(8.0))
+                    .pt(px(4.0))
+                    .pb(px(2.0))
+                    .text_size(px(8.5))
+                    .text_color(Colors::text_faint())
+                    .child(self.drum_lane_name(pitch)),
+            )
+            .child(row(
+                0,
+                "Fill Every 2 Steps",
+                false,
+                LaneAction::FillEvery(2),
+            ))
+            .child(row(
+                1,
+                "Fill Every 4 Steps",
+                false,
+                LaneAction::FillEvery(4),
+            ))
+            .child(row(
+                2,
+                "Randomize Velocity (±15%)",
+                false,
+                LaneAction::RandomizeVelocity,
+            ))
+            .child(
+                div()
+                    .h(px(1.0))
+                    .mx(px(4.0))
+                    .my(px(2.0))
+                    .bg(Colors::border_subtle()),
+            )
+            .child(row(3, "Clear Row", true, LaneAction::Clear));
+        Some(
+            deferred(
+                gpui::anchored()
+                    .position(position)
+                    .snap_to_window_with_margin(px(crate::theme::space::BASE))
+                    .child(panel),
+            )
+            .with_priority(PIANO_ROLL_MENU_PRIORITY)
+            .into_any_element(),
+        )
+    }
+
     pub(super) fn build_velocity_gesture_overlay(&self) -> Option<gpui::AnyElement> {
         match &self.drag {
             PianoDrag::VelocitySelect {
@@ -1197,8 +1288,8 @@ impl PianoRoll {
                 }),
             ));
         if self.step_mode {
-            // Note repeat: how many hits a new step plays, and what Alt-click
-            // rewrites a step to.
+            // Note repeat: how many hits a new step plays, and what
+            // Shift-click rewrites a step to.
             let current = self.step_repeat;
             for repeat in step_grid::STEP_REPEATS {
                 editor_mode = editor_mode.child(tool_text_segment(
@@ -1209,7 +1300,7 @@ impl PianoRoll {
                     } else {
                         format!(
                             "Note repeat: {repeat} hits per step. New steps play it; \
-                             Alt-click a step to give it this count"
+                             Shift-click a step to give it this count"
                         )
                     }
                     .into(),
@@ -1221,10 +1312,11 @@ impl PianoRoll {
             if off_grid > 0 {
                 editor_mode = editor_mode.child(tool_text_segment(
                     ("pr-step-snap", 0usize),
-                    format!("Snap {off_grid} off-grid"),
+                    format!("Snap {off_grid} to grid"),
                     format!(
-                        "{off_grid} note(s) sit between the step lines (amber). \
-                         Move them onto the nearest step — one undo"
+                        "{off_grid} note(s) sit off their step lines: nudged, played \
+                         early or late, or in an uneven roll (amber). Put them back \
+                         on the lines (one undo)"
                     )
                     .into(),
                     false,
@@ -1867,6 +1959,7 @@ impl PianoRoll {
         let draw_preview = self.build_draw_note_preview(track_color);
         let erase_overlay = self.build_erase_overlay();
         let note_menu = self.build_note_context_menu(cx);
+        let lane_menu = self.build_lane_menu(cx);
         let scrollbars = self.render_scrollbars(cx);
         // Empty clip: the musical canvas (ruler, keys, grid) stays, with one
         // quiet hint naming the gesture that actually creates a note. Nothing
@@ -1881,7 +1974,7 @@ impl PianoRoll {
                 .text_size(px(typography::UI_XS))
                 .text_color(Colors::text_muted())
                 .child(if self.step_mode {
-                    "Click a step to add a hit; Alt-click a hit to give it the Repeat count"
+                    "Click or drag to add hits; right-drag erases; Alt-drag ramps velocity; Ctrl-drag nudges"
                 } else {
                     "Draw notes with the Draw tool, or record onto this clip"
                 })
@@ -2144,7 +2237,13 @@ impl PianoRoll {
                                     let Some(raw) = this.key_lane_pitch_at(ev.position) else {
                                         return;
                                     };
-                                    let pitch = this.pitch_ctx.constrain_pitch(raw);
+                                    // Drum lanes are sounds of the kit: the
+                                    // scale lock has no say over which plays.
+                                    let pitch = if this.drum_mode {
+                                        raw
+                                    } else {
+                                        this.pitch_ctx.constrain_pitch(raw)
+                                    };
                                     if midi_debug_enabled() {
                                         eprintln!("[PianoKeyPreview] down note={pitch}");
                                     }
@@ -2152,6 +2251,21 @@ impl PianoRoll {
                                     this.key_lane_pressed_pitch = Some(pitch);
                                     this.begin_preview_note(pitch, 100, "piano_key_down", cx);
                                     cx.notify();
+                                }),
+                            )
+                            // A drum lane's name: right-click for its row
+                            // actions (fill, clear, randomize velocity).
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                                    if !this.drum_mode {
+                                        return;
+                                    }
+                                    let Some(pitch) = this.key_lane_pitch_at(ev.position) else {
+                                        return;
+                                    };
+                                    cx.stop_propagation();
+                                    this.open_lane_menu_at(pitch, ev.position, window, cx);
                                 }),
                             )
                             .child(key_lane_canvas)
@@ -2219,6 +2333,7 @@ impl PianoRoll {
                             .when_some(erase_overlay, |el, overlay| el.child(overlay))
                             .children(scrollbars)
                             .children(note_menu)
+                            .children(lane_menu)
                             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_grid_down))
                             .on_mouse_down(
                                 MouseButton::Right,
@@ -3790,7 +3905,18 @@ impl PianoRoll {
     /// The step view's grid: every step of every visible lane as a cell,
     /// filled where the clip plays one. Painted in one canvas — a 64-step
     /// pattern over a kit is a few thousand cells, too many for an element
-    /// each. Clicks are handled by the grid (`press_step`), not by the cells.
+    /// each. Presses are handled by the grid (`begin_step_gesture`).
+    ///
+    /// What it shows, and why:
+    /// - every other beat's columns sit on a faint band, so beats 1–4 read at
+    ///   a glance without counting lines;
+    /// - a single hit fills its cell, brighter the louder it is;
+    /// - a ratchet shows one bar per hit, each as tall as that hit is loud, so
+    ///   a roll's shape is visible in the cell;
+    /// - a nudged step is drawn where it plays, shifted inside its column;
+    /// - an uneven roll is amber, the one thing "Snap to grid" fixes;
+    /// - the step under the pointer is outlined, and its lane is lit across
+    ///   the grid by the drum hover band beneath.
     pub(super) fn build_step_cells(
         &self,
         cx: &Context<Self>,
@@ -3806,6 +3932,7 @@ impl PianoRoll {
         if steps == 0 || step_w < 1.0 {
             return Vec::new();
         }
+        let px_per_beat = step_w / step;
         // A cell is inset so neighbours read as separate pads.
         let gap = (step_w * 0.12).clamp(1.0, 3.0);
         let notes: Vec<MidiNoteState> = self
@@ -3815,18 +3942,41 @@ impl PianoRoll {
             .midi_clip_notes(clip_id)
             .map(|notes| notes.to_vec())
             .unwrap_or_default();
-        let beats_per_bar = self.bar_beats().max(step);
         let first_step = ((self.x_to_clip_beat(0.0) / step).floor().max(0.0)) as usize;
         let last_step =
             (((self.x_to_clip_beat(view_w) / step).ceil().max(0.0)) as usize + 1).min(steps);
+        let rows = self.visible_drum_rows(view_h);
+        let rows_top = rows.start as f32 * row_h - self.scroll_y;
+        let rows_bottom = rows.end as f32 * row_h - self.scroll_y;
 
-        // (x, y, w, h, colour) per quad, resolved here so the paint closure
-        // only walks a list.
-        let mut quads: Vec<(f32, f32, f32, f32, gpui::Rgba)> = Vec::new();
+        // Resolved here so the paint closure only walks a list (DESIGN.md:
+        // no colour work in a per-frame paint loop).
         let empty = Colors::with_alpha(Colors::text_primary(), 0.05);
-        let empty_beat = Colors::with_alpha(Colors::text_primary(), 0.09);
-        let warning = Colors::status_warning();
-        for row in self.visible_drum_rows(view_h) {
+        let empty_hover = Colors::with_alpha(Colors::text_primary(), 0.14);
+        let beat_band = Colors::with_alpha(Colors::text_primary(), 0.025);
+        let outline = Colors::with_alpha(Colors::text_primary(), 0.7);
+        let uneven = Colors::status_warning();
+        let mut slab = track_color;
+        slab.a = 0.22;
+        let mut quads: Vec<StepQuad> = Vec::new();
+
+        // Beat shading: the odd beats' columns, behind every lane.
+        for index in first_step..last_step {
+            let beat = (index as f32 * step + 1e-4).floor() as i64;
+            if beat % 2 == 1 {
+                let x = self.clip_beat_to_x(index as f32 * step);
+                quads.push(StepQuad::fill(
+                    x,
+                    rows_top,
+                    step_w,
+                    rows_bottom - rows_top,
+                    beat_band,
+                    0.0,
+                ));
+            }
+        }
+
+        for row in rows {
             let Some(&pitch) = self.drum_rows.get(row) else {
                 continue;
             };
@@ -3834,55 +3984,92 @@ impl PianoRoll {
             let h = (row_h - 2.0 * gap).max(1.0);
             let cells = step_grid::lane_cells(&notes, pitch, step);
             for index in first_step..last_step {
-                let x = self.clip_beat_to_x(index as f32 * step) + gap * 0.5;
+                let line_x = self.clip_beat_to_x(index as f32 * step) + gap * 0.5;
                 let w = (step_w - gap).max(1.0);
-                let beat = index as f32 * step;
-                let on_beat = (beat - beat.round()).abs() < 1e-4;
-                let on_bar = (beat / beats_per_bar - (beat / beats_per_bar).round()).abs() < 1e-4;
+                let hovered = self.step_hover == Some((pitch, index));
                 let Some(cell) = cells.iter().find(|cell| cell.index == index) else {
-                    quads.push((
-                        x,
+                    quads.push(StepQuad::fill(
+                        line_x,
                         y,
                         w,
                         h,
-                        if on_bar || on_beat { empty_beat } else { empty },
+                        if hovered { empty_hover } else { empty },
+                        2.0,
                     ));
                     continue;
                 };
-                // Velocity is the fill's strength; a muted step is faint and
-                // an off-grid one amber, so it is found before it is snapped.
-                let mut color = if cell.on_grid { track_color } else { warning };
-                color.a = if cell.muted {
-                    0.2
-                } else {
-                    0.45 + 0.55 * (f32::from(cell.velocity) / 127.0)
-                };
-                quads.push((x, y, w, h, color));
-                // A ratchet: one notch per extra hit, so ×4 reads as four.
-                if cell.repeat > 1 && cell.on_grid {
-                    let notch = Colors::with_alpha(Colors::surface_canvas(), 0.85);
-                    for hit in 1..cell.repeat {
-                        let nx = x + w * f32::from(hit) / f32::from(cell.repeat);
-                        quads.push((nx - 0.5, y + h * 0.25, 1.0, h * 0.5, notch));
+                // Where the step plays: its line plus its nudge.
+                let x = line_x + cell.offset * px_per_beat;
+                if !cell.even {
+                    let mut color = uneven;
+                    color.a = if cell.muted { 0.25 } else { 0.85 };
+                    quads.push(StepQuad::fill(x, y, w, h, color, 2.0));
+                } else if cell.repeat > 1 {
+                    // One bar per hit, its height that hit's velocity, on a
+                    // faint slab the size of the step.
+                    quads.push(StepQuad::fill(x, y, w, h, slab, 2.0));
+                    let slice = w / f32::from(cell.repeat);
+                    let mut bar = track_color;
+                    bar.a = if cell.muted { 0.3 } else { 0.95 };
+                    for (i, velocity) in cell.velocities.iter().enumerate() {
+                        let bar_h = (h * f32::from(*velocity) / 127.0).max(2.0);
+                        quads.push(StepQuad::fill(
+                            x + slice * i as f32 + 0.5,
+                            y + h - bar_h,
+                            (slice - 1.0).max(1.0),
+                            bar_h,
+                            bar,
+                            1.0,
+                        ));
                     }
+                } else {
+                    // Velocity is the fill's strength; a muted step is faint.
+                    let mut color = track_color;
+                    color.a = if cell.muted {
+                        0.2
+                    } else {
+                        0.45 + 0.55 * (f32::from(cell.velocity) / 127.0)
+                    };
+                    quads.push(StepQuad::fill(x, y, w, h, color, 2.0));
+                }
+                if hovered {
+                    quads.push(StepQuad::outline(x, y, w, h, outline));
                 }
             }
         }
         let scale = self.window_scale;
+        let this = cx.weak_entity();
         vec![gpui::canvas(
             |_, _, _| {},
             move |bounds, (), window, _| {
+                // Window-wide, not hover-scoped: see `on_step_pointer_move`.
+                let moved = this.clone();
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
+                    if phase == gpui::DispatchPhase::Bubble {
+                        let _ = moved.update(cx, |this, cx| this.on_step_pointer_move(event, cx));
+                    }
+                });
+                let released = this.clone();
+                window.on_mouse_event(move |_: &MouseUpEvent, phase, _window, cx| {
+                    if phase == gpui::DispatchPhase::Bubble {
+                        let _ = released.update(cx, |this, cx| this.on_step_pointer_up(cx));
+                    }
+                });
                 let origin = bounds.origin;
-                for (x, y, w, h, color) in &quads {
+                for quad in &quads {
                     let rect = gpui::Bounds::new(
                         origin
                             + gpui::point(
-                                px(grid_render::snap(*x, scale)),
-                                px(grid_render::snap(*y, scale)),
+                                px(grid_render::snap(quad.x, scale)),
+                                px(grid_render::snap(quad.y, scale)),
                             ),
-                        gpui::size(px(*w), px(*h)),
+                        gpui::size(px(quad.w), px(quad.h)),
                     );
-                    window.paint_quad(gpui::fill(rect, *color).corner_radii(px(2.0)));
+                    let paint = gpui::fill(rect, quad.fill).corner_radii(px(quad.radius));
+                    window.paint_quad(match quad.border {
+                        Some(border) => paint.border_widths(px(1.0)).border_color(border),
+                        None => paint,
+                    });
                 }
             },
         )
@@ -4257,14 +4444,23 @@ impl PianoRoll {
         let stem_rest = Colors::with_alpha(track_color, 0.55);
         let muted_color = Colors::with_alpha(Colors::text_muted(), 0.45);
         let selected_color = Colors::accent_primary();
+        // The step under the pointer in the step view: its stalks are lit and
+        // drawn last, so the one that belongs to it is found among the other
+        // drums hitting at the same time.
+        let hovered_ids = self.hovered_step_ids(cx);
+        let mut geos = geos;
+        geos.sort_by_key(|(id, ..)| hovered_ids.contains(id));
 
         geos.into_iter()
             .map(|(id, vel, x, selected, muted)| {
                 let head_y = velocity_lane_y(vel, usable);
+                let hovered = hovered_ids.contains(&id);
                 let (stem, head) = if selected {
                     (selected_color, selected_color)
                 } else if muted {
                     (muted_color, muted_color)
+                } else if hovered {
+                    (Colors::text_primary(), track_color)
                 } else {
                     (stem_rest, track_color)
                 };
@@ -4302,7 +4498,7 @@ impl PianoRoll {
                             .size(px(HEAD))
                             .rounded(px(crate::theme::radius::PILL))
                             .bg(head)
-                            .when(selected, |dot| {
+                            .when(selected || hovered, |dot| {
                                 dot.border(px(1.0)).border_color(Colors::text_primary())
                             }),
                     )
@@ -4325,4 +4521,47 @@ struct DrumHit {
     erase_target: bool,
     muted: bool,
     name: SharedString,
+}
+
+/// One rectangle of the step grid, in grid-local logical pixels.
+struct StepQuad {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    fill: gpui::Rgba,
+    border: Option<gpui::Rgba>,
+    radius: f32,
+}
+
+impl StepQuad {
+    fn fill(x: f32, y: f32, w: f32, h: f32, fill: gpui::Rgba, radius: f32) -> Self {
+        Self {
+            x,
+            y,
+            w,
+            h,
+            fill,
+            border: None,
+            radius,
+        }
+    }
+
+    /// The hovered step's outline: a ring, so the fill under it still reads.
+    fn outline(x: f32, y: f32, w: f32, h: f32, border: gpui::Rgba) -> Self {
+        Self {
+            x,
+            y,
+            w,
+            h,
+            fill: gpui::Rgba {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.0,
+            },
+            border: Some(border),
+            radius: 2.0,
+        }
+    }
 }
