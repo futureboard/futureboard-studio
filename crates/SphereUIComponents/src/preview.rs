@@ -25,6 +25,7 @@ use crate::components::dyn_model::DynKind;
 use crate::components::native_plugin_shell::ShellIdentity;
 use crate::components::plate;
 use crate::components::plugin_kit::{KitModel, KitWindow};
+use crate::components::visualizer::VisualizerKind;
 use crate::components::white_sharp_panel::DOCK_H as WHITESHARP_DOCK_H;
 use crate::components::white_sharp_window::{Dock, WhiteSharpWindow, WHITESHARP_WINDOW_SIZE};
 
@@ -937,7 +938,136 @@ pub fn scenes() -> Vec<Scene> {
             height: 640.0,
             open: add_track_drumstep,
         },
+        Scene {
+            name: "visualizer-spectrum",
+            width: 420.0,
+            height: 260.0,
+            open: |o, cx| visualizer_scene(o, cx, VisualizerKind::Spectrum),
+        },
+        Scene {
+            name: "visualizer-stereo-image",
+            width: 420.0,
+            height: 260.0,
+            open: |o, cx| visualizer_scene(o, cx, VisualizerKind::StereoImage),
+        },
+        Scene {
+            name: "visualizer-loudness",
+            width: 460.0,
+            height: 260.0,
+            open: |o, cx| visualizer_scene(o, cx, VisualizerKind::Loudness),
+        },
+        Scene {
+            name: "visualizer-oscilloscope",
+            width: 420.0,
+            height: 260.0,
+            open: |o, cx| visualizer_scene(o, cx, VisualizerKind::Oscilloscope),
+        },
+        Scene {
+            name: "visualizer-spectrogram",
+            width: 420.0,
+            height: 260.0,
+            open: |o, cx| visualizer_scene(o, cx, VisualizerKind::Spectrogram),
+        },
+        // Each view at its smallest window.
+        Scene {
+            name: "visualizer-spectrum-min",
+            width: 240.0,
+            height: 180.0,
+            open: |o, cx| visualizer_scene(o, cx, VisualizerKind::Spectrum),
+        },
+        Scene {
+            name: "visualizer-stereo-image-min",
+            width: 240.0,
+            height: 180.0,
+            open: |o, cx| visualizer_scene(o, cx, VisualizerKind::StereoImage),
+        },
+        Scene {
+            name: "visualizer-loudness-min",
+            width: 320.0,
+            height: 216.0,
+            open: |o, cx| visualizer_scene(o, cx, VisualizerKind::Loudness),
+        },
+        Scene {
+            name: "visualizer-oscilloscope-min",
+            width: 240.0,
+            height: 180.0,
+            open: |o, cx| visualizer_scene(o, cx, VisualizerKind::Oscilloscope),
+        },
+        Scene {
+            name: "visualizer-spectrogram-min",
+            width: 240.0,
+            height: 180.0,
+            open: |o, cx| visualizer_scene(o, cx, VisualizerKind::Spectrogram),
+        },
+        // A big window: the axes fill in and the readouts keep their place.
+        Scene {
+            name: "visualizer-spectrum-large",
+            width: 760.0,
+            height: 420.0,
+            open: |o, cx| visualizer_scene(o, cx, VisualizerKind::Spectrum),
+        },
+        Scene {
+            name: "visualizer-loudness-large",
+            width: 760.0,
+            height: 420.0,
+            open: |o, cx| visualizer_scene(o, cx, VisualizerKind::Loudness),
+        },
     ]
+}
+
+// ── Window > Visualizer ─────────────────────────────────────────────────────
+
+fn visualizer_scene(
+    options: WindowOptions,
+    cx: &mut App,
+    kind: VisualizerKind,
+) -> Result<AnyWindowHandle> {
+    crate::components::visualizer::window::open_preview_window(
+        kind,
+        options,
+        visualizer_signal(),
+        cx,
+    )
+    .map(Into::into)
+}
+
+/// A deterministic stand-in for the master bus at 48 kHz, shaped like a mix
+/// so every view has something to show: a pitch-swept kick on the beat, an
+/// A-major pad a little wider on the right, and hi-hat noise on the offbeat,
+/// swelling slowly so the loudness graph moves.
+fn visualizer_signal() -> Box<dyn FnMut(&mut [f32], &mut [f32])> {
+    use std::f64::consts::TAU;
+    const RATE: f64 = 48_000.0;
+    let mut n: u64 = 0;
+    let mut seed: u32 = 0x1234_5678;
+    let mut previous = 0.0f64;
+    Box::new(move |left, right| {
+        for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+            let t = n as f64 / RATE;
+            n += 1;
+            let beat = t % 0.5;
+            let kick = (TAU * (50.0 * beat + 2.25 * (1.0 - (-beat * 40.0).exp()))).sin()
+                * (-beat * 12.0).exp()
+                * 0.5;
+            let swell = 0.7 + 0.3 * (TAU * 0.06 * t).sin();
+            let (mut pad_l, mut pad_r) = (0.0, 0.0);
+            for (voice, hz) in [220.0, 277.18, 329.63, 440.0].into_iter().enumerate() {
+                for harmonic in 1..=8 {
+                    let h = harmonic as f64;
+                    let a = 0.032 / h;
+                    pad_l += a * (TAU * hz * h * t).sin();
+                    pad_r += a * (TAU * hz * h * 1.004 * t + voice as f64).sin();
+                }
+            }
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let white = (seed >> 8) as f64 / (1u32 << 24) as f64 * 2.0 - 1.0;
+            let hiss = white - previous;
+            previous = white;
+            let hat = hiss * (-((t + 0.25) % 0.5) * 28.0).exp() * 0.1;
+            *l = (kick + pad_l * swell + hat * 0.8) as f32;
+            *r = (kick + pad_r * swell + hat) as f32;
+        }
+    })
 }
 
 // ── Add Track instrument picker ─────────────────────────────────────────────

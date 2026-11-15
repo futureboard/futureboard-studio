@@ -323,6 +323,17 @@ impl Analyzer {
         }
     }
 
+    /// Feed one display frame's worth of audio and analyse it, as [`pull`]
+    /// does with what the tap delivered. For the UI preview's test signal;
+    /// Studio itself only ever listens to the tap.
+    ///
+    /// [`pull`]: Self::pull
+    #[cfg(any(test, feature = "ui-preview"))]
+    pub fn feed(&mut self, left: &[f32], right: &[f32], dt: f32) {
+        self.push(left, right);
+        self.finish_frame(dt);
+    }
+
     fn finish_frame(&mut self, dt: f32) {
         let dt = dt.clamp(0.0, 0.5);
         let energy = self.ll * self.rr;
