@@ -394,6 +394,65 @@ impl PianoRoll {
         )
     }
 
+    /// A rack row's output menu, drawn, where the platform has no native
+    /// popup menus: Main and Out 2 … Out 16, the current one marked. A press
+    /// outside it or Escape closes it.
+    fn build_output_menu(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let (pad, position) = self.open_output_menu?;
+        let current = self.rack_pad_output(pad);
+        let hover = Colors::composite(Colors::surface_card(), Colors::state_hover());
+        let rows = (0..super::sampler_rack::OUTPUTS).map(|output| {
+            div()
+                .id(("pr-output-menu", usize::from(output)))
+                .flex()
+                .items_center()
+                .h(px(20.0))
+                .px(px(8.0))
+                .rounded(px(crate::theme::radius::CONTROL_SM))
+                .text_size(px(10.0))
+                .text_color(if output == current {
+                    Colors::text_primary()
+                } else {
+                    Colors::text_secondary()
+                })
+                .when(output == current, |row| row.bg(Colors::state_selected()))
+                .hover(move |s| s.bg(hover))
+                .cursor(gpui::CursorStyle::PointingHand)
+                .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _w, cx| {
+                    this.set_rack_output(pad, output, cx);
+                }))
+                .child(super::sampler_rack::output_name(output))
+        });
+        let panel = div()
+            .id("pr-output-menu")
+            .w(px(96.0))
+            .flex()
+            .flex_col()
+            .p(px(3.0))
+            .gap(px(1.0))
+            .rounded(px(crate::theme::radius::CONTROL))
+            .bg(Colors::surface_card())
+            .border(px(1.0))
+            .border_color(Colors::border_subtle())
+            .shadow_lg()
+            .occlude()
+            .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _w, cx| {
+                this.open_output_menu = None;
+                cx.notify();
+            }))
+            .children(rows);
+        Some(
+            deferred(
+                gpui::anchored()
+                    .position(position)
+                    .snap_to_window_with_margin(px(crate::theme::space::BASE))
+                    .child(panel),
+            )
+            .with_priority(PIANO_ROLL_MENU_PRIORITY)
+            .into_any_element(),
+        )
+    }
+
     /// The drum lane menu, drawn, where the platform has no native popup
     /// menus: the lane's row actions at the right-click. A press outside it
     /// or Escape closes it.
@@ -2016,6 +2075,7 @@ impl PianoRoll {
         let erase_overlay = self.build_erase_overlay();
         let note_menu = self.build_note_context_menu(cx);
         let lane_menu = self.build_lane_menu(cx);
+        let output_menu = self.build_output_menu(cx);
         let scrollbars = self.render_scrollbars(cx);
         // Empty clip: the musical canvas (ruler, keys, grid) stays, with one
         // quiet hint naming the gesture that actually creates a note. Nothing
@@ -2404,6 +2464,7 @@ impl PianoRoll {
                             .children(scrollbars)
                             .children(note_menu)
                             .children(lane_menu)
+                            .children(output_menu)
                             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_grid_down))
                             .on_mouse_down(
                                 MouseButton::Right,
@@ -2701,13 +2762,26 @@ impl PianoRoll {
                         this.load_rack_pad(pad, Some(path.clone()), window, cx);
                     }
                 }))
-                // The pad's note, as the Drum Sampler numbers it.
+                // The pad's note: drag it up or down to change it.
                 .child(
                     div()
+                        .id(("pr-rack-note", pad))
                         .flex_none()
                         .w(px(26.0))
                         .text_size(px(typography::DENSE_CAPTION))
                         .text_color(Colors::text_faint())
+                        .hover(|s| s.text_color(Colors::text_secondary()))
+                        .cursor(gpui::CursorStyle::ResizeUpDown)
+                        .tooltip(crate::components::controls::fb_tooltip(
+                            "Drag up or down to change the note this pad plays on; its steps move with it",
+                        ))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
+                                cx.stop_propagation();
+                                this.begin_rack_note(pad, ev.position.y.into(), cx);
+                            }),
+                        )
                         .child(note_name(i32::from(state.note))),
                 )
                 .child(
@@ -2733,7 +2807,7 @@ impl PianoRoll {
                                 RackRequest::OpenEditor {
                                     track_id: track_id.clone(),
                                 },
-                                window,
+                                Some(window),
                                 cx,
                             );
                         }))
@@ -2743,7 +2817,7 @@ impl PianoRoll {
                     div()
                         .id(("pr-rack-sample", pad))
                         .flex_none()
-                        .w(px(64.0))
+                        .w(px(56.0))
                         .overflow_hidden()
                         .whitespace_nowrap()
                         .text_ellipsis()
@@ -2762,6 +2836,33 @@ impl PianoRoll {
                         } else {
                             "Load sample"
                         }),
+                )
+                .child(
+                    div()
+                        .id(("pr-rack-output", pad))
+                        .flex_none()
+                        .w(px(36.0))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_size(px(typography::DENSE_CAPTION))
+                        .text_color(if state.output == 0 {
+                            Colors::text_faint()
+                        } else {
+                            Colors::text_secondary()
+                        })
+                        .cursor(gpui::CursorStyle::PointingHand)
+                        .hover(|s| s.text_color(Colors::text_primary()))
+                        .tooltip(crate::components::controls::fb_tooltip(
+                            "Output: Main, or its own mixer strip (Out 2 … Out 16)",
+                        ))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.open_rack_output_menu(pad, ev.position, window, cx);
+                            }),
+                        )
+                        .child(super::sampler_rack::output_name(state.output)),
                 )
                 .child(
                     toggle(
@@ -2857,8 +2958,11 @@ impl PianoRoll {
             );
         }
 
-        // A fader drag follows the pointer anywhere in the window.
-        if matches!(self.drag, PianoDrag::RackMixer { .. }) {
+        // A fader or note drag follows the pointer anywhere in the window.
+        if matches!(
+            self.drag,
+            PianoDrag::RackMixer { .. } | PianoDrag::RackNote { .. }
+        ) {
             let this = cx.weak_entity();
             out.push(
                 gpui::canvas(

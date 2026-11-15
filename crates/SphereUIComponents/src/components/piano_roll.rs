@@ -1224,9 +1224,9 @@ impl GridRes {
     }
 }
 
-/// Width of the Sampler Rack's row headers: name, sample, mute, solo, gain
-/// and pan side by side.
-const RACK_LANE_W: f32 = 300.0;
+/// Width of the Sampler Rack's row headers: note, name, sample, output,
+/// mute, solo, gain and pan side by side.
+const RACK_LANE_W: f32 = 330.0;
 
 /// What the step view's rows are.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1252,13 +1252,17 @@ pub enum PadControl {
     Gain,
     /// −1 … +1.
     Pan,
+    /// The note the pad answers to, 0 … 127.
+    Note,
+    /// 0 is Main, 1 … 15 are Out 2 … Out 16.
+    Output,
 }
 
 /// Something the Sampler Rack asks the studio to do: what needs the plug-in
 /// host or the audio engine, neither of which the editor owns.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RackRequest {
-    /// Open the track's Drum Sampler.
+    /// Open the track's Drum Sampler. Needs the window it opens from.
     OpenEditor { track_id: String },
     /// Load a sample onto `pad`: `path`, or one picked in a file dialog
     /// when `None`.
@@ -1277,6 +1281,10 @@ pub enum RackRequest {
         value: f32,
     },
 }
+
+/// How the studio takes the rack's requests (see [`PianoRoll::set_rack_request_handler`]).
+pub type RackRequestHandler =
+    std::sync::Arc<dyn Fn(RackRequest, Option<&mut Window>, &mut gpui::App)>;
 
 /// One row of the step view: the note it reads and writes, in which clip.
 #[derive(Debug, Clone, PartialEq)]
@@ -1395,6 +1403,15 @@ enum PianoDrag {
         control: PadControl,
         start_x: f32,
         prev: f32,
+    },
+    /// A rack row's note dragged up or down from its header: the pad answers
+    /// to `to` and its steps (`ids`) move along, live.
+    RackNote {
+        pad: usize,
+        start_y: f32,
+        from: u8,
+        to: u8,
+        ids: Vec<u64>,
     },
     /// Move the selected notes. `prev` snapshots each affected note's original
     /// (id, start, pitch); `ids` is the same set, hashed, so the per-note
@@ -1691,7 +1708,12 @@ pub struct PianoRoll {
     /// Pads "+ Add Sampler" made rows this session, `(insert id, pad)`, so an
     /// empty pad waiting for its sample stays shown.
     rack_added: Vec<(String, usize)>,
-    on_rack_request: Option<std::sync::Arc<dyn Fn(RackRequest, &mut Window, &mut gpui::App)>>,
+    /// The studio's side of the rack. The window is there when the request
+    /// comes from an element; a native menu's pick has none.
+    on_rack_request: Option<RackRequestHandler>,
+    /// The drawn output menu (platforms without native popup menus): the pad
+    /// and where it opened, window space.
+    open_output_menu: Option<(usize, gpui::Point<Pixels>)>,
     /// Which lanes drum mode lists.
     drum_lanes: DrumLanes,
     /// Which way the lanes run: kick at the top, or reversed.
@@ -2027,6 +2049,7 @@ impl PianoRoll {
             rack_rows: Vec::new(),
             rack_target: None,
             rack_added: Vec::new(),
+            open_output_menu: None,
             on_rack_request: None,
             drum_lanes: DrumLanes::Kit,
             drum_order: DrumOrder::LowFirst,
@@ -2201,7 +2224,7 @@ impl PianoRoll {
             | PianoDrag::Pan { .. }
             // A step gesture's notes are its own to add and remove.
             | PianoDrag::Steps(_)
-            | PianoDrag::RackMixer { .. } => false,
+            | PianoDrag::RackMixer { .. } | PianoDrag::RackNote { .. } => false,
             PianoDrag::Move { prev, ids, .. } => {
                 prev.retain(|(id, _, _)| valid_note_ids.contains(id));
                 ids.retain(|id| valid_note_ids.contains(id));
@@ -2351,7 +2374,7 @@ impl PianoRoll {
                 }
             }
             PianoDrag::Pan { .. } => "Pan".to_string(),
-            PianoDrag::Steps(_) | PianoDrag::RackMixer { .. } => {
+            PianoDrag::Steps(_) | PianoDrag::RackMixer { .. } | PianoDrag::RackNote { .. } => {
                 self.drag_value_status.clone().unwrap_or(pointer)
             }
             PianoDrag::None => self.hover_note_status.clone().unwrap_or(pointer),
@@ -3112,17 +3135,14 @@ impl PianoRoll {
         cx.notify();
     }
 
-    pub fn set_rack_request_handler(
-        &mut self,
-        handler: Option<std::sync::Arc<dyn Fn(RackRequest, &mut Window, &mut gpui::App)>>,
-    ) {
+    pub fn set_rack_request_handler(&mut self, handler: Option<RackRequestHandler>) {
         self.on_rack_request = handler;
     }
 
     pub(super) fn send_rack_request(
         &self,
         request: RackRequest,
-        window: &mut Window,
+        window: Option<&mut Window>,
         cx: &mut gpui::App,
     ) {
         if let Some(handler) = self.on_rack_request.clone() {
@@ -3872,7 +3892,7 @@ impl PianoRoll {
         pad: usize,
         control: PadControl,
         value: f32,
-        window: &mut Window,
+        window: Option<&mut Window>,
         cx: &mut gpui::App,
     ) {
         let Some(target) = self.rack_target.clone() else {
@@ -3906,11 +3926,11 @@ impl PianoRoll {
         let flag = match control {
             PadControl::Mute => &mut row.state.muted,
             PadControl::Solo => &mut row.state.solo,
-            PadControl::Gain | PadControl::Pan => return,
+            _ => return,
         };
         *flag = !*flag;
         let value = if *flag { 1.0 } else { 0.0 };
-        self.set_rack_pad(pad, control, value, window, cx);
+        self.set_rack_pad(pad, control, value, Some(window), cx);
         cx.notify();
     }
 
@@ -3933,7 +3953,7 @@ impl PianoRoll {
                 pad,
                 path: None,
             },
-            window,
+            Some(window),
             cx,
         );
         cx.notify();
@@ -3957,7 +3977,7 @@ impl PianoRoll {
                 pad,
                 path,
             },
-            window,
+            Some(window),
             cx,
         );
     }
@@ -3976,7 +3996,7 @@ impl PianoRoll {
         let prev = match control {
             PadControl::Gain => row.state.gain_db,
             PadControl::Pan => row.state.pan,
-            PadControl::Mute | PadControl::Solo => return,
+            _ => return,
         };
         self.drag = PianoDrag::RackMixer {
             pad,
@@ -3998,6 +4018,10 @@ impl PianoRoll {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if matches!(self.drag, PianoDrag::RackNote { .. }) {
+            self.on_rack_note_move(event, cx);
+            return;
+        }
         let PianoDrag::RackMixer {
             pad,
             control,
@@ -4035,18 +4059,140 @@ impl PianoRoll {
                 }
             }
         });
-        self.set_rack_pad(pad, control, value, window, cx);
+        self.set_rack_pad(pad, control, value, Some(window), cx);
         cx.notify();
     }
 
     /// The release of a rack fader drag. A pad control lives in the Drum
     /// Sampler's own state, like its knob in the Drum Sampler window.
     pub(super) fn on_rack_mixer_up(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.drag, PianoDrag::RackMixer { .. }) {
+        if matches!(
+            self.drag,
+            PianoDrag::RackMixer { .. } | PianoDrag::RackNote { .. }
+        ) {
             self.drag = PianoDrag::None;
             self.drag_value_status = None;
             cx.notify();
         }
+    }
+
+    /// Vertical travel that moves a pad's note one semitone.
+    const RACK_NOTE_PX: f32 = 8.0;
+
+    /// Press on a rack row's note: dragging up or down changes the note the
+    /// pad answers to, and its steps move with it.
+    pub(super) fn begin_rack_note(&mut self, pad: usize, y: f32, cx: &mut Context<Self>) {
+        let Some(row) = self.rack_rows.iter().find(|row| row.pad == pad) else {
+            return;
+        };
+        let from = row.state.note;
+        let ids = self
+            .editing_clip_id(cx)
+            .map(|clip_id| self.clip_notes(&clip_id, cx))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|note| note.pitch == from)
+            .map(|note| note.id)
+            .collect();
+        self.drag = PianoDrag::RackNote {
+            pad,
+            start_y: y,
+            from,
+            to: from,
+            ids,
+        };
+        cx.notify();
+    }
+
+    /// A move during a pad-note drag. The pad's note is a Drum Sampler
+    /// setting, like its other controls, and not in the undo history; the
+    /// steps move with it the same way, so the two never part. The engine
+    /// hears both at once.
+    fn on_rack_note_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let PianoDrag::RackNote {
+            pad,
+            start_y,
+            from,
+            to,
+            ids,
+        } = self.drag.clone()
+        else {
+            return;
+        };
+        if event.pressed_button.is_none() {
+            self.on_rack_mixer_up(cx);
+            return;
+        }
+        let y: f32 = event.position.y.into();
+        let notches = ((start_y - y) / Self::RACK_NOTE_PX).round() as i32;
+        let taken: Vec<u8> = self
+            .rack_rows
+            .iter()
+            .filter(|row| row.pad != pad)
+            .map(|row| row.state.note)
+            .collect();
+        let next = sampler_rack::next_free_note(from, notches, &taken);
+        self.drag_value_status = Some(format!("Note {}", note_name(i32::from(next))));
+        if next != to {
+            self.set_rack_pad(pad, PadControl::Note, f32::from(next), None, cx);
+            if let Some(clip_id) = self.editing_clip_id(cx) {
+                let moved: Vec<MidiNoteState> = self
+                    .clip_notes(&clip_id, cx)
+                    .into_iter()
+                    .filter(|note| ids.contains(&note.id))
+                    .map(|mut note| {
+                        note.pitch = next;
+                        note
+                    })
+                    .collect();
+                self.write_steps_live(&clip_id, &[], &[], &moved, cx);
+                self.timeline
+                    .update(cx, |tl, tcx| tl.mark_midi_changed(tcx));
+            }
+            if let Some(row) = self.rack_rows.iter_mut().find(|row| row.pad == pad) {
+                row.state.note = next;
+            }
+            if let PianoDrag::RackNote { to, .. } = &mut self.drag {
+                *to = next;
+            }
+        }
+        cx.notify();
+    }
+
+    /// A rack row's output picked: Main or Out 2 … Out 16, the pad's own.
+    pub(super) fn set_rack_output(&mut self, pad: usize, output: u8, cx: &mut Context<Self>) {
+        self.open_output_menu = None;
+        if let Some(row) = self.rack_rows.iter_mut().find(|row| row.pad == pad) {
+            row.state.output = output;
+        }
+        self.set_rack_pad(pad, PadControl::Output, f32::from(output), None, cx);
+        cx.notify();
+    }
+
+    /// A rack row's output pressed: its outputs, as a native menu where the
+    /// platform has one and the drawn one otherwise.
+    pub(super) fn open_rack_output_menu(
+        &mut self,
+        pad: usize,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_lane_menu = None;
+        if self.open_native_output_menu(pad, window, cx) {
+            return;
+        }
+        self.open_output_menu = Some((pad, position));
+        cx.notify();
+    }
+
+    /// The output a rack row's pad plays through.
+    pub(super) fn rack_pad_output(&self, pad: usize) -> u8 {
+        self.rack_rows
+            .iter()
+            .find(|row| row.pad == pad)
+            .map(|row| row.state.output)
+            .unwrap_or(0)
     }
 
     /// How many notes the step view's rows read sit off the step grid.
@@ -4444,7 +4590,10 @@ impl PianoRoll {
         }
         // A rack fader is already heard where it is; ending it there (one
         // undo entry) keeps the engine, the track and the history agreeing.
-        if matches!(self.drag, PianoDrag::RackMixer { .. }) {
+        if matches!(
+            self.drag,
+            PianoDrag::RackMixer { .. } | PianoDrag::RackNote { .. }
+        ) {
             self.on_rack_mixer_up(cx);
             return;
         }
@@ -6457,7 +6606,10 @@ impl PianoRoll {
         let snap_enabled = self.snap_on && !self.grid_res.is_free();
         let snap_step = self.step_beats();
         match &mut self.drag {
-            PianoDrag::None | PianoDrag::Steps(_) | PianoDrag::RackMixer { .. } => {}
+            PianoDrag::None
+            | PianoDrag::Steps(_)
+            | PianoDrag::RackMixer { .. }
+            | PianoDrag::RackNote { .. } => {}
             PianoDrag::Move { .. } | PianoDrag::Resize { .. } => {}
             PianoDrag::Stretch {
                 start_x,
@@ -6613,7 +6765,10 @@ impl PianoRoll {
             self.on_step_pointer_up(cx);
             return;
         }
-        if matches!(self.drag, PianoDrag::RackMixer { .. }) {
+        if matches!(
+            self.drag,
+            PianoDrag::RackMixer { .. } | PianoDrag::RackNote { .. }
+        ) {
             // Likewise for a rack fader: recorded, not dropped.
             self.on_rack_mixer_up(cx);
             return;
@@ -6667,7 +6822,10 @@ impl PianoRoll {
             return;
         };
         match drag {
-            PianoDrag::None | PianoDrag::Steps(_) | PianoDrag::RackMixer { .. } => return,
+            PianoDrag::None
+            | PianoDrag::Steps(_)
+            | PianoDrag::RackMixer { .. }
+            | PianoDrag::RackNote { .. } => return,
             PianoDrag::Move {
                 prev,
                 travel,
@@ -6949,6 +7107,7 @@ impl PianoRoll {
                 if self.open_note_menu.take().is_some()
                     || self.open_velocity_menu.take().is_some()
                     || self.open_lane_menu.take().is_some()
+                    || self.open_output_menu.take().is_some()
                 {
                     cx.notify();
                 } else if !matches!(self.drag, PianoDrag::None) {
@@ -10550,8 +10709,8 @@ mod step_view_gesture_tests {
         #[gpui::test]
         fn a_rack_step_is_a_note_at_its_pads_note(cx: &mut TestAppContext) {
             let mut rack = rack_rig(cx, "builtin:drumsampler");
-            rack.click(1, 6);
-            assert_eq!(starts(&rack.rig.lane(38)), vec![1.0, 1.5]);
+            rack.click(1, 5);
+            assert_eq!(starts(&rack.rig.lane(38)), vec![1.0, 1.25]);
             assert_eq!(
                 starts(&rack.rig.lane(36)),
                 vec![0.0],
@@ -10630,6 +10789,56 @@ mod step_view_gesture_tests {
                 .rig
                 .roll(|roll, _| matches!(roll.drag, PianoDrag::None));
             assert!(idle, "the release ends the drag");
+        }
+
+        /// Dragging a row's note up moves the pad to the next free note and its
+        /// steps with it, live; it is a pad setting, not an undo step.
+        #[gpui::test]
+        fn dragging_a_rows_note_moves_the_pad_and_its_steps(cx: &mut TestAppContext) {
+            let mut rack = rack_rig(cx, "builtin:drumsampler");
+            rack.rig.roll(|roll, cx| roll.begin_rack_note(2, 200.0, cx));
+            let up = gpui::point(px(40.0), px(200.0 - PianoRoll::RACK_NOTE_PX));
+            rack.rig.drag_to(up, MouseButton::Left, none());
+            rack.rig.cx.run_until_parked();
+            assert!(rack.rig.lane(38).is_empty());
+            assert_eq!(
+                starts(&rack.rig.lane(39)),
+                vec![1.0],
+                "the snare's step moved"
+            );
+            assert!(matches!(
+                rack.last_request(),
+                Some(RackRequest::SetPad {
+                    pad: 2,
+                    control: PadControl::Note,
+                    value,
+                    ..
+                }) if value == 39.0
+            ));
+            // Further down it steps over the kick's note.
+            let down = gpui::point(px(40.0), px(200.0 + 2.0 * PianoRoll::RACK_NOTE_PX));
+            rack.rig.drag_to(down, MouseButton::Left, none());
+            rack.rig.cx.run_until_parked();
+            assert_eq!(starts(&rack.rig.lane(35)), vec![1.0], "36 is the kick's");
+            assert_eq!(starts(&rack.rig.lane(36)), vec![0.0]);
+            rack.rig.release(down, MouseButton::Left, none());
+            assert!(!rack.rig.undo(), "a pad's note is not an undo step");
+        }
+
+        /// A row's output is the pad's output.
+        #[gpui::test]
+        fn picking_a_rows_output_sets_its_pads_output(cx: &mut TestAppContext) {
+            let mut rack = rack_rig(cx, "builtin:drumsampler");
+            rack.rig.roll(|roll, cx| roll.set_rack_output(0, 3, cx));
+            assert!(matches!(
+                rack.last_request(),
+                Some(RackRequest::SetPad {
+                    pad: 0,
+                    control: PadControl::Output,
+                    value,
+                    ..
+                }) if value == 3.0
+            ));
         }
 
         /// Another instrument has no pads: the rack says so and has no rows.

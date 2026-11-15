@@ -432,6 +432,25 @@ fn poll_bridge_events(runtime: &SharedPluginBridgeRuntime, timeline_state: &mut 
                         &plugin_instance_id,
                         &output_bus_channels,
                     );
+                    // Only the outputs its pads use get strips (a fresh Drum
+                    // Sampler: Main alone), as the studio's own load does.
+                    #[cfg(feature = "builtin-plugin-editor")]
+                    if let Some(buses) = timeline_state
+                        .find_insert_slot(&track_id, &plugin_instance_id)
+                        .and_then(|slot| slot.plugin_id.clone())
+                        .and_then(|plugin_id| {
+                            crate::components::builtin_plugin_editor::builtin_output_buses_for(
+                                &plugin_id,
+                                &plugin_instance_id,
+                            )
+                        })
+                    {
+                        timeline_state.set_insert_active_output_buses(
+                            &track_id,
+                            &plugin_instance_id,
+                            Some(buses),
+                        );
+                    }
                     timeline_state.auto_enable_detected_insert_outputs(
                         &track_id,
                         &plugin_instance_id,

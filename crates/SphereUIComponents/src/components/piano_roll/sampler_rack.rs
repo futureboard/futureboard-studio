@@ -34,6 +34,8 @@ pub(crate) struct PadState {
     pub gain_db: f32,
     /// −1 (left) … +1 (right).
     pub pan: f32,
+    /// The output it plays through: 0 is Main, 1 … 15 are Out 2 … Out 16.
+    pub output: u8,
 }
 
 impl PadState {
@@ -45,6 +47,7 @@ impl PadState {
             solo: false,
             gain_db: 0.0,
             pan: 0.0,
+            output: 0,
         }
     }
 }
@@ -117,6 +120,39 @@ pub(crate) fn rack_rows(
         .collect()
 }
 
+/// How many outputs a Drum Sampler has: Main and Out 2 … Out 16.
+pub(crate) const OUTPUTS: u8 = 16;
+
+/// An output's name as the Drum Sampler shows it.
+pub(crate) fn output_name(output: u8) -> String {
+    if output == 0 {
+        "Main".to_string()
+    } else {
+        format!("Out {}", output + 1)
+    }
+}
+
+/// The note `from` moved `notches` semitones (up is positive), stepping over
+/// the notes in `taken` (other pads' notes, so two rows never merge), held
+/// inside 0 … 127. Stays at `from` when every note that way is taken.
+pub(crate) fn next_free_note(from: u8, notches: i32, taken: &[u8]) -> u8 {
+    let step = notches.signum();
+    let mut note = i32::from(from);
+    let mut left = notches.abs();
+    while left > 0 {
+        let mut next = note + step;
+        while (0..=127).contains(&next) && taken.contains(&(next as u8)) {
+            next += step;
+        }
+        if !(0..=127).contains(&next) {
+            break;
+        }
+        note = next;
+        left -= 1;
+    }
+    note as u8
+}
+
 /// The first pad not already a row: where "+ Add Sampler" puts the next one.
 pub(crate) fn next_free_pad(rows: &[RackRow], pads: usize) -> Option<usize> {
     (0..pads).find(|pad| !rows.iter().any(|row| row.pad == *pad))
@@ -138,6 +174,7 @@ pub(crate) fn pads_of(insert_id: &str) -> Vec<PadState> {
             solo: pad.solo,
             gain_db: pad.gain_db,
             pan: pad.pan,
+            output: pad.output,
         })
         .collect()
 }
@@ -191,6 +228,17 @@ mod tests {
             })
             .collect();
         assert_eq!(next_free_pad(&full, PAD_COUNT), None);
+    }
+
+    #[test]
+    fn a_pads_note_moves_past_the_notes_other_pads_use() {
+        assert_eq!(next_free_note(38, 1, &[]), 39);
+        assert_eq!(next_free_note(38, 2, &[39]), 41, "D#2 is another pad's");
+        assert_eq!(next_free_note(38, -3, &[36, 37]), 33);
+        assert_eq!(next_free_note(126, 5, &[]), 127, "held at the top");
+        assert_eq!(next_free_note(1, -1, &[0]), 1, "nothing free below");
+        assert_eq!(output_name(0), "Main");
+        assert_eq!(output_name(3), "Out 4");
     }
 
     #[test]

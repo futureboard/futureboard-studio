@@ -2510,6 +2510,8 @@ fn midi_rack_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHand
             builtin_state_apply(PLUGIN, &slot, wire("pad3Mute"), 1.0);
             builtin_state_apply(PLUGIN, &slot, wire("pad6Pan"), 0.45);
             builtin_state_apply(PLUGIN, &slot, wire("pad6Gain"), -9.0);
+            // The hat on its own mixer strip.
+            builtin_state_apply(PLUGIN, &slot, wire("pad6Output"), 2.0);
             state.select_clip(&clip);
             timeline
         });

@@ -14,13 +14,14 @@ impl StudioLayout {
     pub(super) fn handle_rack_request(
         &mut self,
         request: RackRequest,
-        window: &mut Window,
+        window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
         match request {
-            RackRequest::OpenEditor { track_id } => {
-                self.open_track_instrument(&track_id, window, cx);
-            }
+            RackRequest::OpenEditor { track_id } => match window {
+                Some(window) => self.open_track_instrument(&track_id, window, cx),
+                None => eprintln!("[SamplerRack] open editor asked for without a window"),
+            },
             RackRequest::LoadPadSample {
                 insert_id,
                 pad,
@@ -56,6 +57,8 @@ impl StudioLayout {
             PadControl::Solo => "Solo",
             PadControl::Gain => "Gain",
             PadControl::Pan => "Pan",
+            PadControl::Note => "Note",
+            PadControl::Output => "Output",
         };
         let Some(index) = drumsampler::ui_param_index(&format!("pad{pad}{field}")) else {
             return;
@@ -84,6 +87,11 @@ impl StudioLayout {
             &plugin_id, insert_id, index, value,
         );
         self.note_plugin_state_edited(cx);
+        // A pad sent to another output gets that output's mixer strip; an
+        // output nothing uses any more loses its strip.
+        if control == PadControl::Output {
+            self.sync_builtin_output_strips(cx);
+        }
         cx.notify();
     }
 

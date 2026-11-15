@@ -61,6 +61,34 @@ impl PianoRoll {
     }
 
     /// A drum lane's menu: quick pattern actions on that lane's steps.
+    /// A rack row's outputs: Main and Out 2 … Out 16, the current one ticked.
+    pub(super) fn open_native_output_menu(
+        &mut self,
+        pad: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let current = self.rack_pad_output(pad);
+        let mut items = vec![PopupItem::Header(format!("Pad {} output", pad + 1))];
+        items.extend((0..super::sampler_rack::OUTPUTS).map(|output| {
+            command(
+                super::sampler_rack::output_name(output),
+                format!("out:{output}"),
+                output == current,
+            )
+        }));
+        self.show_native_menu(
+            items,
+            move |editor, chosen, cx| {
+                if let Some(output) = index_after(chosen, "out:") {
+                    editor.set_rack_output(pad, output as u8, cx);
+                }
+            },
+            window,
+            cx,
+        )
+    }
+
     pub(super) fn open_native_lane_menu(
         &mut self,
         row: usize,

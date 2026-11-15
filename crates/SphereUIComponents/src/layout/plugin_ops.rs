@@ -1375,10 +1375,16 @@ impl StudioLayout {
                             // A multi-out built-in names the outputs its pads
                             // use; only those get strips.
                             #[cfg(feature = "builtin-plugin-editor")]
-                            if let Some(buses) =
-                                crate::components::builtin_plugin_editor::builtin_used_output_buses(
-                                    &plugin_instance_id,
-                                )
+                            if let Some(buses) = timeline
+                                .state
+                                .find_insert_slot(&track_id, &plugin_instance_id)
+                                .and_then(|slot| slot.plugin_id.clone())
+                                .and_then(|plugin_id| {
+                                    crate::components::builtin_plugin_editor::builtin_output_buses_for(
+                                        &plugin_id,
+                                        &plugin_instance_id,
+                                    )
+                                })
                             {
                                 timeline.state.set_insert_active_output_buses(
                                     &track_id,
@@ -3864,22 +3870,22 @@ impl StudioLayout {
         #[cfg(feature = "builtin-plugin-editor")]
         {
             let changed = self.timeline.update(cx, |timeline, _cx| {
-                let inserts: Vec<(String, String)> = timeline
+                let inserts: Vec<(String, String, String)> = timeline
                     .state
                     .tracks
                     .iter()
                     .flat_map(|track| {
-                        track
-                            .inserts
-                            .iter()
-                            .map(move |slot| (track.id.clone(), slot.id.clone()))
+                        track.inserts.iter().filter_map(move |slot| {
+                            let plugin_id = slot.plugin_id.clone()?;
+                            Some((track.id.clone(), slot.id.clone(), plugin_id))
+                        })
                     })
                     .collect();
                 let mut changed = false;
-                for (track_id, insert_id) in inserts {
+                for (track_id, insert_id, plugin_id) in inserts {
                     let Some(buses) =
-                        crate::components::builtin_plugin_editor::builtin_used_output_buses(
-                            &insert_id,
+                        crate::components::builtin_plugin_editor::builtin_output_buses_for(
+                            &plugin_id, &insert_id,
                         )
                     else {
                         continue;

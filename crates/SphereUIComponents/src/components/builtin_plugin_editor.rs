@@ -1111,6 +1111,17 @@ mod state_mirror {
         }
     }
 
+    /// [`builtin_used_output_buses`] for an insert of `plugin_id`, also when
+    /// nothing is mirrored for it yet. A Drum Sampler that was never edited
+    /// plays its default kit, every pad on Main, so it uses no other output
+    /// and gets no strips for them; it used to get all sixteen. `None` still
+    /// means a plug-in with one output.
+    pub fn builtin_output_buses_for(plugin_id: &str, insert_id: &str) -> Option<Vec<u8>> {
+        builtin_used_output_buses(insert_id).or_else(|| {
+            (origin_for_plugin_id(plugin_id) == Some(drumsampler::ui::UI_ORIGIN)).then(Vec::new)
+        })
+    }
+
     /// The output buses a multi-out built-in insert is using (bus 0 being
     /// its main output), or `None` for an insert with one output. For the
     /// Drum Sampler: every output a pad is sent to, besides Main — the
@@ -1179,13 +1190,14 @@ pub use state_mirror::{
     builtin_compresser_params, builtin_deesser_params, builtin_default_replay,
     builtin_drum_sampler_params, builtin_duckstep_params, builtin_echospace_params,
     builtin_equz8_params, builtin_equzx_params, builtin_imager_params, builtin_mixstation_params,
-    builtin_quick_sampler_params, builtin_replay_changes, builtin_rodhareist_files,
-    builtin_rodhareist_params, builtin_sample_names, builtin_slicer_params, builtin_state_apply,
-    builtin_state_bytes, builtin_state_clear, builtin_state_parses, builtin_state_remove,
-    builtin_state_replace, builtin_state_replay, builtin_state_seed,
-    builtin_state_set_rodhareist_file, builtin_state_set_sample, builtin_transient_params,
-    builtin_used_output_buses, builtin_verbspace_params, builtin_waygate_params,
-    builtin_whitesharp_params, builtin_wrapsynth_params, builtin_zapp_params, builtin_zcomp_params,
+    builtin_output_buses_for, builtin_quick_sampler_params, builtin_replay_changes,
+    builtin_rodhareist_files, builtin_rodhareist_params, builtin_sample_names,
+    builtin_slicer_params, builtin_state_apply, builtin_state_bytes, builtin_state_clear,
+    builtin_state_parses, builtin_state_remove, builtin_state_replace, builtin_state_replay,
+    builtin_state_seed, builtin_state_set_rodhareist_file, builtin_state_set_sample,
+    builtin_transient_params, builtin_used_output_buses, builtin_verbspace_params,
+    builtin_waygate_params, builtin_whitesharp_params, builtin_wrapsynth_params,
+    builtin_zapp_params, builtin_zcomp_params,
 };
 
 /// Featureless no-ops: without the editor there is no param wire, so there is
@@ -3520,6 +3532,30 @@ pub use imp::{
 
 #[cfg(test)]
 mod tests {
+    /// A Drum Sampler nobody has edited yet plays every pad through Main, so
+    /// it needs no strip for Out 2 … Out 16; once a pad is sent to another
+    /// output, that output gets one. Not a Drum Sampler: no answer.
+    #[cfg(feature = "builtin-plugin-editor")]
+    #[test]
+    fn a_fresh_drum_sampler_uses_only_its_main_output() {
+        use super::{builtin_output_buses_for, builtin_state_apply};
+        let insert = "test-fresh-drum-outputs";
+        assert_eq!(
+            builtin_output_buses_for("builtin:drumsampler", insert),
+            Some(Vec::new())
+        );
+        let out4 = drumsampler::ui_param_index("pad5Output").expect("pad output");
+        builtin_state_apply("builtin:drumsampler", insert, out4, 3.0);
+        assert_eq!(
+            builtin_output_buses_for("builtin:drumsampler", insert),
+            Some(vec![3])
+        );
+        assert_eq!(
+            builtin_output_buses_for("builtin:quicksampler", "test-quick-outputs"),
+            None
+        );
+    }
+
     use super::*;
 
     #[test]

@@ -1186,16 +1186,18 @@ impl StudioLayout {
             // samples and live channel controls. Deferred like every child
             // callback here, so the editor never updates its parent mid-update.
             let target = cx.entity().clone();
-            let rack_handler: Arc<
-                dyn Fn(components::piano_roll::RackRequest, &mut Window, &mut gpui::App),
-            > = Arc::new(move |request, window, cx| {
-                StudioLayout::defer_update_in_window(
-                    &target,
-                    window,
-                    cx,
-                    move |this, window, cx| this.handle_rack_request(request, window, cx),
-                );
-            });
+            let rack_handler: components::piano_roll::RackRequestHandler =
+                Arc::new(move |request, window, cx| match window {
+                    Some(window) => StudioLayout::defer_update_in_window(
+                        &target,
+                        window,
+                        cx,
+                        move |this, window, cx| this.handle_rack_request(request, Some(window), cx),
+                    ),
+                    None => StudioLayout::defer_update(&target, cx, move |this, cx| {
+                        this.handle_rack_request(request, None, cx)
+                    }),
+                });
             let _ = piano_roll.update(cx, |roll, _cx| {
                 roll.set_rack_request_handler(Some(rack_handler.clone()));
             });
