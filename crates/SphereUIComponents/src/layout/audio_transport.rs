@@ -297,6 +297,11 @@ pub(crate) struct AudioBridgeState {
     /// Last failure text logged for a retry, so a device that stays missing
     /// reports once instead of once per attempt.
     pub stream_warm_last_error: Option<String>,
+    /// The stream was opened after the session loaded (an ASIO session, or a
+    /// warm-up retry). The device inventory the project's connections were
+    /// checked against predates it, so the next poll rescans; see
+    /// [`StudioLayout::ensure_audio_stream_warm`].
+    pub inventory_stale: bool,
     /// Playhead beat captured when the user last pressed Play. Play/Stop and
     /// "return on Stop" seek back here rather than to bar 1.
     pub playback_anchor_beats: Option<f32>,
@@ -354,6 +359,7 @@ impl Default for AudioBridgeState {
             stream_warm_retry_at: None,
             stream_warm_backoff: None,
             stream_warm_last_error: None,
+            inventory_stale: false,
             playback_anchor_beats: None,
         }
     }
@@ -991,6 +997,12 @@ impl StudioLayout {
             self.clear_stream_warm_retry();
         } else {
             self.retry_audio_stream_warm();
+        }
+        if std::mem::take(&mut self.audio_bridge.inventory_stale) {
+            self.refresh_audio_device_inventory(cx);
+            // Track input devices and channels travel in the engine project
+            // snapshot, which is what opens the capture stream.
+            self.audio_bridge.project_dirty = true;
         }
 
         let engine_beat = stats.position_beats.max(0.0) as f32;
@@ -2256,6 +2268,11 @@ impl StudioLayout {
                 // poll queues the background sync.
                 if !was_open {
                     self.audio_bridge.project_dirty = true;
+                    // The inventory taken at load predates this open. An ASIO
+                    // driver reports no channels until its session is open, so
+                    // every bus on it loaded as unavailable; rescan the way
+                    // Restart Audio Engine does.
+                    self.audio_bridge.inventory_stale = true;
                 }
                 true
             }
