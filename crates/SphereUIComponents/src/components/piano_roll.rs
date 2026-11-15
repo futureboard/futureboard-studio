@@ -55,6 +55,8 @@ mod render;
 pub mod scope;
 mod step_grid;
 pub use drum_map::{DrumLanes, DrumOrder};
+#[cfg(feature = "ui-preview")]
+pub(crate) use step_grid::RepeatCurve;
 mod stretch;
 mod tools_panel;
 
@@ -1596,6 +1598,9 @@ pub struct PianoRoll {
     /// How many hits a step plays when one is added or re-repeated (a
     /// ratchet), one of [`step_grid::STEP_REPEATS`].
     step_repeat: u8,
+    /// The velocity shape of a new step's repeated hits, and what the curve
+    /// buttons give the selected steps.
+    step_curve: step_grid::RepeatCurve,
     /// Whether the clip being edited is on a DrumStep track, so the view
     /// switches only when the editor moves to a track of the other kind.
     on_drum_step_track: bool,
@@ -1932,6 +1937,7 @@ impl PianoRoll {
             drum_mode: false,
             step_mode: false,
             step_repeat: 1,
+            step_curve: step_grid::RepeatCurve::Flat,
             on_drum_step_track: false,
             step_hover: None,
             open_lane_menu: None,
@@ -2899,6 +2905,72 @@ impl PianoRoll {
         }
     }
 
+    pub(crate) fn step_curve(&self) -> step_grid::RepeatCurve {
+        self.step_curve
+    }
+
+    pub(crate) fn set_step_curve(&mut self, curve: step_grid::RepeatCurve, cx: &mut Context<Self>) {
+        if self.step_curve != curve {
+            self.step_curve = curve;
+            cx.notify();
+        }
+    }
+
+    /// A xN toolbar button: the count new steps get, and the selected steps
+    /// rewritten to it (keeping their curves) as one undo entry.
+    pub(super) fn choose_step_repeat(&mut self, repeat: u8, cx: &mut Context<Self>) {
+        self.set_step_repeat(repeat, cx);
+        self.rewrite_selected_steps(Some(self.step_repeat), None, "Note Repeat", cx);
+    }
+
+    /// A repeat-curve toolbar button: the curve new steps get, and the
+    /// selected steps reshaped to it (keeping their counts) as one undo entry.
+    pub(super) fn choose_step_curve(
+        &mut self,
+        curve: step_grid::RepeatCurve,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_step_curve(curve, cx);
+        self.rewrite_selected_steps(None, Some(curve), "Repeat Curve", cx);
+    }
+
+    /// The steps holding selected notes, rewritten with `repeat` and/or
+    /// `curve`; the new notes are selected in their place. Nothing to do,
+    /// nothing recorded.
+    fn rewrite_selected_steps(
+        &mut self,
+        repeat: Option<u8>,
+        curve: Option<step_grid::RepeatCurve>,
+        label: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.step_mode || self.selection.is_empty() {
+            return;
+        }
+        let Some((clip_id, notes)) = self.step_clip_notes(cx) else {
+            return;
+        };
+        let step = self.step_view_beats();
+        let ids: Vec<u64> = self.selection.iter().copied().collect();
+        let cells = step_grid::cells_holding(&notes, &ids, step);
+        let (removed, added) = step_grid::rewrite_steps(&notes, &cells, step, repeat, curve);
+        if added.is_empty() && removed.is_empty() {
+            return;
+        }
+        self.selection
+            .retain(|id| !removed.iter().any(|n| n.id == *id));
+        self.selection.extend(added.iter().map(|n| n.id));
+        self.run_edit_command(
+            EditCommand::ReplaceMidiNotes {
+                label,
+                clip_id,
+                removed,
+                added,
+            },
+            cx,
+        );
+    }
+
     /// The step length the step view uses: the editor's grid when it is a
     /// note value, a sixteenth when the grid is a bar, free or adaptive —
     /// none of which is a step a drum pattern is written in.
@@ -3011,33 +3083,50 @@ impl PianoRoll {
             return;
         }
         if modifiers.shift {
-            // One step rewritten with the current repeat count, at its own
-            // velocity: a single edit, nothing to drag.
-            if let Some(cell) = cell {
-                let removed = step_grid::notes_with(&notes, &cell.ids);
-                let added = step_grid::step_notes(
-                    pitch,
-                    index,
-                    step,
-                    self.step_repeat,
-                    cell.velocity,
-                    cell.channel,
-                );
-                self.selection
-                    .retain(|id| !removed.iter().any(|n| n.id == *id));
-                self.run_edit_command(
-                    EditCommand::ReplaceMidiNotes {
-                        label: "Repeat Step",
-                        clip_id,
-                        removed,
-                        added,
-                    },
-                    cx,
-                );
+            // Drag up or down for more or fewer hits; a click gives the step
+            // the toolbar's count. An empty step is filled first, then
+            // dragged like any other.
+            let (current, from_repeat, curve) = match &cell {
+                Some(cell) => (
+                    step_grid::notes_with(&notes, &cell.ids),
+                    cell.repeat,
+                    step_grid::RepeatCurve::detect(&cell.velocities).unwrap_or(self.step_curve),
+                ),
+                None => {
+                    let channel = self.active_note_channel(cx);
+                    let painted = step_grid::paint_steps(
+                        &notes,
+                        pitch,
+                        &[index],
+                        self.step_total(cx),
+                        step,
+                        self.step_repeat,
+                        self.step_curve,
+                        channel,
+                    );
+                    self.write_steps_live(&clip_id, &[], &painted, &[], cx);
+                    self.begin_preview_note(pitch, step_grid::STEP_VELOCITY, "step_repeat", cx);
+                    (painted, self.step_repeat, self.step_curve)
+                }
+            };
+            let mut session = drag(step_grid::StepGesture::Repeat {
+                from_repeat,
+                curve,
+                dragged: cell.is_none(),
+            });
+            // A filled step counts as taken out and put back as itself until
+            // the drag changes it, so Escape and release see one swap.
+            if cell.is_some() {
+                session.removed = current.clone();
             }
+            session.added = current;
+            self.selection = session.added.iter().map(|n| n.id).collect();
+            self.drag = PianoDrag::Steps(session);
             cx.notify();
             return;
         }
+        // Any other press works on steps, not on a selection.
+        self.selection.clear();
         if modifiers.alt {
             let from_velocity = cell
                 .as_ref()
@@ -3082,6 +3171,7 @@ impl PianoRoll {
                     self.step_total(cx),
                     step,
                     self.step_repeat,
+                    self.step_curve,
                     channel,
                 );
                 self.write_steps_live(&clip_id, &[], &added, &[], cx);
@@ -3119,6 +3209,7 @@ impl PianoRoll {
                     steps,
                     step,
                     self.step_repeat,
+                    self.step_curve,
                     channel,
                 );
                 self.write_steps_live(&clip_id, &[], &added, &[], cx);
@@ -3167,6 +3258,24 @@ impl PianoRoll {
                 self.write_steps_live(&clip_id, &[], &[], &next, cx);
                 self.drag_value_status = Some(format!("Velocity {from_velocity} → {to_velocity}"));
             }
+            step_grid::StepGesture::Repeat {
+                from_repeat,
+                curve,
+                dragged,
+            } => {
+                let rise = session.start_y - ly;
+                if dragged || rise.abs() >= step_grid::RATCHET_PX_PER_COUNT * 0.5 {
+                    let notches = (rise / step_grid::RATCHET_PX_PER_COUNT).round() as i32;
+                    let repeat = step_grid::repeat_after(from_repeat, notches);
+                    self.restep_live(&clip_id, &mut session, repeat, curve, step, cx);
+                    session.gesture = step_grid::StepGesture::Repeat {
+                        from_repeat,
+                        curve,
+                        dragged: true,
+                    };
+                    self.drag_value_status = Some(format!("×{repeat} · {}", curve.label()));
+                }
+            }
             step_grid::StepGesture::Nudge { offset } => {
                 let cells = step_grid::lane_cells(&session.prev, session.pitch, step);
                 if let Some(cell) = cells.first() {
@@ -3184,6 +3293,37 @@ impl PianoRoll {
         }
         self.drag = PianoDrag::Steps(session);
         cx.notify();
+    }
+
+    /// A Repeat gesture's step written again with `repeat` hits shaped by
+    /// `curve`, in place of what the gesture last wrote. The new notes are
+    /// the selection, so the toolbar's curve buttons act on them next.
+    fn restep_live(
+        &mut self,
+        clip_id: &str,
+        session: &mut step_grid::StepDrag,
+        repeat: u8,
+        curve: step_grid::RepeatCurve,
+        step: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(cell) = step_grid::lane_cells(&session.added, session.pitch, step)
+            .into_iter()
+            .next()
+        else {
+            return;
+        };
+        if cell.repeat == repeat && step_grid::RepeatCurve::detect(&cell.velocities) == Some(curve)
+        {
+            return;
+        }
+        let next = step_grid::rewritten_step(session.pitch, &cell, step, repeat, curve);
+        // What the gesture wrote last goes; the step's original notes stay
+        // recorded as taken out.
+        let current = std::mem::take(&mut session.added);
+        self.write_steps_live(clip_id, &current, &next, &[], cx);
+        self.selection = next.iter().map(|n| n.id).collect();
+        session.added = next;
     }
 
     /// Every pointer move while a step gesture is held, window-wide: a velocity
@@ -3212,12 +3352,33 @@ impl PianoRoll {
     }
 
     /// The release: record the gesture as one undo entry.
-    fn finish_step_gesture(&mut self, session: step_grid::StepDrag, cx: &mut Context<Self>) {
+    fn finish_step_gesture(&mut self, mut session: step_grid::StepDrag, cx: &mut Context<Self>) {
         self.drag_value_status = None;
         let Some((clip_id, notes)) = self.step_clip_notes(cx) else {
             return;
         };
+        // A Shift-click that never became a drag: the toolbar's count.
+        if let step_grid::StepGesture::Repeat {
+            curve,
+            dragged: false,
+            ..
+        } = session.gesture
+        {
+            let repeat = self.step_repeat;
+            let step = self.step_view_beats();
+            self.restep_live(&clip_id, &mut session, repeat, curve, step, cx);
+        }
         let command = match session.gesture {
+            step_grid::StepGesture::Repeat { .. } => {
+                let removed: Vec<u64> = session.removed.iter().map(|n| n.id).collect();
+                let added: Vec<u64> = session.added.iter().map(|n| n.id).collect();
+                (removed != added).then_some(EditCommand::ReplaceMidiNotes {
+                    label: "Repeat Step",
+                    clip_id,
+                    removed: session.removed,
+                    added: session.added,
+                })
+            }
             step_grid::StepGesture::Paint
             | step_grid::StepGesture::Clear
             | step_grid::StepGesture::Erase => {
@@ -3347,6 +3508,7 @@ impl PianoRoll {
                     steps,
                     step,
                     self.step_repeat,
+                    self.step_curve,
                     channel,
                 );
                 (!added.is_empty()).then(|| EditCommand::ReplaceMidiNotes {
@@ -3508,6 +3670,17 @@ impl PianoRoll {
     pub fn preview_hover_step(&mut self, pitch: u8, index: usize) {
         self.step_hover = Some((pitch, index));
         self.drum_hover_lane = Some(pitch);
+    }
+
+    /// Select one step's notes, as a Shift-drag leaves them, for a still
+    /// render.
+    #[cfg(feature = "ui-preview")]
+    pub fn preview_select_step(&mut self, pitch: u8, index: usize, cx: &Context<Self>) {
+        if let Some((_, notes)) = self.step_clip_notes(cx) {
+            if let Some(cell) = step_grid::cell_at(&notes, pitch, index, self.step_view_beats()) {
+                self.selection = cell.ids.into_iter().collect();
+            }
+        }
     }
 
     /// The drum lane under a window point inside the note grid.
@@ -9573,5 +9746,154 @@ mod step_view_gesture_tests {
             .expect("window");
         assert_eq!(hover, Some((SNARE, 0)));
         assert_eq!(ids, snare_ids);
+    }
+
+    fn shift() -> Modifiers {
+        Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        }
+    }
+
+    fn velocities(lane: &[(f32, u8)]) -> Vec<u8> {
+        lane.iter().map(|(_, v)| *v).collect()
+    }
+
+    impl Rig {
+        fn roll<R>(&mut self, f: impl FnOnce(&mut PianoRoll, &mut Context<PianoRoll>) -> R) -> R {
+            let out = self
+                .window
+                .update(&mut self.cx, |roll, _, cx| f(roll, cx))
+                .expect("window");
+            self.cx.run_until_parked();
+            out
+        }
+
+        /// Shift-drag the step `rise` pixels up (negative: down), checking
+        /// nothing, and return the lane while the button is still held.
+        fn shift_drag(&mut self, pitch: u8, index: usize, rise: f32) -> Vec<(f32, u8)> {
+            let from = self.at(pitch, index, 0.0, 0.0);
+            let to = self.at(pitch, index, 0.0, -rise);
+            self.press(from, MouseButton::Left, shift());
+            self.drag_to(to, MouseButton::Left, shift());
+            self.cx.run_until_parked();
+            let held = self.lane(pitch);
+            self.release(to, MouseButton::Left, shift());
+            held
+        }
+    }
+
+    /// Shift-drag up: the step's count climbs x1, x2, x3 while the button is
+    /// held, the hits are written as it goes, and one undo takes it back.
+    #[gpui::test]
+    fn a_shift_drag_up_raises_the_repeat_count_live(cx: &mut TestAppContext) {
+        let mut rig = rig(cx, &[(SNARE, 0.5, 100)]);
+        let held = rig.shift_drag(SNARE, 2, step_grid::RATCHET_PX_PER_COUNT * 2.0);
+        assert_eq!(held.len(), 3, "written while dragging: {held:?}");
+        let lane = rig.lane(SNARE);
+        assert_eq!(lane.len(), 3);
+        assert!((lane[0].0 - 0.5).abs() < 1e-5);
+        assert!((lane[1].0 - (0.5 + 0.25 / 3.0)).abs() < 1e-5);
+        // The step is selected, so the curve buttons act on it next.
+        let selected = rig.roll(|roll, _| roll.selection.len());
+        assert_eq!(selected, 3);
+        assert!(rig.undo());
+        assert_eq!(rig.lane(SNARE), vec![(0.5, 100)]);
+    }
+
+    /// Dragging the count of a decaying roll keeps it decaying, and as loud.
+    #[gpui::test]
+    fn a_shift_drag_keeps_the_step_curve(cx: &mut TestAppContext) {
+        let roll: Vec<(u8, f32, u8)> = [100u8, 75, 50, 25]
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| (SNARE, 0.5 + i as f32 * 0.0625, v))
+            .collect();
+        let mut rig = rig(cx, &roll);
+        rig.shift_drag(SNARE, 2, step_grid::RATCHET_PX_PER_COUNT);
+        let lane = rig.lane(SNARE);
+        assert_eq!(lane.len(), 6);
+        assert_eq!(
+            step_grid::RepeatCurve::detect(&velocities(&lane)),
+            Some(step_grid::RepeatCurve::Decay)
+        );
+        assert_eq!(lane[0].1, 100);
+        // And down past x1 it stops at one hit.
+        rig.shift_drag(SNARE, 2, -step_grid::RATCHET_PX_PER_COUNT * 9.0);
+        assert_eq!(rig.lane(SNARE), vec![(0.5, 100)]);
+    }
+
+    /// A Shift-click that never moves gives the step the toolbar's count.
+    #[gpui::test]
+    fn a_shift_click_applies_the_toolbar_count(cx: &mut TestAppContext) {
+        let mut rig = rig(cx, &[(HAT, 1.0, 90)]);
+        rig.roll(|roll, cx| roll.set_step_repeat(4, cx));
+        rig.shift_drag(HAT, 4, 0.0);
+        let lane = rig.lane(HAT);
+        assert_eq!(lane.len(), 4);
+        assert_eq!(velocities(&lane), vec![90; 4]);
+        assert!(rig.undo());
+        assert_eq!(rig.lane(HAT), vec![(1.0, 90)]);
+    }
+
+    /// A curve button reshapes the selected roll as one undo entry, and the
+    /// x buttons change its count keeping that curve.
+    #[gpui::test]
+    fn the_curve_and_count_buttons_rewrite_the_selected_step(cx: &mut TestAppContext) {
+        let mut rig = rig(cx, &[(SNARE, 0.5, 100)]);
+        rig.shift_drag(SNARE, 2, step_grid::RATCHET_PX_PER_COUNT * 3.0);
+        assert_eq!(velocities(&rig.lane(SNARE)), vec![100; 4]);
+
+        rig.roll(|roll, cx| roll.choose_step_curve(step_grid::RepeatCurve::RampUp, cx));
+        assert_eq!(velocities(&rig.lane(SNARE)), vec![35, 57, 78, 100]);
+
+        rig.roll(|roll, cx| roll.choose_step_repeat(8, cx));
+        let lane = rig.lane(SNARE);
+        assert_eq!(lane.len(), 8);
+        assert_eq!(
+            step_grid::RepeatCurve::detect(&velocities(&lane)),
+            Some(step_grid::RepeatCurve::RampUp)
+        );
+
+        // Each button is its own undo step.
+        assert!(rig.undo());
+        assert_eq!(velocities(&rig.lane(SNARE)), vec![35, 57, 78, 100]);
+        assert!(rig.undo());
+        assert_eq!(velocities(&rig.lane(SNARE)), vec![100; 4]);
+        assert!(rig.undo());
+        assert_eq!(rig.lane(SNARE), vec![(0.5, 100)]);
+    }
+
+    /// With nothing selected, the buttons only set what new steps play.
+    #[gpui::test]
+    fn without_a_selection_the_buttons_shape_new_steps_only(cx: &mut TestAppContext) {
+        let mut rig = rig(cx, &[(SNARE, 0.5, 100)]);
+        rig.roll(|roll, cx| {
+            roll.choose_step_repeat(4, cx);
+            roll.choose_step_curve(step_grid::RepeatCurve::Accent, cx);
+        });
+        assert_eq!(rig.lane(SNARE), vec![(0.5, 100)], "nothing rewritten");
+        let at = rig.at(KICK, 0, 0.0, 0.0);
+        rig.press(at, MouseButton::Left, none());
+        rig.release(at, MouseButton::Left, none());
+        assert_eq!(
+            velocities(&rig.lane(KICK)),
+            step_grid::RepeatCurve::Accent.velocities(step_grid::STEP_VELOCITY, 4)
+        );
+    }
+
+    /// Escape during a Shift-drag puts the step back as it was, unrecorded.
+    #[gpui::test]
+    fn escape_reverts_a_shift_drag(cx: &mut TestAppContext) {
+        let mut rig = rig(cx, &[(SNARE, 0.5, 100)]);
+        let from = rig.at(SNARE, 2, 0.0, 0.0);
+        let to = rig.at(SNARE, 2, 0.0, -step_grid::RATCHET_PX_PER_COUNT * 3.0);
+        rig.press(from, MouseButton::Left, shift());
+        rig.drag_to(to, MouseButton::Left, shift());
+        rig.cx.run_until_parked();
+        assert_eq!(rig.lane(SNARE).len(), 4);
+        rig.roll(|roll, cx| roll.cancel_active_gesture(cx));
+        assert_eq!(rig.lane(SNARE), vec![(0.5, 100)]);
+        assert!(!rig.undo(), "nothing was recorded");
     }
 }

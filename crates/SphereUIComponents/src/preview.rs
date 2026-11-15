@@ -2335,10 +2335,20 @@ fn midi_steps_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHan
                     state.add_midi_note(&clip, 36, kick, 0.25, 118);
                 }
                 state.add_midi_note(&clip, 38, 1.0, 0.25, 104);
-                // A ×4 snare roll on the last step of the bar, building up:
-                // each slice's bar shows its own velocity.
-                for (hit, velocity) in [52u8, 72, 94, 120].into_iter().enumerate() {
+                // A ×4 snare roll on the last step of the bar, Ramp Up: each
+                // slice's bar shows its own velocity.
+                for (hit, velocity) in [42u8, 73, 99, 120].into_iter().enumerate() {
                     state.add_midi_note(&clip, 38, 3.75 + hit as f32 * 0.0625, 0.0625, velocity);
+                }
+                // A ×6 clap roll dying away (Decay).
+                for (hit, velocity) in [110u8, 94, 77, 61, 44, 28].into_iter().enumerate() {
+                    state.add_midi_note(
+                        &clip,
+                        39,
+                        1.5 + hit as f32 * 0.25 / 6.0,
+                        0.25 / 6.0,
+                        velocity,
+                    );
                 }
                 // A kick nudged a little late for groove (Ctrl-drag).
                 state.add_midi_note(&clip, 36, 3.03, 0.25, 110);
@@ -2360,7 +2370,11 @@ fn midi_steps_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHan
             roll.set_step_mode(true, cx);
             roll.set_drum_lanes(DrumLanes::Used, cx);
             roll.set_step_repeat(4, cx);
-            roll.preview_hover_step(38, 15);
+            roll.set_step_curve(crate::components::piano_roll::RepeatCurve::RampUp, cx);
+            // The snare roll is selected (what the curve buttons act on); the
+            // clap roll is under the pointer.
+            roll.preview_select_step(38, 15, cx);
+            roll.preview_hover_step(39, 6);
             roll
         })
     })?;

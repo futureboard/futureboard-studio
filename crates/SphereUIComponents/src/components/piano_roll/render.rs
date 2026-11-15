@@ -1288,24 +1288,46 @@ impl PianoRoll {
                 }),
             ));
         if self.step_mode {
-            // Note repeat: how many hits a new step plays, and what
-            // Shift-click rewrites a step to.
+            // Note repeat: how many hits a new step plays, what Shift-click
+            // gives a step, and what the selected steps are rewritten to.
             let current = self.step_repeat;
             for repeat in step_grid::STEP_REPEATS {
                 editor_mode = editor_mode.child(tool_text_segment(
                     ("pr-step-repeat", usize::from(repeat)),
                     format!("×{repeat}"),
                     if repeat == 1 {
-                        "One hit per step".to_string()
+                        "One hit per step. Applies to the selected steps too".to_string()
                     } else {
                         format!(
-                            "Note repeat: {repeat} hits per step. New steps play it; \
-                             Shift-click a step to give it this count"
+                            "Note repeat: {repeat} hits per step. New steps and the \
+                             selected steps play it; Shift-drag a step up or down to \
+                             change its count"
                         )
                     }
                     .into(),
                     repeat == current,
-                    cx.listener(move |this, _, _w, cx| this.set_step_repeat(repeat, cx)),
+                    cx.listener(move |this, _, _w, cx| {
+                        this.cancel_active_gesture(cx);
+                        this.choose_step_repeat(repeat, cx);
+                    }),
+                ));
+            }
+            // Repeat curve: the velocity shape of a step's repeated hits.
+            let current_curve = self.step_curve();
+            for (slot, curve) in step_grid::RepeatCurve::ALL.into_iter().enumerate() {
+                editor_mode = editor_mode.child(tool_text_segment(
+                    ("pr-step-curve", slot),
+                    curve.label().to_string(),
+                    format!(
+                        "{}. New steps and the selected steps play it",
+                        curve.description()
+                    )
+                    .into(),
+                    curve == current_curve,
+                    cx.listener(move |this, _, _w, cx| {
+                        this.cancel_active_gesture(cx);
+                        this.choose_step_curve(curve, cx);
+                    }),
                 ));
             }
             let off_grid = self.step_off_grid_count(cx);
@@ -1974,7 +1996,7 @@ impl PianoRoll {
                 .text_size(px(typography::UI_XS))
                 .text_color(Colors::text_muted())
                 .child(if self.step_mode {
-                    "Click or drag to add hits; right-drag erases; Alt-drag ramps velocity; Ctrl-drag nudges"
+                    "Click or drag to add hits; Shift-drag sets note repeat; right-drag erases; Alt-drag ramps velocity; Ctrl-drag nudges"
                 } else {
                     "Draw notes with the Draw tool, or record onto this clip"
                 })
@@ -3955,6 +3977,7 @@ impl PianoRoll {
         let empty_hover = Colors::with_alpha(Colors::text_primary(), 0.14);
         let beat_band = Colors::with_alpha(Colors::text_primary(), 0.025);
         let outline = Colors::with_alpha(Colors::text_primary(), 0.7);
+        let selected = Colors::accent_primary();
         let uneven = Colors::status_warning();
         let mut slab = track_color;
         slab.a = 0.22;
@@ -4032,7 +4055,11 @@ impl PianoRoll {
                     };
                     quads.push(StepQuad::fill(x, y, w, h, color, 2.0));
                 }
-                if hovered {
+                // Selected (what the toolbar's count and curve buttons act
+                // on) wins over hover: the accent is for selection alone.
+                if cell.ids.iter().any(|id| self.selection.contains(id)) {
+                    quads.push(StepQuad::outline(x, y, w, h, selected));
+                } else if hovered {
                     quads.push(StepQuad::outline(x, y, w, h, outline));
                 }
             }

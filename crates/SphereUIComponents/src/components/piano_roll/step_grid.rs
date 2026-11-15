@@ -45,6 +45,103 @@ pub(crate) const RAMP_VELOCITY_PER_PX: f32 = 127.0 / 150.0;
 /// How far "Randomize Velocity" moves each hit, as a share of its velocity.
 pub(crate) const RANDOM_VELOCITY_SPREAD: f32 = 0.15;
 
+/// Vertical travel, in logical pixels, that moves a Shift-drag one repeat
+/// count up or down: ×1 to ×8 is about 100 px.
+pub(crate) const RATCHET_PX_PER_COUNT: f32 = 20.0;
+
+/// The velocity shape of a step's repeated hits, as shares of the step's
+/// velocity. A ratchet at one velocity sounds like a machine gun; a roll
+/// that builds, dies away or swings sounds played.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum RepeatCurve {
+    /// Every hit at the step's velocity.
+    #[default]
+    Flat,
+    /// 35% rising to 100%: a snare or hi-hat build-up.
+    RampUp,
+    /// 100% falling to 25%: a roll dying away.
+    Decay,
+    /// 100%, 55%, 80%, 45%, repeating: a swung, accented roll.
+    Accent,
+}
+
+impl RepeatCurve {
+    pub(crate) const ALL: [Self; 4] = [Self::Flat, Self::RampUp, Self::Decay, Self::Accent];
+
+    const ACCENTS: [f32; 4] = [1.0, 0.55, 0.80, 0.45];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Flat => "Flat",
+            Self::RampUp => "Ramp Up",
+            Self::Decay => "Decay",
+            Self::Accent => "Accent",
+        }
+    }
+
+    pub(crate) fn description(self) -> &'static str {
+        match self {
+            Self::Flat => "Repeat curve: every hit at the step's velocity",
+            Self::RampUp => "Repeat curve: hits rise from 35% to 100% (build-ups)",
+            Self::Decay => "Repeat curve: hits fall from 100% to 25% (roll fade-outs)",
+            Self::Accent => "Repeat curve: accented groove, 100% 55% 80% 45%",
+        }
+    }
+
+    /// Share of the step's velocity hit `hit` of `count` plays at.
+    pub(crate) fn factor(self, hit: usize, count: usize) -> f32 {
+        let t = if count > 1 {
+            hit as f32 / (count - 1) as f32
+        } else {
+            0.0
+        };
+        match self {
+            Self::Flat => 1.0,
+            Self::RampUp if count > 1 => 0.35 + 0.65 * t,
+            Self::Decay => 1.0 - 0.75 * t,
+            Self::Accent => Self::ACCENTS[hit % Self::ACCENTS.len()],
+            Self::RampUp => 1.0,
+        }
+    }
+
+    /// `count` velocities for a step at `velocity`. The loudest is always
+    /// `velocity` itself, so reading the step back finds the same velocity.
+    pub(crate) fn velocities(self, velocity: u8, count: usize) -> Vec<u8> {
+        (0..count)
+            .map(|hit| {
+                (f32::from(velocity) * self.factor(hit, count))
+                    .round()
+                    .clamp(1.0, 127.0) as u8
+            })
+            .collect()
+    }
+
+    /// The curve a step's hits were written with, if they match one. Several
+    /// match a single hit or a flat pair; Flat wins, as the plainest.
+    pub(crate) fn detect(velocities: &[u8]) -> Option<Self> {
+        let loudest = velocities.iter().copied().max()?;
+        Self::ALL.into_iter().find(|curve| {
+            curve
+                .velocities(loudest, velocities.len())
+                .iter()
+                .zip(velocities)
+                .all(|(want, have)| want.abs_diff(*have) <= 1)
+        })
+    }
+}
+
+/// The repeat count `notches` steps along [`STEP_REPEATS`] from `from`
+/// (positive: more hits), held at ×1 and ×8. A count not in the list (an
+/// uneven roll of five) starts from the nearest one above it.
+pub(crate) fn repeat_after(from: u8, notches: i32) -> u8 {
+    let at = STEP_REPEATS
+        .iter()
+        .position(|repeat| *repeat >= from)
+        .unwrap_or(STEP_REPEATS.len() - 1) as i32;
+    let to = (at + notches).clamp(0, STEP_REPEATS.len() as i32 - 1);
+    STEP_REPEATS[to as usize]
+}
+
 /// One filled step of one lane.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StepCell {
@@ -163,29 +260,130 @@ pub(crate) fn cell_at(
 }
 
 /// The notes one step plays: `repeat` hits spread evenly over the step from
-/// its line plus `offset`, each as long as its share of it.
+/// its line, each as long as its share of it, their velocities `curve`
+/// shaped from `velocity`.
 pub(crate) fn step_notes(
     pitch: u8,
     index: usize,
     step: f32,
     repeat: u8,
     velocity: u8,
+    curve: RepeatCurve,
     channel: MidiChannel,
 ) -> Vec<MidiNoteState> {
     let repeat = repeat.max(1);
     let sub = step / f32::from(repeat);
-    (0..repeat)
-        .map(|i| {
-            let mut note = MidiNoteState::new(
-                pitch,
-                index as f32 * step + f32::from(i) * sub,
-                sub,
-                velocity.clamp(1, 127),
-            );
+    curve
+        .velocities(velocity.clamp(1, 127), usize::from(repeat))
+        .into_iter()
+        .enumerate()
+        .map(|(i, velocity)| {
+            let mut note =
+                MidiNoteState::new(pitch, index as f32 * step + i as f32 * sub, sub, velocity);
             note.channel = channel;
             note
         })
         .collect()
+}
+
+/// `cell` written again with `repeat` hits shaped by `curve`: same lane,
+/// line, nudge, channel, mute and velocity (its loudest hit). New notes; the
+/// caller swaps them for the cell's.
+pub(crate) fn rewritten_step(
+    pitch: u8,
+    cell: &StepCell,
+    step: f32,
+    repeat: u8,
+    curve: RepeatCurve,
+) -> Vec<MidiNoteState> {
+    step_notes(
+        pitch,
+        cell.index,
+        step,
+        repeat,
+        cell.velocity,
+        curve,
+        cell.channel,
+    )
+    .into_iter()
+    .map(|mut note| {
+        note.start = (note.start + cell.offset).max(0.0);
+        note.muted = cell.muted;
+        note
+    })
+    .collect()
+}
+
+/// The filled steps holding any of `ids`, with their lanes, in lane then
+/// step order.
+pub(crate) fn cells_holding(
+    notes: &[MidiNoteState],
+    ids: &[u64],
+    step: f32,
+) -> Vec<(u8, StepCell)> {
+    let mut pitches: Vec<u8> = notes
+        .iter()
+        .filter(|n| ids.contains(&n.id))
+        .map(|n| n.pitch)
+        .collect();
+    pitches.sort_unstable();
+    pitches.dedup();
+    pitches
+        .into_iter()
+        .flat_map(|pitch| {
+            lane_cells(notes, pitch, step)
+                .into_iter()
+                .filter(|cell| cell.ids.iter().any(|id| ids.contains(id)))
+                .map(move |cell| (pitch, cell))
+        })
+        .collect()
+}
+
+/// The selected steps rewritten: each with `repeat` hits (or its own count)
+/// and `curve` (or the curve its hits already follow, else Flat). Returns
+/// `(removed, added)` for one replace; both empty when nothing would change.
+pub(crate) fn rewrite_steps(
+    notes: &[MidiNoteState],
+    cells: &[(u8, StepCell)],
+    step: f32,
+    repeat: Option<u8>,
+    curve: Option<RepeatCurve>,
+) -> (Vec<MidiNoteState>, Vec<MidiNoteState>) {
+    let mut removed = Vec::new();
+    let mut added = Vec::new();
+    for (pitch, cell) in cells {
+        let count = repeat.unwrap_or(cell.repeat);
+        let shape = curve
+            .or_else(|| RepeatCurve::detect(&cell.velocities))
+            .unwrap_or_default();
+        let next = rewritten_step(*pitch, cell, step, count, shape);
+        let before = notes_with(notes, &cell.ids);
+        if same_hits(&before, &next) {
+            continue;
+        }
+        removed.extend(before);
+        added.extend(next);
+    }
+    (removed, added)
+}
+
+/// Whether two sets of hits play the same: starts, lengths and velocities.
+fn same_hits(a: &[MidiNoteState], b: &[MidiNoteState]) -> bool {
+    let key = |notes: &[MidiNoteState]| {
+        let mut hits: Vec<(i64, i64, u8)> = notes
+            .iter()
+            .map(|n| {
+                (
+                    (n.start / ON_LINE_BEATS).round() as i64,
+                    (n.duration / ON_LINE_BEATS).round() as i64,
+                    n.velocity,
+                )
+            })
+            .collect();
+        hits.sort_unstable();
+        hits
+    };
+    key(a) == key(b)
 }
 
 /// The notes of `ids` among `notes`, in the order `notes` holds them.
@@ -217,6 +415,15 @@ pub(crate) enum StepGesture {
     /// Ctrl/Cmd + left press on a filled step: slide that step early or late,
     /// up to just under half a step.
     Nudge { offset: f32 },
+    /// Shift + left press: dragging up or down steps the pressed step's
+    /// repeat count through [`STEP_REPEATS`], from `from_repeat`, keeping its
+    /// curve. A press that never moves gives it the toolbar's count instead.
+    Repeat {
+        from_repeat: u8,
+        curve: RepeatCurve,
+        /// Moved far enough to be a drag rather than a click.
+        dragged: bool,
+    },
 }
 
 /// One press-drag-release in the step view.
@@ -299,6 +506,7 @@ pub(crate) fn paint_steps(
     steps: usize,
     step: f32,
     repeat: u8,
+    curve: RepeatCurve,
     channel: MidiChannel,
 ) -> Vec<MidiNoteState> {
     let filled: Vec<usize> = lane_cells(notes, pitch, step)
@@ -315,7 +523,7 @@ pub(crate) fn paint_steps(
             seen.push(*index);
             first
         })
-        .flat_map(|index| step_notes(pitch, index, step, repeat, STEP_VELOCITY, channel))
+        .flat_map(|index| step_notes(pitch, index, step, repeat, STEP_VELOCITY, curve, channel))
         .collect()
 }
 
@@ -411,11 +619,12 @@ pub(crate) fn fill_every(
     steps: usize,
     step: f32,
     repeat: u8,
+    curve: RepeatCurve,
     channel: MidiChannel,
 ) -> Vec<MidiNoteState> {
     let every = every.max(1);
     let indices: Vec<usize> = (0..steps).step_by(every).collect();
-    paint_steps(notes, pitch, &indices, steps, step, repeat, channel)
+    paint_steps(notes, pitch, &indices, steps, step, repeat, curve, channel)
 }
 
 /// "Randomize Velocity": each note of `row` moved by up to
@@ -553,7 +762,15 @@ mod tests {
     #[test]
     fn every_repeat_reads_back_as_the_step_it_was_written_as() {
         for repeat in STEP_REPEATS {
-            let notes = step_notes(36, 5, SIXTEENTH, repeat, 90, MidiChannel::default());
+            let notes = step_notes(
+                36,
+                5,
+                SIXTEENTH,
+                repeat,
+                90,
+                RepeatCurve::Flat,
+                MidiChannel::default(),
+            );
             assert_eq!(notes.len(), usize::from(repeat));
             let cells = lane_cells(&notes, 36, SIXTEENTH);
             assert_eq!(cells.len(), 1, "×{repeat}");
@@ -601,7 +818,15 @@ mod tests {
     /// A ratchet whose later hits sit past the half-step is still one step.
     #[test]
     fn a_ratchet_never_splits_across_lines() {
-        let notes = step_notes(38, 15, SIXTEENTH, 4, 96, MidiChannel::default());
+        let notes = step_notes(
+            38,
+            15,
+            SIXTEENTH,
+            4,
+            96,
+            RepeatCurve::Flat,
+            MidiChannel::default(),
+        );
         let cells = lane_cells(&notes, 38, SIXTEENTH);
         assert_eq!(cells.len(), 1);
         assert_eq!((cells[0].index, cells[0].repeat), (15, 4));
@@ -662,6 +887,7 @@ mod tests {
             16,
             SIXTEENTH,
             1,
+            RepeatCurve::Flat,
             MidiChannel::default(),
         );
         assert_eq!(added.len(), 4, "step 2 was already played");
@@ -679,6 +905,7 @@ mod tests {
             16,
             SIXTEENTH,
             1,
+            RepeatCurve::Flat,
             MidiChannel::default()
         )
         .is_empty());
@@ -686,7 +913,15 @@ mod tests {
 
     #[test]
     fn clearing_takes_out_whole_steps_including_ratchets() {
-        let mut notes = step_notes(38, 3, SIXTEENTH, 4, 90, MidiChannel::default());
+        let mut notes = step_notes(
+            38,
+            3,
+            SIXTEENTH,
+            4,
+            90,
+            RepeatCurve::Flat,
+            MidiChannel::default(),
+        );
         notes.push(velocity_note(38, 0.0, 100));
         let removed = clear_steps(&notes, 38, &[2, 3], SIXTEENTH);
         assert_eq!(removed.len(), 4);
@@ -699,7 +934,15 @@ mod tests {
     #[test]
     fn a_note_added_then_cleared_in_one_gesture_cancels_out() {
         let mut drag = StepDrag::new(StepGesture::Erase, 36, 0, 0.0, 0.0);
-        let fresh = step_notes(36, 0, SIXTEENTH, 1, 100, MidiChannel::default());
+        let fresh = step_notes(
+            36,
+            0,
+            SIXTEENTH,
+            1,
+            100,
+            RepeatCurve::Flat,
+            MidiChannel::default(),
+        );
         drag.added.extend(fresh.clone());
         let old = velocity_note(36, 1.0, 80);
         drag.take_out(fresh);
@@ -732,7 +975,15 @@ mod tests {
     /// the step stays the one it was.
     #[test]
     fn a_nudge_slides_a_step_and_stays_within_half_a_step() {
-        let notes = step_notes(36, 4, SIXTEENTH, 2, 100, MidiChannel::default());
+        let notes = step_notes(
+            36,
+            4,
+            SIXTEENTH,
+            2,
+            100,
+            RepeatCurve::Flat,
+            MidiChannel::default(),
+        );
         let cell = lane_cells(&notes, 36, SIXTEENTH).remove(0);
         let late = nudged(&notes, &cell, SIXTEENTH, 0.05);
         assert!((late[0].start - 1.05).abs() < 1e-6);
@@ -747,7 +998,16 @@ mod tests {
     #[test]
     fn fill_every_n_fills_only_empty_lines() {
         let notes = vec![velocity_note(42, 0.0, 50)];
-        let added = fill_every(&notes, 42, 2, 16, SIXTEENTH, 1, MidiChannel::default());
+        let added = fill_every(
+            &notes,
+            42,
+            2,
+            16,
+            SIXTEENTH,
+            1,
+            RepeatCurve::Flat,
+            MidiChannel::default(),
+        );
         assert_eq!(added.len(), 7, "eight lines, one already played");
         let after = apply(&notes, &[], &added);
         let indices: Vec<usize> = lane_cells(&after, 42, SIXTEENTH)
@@ -756,7 +1016,17 @@ mod tests {
             .collect();
         assert_eq!(indices, vec![0, 2, 4, 6, 8, 10, 12, 14]);
         assert_eq!(
-            fill_every(&after, 42, 4, 16, SIXTEENTH, 1, MidiChannel::default()).len(),
+            fill_every(
+                &after,
+                42,
+                4,
+                16,
+                SIXTEENTH,
+                1,
+                RepeatCurve::Flat,
+                MidiChannel::default()
+            )
+            .len(),
             0
         );
     }
@@ -775,5 +1045,102 @@ mod tests {
             .all(|(a, b)| a.id == b.id && a.start == b.start));
         let loud = vec![velocity_note(38, 0.0, 127)];
         assert!(randomized_velocities(&loud, 3)[0].velocity <= 127);
+    }
+
+    #[test]
+    fn repeat_curves_shape_the_hits_from_the_step_velocity() {
+        assert_eq!(RepeatCurve::Flat.velocities(100, 4), vec![100; 4]);
+        assert_eq!(
+            RepeatCurve::RampUp.velocities(100, 4),
+            vec![35, 57, 78, 100]
+        );
+        assert_eq!(RepeatCurve::Decay.velocities(100, 4), vec![100, 75, 50, 25]);
+        assert_eq!(
+            RepeatCurve::Accent.velocities(100, 6),
+            vec![100, 55, 80, 45, 100, 55]
+        );
+        // One hit is the step's velocity whatever the curve.
+        for curve in RepeatCurve::ALL {
+            assert_eq!(curve.velocities(90, 1), vec![90]);
+        }
+        // Never below 1, even from a quiet step.
+        assert!(RepeatCurve::Decay.velocities(2, 8).iter().all(|v| *v >= 1));
+    }
+
+    /// Writing a curve and reading it back finds the curve and the step's
+    /// velocity, so rewriting the count keeps the shape and the level.
+    #[test]
+    fn a_written_curve_reads_back_as_itself() {
+        for curve in RepeatCurve::ALL {
+            for repeat in [2u8, 3, 4, 6, 8] {
+                let notes = step_notes(38, 2, SIXTEENTH, repeat, 96, curve, MidiChannel::default());
+                let cell = &lane_cells(&notes, 38, SIXTEENTH)[0];
+                assert_eq!(cell.velocity, 96, "{curve:?} ×{repeat}");
+                assert_eq!(
+                    RepeatCurve::detect(&cell.velocities),
+                    Some(curve),
+                    "×{repeat}"
+                );
+            }
+        }
+        assert_eq!(RepeatCurve::detect(&[100, 20, 90]), None);
+    }
+
+    #[test]
+    fn the_repeat_count_steps_through_the_list_and_stops_at_its_ends() {
+        assert_eq!(repeat_after(1, 1), 2);
+        assert_eq!(repeat_after(4, 1), 6);
+        assert_eq!(repeat_after(4, -2), 2);
+        assert_eq!(repeat_after(8, 3), 8);
+        assert_eq!(repeat_after(2, -5), 1);
+        // An uneven roll of five counts from ×6.
+        assert_eq!(repeat_after(5, 0), 6);
+    }
+
+    /// Rewriting keeps a step where it plays (nudge), muted, and as loud;
+    /// the count and curve change and nothing else.
+    #[test]
+    fn rewriting_a_step_keeps_its_nudge_mute_and_level() {
+        let mut notes = step_notes(
+            36,
+            4,
+            SIXTEENTH,
+            2,
+            110,
+            RepeatCurve::Flat,
+            MidiChannel::default(),
+        );
+        for note in &mut notes {
+            note.start += 0.03;
+            note.muted = true;
+        }
+        let ids: Vec<u64> = notes.iter().map(|n| n.id).collect();
+        let cells = cells_holding(&notes, &ids[..1], SIXTEENTH);
+        assert_eq!(cells.len(), 1);
+        let (removed, added) =
+            rewrite_steps(&notes, &cells, SIXTEENTH, Some(4), Some(RepeatCurve::Decay));
+        assert_eq!(removed.len(), 2);
+        assert_eq!(added.len(), 4);
+        let after = apply(&notes, &removed, &added);
+        let cell = &lane_cells(&after, 36, SIXTEENTH)[0];
+        assert_eq!((cell.index, cell.repeat, cell.velocity), (4, 4, 110));
+        assert!((cell.offset - 0.03).abs() < 1e-5);
+        assert!(cell.even && cell.muted);
+        assert_eq!(
+            RepeatCurve::detect(&cell.velocities),
+            Some(RepeatCurve::Decay)
+        );
+
+        // Only the count given: the curve the hits already follow is kept.
+        let cells = cells_holding(&after, &[added[0].id], SIXTEENTH);
+        let (_, again) = rewrite_steps(&after, &cells, SIXTEENTH, Some(8), None);
+        assert_eq!(
+            RepeatCurve::detect(&again.iter().map(|n| n.velocity).collect::<Vec<_>>()),
+            Some(RepeatCurve::Decay)
+        );
+        // Asking for what is already there changes nothing.
+        let (removed, added) =
+            rewrite_steps(&after, &cells, SIXTEENTH, Some(4), Some(RepeatCurve::Decay));
+        assert!(removed.is_empty() && added.is_empty());
     }
 }

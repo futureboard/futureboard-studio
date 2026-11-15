@@ -142,6 +142,12 @@ impl PianoRoll {
         cx: &Context<Self>,
         clip_id: &str,
     ) -> Option<((f32, f32), (u8, u8), Option<StretchAnchor>)> {
+        // The step view selects whole steps (a Shift-drag leaves its ratchet
+        // selected for the curve buttons); stretching would pull the hits off
+        // their steps, and the step's own ring already marks the selection.
+        if self.step_mode {
+            return None;
+        }
         let notes = self.timeline.read(cx).state.midi_clip_notes(clip_id)?;
         let (ids, span, dragging) = match &self.drag {
             PianoDrag::Stretch { ids, spec, .. } => (ids, spec.stretched_span(), Some(spec.anchor)),
