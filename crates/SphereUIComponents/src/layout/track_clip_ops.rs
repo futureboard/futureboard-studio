@@ -468,6 +468,12 @@ impl StudioLayout {
                 // A lane it created is one undo step.
                 timeline.record_automation_lanes_edit(track_id, lanes_before, cx);
             }
+            // Bring the track and its lane into view. A Bus or Return has no
+            // row until it carries a lane, and that row comes in at its place
+            // in the track list — usually below the arrangement's visible
+            // part — so adding one from Add Track or the mixer seemed to do
+            // nothing.
+            timeline.state.reveal_track_row(track_id);
             cx.notify();
             change
         });

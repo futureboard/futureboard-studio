@@ -2727,6 +2727,49 @@ mod mixer_target_tests {
         state.ensure_automation_lane(&id, AutomationTarget::TrackVolume);
         assert!(!is_arrangement_hidden_track(state.find_track(&id).unwrap()));
     }
+
+    /// A Bus is listed after the tracks feeding it, so the row its new lane
+    /// brings in is usually below what the arrangement shows: revealing it
+    /// scrolls there, or adding the lane looked like doing nothing.
+    #[test]
+    fn a_bus_lane_added_below_the_view_is_scrolled_into_it() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        for _ in 0..20 {
+            state.create_audio_track();
+        }
+        let bus = state.create_track(CreateTrackOptions {
+            track_type: TrackType::Bus,
+            name: "Drums Bus".to_string(),
+            color: gpui::rgb(0x336699),
+            volume: 1.0,
+            pan: 0.0,
+            armed: false,
+            input_monitor: InputMonitorMode::Off,
+        });
+        state.viewport.track_area_height = 300.0;
+        state.viewport.scroll_y = 0.0;
+
+        state.set_track_automation_target(&bus, AutomationTarget::TrackVolume);
+        let row = state
+            .track_row_layout()
+            .rows
+            .into_iter()
+            .find(|row| row.track_id == bus)
+            .expect("bus row");
+        assert!(row.height > 0.0, "the bus has a row now");
+        assert!(row.y > 300.0, "and it starts below the view");
+
+        assert!(state.reveal_track_row(&bus));
+        let scroll = state.viewport.scroll_y;
+        assert!(
+            row.y >= scroll && row.y + row.height <= scroll + 300.0,
+            "row {}..{} not inside view {scroll}..{}",
+            row.y,
+            row.y + row.height,
+            scroll + 300.0
+        );
+    }
 }
 
 #[cfg(test)]
