@@ -936,6 +936,8 @@ const LANE_MENU_PRIORITY: usize = 100;
 const RULER_H: f32 = 22.0;
 /// The editor's toolbar: a prominent-tier row holding default-tier controls.
 const TOOLBAR_H: f32 = crate::theme::size::PROMINENT + crate::theme::space::TIGHT;
+/// The second toolbar row: the current view's own options.
+const OPTIONS_H: f32 = crate::theme::size::DEFAULT + crate::theme::space::SNUG;
 /// The status footer under the editor.
 const FOOTER_H: f32 = crate::theme::size::ROW_DENSE;
 /// The note inspector column on the right.
@@ -8774,6 +8776,77 @@ fn tool_text_segment(
             Colors::text_muted()
         })
         .child(label)
+}
+
+/// One of the editor's view tabs (Piano Roll, Drums...): an icon and its name,
+/// sized to read at a glance.
+fn mode_tab(
+    id: &'static str,
+    icon: &'static str,
+    label: &'static str,
+    tip: gpui::SharedString,
+    active: bool,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    use crate::theme::{radius, size, space, typography};
+    let track = Colors::surface_input();
+    let rest = if active {
+        Colors::composite(track, Colors::state_selected())
+    } else {
+        Colors::with_alpha(track, 0.0)
+    };
+    let hover = Colors::composite(if active { rest } else { track }, Colors::state_hover());
+    let pressed = Colors::composite(if active { rest } else { track }, Colors::state_recessed());
+    div()
+        .id(id)
+        .role(gpui::Role::Tab)
+        .aria_label(label)
+        .aria_selected(active)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(space::SNUG))
+        .h(px(size::DEFAULT))
+        .px(px(space::BASE + space::HAIR))
+        .rounded(px(radius::inner(radius::CONTROL, space::HAIR)))
+        .bg(rest)
+        .cursor(gpui::CursorStyle::PointingHand)
+        .hover(move |s| s.bg(hover))
+        .active(move |s| s.bg(pressed))
+        .tooltip(crate::components::controls::fb_tooltip(tip))
+        .on_click(on_click)
+        .child(svg().path(icon).size(px(13.0)).text_color(if active {
+            Colors::accent_primary()
+        } else {
+            Colors::text_muted()
+        }))
+        .child(
+            div()
+                .text_size(px(typography::UI_XS))
+                .font_weight(if active {
+                    gpui::FontWeight::SEMIBOLD
+                } else {
+                    gpui::FontWeight::MEDIUM
+                })
+                .text_color(if active {
+                    Colors::text_primary()
+                } else {
+                    Colors::text_secondary()
+                })
+                .child(label),
+        )
+}
+
+/// A quiet caption in front of an option group on the editor's second row.
+fn option_label(text: &'static str) -> gpui::Div {
+    use crate::theme::{space, typography};
+    div()
+        .flex_shrink_0()
+        .pl(px(space::TIGHT))
+        .pr(px(space::HAIR))
+        .text_size(px(typography::DENSE_LABEL))
+        .text_color(Colors::text_faint())
+        .child(text)
 }
 
 /// The inset strip the tool segments sit in.

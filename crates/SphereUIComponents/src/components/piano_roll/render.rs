@@ -1320,41 +1320,66 @@ impl PianoRoll {
                 cx,
             ));
 
-        // ── Editor mode: the keyboard or the drum lanes ──
+        // ── Views: named tabs in the middle of the bar ──
+        // Every view edits the same notes; the tabs say what each one is in
+        // words, so nobody has to learn four icons first.
         let drum_mode = self.drum_mode;
-        let mut editor_mode = tool_strip()
-            .child(tool_segment(
+        let step_mode = self.step_mode;
+        let score_mode = self.score_mode;
+        let mut mode_tabs = tool_strip()
+            .child(mode_tab(
                 "pr-mode-piano",
                 assets::ICON_KEYBOARD_PATH,
-                "Piano editor".into(),
-                !drum_mode,
+                "Piano Roll",
+                "Notes on a keyboard grid".into(),
+                !drum_mode && !score_mode,
                 cx.listener(|this, _, _w, cx| {
                     this.cancel_active_gesture(cx);
                     this.set_drum_mode(false, cx);
                 }),
             ))
-            .child(tool_segment(
+            .child(mode_tab(
                 "pr-mode-drum",
                 assets::ICON_DRUM_PATH,
-                "Drum editor: lanes by sound, one hit per step".into(),
-                drum_mode && !self.step_mode,
+                "Drums",
+                "One lane per drum sound".into(),
+                drum_mode && !step_mode,
                 cx.listener(|this, _, _w, cx| {
                     this.cancel_active_gesture(cx);
                     // Step → MIDI: the step view back to the drum lanes.
                     this.set_drum_mode(true, cx);
                 }),
             ))
-            .child(tool_segment(
+            .child(mode_tab(
                 "pr-mode-step",
                 assets::ICON_SQUARE_PATH,
-                "MIDI → Step: edit this clip as a step sequencer (the notes stay the clip's MIDI)"
-                    .into(),
-                self.step_mode,
+                "Step Sequencer",
+                "Click steps on and off. The steps are this clip's notes".into(),
+                step_mode,
                 cx.listener(|this, _, _w, cx| {
                     this.cancel_active_gesture(cx);
                     this.set_step_mode(true, cx);
                 }),
             ));
+        if Self::score_available() {
+            mode_tabs = mode_tabs.child(mode_tab(
+                "pr-mode-score",
+                assets::ICON_MUSIC_PATH,
+                "Score",
+                "This clip as notation, edited in place".into(),
+                score_mode,
+                cx.listener(|this, _, _w, cx| {
+                    this.cancel_active_gesture(cx);
+                    this.set_score_mode(true, cx);
+                }),
+            ));
+        }
+        // The current view's own options, for the second row.
+        let mut step_source_strip = tool_strip();
+        let mut step_repeat_strip = tool_strip();
+        let mut step_curve_strip = tool_strip();
+        let mut step_snap: Option<gpui::Stateful<gpui::Div>> = None;
+        let mut drum_strip = tool_strip();
         if self.step_mode {
             // What the rows are: one clip's drum lanes, or a rack of tracks.
             let source = self.step_source();
@@ -1374,7 +1399,7 @@ impl PianoRoll {
             .into_iter()
             .enumerate()
             {
-                editor_mode = editor_mode.child(tool_text_segment(
+                step_source_strip = step_source_strip.child(tool_text_segment(
                     ("pr-step-source", slot),
                     label.to_string(),
                     tip.into(),
@@ -1389,7 +1414,7 @@ impl PianoRoll {
             // gives a step, and what the selected steps are rewritten to.
             let current = self.step_repeat;
             for repeat in step_grid::STEP_REPEATS {
-                editor_mode = editor_mode.child(tool_text_segment(
+                step_repeat_strip = step_repeat_strip.child(tool_text_segment(
                     ("pr-step-repeat", usize::from(repeat)),
                     format!("×{repeat}"),
                     if repeat == 1 {
@@ -1412,7 +1437,7 @@ impl PianoRoll {
             // Repeat curve: the velocity shape of a step's repeated hits.
             let current_curve = self.step_curve();
             for (slot, curve) in step_grid::RepeatCurve::ALL.into_iter().enumerate() {
-                editor_mode = editor_mode.child(tool_text_segment(
+                step_curve_strip = step_curve_strip.child(tool_text_segment(
                     ("pr-step-curve", slot),
                     curve.label().to_string(),
                     format!(
@@ -1429,7 +1454,7 @@ impl PianoRoll {
             }
             let off_grid = self.step_off_grid_count(cx);
             if off_grid > 0 {
-                editor_mode = editor_mode.child(tool_text_segment(
+                step_snap = Some(tool_text_segment(
                     ("pr-step-snap", 0usize),
                     format!("Snap {off_grid} to grid"),
                     format!(
@@ -1449,7 +1474,7 @@ impl PianoRoll {
         if drum_mode {
             // Which lanes: the whole kit, or only what the clip plays.
             let lanes = self.drum_lanes;
-            editor_mode = editor_mode
+            drum_strip = drum_strip
                 .child(tool_segment(
                     "pr-drum-kit",
                     assets::ICON_LIST_MUSIC_PATH,
@@ -1814,81 +1839,138 @@ impl PianoRoll {
                 }),
             ));
 
-        div()
+        // ── Row 1: draw tools · the views, centred · view and panels ──
+        // The two sides take equal shares of the row, so the tabs sit in the
+        // middle of the editor whatever is on either side of them.
+        let side = || {
+            div()
+                .flex()
+                .flex_row()
+                .flex_1()
+                .min_w_0()
+                .items_center()
+                .gap(px(space::HAIR))
+                .overflow_hidden()
+        };
+        let header = div()
             .flex()
             .flex_row()
-            .flex_shrink_0()
             .items_center()
-            // Modules are set apart by their dividers; within one, controls
-            // sit a hair apart. The row has to fit the editor window's minimum
-            // width without clipping the panel toggles at its end.
-            .gap(px(space::HAIR))
+            .gap(px(space::BASE))
             .h(px(TOOLBAR_H))
             .px(px(space::BASE))
+            // The score view brings its own tools, grid and zoom; the piano
+            // roll's would do nothing there.
+            .child(side().when(!score_mode, |row| row.child(tools)))
+            .child(mode_tabs.flex_shrink_0())
+            .child(
+                side()
+                    .justify_end()
+                    .when(!score_mode, |row| {
+                        row.child(view)
+                            .child(bar_divider())
+                            .child(bar_icon_button(
+                                "pr-tools",
+                                assets::ICON_PANEL_LEFT_PATH,
+                                "MIDI tools".into(),
+                                Some(self.tools.open),
+                                cx.listener(|this, _, _w, cx| {
+                                    this.tools.open = !this.tools.open;
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(bar_icon_button(
+                                "pr-inspector",
+                                assets::ICON_PANEL_RIGHT_PATH,
+                                "Note inspector".into(),
+                                Some(self.inspector_open),
+                                cx.listener(|this, _, _w, cx| {
+                                    this.inspector_open = !this.inspector_open;
+                                    cx.notify();
+                                }),
+                            ))
+                    })
+                    .when_some(self.on_pop_out.clone(), |row, pop_out| {
+                        row.child(bar_icon_button(
+                            "pr-pop-out",
+                            assets::ICON_POP_OUT_PATH,
+                            "Open in a window".into(),
+                            None,
+                            move |_, window, cx| pop_out(window, cx),
+                        ))
+                    }),
+            );
+
+        // ── Row 2: what the current view offers, and nothing else ──
+        let snap = bar_icon_button(
+            "pr-snap",
+            assets::ICON_MAGNET_PATH,
+            command_tip("Snap to grid", "midi:toggle-snap"),
+            Some(snap_on),
+            cx.listener(|this, _, _w, cx| {
+                this.snap_on = !this.snap_on;
+                cx.notify();
+            }),
+        );
+        let mut options = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(space::HAIR))
+            .h(px(OPTIONS_H))
+            .px(px(space::BASE))
             .overflow_hidden()
+            .border_t(px(1.0))
+            .border_color(Colors::divider());
+        if step_mode {
+            // Step length follows the grid; then what a step plays.
+            options = options
+                .child(option_label("Rows"))
+                .child(step_source_strip)
+                .child(bar_divider())
+                .child(option_label("Step"))
+                .child(grid_menu)
+                .child(bar_divider())
+                .child(option_label("Repeat"))
+                .child(step_repeat_strip)
+                .child(bar_divider())
+                .child(option_label("Velocity"))
+                .child(step_curve_strip)
+                .when_some(step_snap, |row, button| {
+                    row.child(bar_divider()).child(button)
+                });
+        } else {
+            options = options
+                .child(snap)
+                .child(grid_menu)
+                .child(bar_divider())
+                // Scale lock and chord insert act on pitch; drum lanes are
+                // sounds, so the drum view offers its lane options instead.
+                .when(!drum_mode, |row| {
+                    row.child(option_label("Scale"))
+                        .child(scale_menu)
+                        .child(lock)
+                        .child(chord_menu)
+                })
+                .when(drum_mode, |row| {
+                    row.child(option_label("Lanes")).child(drum_strip)
+                })
+                .child(bar_divider())
+                .child(channel_menu)
+                .child(div().flex_1())
+                .child(quantize)
+                .child(advanced);
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
             .border_b(px(1.0))
             .border_color(Colors::panel_border())
             .bg(Colors::surface_panel())
-            .child(tools)
-            .child(bar_divider())
-            .child(editor_mode)
-            .child(bar_divider())
-            .child(bar_icon_button(
-                "pr-snap",
-                assets::ICON_MAGNET_PATH,
-                command_tip("Snap to grid", "midi:toggle-snap"),
-                Some(snap_on),
-                cx.listener(|this, _, _w, cx| {
-                    this.snap_on = !this.snap_on;
-                    cx.notify();
-                }),
-            ))
-            .child(grid_menu)
-            .child(bar_divider())
-            // Scale lock and chord insert act on pitch; drum lanes are sounds,
-            // and drum mode ignores both, so they are not offered there.
-            .when(!drum_mode, |row| {
-                row.child(scale_menu)
-                    .child(lock)
-                    .child(chord_menu)
-                    .child(bar_divider())
-            })
-            .child(channel_menu)
-            .child(bar_divider())
-            .child(quantize)
-            .child(advanced)
-            .child(div().flex_1().min_w(px(space::BASE)))
-            .child(view)
-            .child(bar_divider())
-            .child(bar_icon_button(
-                "pr-tools",
-                assets::ICON_PANEL_LEFT_PATH,
-                "MIDI tools".into(),
-                Some(self.tools.open),
-                cx.listener(|this, _, _w, cx| {
-                    this.tools.open = !this.tools.open;
-                    cx.notify();
-                }),
-            ))
-            .child(bar_icon_button(
-                "pr-inspector",
-                assets::ICON_PANEL_RIGHT_PATH,
-                "Note inspector".into(),
-                Some(self.inspector_open),
-                cx.listener(|this, _, _w, cx| {
-                    this.inspector_open = !this.inspector_open;
-                    cx.notify();
-                }),
-            ))
-            .when_some(self.on_pop_out.clone(), |row, pop_out| {
-                row.child(bar_icon_button(
-                    "pr-pop-out",
-                    assets::ICON_POP_OUT_PATH,
-                    "Open in a window".into(),
-                    None,
-                    move |_, window, cx| pop_out(window, cx),
-                ))
-            })
+            .child(header)
+            .when(!score_mode, |bar| bar.child(options))
     }
 
     /// The status footer: what the pointer or the gesture in flight is doing
