@@ -1814,6 +1814,72 @@ impl BuiltinHostProcessor {
             _ => {}
         }
     }
+
+    /// True for the instruments whose cores start a note the moment
+    /// [`Self::apply_midi`] hands it over, instead of queueing it with its
+    /// sample offset as WrapSynth does. Their blocks are rendered through
+    /// [`Self::process_block_with_midi`].
+    fn plays_midi_on_apply(&self) -> bool {
+        // SAFETY: the dedicated producer thread is the sole DSP accessor.
+        matches!(
+            unsafe { &*self.dsp.get() },
+            BuiltinDsp::DrumSampler(_) | BuiltinDsp::QuickSampler(_) | BuiltinDsp::Slicer(_)
+        )
+    }
+
+    /// One block of an instrument that plays MIDI as it is applied, with
+    /// every event taken from `next_event` landing on its own sample: the
+    /// block is rendered up to the event's offset, the event applied, and the
+    /// rest rendered after it. Returns how many events it took.
+    ///
+    /// Applying the whole ring ahead of the block, as this path used to,
+    /// started every note at the block's first sample: up to one buffer
+    /// early, by an amount that changed from note to note and grew with the
+    /// buffer size, while audio tracks and offset-aware instruments stayed on
+    /// the grid. Producer thread only; no allocation.
+    fn process_block_with_midi(
+        &self,
+        next_event: &mut dyn FnMut() -> Option<SharedMidiEvent>,
+        in_l: &[f32],
+        in_r: &[f32],
+        interleaved: &mut [f32],
+        frames: usize,
+    ) -> u32 {
+        let channels = self.output_channels().max(1);
+        let frames = frames
+            .min(interleaved.len() / channels)
+            .min(in_l.len())
+            .min(in_r.len());
+        let mut rendered = 0usize;
+        let mut events = 0u32;
+        while let Some(event) = next_event() {
+            // Offsets arrive in order; one that does not (or lies past the
+            // block) plays as early as it still can rather than being lost.
+            let at = (event.sample_offset as usize).clamp(rendered, frames);
+            if at > rendered {
+                self.process_block_keyed(
+                    &in_l[rendered..at],
+                    &in_r[rendered..at],
+                    None,
+                    &mut interleaved[rendered * channels..at * channels],
+                    at - rendered,
+                );
+                rendered = at;
+            }
+            self.apply_midi(event);
+            events += 1;
+        }
+        if frames > rendered {
+            self.process_block_keyed(
+                &in_l[rendered..frames],
+                &in_r[rendered..frames],
+                None,
+                &mut interleaved[rendered * channels..frames * channels],
+                frames - rendered,
+            );
+        }
+        events
+    }
 }
 
 /// A built-in's output buses, as channel counts: one stereo bus for most,
@@ -2070,6 +2136,94 @@ mod builtin_processor_tests {
         assert!(meters.out_peak > 0.0);
         assert_eq!((meters.in_peak, meters.in_rms), (0.0, 0.0));
         assert_eq!(processor.latency_samples(), 0);
+    }
+
+    /// A sampler's note sounds on the sample its event names, not at the top
+    /// of the block it arrived in. A constant sample makes the first sounding
+    /// frame unmistakable.
+    #[test]
+    fn sampler_notes_land_on_their_sample_offset() {
+        const FRAMES: usize = 512;
+        let first_sounding = |output: &[f32], channels: usize| {
+            output
+                .chunks_exact(channels)
+                .position(|frame| frame.iter().any(|sample| sample.abs() > 1.0e-6))
+        };
+        let note = |sample_offset: u32, data1: u8| SharedMidiEvent {
+            sample_offset,
+            status: 0x90,
+            data1,
+            data2: 120,
+            ..SharedMidiEvent::default()
+        };
+        let silence = [0.0f32; FRAMES];
+
+        let quick = BuiltinHostProcessor::quicksampler(48_000, None);
+        let level = vec![0.5f32; 48_000];
+        let sample = quicksampler::SampleData::from_interleaved(&level, 1, 48_000).unwrap();
+        quick
+            .sample_loader
+            .as_ref()
+            .expect("quick sampler has a sample loader")
+            .submit(Some(std::sync::Arc::new(sample)));
+        // A submitted sample is adopted at the top of the next block.
+        quick.process_block(&silence, &silence, &mut [0.0f32; FRAMES * 2], FRAMES);
+        for offset in [0u32, 1, 137, 511] {
+            let mut events = [note(offset, 60)].into_iter();
+            let mut output = [0.0f32; FRAMES * 2];
+            let taken = quick.process_block_with_midi(
+                &mut || events.next(),
+                &silence,
+                &silence,
+                &mut output,
+                FRAMES,
+            );
+            assert_eq!(taken, 1);
+            assert_eq!(
+                first_sounding(&output, 2),
+                Some(offset as usize),
+                "quick sampler note at offset {offset}"
+            );
+            // Let the note go before the next round.
+            let mut off = [SharedMidiEvent {
+                status: 0xb0,
+                data1: 120,
+                ..SharedMidiEvent::default()
+            }]
+            .into_iter();
+            for _ in 0..200 {
+                quick.process_block_with_midi(
+                    &mut || off.next(),
+                    &silence,
+                    &silence,
+                    &mut output,
+                    FRAMES,
+                );
+            }
+        }
+
+        let drums = BuiltinHostProcessor::drumsampler(48_000, None);
+        drums.drum_pad_loaders.as_ref().expect("pad loaders")[2].submit(Box::new(
+            drumsampler::PadBuffer {
+                samples: vec![0.5f32; 48_000].into_boxed_slice(),
+                channels: 1,
+                frames: 48_000,
+                sample_rate: 48_000.0,
+            },
+        ));
+        let channels = drumsampler::OUTPUT_CHANNELS;
+        let mut events = [note(200, 38)].into_iter();
+        let mut output = vec![0.0f32; FRAMES * channels];
+        drums.process_block(&silence, &silence, &mut output, FRAMES);
+        output.fill(0.0);
+        drums.process_block_with_midi(
+            &mut || events.next(),
+            &silence,
+            &silence,
+            &mut output,
+            FRAMES,
+        );
+        assert_eq!(first_sounding(&output, channels), Some(200));
     }
 
     /// Quick Sampler: a submitted sample plays from the next block on a MIDI
@@ -3474,6 +3628,10 @@ fn service_audio_bridge(
     // broadcast to every loaded plugin.
     let mut midi_count = 0u32;
     match runtime {
+        // These take their ring while they render, below, so each event
+        // lands on its own sample.
+        BlockRuntime::Builtin(builtin) if builtin.plays_midi_on_apply() => {}
+        // WrapSynth queues each event with its offset; effects ignore MIDI.
         BlockRuntime::Builtin(builtin) => {
             while let Some(ev) = bridge.midi.try_pop() {
                 builtin.apply_midi(ev);
@@ -3481,7 +3639,7 @@ fn service_audio_bridge(
             }
         }
         // Audio Units schedule events inside the slice, so the ring's
-        // `sample_offset` survives the hop (the built-in path drops it).
+        // `sample_offset` survives the hop.
         BlockRuntime::Au(au) => {
             while let Some(ev) = bridge.midi.try_pop() {
                 au.apply_midi(ev);
@@ -3580,6 +3738,16 @@ fn service_audio_bridge(
     let mut interleaved = [0.0f32; AUDIO_BUF_LEN];
     let len = (frames * output_channels).min(AUDIO_BUF_LEN);
     let produced_channels = match runtime {
+        BlockRuntime::Builtin(builtin) if builtin.plays_midi_on_apply() => {
+            midi_count += builtin.process_block_with_midi(
+                &mut || bridge.midi.try_pop(),
+                &in_l[..frames],
+                &in_r[..frames],
+                &mut interleaved[..len],
+                frames,
+            );
+            output_channels
+        }
         BlockRuntime::Builtin(builtin) => {
             builtin.process_block_keyed(
                 &in_l[..frames],
