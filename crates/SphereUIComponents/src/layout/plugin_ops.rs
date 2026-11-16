@@ -1437,7 +1437,7 @@ impl StudioLayout {
                         self.audio_bridge.project_dirty = true;
                         self.schedule_audio_project_sync(cx, true, "bridge_processing_prepared");
                     }
-                    self.request_bridge_insert_parameters(&plugin_instance_id);
+                    self.request_bridge_insert_parameters(&plugin_instance_id, cx);
                 }
                 ClientEvent::Host(HostEvent::PluginParameters {
                     plugin_instance_id,
@@ -7249,7 +7249,7 @@ impl StudioLayout {
             self.audio_bridge.project_dirty = true;
             self.schedule_audio_project_sync(cx, true, source);
         }
-        self.request_bridge_insert_parameters(plugin_instance_id);
+        self.request_bridge_insert_parameters(plugin_instance_id, cx);
         slot_changed
     }
 
@@ -7616,7 +7616,24 @@ impl StudioLayout {
         }
     }
 
-    pub(super) fn request_bridge_insert_parameters(&self, plugin_instance_id: &str) {
+    /// Fill an insert's parameter list, which the automation picker offers.
+    ///
+    /// A built-in's comes from its own descriptor here: the host's VST3
+    /// engine does not hold built-ins, so asking it answered "no parameters"
+    /// and the picker showed "Loading parameters…" for good. Anything else is
+    /// asked of the host, whose answer lands in `PluginParameters`.
+    pub(super) fn request_bridge_insert_parameters(
+        &mut self,
+        plugin_instance_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let builtin = self
+            .slot_plugin_id_by_insert(plugin_instance_id, cx)
+            .filter(|plugin| SpherePluginHost::builtin_audio_bridge_supported(plugin));
+        if let Some(plugin_id) = builtin {
+            self.apply_builtin_insert_parameters(plugin_instance_id, &plugin_id, cx);
+            return;
+        }
         let Some(runtime) = self.plugin_editors.bridge_runtime.as_ref() else {
             return;
         };
@@ -7629,7 +7646,56 @@ impl StudioLayout {
         }
     }
 
-    pub(super) fn request_track_insert_parameters(&self, track_id: &str, cx: &Context<Self>) {
+    /// A built-in's parameter list, from its descriptor, with each value read
+    /// from the insert's state mirror (its descriptor default when the mirror
+    /// has none).
+    fn apply_builtin_insert_parameters(
+        &mut self,
+        plugin_instance_id: &str,
+        plugin_id: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        use crate::components::builtin_plugin_editor as host;
+        use crate::components::timeline::timeline_state::PluginParameterState;
+        let current = host::builtin_state_replay(plugin_id, plugin_instance_id);
+        let params: Vec<PluginParameterState> = host::builtin_param_specs(plugin_id)
+            .into_iter()
+            .map(|spec| {
+                let value = current
+                    .iter()
+                    .find(|(index, _)| *index == spec.wire_index)
+                    .map_or(spec.default_value, |(_, value)| *value);
+                PluginParameterState {
+                    id: spec.wire_index,
+                    name: spec.name.clone(),
+                    value_normalized: spec.normalize(value),
+                    automatable: true,
+                    hidden: false,
+                    read_only: false,
+                    unit: spec.unit.clone(),
+                }
+            })
+            .collect();
+        self.timeline.update(cx, |timeline, _cx| {
+            timeline
+                .state
+                .insert_owner_ids_containing(plugin_instance_id)
+                .into_iter()
+                .any(|track_id| {
+                    timeline.state.set_insert_parameters(
+                        &track_id,
+                        plugin_instance_id,
+                        params.clone(),
+                    )
+                })
+        })
+    }
+
+    pub(super) fn request_track_insert_parameters(
+        &mut self,
+        track_id: &str,
+        cx: &mut Context<Self>,
+    ) {
         let timeline = self.timeline.read(cx);
         let state = &timeline.state;
         let instance_ids: Vec<String> =
@@ -7655,7 +7721,7 @@ impl StudioLayout {
                     .unwrap_or_default()
             };
         for instance_id in instance_ids {
-            self.request_bridge_insert_parameters(&instance_id);
+            self.request_bridge_insert_parameters(&instance_id, cx);
         }
     }
 

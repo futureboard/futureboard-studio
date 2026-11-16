@@ -34,7 +34,7 @@ impl RuntimeAutomationCurve {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RuntimeAutomationTarget {
     TrackVolume,
     TrackPan,
@@ -42,6 +42,11 @@ pub enum RuntimeAutomationTarget {
     PluginParameter {
         insert_id: String,
         parameter_id: String,
+        /// [`EngineAutomationTargetSnapshot::value_range`]: what the
+        /// normalized value maps onto for a plug-in in its own units.
+        ///
+        /// [`EngineAutomationTargetSnapshot::value_range`]: crate::types::EngineAutomationTargetSnapshot::value_range
+        value_range: Option<(f32, f32)>,
     },
     SendGain {
         send_id: String,
@@ -58,7 +63,7 @@ pub enum RuntimeAutomationTarget {
 }
 
 impl RuntimeAutomationTarget {
-    pub(super) fn from_snapshot(lane: &EngineAutomationLaneSnapshot) -> Self {
+    pub(crate) fn from_snapshot(lane: &EngineAutomationLaneSnapshot) -> Self {
         match lane.target.tag {
             0 => Self::TrackVolume,
             1 => Self::TrackPan,
@@ -67,6 +72,11 @@ impl RuntimeAutomationTarget {
                 Self::PluginParameter {
                     insert_id: lane.target.insert_id.clone(),
                     parameter_id: lane.target.parameter_id.clone(),
+                    value_range: lane
+                        .target
+                        .value_range
+                        .filter(|[min, max]| min.is_finite() && max.is_finite() && max > min)
+                        .map(|[min, max]| (min, max)),
                 }
             }
             4 if !lane.target.send_id.is_empty() => Self::SendGain {
@@ -130,8 +140,11 @@ pub struct RuntimeTrackAutomationValues {
 pub struct RuntimePluginParamBinding {
     pub insert_ix: usize,
     pub lane_ix: usize,
-    /// Real VST3 `ParamID`.
+    /// Real VST3 `ParamID`, or a built-in's wire index.
     pub param_id: u32,
+    /// What the lane's normalized value maps onto before it is sent, for a
+    /// plug-in that takes its own units; `None` sends it normalized.
+    pub value_range: Option<(f32, f32)>,
     /// Last normalized value pushed to the plugin; starts `NaN` so the first
     /// block after a (re)build always emits. Dedupe avoids flooding the param
     /// ring with identical values every block.
@@ -437,6 +450,7 @@ pub(crate) fn plugin_param_bindings(
         let RuntimeAutomationTarget::PluginParameter {
             insert_id,
             parameter_id,
+            value_range,
         } = &lane.target
         else {
             continue;
@@ -451,6 +465,7 @@ pub(crate) fn plugin_param_bindings(
             insert_ix,
             lane_ix,
             param_id,
+            value_range: *value_range,
             last_value: f32::NAN,
         });
     }

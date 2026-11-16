@@ -232,6 +232,7 @@ fn plugin_param_lane(insert_id: &str, param_id: &str) -> crate::runtime::Runtime
         target: crate::runtime::RuntimeAutomationTarget::PluginParameter {
             insert_id: insert_id.to_string(),
             parameter_id: param_id.to_string(),
+            value_range: None,
         },
         enabled: true,
         points: vec![
@@ -260,6 +261,7 @@ fn plugin_param_automation_pushes_value_to_bridge_sink_during_playback() {
         insert_ix: 0,
         lane_ix: 0,
         param_id: 42,
+        value_range: None,
         last_value: f32::NAN,
     }];
     let sink = std::sync::Arc::new(ParamCaptureSink::default());
@@ -279,6 +281,70 @@ fn plugin_param_automation_pushes_value_to_bridge_sink_during_playback() {
     assert!((pushed - 0.5).abs() < 1e-4, "pushed={pushed}");
 }
 
+/// A built-in takes its parameter in its own units: the lane's normalized
+/// value goes out mapped onto the parameter's range, not as 0…1.
+#[test]
+fn plugin_param_automation_maps_onto_a_builtins_range() {
+    let mut track = bridge_effect_track(0.0);
+    track.automation_lanes = vec![plugin_param_lane("insert-1", "2")];
+    track.plugin_param_automation = vec![crate::runtime::RuntimePluginParamBinding {
+        insert_ix: 0,
+        lane_ix: 0,
+        param_id: 2,
+        value_range: Some((-12.0, 24.0)),
+        last_value: f32::NAN,
+    }];
+    let sink = std::sync::Arc::new(ParamCaptureSink::default());
+    track.inserts[0].bridge_sink = Some(sink.clone());
+
+    // Beat 2.0 is the lane's midpoint, 0.5: halfway from -12 to +24 dB.
+    let transport = RuntimeTransportContext {
+        playing: true,
+        ppq_position: 2.0,
+        ..RuntimeTransportContext::default()
+    };
+    apply_track_chain_block(&mut track, 4, transport);
+    let pushed = f32::from_bits(sink.last_value_bits.load(Ordering::Acquire) as u32);
+    assert!((pushed - 6.0).abs() < 1e-3, "pushed={pushed}");
+}
+
+/// The range reaches the binding from the snapshot, and a bad range is
+/// dropped rather than mapped.
+#[test]
+fn a_snapshot_range_reaches_the_binding() {
+    use crate::types::{EngineAutomationLaneSnapshot, EngineAutomationTargetSnapshot};
+    let lane = |range| EngineAutomationLaneSnapshot {
+        id: "lane".into(),
+        name: "Gain".into(),
+        target: EngineAutomationTargetSnapshot {
+            tag: 3,
+            insert_id: "insert-1".into(),
+            parameter_id: "2".into(),
+            value_range: range,
+            ..Default::default()
+        },
+        enabled: true,
+        points: Vec::new(),
+    };
+    let target = |range| crate::runtime::RuntimeAutomationTarget::from_snapshot(&lane(range));
+    assert!(matches!(
+        target(Some([-12.0, 24.0])),
+        crate::runtime::RuntimeAutomationTarget::PluginParameter {
+            value_range: Some((min, max)),
+            ..
+        } if min == -12.0 && max == 24.0
+    ));
+    for bad in [Some([1.0, 1.0]), Some([f32::NAN, 2.0]), None] {
+        assert!(matches!(
+            target(bad),
+            crate::runtime::RuntimeAutomationTarget::PluginParameter {
+                value_range: None,
+                ..
+            }
+        ));
+    }
+}
+
 #[test]
 fn plugin_param_automation_dedupes_unchanged_value_and_is_idle_when_stopped() {
     let mut track = bridge_effect_track(0.0);
@@ -287,6 +353,7 @@ fn plugin_param_automation_dedupes_unchanged_value_and_is_idle_when_stopped() {
         insert_ix: 0,
         lane_ix: 0,
         param_id: 42,
+        value_range: None,
         last_value: f32::NAN,
     }];
     let sink = std::sync::Arc::new(ParamCaptureSink::default());
@@ -323,6 +390,7 @@ fn plugin_param_automation_resends_a_value_it_could_not_deliver() {
         insert_ix: 0,
         lane_ix: 0,
         param_id: 42,
+        value_range: None,
         last_value: f32::NAN,
     }];
     let sink = std::sync::Arc::new(ParamCaptureSink::default());
@@ -360,6 +428,7 @@ fn plugin_param_automation_reads_at_the_chain_beat() {
         insert_ix: 0,
         lane_ix: 0,
         param_id: 42,
+        value_range: None,
         last_value: f32::NAN,
     }];
     let sink = std::sync::Arc::new(ParamCaptureSink::default());

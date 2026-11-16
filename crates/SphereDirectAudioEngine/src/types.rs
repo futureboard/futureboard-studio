@@ -659,6 +659,11 @@ pub struct EngineAutomationTargetSnapshot {
     pub parameter_name: String,
     #[serde(default)]
     pub send_id: String,
+    /// For a plug-in parameter that takes its own units rather than
+    /// `0.0..=1.0` (a built-in: dB, ms, Hz, %), the `[min, max]` the lane's
+    /// normalized value maps onto. `None` sends the normalized value.
+    #[serde(default)]
+    pub value_range: Option<[f32; 2]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -104,6 +104,93 @@ pub fn builtin_param_index(_plugin_id: &str, _param_id: &str) -> Option<u32> {
     None
 }
 
+/// One parameter of a built-in that automation can drive: its wire index
+/// (what the param ring carries) and the range its value lives in, in the
+/// plug-in's own units.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BuiltinParamSpec {
+    pub wire_index: u32,
+    pub name: String,
+    pub unit: String,
+    pub min: f32,
+    pub max: f32,
+    pub default_value: f32,
+}
+
+impl BuiltinParamSpec {
+    /// `value` (in the plug-in's units) as a lane's `0.0..=1.0`.
+    pub fn normalize(&self, value: f32) -> f32 {
+        ((value - self.min) / (self.max - self.min)).clamp(0.0, 1.0)
+    }
+}
+
+/// The parameters `plugin_id`'s descriptor lists that reach its DSP over
+/// the wire, in descriptor order. A descriptor entry with no wire index, or
+/// with no range to move through, is left out. Empty for a plug-in without
+/// a descriptor (Quick Sampler, Slicer) and for anything not a built-in.
+#[cfg(feature = "builtin-plugin-editor")]
+pub fn builtin_param_specs(plugin_id: &str) -> Vec<BuiltinParamSpec> {
+    macro_rules! specs {
+        ($krate:ident) => {
+            $krate::descriptor()
+                .params
+                .iter()
+                .filter_map(|param| {
+                    let wire_index = builtin_param_index(plugin_id, &*param.id)?;
+                    (param.min.is_finite() && param.max.is_finite() && param.max > param.min).then(
+                        || BuiltinParamSpec {
+                            wire_index,
+                            name: param.name.to_string(),
+                            unit: param.unit.to_string(),
+                            min: param.min,
+                            max: param.max,
+                            default_value: param.default_value,
+                        },
+                    )
+                })
+                .collect()
+        };
+    }
+    match origin_for_plugin_id(plugin_id) {
+        Some(rodharerist::ui::UI_ORIGIN) => specs!(rodharerist),
+        Some(equz8::ui::UI_ORIGIN) => specs!(equz8),
+        Some(equzx::ui::UI_ORIGIN) => specs!(equzx),
+        Some(verbspace::ui::UI_ORIGIN) => specs!(verbspace),
+        Some(whitesharp::ui::UI_ORIGIN) => specs!(whitesharp),
+        Some(zapp::ui::UI_ORIGIN) => specs!(zapp),
+        Some(airboost::ui::UI_ORIGIN) => specs!(airboost),
+        Some(deesser::ui::UI_ORIGIN) => specs!(deesser),
+        Some(duckstep::ui::UI_ORIGIN) => specs!(duckstep),
+        Some(echospace::ui::UI_ORIGIN) => specs!(echospace),
+        Some(imager::ui::UI_ORIGIN) => specs!(imager),
+        Some(burnlimit::ui::UI_ORIGIN) => specs!(burnlimit),
+        Some(clipper67::ui::UI_ORIGIN) => specs!(clipper67),
+        Some(transient::ui::UI_ORIGIN) => specs!(transient),
+        Some(waygate::ui::UI_ORIGIN) => specs!(waygate),
+        Some(wrapsynth::ui::UI_ORIGIN) => specs!(wrapsynth),
+        Some(drumsampler::ui::UI_ORIGIN) => specs!(drumsampler),
+        Some(zcomp::ui::UI_ORIGIN) => specs!(zcomp),
+        Some(mixstation::ui::UI_ORIGIN) => specs!(mixstation),
+        Some(compresser::ui::UI_ORIGIN) => specs!(compresser),
+        _ => Vec::new(),
+    }
+}
+
+/// Without the editor feature there is no parameter table to read.
+#[cfg(not(feature = "builtin-plugin-editor"))]
+pub fn builtin_param_specs(_plugin_id: &str) -> Vec<BuiltinParamSpec> {
+    Vec::new()
+}
+
+/// The range wire index `wire_index` of `plugin_id` takes, for automation to
+/// map a lane's normalized value onto; `None` for a parameter it cannot drive.
+pub fn builtin_param_range(plugin_id: &str, wire_index: u32) -> Option<(f32, f32)> {
+    builtin_param_specs(plugin_id)
+        .into_iter()
+        .find(|spec| spec.wire_index == wire_index)
+        .map(|spec| (spec.min, spec.max))
+}
+
 /// Authoritative main-process mirror of every built-in insert's parameter
 /// state, keyed by insert slot id. The single source of truth for what a
 /// built-in insert *is*: seeded from the project blob, updated by every
@@ -3950,6 +4037,36 @@ mod tests {
         let unchanged = builtin_quick_sampler_params(insert).expect("unchanged");
         assert_eq!(unchanged.sampler.cutoff_hz, 750.0);
         builtin_state_remove(insert);
+    }
+
+    /// Automation offers a built-in's parameters from its descriptor: every
+    /// bridged built-in that has one lists parameters, each on a wire index
+    /// of its own and with a range to move through.
+    #[cfg(feature = "builtin-plugin-editor")]
+    #[test]
+    fn builtin_parameters_come_from_the_descriptor() {
+        for stem in SpherePluginHost::builtin::AUDIO_BRIDGE_STEMS {
+            let specs = builtin_param_specs(stem);
+            if matches!(*stem, "quicksampler" | "slicer") {
+                assert!(specs.is_empty(), "{stem} has no descriptor");
+                continue;
+            }
+            assert!(!specs.is_empty(), "{stem} lists no automatable parameter");
+            let mut seen = std::collections::HashSet::new();
+            for spec in &specs {
+                assert!(spec.max > spec.min, "{stem} {}: empty range", spec.name);
+                assert!(
+                    seen.insert(spec.wire_index),
+                    "{stem}: wire {} listed twice",
+                    spec.wire_index
+                );
+            }
+        }
+        // BurnLimit's gain: -12…+24 dB on its own wire index.
+        let gain = builtin_param_index("burnlimit", "gainDb").expect("gainDb");
+        assert_eq!(builtin_param_range("burnlimit", gain), Some((-12.0, 24.0)));
+        assert_eq!(builtin_param_range("quicksampler", 0), None);
+        assert_eq!(builtin_param_range("not-a-plugin", 0), None);
     }
 
     #[test]

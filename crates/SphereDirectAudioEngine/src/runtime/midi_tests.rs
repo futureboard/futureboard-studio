@@ -1071,6 +1071,7 @@ fn build_plugin_param_bindings_resolves_only_valid_lanes() {
             target: RuntimeAutomationTarget::PluginParameter {
                 insert_id: insert.to_string(),
                 parameter_id: param.to_string(),
+                value_range: None,
             },
             enabled,
             points,

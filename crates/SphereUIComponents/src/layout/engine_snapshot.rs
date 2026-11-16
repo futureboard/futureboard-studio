@@ -926,13 +926,19 @@ fn build_engine_sends(track: &TrackState) -> Vec<EngineSendSnapshot> {
 }
 
 fn build_engine_automation_lanes(track: &TrackState) -> Vec<EngineAutomationLaneSnapshot> {
-    build_engine_automation_lanes_from(&track.automation_lanes, track.volume_automation_read)
+    build_engine_automation_lanes_from(
+        &track.automation_lanes,
+        &track.inserts,
+        track.volume_automation_read,
+    )
 }
 
 /// The engine's copy of a set of lanes. `volume_read` is the owner's Volume
-/// read switch (the master has none, so it always reads).
+/// read switch (the master has none, so it always reads). `inserts` are the
+/// owner's, for the range a built-in's parameter lane maps onto.
 fn build_engine_automation_lanes_from(
     lanes: &[timeline_state::AutomationLaneState],
+    inserts: &[timeline_state::InsertSlotState],
     volume_read: bool,
 ) -> Vec<EngineAutomationLaneSnapshot> {
     lanes
@@ -951,6 +957,19 @@ fn build_engine_automation_lanes_from(
                     target.insert_id = insert_id.clone();
                     target.parameter_id = parameter_id.clone();
                     target.parameter_name = parameter_name.clone();
+                    // A built-in takes the value in its own units.
+                    target.value_range = inserts
+                        .iter()
+                        .find(|slot| &slot.id == insert_id)
+                        .and_then(|slot| slot.plugin_id.as_deref())
+                        .filter(|plugin| SpherePluginHost::builtin_audio_bridge_supported(plugin))
+                        .zip(parameter_id.parse::<u32>().ok())
+                        .and_then(|(plugin, wire)| {
+                            crate::components::builtin_plugin_editor::builtin_param_range(
+                                plugin, wire,
+                            )
+                        })
+                        .map(|(min, max)| [min, max]);
                 }
                 timeline_state::AutomationTarget::SendLevel { send_id }
                 | timeline_state::AutomationTarget::SendEnabled { send_id } => {
@@ -1151,7 +1170,11 @@ fn build_engine_project_snapshot_inner(
         output_track_id: None,
         inserts: master_inserts,
         sends: Vec::new(),
-        automation_lanes: build_engine_automation_lanes_from(&state.master.automation_lanes, true),
+        automation_lanes: build_engine_automation_lanes_from(
+            &state.master.automation_lanes,
+            &state.master.inserts,
+            true,
+        ),
         builtin_soundfont_player: false,
         soundfont_path: None,
         soundfont_preset_bank: None,

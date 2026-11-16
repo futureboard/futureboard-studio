@@ -227,11 +227,17 @@ pub(super) fn apply_plugin_param_automation(track: &mut RuntimeTrack, beat: f64)
         if !insert.active() {
             continue;
         }
+        // A built-in takes its own units (dB, ms, Hz, %): the lane's
+        // normalized value is mapped onto the parameter's range.
+        let wire_value = match binding.value_range {
+            Some((min, max)) => min + value * (max - min),
+            None => value,
+        };
         let sent = match insert.kind_tag {
             crate::runtime::RuntimeInsertKind::ExternalBridge => insert
                 .bridge_sink
                 .as_ref()
-                .is_some_and(|sink| sink.push_param(binding.param_id, value, 0)),
+                .is_some_and(|sink| sink.push_param(binding.param_id, wire_value, 0)),
             _ => match insert.vst3.as_mut() {
                 Some(vst3) => {
                     vst3.set_param(binding.param_id, value as f64);
