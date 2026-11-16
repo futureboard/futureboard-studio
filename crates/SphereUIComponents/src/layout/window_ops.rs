@@ -1231,6 +1231,72 @@ impl StudioLayout {
     /// Callers that originate from a Timeline `cx.listener` must still defer via
     /// [`StudioLayout::defer_update_in_window`]: this path reads Timeline for bus
     /// output targets and will panic on a nested lease.
+    /// Every track's automation targets for the Add Track dialog's Automation
+    /// tab — the lane picker's own list, labels and commands — with the
+    /// selected track to start on. Plug-in parameter lists are filled first,
+    /// so a built-in's parameters are there.
+    fn add_track_automation_choices(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> (
+        Vec<crate::components::add_track_dialog::AutomationTrackChoice>,
+        Option<String>,
+    ) {
+        use crate::components::add_track_dialog::AutomationTrackChoice;
+        use crate::components::timeline::timeline_state::{
+            automation_target_menu_command, MASTER_TRACK_ID,
+        };
+        let tracks: Vec<(String, String)> = {
+            let state = &self.timeline.read(cx).state;
+            state
+                .tracks
+                .iter()
+                // A VSTi output strip is the instrument's, not a track of the
+                // project: its parent track is where it is automated.
+                .filter(|track| {
+                    track.track_type != TrackType::Master
+                        && !timeline_state::is_vsti_output_child_track_id(&track.id)
+                })
+                .map(|track| (track.id.clone(), track.name.clone()))
+                .chain(std::iter::once((
+                    MASTER_TRACK_ID.to_string(),
+                    "Master".to_string(),
+                )))
+                .collect()
+        };
+        for (track_id, _) in &tracks {
+            self.request_track_insert_parameters(track_id, cx);
+        }
+        let state = &self.timeline.read(cx).state;
+        let choices = tracks
+            .into_iter()
+            .map(|(track_id, name)| {
+                let lanes = state.automation_lanes_of(&track_id).unwrap_or(&[]);
+                let targets = state
+                    .available_automation_targets(&track_id)
+                    .into_iter()
+                    .map(|target| {
+                        let shown = lanes
+                            .iter()
+                            .any(|lane| lane.target == target && lane.visible);
+                        (
+                            automation_target_menu_command(&track_id, &target),
+                            state.automation_target_label(&track_id, &target),
+                            shown,
+                        )
+                    })
+                    .collect();
+                AutomationTrackChoice {
+                    track_id,
+                    name,
+                    targets,
+                }
+            })
+            .filter(|choice: &AutomationTrackChoice| !choice.targets.is_empty())
+            .collect();
+        (choices, state.selection.selected_track_id.clone())
+    }
+
     pub(super) fn open_add_track_external_window_with_context(
         &mut self,
         kind: AddTrackKind,
@@ -1254,9 +1320,11 @@ impl StudioLayout {
         crate::device_registry::scan_midi();
         let midi_input_devices = add_track_midi_input_devices(&self.settings.read(cx).current);
 
+        let (automation_choices, automation_track) = self.add_track_automation_choices(cx);
         if let Some(handle) = self.external_windows.add_track.clone() {
             let audio_output_targets = project_bus_output_targets(&self.timeline.read(cx).state);
             let audio_input_choices = dialog_audio_input_choices(&self.timeline.read(cx).state);
+            let automation_choices = automation_choices.clone();
             if handle
                 .update(cx, |win, window, cx| {
                     win.set_instrument_plugins(add_track_instrument_plugins_from_catalog(
@@ -1266,6 +1334,7 @@ impl StudioLayout {
                     win.set_context(kind, track_count, has_master_track, default_monitor_mode);
                     win.set_audio_output_targets(audio_output_targets);
                     win.set_audio_input_choices(audio_input_choices);
+                    win.set_automation_choices(automation_choices, automation_track.as_deref());
                     window.activate_window();
                     cx.notify();
                 })
@@ -1299,6 +1368,19 @@ impl StudioLayout {
         let audio_output_targets = project_bus_output_targets(&self.timeline.read(cx).state);
         let on_confirm_request: Arc<dyn Fn(AddTrackDialogState, String, &mut gpui::App) + 'static> =
             Arc::new(move |dialog, _name, cx| {
+                // Automation adds a lane to a track that exists, exactly as
+                // the lane picker does: same command, same undo step.
+                if dialog.selected_kind == AddTrackKind::Automation {
+                    let picked = dialog
+                        .automation_command_ready()
+                        .and_then(timeline_state::parse_automation_target_menu_command);
+                    if let Some((track_id, target)) = picked {
+                        let _ = layout.update(cx, |this, cx| {
+                            this.add_automation_target_for_track(&track_id, target, cx);
+                        });
+                    }
+                    return;
+                }
                 let Some(track_type) = dialog.selected_kind.native_track_type() else {
                     return;
                 };
@@ -1615,7 +1697,13 @@ impl StudioLayout {
             on_confirm_request,
             cx,
         ) {
-            Ok(handle) => self.external_windows.add_track = Some(handle),
+            Ok(handle) => {
+                let _ = handle.update(cx, |win, _window, cx| {
+                    win.set_automation_choices(automation_choices, automation_track.as_deref());
+                    cx.notify();
+                });
+                self.external_windows.add_track = Some(handle);
+            }
             Err(err) => eprintln!("[add-track] failed to open window: {err}"),
         }
     }

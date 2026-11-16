@@ -183,6 +183,18 @@ pub enum AddTrackSelectId {
     Input,
     Output,
     MidiChannel,
+    AutomationTrack,
+    AutomationTarget,
+}
+
+/// One track the Automation tab can open a lane on, with every parameter it
+/// can automate: `(menu command, label, lane already shown)`. The command is
+/// the one the lane picker sends, so adding here is adding there.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AutomationTrackChoice {
+    pub track_id: String,
+    pub name: String,
+    pub targets: Vec<(String, String, bool)>,
 }
 
 impl AddTrackKind {
@@ -375,6 +387,13 @@ pub struct AddTrackDialogState {
     pub next_number: usize,
     pub has_master_track: bool,
     pub base_track_count: usize,
+    /// The Automation tab's tracks and their parameters, refreshed whenever
+    /// the dialog opens.
+    pub automation_choices: Vec<AutomationTrackChoice>,
+    /// The track the Automation tab opens a lane on.
+    pub automation_track_id: Option<String>,
+    /// The lane picker command for the parameter chosen on that track.
+    pub automation_command: Option<String>,
 }
 
 pub(crate) fn add_track_debug_enabled() -> bool {
@@ -437,7 +456,82 @@ impl AddTrackDialogState {
             next_number,
             has_master_track,
             base_track_count: track_count,
+            automation_choices: Vec::new(),
+            automation_track_id: None,
+            automation_command: None,
         }
+    }
+
+    /// Offer `choices`, keeping the chosen track and parameter while they
+    /// still exist; otherwise `preferred` (the selected track) or the first
+    /// track, on its first parameter without a lane yet.
+    pub fn set_automation_choices(
+        &mut self,
+        choices: Vec<AutomationTrackChoice>,
+        preferred: Option<&str>,
+    ) {
+        self.automation_choices = choices;
+        let current = self
+            .automation_track_id
+            .clone()
+            .filter(|id| self.automation_choice(id).is_some());
+        let track = current
+            .or_else(|| {
+                preferred
+                    .filter(|id| self.automation_choice(id).is_some())
+                    .map(str::to_string)
+            })
+            .or_else(|| {
+                self.automation_choices
+                    .first()
+                    .map(|choice| choice.track_id.clone())
+            });
+        let keep = self.automation_command.clone().filter(|command| {
+            track
+                .as_deref()
+                .and_then(|id| self.automation_choice(id))
+                .is_some_and(|choice| choice.targets.iter().any(|(c, _, _)| c == command))
+        });
+        match track {
+            Some(id) if keep.is_none() => self.select_automation_track(&id),
+            track => {
+                self.automation_track_id = track;
+                self.automation_command = keep;
+            }
+        }
+    }
+
+    fn automation_choice(&self, track_id: &str) -> Option<&AutomationTrackChoice> {
+        self.automation_choices
+            .iter()
+            .find(|choice| choice.track_id == track_id)
+    }
+
+    /// Choose the track the lane goes on, and its first parameter that has
+    /// no lane showing yet (or its first, when all do).
+    pub fn select_automation_track(&mut self, track_id: &str) {
+        let command = self.automation_choice(track_id).and_then(|choice| {
+            choice
+                .targets
+                .iter()
+                .find(|(_, _, shown)| !shown)
+                .or_else(|| choice.targets.first())
+                .map(|(command, _, _)| command.clone())
+        });
+        self.automation_track_id = Some(track_id.to_string());
+        self.automation_command = command;
+    }
+
+    /// The lane picker command Add sends, when the chosen parameter is one
+    /// the chosen track has.
+    pub fn automation_command_ready(&self) -> Option<&str> {
+        let choice = self.automation_choice(self.automation_track_id.as_deref()?)?;
+        let command = self.automation_command.as_deref()?;
+        choice
+            .targets
+            .iter()
+            .any(|(c, _, _)| c == command)
+            .then_some(command)
     }
 
     pub fn selected_color(&self) -> gpui::Rgba {
@@ -450,6 +544,10 @@ impl AddTrackDialogState {
     }
 
     pub fn is_valid(&self) -> bool {
+        // Automation adds a lane to a track that exists: no name, no count.
+        if self.selected_kind == AddTrackKind::Automation {
+            return self.automation_command_ready().is_some();
+        }
         let name_ok = !self.track_name.trim().is_empty();
         let count_ok = self.count >= 1 && self.count <= MAX_TRACK_COUNT;
         name_ok
@@ -551,6 +649,8 @@ pub struct AddTrackDialogCallbacks {
     pub on_input_label: StringCb,
     pub on_output_label: StringCb,
     pub on_midi_channel_label: StringCb,
+    pub on_automation_track: StringCb,
+    pub on_automation_target: StringCb,
 }
 
 pub fn track_color(index: usize) -> gpui::Rgba {
@@ -1593,15 +1693,84 @@ fn type_fields(
                 })
                 .into_any_element()
         }
-        AddTrackKind::Automation => div()
-            .flex()
-            .flex_col()
-            .gap(px(space::SNUG))
-            .child(fb_form_row("Target", locked_select_box("None".to_string())))
-            .child(disabled_hint(
-                "Automation lanes on existing tracks. Dedicated automation tracks are coming soon.",
-            ))
-            .into_any_element(),
+        AddTrackKind::Automation => {
+            let toggle_track = callbacks.on_toggle_select.clone();
+            let toggle_target = callbacks.on_toggle_select.clone();
+            let track_cb = callbacks.on_automation_track.clone();
+            let target_cb = callbacks.on_automation_target.clone();
+            let track_options: Vec<SelectOption> = state
+                .automation_choices
+                .iter()
+                .map(|choice| SelectOption::new(choice.track_id.clone(), choice.name.clone()))
+                .collect();
+            let target_options: Vec<SelectOption> = state
+                .automation_track_id
+                .as_deref()
+                .and_then(|id| state.automation_choice(id))
+                .map(|choice| {
+                    choice
+                        .targets
+                        .iter()
+                        .map(|(command, label, shown)| {
+                            let label = if *shown {
+                                format!("{label} (shown)")
+                            } else {
+                                label.clone()
+                            };
+                            SelectOption::new(command.clone(), label)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if state.automation_choices.is_empty() {
+                return div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(space::SNUG))
+                    .child(disabled_hint(
+                        "No tracks yet. Add a track first, then add automation to it.",
+                    ))
+                    .into_any_element();
+            }
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(space::SNUG))
+                .child(fb_form_row(
+                    "Track",
+                    add_track_select(
+                        "add-track-automation-track",
+                        state.automation_track_id.as_deref(),
+                        "Select track...",
+                        track_options,
+                        add_track_select_open(open_select, AddTrackSelectId::AutomationTrack),
+                        SelectMenuPlacement::Below,
+                        Arc::new(move |_, w, cx| {
+                            toggle_track(&AddTrackSelectId::AutomationTrack, w, cx)
+                        }),
+                        Arc::new(move |value, w, cx| track_cb(value, w, cx)),
+                    ),
+                ))
+                .child(fb_form_row(
+                    "Parameter",
+                    add_track_select(
+                        "add-track-automation-target",
+                        state.automation_command.as_deref(),
+                        "Select parameter...",
+                        target_options,
+                        add_track_select_open(open_select, AddTrackSelectId::AutomationTarget),
+                        SelectMenuPlacement::Below,
+                        Arc::new(move |_, w, cx| {
+                            toggle_target(&AddTrackSelectId::AutomationTarget, w, cx)
+                        }),
+                        Arc::new(move |value, w, cx| target_cb(value, w, cx)),
+                    ),
+                ))
+                .child(disabled_hint(
+                    "Opens an automation lane for this parameter on the chosen track.",
+                ))
+                .into_any_element()
+        }
         AddTrackKind::Folder => div()
             .flex()
             .flex_col()
@@ -1664,7 +1833,10 @@ pub fn add_track_dialog_body(
     let confirm = callbacks.on_confirm.clone();
     let cancel = callbacks.on_close.clone();
     let valid = state.is_valid();
-    let ok_label = if state.count == 1 {
+    let automation = state.selected_kind == AddTrackKind::Automation;
+    let ok_label = if automation {
+        "Add Lane".to_string()
+    } else if state.count == 1 {
         i18n.tr("add-track.button.add-one")
     } else {
         i18n.tr_vars(
@@ -1696,32 +1868,35 @@ pub fn add_track_dialog_body(
                 .px(px(BODY_PAD_X))
                 .pb(px(space::LOOSE))
                 .gap(px(FORM_GAP))
-                .child(form_panel(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(FORM_GAP))
-                        .child(fb_form_row(
-                            i18n.tr("add-track.field.name"),
-                            text_field_with_callbacks_and_ime(
-                                track_name_input,
-                                track_name_focused,
-                                track_name_callbacks,
-                                track_name_ime_target,
-                            ),
-                        ))
-                        .child(fb_form_row(
-                            i18n.tr("add-track.field.count"),
-                            count_stepper(
-                                state,
-                                count_input,
-                                count_focused,
-                                count_callbacks,
-                                &callbacks,
-                            ),
-                        ))
-                        .child(color_row(state, &callbacks, color_ui, i18n)),
-                ))
+                // A lane goes on a track that exists: no name, count or color.
+                .when(!automation, |body| {
+                    body.child(form_panel(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(FORM_GAP))
+                            .child(fb_form_row(
+                                i18n.tr("add-track.field.name"),
+                                text_field_with_callbacks_and_ime(
+                                    track_name_input,
+                                    track_name_focused,
+                                    track_name_callbacks,
+                                    track_name_ime_target,
+                                ),
+                            ))
+                            .child(fb_form_row(
+                                i18n.tr("add-track.field.count"),
+                                count_stepper(
+                                    state,
+                                    count_input,
+                                    count_focused,
+                                    count_callbacks,
+                                    &callbacks,
+                                ),
+                            ))
+                            .child(color_row(state, &callbacks, color_ui, i18n)),
+                    ))
+                })
                 .child(form_panel(type_fields(
                     state,
                     &callbacks,
@@ -1959,6 +2134,16 @@ impl AddTrackWindow {
     /// Preferences MIDI device changes, mirroring `set_instrument_plugins`.
     pub fn set_midi_input_devices(&mut self, midi_input_devices: Vec<String>) {
         self.midi_input_devices = midi_input_devices;
+    }
+
+    /// Refresh the Automation tab's tracks and parameters. Called whenever the
+    /// dialog opens, so it offers the tracks and plug-ins there are now.
+    pub fn set_automation_choices(
+        &mut self,
+        choices: Vec<AutomationTrackChoice>,
+        preferred_track: Option<&str>,
+    ) {
+        self.state.set_automation_choices(choices, preferred_track);
     }
 
     /// Refresh Bus/Return destinations for the Output select. Called whenever
@@ -2697,6 +2882,28 @@ impl Render for AddTrackWindow {
                     });
                 }
             }),
+            on_automation_track: Arc::new({
+                let target = target.clone();
+                move |value: &String, _w, cx| {
+                    let value = value.clone();
+                    let _ = target.update(cx, |this, cx| {
+                        this.state.select_automation_track(&value);
+                        this.open_select = None;
+                        cx.notify();
+                    });
+                }
+            }),
+            on_automation_target: Arc::new({
+                let target = target.clone();
+                move |value: &String, _w, cx| {
+                    let value = value.clone();
+                    let _ = target.update(cx, |this, cx| {
+                        this.state.automation_command = Some(value);
+                        this.open_select = None;
+                        cx.notify();
+                    });
+                }
+            }),
         };
 
         // Click-catcher that dismisses the open Select when the user clicks
@@ -3277,6 +3484,62 @@ mod tests {
             AddTrackKind::Folder.native_track_type(),
             Some(TrackType::Group)
         );
+        assert!(state.is_valid());
+    }
+
+    fn automation_choices() -> Vec<AutomationTrackChoice> {
+        let choice = |id: &str, shown_volume: bool| AutomationTrackChoice {
+            track_id: id.to_string(),
+            name: id.to_string(),
+            targets: vec![
+                (
+                    format!("automation:add-target:{id}:volume"),
+                    "Volume".to_string(),
+                    shown_volume,
+                ),
+                (
+                    format!("automation:add-target:{id}:pan"),
+                    "Pan".to_string(),
+                    false,
+                ),
+            ],
+        };
+        vec![choice("track-1", true), choice("track-2", false)]
+    }
+
+    /// The Automation tab adds a lane, not a track: it is ready once a
+    /// track's parameter is chosen, and starts on the selected track's first
+    /// parameter without a lane.
+    #[test]
+    fn automation_tab_opens_a_lane_on_a_chosen_track() {
+        let mut state = AddTrackDialogState::open_for(2, false);
+        state.set_kind(AddTrackKind::Automation);
+        assert!(!state.is_valid(), "nothing to add a lane to yet");
+
+        state.set_automation_choices(automation_choices(), Some("track-1"));
+        assert_eq!(state.automation_track_id.as_deref(), Some("track-1"));
+        assert_eq!(
+            state.automation_command_ready(),
+            Some("automation:add-target:track-1:pan"),
+            "volume already has a lane showing"
+        );
+        assert!(state.is_valid());
+
+        state.select_automation_track("track-2");
+        assert_eq!(
+            state.automation_command_ready(),
+            Some("automation:add-target:track-2:volume")
+        );
+        // A parameter of another track is not this track's.
+        state.automation_command = Some("automation:add-target:track-1:pan".into());
+        assert!(!state.is_valid());
+
+        // Reopened with track-2 gone: back to the selected track.
+        state.set_automation_choices(
+            automation_choices().into_iter().take(1).collect(),
+            Some("track-1"),
+        );
+        assert_eq!(state.automation_track_id.as_deref(), Some("track-1"));
         assert!(state.is_valid());
     }
 }
