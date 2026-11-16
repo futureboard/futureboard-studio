@@ -874,9 +874,9 @@ settings.field.master-plugin-latency = ປລັກອິນມາສເຕີ
 settings.field.pdc-status = ການຊົດເຊີຍຄວາມໜ່ວງ
 settings.field.latency-compensation = ການຊົດເຊີຍຄວາມໜ່ວງປລັກອິນ (PDC)
 settings.field.audioguard = Solfege Audioguard
-settings.hint.audioguard = ປ້ອງກັນສຽງຂາດ\: ເຣັນເດີລ່ວງໜ້າເມື່ອບໍ່ມີຫຍັງຫຼິ້ນສົດ, ປິດສຽງເມື່ອເອົາພຸດຜິດປົກກະຕິ ຫຼື ດັງເກີນຄວບຄຸມ, ແລະ ຂ້າມປລັກອິນທີ່ຜິດພາດຊ້ຳໆ. ປິດ \= ເຣັນເດີທຸກບລັອກຂະນະຫຼິ້ນ.
+settings.hint.audioguard = ປ້ອງກັນສຽງຂາດ\: ເຣັນເດີລ່ວງໜ້າເມື່ອບໍ່ມີຫຍັງຫຼິ້ນສົດ, ປິດສຽງເມື່ອເອົາພຸດຜິດປົກກະຕິ ຫຼື ດັງເກີນຄວບຄຸມ, ແລະ ຂ້າມປລັກອິນທີ່ຜິດພາດຊ້ຳໆ. ປິດ \= ເຣັນເດີທຸກບລັອກຂະນະຫຼິ້ນ. ແນະນຳໃຫ້ໃຊ້ ປົກກະຕິ.
 settings.audioguard.off = ປິດ
-settings.audioguard.normal = ປົກກະຕິ (ແນະນຳ)
+settings.audioguard.normal = ປົກກະຕິ
 settings.audioguard.high = ສູງ
 settings.field.overload-warning = ແຈ້ງເຕືອນເມື່ອລະບົບໂຫຼດເກີນ
 settings.hint.overload-warning = ສະແດງກ່ອງແຈ້ງເຕືອນລະບົບໂຫຼດເກີນ ພ້ອມວິທີແກ້ ເມື່ອສຽງຂາດຊ້ຳໆ ລະຫວ່າງຫຼິ້ນ.
