@@ -307,6 +307,9 @@ impl StudioLayout {
         // This path never seeded the built-in state mirror (only opening an
         // editor did), so seed it from the loaded slots, then refresh.
         self.reseed_builtin_state_mirror(cx);
+        // The plug-ins were loaded before this layout existed, so the ready
+        // handling that sends a sampler's pad audio never ran for them.
+        self.reload_loaded_builtin_files(cx);
         self.refresh_builtin_editor_sidebars(cx);
 
         for warning in &self.session_install_warnings {

@@ -7453,6 +7453,34 @@ impl StudioLayout {
         }
     }
 
+    /// [`Self::reload_builtin_samples`] for every built-in the host already
+    /// holds: the files a sampler or a guitar rig plays, sent again.
+    ///
+    /// For a project installed before the studio mounted. That path loads
+    /// the plug-ins and drains their "loaded" events itself, so the studio's
+    /// own ready handling — where these files are normally sent — never runs
+    /// for them: their parameters arrive with the load, but a Drum Sampler's
+    /// pads stayed silent until each sample was picked again.
+    pub(super) fn reload_loaded_builtin_files(&self, cx: &Context<Self>) {
+        let Some(loaded) = self
+            .plugin_editors
+            .bridge_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.lock().ok().map(|r| r.loaded_instance_ids()))
+        else {
+            return;
+        };
+        let builtins: Vec<String> = self
+            .bridge_audio_insert_slots(cx)
+            .into_iter()
+            .map(|(_, insert_id)| insert_id)
+            .filter(|insert_id| loaded.iter().any(|id| id == insert_id))
+            .collect();
+        for insert_id in builtins {
+            self.reload_builtin_samples(&insert_id, cx);
+        }
+    }
+
     fn reload_builtin_samples(&self, insert_id: &str, cx: &Context<Self>) {
         let state = &self.timeline.read(cx).state;
         let Some(slot) = std::iter::once(&state.master.inserts)
