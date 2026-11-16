@@ -78,6 +78,7 @@ pub mod platform_chrome;
 pub mod plugin_module_gate;
 pub mod pre_studio_install;
 pub mod project;
+pub mod score_view;
 pub mod session_shutdown;
 pub mod settings;
 pub mod shell_metrics;

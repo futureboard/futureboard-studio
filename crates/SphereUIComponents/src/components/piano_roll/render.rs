@@ -746,12 +746,20 @@ impl Render for PianoRoll {
 
         // Toolbar and footer are always shown; the body shows a hint when no
         // MIDI clip is selected.
+        // Before the toolbar: a score view whose provider went away (the
+        // license lapsed) turns score mode off, and the toolbar should agree.
+        let score_body = if self.score_mode {
+            self.score_body(window, cx, clip_id.as_deref())
+        } else {
+            None
+        };
         let toolbar = self.render_toolbar(cx, clip_id.as_deref());
         let footer = self.render_footer(cx, clip_id.as_deref());
 
-        let body: gpui::AnyElement = match clip_id {
-            Some(cid) => self.render_body(cx, &cid).into_any_element(),
-            None => div()
+        let body: gpui::AnyElement = match (score_body, clip_id) {
+            (Some(score), _) => score,
+            (None, Some(cid)) => self.render_body(cx, &cid).into_any_element(),
+            (None, None) => div()
                 .flex_1()
                 .flex()
                 .items_center()

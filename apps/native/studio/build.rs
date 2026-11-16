@@ -447,6 +447,28 @@ fn stage_professional_sources() {
     stage_professional_source(&source_dir, &output_dir, "eula_dialog.rs");
     stage_professional_source(&source_dir, &output_dir, "updates.rs");
 
+    // The notation engine and the MIDI editor's Score view: every file in
+    // `src/notation`, staged under `notation/` for `professional_edition.rs`.
+    let notation_dir = source_dir.join("notation");
+    println!("cargo:rerun-if-changed={}", notation_dir.display());
+    std::fs::create_dir_all(output_dir.join("notation"))
+        .expect("failed to create the staged notation dir");
+    let mut notation_files: Vec<String> = std::fs::read_dir(&notation_dir)
+        .unwrap_or_else(|error| {
+            panic!(
+                "Professional Edition notation sources are required for --features professional: {}: {error}",
+                notation_dir.display()
+            )
+        })
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".rs"))
+        .collect();
+    notation_files.sort();
+    for name in notation_files {
+        stage_professional_source(&source_dir, &output_dir, &format!("notation/{name}"));
+    }
+
     // The EULA text is embedded into the binary. Copy it beside the staged
     // source so `include_str!(concat!(env!("OUT_DIR"), ...))` finds it.
     copy_professional_asset(&assets_dir, &output_dir, "EULA.EN.txt");

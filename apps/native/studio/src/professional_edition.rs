@@ -53,6 +53,34 @@ mod asio {
     ));
 }
 
+/// The notation engine and the MIDI editor's Score view. The engine's files
+/// declare their modules through `notation_module!`, so the same sources
+/// build here (from the staged copies) and in the engine's standalone test
+/// package.
+#[allow(dead_code)]
+mod notation {
+    macro_rules! notation_module {
+        ($name:ident) => {
+            pub mod $name {
+                include!(concat!(
+                    env!("OUT_DIR"),
+                    "/futureboard-professional/notation/",
+                    stringify!($name),
+                    ".rs"
+                ));
+            }
+        };
+    }
+
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/futureboard-professional/notation/engine.rs"
+    ));
+
+    // App-only: needs GPUI and the shared UI crate.
+    notation_module!(score_editor);
+}
+
 pub use license_activation_dialog::open_license_activation_window;
 
 /// Open the License window over the given owner window.
@@ -102,6 +130,13 @@ pub fn show_eula_if_needed(cx: &mut gpui::App) {
 /// An unlicensed machine is not an error. Its cached capability is false, so
 /// the audio backend list and all future ASIO host acquisitions stay disabled.
 pub fn install_licensed_providers() -> Result<(), String> {
+    // The Score view comes with any active Professional license, and goes
+    // when it lapses: the MIDI editor drops the mode with the provider.
+    let licensed = license::active_license().is_some();
+    sphere_ui_components::score_view::set_score_view_provider(
+        licensed.then(notation::score_editor::provider),
+    );
+
     #[cfg(target_os = "windows")]
     {
         let asio_entitled = license::active_license()

@@ -1683,6 +1683,11 @@ pub struct PianoRoll {
     /// read from the clip's notes, and a click fills or clears a step. The
     /// notes stay the clip's only data — see [`step_grid`].
     step_mode: bool,
+    /// Score view: the clip as notation, drawn and edited by the view the
+    /// edition installs in [`crate::score_view`]. Offered only while one is
+    /// installed (a licensed Professional build).
+    score_mode: bool,
+    score_view: Option<crate::score_view::ScoreViewHandle>,
     /// How many hits a step plays when one is added or re-repeated (a
     /// ratchet), one of [`step_grid::STEP_REPEATS`].
     step_repeat: u8,
@@ -2040,6 +2045,8 @@ impl PianoRoll {
             row_h: DEFAULT_ROW_H,
             drum_mode: false,
             step_mode: false,
+            score_mode: false,
+            score_view: None,
             step_repeat: 1,
             step_curve: step_grid::RepeatCurve::Flat,
             on_drum_step_track: false,
@@ -2966,8 +2973,11 @@ impl PianoRoll {
         // the drum lanes from the step view is a mode change too.
         let leaving_steps = self.step_mode;
         self.step_mode = false;
+        // Every editor mode button lands here, so this is also how the score
+        // view is left.
+        let leaving_score = std::mem::take(&mut self.score_mode);
         if self.drum_mode == on {
-            if leaving_steps {
+            if leaving_steps || leaving_score {
                 cx.notify();
             }
             return;
@@ -2986,6 +2996,61 @@ impl PianoRoll {
 
     pub fn step_mode(&self) -> bool {
         self.step_mode
+    }
+
+    pub fn score_mode(&self) -> bool {
+        self.score_mode
+    }
+
+    /// Whether this build and license offer the score view.
+    pub fn score_available() -> bool {
+        crate::score_view::score_view_provider().is_some()
+    }
+
+    /// Show the clip as notation. Ignored when no score view is installed.
+    pub fn set_score_mode(&mut self, on: bool, cx: &mut Context<Self>) {
+        if on && !Self::score_available() {
+            return;
+        }
+        if on {
+            // Off the drum lanes and the step grid: notation reads pitches.
+            self.set_drum_mode(false, cx);
+        }
+        self.score_mode = on;
+        cx.notify();
+    }
+
+    /// The score view's element for this frame, creating the view on first
+    /// use. `None` sends the editor back to the piano roll: the provider can
+    /// go away mid-session when the license lapses.
+    pub(super) fn score_body(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        clip_id: Option<&str>,
+    ) -> Option<gpui::AnyElement> {
+        let Some(factory) = crate::score_view::score_view_provider() else {
+            self.score_mode = false;
+            self.score_view = None;
+            return None;
+        };
+        if self.score_view.is_none() {
+            let context = crate::score_view::ScoreViewContext {
+                timeline: self.timeline.clone(),
+                preview: self.on_midi_preview.clone(),
+            };
+            self.score_view = Some(factory(context, window, cx));
+        }
+        let handle = self.score_view.as_ref()?;
+        (handle.set_clip)(clip_id.map(str::to_string), cx);
+        Some(
+            div()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .child(handle.view.clone())
+                .into_any_element(),
+        )
     }
 
     /// MIDI → Step: show the clip on the step grid (over the drum lanes).
@@ -7002,6 +7067,11 @@ impl PianoRoll {
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        // The score view handles its own keys; one it leaves alone must not
+        // reach the piano roll's hidden selection.
+        if self.score_mode {
+            return;
+        }
         // Typing in the editor while a tool previews keeps the tool's result
         // first, so the key acts on the notes as they look.
         self.accept_active_tool(cx);
