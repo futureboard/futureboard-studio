@@ -259,8 +259,23 @@ impl EngineInner {
     /// after that is carried into the new graph (#365).
     pub fn load_project_as_of(
         &self,
+        snapshot: EngineProjectSnapshot,
+        insert_param_revision: u64,
+    ) -> Result<(), SphereAudioError> {
+        let output_sample_rate = self.shared.sample_rate.load(Ordering::Relaxed).max(1);
+        self.load_project_built_at(snapshot, insert_param_revision, output_sample_rate)
+    }
+
+    /// [`Self::load_project_as_of`] building the graph for `output_sample_rate`,
+    /// the open stream's rate as read when the load began. The stream can be
+    /// replaced while the graph is being built (the build decodes media and
+    /// runs off the UI thread; a Settings change reopens the device on it), so
+    /// the rate is checked again before the graph is queued.
+    pub(super) fn load_project_built_at(
+        &self,
         mut snapshot: EngineProjectSnapshot,
         insert_param_revision: u64,
+        output_sample_rate: u32,
     ) -> Result<(), SphereAudioError> {
         let input_state_revision_at_start = self.input_state_revision.load(Ordering::Acquire);
         let old_state = AudioEngineState::from_u8(
@@ -272,12 +287,11 @@ impl EngineInner {
             "[AudioEngineState] old={old_state:?} new=LoadingProject source=load_project playing={}",
             self.shared.playing.load(Ordering::Relaxed)
         );
-        let output_sample_rate = self.shared.sample_rate.load(Ordering::Relaxed).max(1);
         // A note edit changes the MIDI and nothing else. Rebuilding the whole
         // graph for it re-read every SoundFont from disk and, at the swap,
         // silenced every sounding note and restarted every stretcher and PDC
         // line -- once per note drawn. Swap the schedule instead.
-        let structure_key =
+        let mut structure_key =
             project_structure_key(&mut snapshot, output_sample_rate, self.pdc_enabled());
         if structure_key.is_some() && *self.structure_key.lock() == structure_key {
             self.shared
@@ -476,6 +490,26 @@ impl EngineInner {
         // callback's first graph swap is a cheap atomic enqueue, never a
         // channel allocation + thread spawn on the audio thread.
         prime_audio_thread_resources();
+
+        // From here to the send no stream can open or close. If one did while
+        // the graph was being built, every sample position in it is counted at
+        // the rate of a stream that is gone, and the callback only relabels
+        // the graph it is handed: a clip built for 48 kHz and played at
+        // 44.1 kHz started 8.8% of its timeline position late, each clip by a
+        // different amount. Bring the graph to the open stream's rate here, on
+        // the control thread, and forget the structure key so the next sync
+        // builds it natively.
+        let _stream_gate = self.stream_gate.lock();
+        let live_sample_rate = self.shared.sample_rate.load(Ordering::Relaxed).max(1);
+        if live_sample_rate != output_sample_rate {
+            eprintln!(
+                "[audio-sync] load_project: stream rate changed during the build \
+                 ({output_sample_rate} -> {live_sample_rate}); retargeting the graph"
+            );
+            runtime.retarget_sample_rate(live_sample_rate);
+            structure_key = None;
+        }
+        let output_sample_rate = live_sample_rate;
 
         // Serialize the project store and callback command with incremental
         // input edits. If one committed while this graph was being built, carry

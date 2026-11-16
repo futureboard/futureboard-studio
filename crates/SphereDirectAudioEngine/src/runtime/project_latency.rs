@@ -39,7 +39,12 @@ impl RuntimeProject {
         if track.inserts.is_empty() {
             return track.plugin_latency_samples.max(instrument);
         }
-        track.inserts.iter().fold(instrument, |samples, insert| {
+        // The ARA renderers play the clips ahead of the inserts. Their share
+        // is not an insert's, so it has to be carried here: summing the
+        // inserts alone read as "this track's latency changed" on the first
+        // refresh after every graph load and replanned the ARA latency away.
+        let source = instrument.saturating_add(track.ara_latency_samples);
+        track.inserts.iter().fold(source, |samples, insert| {
             samples.saturating_add(Self::insert_latency_samples(insert, bridge_period_frames))
         })
     }
@@ -85,7 +90,8 @@ impl RuntimeProject {
             .soundfont_player
             .as_ref()
             .map(RuntimeSoundfontPlayer::latency_samples)
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .saturating_add(track.ara_latency_samples);
         for insert in &mut track.inserts {
             chain =
                 chain.saturating_add(Self::insert_latency_samples(insert, bridge_period_frames));

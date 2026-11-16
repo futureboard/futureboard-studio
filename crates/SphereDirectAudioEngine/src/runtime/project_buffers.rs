@@ -136,12 +136,16 @@ impl RuntimeProject {
             }
             // The built-in Soundfont Player is a track instrument rather than an
             // insert, so its decimation delay has to be seeded here before the
-            // insert latencies accumulate on top.
+            // insert latencies accumulate on top. So do the ARA renderers,
+            // which the graph carries across a retarget: without their share
+            // here a device reopened at another rate planned compensation as
+            // if the track had no ARA plug-in.
             track.plugin_latency_samples = track
                 .soundfont_player
                 .as_ref()
                 .map(RuntimeSoundfontPlayer::latency_samples)
-                .unwrap_or(0);
+                .unwrap_or(0)
+                .saturating_add(track.ara_latency_samples);
             for insert in &mut track.inserts {
                 insert.dsp.rebuild(
                     canonical_plugin_id(&insert.kind),

@@ -294,6 +294,38 @@ struct LoadedPlugin {
 
 type LoadedRegistry = HashMap<String, LoadedPlugin>;
 
+/// The rate `plugin_instance_id` was created at — the rate its DSP runs at —
+/// or `requested` when the registry does not know the instance.
+///
+/// A plug-in's processing setup is fixed when it is created; nothing in this
+/// host moves a live instance to another rate. A `PrepareProcessing` for
+/// another rate therefore must not be answered as if it had been applied: it
+/// is answered with this, and the instance is brought to the new rate by
+/// unloading it and loading it again.
+fn created_sample_rate(loaded: &LoadedRegistry, plugin_instance_id: &str, requested: u32) -> u32 {
+    let Some(created) = loaded
+        .get(plugin_instance_id)
+        .map(|plugin| plugin.sample_rate)
+        .filter(|rate| *rate > 0)
+    else {
+        return requested;
+    };
+    if created != requested {
+        eprintln!(
+            "[plugin-host-dsp] instance={plugin_instance_id} runs at {created} Hz, not the \
+             {requested} Hz asked for; it has to be loaded again to change rate"
+        );
+    }
+    created
+}
+
+/// Whether every loaded instance was created at `sample_rate`.
+fn instances_follow_rate(loaded: &LoadedRegistry, sample_rate: u32) -> bool {
+    loaded
+        .values()
+        .all(|plugin| plugin.sample_rate == sample_rate)
+}
+
 /// The DSP core behind a built-in insert, one variant per bridge-enabled
 /// built-in. The variants deliberately do not share a trait: they differ in
 /// what they *have* (block-boundary hand-off, meters, latency), and a
@@ -5983,18 +6015,22 @@ fn dispatch(
             sample_rate,
             max_block_size,
         } => {
-            // Stage 1: the main engine owns sample rate / block size; follow it.
+            // The main engine owns sample rate / block size. This sets what the
+            // next load is created at; an instance already loaded keeps the
+            // rate it was created at, and the answer says so instead of
+            // claiming the host follows a rate its plug-ins do not run at.
             let (sr, block) = preview.lock().configure(sample_rate, max_block_size);
+            let follows_engine = instances_follow_rate(loaded, sample_rate);
             eprintln!(
                 "[plugin-host-bridge] ConfigureAudioBridge engine_sr={sample_rate} engine_block={max_block_size} \
-                 host_sr={sr} host_block={block} follows_engine=true"
+                 host_sr={sr} host_block={block} follows_engine={follows_engine}"
             );
             let _ = ipc::write_frame(
                 out,
                 &HostEvent::AudioBridgeConfigured {
                     sample_rate: sr,
                     max_block_size: block,
-                    follows_engine: true,
+                    follows_engine,
                 },
             );
         }
@@ -6076,6 +6112,7 @@ fn dispatch(
             // instance for not being in the VST3 preview engine.
             if let Some(au) = au_instance(au_processors, &plugin_instance_id) {
                 let channels = au.output_channels().max(1);
+                let sample_rate = created_sample_rate(loaded, &plugin_instance_id, sample_rate);
                 eprintln!(
                     "[plugin-host-au] prepared instance={plugin_instance_id} sr={sample_rate} block={max_block_size} outputs={channels}"
                 );
@@ -6106,7 +6143,11 @@ fn dispatch(
             eprintln!(
                 "[plugin-host] PrepareProcessing uses existing instance={plugin_instance_id}"
             );
-            let (sr, block) = preview_guard.configure(sample_rate, max_block_size);
+            let (_, block) = preview_guard.configure(sample_rate, max_block_size);
+            // The instance was created at the rate of its load and stays
+            // there: report that rate, not the one asked for, so a caller that
+            // wanted another one can see it has to load the instance again.
+            let sr = created_sample_rate(loaded, &plugin_instance_id, sample_rate);
             preview_guard.set_dsp_ready(true);
             let actual_output_channels = preview_guard
                 .main_audio_output_channel_count_for_instance(&plugin_instance_id)
@@ -6117,7 +6158,6 @@ fn dispatch(
             drop(preview_guard);
             if let Some(plugin) = loaded.get_mut(&plugin_instance_id) {
                 plugin.processing_ready = true;
-                plugin.sample_rate = sr;
                 plugin.max_block_size = block;
             }
             eprintln!(

@@ -637,6 +637,21 @@ pub struct EngineInner {
 
     // Browser sample-preview decode requests (see `AuditionRequests`).
     audition_requests: Arc<AuditionRequests>,
+
+    /// Orders a stream open against the tail of `load_project`, the one job
+    /// that runs on another thread and ends by handing the callback a graph.
+    /// Held for the whole open (close, build, commit) and for the short tail
+    /// of a load (rate check, mirror store, send) — never across the build —
+    /// so a graph built for the rate of a stream that has since been replaced
+    /// is brought to the new stream's rate before it is queued.
+    /// Lock order: this, then `project`.
+    stream_gate: Mutex<()>,
+    /// The rate `position_samples` and the loop bounds are counted in: that of
+    /// the last stream committed, 0 before the first. See
+    /// [`Self::carry_transport_to_stream`].
+    transport_sample_rate: AtomicU32,
+    /// Streams committed so far; names a stream in the `[audio-sync]` log.
+    stream_generation: AtomicU64,
 }
 
 /// Single-slot mailbox for Browser sample-preview decode requests.
@@ -822,6 +837,9 @@ impl EngineInner {
             asio_caps: Mutex::new(None),
             input_test_uses_session: std::sync::atomic::AtomicBool::new(false),
             audition_requests: Arc::new(AuditionRequests::default()),
+            stream_gate: Mutex::new(()),
+            transport_sample_rate: AtomicU32::new(0),
+            stream_generation: AtomicU64::new(0),
         }
     }
 
@@ -1071,3 +1089,6 @@ mod structure_key_tests;
 
 #[cfg(test)]
 mod render_position_tests;
+
+#[cfg(test)]
+mod backend_switch_sync_tests;

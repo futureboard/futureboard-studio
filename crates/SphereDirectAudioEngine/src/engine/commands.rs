@@ -90,6 +90,7 @@ impl EngineInner {
         backend_name: String,
     ) {
         self.shared.sample_rate.store(sr, Ordering::Relaxed);
+        self.carry_transport_to_stream(sr, &backend_name, bs);
         let mut st = self.status.lock();
         st.stream_open = true;
         st.running = false;

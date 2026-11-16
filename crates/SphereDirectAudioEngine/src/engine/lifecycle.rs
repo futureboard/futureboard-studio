@@ -2,6 +2,12 @@
 
 use super::*;
 
+/// `samples` counted at `from` Hz, as the nearest count at `to` Hz.
+pub(super) fn rescale_samples(samples: u64, from: u32, to: u32) -> u64 {
+    let from = u128::from(from.max(1));
+    ((u128::from(samples) * u128::from(to) + from / 2) / from).min(u128::from(u64::MAX)) as u64
+}
+
 impl EngineInner {
     pub fn get_version(&self) -> String {
         ENGINE_VERSION.to_string()
@@ -38,6 +44,7 @@ impl EngineInner {
     /// Open (or re-open) an audio output stream.
     /// Closes any existing stream first.
     pub fn open_device(&self, config: JsDeviceOpenConfig) -> Result<(), SphereAudioError> {
+        let _stream_gate = self.stream_gate.lock();
         self.prepare_stream_open();
 
         let (dev, dev_name) = device::resolve_output_device(config.output_device_id.as_deref())
@@ -117,6 +124,7 @@ impl EngineInner {
         let sample_rate = selected_config.config.sample_rate.0;
         let buffer_size = reported_buffer_size(&selected_config.config);
         eprintln!("[audio-engine] active_sample_rate={sample_rate} block_size={buffer_size}");
+        self.carry_transport_to_stream(sample_rate, "cpal (legacy)", buffer_size);
 
         // Store the stream and sender.
         *self.stream.lock() = Some(stream);
@@ -172,6 +180,52 @@ impl EngineInner {
         st.running = false;
     }
 
+    /// Carry the transport onto a stream that has just opened at `sample_rate`.
+    ///
+    /// The transport position and the loop bounds are counted in device
+    /// samples. Switching backend usually switches rate with it (a WASAPI
+    /// Shared endpoint runs at its mix format, an ASIO driver at its own
+    /// clock), and the new stream read the old count at its own rate: stopped
+    /// at 4.15 s on a 48 kHz stream, the song reopened at 4.52 s on a 44.1 kHz
+    /// one, and a loop moved and stretched with it. Converted here, once, to
+    /// the same place in time.
+    ///
+    /// Control thread, under `stream_gate`, before the new stream's command
+    /// sender is published. Its callback does not advance the position until a
+    /// `StartTransport` reaches it, so nothing races these stores.
+    pub(super) fn carry_transport_to_stream(&self, sample_rate: u32, backend: &str, block: u32) {
+        let generation = self.stream_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let previous = self
+            .transport_sample_rate
+            .swap(sample_rate, Ordering::Relaxed);
+        let before = self.shared.position_samples.load(Ordering::Relaxed);
+        if previous != 0 && sample_rate != 0 && previous != sample_rate {
+            for cell in [
+                &self.shared.position_samples,
+                &self.shared.loop_start_samples,
+                &self.shared.loop_end_samples,
+            ] {
+                let samples = cell.load(Ordering::Relaxed);
+                cell.store(
+                    rescale_samples(samples, previous, sample_rate),
+                    Ordering::Relaxed,
+                );
+            }
+        }
+        let after = self.shared.position_samples.load(Ordering::Relaxed);
+        eprintln!(
+            "[audio-sync] stream_open generation={generation} backend={backend:?} \
+             sample_rate={previous}->{sample_rate} block={block} \
+             transport_samples={before}->{after} transport_seconds={:.6}->{:.6} \
+             loop_samples={}..{} pdc_enabled={}",
+            before as f64 / previous.max(1) as f64,
+            after as f64 / sample_rate.max(1) as f64,
+            self.shared.loop_start_samples.load(Ordering::Relaxed),
+            self.shared.loop_end_samples.load(Ordering::Relaxed),
+            self.pdc_enabled(),
+        );
+    }
+
     /// Push the control thread's transport-clock and metronome state into a
     /// freshly opened stream.
     ///
@@ -221,6 +275,7 @@ impl EngineInner {
         &self,
         sample_rate: u32,
     ) -> (crossbeam_channel::Receiver<EngineCommand>, RuntimeProject) {
+        let _stream_gate = self.stream_gate.lock();
         self.prepare_stream_open();
         self.shared
             .sample_rate
@@ -228,6 +283,8 @@ impl EngineInner {
         let mut initial_runtime = self.get_initial_runtime(Some(sample_rate));
         // What every backend does with it before its first block.
         initial_runtime.retarget_sample_rate(sample_rate);
+        // And `commit_stream_open` once the stream is built.
+        self.carry_transport_to_stream(sample_rate, "test", 0);
         let (tx, rx) = bounded::<EngineCommand>(512);
         *self.cmd_tx.lock() = Some(tx);
         self.reseed_stream_transport_state();

@@ -260,6 +260,10 @@ pub(crate) struct PluginEditorWindows {
     /// for it — a short while after the first edit, so a knob sweep is one
     /// request, not one per step.
     pub state_capture_due: std::collections::HashMap<String, std::time::Instant>,
+    /// `(sample rate, max block size)` of the stream the bridged plug-ins were
+    /// last brought to; `None` until a stream has been seen open. See
+    /// [`StudioLayout::follow_stream_with_bridge_plugins`].
+    pub prepared_stream: Option<(u32, u32)>,
 }
 
 /// How long after a bridged plug-in's first unsaved edit its state is
@@ -4457,6 +4461,312 @@ impl StudioLayout {
                 runtime.unload_plugin(insert_id.to_string());
             }
         }
+    }
+
+    /// Called from the engine poll: when the open stream's rate or buffer size
+    /// is not the one the bridged plug-ins were last brought to, bring them to
+    /// it. One comparison per poll while nothing changed.
+    ///
+    /// Watching the stream rather than each place that reopens it (a Settings
+    /// change, the sample-rate flow, the Performance Monitor's restart, the
+    /// warm-up retry, a recovered device) means a new way to reopen cannot
+    /// forget the plug-ins.
+    pub(super) fn follow_stream_with_bridge_plugins(&mut self, cx: &mut Context<Self>) {
+        let Some(stats) = self.audio_bridge.stats.as_ref() else {
+            return;
+        };
+        if !stats.stream_open || stats.sample_rate == 0 {
+            return;
+        }
+        let Some(engine) = self.audio_bridge.engine.as_ref() else {
+            return;
+        };
+        // The pair a load is sent with (`load_bridge_insert_for_slot`).
+        let target = (stats.sample_rate, engine.config().buffer_size);
+        if self.plugin_editors.prepared_stream == Some(target) {
+            return;
+        }
+        self.plugin_editors.prepared_stream = Some(target);
+        self.reprepare_bridge_plugins_for_stream(target, cx);
+    }
+
+    /// Bring every bridged plug-in to a stream running at `target`
+    /// (`(sample rate, max block size)`).
+    ///
+    /// A plug-in host builds an instance's DSP at the rate of its load and
+    /// cannot move it. Left alone after the device reopened at another rate,
+    /// every plug-in kept processing at the old one and reported its latency
+    /// in old-rate samples, which delay compensation then applied as new-rate
+    /// samples: each track behind a latent plug-in landed off by a different
+    /// amount (#436). So each instance that cannot follow the stream where it
+    /// is gets created again for it:
+    ///
+    /// 1. its state is taken from the plug-in itself, now — a built-in's from
+    ///    the main-process mirror its editor keeps current, a hosted one's by
+    ///    asking it — and stored in its insert;
+    /// 2. its sink leaves the engine and its editor closes, so nothing is
+    ///    exchanging blocks with it or attached to it;
+    /// 3. it is unloaded, which drops its shared region;
+    /// 4. it is loaded again through the path a project open uses: a new
+    ///    region stamped with the stream's rate, a new instance created at
+    ///    that rate, the stored state restored into it;
+    /// 5. the new sinks are installed and the project is synced, so the
+    ///    engine re-reads every latency and replans compensation.
+    ///
+    /// A hosted plug-in whose state does not come back is **not** reloaded:
+    /// the insert's stored copy may be older than what the plug-in holds, and
+    /// reloading from it would throw the difference away. It keeps running at
+    /// its old rate and is reported, by name, as needing a project re-open.
+    ///
+    /// Blocks the caller for as long as the hosted plug-ins take to answer
+    /// (bounded). The transport is stopped across a reopen, so no block is
+    /// being asked of them meanwhile.
+    pub(super) fn reprepare_bridge_plugins_for_stream(
+        &mut self,
+        stream: (u32, u32),
+        cx: &mut Context<Self>,
+    ) {
+        /// Longer than a save waits: giving up here leaves a plug-in at the
+        /// wrong rate, which costs more than a moment of the caller's time.
+        const STATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        const TASK_ID: &str = "plugin-stream-reprepare";
+
+        if !super::plugin_bridge_runtime::bridge_enabled() {
+            return;
+        }
+        let Some(runtime) = self.plugin_editors.bridge_runtime.clone() else {
+            return;
+        };
+        let stale = match runtime.lock() {
+            Ok(mut runtime) => runtime.plan_stream_reprepare(stream.0, stream.1),
+            Err(_) => return,
+        };
+        if stale.is_empty() {
+            return;
+        }
+        eprintln!(
+            "[plugin-reprepare] stream sr={} block={} instances={}",
+            stream.0,
+            stream.1,
+            stale.len()
+        );
+
+        // Where each instance is now (an insert can have moved channel since
+        // its load), and whether it is one of ours.
+        struct Target {
+            track_id: String,
+            insert_id: String,
+            name: String,
+            from: (u32, u32),
+            builtin_plugin_id: Option<String>,
+            confirmed: bool,
+        }
+        let mut targets = Vec::new();
+        for loaded in &stale {
+            let insert_id = loaded.descriptor.insert_id.clone();
+            let found = {
+                let state = &self.timeline.read(cx).state;
+                state
+                    .insert_owner_ids_containing(&insert_id)
+                    .into_iter()
+                    .next()
+                    .and_then(|track_id| {
+                        let slot = state.find_insert_slot(&track_id, &insert_id)?;
+                        let builtin = slot
+                            .plugin_id
+                            .clone()
+                            .filter(|id| SpherePluginHost::builtin_audio_bridge_supported(id));
+                        Some((track_id, builtin))
+                    })
+            };
+            let Some((track_id, builtin_plugin_id)) = found else {
+                // No insert holds it any more: nothing to bring across.
+                if let Some(engine) = self.audio_bridge.engine.as_ref() {
+                    let _ = engine.set_plugin_bridge_sink(insert_id.clone(), None);
+                }
+                self.unload_bridge_plugin(&insert_id);
+                continue;
+            };
+            targets.push(Target {
+                track_id,
+                insert_id,
+                name: loaded.descriptor.display_name.clone(),
+                from: loaded.prepared,
+                builtin_plugin_id,
+                confirmed: loaded.confirmed(),
+            });
+        }
+
+        // 1. State, from the plug-ins themselves. An instance still loading
+        //    has none the insert lacks.
+        let ask: Vec<String> = targets
+            .iter()
+            .filter(|t| t.confirmed && t.builtin_plugin_id.is_none())
+            .map(|t| t.insert_id.clone())
+            .collect();
+        let capture = if ask.is_empty() {
+            Default::default()
+        } else {
+            match runtime.lock() {
+                Ok(mut runtime) => runtime.request_plugin_states(&ask, STATE_TIMEOUT),
+                Err(_) => return,
+            }
+        };
+        let mut fresh: std::collections::HashMap<String, std::sync::Arc<Vec<u8>>> = capture
+            .states
+            .into_iter()
+            .map(|(id, bytes)| (id, std::sync::Arc::new(bytes)))
+            .collect();
+        for target in &targets {
+            let Some(plugin_id) = target.builtin_plugin_id.as_deref() else {
+                continue;
+            };
+            if let Some(bytes) = crate::components::builtin_plugin_editor::builtin_state_bytes(
+                plugin_id,
+                &target.insert_id,
+            ) {
+                fresh.insert(target.insert_id.clone(), std::sync::Arc::new(bytes));
+            }
+        }
+        let uncaptured: std::collections::HashSet<String> = capture
+            .unanswered
+            .into_iter()
+            .chain(capture.failed)
+            .collect();
+        self.timeline.update(cx, |timeline, _cx| {
+            for target in &targets {
+                let Some(state) = fresh.get(&target.insert_id) else {
+                    continue;
+                };
+                let slot = timeline
+                    .state
+                    .insert_slots_mut(&target.track_id)
+                    .and_then(|slots| slots.iter_mut().find(|slot| slot.id == target.insert_id));
+                if let Some(slot) = slot {
+                    slot.vst3_state = Some(state.clone());
+                }
+            }
+        });
+        for id in fresh.keys() {
+            // The insert now holds a state at least as new.
+            self.plugin_editors.live_states.remove(id);
+        }
+
+        // 2–4. Out of the engine, unloaded, loaded again. One engine sync for
+        // the batch, after it (see `plugin_restore_batch_active`).
+        let mut reloaded = Vec::new();
+        let mut kept = Vec::new();
+        let mut failed = Vec::new();
+        let batch_was_active = std::mem::replace(&mut self.plugin_restore_batch_active, true);
+        for target in &targets {
+            if uncaptured.contains(&target.insert_id) {
+                eprintln!(
+                    "[plugin-reprepare] instance={} state not captured; kept at sr={} block={}",
+                    target.insert_id, target.from.0, target.from.1
+                );
+                kept.push(target.name.clone());
+                continue;
+            }
+            let editor_open = self
+                .editor_showing_insert(&target.track_id, &target.insert_id, cx)
+                .is_some()
+                || self
+                    .plugin_editors
+                    .bridge
+                    .contains_key(&(target.track_id.clone(), target.insert_id.clone()));
+            if let Some(engine) = self.audio_bridge.engine.as_ref() {
+                let _ = engine.set_plugin_bridge_sink(target.insert_id.clone(), None);
+            }
+            self.close_insert_editor(&target.track_id, &target.insert_id, cx);
+            self.plugin_editors
+                .state_capture_due
+                .remove(&target.insert_id);
+            self.unload_bridge_plugin(&target.insert_id);
+            eprintln!(
+                "[plugin-reprepare] instance={} sr={}->{} block={}->{} state_bytes={}",
+                target.insert_id,
+                target.from.0,
+                stream.0,
+                target.from.1,
+                stream.1,
+                fresh.get(&target.insert_id).map_or(0, |state| state.len())
+            );
+            if self.load_bridge_insert_for_slot(&target.track_id, &target.insert_id, cx) {
+                if editor_open {
+                    // Opens again on the new instance once it is ready.
+                    self.timeline.update(cx, |timeline, _cx| {
+                        timeline.state.set_insert_pending_editor_open(
+                            &target.track_id,
+                            &target.insert_id,
+                            true,
+                        );
+                    });
+                }
+                reloaded.push(target.name.clone());
+            } else {
+                failed.push(target.name.clone());
+            }
+        }
+        self.plugin_restore_batch_active = batch_was_active;
+
+        // 5. New sinks in, then one sync: the engine re-reads every latency.
+        self.sync_plugin_bridge_sinks_to_engine(cx, "stream_reprepare");
+        self.audio_bridge.project_dirty = true;
+        self.schedule_audio_project_sync(cx, true, "stream_reprepare");
+
+        if kept.is_empty() && failed.is_empty() {
+            let was_failed = self
+                .background_tasks
+                .tasks
+                .get(TASK_ID)
+                .is_some_and(|task| task.status == crate::components::BackgroundTaskStatus::Failed);
+            if was_failed {
+                self.complete_background_task(
+                    TASK_ID,
+                    Some(format!("Every plug-in runs at {} Hz", stream.0)),
+                );
+            }
+        } else {
+            let mut message = Vec::new();
+            if !kept.is_empty() {
+                message.push(format!(
+                    "{} did not return its state and still runs at its previous sample rate. \
+                     Save and re-open the project to bring it to {} Hz.",
+                    kept.join(", "),
+                    stream.0
+                ));
+            }
+            if !failed.is_empty() {
+                message.push(format!(
+                    "{} could not be loaded again at {} Hz.",
+                    failed.join(", "),
+                    stream.0
+                ));
+            }
+            let message = message.join(" ");
+            eprintln!("[plugin-reprepare] {message}");
+            self.start_background_task(
+                TASK_ID,
+                crate::components::BackgroundTaskKind::SampleRateConversion,
+                "Plug-ins not re-prepared",
+                None,
+                None,
+                false,
+            );
+            self.fail_background_task(TASK_ID, message);
+        }
+        if !reloaded.is_empty() {
+            self.show_edit_notice(
+                format!(
+                    "Re-prepared {} plug-in{} for {} Hz.",
+                    reloaded.len(),
+                    if reloaded.len() == 1 { "" } else { "s" },
+                    stream.0
+                ),
+                cx,
+            );
+        }
+        cx.notify();
     }
 
     /// Fully tear down ONE live plugin instance everywhere outside the project

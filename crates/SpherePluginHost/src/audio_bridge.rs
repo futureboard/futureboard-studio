@@ -773,6 +773,21 @@ impl SharedAudioBridge {
         self.magic.store(BRIDGE_MAGIC, Ordering::Release);
     }
 
+    /// Record the largest block the stream now asks for (creator side).
+    ///
+    /// The one header field that describes the stream rather than the
+    /// instance: the buffers are sized for [`MAX_BLOCK_FRAMES`] whatever it
+    /// says, so a stream reopened at another buffer size needs no new region,
+    /// only this. `sample_rate` has no such setter on purpose — it is the rate
+    /// the instance behind the region was created at, and a stream at another
+    /// rate needs a new instance and a new region with it.
+    pub fn set_max_block_size(&self, max_block_size: u32) {
+        self.max_block_size.store(
+            max_block_size.min(MAX_BLOCK_FRAMES as u32),
+            Ordering::Relaxed,
+        );
+    }
+
     /// Opener-side validation: the header magic + layout version match.
     pub fn header_valid(&self) -> bool {
         self.magic.load(Ordering::Acquire) == BRIDGE_MAGIC

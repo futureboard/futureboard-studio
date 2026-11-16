@@ -24,6 +24,7 @@ impl EngineInner {
     /// again with a safe fallback config.  Use `open_daux_safe` if you want the
     /// engine to handle the fallback automatically.
     pub fn open_daux(&self, config: JsDauxConfig) -> Result<(), SphereAudioError> {
+        let _stream_gate = self.stream_gate.lock();
         self.prepare_stream_open();
 
         // Sanitize before open so a persisted Exclusive ASIO id cannot reach

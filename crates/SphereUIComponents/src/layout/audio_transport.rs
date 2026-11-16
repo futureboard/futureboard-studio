@@ -1172,6 +1172,9 @@ impl StudioLayout {
         }
 
         self.audio_bridge.stats = Some(stats);
+        // A stream that reopened at another rate or buffer size takes the
+        // bridged plug-ins with it (#436).
+        self.follow_stream_with_bridge_plugins(cx);
 
         if meter_changed {
             self.notify_mixer_meter_regions(cx);

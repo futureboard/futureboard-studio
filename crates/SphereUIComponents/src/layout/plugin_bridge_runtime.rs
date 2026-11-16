@@ -26,6 +26,55 @@ pub(crate) struct BridgeLoadedPlugin {
     pub descriptor: BridgePluginDescriptor,
     pub host_pid: Option<u32>,
     confirmed: bool,
+    /// `(sample rate, max block size)` the instance was created for. The host
+    /// builds a plug-in's DSP at the rate of its load and has no way to move
+    /// it afterwards, so this — not what the stream runs at now — is the rate
+    /// the instance processes at and reports its latency in.
+    pub prepared: (u32, u32),
+}
+
+impl BridgeLoadedPlugin {
+    /// The host has answered the load: the instance exists and may hold state
+    /// the project does not.
+    pub fn confirmed(&self) -> bool {
+        self.confirmed
+    }
+
+    /// Whether the instance's processing setup takes the block size. Only an
+    /// Audio Unit's does (its maximum frames per slice); VST3, VST2, CLAP and
+    /// built-in instances are created from the sample rate alone.
+    fn block_size_bound(&self) -> bool {
+        self.descriptor.class_id.starts_with("au:")
+    }
+}
+
+/// What a stream running at `target` asks of an instance prepared for
+/// `prepared`, both `(sample rate, max block size)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamConfigChange {
+    /// Prepared for this stream.
+    None,
+    /// Only the block size moved, and the instance's setup does not take it
+    /// (or still covers it): the shared region's header is brought up to
+    /// date, the instance plays on.
+    Restamp,
+    /// The instance processes at another rate, or cannot take blocks this
+    /// large: it has to be created again for the stream.
+    Reprepare,
+}
+
+pub(crate) fn stream_config_change(
+    prepared: (u32, u32),
+    target: (u32, u32),
+    block_size_bound: bool,
+) -> StreamConfigChange {
+    if prepared.0 != target.0 || (block_size_bound && target.1 > prepared.1) {
+        StreamConfigChange::Reprepare
+    } else if prepared.1 != target.1 {
+        StreamConfigChange::Restamp
+    } else {
+        StreamConfigChange::None
+    }
 }
 
 /// One plug-in host process and what it holds. The studio talks to hosts
@@ -83,6 +132,11 @@ pub(crate) struct PluginStateCapture {
     /// out (or when the host went away), sorted. Their slots keep whatever
     /// state was captured before, which may be older than the plug-in's.
     pub unanswered: Vec<String>,
+    /// Instances whose host answered that it could not capture their state,
+    /// sorted. Like `unanswered`, what their slots hold may be older than what
+    /// the plug-in has; unlike an instance in neither list, which answered
+    /// with a state or with none to keep.
+    pub failed: Vec<String>,
 }
 
 pub(crate) fn bridge_enabled() -> bool {
@@ -182,6 +236,37 @@ mod tests {
             HostIsolation::Instance.key_for(&kontakt_a, false),
             HostIsolation::Instance.key_for(&kontakt_b, false)
         );
+    }
+
+    /// #436: which instances a reopened stream leaves alone, which only need
+    /// their region's header brought up to date, and which have to be created
+    /// again.
+    #[test]
+    fn a_stream_change_reprepares_only_what_cannot_follow_it() {
+        use super::{stream_config_change, StreamConfigChange::*};
+        let prepared = (48_000, 256);
+        // Same stream.
+        assert_eq!(stream_config_change(prepared, (48_000, 256), false), None);
+        assert_eq!(stream_config_change(prepared, (48_000, 256), true), None);
+        // Another rate, either way, whatever the buffer does.
+        for target in [(44_100, 256), (96_000, 256), (44_100, 441), (44_100, 64)] {
+            assert_eq!(stream_config_change(prepared, target, false), Reprepare);
+            assert_eq!(stream_config_change(prepared, target, true), Reprepare);
+        }
+        // Another buffer size at the same rate: an instance created from the
+        // rate alone plays on.
+        assert_eq!(
+            stream_config_change(prepared, (48_000, 1024), false),
+            Restamp
+        );
+        assert_eq!(stream_config_change(prepared, (48_000, 64), false), Restamp);
+        // One whose setup carries a largest block is created again only for
+        // blocks larger than that.
+        assert_eq!(
+            stream_config_change(prepared, (48_000, 1024), true),
+            Reprepare
+        );
+        assert_eq!(stream_config_change(prepared, (48_000, 64), true), Restamp);
     }
 
     #[test]
@@ -492,6 +577,37 @@ impl BridgeHost {
         self.remove_shared_audio(instance);
     }
 
+    /// Bring this host's instances to a stream running at `target`
+    /// (`(sample rate, max block size)`) as far as it can be done in place,
+    /// and return the ones that have to be created again (see
+    /// [`StreamConfigChange`]), loaded or still loading.
+    ///
+    /// In place: an instance whose setup does not depend on the block size
+    /// keeps playing, and its region's header — the one field of it that
+    /// describes the stream rather than the instance — is brought up to date.
+    /// The region itself is sized for the largest block any stream can ask
+    /// for, so nothing is remapped.
+    fn plan_stream_change(&mut self, target: (u32, u32)) -> Vec<BridgeLoadedPlugin> {
+        let mut reprepare = Vec::new();
+        for (instance_id, loaded) in self.loaded.iter_mut() {
+            match stream_config_change(loaded.prepared, target, loaded.block_size_bound()) {
+                StreamConfigChange::None => {}
+                StreamConfigChange::Restamp => {
+                    if let Some(region) = self.shared_audio.get(instance_id) {
+                        region.bridge().set_max_block_size(target.1);
+                    }
+                    eprintln!(
+                        "[plugin-bridge] stream block size instance={instance_id} {} -> {} (instance kept)",
+                        loaded.prepared.1, target.1
+                    );
+                    loaded.prepared.1 = target.1;
+                }
+                StreamConfigChange::Reprepare => reprepare.push(loaded.clone()),
+            }
+        }
+        reprepare
+    }
+
     /// Stage 1: push the engine-owned sample rate / block size to the host so it
     /// follows them for plugin DSP. Idempotent — only re-sent when the config
     /// actually changes. The host replies `AudioBridgeConfigured`.
@@ -597,6 +713,7 @@ impl BridgeHost {
                 descriptor,
                 host_pid: self.host_pid,
                 confirmed: false,
+                prepared: (sample_rate, max_block_size),
             },
         );
         Ok(())
@@ -649,6 +766,7 @@ impl BridgeHost {
                 descriptor,
                 host_pid: self.host_pid,
                 confirmed: false,
+                prepared: (sample_rate, max_block_size),
             },
         );
         Ok(())
@@ -691,6 +809,7 @@ impl BridgeHost {
                 descriptor: descriptor.clone(),
                 host_pid: self.host_pid,
                 confirmed: false,
+                prepared: (sample_rate, max_block_size),
             },
         );
         let input_channels = 2u32;
@@ -955,6 +1074,7 @@ impl BridgeHost {
         timeout: std::time::Duration,
     ) -> PluginStateCapture {
         let mut results = HashMap::new();
+        let mut failed = Vec::new();
         while !pending.is_empty() && std::time::Instant::now() < deadline {
             let Some(event) = self.client.try_recv_event() else {
                 std::thread::sleep(std::time::Duration::from_millis(2));
@@ -972,6 +1092,7 @@ impl BridgeHost {
                         eprintln!(
                             "[plugin-bridge] GetPluginState failed instance={plugin_instance_id}"
                         );
+                        failed.push(plugin_instance_id);
                         continue;
                     }
                     if let Some(packed) =
@@ -997,9 +1118,11 @@ impl BridgeHost {
                 unanswered.join(",")
             );
         }
+        failed.sort();
         PluginStateCapture {
             states: results,
             unanswered,
+            failed,
         }
     }
 
@@ -1431,6 +1554,25 @@ impl PluginBridgeRuntime {
         }
     }
 
+    /// Tell every host the stream now runs at `sample_rate` with blocks of up
+    /// to `max_block_size`, and return the instances that cannot follow it
+    /// where they are and have to be created again, sorted by instance id. See
+    /// [`BridgeHost::plan_stream_change`].
+    pub fn plan_stream_reprepare(
+        &mut self,
+        sample_rate: u32,
+        max_block_size: u32,
+    ) -> Vec<BridgeLoadedPlugin> {
+        let _ = self.configure_audio_bridge(sample_rate, max_block_size);
+        let mut reprepare: Vec<BridgeLoadedPlugin> = self
+            .hosts
+            .values_mut()
+            .flat_map(|host| host.plan_stream_change((sample_rate, max_block_size)))
+            .collect();
+        reprepare.sort_by(|a, b| a.descriptor.insert_id.cmp(&b.descriptor.insert_id));
+        reprepare
+    }
+
     pub fn mark_plugin_load_failed(&mut self, instance: &str) {
         if let Some(host) = self.host_for_mut(instance) {
             host.mark_plugin_load_failed(instance);
@@ -1672,9 +1814,11 @@ impl PluginBridgeRuntime {
                 let part = host.collect_state_replies(pending, deadline, timeout);
                 capture.states.extend(part.states);
                 capture.unanswered.extend(part.unanswered);
+                capture.failed.extend(part.failed);
             }
         }
         capture.unanswered.sort();
+        capture.failed.sort();
         capture
     }
 

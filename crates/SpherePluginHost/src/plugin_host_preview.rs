@@ -634,10 +634,13 @@ impl PluginHostPreviewEngine {
         self.bridge.publish(voices);
     }
 
-    /// Stage 1: follow the main engine's sample rate / block size (the engine
-    /// owns them). Returns the clamped values actually adopted. Existing loaded
-    /// instances keep their current sample rate until reloaded — re-prepare is a
-    /// later stage once the shared audio transport drives `process()`.
+    /// Take the main engine's sample rate / block size (the engine owns them)
+    /// as what the next load is created at. Returns the clamped values.
+    ///
+    /// This does not touch a loaded instance: its processing setup was fixed
+    /// when it was created. A stream that reopens at another rate is followed
+    /// by unloading each instance and loading it again with its state — the
+    /// Studio does that ("re-prepare") — never by relabelling it here.
     pub fn configure(&mut self, sample_rate: u32, max_block_size: u32) -> (u32, u32) {
         self.sample_rate = sample_rate.max(44_100);
         self.block_size = max_block_size.clamp(64, 2048);
