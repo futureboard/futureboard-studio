@@ -1086,7 +1086,7 @@ impl AudioguardLevel {
     pub fn label(self) -> &'static str {
         match self {
             AudioguardLevel::Off => "Off",
-            AudioguardLevel::Normal => "Normal (Recommended)",
+            AudioguardLevel::Normal => "Normal",
             AudioguardLevel::High => "High",
         }
     }

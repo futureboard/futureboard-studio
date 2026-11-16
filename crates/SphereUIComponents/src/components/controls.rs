@@ -720,7 +720,11 @@ pub fn fb_segment(
         .hover(move |s| s.bg(hover))
         .active(move |s| s.bg(pressed))
         .on_click(on_click)
-        .child(label)
+        // Segments share the track's width evenly. A label longer than its
+        // share is cut with an ellipsis inside its own segment instead of
+        // drawing over its neighbours (the full text stays the aria label).
+        .overflow_hidden()
+        .child(div().min_w_0().truncate().child(label))
 }
 
 /// Inset track that holds [`fb_segment`] children. Its padding is what makes

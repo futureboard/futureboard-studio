@@ -874,9 +874,9 @@ settings.field.master-plugin-latency = ปลั๊กอินมาสเต�
 settings.field.pdc-status = การชดเชยดีเลย์
 settings.field.latency-compensation = การชดเชยดีเลย์ปลั๊กอิน
 settings.field.audioguard = Solfege Audioguard
-settings.hint.audioguard = ป้องกันเสียงขาดหาย\: เรนเดอร์ล่วงหน้าเมื่อไม่มีอะไรเล่นสด ปิดเสียงเมื่อเอาต์พุตผิดปกติหรือดังเกินควบคุม และข้ามปลั๊กอินที่ผิดพลาดซ้ำ ๆ ปิด \= เรนเดอร์ทุกบล็อกขณะเล่น
+settings.hint.audioguard = ป้องกันเสียงขาดหาย\: เรนเดอร์ล่วงหน้าเมื่อไม่มีอะไรเล่นสด ปิดเสียงเมื่อเอาต์พุตผิดปกติหรือดังเกินควบคุม และข้ามปลั๊กอินที่ผิดพลาดซ้ำ ๆ ปิด \= เรนเดอร์ทุกบล็อกขณะเล่น แนะนำให้ใช้ ปกติ
 settings.audioguard.off = ปิด
-settings.audioguard.normal = ปกติ (แนะนำ)
+settings.audioguard.normal = ปกติ
 settings.audioguard.high = สูง
 settings.field.overload-warning = เตือนเมื่อระบบโหลดเกิน
 settings.hint.overload-warning = แสดงหน้าต่างแจ้งระบบโหลดเกินพร้อมวิธีแก้ เมื่อเสียงขาดซ้ำ ๆ ระหว่างเล่น

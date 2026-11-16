@@ -553,6 +553,12 @@ pub fn scenes() -> Vec<Scene> {
             open: settings_audio_shared,
         },
         Scene {
+            name: "settings-playback",
+            width: crate::components::settings_layout::SETTINGS_WINDOW_WIDTH,
+            height: crate::components::settings_layout::SETTINGS_WINDOW_HEIGHT,
+            open: settings_playback,
+        },
+        Scene {
             name: "wrapsynth",
             width: plate::WINDOW_SIZE.0,
             height: plate::WINDOW_SIZE.1,
@@ -4587,6 +4593,18 @@ fn settings_audio_shared(options: WindowOptions, cx: &mut App) -> Result<AnyWind
     schema.hardware.audio.driver_type = "WASAPI Shared".to_string();
     schema.hardware.audio.shared_headroom = true;
     settings_on(SettingsTab::Audio, schema, options, cx)
+}
+
+/// The Playback page at its defaults: the Audioguard segments, whose labels
+/// must stay inside their own segment.
+fn settings_playback(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    use crate::components::settings_dialog::SettingsTab;
+    settings_on(
+        SettingsTab::Playback,
+        crate::settings::SettingsSchema::default(),
+        options,
+        cx,
+    )
 }
 
 /// The Preferences window on `tab`, showing `schema`.
