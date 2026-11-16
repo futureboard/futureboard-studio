@@ -38,6 +38,7 @@ impl RuntimeProject {
         let channel = channel.min(15);
         let pitch = pitch.min(127);
         let velocity = velocity.clamp(1, 127);
+        self.midi_sent_since_panic = true;
         let bridged = self.plugin_bridge_sinks.contains_key(plugin_instance_id);
         if bridged {
             // Shared-memory path: always write into the realtime MIDI ring on the
@@ -105,6 +106,7 @@ impl RuntimeProject {
     ) {
         let channel = channel.min(15);
         let value = value.min(127);
+        self.midi_sent_since_panic = true;
         // `128`/`129` are the VST3 out-of-band controller numbers for channel
         // pressure and pitch bend. Clamping them to 127 turned every bend into
         // CC 127 (Poly Mode On), so they keep their own meaning here.
@@ -156,6 +158,7 @@ impl RuntimeProject {
     ) {
         let channel = channel.min(15);
         let value = value.min(16_383);
+        self.midi_sent_since_panic = true;
         if self.plugin_bridge_sinks.contains_key(plugin_instance_id) {
             self.push_bridge_preview_midi(
                 plugin_instance_id,

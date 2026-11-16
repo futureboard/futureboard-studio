@@ -1514,6 +1514,42 @@ fn stop_panic_pushes_note_offs_and_ccs_and_arms_bridge_flush() {
     assert!(p.midi_tracks[0].active.is_empty());
 }
 
+/// Play after a stop: the stop already sent the controller panic, so the
+/// play-from reset sends none. Sent again, it shared sample 0 with a note at
+/// the start position, and an instrument that applies those controllers
+/// after its notes (VST3 maps them to parameter changes) dropped that note.
+#[test]
+fn play_after_stop_sends_the_first_note_without_a_panic() {
+    let (mut p, sink) = bridged_project();
+    p.all_notes_off("stop");
+    sink.take();
+
+    p.reset_midi_playback(96_000);
+    p.schedule_midi_block(96_000, 512);
+
+    assert_eq!(sink.take(), vec![(0x90, 60, 100, 0)]);
+}
+
+/// A seek while notes are playing still sends the full panic: sustain or
+/// a controller the clip set may be holding something down.
+#[test]
+fn seek_after_playback_still_sends_the_controller_panic() {
+    let (mut p, sink) = bridged_project();
+    p.reset_midi_playback(96_000);
+    p.schedule_midi_block(96_000, 512);
+    sink.take();
+
+    p.reset_midi_playback(0);
+
+    let events = sink.take();
+    assert_eq!(events[0], (0x80, 60, 0, 0));
+    assert!(events.contains(&(0xB0, 123, 0, 0)), "{events:?}");
+
+    // A second seek with nothing played since sends no controllers again.
+    p.reset_midi_playback(0);
+    assert!(sink.take().is_empty());
+}
+
 #[test]
 fn repeated_bridge_preview_cycle_leaves_no_stuck_notes() {
     let (mut p, sink) = bridged_project();

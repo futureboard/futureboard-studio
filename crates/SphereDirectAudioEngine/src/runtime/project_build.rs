@@ -631,6 +631,9 @@ impl RuntimeProject {
             // Set by whoever renders the graph: the live callback from the
             // open stream, the exporter from its block size.
             bridge_period_frames: 0,
+            // A graph swap panics the outgoing graph first, and a fresh
+            // instrument has nothing to reset.
+            midi_sent_since_panic: false,
             latency_replan_count: 0,
             // Realtime default: smooth fader/pan drags. The offline exporter
             // overrides this to `false` right after `build()` for a deterministic,

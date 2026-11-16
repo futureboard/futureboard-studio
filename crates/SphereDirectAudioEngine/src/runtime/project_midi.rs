@@ -168,8 +168,15 @@ impl RuntimeProject {
     /// Like [`Self::reset_midi_playback`], but note-off panic events are placed
     /// at `sample_offset` within the current callback block. Used when the
     /// render kernel wraps a loop in the middle of a device block.
+    ///
+    /// Sounding notes always get their note-offs. The controller panic goes
+    /// out only when MIDI has played since the last one
+    /// ([`Self::midi_sent_since_panic`]): play after a stop would otherwise
+    /// put it on the same sample as a note at the start position, and an
+    /// instrument that applies it after the note dropped that first note.
     pub fn reset_midi_playback_with_offset(&mut self, position_sample: u64, sample_offset: u32) {
-        self.all_notes_off_with_offset("seek/play", sample_offset, true);
+        let controllers = self.midi_sent_since_panic;
+        self.all_notes_off_with_offset("seek/play", sample_offset, controllers);
         self.rewind_midi_cursors(position_sample);
     }
 
@@ -322,6 +329,9 @@ impl RuntimeProject {
         sample_offset: u32,
         controllers: bool,
     ) {
+        if controllers {
+            self.midi_sent_since_panic = false;
+        }
         let debug = midi_engine_debug_enabled();
         if debug && reason.contains("seek") {
             for mt in &self.midi_tracks {
@@ -460,6 +470,7 @@ impl RuntimeProject {
                     continue;
                 }
                 apply_active(&mut mt.active, &ev);
+                self.midi_sent_since_panic = true;
                 if let Some(ti) = track_ix {
                     let has_soundfont = self.tracks[ti].soundfont_player.is_some();
                     let has_solfege = self.tracks[ti].solfege_engine.is_some();

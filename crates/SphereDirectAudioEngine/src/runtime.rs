@@ -177,6 +177,13 @@ pub struct RuntimeProject {
     /// callback sets it from [`crate::engine::SharedState::bridge_period_frames_for_block`];
     /// 0 means not set yet, and the render pass then takes its first block.
     pub bridge_period_frames: u32,
+    /// MIDI has reached an instrument since the last full controller panic
+    /// (sustain / all-notes-off / all-sound-off). A seek or play-from sends
+    /// those controllers again only when this is set: after a stop they were
+    /// already sent, and repeating them on play put them on sample 0 next to
+    /// the first note, where an instrument that applies them after its notes
+    /// (VST3 turns them into parameter changes) silenced that note.
+    pub(crate) midi_sent_since_panic: bool,
     /// Times the audio thread has recomputed the compensation plan
     /// ([`Self::refresh_runtime_latency_graph`]). Diagnostics only.
     pub latency_replan_count: u64,
