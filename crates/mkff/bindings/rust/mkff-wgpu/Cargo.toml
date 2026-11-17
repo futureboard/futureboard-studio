@@ -1,0 +1,25 @@
+[package]
+name = "mkff-wgpu"
+version = "0.1.0-dev"
+edition = "2021"
+license = "MIT"
+description = "WGPU / egui demos: display MKFF-decoded frames (hardware MP4 / Annex-B, or any container via mkff-codecs)"
+publish = false
+
+[[example]]
+name = "view"
+path = "examples/view.rs"
+
+[[example]]
+name = "player"
+path = "examples/player.rs"
+
+[dependencies]
+bytemuck = { version = "1", features = ["derive"] }
+eframe = { version = "0.31.1", default-features = false, features = ["default_fonts", "wgpu"] }
+egui = "0.31.1"
+mkff = { path = "../mkff", default-features = false, features = ["bundled", "hevc", "hevc-software-fallback"] }
+mkff-codecs = { path = "../mkff-codecs" }
+pollster = "0.4"
+wgpu = { version = "24", features = ["wgsl"] }
+winit = "0.30"

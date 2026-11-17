@@ -1,0 +1,10 @@
+[package]
+name = "mkff-alac"
+version = "0.1.0-dev"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+description = "Apple Lossless (ALAC) decoder and encoder, written for MKFF in safe Rust"
+
+[dependencies]
+mkff-audio-core = { path = "../mkff-audio-core" }

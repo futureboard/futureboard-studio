@@ -1,0 +1,19 @@
+[package]
+name = "mkff"
+version = "0.1.0-dev"
+edition = "2021"
+license = "MIT"
+description = "Safe RAII wrapper around libmkff (MediaKit Foundation Framework)"
+build = "build.rs"
+
+[features]
+default = ["bundled", "hevc", "hevc-software-fallback"]
+bundled = ["mkff-sys/bundled"]
+hevc = ["mkff-sys/hevc"]
+hevc-software-fallback = ["hevc", "mkff-sys/hevc-software-fallback"]
+# Pure-Rust demux + decode of every container / codec (no FFmpeg), as `mkff::codecs`.
+software-codecs = ["dep:mkff-codecs"]
+
+[dependencies]
+mkff-sys = { path = "../mkff-sys", default-features = false }
+mkff-codecs = { path = "../mkff-codecs", optional = true }

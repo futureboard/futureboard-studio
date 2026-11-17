@@ -1,0 +1,15 @@
+[package]
+name = "mkff-codecs-capi"
+version = "0.1.0-dev"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+description = "C ABI for mkff-codecs (include/mkff/codecs.h): libmkff_swcodecs shared / static library"
+publish = false
+
+[lib]
+name = "mkff_swcodecs"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+mkff-codecs = { path = "../mkff-codecs" }

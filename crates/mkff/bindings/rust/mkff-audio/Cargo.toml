@@ -1,0 +1,20 @@
+[package]
+name = "mkff-audio"
+version = "0.1.0-dev"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+description = "MKFF's own audio stack in one crate: decode MP3 / AAC / FLAC / ALAC / AC-3 / E-AC-3 / Opus / Vorbis / PCM, encode MP3 / AAC / FLAC / ALAC / WAV, demux and mux the audio containers, and register it all as Media Kit add-on flavors"
+
+[dependencies]
+mkff-audio-core = { path = "../mkff-audio-core" }
+mkff-audio-format = { path = "../mkff-audio-format" }
+mkff-mp3 = { path = "../mkff-mp3" }
+mkff-aac = { path = "../mkff-aac" }
+mkff-flac = { path = "../mkff-flac" }
+mkff-alac = { path = "../mkff-alac" }
+mkff-ac3 = { path = "../mkff-ac3" }
+mkff-opus = { path = "../mkff-opus" }
+mkff-vorbis = { path = "../mkff-vorbis" }
+mkff-mediakit = { path = "../mkff-mediakit" }
+log = "0.4"

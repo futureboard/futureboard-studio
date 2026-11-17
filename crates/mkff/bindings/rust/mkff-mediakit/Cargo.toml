@@ -1,0 +1,27 @@
+[package]
+name = "mkff-mediakit"
+version = "0.1.0-dev"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+description = "BeOS-style Media Kit for MKFF: media roster, codec add-ons with automatic hardware / software selection, event-looper nodes, shared-memory buffer groups, time sources and GPU accelerants (DXGI / D3D11 / Media Foundation on Windows)"
+
+[dependencies]
+log = "0.4"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+]

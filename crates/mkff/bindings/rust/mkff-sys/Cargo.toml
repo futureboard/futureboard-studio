@@ -1,0 +1,23 @@
+[package]
+name = "mkff-sys"
+version = "0.1.0-dev"
+edition = "2021"
+license = "MIT"
+description = "Raw FFI declarations for libmkff (MediaKit Foundation Framework)"
+build = "build.rs"
+links = "mkff"
+
+[lib]
+name = "mkff_sys"
+path = "src/lib.rs"
+
+[features]
+default = ["bundled", "hevc", "hevc-software-fallback"]
+bundled = ["dep:cmake"]
+hevc = []
+hevc-software-fallback = ["hevc"]
+
+[dependencies]
+
+[build-dependencies]
+cmake = { version = "0.1", optional = true }

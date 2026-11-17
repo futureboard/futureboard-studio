@@ -1,0 +1,10 @@
+[package]
+name = "mkff-ac3"
+version = "0.1.0-dev"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+description = "AC-3 and E-AC-3 decoder, written for MKFF in safe Rust"
+
+[dependencies]
+mkff-audio-core = { path = "../mkff-audio-core" }

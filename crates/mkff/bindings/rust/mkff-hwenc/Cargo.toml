@@ -1,0 +1,26 @@
+[package]
+name = "mkff-hwenc"
+version = "0.1.0-dev"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+description = "Hardware H.264 encode for MKFF: NVIDIA NVENC, Intel Quick Sync (QSV) and AMD AMF through their Media Foundation encoders (Windows), producing mkff-codecs packets"
+
+[dependencies]
+mkff-codecs = { path = "../mkff-codecs" }
+# Registers the encoders as Media Kit add-on flavors (`addon` module).
+mkff-mediakit = { path = "../mkff-mediakit" }
+rayon = "1.10"
+log = "0.4"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+]
