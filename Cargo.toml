@@ -72,6 +72,9 @@ exclude = [
     # Vendored GPUI is a nested workspace. It is consumed as path dependencies,
     # but must not be claimed as a member of the Futureboard root workspace.
     "crates/gpui",
+    # MKFF is a nested workspace too; `mkff-audio` is consumed as a path
+    # dependency (audio file decoding).
+    "crates/mkff",
 
     # Standalone VST3/CLAP plug-ins. Each is its own workspace with its own
     # target directory; `cargo build --workspace` does not build them. From
@@ -116,8 +119,9 @@ sphere-plugin-host = { path = "crates/SpherePluginHost", default-features = fals
 livestage-engine = { path = "crates/LiveStageEngine", default-features = false }
 sphere-soundfont-player = { path = "crates/SphereSoundfontPlayer", package = "SphereSoundfontPlayer" }
 solfege_spatialaudio = { path = "crates/solfege_spatialaudio" }
-# Video preview/reference decoding for the arrangement Video Track. Uses OS
-# codecs (Media Foundation on Windows) — no FFmpeg/libav anywhere.
+# Video preview/reference decoding for the arrangement Video Track, on MKFF:
+# GPU (mkff-mediakit accelerants) for H.264/HEVC MP4/MOV, mkff-codecs software
+# decode for everything else — no FFmpeg/libav anywhere.
 sphere-video-player = { path = "crates/SphereVideoPlayer" }
 sphere-discord-rpc = { path = "crates/SphereDiscordRPC", package = "SphereDiscordRPC" }
 sphere-platform = { path = "crates/SpherePlatform", package = "SpherePlatform" }
@@ -178,7 +182,8 @@ biquad = "0.6"
 # capture engine (WaveNet A1/A2, LSTM, SlimmableContainer).
 nam-rs = "0.4"
 # `std` required (fundsp no_std path currently misses Vec imports in resample).
-# Keep `files`/`fft` off to avoid pulling Symphonia into stock synth DSP.
+# Keep `files`/`fft` off: `files` pulls Symphonia, which the workspace does not
+# use (audio files are decoded by `mkff-audio`).
 fundsp = { version = "0.23", default-features = false, features = ["std"] }
 
 # CEF 150.0.11 bindings have not reached crates.io yet. Keep the exact upstream
@@ -273,18 +278,9 @@ zip = { version = "9.4.2", default-features = false, features = [
     "deflate-flate2",
 ] }
 flate2 = "1"
-symphonia = { version = "0.5", default-features = false, features = [
-    "wav",
-    "pcm",
-    "aiff",
-    "mp3",
-    "flac",
-    "ogg",
-    "vorbis",
-    "isomp4",
-    "aac",
-    "alac",
-] }
+# MKFF's own audio stack (in-tree, safe Rust): demux + decode of WAV/RF64,
+# AIFF, MP3, ADTS, FLAC, Ogg Vorbis/Opus/FLAC and MP4/M4A (AAC, ALAC, AC-3).
+mkff-audio = { path = "crates/mkff/bindings/rust/mkff-audio" }
 
 
 # =============================================================================

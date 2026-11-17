@@ -136,6 +136,8 @@ sphere-graphic-engine.workspace = true
 sphere-midi-service.workspace = true
 sphere-soundfont-player.workspace = true
 sphere-video-player.workspace = true
+# Raw (headerless) PCM import: decode with the user's layout, write a WAV.
+mkff-audio.workspace = true
 fbmx-runtime.workspace = true
 solfege-model.workspace = true
 # Cross-platform user directories for the file browser default location.

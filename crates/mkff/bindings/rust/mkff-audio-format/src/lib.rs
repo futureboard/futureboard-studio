@@ -1,5 +1,5 @@
-//! Audio container demuxers and muxers for MKFF: WAV / RF64 / AIFF, raw MPEG audio, ADTS, FLAC,
-//! Ogg and MP4 / M4A / MOV audio tracks.
+//! Audio container demuxers and muxers for MKFF: WAV / RF64 / AIFF, RAUF, headerless RAW PCM,
+//! raw MPEG audio, ADTS, FLAC, Ogg and MP4 / M4A / MOV audio tracks.
 //!
 //! Everything is written for MKFF from the public specifications, in safe Rust, with no
 //! dependencies besides [`mkff_audio_core`]. Codecs live in the sibling crates; this crate only
@@ -26,6 +26,8 @@
 //! |---|---|---|
 //! | `"WAV"` | RIFF WAVE, RF64, BW64 (PCM 8/16/24/32, float 32/64, A-law, µ-law, `WAVE_FORMAT_EXTENSIBLE`) | ~4096 frames of interleaved PCM |
 //! | `"AIFF"` | AIFF, AIFF-C (`NONE twos sowt fl32 fl64 in24 in32 raw alaw ulaw`) | ~4096 frames of interleaved PCM |
+//! | `"RAUF"` | Futureboard RAUF v1 (`s32le`, `f32le`, finalized or size-recovered) | ~4096 frames of interleaved PCM |
+//! | `"RAW PCM"` | headerless PCM opened via [`open_raw_pcm`] / [`open_raw_pcm_path`] | ~4096 frames of interleaved PCM |
 //! | `"MP3"` | raw MPEG-1/2/2.5 layer I/II/III (`.mp3 .mp2 .mp1`), ID3v2/ID3v1/APE skipped | one frame (with header) |
 //! | `"ADTS"` | raw AAC in ADTS | one raw AAC access unit (ADTS header and CRC stripped) |
 //! | `"FLAC"` | native FLAC | one FLAC frame (with header) |
@@ -148,6 +150,8 @@ mod mp4;
 mod mpa;
 mod ogg;
 mod pcm;
+mod rauf;
+mod raw;
 mod wav;
 mod xiph;
 
@@ -157,6 +161,11 @@ pub use mp4::{M4aTrack, M4aWriter};
 pub use mpa::{MpaGapless, MpaInfoTag, MpaWriter, MpegAudioHeader};
 pub use ogg::{ogg_flac_headers, OggOpusWriter, OggWriter};
 pub use pcm::{decode_pcm, encode_pcm, PcmCoding, PcmDecoder, PcmFormat};
+pub use rauf::{
+    read_rauf_info, RaufInfo, RAUF_FLAG_FINALIZED, RAUF_FLAG_HAS_PEAK, RAUF_FLAG_HAS_SIDECAR,
+    RAUF_FLAG_RECOVERED,
+};
+pub use raw::{open_raw_pcm, open_raw_pcm_path, RawPcmSpec, RAW_PCM_EXTENSIONS};
 pub use wav::{default_channel_mask, WavSampleFormat, WavWriter};
 pub use xiph::{opus_packet_duration, xiph_lace, xiph_unlace};
 
@@ -248,7 +257,7 @@ pub struct DemuxPacket {
 
 /// A container reader.
 pub trait Demuxer: Send {
-    /// `"WAV"`, `"AIFF"`, `"MP3"`, `"ADTS"`, `"FLAC"`, `"Ogg"` or `"MP4"`.
+    /// `"WAV"`, `"AIFF"`, `"RAUF"`, `"RAW PCM"`, `"MP3"`, `"ADTS"`, `"FLAC"`, `"Ogg"` or `"MP4"`.
     fn format_name(&self) -> &str;
     /// The audio tracks (at least one).
     fn tracks(&self) -> &[Track];
@@ -262,14 +271,15 @@ pub trait Demuxer: Send {
 
 /// File extensions (lower case, without the dot) of the formats [`open`] reads.
 pub const AUDIO_EXTENSIONS: &[&str] = &[
-    "wav", "wave", "rf64", "bw64", "aif", "aiff", "aifc", "mp3", "mp2", "mp1", "mpa", "aac",
-    "adts", "flac", "ogg", "oga", "opus", "m4a", "m4b", "mp4", "mov", "3gp", "3g2", "qt",
+    "wav", "wave", "rf64", "bw64", "aif", "aiff", "aifc", "rauf", "mp3", "mp2", "mp1", "mpa",
+    "aac", "adts", "flac", "ogg", "oga", "opus", "m4a", "m4b", "mp4", "mov", "3gp", "3g2", "qt",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Format {
     Wav,
     Aiff,
+    Rauf,
     Mpa,
     Adts,
     Flac,
@@ -282,6 +292,7 @@ impl Format {
         match self {
             Format::Wav => "WAV",
             Format::Aiff => "AIFF",
+            Format::Rauf => "RAUF",
             Format::Mpa => "MP3",
             Format::Adts => "ADTS",
             Format::Flac => "FLAC",
@@ -303,6 +314,7 @@ fn format_for_extension(ext: &str) -> Option<Format> {
     Some(match ext {
         "wav" | "wave" | "rf64" | "bw64" => Format::Wav,
         "aif" | "aiff" | "aifc" => Format::Aiff,
+        "rauf" => Format::Rauf,
         "mp3" | "mp2" | "mp1" | "mpa" => Format::Mpa,
         "aac" | "adts" => Format::Adts,
         "flac" => Format::Flac,
@@ -327,6 +339,9 @@ fn detect(h: &[u8], ext: &str) -> Option<Format> {
     }
     if h.len() >= 12 && &h[..4] == b"FORM" && (&h[8..12] == b"AIFF" || &h[8..12] == b"AIFC") {
         return Some(Format::Aiff);
+    }
+    if h.starts_with(b"RAUF") {
+        return Some(Format::Rauf);
     }
     if h.starts_with(b"fLaC") {
         return Some(Format::Flac);
@@ -401,6 +416,7 @@ pub fn open(reader: Box<dyn ReadSeek>, name_hint: &str) -> Result<Box<dyn Demuxe
     Ok(match fmt {
         Format::Wav => Box::new(wav::WavDemuxer::open(src)?),
         Format::Aiff => Box::new(aiff::AiffDemuxer::open(src)?),
+        Format::Rauf => Box::new(rauf::RaufDemuxer::open(src)?),
         Format::Mpa => Box::new(mpa::MpaDemuxer::open(src, start)?),
         Format::Adts => Box::new(adts::AdtsDemuxer::open(src, start)?),
         Format::Flac => Box::new(flac::FlacDemuxer::open(src, start)?),

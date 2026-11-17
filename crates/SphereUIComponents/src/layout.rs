@@ -66,6 +66,7 @@ mod midi_import_ops;
 mod midi_input_router;
 mod missing_media_ops;
 mod mixer_ops;
+mod raw_pcm_import_ops;
 mod stem_extract_ops;
 pub(crate) use mixer_ops::{clone_track_for_mixer, clone_track_for_mixer_summary};
 pub(crate) mod audioguard_ops;
@@ -644,6 +645,9 @@ pub struct StudioLayout {
     /// plugin-manager, export) + deferred external-mixer open bounds. Grouped
     /// into [`window_ops::ExternalWindows`] (decomposition slice).
     external_windows: window_ops::ExternalWindows,
+    /// The layout the last raw PCM import used: the next one starts from it,
+    /// since raw files usually come in batches from the same source.
+    last_raw_pcm_settings: Option<crate::components::timeline::raw_pcm_import::RawPcmSettings>,
     /// The Control Room's listening simulation (Virtual Speaker) as set this
     /// session; `None` until first changed, when it reads as off on the
     /// remembered profile (see `listening_simulation`).
@@ -1513,6 +1517,7 @@ impl StudioLayout {
         {
             let target = cx.entity().clone();
             let notice_target = target.clone();
+            let raw_target = target.clone();
             let _ = timeline.update(cx, |timeline, _cx| {
                 timeline.set_edit_notice_callback(Some(Arc::new(move |message, cx| {
                     StudioLayout::defer_update(&notice_target, cx, move |this, cx| {
@@ -1532,6 +1537,21 @@ impl StudioLayout {
                             cx,
                             move |this, _window, cx| {
                                 this.open_midi_import_dialog_for_drop(&request, cx);
+                            },
+                        );
+                    },
+                )));
+                timeline.set_raw_pcm_import_prompt_callback(Some(Arc::new(
+                    move |request, window, cx| {
+                        // Deferred like the MIDI prompt: this fires inside a
+                        // `Timeline::update`.
+                        let request = request.clone();
+                        StudioLayout::defer_update_in_window(
+                            &raw_target,
+                            window,
+                            cx,
+                            move |this, _window, cx| {
+                                this.open_raw_pcm_import_dialog_for_drop(request, cx);
                             },
                         );
                     },
@@ -1632,6 +1652,7 @@ impl StudioLayout {
             )
             .with_placeholder("Search parameters…"),
             external_windows: window_ops::ExternalWindows::default(),
+            last_raw_pcm_settings: None,
             listening_simulation: None,
             plugin_catalog: plugin_ops::PluginCatalogState::default(),
             plugin_editors: plugin_ops::PluginEditorWindows::default(),

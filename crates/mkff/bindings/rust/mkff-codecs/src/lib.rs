@@ -52,6 +52,7 @@ pub use video::{VideoCodec, VideoDecoder};
 pub mod filmcraft {
     pub use filmcraft_codecs as codecs;
     pub use filmcraft_frame as frame;
+    pub use filmcraft_isobmff as isobmff;
     pub use filmcraft_media as media;
 }
 

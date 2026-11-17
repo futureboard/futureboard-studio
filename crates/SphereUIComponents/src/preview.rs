@@ -295,6 +295,18 @@ pub fn scenes() -> Vec<Scene> {
             open: missing_media_scene,
         },
         Scene {
+            name: "raw-pcm-import",
+            width: crate::components::raw_pcm_import_dialog::RAW_PCM_IMPORT_DIALOG_WIDTH,
+            height: crate::components::raw_pcm_import_dialog::RAW_PCM_IMPORT_DIALOG_HEIGHT,
+            open: raw_pcm_import_scene,
+        },
+        Scene {
+            name: "raw-pcm-import-s24be",
+            width: crate::components::raw_pcm_import_dialog::RAW_PCM_IMPORT_DIALOG_WIDTH,
+            height: crate::components::raw_pcm_import_dialog::RAW_PCM_IMPORT_DIALOG_HEIGHT,
+            open: raw_pcm_import_s24be_scene,
+        },
+        Scene {
             name: "deesser-wide",
             width: plate::WINDOW_SIZE.0,
             height: plate::WINDOW_SIZE.1,
@@ -1325,6 +1337,49 @@ fn missing_media_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindow
         cx.new(|cx| MissingMediaWindow::new(rows, callbacks, notes, cx))
     })?;
     Ok(handle.into())
+}
+
+fn open_raw_pcm_import(
+    options: WindowOptions,
+    file_len: u64,
+    settings: crate::components::timeline::raw_pcm_import::RawPcmSettings,
+    cx: &mut App,
+) -> Result<AnyWindowHandle> {
+    use crate::components::raw_pcm_import_dialog::{RawPcmImportDialog, RawPcmImportDialogSetup};
+    let setup = RawPcmImportDialogSetup {
+        file_name: "field_recorder_dump_0412.raw".to_string(),
+        file_len,
+        settings,
+    };
+    let handle = cx.open_window(options, move |_, cx| {
+        cx.new(|_| RawPcmImportDialog::new(setup, Arc::new(|_, _, _| {}), Arc::new(|_, _| {})))
+    })?;
+    Ok(handle.into())
+}
+
+fn raw_pcm_import_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    // 3:00 of 16-bit stereo at 44.1 kHz.
+    open_raw_pcm_import(
+        options,
+        4 * 44_100 * 180,
+        crate::components::timeline::raw_pcm_import::RawPcmSettings::default(),
+        cx,
+    )
+}
+
+fn raw_pcm_import_s24be_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    use crate::components::timeline::raw_pcm_import::{RawPcmSettings, RawSampleFormat};
+    open_raw_pcm_import(
+        options,
+        3 * 48_000 * 42 + 2,
+        RawPcmSettings {
+            sample_rate: 48_000,
+            channels: 1,
+            format: RawSampleFormat::S24,
+            big_endian: true,
+        },
+        cx,
+    )
 }
 
 fn whitesharp_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {

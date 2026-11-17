@@ -213,14 +213,15 @@ samples):
 | AC-3 / E-AC-3 (incl. 7.1 dependent substreams, AHT, SPX) | `mkff-ac3` | 99–137 dB | — |
 | Opus (SILK, CELT, hybrid, multistream) | `mkff-opus` | SILK bit-exact, CELT / hybrid 81–87 dB; RFC 8251 vectors range-exact | — |
 | Vorbis | `mkff-vorbis` | 130 dB | — |
-| PCM (int / float / A-law / µ-law) | `mkff-audio-format` | exact | WAV / AIFF / MP4 |
+| PCM (int / float / A-law / µ-law) | `mkff-audio-format` | exact (WAV / AIFF / RAUF / RAW / MP4) | WAV / AIFF / MP4 |
 
 Known gaps: HE-AAC plays its AAC-LC core upsampled (no SBR / PS yet); E-AC-3
 enhanced coupling is unsupported; Opus FEC is not used.
 
-Containers (`mkff-audio-format`): WAV / RF64 / BW64, AIFF / AIFF-C, raw MPEG audio
-(ID3, Xing / VBRI / LAME gapless), ADTS, FLAC, Ogg (Vorbis / Opus / FLAC), MP4 / M4A /
-MOV audio tracks (fragmented too); writers for each.
+Containers (`mkff-audio-format`): WAV / RF64 / BW64, AIFF / AIFF-C, RAUF, headerless
+RAW PCM, raw MPEG audio (ID3, Xing / VBRI / LAME gapless), ADTS, FLAC, Ogg (Vorbis /
+Opus / FLAC), MP4 / M4A / MOV audio tracks (fragmented too); writers for WAV, MP3,
+ADTS, FLAC, Ogg and MP4 / M4A.
 
 ```rust
 use mkff_audio::{AudioFile, AudioWriter, CodecId, EncoderSettings};

@@ -3,7 +3,7 @@
 //! input.
 //!
 //! ```txt
-//! take folder ──► reader thread (symphonia: decode, seek, loop)
+//! take folder ──► reader thread (mkff-audio: decode, seek, loop)
 //!                   └─► one SPSC ring per file (≥ 4 s, made when the take loads)
 //!                         └─► audio thread: one block per file, popped
 //!                               └─► the assigned channel's input, while
@@ -30,15 +30,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
+use mkff_audio::{AudioBuffer, AudioFile};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::{CODEC_TYPE_NULL, Decoder, DecoderOptions};
-use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo};
-use symphonia::core::io::MediaSourceStream;
-use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
 
 use crate::graph::{BYPASS_FADE_SECONDS, MAX_BLOCK};
 use crate::ring::SampleRing;
@@ -83,207 +77,61 @@ fn is_audio_file(path: &Path) -> bool {
         .is_some_and(|e| AUDIO_EXTENSIONS.iter().any(|a| e.eq_ignore_ascii_case(a)))
 }
 
-/// A take file read with a few header bytes replaced, so symphonia accepts
-/// what the recorder writes.
+/// Failed chunks in a row after which a take file counts as unreadable (or,
+/// when the failures are its data running out, as ended).
+const MAX_CONSECUTIVE_DECODE_FAILURES: u32 = 256;
+
+/// A take file opened with mkff-audio, which reads what the recorder writes
+/// as it is:
 ///
-/// * **FLAC** ([`Self::flac`]): takes recorded before #352 have the last
-///   block's length as the minimum block size. symphonia then takes the
-///   fixed-blocksize stream for a variable one and accepts none of its
-///   frames. When the first frame says the stream is fixed-blocksize, the
-///   minimum is read as the maximum, as the FLAC format has it
-///   (`sphere_encoder::flac_header`, shared with Studio's import path).
-/// * **WAV** ([`Self::wav`]): a take that outgrew 4 GiB is RF64, which
-///   symphonia does not read. It is presented as RIFF with `ds64` turned
-///   into a skipped `JUNK` chunk and the data size taken from `ds64`, capped
-///   at what a RIFF size can say: symphonia plays the first 4 GiB of such a
-///   take (about 93 minutes of a stereo 96 kHz float strip) and no more.
-///   Every other WAV is read as it is.
-struct PatchedFile {
-    file: std::fs::File,
-    len: u64,
-    pos: u64,
-    /// `(offset, byte)` read in place of the file's own byte at `offset`.
-    patches: Vec<(u64, u8)>,
+/// * **FLAC**: takes recorded before #352 have the last block's length as
+///   STREAMINFO's minimum block size; mkff takes the fixed block size from
+///   the first frame header, so they decode and seek like current takes.
+/// * **WAV**: a take that outgrew 4 GiB is RF64, which mkff reads natively —
+///   the whole take, not only its first 4 GiB.
+fn open_file(path: &Path) -> Result<AudioFile, String> {
+    AudioFile::open(path).map_err(|error| format!("{}: {error}", path.display()))
 }
 
-impl PatchedFile {
-    const MIN_BLOCK_AT: u64 = sphere_encoder::flac_header::STREAMINFO_MIN_BLOCK_SIZE_OFFSET;
-
-    fn patch(&mut self, at: u64, bytes: &[u8]) {
-        for (i, byte) in bytes.iter().enumerate() {
-            self.patches.push((at + i as u64, *byte));
-        }
-    }
-
-    fn wav(path: &Path) -> std::io::Result<Self> {
-        use std::io::{Read, Seek, SeekFrom};
-        let file = std::fs::File::open(path)?;
-        let len = file.metadata()?.len();
-        let mut source = Self {
-            file,
-            len,
-            pos: 0,
-            patches: Vec::new(),
-        };
-        let mut head = [0u8; 12];
-        if source.file.read_exact(&mut head).is_ok()
-            && &head[0..4] == b"RF64"
-            && &head[8..12] == b"WAVE"
-        {
-            source.patch(0, b"RIFF");
-            source.patch(4, &u32::MAX.to_le_bytes());
-            let mut data_size: Option<u64> = None;
-            let mut at = 12u64;
-            // A handful of chunks precede `data`; never walk a broken file forever.
-            for _ in 0..64 {
-                let mut chunk = [0u8; 8];
-                source.file.seek(SeekFrom::Start(at))?;
-                if source.file.read_exact(&mut chunk).is_err() {
-                    break;
+/// The next decoded chunk of `file`: a damaged packet is skipped (mkff keeps
+/// positions, the hole decodes as silence) and the file plays on; a run of
+/// failures is the end of a truncated file, or an error.
+fn next_chunk(file: &mut AudioFile, path: &Path) -> Result<Option<AudioBuffer>, String> {
+    let mut failures = 0;
+    loop {
+        match file.next_chunk() {
+            Ok(chunk) => return Ok(chunk),
+            Err(error) => {
+                failures += 1;
+                if failures >= MAX_CONSECUTIVE_DECODE_FAILURES {
+                    return match error {
+                        mkff_audio::Error::EndOfData => Ok(None),
+                        error => Err(format!("{}: {error}", path.display())),
+                    };
                 }
-                let size = u64::from(u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]));
-                match &chunk[0..4] {
-                    b"ds64" => {
-                        let mut sizes = [0u8; 16];
-                        source.file.read_exact(&mut sizes)?;
-                        data_size = Some(u64::from_le_bytes(sizes[8..16].try_into().unwrap()));
-                        source.patch(at, b"JUNK");
-                    }
-                    b"data" => {
-                        let real = if size == u64::from(u32::MAX) {
-                            data_size.unwrap_or(size)
-                        } else {
-                            size
-                        };
-                        let shown = real.min(u64::from(u32::MAX)) as u32;
-                        source.patch(at + 4, &shown.to_le_bytes());
-                        break;
-                    }
-                    _ => {}
-                }
-                at += 8 + size + (size & 1);
             }
         }
-        source.file.seek(SeekFrom::Start(0))?;
-        Ok(source)
     }
-
-    fn flac(path: &Path) -> std::io::Result<Self> {
-        use std::io::{Seek, SeekFrom};
-        let mut file = std::fs::File::open(path)?;
-        let len = file.metadata()?.len();
-        // Shared with Studio's import path (#388).
-        let min_block = sphere_encoder::flac_header::legacy_min_block_size_fix(&mut file);
-        file.seek(SeekFrom::Start(0))?;
-        let mut source = Self {
-            file,
-            len,
-            pos: 0,
-            patches: Vec::new(),
-        };
-        if let Some(fix) = min_block {
-            source.patch(Self::MIN_BLOCK_AT, &fix.to_be_bytes());
-        }
-        Ok(source)
-    }
-}
-
-impl std::io::Read for PatchedFile {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.file.read(buf)?;
-        for &(at, byte) in &self.patches {
-            if (self.pos..self.pos + n as u64).contains(&at) {
-                buf[(at - self.pos) as usize] = byte;
-            }
-        }
-        self.pos += n as u64;
-        Ok(n)
-    }
-}
-
-impl std::io::Seek for PatchedFile {
-    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
-        self.pos = self.file.seek(to)?;
-        Ok(self.pos)
-    }
-}
-
-impl symphonia::core::io::MediaSource for PatchedFile {
-    fn is_seekable(&self) -> bool {
-        true
-    }
-
-    fn byte_len(&self) -> Option<u64> {
-        Some(self.len)
-    }
-}
-
-fn open_format(path: &Path) -> Result<(Box<dyn FormatReader>, u32), String> {
-    let failed = |error: std::io::Error| format!("{}: {error}", path.display());
-    let flac = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("flac"));
-    let source: Box<dyn symphonia::core::io::MediaSource> = if flac {
-        Box::new(PatchedFile::flac(path).map_err(failed)?)
-    } else {
-        Box::new(PatchedFile::wav(path).map_err(failed)?)
-    };
-    let stream = MediaSourceStream::new(source, Default::default());
-    let mut hint = Hint::new();
-    if let Some(extension) = path.extension().and_then(|e| e.to_str()) {
-        hint.with_extension(extension);
-    }
-    let probed = symphonia::default::get_probe()
-        .format(
-            &hint,
-            stream,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
-        )
-        .map_err(|error| format!("{}: {error}", path.display()))?;
-    let format = probed.format;
-    let track = format
-        .tracks()
-        .iter()
-        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
-        .ok_or_else(|| format!("{}: no audio in the file", path.display()))?
-        .id;
-    Ok((format, track))
 }
 
 /// A file's channels, rate and length, from its header (counted by reading
 /// it through when the header does not say).
 pub fn probe_file(path: &Path) -> Result<TakeFile, String> {
-    let (mut format, track_id) = open_format(path)?;
-    let params = format
-        .tracks()
-        .iter()
-        .find(|t| t.id == track_id)
-        .map(|t| t.codec_params.clone())
-        .ok_or_else(|| format!("{}: no audio in the file", path.display()))?;
-    let rate = params
-        .sample_rate
-        .ok_or_else(|| format!("{}: no sample rate in the header", path.display()))?;
-    let channels = params.channels.map(|c| c.count()).unwrap_or(0);
+    let mut file = open_file(path)?;
+    let rate = file.sample_rate();
+    if rate == 0 {
+        return Err(format!("{}: no sample rate in the header", path.display()));
+    }
+    let channels = file.channels();
     if channels == 0 {
         return Err(format!("{}: no channels in the header", path.display()));
     }
-    let frames = match params.n_frames {
+    let frames = match file.duration() {
         Some(frames) => frames,
         None => {
             let mut frames = 0u64;
-            loop {
-                match format.next_packet() {
-                    Ok(packet) if packet.track_id() == track_id => frames += packet.dur,
-                    Ok(_) => {}
-                    Err(SymphoniaError::IoError(error))
-                        if error.kind() == std::io::ErrorKind::UnexpectedEof =>
-                    {
-                        break;
-                    }
-                    Err(error) => return Err(format!("{}: {error}", path.display())),
-                }
+            while let Some(chunk) = next_chunk(&mut file, path)? {
+                frames += chunk.frames() as u64;
             }
             frames
         }
@@ -653,84 +501,46 @@ impl PlayerCell {
 /// One file being decoded. Reader thread (opened on the control thread).
 struct TrackReader {
     path: PathBuf,
-    format: Box<dyn FormatReader>,
-    decoder: Box<dyn Decoder>,
-    track_id: u32,
+    file: AudioFile,
     /// The file's length, frames.
     frames: u64,
     /// The ring's channels (1 or 2).
     channels: usize,
-    buffer: Option<SampleBuffer<f32>>,
     /// Decoded, not yet handed out: interleaved at `channels`.
     pending: Vec<f32>,
     pending_at: usize,
-    /// Frames still to drop after a seek that landed early.
-    discard: u64,
     eof: bool,
 }
 
 impl TrackReader {
     fn open(file: &TakeFile) -> Result<Self, String> {
-        let (format, track_id) = open_format(&file.path)?;
-        let params = format
-            .tracks()
-            .iter()
-            .find(|t| t.id == track_id)
-            .map(|t| t.codec_params.clone())
-            .ok_or_else(|| format!("{}: no audio in the file", file.path.display()))?;
-        let decoder = symphonia::default::get_codecs()
-            .make(&params, &DecoderOptions::default())
-            .map_err(|error| format!("{}: {error}", file.path.display()))?;
         Ok(Self {
             path: file.path.clone(),
-            format,
-            decoder,
-            track_id,
+            file: open_file(&file.path)?,
             frames: file.frames,
             channels: if file.channels == 1 { 1 } else { 2 },
-            buffer: None,
             pending: Vec::with_capacity(CHUNK_FRAMES * 2),
             pending_at: 0,
-            discard: 0,
             eof: false,
         })
     }
 
-    /// Go to `frame` (past the end: silence from now on).
+    /// Go to `frame` (past the end: silence from now on). mkff seeks
+    /// sample-exactly, so nothing has to be dropped after it.
     fn seek(&mut self, frame: u64) -> Result<(), String> {
         self.pending.clear();
         self.pending_at = 0;
-        self.discard = 0;
         self.eof = false;
         if frame >= self.frames {
             self.eof = true;
             return Ok(());
         }
-        let to = SeekTo::TimeStamp {
-            ts: frame,
-            track_id: self.track_id,
-        };
-        match self.format.seek(SeekMode::Accurate, to) {
-            Ok(seeked) => {
-                self.decoder.reset();
-                self.discard = seeked.required_ts.saturating_sub(seeked.actual_ts);
-                Ok(())
-            }
-            Err(_) => {
-                // Read it through from the start instead.
-                let file = TakeFile {
-                    name: String::new(),
-                    path: self.path.clone(),
-                    channels: self.channels as u16,
-                    rate: 0,
-                    seconds: 0.0,
-                    frames: self.frames,
-                };
-                *self = Self::open(&file)?;
-                self.discard = frame;
-                Ok(())
-            }
+        if let Err(error) = self.file.seek(frame) {
+            // Silence rather than audio from the wrong place.
+            self.eof = true;
+            return Err(format!("{}: {error}", self.path.display()));
         }
+        Ok(())
     }
 
     /// Fill `out` (interleaved at the ring's channels) with the next frames;
@@ -759,55 +569,22 @@ impl TrackReader {
         Ok(())
     }
 
-    /// Decode one packet into `pending`.
+    /// Decode one chunk into `pending`.
     fn decode_next(&mut self) -> Result<(), String> {
         self.pending.clear();
         self.pending_at = 0;
-        let packet = match self.format.next_packet() {
-            Ok(packet) => packet,
-            Err(SymphoniaError::IoError(error))
-                if error.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
-                self.eof = true;
-                return Ok(());
-            }
-            Err(SymphoniaError::ResetRequired) => {
-                self.decoder.reset();
-                return Ok(());
-            }
-            Err(error) => return Err(format!("{}: {error}", self.path.display())),
-        };
-        if packet.track_id() != self.track_id {
+        let Some(chunk) = next_chunk(&mut self.file, &self.path)? else {
+            self.eof = true;
             return Ok(());
-        }
-        let decoded = match self.decoder.decode(&packet) {
-            Ok(decoded) => decoded,
-            // A damaged packet: skipped, the file plays on.
-            Err(SymphoniaError::DecodeError(_)) => return Ok(()),
-            Err(error) => return Err(format!("{}: {error}", self.path.display())),
         };
-        let spec = *decoded.spec();
-        let channels = spec.channels.count().max(1);
-        let frames = decoded.frames();
-        if self
-            .buffer
-            .as_ref()
-            .is_none_or(|b| b.capacity() < frames * channels)
-        {
-            self.buffer = Some(SampleBuffer::new(decoded.capacity() as u64, spec));
-        }
-        let buffer = self.buffer.as_mut().expect("made above");
-        buffer.copy_interleaved_ref(decoded);
-        let skip = usize::try_from(self.discard)
-            .unwrap_or(usize::MAX)
-            .min(frames);
-        self.discard -= skip as u64;
-        for frame in buffer.samples().chunks_exact(channels).skip(skip) {
-            if self.channels == 1 {
-                self.pending.push(frame[0]);
-            } else {
-                self.pending.push(frame[0]);
-                self.pending.push(frame.get(1).copied().unwrap_or(frame[0]));
+        let left = chunk.channels.first().map_or(&[][..], Vec::as_slice);
+        let right = chunk.channels.get(1).map_or(left, Vec::as_slice);
+        if self.channels == 1 {
+            self.pending.extend_from_slice(left);
+        } else {
+            for (&l, &r) in left.iter().zip(right) {
+                self.pending.push(l);
+                self.pending.push(r);
             }
         }
         Ok(())
@@ -1258,9 +1035,8 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
-    /// symphonia reads no RF64, so a take that outgrew 4 GiB would refuse to
-    /// load at all. Presented as RIFF it opens with its real length and plays
-    /// its samples.
+    /// A take that outgrew 4 GiB is RF64: it opens with its real length,
+    /// plays its samples through the reader, and seeks to the exact frame.
     #[test]
     fn an_rf64_take_opens_with_its_length_and_samples() {
         let dir = std::env::temp_dir().join(format!("livestage-rf64-{}", std::process::id()));
@@ -1272,22 +1048,76 @@ mod tests {
         let file = probe_file(&path).unwrap();
         assert_eq!((file.channels, file.rate, file.frames), (2, 48_000, 1000));
 
-        let (mut format, track) = open_format(&path).unwrap();
-        let params = format.tracks()[0].codec_params.clone();
-        let mut decoder = symphonia::default::get_codecs()
-            .make(&params, &DecoderOptions::default())
-            .unwrap();
-        let mut decoded = Vec::new();
-        while let Ok(packet) = format.next_packet() {
-            if packet.track_id() != track {
-                continue;
-            }
-            let audio = decoder.decode(&packet).unwrap();
-            let mut buffer = SampleBuffer::<f32>::new(audio.capacity() as u64, *audio.spec());
-            buffer.copy_interleaved_ref(audio);
-            decoded.extend_from_slice(buffer.samples());
-        }
+        let mut reader = TrackReader::open(&file).unwrap();
+        let mut decoded = vec![0.0f32; samples.len()];
+        reader.read(&mut decoded).unwrap();
         assert_eq!(decoded, samples);
+
+        reader.seek(617).unwrap();
+        let mut frame = [0.0f32; 4];
+        reader.read(&mut frame).unwrap();
+        assert_eq!(frame[..], samples[617 * 2..619 * 2]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #388: a FLAC take recorded before #352 — STREAMINFO's minimum block
+    /// size is the last block's length — probes with its length, plays and
+    /// seeks like the same take with the current header, read as it is.
+    #[test]
+    fn a_pre_352_flac_take_plays_like_a_current_one() {
+        use sphere_encoder::{
+            AudioEncodeOptions, AudioEncodeSpec, AudioFileFormat, AudioSampleFormat, create_encoder,
+        };
+        let dir = std::env::temp_dir().join(format!("livestage-pre352-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (current, old) = (dir.join("Keys.flac"), dir.join("Keys old.flac"));
+        let frames = 65_541usize;
+        let mut encoder = create_encoder(
+            &current,
+            AudioEncodeSpec {
+                sample_rate: 48_000,
+                channels: 2,
+                sample_format: AudioSampleFormat::I16,
+            },
+            AudioEncodeOptions {
+                format: AudioFileFormat::Flac,
+                ..AudioEncodeOptions::default()
+            },
+        )
+        .unwrap();
+        let samples: Vec<f32> = (0..frames * 2)
+            .map(|i| ((i / 2) as f32 * 0.01 + (i % 2) as f32).sin() * 0.5)
+            .collect();
+        encoder.write_interleaved_f32(&samples).unwrap();
+        encoder.finalize().unwrap();
+        let mut bytes = std::fs::read(&current).unwrap();
+        bytes[8..10].copy_from_slice(&((frames % 4_096) as u16).to_be_bytes());
+        std::fs::write(&old, &bytes).unwrap();
+        assert!(
+            sphere_encoder::flac_header::legacy_min_block_size_fix(
+                &mut std::fs::File::open(&old).unwrap()
+            )
+            .is_some(),
+            "the fixture is not a pre-#352 header"
+        );
+
+        let play = |path: &Path, from: u64| {
+            let file = probe_file(path).unwrap();
+            assert_eq!((file.channels, file.frames), (2, frames as u64));
+            let mut reader = TrackReader::open(&file).unwrap();
+            reader.seek(from).unwrap();
+            let mut out = vec![0.0f32; (frames - from as usize) * 2];
+            reader.read(&mut out).unwrap();
+            out
+        };
+        for from in [0u64, 4_096 * 9 + 123] {
+            let want = play(&current, from);
+            assert_eq!(want.len(), (frames - from as usize) * 2);
+            assert!(play(&old, from) == want, "from {from}");
+            for (got, want) in want.iter().zip(&samples[from as usize * 2..]) {
+                assert!((got - want).abs() < 1e-4, "from {from}: {got} vs {want}");
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -14,9 +14,9 @@
 //! | Vorbis | ✓ | — | `mkff-vorbis` |
 //! | PCM | ✓ | ✓ | `mkff-audio-format` |
 //!
-//! Containers (`mkff-audio-format`): WAV / RF64 / AIFF, raw MPEG audio (ID3, Xing / LAME
-//! gapless), ADTS, FLAC, Ogg (Vorbis / Opus / FLAC), MP4 / M4A / MOV audio tracks (fragmented
-//! too); writers for all of them.
+//! Containers (`mkff-audio-format`): WAV / RF64 / AIFF, RAUF, headerless RAW PCM, raw MPEG audio
+//! (ID3, Xing / LAME gapless), ADTS, FLAC, Ogg (Vorbis / Opus / FLAC), MP4 / M4A / MOV audio
+//! tracks (fragmented too); writers for WAV, MP3, ADTS, FLAC, Ogg and MP4 / M4A.
 //!
 //! - [`AudioFile`]: open a file, stream it, seek sample-exactly, read any range at any rate.
 //! - [`AudioWriter`]: encode into `.mp3`, `.m4a`, `.aac`, `.flac` or `.wav`.
@@ -37,6 +37,7 @@ pub use mkff_audio_core::{
     resample, AudioBuffer, CodecId, Decoder, Encoder, Error, Packet, Result,
 };
 pub use mkff_audio_format as format;
+pub use mkff_audio_format::{read_rauf_info, RaufInfo, RawPcmSpec, RAW_PCM_EXTENSIONS};
 pub use writer::{AudioWriter, Container};
 
 /// File extensions [`AudioFile::open`] reads.

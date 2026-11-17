@@ -160,6 +160,42 @@ fn mulaw_to_linear(u: u8) -> i16 {
     (if u & 0x80 != 0 { 0x84 - t } else { t - 0x84 }) as i16
 }
 
+/// 16-bit linear to G.711 A-law.
+fn linear_to_alaw(pcm: i16) -> u8 {
+    let mut v = i32::from(pcm);
+    let mask = if v >= 0 {
+        0xD5u8
+    } else {
+        v = (-v - 1).max(0);
+        0x55u8
+    };
+    let seg = if v < 0x100 {
+        0
+    } else {
+        (24u32.saturating_sub((v as u32).leading_zeros())).min(7) as u8
+    };
+    let mant = if seg < 2 {
+        ((v >> 4) & 0x0F) as u8
+    } else {
+        ((v >> (seg + 3)) & 0x0F) as u8
+    };
+    ((seg << 4) | mant) ^ mask
+}
+
+/// 16-bit linear to G.711 µ-law.
+fn linear_to_mulaw(pcm: i16) -> u8 {
+    let v = i32::from(pcm);
+    let (sign, mag) = if v < 0 {
+        (0x80u8, (-v).min(32635))
+    } else {
+        (0u8, v.min(32635))
+    };
+    let t = (mag + 0x84) as u32;
+    let seg = (24u32.saturating_sub(t.leading_zeros())).min(7) as u8;
+    let mant = ((t >> (seg + 3)) & 0x0F) as u8;
+    !(sign | (seg << 4) | mant)
+}
+
 #[inline]
 fn sample(b: &[u8], fmt: &PcmFormat) -> f32 {
     match fmt.coding {
@@ -218,10 +254,10 @@ pub fn decode_pcm(data: &[u8], fmt: PcmFormat, channels: usize) -> AudioBuffer {
     out
 }
 
-/// Encode planar f32 samples as interleaved PCM in `fmt` (integers are rounded and clipped;
-/// G.711 is not supported for encoding and gives an error).
+/// Encode planar f32 samples as interleaved PCM in `fmt` (integers and G.711 are rounded and
+/// clipped).
 pub fn encode_pcm(buf: &AudioBuffer, fmt: PcmFormat) -> Result<Vec<u8>> {
-    if !fmt.is_valid() || fmt.coding != PcmCoding::Linear {
+    if !fmt.is_valid() {
         return Err(Error::InvalidArgument(format!(
             "cannot encode PCM as {}",
             fmt.label()
@@ -240,6 +276,21 @@ pub fn encode_pcm(buf: &AudioBuffer, fmt: PcmFormat) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn push_sample(out: &mut Vec<u8>, s: f32, fmt: &PcmFormat) {
+    match fmt.coding {
+        PcmCoding::ALaw => {
+            let s = if s.is_nan() { 0.0 } else { f64::from(s) };
+            let pcm = (s * 32768.0).round().clamp(-32768.0, 32767.0) as i16;
+            out.push(linear_to_alaw(pcm));
+            return;
+        }
+        PcmCoding::MuLaw => {
+            let s = if s.is_nan() { 0.0 } else { f64::from(s) };
+            let pcm = (s * 32768.0).round().clamp(-32768.0, 32767.0) as i16;
+            out.push(linear_to_mulaw(pcm));
+            return;
+        }
+        PcmCoding::Linear => {}
+    }
     if fmt.float {
         if fmt.bits == 32 {
             out.extend_from_slice(&if fmt.big_endian {

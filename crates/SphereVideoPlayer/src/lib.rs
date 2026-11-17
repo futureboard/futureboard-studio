@@ -5,55 +5,33 @@
 //! next to the audio. It is not a playback engine — it produces no audio, owns
 //! no clock, and never runs on a realtime thread.
 //!
-//! No FFmpeg / libav dependency exists on any platform. Each backend links the
-//! media framework its platform already ships:
+//! Decoding is MKFF's (`crates/mkff`), with no FFmpeg / libav and no OS media
+//! framework:
 //!
-//! | Platform | Backend                                     |
-//! |----------|---------------------------------------------|
-//! | Windows  | Media Foundation Source Reader              |
-//! | macOS    | AVFoundation (`AVAssetImageGenerator`)      |
-//! | Linux    | none yet — VAAPI is the intended backend    |
+//! | Path     | Streams                                   | How                                          |
+//! |----------|-------------------------------------------|----------------------------------------------|
+//! | GPU      | H.264 / HEVC in MP4 / MOV                 | MKFF MP4 demux → `mkff-mediakit` accelerant (D3D11 / DXVA on Windows) |
+//! | Software | everything `mkff-codecs` opens            | pure-Rust demux + decode, every platform     |
 //!
-//! Linux is deliberately unimplemented rather than wired to GStreamer/FFmpeg,
-//! whose licensing this project does not want to take on. VAAPI (`libva`) is
-//! the intended replacement, but unlike the other two it is a decode-only API:
-//! it has no demuxer and no bitstream parser, so a VAAPI backend also needs a
-//! permissively licensed container demuxer and slice-level H.264/HEVC parsing
-//! (the `cros-libva`/`cros-codecs` stack, BSD-3-Clause, covers the latter). It
-//! also has no software fallback — a machine with no working VAAPI driver
-//! decodes nothing.
-//!
-//! Until that lands, Linux reports [`VideoError::UnsupportedPlatform`] and the
-//! UI disables the player honestly instead of showing a fake frame. Any other
-//! platform does the same.
+//! [`VideoDecoder::open`] tries the GPU path first and falls back to software
+//! when the file, codec or machine has no accelerant for it; a GPU decoder that
+//! fails mid-stream is replaced by the software path for the rest of the
+//! session. [`VideoInfo::decoder`] says which one is running.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod hardware;
 mod preview;
+mod software;
+
 pub use preview::{PreviewStatus, VideoPreview, VideoPreviewFrame};
 
-#[cfg(windows)]
-mod windows_d3d;
-#[cfg(windows)]
-mod windows_mf;
-
-#[cfg(target_os = "macos")]
-mod macos_avf;
-
-/// `true` when this build has a real decode backend compiled in.
-macro_rules! has_backend {
-    () => {
-        cfg!(any(windows, target_os = "macos"))
-    };
-}
-
-/// Container extensions the shipped backend is expected to open. Used for file
-/// dialog filters and drag-and-drop acceptance; the decoder is still the
-/// authority and may reject a file whose codec the OS cannot decode.
-pub const SUPPORTED_VIDEO_EXTENSIONS: &[&str] = &[
-    "mp4", "m4v", "mov", "avi", "wmv", "asf", "mkv", "webm", "mpg", "mpeg", "ts", "m2ts",
-];
+/// Container extensions the decoder is expected to open (MKFF's video
+/// containers). Used for file dialog filters and drag-and-drop acceptance; the
+/// decoder is still the authority and may reject a file whose codec MKFF does
+/// not decode.
+pub const SUPPORTED_VIDEO_EXTENSIONS: &[&str] = mkff_codecs::filmcraft::media::VIDEO_EXTENSIONS;
 
 /// `true` when `path`'s extension is one this crate advertises support for.
 pub fn is_supported_video_path(path: &Path) -> bool {
@@ -63,26 +41,16 @@ pub fn is_supported_video_path(path: &Path) -> bool {
         .is_some_and(|e| SUPPORTED_VIDEO_EXTENSIONS.contains(&e.as_str()))
 }
 
-/// Human-readable name of the compiled decode backend, for diagnostics and the
-/// player window's status line.
+/// Human-readable name of the decode framework, for diagnostics and the player
+/// window's status line. Which path a file uses is [`VideoInfo::decoder`].
 pub fn backend_name() -> &'static str {
-    #[cfg(windows)]
-    {
-        "media-foundation"
-    }
-    #[cfg(target_os = "macos")]
-    {
-        "avfoundation"
-    }
-    #[cfg(not(any(windows, target_os = "macos")))]
-    {
-        "unavailable"
-    }
+    "mkff"
 }
 
-/// `true` when this build has a real decode backend.
+/// `true` when this build has a real decode backend. MKFF's software path
+/// runs on every platform.
 pub fn backend_available() -> bool {
-    has_backend!()
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,7 +63,7 @@ pub enum VideoError {
     NoVideoStream,
     /// The requested position is past the end of the media.
     EndOfStream,
-    /// Backend-specific failure (HRESULT text, lock failure, …).
+    /// Decoder failure (unsupported codec, corrupt data, GPU error, …).
     Backend(String),
 }
 
@@ -124,6 +92,8 @@ pub struct VideoInfo {
     pub duration_seconds: f64,
     /// Nominal frame rate. `0.0` when unknown.
     pub frame_rate: f64,
+    /// Decode path in use: `"GPU"` or `"software"`.
+    pub decoder: &'static str,
 }
 
 impl VideoInfo {
@@ -158,6 +128,11 @@ impl std::fmt::Debug for VideoFrame {
     }
 }
 
+enum Backend {
+    Hardware(hardware::HardwareDecoder),
+    Software(software::SoftwareDecoder),
+}
+
 /// A single-stream, single-threaded video frame reader.
 ///
 /// Not `Sync`. Own it from one worker thread (see [`VideoPreview`]) — never
@@ -165,33 +140,33 @@ impl std::fmt::Debug for VideoFrame {
 /// milliseconds on a long GOP.
 pub struct VideoDecoder {
     path: PathBuf,
-    #[cfg(any(windows, target_os = "macos"))]
-    inner: PlatformDecoder,
+    backend: Backend,
 }
 
-#[cfg(windows)]
-type PlatformDecoder = windows_mf::MediaFoundationDecoder;
-#[cfg(target_os = "macos")]
-type PlatformDecoder = macos_avf::AvFoundationDecoder;
-
 impl VideoDecoder {
-    /// Opens `path` and configures the first video stream for BGRA output.
+    /// Opens `path`'s first video stream: on the GPU when an accelerant takes
+    /// it, otherwise in software.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, VideoError> {
         let path = path.as_ref().to_path_buf();
         if !path.exists() {
             return Err(VideoError::NotFound(path));
         }
-
-        #[cfg(any(windows, target_os = "macos"))]
-        {
-            let inner = PlatformDecoder::open(&path)?;
-            Ok(Self { path, inner })
-        }
-        #[cfg(not(any(windows, target_os = "macos")))]
-        {
-            let _ = path;
-            Err(VideoError::UnsupportedPlatform)
-        }
+        let backend = match hardware::HardwareDecoder::open(&path) {
+            Ok(decoder) => Backend::Hardware(decoder),
+            Err(gpu_err) => match software::SoftwareDecoder::open(&path) {
+                Ok(decoder) => Backend::Software(decoder),
+                // The software path covers every container, so its error is
+                // the one that explains the file; the GPU reason goes to logs.
+                Err(sw_err) => {
+                    eprintln!(
+                        "[video-mkff] GPU path declined {}: {gpu_err}",
+                        path.display()
+                    );
+                    return Err(sw_err);
+                }
+            },
+        };
+        Ok(Self { path, backend })
     }
 
     pub fn path(&self) -> &Path {
@@ -199,33 +174,41 @@ impl VideoDecoder {
     }
 
     pub fn info(&self) -> VideoInfo {
-        #[cfg(any(windows, target_os = "macos"))]
-        {
-            self.inner.info()
-        }
-        #[cfg(not(any(windows, target_os = "macos")))]
-        {
-            unreachable!("VideoDecoder cannot be constructed without a backend")
+        match &self.backend {
+            Backend::Hardware(d) => d.info(),
+            Backend::Software(d) => d.info(),
         }
     }
 
     /// Decodes the frame presented at (or immediately before) `seconds`.
     ///
-    /// Seeks only when the target is behind the reader or far ahead of it, so
-    /// playback-rate stepping reads forward instead of re-seeking every frame.
+    /// Seeks only when the target is behind the reader or past the next
+    /// keyframe, so playback-rate stepping reads forward instead of re-seeking
+    /// every frame.
     ///
     /// Returns the frame behind an `Arc`: a decoded frame is a full
-    /// uncompressed image, and the backends hand the same one out repeatedly
-    /// while the playhead stays inside it.
+    /// uncompressed image, and the same one is handed out repeatedly while the
+    /// playhead stays inside it.
     pub fn frame_at(&mut self, seconds: f64) -> Result<Arc<VideoFrame>, VideoError> {
-        #[cfg(any(windows, target_os = "macos"))]
-        {
-            self.inner.frame_at(seconds.max(0.0))
-        }
-        #[cfg(not(any(windows, target_os = "macos")))]
-        {
-            let _ = seconds;
-            Err(VideoError::UnsupportedPlatform)
+        let seconds = seconds.max(0.0);
+        let result = match &mut self.backend {
+            Backend::Software(d) => return d.frame_at(seconds),
+            Backend::Hardware(d) => d.frame_at(seconds),
+        };
+        match result {
+            Err(VideoError::Backend(message)) => {
+                // The GPU decoder broke (device lost, driver rejects the
+                // stream); continue in software rather than going dark.
+                eprintln!(
+                    "[video-mkff] GPU decode failed for {}: {message}; switching to software",
+                    self.path.display()
+                );
+                let mut software = software::SoftwareDecoder::open(&self.path)?;
+                let frame = software.frame_at(seconds);
+                self.backend = Backend::Software(software);
+                frame
+            }
+            other => other,
         }
     }
 }
@@ -243,6 +226,7 @@ mod tests {
     fn extension_filter_is_case_insensitive() {
         assert!(is_supported_video_path(Path::new("C:/clips/Take 1.MP4")));
         assert!(is_supported_video_path(Path::new("/tmp/ref.mov")));
+        assert!(is_supported_video_path(Path::new("/tmp/ref.mkv")));
         assert!(!is_supported_video_path(Path::new("/tmp/mix.wav")));
         assert!(!is_supported_video_path(Path::new("/tmp/noextension")));
     }
@@ -267,6 +251,7 @@ mod tests {
             height: 0,
             duration_seconds: 0.0,
             frame_rate: 0.0,
+            decoder: "software",
         };
         assert!((unknown.aspect_ratio() - 16.0 / 9.0).abs() < 1.0e-6);
 
@@ -275,6 +260,7 @@ mod tests {
             height: 1080,
             duration_seconds: 12.0,
             frame_rate: 30.0,
+            decoder: "GPU",
         };
         assert!((hd.aspect_ratio() - 16.0 / 9.0).abs() < 1.0e-6);
     }

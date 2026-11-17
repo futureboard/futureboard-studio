@@ -89,6 +89,25 @@ impl AudioFile {
         Self::from_reader(Box::new(std::io::Cursor::new(bytes)), name_hint, 0)
     }
 
+    /// Open a headerless PCM file with an explicit [`RawPcmSpec`](mkff_audio_format::RawPcmSpec).
+    pub fn open_raw_pcm(
+        path: impl AsRef<Path>,
+        spec: mkff_audio_format::RawPcmSpec,
+    ) -> Result<Self> {
+        let demux = mkff_audio_format::open_raw_pcm_path(path, spec)?;
+        Self::from_demuxer(demux, 0)
+    }
+
+    /// Open headerless PCM from any reader with an explicit
+    /// [`RawPcmSpec`](mkff_audio_format::RawPcmSpec).
+    pub fn from_raw_pcm_reader(
+        reader: Box<dyn ReadSeek>,
+        spec: mkff_audio_format::RawPcmSpec,
+    ) -> Result<Self> {
+        let demux = mkff_audio_format::open_raw_pcm(reader, spec)?;
+        Self::from_demuxer(demux, 0)
+    }
+
     /// Decode track `index` of an opened demuxer.
     pub fn from_demuxer(demux: Box<dyn Demuxer>, index: usize) -> Result<Self> {
         let track = demux

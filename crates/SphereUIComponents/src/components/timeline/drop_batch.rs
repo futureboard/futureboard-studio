@@ -152,6 +152,8 @@ pub(crate) enum DroppedFile {
         parsed: Result<Vec<ImportedMidiTrack>, String>,
     },
     Audio(PathBuf),
+    /// A headerless PCM file: lands through the Import Raw PCM dialog.
+    RawPcm(PathBuf),
     Video(PathBuf),
 }
 

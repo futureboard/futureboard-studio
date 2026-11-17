@@ -236,6 +236,13 @@ pub(crate) struct ExternalWindows {
     /// controller lanes / SysEx.
     pub import_midi:
         Option<gpui::WindowHandle<crate::components::midi_import_dialog::MidiImportDialog>>,
+    /// Import Raw PCM dialog, opened by a dropped `.raw` / `.pcm` file.
+    pub import_raw_pcm:
+        Option<gpui::WindowHandle<crate::components::raw_pcm_import_dialog::RawPcmImportDialog>>,
+    /// Raw PCM files dropped while that dialog was open, asked about in turn.
+    pub queued_raw_pcm_imports: std::collections::VecDeque<
+        crate::components::timeline::timeline::TimelineRawPcmImportPrompt,
+    >,
     /// Indeterminate progress while a plug-in loads in the host process.
     pub plugin_loading:
         Option<gpui::WindowHandle<crate::components::progress_dialog::ProgressDialogWindow>>,

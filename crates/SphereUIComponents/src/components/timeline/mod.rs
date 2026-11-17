@@ -21,6 +21,7 @@ pub mod midi_clip;
 pub mod midi_export;
 pub mod midi_import;
 pub mod playhead;
+pub mod raw_pcm_import;
 pub mod region_track;
 pub mod render;
 pub mod song_text_track;

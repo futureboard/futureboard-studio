@@ -89,18 +89,11 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use std::fs::File;
-use std::io;
 use std::path::Path;
-use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::{Decoder, DecoderOptions};
-use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo};
-use symphonia::core::io::MediaSourceStream;
-use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
 
-use crate::audio_file::probe_audio_file;
+use mkff_audio::AudioFile;
+
+use crate::audio_file::{open_mkff, probe_audio_file, MAX_CONSECUTIVE_DECODE_FAILURES};
 
 /// Ring capacity in stereo frames. 262144 frames ≈ 5.46 s @ 48 kHz and uses
 /// ~2 MB (`capacity * 2 * 4` bytes) regardless of how long the source file is.
@@ -1052,17 +1045,18 @@ impl Drop for StreamingSource {
     }
 }
 
-/// The decoder half of a stream: a symphonia reader and decoder, plus the
-/// absolute frame index the next decoded packet starts at.
+/// The decoder half of a stream: an mkff-audio file (demuxer + decoder,
+/// sample-exact seeking), plus the absolute frame index the next decoded
+/// chunk starts at.
 struct StreamDecoder {
-    format: Box<dyn FormatReader>,
-    decoder: Box<dyn Decoder>,
-    track_id: u32,
-    channels: usize,
-    sample_buf: Option<SampleBuffer<f32>>,
-    /// Frames in `sample_buf` from the last [`Self::decode_next`].
+    file: AudioFile,
+    /// Planar samples of the last [`Self::decode_next`] chunk.
+    chunk: Vec<Vec<f32>>,
+    /// Frames in `chunk`.
     decoded: usize,
     next_frame: u64,
+    /// Failed chunks in a row (see [`Self::decode_next`]).
+    failures: u32,
 }
 
 /// What one [`StreamDecoder::decode_next`] call produced.
@@ -1076,120 +1070,66 @@ enum Packet {
 
 impl StreamDecoder {
     fn open(path: &str) -> Result<Self, String> {
-        // Through the same source as the probe, so a pre-#352 FLAC export
-        // streams with its STREAMINFO corrected too (#388).
-        let file = File::open(Path::new(path))
-            .and_then(crate::audio_file::symphonia_file_source)
-            .map_err(|e| format!("open failed: {e}"))?;
-        let mss = MediaSourceStream::new(file, Default::default());
-
-        let mut hint = Hint::new();
-        if let Some(ext) = Path::new(path).extension().and_then(|e| e.to_str()) {
-            hint.with_extension(ext);
-        }
-
-        let probed = symphonia::default::get_probe()
-            .format(
-                &hint,
-                mss,
-                &FormatOptions {
-                    enable_gapless: true,
-                    ..Default::default()
-                },
-                &MetadataOptions::default(),
-            )
-            .map_err(|e| format!("format probe failed: {e}"))?;
-
-        let format = probed.format;
-        let track = format
-            .tracks()
-            .iter()
-            .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
-            .ok_or_else(|| "no decodable audio track".to_string())?
-            .clone();
-        let decoder = symphonia::default::get_codecs()
-            .make(&track.codec_params, &DecoderOptions::default())
-            .map_err(|e| format!("decoder create failed: {e}"))?;
-
+        // Through the same open as the probe; a pre-#352 FLAC export (#388)
+        // needs no header correction with mkff.
+        let file = open_mkff(Path::new(path))?;
         Ok(Self {
-            format,
-            decoder,
-            track_id: track.id,
-            channels: track
-                .codec_params
-                .channels
-                .map(|c| c.count())
-                .unwrap_or(2)
-                .max(1),
-            sample_buf: None,
+            file,
+            chunk: Vec::new(),
             decoded: 0,
             next_frame: 0,
+            failures: 0,
         })
     }
 
-    /// Reposition so the next packet starts at or before `frame`.
+    /// Reposition so the next chunk starts exactly at `frame` (mkff seeks
+    /// sample-exactly; the pre-roll a codec needs is decoded and dropped
+    /// inside it).
     fn seek(&mut self, frame: u64) {
-        let seeked = self.format.seek(
-            SeekMode::Accurate,
-            SeekTo::TimeStamp {
-                ts: frame,
-                track_id: self.track_id,
-            },
-        );
-        self.decoder.reset();
-        self.next_frame = match seeked {
-            Ok(to) => to.actual_ts,
-            Err(_) => frame, // best-effort: some formats seek approximately
-        };
+        self.failures = 0;
+        // On failure mkff stays where it was or at `frame`; either way its
+        // position is where the next chunk starts.
+        let _ = self.file.seek(frame);
+        self.next_frame = self.file.position();
     }
 
     fn decode_next(&mut self) -> Result<Packet, String> {
-        let packet = match self.format.next_packet() {
-            Ok(p) => p,
-            Err(SymphoniaError::IoError(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                return Ok(Packet::Eof);
-            }
-            Err(SymphoniaError::ResetRequired) => {
-                self.decoder.reset();
-                return Ok(Packet::Skipped);
-            }
-            Err(e) => return Err(format!("packet read error: {e}")),
-        };
-        if packet.track_id() != self.track_id {
-            return Ok(Packet::Skipped);
-        }
-        match self.decoder.decode(&packet) {
-            Ok(audio_ref) => {
-                let buf = self.sample_buf.get_or_insert_with(|| {
-                    SampleBuffer::<f32>::new(audio_ref.capacity() as u64, *audio_ref.spec())
-                });
-                buf.copy_interleaved_ref(audio_ref);
-                self.decoded = buf.samples().len() / self.channels;
+        match self.file.next_chunk() {
+            Ok(Some(chunk)) => {
+                self.failures = 0;
+                self.decoded = chunk.frames();
+                self.chunk = chunk.channels;
                 let first = self.next_frame;
                 self.next_frame += self.decoded as u64;
                 GLOBAL_BLOCKS_DECODED.fetch_add(1, Ordering::Relaxed);
                 GLOBAL_FRAMES_DECODED.fetch_add(self.decoded as u64, Ordering::Relaxed);
                 Ok(Packet::Frames(first))
             }
-            Err(SymphoniaError::IoError(_)) | Err(SymphoniaError::DecodeError(_)) => {
-                Ok(Packet::Skipped)
+            Ok(None) => Ok(Packet::Eof),
+            // A damaged packet: skipped, the stream plays on (mkff keeps
+            // positions; the hole decodes as silence). A run of failures is
+            // the end of a truncated file, or an error.
+            Err(error) => {
+                self.failures += 1;
+                if self.failures < MAX_CONSECUTIVE_DECODE_FAILURES {
+                    return Ok(Packet::Skipped);
+                }
+                self.failures = 0;
+                match error {
+                    mkff_audio::Error::EndOfData => Ok(Packet::Eof),
+                    error => Err(format!("decode error: {error}")),
+                }
             }
-            Err(e) => Err(format!("decode error: {e}")),
         }
     }
 
-    /// Stereo frame `i` of the last decoded packet (mono is duplicated).
+    /// Stereo frame `i` of the last decoded chunk (mono is duplicated).
     #[inline]
     fn frame(&self, i: usize) -> (f32, f32) {
-        let Some(buf) = &self.sample_buf else {
-            return (0.0, 0.0);
-        };
-        let samples = buf.samples();
-        let base = i * self.channels;
-        if self.channels == 1 {
-            (samples[base], samples[base])
-        } else {
-            (samples[base], samples[base + 1])
+        match self.chunk.as_slice() {
+            [] => (0.0, 0.0),
+            [mono] => (mono[i], mono[i]),
+            [left, right, ..] => (left[i], right[i]),
         }
     }
 }
