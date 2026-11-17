@@ -1,0 +1,70 @@
+mkff-opus
+=========
+
+This crate is a Rust implementation of the Opus decoder written for MKFF from RFC 6716
+(Definition of the Opus Audio Codec), RFC 8251 (Updates to the Opus Audio Codec) and RFC 7845
+(Ogg Encapsulation for the Opus Audio Codec).
+
+RFC 6716 includes the normative reference implementation of Opus as source code (Appendix A,
+"opus-rfc6716.tar.gz", SHA-1 86a927223e73d2476646a1b933fcd3fffb6ecc8c). Large parts of this
+crate are close ports of that reference code, with the RFC 8251 patches applied:
+
+- src/range.rs           ec_dec (celt/entdec.c, celt/entcode.c)
+- src/celt/rate.rs       celt/rate.c (bit allocation, pulse cache helpers)
+- src/celt/bands.rs      celt/bands.c, celt/vq.c (band decoding, PVQ, spreading, folding,
+                         anti-collapse); the PVQ codeword enumeration follows RFC 6716 §4.3.4.2
+- src/celt/mod.rs        celt/celt.c (decoder), celt/quant_bands.c, celt/laplace.c,
+                         celt/mdct.c (inverse MDCT structure)
+- src/celt/plc.rs        celt/pitch.c, celt/celt_lpc.c (loss concealment)
+- src/silk/mod.rs        silk/dec_API.c, decode_frame.c, decode_indices.c, decode_pulses.c,
+                         shell_coder.c, code_signs.c, decode_parameters.c, decode_pitch.c,
+                         gain_quant.c, NLSF_decode.c, NLSF_unpack.c, NLSF_stabilize.c,
+                         NLSF_VQ_weights_laroia.c, NLSF2A.c, LPC_inv_pred_gain.c,
+                         bwexpander*.c, LPC_analysis_filter.c, decode_core.c,
+                         stereo_decode_pred.c, stereo_MS_to_LR.c, decoder_set_fs.c, PLC.c,
+                         sum_sqr_shift.c, log2lin.c, Inlines.h, resampler.c,
+                         resampler_private_IIR_FIR.c, resampler_private_up2_HQ.c
+- src/stream.rs          src/opus_decoder.c (mode transitions, redundancy)
+- src/packet.rs          src/opus.c / opus_decoder.c packet parsing (RFC 6716 §3)
+- src/lib.rs             src/opus_multistream.c (stream / channel mapping)
+- src/celt/tables.rs,    tables extracted mechanically from celt/modes.c,
+  src/silk/tables.rs     celt/static_modes_float.h, celt/quant_bands.c and silk/tables_*.c,
+                         silk/pitch_est_tables.c, silk/table_LSF_cos.c, silk/resampler_rom.c
+
+That code is distributed under the following license:
+
+Copyright 1994-2011 IETF Trust, Xiph.Org, Skype Limited, Octasic,
+                    Jean-Marc Valin, Timothy B. Terriberry,
+                    CSIRO, Gregory Maxwell, Mark Borgerding,
+                    Erik de Castro Lopo. All rights reserved.
+
+This file is extracted from RFC6716. Please see that RFC for additional
+information.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+
+- Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+
+- Redistributions in binary form must reproduce the above copyright
+notice, this list of conditions and the following disclaimer in the
+documentation and/or other materials provided with the distribution.
+
+- Neither the name of Internet Society, IETF or IETF Trust, nor the
+names of specific contributors, may be used to endorse or promote
+products derived from this software without specific prior written
+permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER
+OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.

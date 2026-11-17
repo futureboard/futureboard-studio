@@ -1,0 +1,10 @@
+[package]
+name = "mkff-flac"
+version = "0.1.0-dev"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+description = "FLAC decoder and encoder, written for MKFF in safe Rust"
+
+[dependencies]
+mkff-audio-core = { path = "../mkff-audio-core" }

@@ -8,57 +8,22 @@ license.workspace = true
 name = "sphere_video_player"
 path = "src/lib.rs"
 
-# Video preview/reference decoding for the arrangement Video Track.
+# Video preview/reference decoding for the arrangement Video Track, on MKFF
+# (crates/mkff) — Futureboard's own media framework. No FFmpeg / libav and no
+# OS media framework (Media Foundation / AVFoundation) is used for decoding:
 #
-# No FFmpeg / libav is bundled or linked on any platform. Decoding is delegated
-# to the media framework the operating system already ships:
+#   GPU      — MP4 / MOV with H.264 or HEVC: samples from MKFF's MP4 demuxer
+#              go to an mkff-mediakit accelerant decoder (D3D11 / DXVA on
+#              Windows, one accelerant per GPU). Machines or files the GPU
+#              path cannot take fall through to software.
+#   Software — every container / codec mkff-codecs decodes (MP4 / MOV, MKV /
+#              WebM, AVI, MXF, MPEG-TS / PS, Y4M; H.264, HEVC, VP8, VP9, AV1,
+#              MPEG-1/2, ProRes, DNxHD/HR, APV, MJPEG), in pure Rust, on every
+#              platform including Linux.
 #
-#   Windows — Media Foundation Source Reader (`IMFSourceReader`) driving a DXVA
-#             hardware decoder onto a shared D3D11 device, with the D3D11 Video
-#             Processor converting NV12/P010 to BGRA. A software Source Reader
-#             configuration (RGB32 via the OS Video Processor MFT) is kept for
-#             machines with no usable D3D11 video device.
-#   macOS   — AVFoundation `AVAssetImageGenerator` + Core Graphics.
-#   Linux   — not implemented yet. VAAPI (`libva`) is the intended backend;
-#             see the crate docs for why that is a larger job than the other
-#             two and what it still needs.
-#
-# A build with no backend reports `VideoError::UnsupportedPlatform` and the UI
-# disables the player rather than faking a preview.
-# No logging facade: the workspace installs no `tracing` subscriber, so
-# `tracing::…` output from here would be dropped. Diagnostics go to stderr with
-# a `[video-mf]` / `[video-perf]` tag, matching `[video-import]` and
-# `[video-player]` in the UI crate.
+# Diagnostics go to stderr with a `[video-mkff]` tag (the workspace installs no
+# tracing subscriber), matching `[video-player]` in the UI crate.
 [dependencies]
-
-[target.'cfg(windows)'.dependencies]
-windows = { workspace = true, features = [
-    "Win32_Graphics_Direct3D",
-    "Win32_Graphics_Direct3D11",
-    "Win32_Graphics_Dxgi",
-    "Win32_Graphics_Dxgi_Common",
-    "Win32_Media_MediaFoundation",
-    "Win32_System_Com",
-    "Win32_System_Com_StructuredStorage",
-    "Win32_System_Variant",
-] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-objc2 = { workspace = true }
-objc2-foundation = { workspace = true, features = ["NSString", "NSURL", "NSArray", "NSError"] }
-objc2-core-foundation = { version = "0.3", features = ["CFCGTypes"] }
-objc2-core-media = { version = "0.3", features = ["CMTime"] }
-objc2-core-graphics = { version = "0.3", features = [
-    "CGBitmapContext",
-    "CGColorSpace",
-    "CGContext",
-    "CGImage",
-] }
-objc2-av-foundation = { version = "0.3", features = [
-    "AVAsset",
-    "AVAssetImageGenerator",
-    "AVAssetTrack",
-    "AVMediaFormat",
-    "objc2-core-graphics",
-    "objc2-core-media",
-] }
+mkff-codecs = { path = "../mkff/bindings/rust/mkff-codecs" }
+mkff-mediakit = { path = "../mkff/bindings/rust/mkff-mediakit" }
+rayon.workspace = true

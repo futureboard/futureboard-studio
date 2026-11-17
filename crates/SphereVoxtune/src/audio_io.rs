@@ -2,19 +2,15 @@
 //! Borrowed from `Futureboard-release/crates/SphereDirectAudioEngine/src/audio_file.rs`.
 //!
 //! Supports WAV/WAVE (8/16/24/32-bit PCM & 32-bit IEEE float, including WAVEFORMATEXTENSIBLE)
-//! via fast inline RIFF parsing, and MP3, FLAC, OGG/Vorbis, M4A/AAC, AIFF, ALAC via `symphonia`.
+//! via fast inline RIFF parsing, and MP3, FLAC, OGG Vorbis/Opus, M4A/AAC, ALAC, AIFF, RF64 via
+//! MKFF's own audio stack (`mkff-audio`).
 
 use std::fs::File;
-use std::io::{self, Cursor, Read, Seek, SeekFrom};
+use std::io::{Cursor, Read};
 use std::path::Path;
 
-use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
-use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::FormatOptions;
-use symphonia::core::io::{MediaSource, MediaSourceStream};
-use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
+use mkff_audio::AudioFile;
+use mkff_audio::format::ReadSeek;
 
 /// Rates below this are treated as a broken header. Resampling 1 Hz audio up
 /// to a project rate allocates tens of thousands of samples per input sample.
@@ -210,12 +206,12 @@ fn read_audio_file(path: &Path) -> Result<RawInterleavedBuffer, String> {
         match decode_wav_bytes(&bytes) {
             Ok(buf) => Ok(buf),
             Err(e) if is_refusal(&e) => Err(e),
-            Err(_) => decode_via_symphonia_reader(Box::new(Cursor::new(bytes)), Some(ext.as_str())),
+            Err(_) => decode_via_mkff_reader(Box::new(Cursor::new(bytes)), Some(ext.as_str())),
         }
     } else {
         let file =
             File::open(path).map_err(|e| format!("Failed to open '{}': {e}", path.display()))?;
-        decode_via_symphonia_reader(Box::new(file), Some(ext.as_str()))
+        decode_via_mkff_reader(Box::new(file), Some(ext.as_str()))
     }
 }
 
@@ -235,13 +231,13 @@ pub fn decode_audio_bytes_to_mono(
             Err(e) if is_refusal(&e) => {
                 return Err(e);
             }
-            Err(_) => decode_via_symphonia_reader(
+            Err(_) => decode_via_mkff_reader(
                 Box::new(Cursor::new(bytes.to_vec())),
                 ext_hint.or(Some("wav")),
             )?,
         }
     } else {
-        decode_via_symphonia_reader(Box::new(Cursor::new(bytes.to_vec())), ext_hint)?
+        decode_via_mkff_reader(Box::new(Cursor::new(bytes.to_vec())), ext_hint)?
     };
 
     finalize_decoded(raw, target_sample_rate)
@@ -377,171 +373,76 @@ pub fn compute_waveform_peaks(mono: &[f32], num_bins: usize) -> Vec<f32> {
     peaks
 }
 
-/// Recognises the STREAMINFO of FLAC files Studio exported before #352
-/// (minimum block size = the last block's length), which symphonia refuses.
-/// The same source file Studio's import and LiveStage's playback use
-/// (`sphere_encoder::flac_header`), compiled in here rather than depended on
-/// so the Android crate and the plug-in still build this crate on its own.
-#[path = "../../SphereEncoder/src/flac_header.rs"]
-mod flac_header;
+/// Failed chunks in a row after which a decode stops.
+const MAX_CONSECUTIVE_DECODE_FAILURES: u32 = 256;
 
-/// A source read with a pre-#352 FLAC export's minimum block size replaced
-/// by the corrected value; the file itself is never written.
-struct FlacHeaderFix {
-    inner: Box<dyn MediaSource>,
-    len: Option<u64>,
-    pos: u64,
-    min_block: [u8; 2],
-}
-
-impl Read for FlacHeaderFix {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        let at = flac_header::STREAMINFO_MIN_BLOCK_SIZE_OFFSET;
-        for (i, byte) in self.min_block.iter().enumerate() {
-            let offset = at + i as u64;
-            if (self.pos..self.pos + n as u64).contains(&offset) {
-                buf[(offset - self.pos) as usize] = *byte;
-            }
-        }
-        self.pos += n as u64;
-        Ok(n)
-    }
-}
-
-impl Seek for FlacHeaderFix {
-    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
-        self.pos = self.inner.seek(to)?;
-        Ok(self.pos)
-    }
-}
-
-impl MediaSource for FlacHeaderFix {
-    fn is_seekable(&self) -> bool {
-        self.inner.is_seekable()
-    }
-
-    fn byte_len(&self) -> Option<u64> {
-        self.len
-    }
-}
-
-/// `source` positioned at its start, read with its STREAMINFO corrected when
-/// it is a pre-#352 FLAC export; any other source is returned as it is.
-fn corrected_source(mut source: Box<dyn MediaSource>) -> io::Result<Box<dyn MediaSource>> {
-    if !source.is_seekable() {
-        return Ok(source);
-    }
-    let fix = flac_header::legacy_min_block_size_fix(&mut source);
-    source.seek(SeekFrom::Start(0))?;
-    Ok(match fix {
-        Some(min_block) => Box::new(FlacHeaderFix {
-            len: source.byte_len(),
-            inner: source,
-            pos: 0,
-            min_block: min_block.to_be_bytes(),
-        }),
-        None => source,
-    })
-}
-
-fn decode_via_symphonia_reader(
-    source: Box<dyn MediaSource>,
+/// Decode with MKFF's own audio stack, from a file or from bytes. The content
+/// is sniffed; `ext_hint` only breaks ties.
+///
+/// FLAC files Studio exported before #352 (minimum block size = the last
+/// block's length) need no header correction: mkff takes the fixed block size
+/// from the first frame header.
+fn decode_via_mkff_reader(
+    source: Box<dyn ReadSeek>,
     ext_hint: Option<&str>,
 ) -> Result<RawInterleavedBuffer, String> {
-    // Every decode starts here, from a file or from bytes.
-    let source = corrected_source(source).map_err(|e| format!("Failed to read audio: {e}"))?;
-    let mss = MediaSourceStream::new(source, Default::default());
-    let mut hint = Hint::new();
-    if let Some(ext) = ext_hint
-        && !ext.is_empty()
-    {
-        hint.with_extension(ext);
-    }
-
-    let probed = symphonia::default::get_probe()
-        .format(
-            &hint,
-            mss,
-            &FormatOptions {
-                enable_gapless: true,
-                ..Default::default()
-            },
-            &MetadataOptions::default(),
-        )
+    let name_hint = match ext_hint {
+        Some(ext) if !ext.is_empty() => format!("audio.{ext}"),
+        _ => String::new(),
+    };
+    let mut file = AudioFile::from_reader(source, &name_hint, 0)
         .map_err(|e| format!("Audio format probe failed: {e}"))?;
 
-    let mut format = probed.format;
-    let track = format
-        .tracks()
-        .iter()
-        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL && t.codec_params.sample_rate.is_some())
-        .ok_or_else(|| "No decodable audio track found in file".to_string())?
-        .clone();
-
-    let track_id = track.id;
-    let sample_rate = track
-        .codec_params
-        .sample_rate
-        .ok_or_else(|| "Audio track has no sample rate".to_string())?;
-    let mut channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(1);
+    let mut sample_rate = file.sample_rate();
+    if sample_rate == 0 {
+        return Err("Audio track has no sample rate".to_string());
+    }
     // Before decoding anything: a rate we cannot use is refused as such.
     if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&sample_rate) {
         return Err(LoadLimit::UnsupportedRate(sample_rate).to_string());
     }
-
-    let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &DecoderOptions::default())
-        .map_err(|e| format!("Failed to create audio codec decoder: {e}"))?;
+    let mut channels = file.channels().max(1);
 
     let mut all_samples: Vec<f32> = Vec::new();
-    let mut sample_buf: Option<SampleBuffer<f32>> = None;
-
+    let mut failures = 0;
     loop {
-        let packet = match format.next_packet() {
-            Ok(p) => p,
-            Err(SymphoniaError::IoError(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                break;
-            }
-            Err(SymphoniaError::ResetRequired) => {
-                decoder.reset();
+        let chunk = match file.next_chunk() {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            // A damaged packet is skipped (mkff keeps positions; the hole
+            // decodes as silence). A run of failures ends the decode with
+            // what was read.
+            Err(_) => {
+                failures += 1;
+                if failures >= MAX_CONSECUTIVE_DECODE_FAILURES {
+                    break;
+                }
                 continue;
             }
-            Err(_) => break,
         };
-
-        if packet.track_id() != track_id {
-            continue;
-        }
-
-        match decoder.decode(&packet) {
-            Ok(audio_buf_ref) => {
-                let spec = *audio_buf_ref.spec();
-                channels = spec.channels.count().max(1);
-                if sample_buf
-                    .as_ref()
-                    .is_none_or(|b| b.capacity() < audio_buf_ref.capacity())
-                {
-                    sample_buf = Some(SampleBuffer::<f32>::new(
-                        audio_buf_ref.capacity() as u64,
-                        spec,
-                    ));
-                }
-                if let Some(buf) = &mut sample_buf {
-                    buf.copy_interleaved_ref(audio_buf_ref);
-                    let incoming = buf.samples();
-                    let cap = max_frames(sample_rate).saturating_mul(channels.max(1));
-                    if all_samples.len().saturating_add(incoming.len()) > cap {
-                        return Err(LoadLimit::TooLong.to_string());
-                    }
-                    if all_samples.try_reserve(incoming.len()).is_err() {
-                        return Err(OUT_OF_MEMORY.to_string());
-                    }
-                    all_samples.extend_from_slice(incoming);
-                }
+        failures = 0;
+        // The decoder is the authority on its output (HE-AAC, a header that
+        // lies); mkff adopts it with the first decoded audio.
+        if all_samples.is_empty() {
+            sample_rate = file.sample_rate();
+            if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&sample_rate) {
+                return Err(LoadLimit::UnsupportedRate(sample_rate).to_string());
             }
-            Err(SymphoniaError::IoError(_)) | Err(SymphoniaError::DecodeError(_)) => continue,
-            Err(_) => break,
+        }
+        channels = chunk.channels.len().max(1);
+        let frames = chunk.frames();
+        let incoming = frames * channels;
+        let cap = max_frames(sample_rate).saturating_mul(channels);
+        if all_samples.len().saturating_add(incoming) > cap {
+            return Err(LoadLimit::TooLong.to_string());
+        }
+        if all_samples.try_reserve(incoming).is_err() {
+            return Err(OUT_OF_MEMORY.to_string());
+        }
+        for i in 0..frames {
+            for plane in &chunk.channels {
+                all_samples.push(plane[i]);
+            }
         }
     }
 
@@ -870,22 +771,14 @@ mod tests {
             let (_, old) = studio_flac_exports(frames, &fixed_path);
             std::fs::write(&old_path, &old).unwrap();
 
-            // The fixture is the reported case: symphonia alone does not
-            // read the old header.
-            let mut hint = Hint::new();
-            hint.with_extension("flac");
-            let raw = symphonia::default::get_probe().format(
-                &hint,
-                MediaSourceStream::new(
-                    Box::new(File::open(&old_path).unwrap()),
-                    Default::default(),
-                ),
-                &FormatOptions::default(),
-                &MetadataOptions::default(),
-            );
+            // The fixture is the reported case: a header the pre-#352
+            // detector recognises. mkff reads it with no correction.
             assert!(
-                raw.is_err(),
-                "{frames}: symphonia read the pre-#352 fixture without a fix"
+                sphere_encoder::flac_header::legacy_min_block_size_fix(
+                    &mut File::open(&old_path).unwrap()
+                )
+                .is_some(),
+                "{frames}: the fixture is not a pre-#352 header"
             );
 
             let reference = decode_audio_file_to_mono(&fixed_path, 48_000).unwrap();

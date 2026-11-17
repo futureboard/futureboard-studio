@@ -1,0 +1,25 @@
+[package]
+name = "mkff-codecs"
+version = "0.1.0-dev"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+description = "Pure-Rust software demux + decode for every MKFF codec, plus H.264 / ProRes / AAC encode and MP4 / MOV mux (no FFmpeg): audio by MKFF's own mkff-audio, video still by the FilmCraft codec crates"
+
+# The FilmCraft codec crates (MIT OR Apache-2.0) are pinned to one revision so
+# every build decodes with the same, reviewed code. Bump them all together.
+[dependencies]
+filmcraft-codecs = { git = "https://github.com/storytold/filmcraft", rev = "9ed9650cad4c9b22cb8d32f4a9ba8050cde20a62" }
+filmcraft-media = { git = "https://github.com/storytold/filmcraft", rev = "9ed9650cad4c9b22cb8d32f4a9ba8050cde20a62" }
+filmcraft-isobmff = { git = "https://github.com/storytold/filmcraft", rev = "9ed9650cad4c9b22cb8d32f4a9ba8050cde20a62" }
+filmcraft-frame = { git = "https://github.com/storytold/filmcraft", rev = "9ed9650cad4c9b22cb8d32f4a9ba8050cde20a62" }
+filmcraft-color = { git = "https://github.com/storytold/filmcraft", rev = "9ed9650cad4c9b22cb8d32f4a9ba8050cde20a62" }
+filmcraft-time = { git = "https://github.com/storytold/filmcraft", rev = "9ed9650cad4c9b22cb8d32f4a9ba8050cde20a62" }
+# Encoders (the `encode` module): H.264, ProRes; MP4 / MOV via filmcraft-isobmff. (AAC is MKFF's own.)
+filmcraft-h264enc = { git = "https://github.com/storytold/filmcraft", rev = "9ed9650cad4c9b22cb8d32f4a9ba8050cde20a62" }
+filmcraft-prores = { git = "https://github.com/storytold/filmcraft", rev = "9ed9650cad4c9b22cb8d32f4a9ba8050cde20a62" }
+# Parallel RGBA → Y'CbCr for the encoders (already in the tree through filmcraft-codecs).
+rayon = "1.10"
+# MKFF's own audio: every audio codec and the audio containers (no FilmCraft, no symphonia).
+mkff-audio = { path = "../mkff-audio" }
+mkff-aac = { path = "../mkff-aac" }

@@ -1,0 +1,10 @@
+[package]
+name = "mkff-vk"
+version = "0.1.0-dev"
+edition = "2021"
+license = "MIT"
+description = "Zero-copy dma-buf -> VkImage import for MediaKit Foundation Framework decoded frames"
+
+[dependencies]
+ash = { version = "0.38", default-features = false, features = ["loaded", "std", "debug"] }
+mkff = { path = "../mkff", default-features = false, features = ["bundled"] }

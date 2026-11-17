@@ -1,0 +1,21 @@
+[package]
+name = "mkff-cli"
+version = "0.1.0-dev"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+description = "mkfx: an FFmpeg-style command-line media tool on MKFF (probe, transcode, remux; GPU encode through the Media Kit), no FFmpeg"
+publish = false
+
+[[bin]]
+name = "mkfx"
+path = "src/main.rs"
+
+[dependencies]
+mkff-audio = { path = "../mkff-audio" }
+mkff-codecs = { path = "../mkff-codecs" }
+mkff-hwenc = { path = "../mkff-hwenc" }
+mkff-mediakit = { path = "../mkff-mediakit" }
+
+[dev-dependencies]
+mkff-audio = { path = "../mkff-audio" }

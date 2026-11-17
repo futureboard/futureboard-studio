@@ -3572,6 +3572,11 @@ fn file_drop_hint_label(paths: &[std::path::PathBuf]) -> &'static str {
         PLUGIN_PRESET_DROP_LABEL
     } else if paths.iter().any(|path| is_supported_audio_ext(path)) {
         "Drop Audio to import"
+    } else if paths
+        .iter()
+        .any(|path| crate::components::timeline::raw_pcm_import::is_raw_pcm_path(path))
+    {
+        "Drop Raw PCM to import"
     } else if paths.iter().any(|path| is_supported_midi_ext(path)) {
         "Drop MIDI to import"
     } else if paths

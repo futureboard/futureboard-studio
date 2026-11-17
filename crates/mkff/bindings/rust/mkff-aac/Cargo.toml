@@ -1,0 +1,10 @@
+[package]
+name = "mkff-aac"
+version = "0.1.0-dev"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+description = "AAC-LC decoder and encoder (raw, ADTS, LATM framing helpers), written for MKFF in safe Rust"
+
+[dependencies]
+mkff-audio-core = { path = "../mkff-audio-core" }

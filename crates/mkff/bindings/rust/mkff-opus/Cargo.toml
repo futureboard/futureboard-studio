@@ -1,0 +1,10 @@
+[package]
+name = "mkff-opus"
+version = "0.1.0-dev"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT AND BSD-3-Clause"
+description = "Opus decoder (SILK, CELT and hybrid), written for MKFF in safe Rust"
+
+[dependencies]
+mkff-audio-core = { path = "../mkff-audio-core" }

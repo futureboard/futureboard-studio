@@ -1,0 +1,131 @@
+# Third-Party Notices
+
+This file lists third-party software that may be incorporated into builds of
+MediaKit Foundation Framework (MKFF).
+
+## libhevc (Ittiam Systems)
+
+- Project: https://github.com/ittiam-systems/libhevc
+- License: Apache License 2.0
+- Used when CMake option `MKFF_ENABLE_HEVC_SOFTWARE` is ON (default), or when
+  the Cargo feature `hevc-software-fallback` is enabled.
+- MKFF fetches a pinned commit via CMake `FetchContent` (or uses a local
+  `third_party/libhevc/` tree if present) and links the decoder-only library
+  into the core `MKFF` library as an in-process software HEVC fallback.
+- Encoder, examples, fuzzers, and upstream unit-test targets are not built
+  into MKFF.
+- The pinned libhevc decoder supports 8-bit Main (NV12). Main10 / 10-bit
+  streams are rejected at the MKFF software wrapper and handled by platform
+  hardware decoders instead.
+
+Apache License 2.0 text: https://www.apache.org/licenses/LICENSE-2.0
+
+Copyright notices and the full Apache-2.0 license text are included in the
+upstream libhevc source tree (`LICENSE` / related notice files) fetched at
+configure time.
+
+## FilmCraft codec crates (ArtCraft Team and the FilmCraft contributors)
+
+- Project: https://github.com/storytold/filmcraft (crates/)
+- License: MIT OR Apache-2.0 — MKFF uses them under the MIT License.
+- Used by the Rust crates `mkff-codecs` / `mkff-codecs-capi`
+  (`libmkff_swcodecs`), and by `mkff` with the `software-codecs` feature.
+  Fetched by Cargo at a pinned git revision (see
+  `bindings/rust/mkff-codecs/Cargo.toml`) and linked unmodified: containers
+  (isobmff, matroska, avi, mxf, mpegts, ogg) and video decoders / encoders
+  (h264, h264enc, hevc, vp8, vp9, av1, mpeg2v, prores, dnx, apv).
+- Audio in `mkff-codecs` is MKFF's own (`mkff-audio`, below). FilmCraft's audio
+  decoders are still compiled in through `filmcraft-codecs` and used only for
+  the audio of the containers MKFF does not demux itself yet (Matroska / WebM,
+  AVI, MXF, MPEG-TS / PS).
+
+  Copyright (c) 2026 ArtCraft Team and the FilmCraft contributors
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
+## Symphonia
+
+- Project: https://github.com/pdeljanov/Symphonia
+- License: Mozilla Public License 2.0 (file-level copyleft; not GPL/LGPL)
+- Pulled in unmodified by `filmcraft-codecs` as its bootstrap decoder for
+  MP3, Vorbis, ALAC, FLAC and non-LC AAC object types. Source is available
+  from crates.io / the project repository; MKFF does not modify it.
+
+MPL-2.0 text: https://www.mozilla.org/MPL/2.0/
+
+## Other Rust crates
+
+The Rust crates above depend on further crates from crates.io (rayon, image,
+thiserror, …) under permissive licenses (MIT, Apache-2.0, BSD, Zlib,
+Unicode-3.0). `cargo metadata` / `cargo about` list them per build.
+
+## Opus reference decoder (RFC 6716 Appendix A)
+
+- Source: the normative reference implementation in RFC 6716 (with the RFC 8251
+  updates), https://www.rfc-editor.org/rfc/rfc6716
+- License: BSD-3-Clause.
+- Used by the Rust crate `mkff-opus` (and through it `mkff-audio`,
+  `mkff-codecs`, `libmkff_swcodecs`): large parts of its decoder and all of its
+  tables are close Rust ports of the reference code. The file-by-file mapping
+  is in `bindings/rust/mkff-opus/NOTICE`.
+
+  Copyright 1994-2011 IETF Trust, Xiph.Org, Skype Limited, Octasic,
+                      Jean-Marc Valin, Timothy B. Terriberry,
+                      CSIRO, Gregory Maxwell, Mark Borgerding,
+                      Erik de Castro Lopo. All rights reserved.
+
+  This file is extracted from RFC6716. Please see that RFC for additional
+  information.
+
+  Redistribution and use in source and binary forms, with or without
+  modification, are permitted provided that the following conditions
+  are met:
+
+  - Redistributions of source code must retain the above copyright
+  notice, this list of conditions and the following disclaimer.
+
+  - Redistributions in binary form must reproduce the above copyright
+  notice, this list of conditions and the following disclaimer in the
+  documentation and/or other materials provided with the distribution.
+
+  - Neither the name of Internet Society, IETF or IETF Trust, nor the
+  names of specific contributors, may be used to endorse or promote
+  products derived from this software without specific prior written
+  permission.
+
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+  ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER
+  OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+  EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+  PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+  PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+  LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+  NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+  SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+## MKFF's own audio codecs
+
+`mkff-audio-core`, `mkff-mp3`, `mkff-aac`, `mkff-flac`, `mkff-alac`, `mkff-ac3`,
+`mkff-vorbis`, `mkff-audio-format`, `mkff-audio` and `mkff-mediakit` are written
+for MKFF from the public specifications (ISO/IEC 11172-3, 13818-3, 13818-7,
+14496-3, 14496-12/14; ETSI TS 102 366; RFC 9639; the Vorbis I and Ogg
+specifications; the ALAC format description; EBU Tech 3306) under the MIT
+License. They contain no third-party code.

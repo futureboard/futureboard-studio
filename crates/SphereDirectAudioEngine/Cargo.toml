@@ -57,8 +57,8 @@ solfege-acoustic.workspace = true
 # Memory-map large audio files so huge WAVs do not explode RAM usage.
 memmap2.workspace = true
 
-# Multi-format decoder: MP3, FLAC, OGG/Vorbis, WAV, AIFF, etc.
-symphonia.workspace = true
+# Multi-format decoder (MKFF): MP3, AAC/M4A, FLAC, OGG Vorbis/Opus, AIFF, etc.
+mkff-audio.workspace = true
 
 # ── Windows-only: raw WASAPI exclusive mode + MMCSS ──────────────────────────
 [target.'cfg(target_os = "windows")'.dependencies]

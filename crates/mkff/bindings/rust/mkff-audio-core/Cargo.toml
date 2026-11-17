@@ -1,0 +1,9 @@
+[package]
+name = "mkff-audio-core"
+version = "0.1.0-dev"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+description = "Shared building blocks of the MKFF audio codecs: bit I/O, FFT / MDCT, CRCs, resampling and the codec traits. No dependencies."
+
+[dependencies]

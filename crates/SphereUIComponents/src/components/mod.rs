@@ -65,6 +65,7 @@ pub mod mixer_tree_cache;
 pub mod mixer_tree_model;
 pub mod mixer_tree_sidebar;
 pub mod mixer_tree_sidebar_view;
+pub mod raw_pcm_import_dialog;
 pub use mixer_tree_sidebar_view::MixerTreeSidebar;
 mod mixer_window;
 pub(crate) use mixer_window::{external_mixer_debug, external_mixer_debug_enabled};

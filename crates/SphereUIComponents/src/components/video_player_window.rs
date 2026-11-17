@@ -229,9 +229,12 @@ impl VideoPlayerWindow {
             PreviewStatus::Ready => match (self.info, self.frame_size) {
                 (Some(info), Some((width, height))) => {
                     if info.frame_rate > 0.0 {
-                        format!("{width}×{height} · {:.2} fps", info.frame_rate)
+                        format!(
+                            "{width}×{height} · {:.2} fps · {}",
+                            info.frame_rate, info.decoder
+                        )
                     } else {
-                        format!("{width}×{height}")
+                        format!("{width}×{height} · {}", info.decoder)
                     }
                 }
                 _ => "Decoding…".to_string(),

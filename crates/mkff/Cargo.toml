@@ -1,0 +1,93 @@
+[workspace]
+resolver = "2"
+members = [
+    "bindings/rust/mkff-sys",
+    "bindings/rust/mkff",
+    "bindings/rust/mkff-vk",
+    "bindings/rust/mkff-wgpu",
+    "bindings/rust/mkff-codecs",
+    "bindings/rust/mkff-codecs-capi",
+    "bindings/rust/mkff-player",
+    "bindings/rust/mkff-hwenc",
+    "bindings/rust/mkff-audio-core",
+    "bindings/rust/mkff-mp3",
+    "bindings/rust/mkff-aac",
+    "bindings/rust/mkff-flac",
+    "bindings/rust/mkff-alac",
+    "bindings/rust/mkff-ac3",
+    "bindings/rust/mkff-opus",
+    "bindings/rust/mkff-vorbis",
+    "bindings/rust/mkff-audio-format",
+    "bindings/rust/mkff-mediakit",
+    "bindings/rust/mkff-audio",
+    "bindings/rust/mkff-cli",
+]
+# mkff-vk is Linux/Vulkan-only; mkff-wgpu is a display example; mkff-player
+# needs ALSA headers on Linux. Keep them out of the default set so `cargo test`
+# stays portable.
+default-members = [
+    "bindings/rust/mkff-sys",
+    "bindings/rust/mkff",
+    "bindings/rust/mkff-codecs",
+    "bindings/rust/mkff-codecs-capi",
+    "bindings/rust/mkff-hwenc",
+    "bindings/rust/mkff-audio-core",
+    "bindings/rust/mkff-mp3",
+    "bindings/rust/mkff-aac",
+    "bindings/rust/mkff-flac",
+    "bindings/rust/mkff-alac",
+    "bindings/rust/mkff-ac3",
+    "bindings/rust/mkff-opus",
+    "bindings/rust/mkff-vorbis",
+    "bindings/rust/mkff-audio-format",
+    "bindings/rust/mkff-mediakit",
+]
+
+# MKFF's own audio codecs: same reason as below.
+[profile.dev.package.mkff-audio-core]
+opt-level = 3
+[profile.dev.package.mkff-mp3]
+opt-level = 3
+[profile.dev.package.mkff-aac]
+opt-level = 3
+[profile.dev.package.mkff-flac]
+opt-level = 3
+[profile.dev.package.mkff-alac]
+opt-level = 3
+[profile.dev.package.mkff-ac3]
+opt-level = 3
+[profile.dev.package.mkff-opus]
+opt-level = 3
+[profile.dev.package.mkff-vorbis]
+opt-level = 3
+
+# The FilmCraft codec hot loops (mkff-codecs) are 10-50x slower unoptimised;
+# keep debug builds and `cargo test` usable on real clips.
+[profile.dev.package.filmcraft-h264]
+opt-level = 3
+[profile.dev.package.filmcraft-h264enc]
+opt-level = 3
+[profile.dev.package.filmcraft-hevc]
+opt-level = 3
+[profile.dev.package.filmcraft-vp8]
+opt-level = 3
+[profile.dev.package.filmcraft-vp9]
+opt-level = 3
+[profile.dev.package.filmcraft-av1]
+opt-level = 3
+[profile.dev.package.filmcraft-mpeg2v]
+opt-level = 3
+[profile.dev.package.filmcraft-prores]
+opt-level = 3
+[profile.dev.package.filmcraft-dnx]
+opt-level = 3
+[profile.dev.package.filmcraft-apv]
+opt-level = 3
+[profile.dev.package.filmcraft-aac]
+opt-level = 3
+[profile.dev.package.filmcraft-opus]
+opt-level = 3
+[profile.dev.package.filmcraft-ac3]
+opt-level = 3
+[profile.dev.package.filmcraft-mpa]
+opt-level = 3

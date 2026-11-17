@@ -26,9 +26,9 @@ parking_lot.workspace = true
 # Default features only (WAV + FLAC, pure Rust): no MP3, no native encoder.
 sphere-encoder = { path = "../SphereEncoder" }
 # Playback (virtual soundcheck) decodes and seeks the WAV/FLAC takes the
-# recorder writes. Pure Rust; the workspace's feature list (also used by the
-# Studio engine) is taken as is.
-symphonia.workspace = true
+# recorder writes (RF64 included). MKFF's pure-Rust audio stack, as in the
+# Studio engine.
+mkff-audio.workspace = true
 
 builtin-dsp-core.workspace = true
 equz8.workspace = true

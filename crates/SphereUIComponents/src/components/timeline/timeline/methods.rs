@@ -359,6 +359,7 @@ impl Timeline {
             on_plugin_drag_drop: None,
             plugin_drop_hint: None,
             on_midi_import_prompt: None,
+            on_raw_pcm_import_prompt: None,
             on_edit_notice: None,
             last_drag_position: None,
             pending_file_drops: Default::default(),
@@ -470,6 +471,7 @@ impl Timeline {
             on_plugin_drag_drop: None,
             plugin_drop_hint: None,
             on_midi_import_prompt: None,
+            on_raw_pcm_import_prompt: None,
             on_edit_notice: None,
             last_drag_position: None,
             pending_file_drops: Default::default(),
@@ -1619,6 +1621,13 @@ impl Timeline {
         callback: Option<TimelineMidiImportPromptCb>,
     ) {
         self.on_midi_import_prompt = callback;
+    }
+
+    pub fn set_raw_pcm_import_prompt_callback(
+        &mut self,
+        callback: Option<super::TimelineRawPcmImportPromptCb>,
+    ) {
+        self.on_raw_pcm_import_prompt = callback;
     }
 
     pub fn set_edit_notice_callback(&mut self, callback: Option<super::TimelineEditNoticeCb>) {
@@ -4430,6 +4439,8 @@ impl Timeline {
                 parses.push((batch.push(None), path.clone()));
             } else if is_supported_audio_ext(path) {
                 batch.push(Some(DroppedFile::Audio(path.clone())));
+            } else if crate::components::timeline::raw_pcm_import::is_raw_pcm_path(path) {
+                batch.push(Some(DroppedFile::RawPcm(path.clone())));
             } else if sphere_video_player::is_supported_video_path(path) {
                 batch.push(Some(DroppedFile::Video(path.clone())));
             }
@@ -4559,6 +4570,7 @@ impl Timeline {
                 self.import_dropped_midi(&path, parsed, placement, window, cx)
             }
             DroppedFile::Audio(path) => self.import_dropped_audio(&path, placement, cx),
+            DroppedFile::RawPcm(path) => self.prompt_raw_pcm_import(&path, placement, window, cx),
             // The Video track is a singleton: a video takes the cursor's beat
             // whichever file it is, and never a new track.
             DroppedFile::Video(path) => {
@@ -4578,6 +4590,74 @@ impl Timeline {
             );
             self.pending_file_drops.clear();
         }
+    }
+
+    /// Hand a dropped headerless PCM file to the Import Raw PCM dialog. It
+    /// counts as landed (later files of the drop go to new tracks) because the
+    /// dialog imports it at this placement.
+    fn prompt_raw_pcm_import(
+        &mut self,
+        path: &std::path::Path,
+        placement: &crate::components::timeline::drop_batch::DropPlacement,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("Raw PCM")
+            .to_string();
+        let Some(prompt) = self.on_raw_pcm_import_prompt.clone() else {
+            self.report_edit_notice(
+                format!("{file_name} was not imported: raw PCM needs the import dialog"),
+                cx,
+            );
+            return false;
+        };
+        let file_len = match std::fs::metadata(path) {
+            Ok(meta) => meta.len(),
+            Err(err) => {
+                self.report_edit_notice(format!("{file_name} could not be read: {err}"), cx);
+                return false;
+            }
+        };
+        let request = super::TimelineRawPcmImportPrompt {
+            path: path.to_path_buf(),
+            file_name,
+            file_len,
+            placement: placement.clone(),
+            project_generation: self.project_generation,
+        };
+        prompt(&request, window, cx);
+        true
+    }
+
+    /// Import the WAV a dropped raw PCM file was converted to, at the
+    /// placement its drop resolved to. Nothing is imported when the project
+    /// has changed since the drop (#385).
+    pub fn import_converted_raw_pcm(
+        &mut self,
+        request: &super::TimelineRawPcmImportPrompt,
+        converted: &std::path::Path,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if request.project_generation != self.project_generation {
+            self.report_edit_notice(
+                format!(
+                    "{} was not imported: it was dropped into a project that is no longer open",
+                    request.file_name
+                ),
+                cx,
+            );
+            return false;
+        }
+        self.import_dropped_audio(converted, &request.placement, cx)
+    }
+
+    /// A status-bar sentence for a raw PCM import that failed after the
+    /// dialog (conversion error).
+    pub fn report_raw_pcm_import_failure(&mut self, message: String, cx: &mut Context<Self>) {
+        self.report_edit_notice(message, cx);
     }
 
     fn import_dropped_audio(

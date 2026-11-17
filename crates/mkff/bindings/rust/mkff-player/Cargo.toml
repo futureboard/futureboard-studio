@@ -1,0 +1,34 @@
+[package]
+name = "mkff-player"
+version = "0.1.0-dev"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+description = "MKFF Player: desktop media player (egui + wgpu) with A/V sync, every container / codec mkff-codecs decodes"
+publish = false
+
+[[bin]]
+name = "mkff-player"
+path = "src/main.rs"
+
+[dependencies]
+mkff-codecs = { path = "../mkff-codecs" }
+# Engine
+cpal = "0.18.2"
+rtrb = "0.4.0"
+log = "0.4"
+# Front end
+bytemuck = { version = "1", features = ["derive"] }
+eframe = { version = "0.31.1", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "persistence",
+    "wayland",
+    "wgpu",
+    "x11",
+] }
+env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
+png = "0.17"
+pollster = "0.4"
+rfd = "0.17.2"
+serde = { version = "1", features = ["derive"] }

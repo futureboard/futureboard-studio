@@ -235,6 +235,10 @@ pub struct Timeline {
     /// besides its notes. Unset (tests, embedded editors) imports everything,
     /// which is what a drop did before the dialog existed.
     on_midi_import_prompt: Option<TimelineMidiImportPromptCb>,
+    /// Asks the owner how a dropped headerless PCM file is laid out. Unset
+    /// (tests, embedded editors) refuses the file with a notice: there is no
+    /// layout to assume for it.
+    on_raw_pcm_import_prompt: Option<TimelineRawPcmImportPromptCb>,
     /// A short status-bar line for an edit that did not land, such as a MIDI
     /// file the importer could not read. Unset in tests: the failure is still
     /// logged, and the shell wires this to the status bar.
@@ -633,6 +637,24 @@ pub struct TimelineMidiImportPrompt {
 
 pub type TimelineMidiImportPromptCb =
     std::sync::Arc<dyn Fn(&TimelineMidiImportPrompt, &mut gpui::Window, &mut gpui::App) + 'static>;
+
+/// A dropped headerless PCM file (`.raw` / `.pcm`), parked until the user
+/// says how it is laid out and it has been converted. Carries the placement
+/// and project of the drop for the same reasons as
+/// [`TimelineMidiImportPrompt`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimelineRawPcmImportPrompt {
+    pub path: std::path::PathBuf,
+    pub file_name: String,
+    /// Size in bytes when dropped (the dialog's duration line).
+    pub file_len: u64,
+    pub placement: crate::components::timeline::drop_batch::DropPlacement,
+    pub project_generation: u64,
+}
+
+pub type TimelineRawPcmImportPromptCb = std::sync::Arc<
+    dyn Fn(&TimelineRawPcmImportPrompt, &mut gpui::Window, &mut gpui::App) + 'static,
+>;
 
 /// One status-bar sentence. The shell shows it; the timeline does not own a
 /// status bar of its own.

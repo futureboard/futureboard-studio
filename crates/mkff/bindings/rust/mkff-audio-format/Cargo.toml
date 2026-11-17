@@ -1,0 +1,10 @@
+[package]
+name = "mkff-audio-format"
+version = "0.1.0-dev"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+description = "Audio container demuxers and muxers for MKFF: WAV / RF64 / AIFF, raw MPEG audio, ADTS, FLAC, Ogg and MP4 / M4A / MOV audio tracks"
+
+[dependencies]
+mkff-audio-core = { path = "../mkff-audio-core" }
