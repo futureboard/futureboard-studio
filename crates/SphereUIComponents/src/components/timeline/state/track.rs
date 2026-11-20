@@ -638,8 +638,7 @@ impl TimelineState {
         } else {
             return false;
         };
-        let max_y = (layout.total_height - view_height).max(0.0);
-        let target = target.clamp(0.0, max_y);
+        let target = target.clamp(0.0, layout.max_scroll_y(view_height));
         if (target - scroll_y).abs() < 0.5 {
             return false;
         }
@@ -1155,6 +1154,15 @@ mod created_track_tests {
         let row = state.track_row_layout().rows[30].clone();
         let bottom = state.viewport.scroll_y + state.viewport.track_area_height;
         assert!(row.y >= state.viewport.scroll_y && row.y + row.height <= bottom + 0.5);
+        assert_eq!(state.viewport.target_scroll_y, state.viewport.scroll_y);
+
+        // From the last row at the top of the view, revealing the previous
+        // row should move back by only one row.
+        state.viewport.scroll_y = layout.rows[39].y;
+        state.viewport.target_scroll_y = state.viewport.scroll_y;
+        let previous = state.tracks[38].id.clone();
+        assert!(state.reveal_track_row(&previous));
+        assert_eq!(state.viewport.scroll_y, layout.rows[38].y);
         assert_eq!(state.viewport.target_scroll_y, state.viewport.scroll_y);
 
         let above = state.tracks[0].id.clone();

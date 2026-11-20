@@ -171,6 +171,20 @@ impl TrackRowLayout {
         self.rows.iter().find(|row| row.track_id == track_id)
     }
 
+    pub(crate) fn last_visible_track_row(&self) -> Option<&TrackRowLayoutEntry> {
+        // Trailing hidden rows have zero height and start at the end of the
+        // track rows, where the master automation block begins.
+        let end = self.rows.partition_point(|row| row.y < self.master_y);
+        self.rows[..end].last()
+    }
+
+    /// Let the last visible track reach the top, while keeping the end of
+    /// any taller track block or master automation reachable.
+    pub(crate) fn max_scroll_y(&self, viewport_height: f32) -> f32 {
+        let last_track_top = self.last_visible_track_row().map_or(0.0, |row| row.y);
+        (self.total_height - viewport_height).max(last_track_top)
+    }
+
     pub fn track_at_content_y(&self, content_y: f32) -> Option<&TrackRowLayoutEntry> {
         if content_y < 0.0 {
             return None;
@@ -805,7 +819,7 @@ impl TimelineState {
 
     /// Set every track in `base` to its height at `factor`, and return the
     /// scroll y that keeps the anchored track at `anchor_viewport_y`, clamped
-    /// to `[0, total - viewport_height]`. `None` when no visible row changed:
+    /// to the arrangement's scroll range. `None` when no visible row changed:
     /// a hidden row takes no space, so it moves nothing on screen.
     ///
     /// Rows are 1:1 with `tracks` by index, so the anchor is a row index plus
@@ -857,7 +871,7 @@ impl TimelineState {
         }
 
         let after = self.track_row_layout();
-        let max_scroll_y = (after.total_height - viewport_height).max(0.0);
+        let max_scroll_y = after.max_scroll_y(viewport_height);
         let next_scroll_y = anchor
             .and_then(|(viewport_y, index, within)| {
                 let row = after.row_for_index(index)?;
@@ -1066,6 +1080,60 @@ mod tests {
         assert_eq!(layout.rows[0].height, DEFAULT_TRACK_HEIGHT);
         assert_eq!(layout.rows[1].y, DEFAULT_TRACK_HEIGHT);
         assert_eq!(layout.total_height, DEFAULT_TRACK_HEIGHT * 2.0);
+    }
+
+    #[test]
+    fn vertical_scroll_can_bring_the_last_track_to_the_top() {
+        let state = sample_state(&[TrackType::Audio; 11]);
+        let layout = state.track_row_layout();
+        let last_track_top = DEFAULT_TRACK_HEIGHT * 10.0;
+
+        // The docked mixer changes the viewport height, not the track's top.
+        for viewport in [320.0, layout.total_height, 900.0] {
+            assert_eq!(layout.max_scroll_y(viewport), last_track_top);
+        }
+    }
+
+    #[test]
+    fn vertical_scroll_ignores_trailing_hidden_rows() {
+        let mut state = sample_state(&[
+            TrackType::Audio,
+            TrackType::Group,
+            TrackType::Audio,
+            TrackType::Bus,
+            TrackType::Return,
+        ]);
+        let group = state.tracks[1].id.clone();
+        let child = state.tracks[2].id.clone();
+        assert!(state.assign_track_to_group(&child, &group));
+        assert_eq!(state.toggle_group_collapsed(&group), Some(true));
+
+        let layout = state.track_row_layout();
+        assert_eq!(layout.max_scroll_y(500.0), DEFAULT_TRACK_HEIGHT);
+        assert_eq!(layout.last_visible_track_row().unwrap().track_id, group);
+    }
+
+    #[test]
+    fn vertical_scroll_can_reach_automation_below_the_last_track() {
+        let mut state = sample_state(&[TrackType::Audio; 2]);
+        state.tracks[1].lane_mode = TrackLaneMode::Automation;
+        state.master.automation_expanded = true;
+
+        let layout = state.track_row_layout();
+        let viewport = DEFAULT_TRACK_HEIGHT + AUTOMATION_CONTROL_LANE_HEIGHT;
+        assert_eq!(
+            layout.max_scroll_y(viewport),
+            DEFAULT_TRACK_HEIGHT + AUTOMATION_CONTROL_LANE_HEIGHT,
+        );
+        assert_eq!(layout.max_scroll_y(500.0), DEFAULT_TRACK_HEIGHT);
+    }
+
+    #[test]
+    fn vertical_scroll_has_no_extra_range_when_at_most_one_row_fits() {
+        for tracks in [&[][..], &[TrackType::Bus][..], &[TrackType::Audio][..]] {
+            let layout = sample_state(tracks).track_row_layout();
+            assert_eq!(layout.max_scroll_y(500.0), 0.0);
+        }
     }
 
     #[test]
@@ -1473,17 +1541,27 @@ mod tests {
         let viewport = 500.0;
         state.viewport.scroll_y = 720.0 - viewport;
 
-        // Zoomed out, the content fits the view: nothing left to scroll.
+        // The anchor would scroll above the first row after shrinking.
         let scroll_y = zoom_and_scroll(&mut state, 0.5, 390.0, viewport).unwrap();
         assert_eq!(state.total_track_rows_height(), 10.0 * MIN_TRACK_ROW_HEIGHT);
         assert_eq!(scroll_y, 0.0);
 
-        // Zoomed in near the bottom, the scroll stays inside the content.
+        // The anchor near the bottom now requires a positive scroll offset.
         let scroll_y = zoom_and_scroll(&mut state, 5.0, 400.0, viewport).unwrap();
-        let total = state.total_track_rows_height();
-        assert!(total > viewport);
         assert!(scroll_y > 0.0);
-        assert!(scroll_y <= total - viewport, "{scroll_y} of {total}");
+        assert!(scroll_y <= state.track_row_layout().max_scroll_y(viewport));
+    }
+
+    #[test]
+    fn track_zoom_preserves_the_last_row_at_the_top() {
+        let mut state = sample_state(&[TrackType::Audio; 3]);
+        state.viewport.scroll_y = DEFAULT_TRACK_HEIGHT * 2.0;
+
+        // Over the blank space below the final row, zoom anchors the row at
+        // the top of the viewport just as it does elsewhere in the arrangement.
+        let scroll_y = zoom_and_scroll(&mut state, 1.5, 300.0, 500.0).unwrap();
+        assert_eq!(scroll_y, DEFAULT_TRACK_HEIGHT * 3.0);
+        assert_eq!(anchor_at(&state, 0.0), (2, 0.0));
     }
 
     /// Every tick that changes a row marks the project, not only a burst's

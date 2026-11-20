@@ -58,7 +58,7 @@ impl Render for Timeline {
         }
         let mut row_layout = self.state.track_row_layout();
         let (viewport_w, viewport_h, (scroll_max_x, scroll_max_y)) =
-            self.scroll_geometry_with_content_height(window, row_layout.total_height);
+            self.scroll_geometry_with_row_layout(window, &row_layout);
         self.state.update_viewport_size(viewport_w, viewport_h);
         // A reopened project's saved scroll (`pending_view_restore`) lands on
         // the first frame with a real viewport, before the clamp.
@@ -1859,7 +1859,6 @@ impl Render for Timeline {
         // position to that point — gives a functional scrollbar without
         // needing a stateful drag.
         let content_w = self.timeline_content_width();
-        let content_h = row_layout.total_height.max(1.0);
         let lane_view_h = viewport_h.max(DEFAULT_TRACK_HEIGHT);
         let lane_view_w = viewport_w.max(1.0);
         let toolbar_default = (16.0, (content_top + lane_view_h - 48.0).max(16.0));
@@ -3110,7 +3109,6 @@ impl Render for Timeline {
             .child(vertical_scrollbar(
                 cx,
                 state.viewport.scroll_y,
-                content_h,
                 lane_view_h,
                 scroll_max_y,
                 content_top,
@@ -3216,7 +3214,6 @@ impl Render for Timeline {
 pub(crate) fn vertical_scrollbar(
     cx: &mut Context<Timeline>,
     scroll_y: f32,
-    content_h: f32,
     view_h: f32,
     max_scroll: f32,
     content_top: f32,
@@ -3225,7 +3222,8 @@ pub(crate) fn vertical_scrollbar(
         return Empty.into_any_element();
     }
     let track_h = view_h;
-    let thumb_h = ((view_h / content_h) * track_h).max(SCROLLBAR_MIN_THUMB);
+    let scrollable_h = view_h + max_scroll;
+    let thumb_h = ((view_h / scrollable_h) * track_h).max(SCROLLBAR_MIN_THUMB);
     let progress = (scroll_y / max_scroll).clamp(0.0, 1.0);
     let thumb_top = progress * (track_h - thumb_h).max(0.0);
 
@@ -3276,6 +3274,7 @@ pub(crate) fn vertical_scrollbar(
         .bottom(px(0.0))
         .w(px(SCROLLBAR_THICKNESS))
         .id("timeline-vscroll")
+        .block_mouse_except_scroll()
         .on_mouse_down(gpui::MouseButton::Left, on_track_click)
         .on_drag(
             ScrollbarDrag {
@@ -4212,6 +4211,75 @@ pub(crate) fn timeline_marker_region_overlay(state: &TimelineState) -> Option<gp
             .children(children)
             .into_any_element(),
     )
+}
+
+#[cfg(test)]
+mod vertical_scroll_tests {
+    use super::*;
+
+    #[gpui::test]
+    fn wheel_and_scrollbar_reach_the_same_last_track(cx: &mut gpui::TestAppContext) {
+        let width = px(1200.0);
+        let window = cx.open_window(gpui::size(width, px(1100.0)), |_, _| {
+            let mut timeline = Timeline::new();
+            timeline.state.tracks.clear();
+            for _ in 0..11 {
+                timeline.state.create_audio_track();
+            }
+            let first_track = timeline.state.tracks[0].id.clone();
+            timeline.state.insert_recorded_clip(
+                &first_track,
+                "test.wav".to_owned(),
+                "Test clip".to_owned(),
+                0.0,
+                60.0,
+                120.0,
+            );
+            timeline.state.selection.selected_clip_ids.clear();
+            timeline
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        let last_track_top = DEFAULT_TRACK_HEIGHT * 10.0;
+
+        for height in [px(1100.0), px(650.0)] {
+            cx.simulate_resize(gpui::size(width, height));
+            cx.run_until_parked();
+            let content_top = window
+                .update(&mut cx, |timeline, _, _| {
+                    timeline.state.timeline_origin_y() + timeline.state.arrangement_content_top()
+                })
+                .expect("window is open");
+            let modifiers = gpui::Modifiers::default();
+            for (delta, expected) in [(-1000.0, last_track_top), (1000.0, 0.0)] {
+                cx.simulate_event(gpui::ScrollWheelEvent {
+                    position: gpui::point(px(600.0), px(content_top + 20.0)),
+                    delta: ScrollDelta::Pixels(gpui::point(px(0.0), px(delta))),
+                    modifiers,
+                    touch_phase: gpui::TouchPhase::Moved,
+                });
+                window
+                    .update(&mut cx, |timeline, _, _| {
+                        assert_eq!(timeline.state.viewport.scroll_y, expected);
+                    })
+                    .expect("window is open");
+            }
+
+            let x = width - px(SCROLLBAR_THICKNESS * 0.5);
+            let button = gpui::MouseButton::Left;
+            let start = gpui::point(x, px(content_top + 12.0));
+            let end = gpui::point(x, height - px(12.0));
+            cx.simulate_mouse_down(start, button, modifiers);
+            cx.simulate_mouse_move(gpui::point(x, start.y + px(12.0)), button, modifiers);
+            cx.simulate_mouse_move(end, button, modifiers);
+            cx.simulate_mouse_up(end, button, modifiers);
+            window
+                .update(&mut cx, |timeline, _, _| {
+                    assert_eq!(timeline.state.viewport.scroll_y, last_track_top);
+                    assert!(timeline.state.selection.selected_clip_ids.is_empty());
+                })
+                .expect("window is open");
+        }
+    }
 }
 
 #[cfg(test)]
