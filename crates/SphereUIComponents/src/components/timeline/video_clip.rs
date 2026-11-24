@@ -12,7 +12,7 @@
 //! clip.
 
 use crate::components::timeline::timeline_state::{
-    ClipDragItem, ClipEdge, ClipResizeDrag, ClipState, ClipType, TimelineState,
+    ClipDragItem, ClipEdge, ClipResizeDrag, ClipState, ClipType,
 };
 use crate::{assets, theme::Colors};
 use gpui::prelude::FluentBuilder;
@@ -28,11 +28,10 @@ const RESIZE_HANDLE_W: f32 = 6.0;
 /// Below this width the film icon is dropped so the name keeps the whole bar.
 const ICON_MIN_CLIP_W: f32 = 56.0;
 
-pub fn video_clip(
+pub(crate) fn video_clip(
     clip: &ClipState,
     track_id: &str,
     track_color: gpui::Rgba,
-    state: &TimelineState,
     row_height: f32,
     on_select_clip: std::sync::Arc<
         dyn Fn(&(String, bool, bool), &mut gpui::Window, &mut gpui::App) + 'static,
@@ -45,6 +44,8 @@ pub fn video_clip(
         std::sync::Arc<dyn Fn(&String, &mut gpui::Window, &mut gpui::App) + 'static>,
     >,
     erase_target: bool,
+    selected: bool,
+    (left, width): (f32, f32),
 ) -> impl IntoElement {
     let clip_id = clip.id.clone();
     let context_clip_id = clip.id.clone();
@@ -54,10 +55,6 @@ pub fn video_clip(
     let drag_name = clip.name.clone();
     let drag_start_beat = clip.start_beat;
 
-    let selected = state
-        .display_selection()
-        .selected_clip_ids
-        .contains(&clip.id);
     let unresolved = matches!(
         &clip.clip_type,
         ClipType::Video {
@@ -67,12 +64,7 @@ pub fn video_clip(
     );
 
     // The shared clip rectangle, the one the marquee hit-tests against.
-    let lane_rect = state.clip_lane_rect(clip, row_height);
-    let left = lane_rect.left;
-    let width = lane_rect.width;
-
-    let pad = lane_rect.top;
-    let clip_h = lane_rect.height;
+    let (pad, clip_h) = super::timeline_state::clip_lane_band(row_height);
 
     let id_num = {
         use std::hash::{Hash, Hasher};

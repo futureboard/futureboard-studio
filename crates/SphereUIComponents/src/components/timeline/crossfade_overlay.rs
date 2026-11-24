@@ -353,7 +353,7 @@ mod tests {
         state.tracks.clear();
         let track_id = state.create_audio_track();
         let track = state.tracks.iter_mut().find(|t| t.id == track_id).unwrap();
-        track.clips = clips;
+        track.clips = clips.into();
         state.reconcile_audio_clip_lengths();
         state.viewport.pixels_per_second = 100.0;
         state.sync_pixels_per_beat();

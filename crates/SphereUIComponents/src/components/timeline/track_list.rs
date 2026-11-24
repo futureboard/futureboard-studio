@@ -47,7 +47,7 @@ fn timeline_bg_debug_enabled() -> bool {
 /// `row_layout` is this frame's arrangement geometry, built once by
 /// `Timeline::render` and shared with the arrangement surface — rebuilding it
 /// here would clone every track id a second time per frame.
-pub fn track_list(
+pub(crate) fn track_list(
     state: &TimelineState,
     row_layout: &TrackRowLayout,
     meters: &SharedArrangementOverlay,
@@ -97,6 +97,7 @@ pub fn track_list(
     // This frame's gesture snapshot, built once by `Timeline::render` and
     // shared with the cached lane views so it is not derived twice.
     gesture: &std::rc::Rc<TimelineGestureContext>,
+    clip_frame: &super::track_lane_view::ClipLaneFrame,
     // One cached view per track lane, for the same reason as the grid. Empty on
     // the very first render, which falls back to the inline build below.
     lane_views: &TrackLaneViews,
@@ -274,6 +275,7 @@ pub fn track_list(
                                     index,
                                     state,
                                     gesture,
+                                    clip_frame,
                                     row_height,
                                     on_select_track.clone(),
                                     on_select_clip.clone(),

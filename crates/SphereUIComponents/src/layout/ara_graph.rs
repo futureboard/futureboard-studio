@@ -491,7 +491,7 @@ mod tests {
             audio_import: Default::default(),
             stretch: Default::default(),
         };
-        state.tracks[0].clips = vec![clip];
+        state.tracks[0].clips = vec![clip].into();
         state
     }
 
@@ -519,7 +519,7 @@ mod tests {
             .expect("just created");
         track.name = "Harmony".to_string();
         track.ara = binding;
-        track.clips = vec![clip];
+        track.clips = vec![clip].into();
         let members = vec![state.tracks[0].id.clone(), second.clone()];
 
         let mut shape = |_: &str| Some((48_000.0, 192_000, 2));

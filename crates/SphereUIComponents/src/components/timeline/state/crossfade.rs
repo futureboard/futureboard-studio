@@ -625,7 +625,15 @@ impl TimelineState {
     /// staggered pair crossfades — `a` starts before `b` and ends before `b`
     /// does — and the overlap is timed through the tempo map.
     pub fn audio_crossfades(&self, track: &TrackState) -> TrackCrossfades {
-        self.crossfades_among(track, crossfade_candidate)
+        self.crossfades_among(track, crossfade_candidate, None)
+    }
+
+    pub(crate) fn audio_crossfades_in(
+        &self,
+        track: &TrackState,
+        map: &std::sync::Arc<DirectAudio::TempoMap>,
+    ) -> TrackCrossfades {
+        self.crossfades_among(track, crossfade_candidate, Some(map))
     }
 
     /// Every crossfade the engine plays on `track`: the audio crossfades, and
@@ -636,7 +644,7 @@ impl TimelineState {
     pub fn engine_crossfades(&self, track: &TrackState) -> TrackCrossfades {
         let mut crossfades = self.audio_crossfades(track);
         crossfades.crossfades.extend(
-            self.crossfades_among(track, video_crossfade_candidate)
+            self.crossfades_among(track, video_crossfade_candidate, None)
                 .crossfades,
         );
         crossfades
@@ -646,7 +654,12 @@ impl TimelineState {
         &self,
         track: &TrackState,
         candidate: fn(&ClipState) -> bool,
+        resolved_tempo: Option<&std::sync::Arc<DirectAudio::TempoMap>>,
     ) -> TrackCrossfades {
+        let local_tempo = std::cell::OnceCell::new();
+        let map = || {
+            resolved_tempo.unwrap_or_else(|| local_tempo.get_or_init(|| self.resolved_tempo_map()))
+        };
         let mut spans: Vec<(f64, f64, usize)> = track
             .clips
             .iter()
@@ -655,7 +668,8 @@ impl TimelineState {
             .map(|(index, clip)| {
                 (
                     clip.start_beat.max(0.0) as f64,
-                    self.crossfade_clip_end_beat(clip),
+                    self.audio_clip_end_beat_in(clip, map())
+                        .unwrap_or((clip.start_beat + clip.duration_beats.max(0.0)) as f64),
                     index,
                 )
             })
@@ -674,7 +688,7 @@ impl TimelineState {
         }
 
         let overlaps = staggered_overlaps(&spans);
-        let tempo = self.tempo_lookup();
+        let tempo = self.tempo_lookup_in(map());
         let mut crossfades = Vec::new();
         for (i, &(_, a_end, a_index)) in spans.iter().enumerate() {
             if overlaps[i].is_empty() {
@@ -739,7 +753,52 @@ impl TimelineState {
         crossfade_in: Option<f64>,
         crossfade_out: Option<f64>,
     ) -> EffectiveFades {
-        let played = self.clip_played_seconds(clip);
+        self.effective_fades_for_played_time(
+            clip,
+            crossfade_in,
+            crossfade_out,
+            self.clip_played_seconds(clip),
+        )
+    }
+
+    pub(crate) fn effective_clip_fades_indexed_in(
+        &self,
+        clip: &ClipState,
+        crossfades: &CrossfadeIndex<'_>,
+        time: &ClipTimeAxis<'_>,
+    ) -> EffectiveFades {
+        self.effective_clip_fades_in(
+            clip,
+            crossfades.fade_in.get(clip.id.as_str()).copied(),
+            crossfades.fade_out.get(clip.id.as_str()).copied(),
+            time,
+        )
+    }
+
+    pub(crate) fn effective_clip_fades_in(
+        &self,
+        clip: &ClipState,
+        crossfade_in: Option<f64>,
+        crossfade_out: Option<f64>,
+        time: &ClipTimeAxis<'_>,
+    ) -> EffectiveFades {
+        let played = clip
+            .stretch
+            .played_seconds_for_project_bpm(self.bpm.max(1.0) as f64)
+            .unwrap_or_else(|| {
+                time.local_seconds_at_beat((clip.start_beat + clip.duration_beats.max(0.0)) as f64)
+            })
+            .max(0.0);
+        self.effective_fades_for_played_time(clip, crossfade_in, crossfade_out, played)
+    }
+
+    fn effective_fades_for_played_time(
+        &self,
+        clip: &ClipState,
+        crossfade_in: Option<f64>,
+        crossfade_out: Option<f64>,
+        played: f64,
+    ) -> EffectiveFades {
         let (in_seconds, out_seconds) = resolve_effective_fades(
             clip.stretch.fade_in_ms as f64 / 1000.0,
             clip.stretch.fade_out_ms as f64 / 1000.0,
@@ -815,11 +874,11 @@ impl TimelineState {
     /// its track. For gesture previews, which must not reorder clips.
     pub fn replace_clip_in_place(&mut self, clip: &ClipState) -> bool {
         for track in &mut self.tracks {
-            if let Some(slot) = track.clips.iter_mut().find(|c| c.id == clip.id) {
-                if *slot == *clip {
+            if let Some(index) = track.clips.iter().position(|c| c.id == clip.id) {
+                if track.clips[index] == *clip {
                     return false;
                 }
-                *slot = clip.clone();
+                track.clips[index] = clip.clone();
                 return true;
             }
         }
@@ -849,6 +908,15 @@ impl TimelineState {
         self.crossfade_room(left, right).err()
     }
 
+    pub(crate) fn crossfade_adjust_block_in(
+        &self,
+        left: &ClipState,
+        right: &ClipState,
+        tempo: &ArrangementTempo,
+    ) -> Option<CrossfadeBlock> {
+        self.crossfade_room_in(left, right, tempo).err()
+    }
+
     /// Whether [`Self::plan_crossfade`] can resize the crossfade between
     /// `left` and `right`: some length of at least [`MIN_CROSSFADE_SECONDS`]
     /// plans. A drag on a crossfade handle starts only then.
@@ -865,9 +933,19 @@ impl TimelineState {
         left: &ClipState,
         right: &ClipState,
     ) -> Result<CrossfadeRoom, CrossfadeBlock> {
+        self.crossfade_room_in(left, right, &ArrangementTempo::new(self))
+    }
+
+    fn crossfade_room_in(
+        &self,
+        left: &ClipState,
+        right: &ClipState,
+        frame_tempo: &ArrangementTempo,
+    ) -> Result<CrossfadeRoom, CrossfadeBlock> {
         if let Some(block) = crossfade_pair_block(left, right) {
             return Err(block);
         }
+        let tempo = frame_tempo.lookup(self);
         let project_bpm = self.bpm.max(1.0) as f64;
         let frames_per_second = |clip: &ClipState| -> f64 {
             let ratio = clip.stretch.effective_time_ratio(project_bpm);
@@ -881,9 +959,12 @@ impl TimelineState {
         let left_fps = frames_per_second(left);
         let right_fps = frames_per_second(right);
 
-        let left_start = self.seconds_at_beat(left.start_beat.max(0.0) as f64);
-        let right_start = self.seconds_at_beat(right.start_beat.max(0.0) as f64);
-        let right_end = self.seconds_at_beat(self.crossfade_clip_end_beat(right));
+        let left_start = tempo.seconds_at_beat(left.start_beat.max(0.0) as f64);
+        let right_start = tempo.seconds_at_beat(right.start_beat.max(0.0) as f64);
+        let right_end = tempo.seconds_at_beat(
+            self.audio_clip_end_beat_in(right, frame_tempo.map())
+                .unwrap_or((right.start_beat + right.duration_beats.max(0.0)) as f64),
+        );
         if right_start <= left_start {
             return Err(CrossfadeBlock::NoRoom);
         }
@@ -897,11 +978,15 @@ impl TimelineState {
         };
         let left_max_local =
             left_total.saturating_sub(left.stretch.source_start_samples) as f64 / left_fps;
-        let latest_end =
-            self.seconds_at_beat(self.clip_beat_at_local_seconds(left, left_max_local));
+        let latest_end = tempo.seconds_at_beat(
+            self.clip_time_axis_in(tempo.clone(), left)
+                .beat_at_local_seconds(left_max_local),
+        );
         let right_min_local = -(right.stretch.source_start_samples as f64) / right_fps;
-        let earliest_start =
-            self.seconds_at_beat(self.clip_beat_at_local_seconds(right, right_min_local));
+        let earliest_start = tempo.seconds_at_beat(
+            self.clip_time_axis_in(tempo.clone(), right)
+                .beat_at_local_seconds(right_min_local),
+        );
 
         let min_body = self.beats_to_seconds(MIN_AUDIO_CLIP_BEATS) as f64;
         let low = earliest_start.max(left_start + min_body);
@@ -1332,7 +1417,7 @@ mod tests {
         state.tracks.clear();
         let track_id = state.create_audio_track();
         let track = state.tracks.iter_mut().find(|t| t.id == track_id).unwrap();
-        track.clips = clips;
+        track.clips = clips.into();
         state.reconcile_audio_clip_lengths();
         state
     }

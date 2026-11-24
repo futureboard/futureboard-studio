@@ -40,10 +40,10 @@ use crate::components::timeline::timeline_ruler::{
 };
 use crate::components::timeline::timeline_state::{
     hit_test_arrangement, ArrangementCoordinateContext, ArrangementHitTarget, ClipDragItem,
-    ClipEdge, ClipResizeDrag, ClipState, ClipType, GlobalLaneKind, GlobalLaneResizeDrag,
-    TempoLaneDrag, TimeSignaturePointDrag, TimelineMarkerDrag, TimelineMarkerState,
-    TimelineRegionState, TimelineState, TimelineTool, TrackDragItem, TrackHeightResizeDrag,
-    TrackType, DEFAULT_TRACK_HEIGHT, HEADER_WIDTH, RULER_HEIGHT,
+    ClipEdge, ClipLocation, ClipResizeDrag, ClipState, ClipType, GlobalLaneKind,
+    GlobalLaneResizeDrag, TempoLaneDrag, TimeSignaturePointDrag, TimelineMarkerDrag,
+    TimelineMarkerState, TimelineRegionState, TimelineState, TimelineTool, TrackDragItem,
+    TrackHeightResizeDrag, TrackType, DEFAULT_TRACK_HEIGHT, HEADER_WIDTH, RULER_HEIGHT,
 };
 use crate::components::timeline::track_list::track_list;
 use crate::theme::Colors;
@@ -132,6 +132,28 @@ struct ClipMoveOrigin {
     anchor_clip_id: String,
     anchor_start: f32,
     clips: Vec<ClipSnapshot>,
+    locations: Vec<Option<ClipLocation>>,
+}
+
+impl ClipMoveOrigin {
+    fn locations(&self, state: &TimelineState) -> std::borrow::Cow<'_, [Option<ClipLocation>]> {
+        if self
+            .locations
+            .iter()
+            .zip(&self.clips)
+            .all(|(slot, snapshot)| {
+                slot.is_some_and(|slot| slot.clip(state, &snapshot.clip.id).is_some())
+            })
+        {
+            return std::borrow::Cow::Borrowed(&self.locations);
+        }
+        let ids: Vec<_> = self
+            .clips
+            .iter()
+            .map(|snapshot| snapshot.clip.id.as_str())
+            .collect();
+        std::borrow::Cow::Owned(state.locate_clips(&ids))
+    }
 }
 
 /// A press on a clip that was already selected. Its selection change waits
@@ -296,8 +318,6 @@ pub struct Timeline {
     range_select_drag: Option<RangeSelectDrag>,
     /// Right-drag erase: clip ids already queued for deletion this gesture.
     erase_clip_drag: Option<HashSet<String>>,
-    /// Live preview of clip ids marked for erase (mirrors `erase_clip_drag`).
-    erase_preview_ids: HashSet<String>,
     /// The notes each ARA clip sounds after its plug-in's edits, by clip id,
     /// drawn over the clip (see [`Self::set_ara_notes`]). Read from the
     /// plug-in, never saved, and outside the undo state.

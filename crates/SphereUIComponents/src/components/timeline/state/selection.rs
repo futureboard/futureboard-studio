@@ -144,16 +144,21 @@ impl TimelineSelection {
         additive: bool,
     ) {
         if additive {
-            for clip_id in clip_ids {
-                if !self.selected_clip_ids.contains(&clip_id) {
-                    self.selected_clip_ids.push(clip_id);
-                }
-            }
-            for track_id in track_ids {
-                if !self.selected_track_ids.contains(track_id) {
-                    self.selected_track_ids.push(track_id.clone());
-                }
-            }
+            let mut selected_clips: std::collections::HashSet<_> =
+                self.selected_clip_ids.iter().cloned().collect();
+            self.selected_clip_ids.extend(
+                clip_ids
+                    .into_iter()
+                    .filter(|id| selected_clips.insert(id.clone())),
+            );
+            let mut selected_tracks: std::collections::HashSet<_> =
+                self.selected_track_ids.iter().cloned().collect();
+            self.selected_track_ids.extend(
+                track_ids
+                    .iter()
+                    .filter(|id| selected_tracks.insert((*id).clone()))
+                    .cloned(),
+            );
             if self.selected_track_id.is_none() {
                 self.selected_track_id = Some(anchor.to_string());
             }
@@ -241,6 +246,7 @@ impl TimelineState {
     /// a track nobody could see.
     pub fn marquee_hits(&self, rows: &TrackRowLayout, rect: MarqueeRect) -> MarqueeHits {
         let mut hits = MarqueeHits::default();
+        let tempo = ArrangementTempo::new(self);
         let first = rows
             .rows
             .partition_point(|row| row.y + row.block_height() <= rect.top);
@@ -276,24 +282,15 @@ impl TimelineState {
             {
                 continue;
             }
-            for clip in &track.clips {
-                // An alternate take is not drawn in this band.
-                if track.is_hidden_take_clip(&clip.id) {
-                    continue;
-                }
-                // A clip drawn from at or past the rectangle's right edge is
-                // not touched however long it is, so its end (through the
-                // tempo map, for audio) is never measured. This is the left
-                // edge `clip_lane_rect` draws it at.
-                if self.beats_to_x(clip.start_beat) >= rect.right {
-                    continue;
-                }
-                let drawn = self.clip_lane_rect(clip, row.height);
+            for (index, left, width) in
+                self.clips_in_lane_range(track, &tempo, rect.left, rect.right, false)
+            {
+                let clip = &track.clips[index];
                 let drawn = (
-                    drawn.left,
-                    row.y + drawn.top,
-                    drawn.right(),
-                    row.y + drawn.bottom(),
+                    left,
+                    row.y + band_top,
+                    left + width,
+                    row.y + (band_top + band_height),
                 );
                 if crate::components::edit::rects_intersect(rect.as_tuple(), drawn) {
                     hits.clip_ids.push(clip.id.clone());
@@ -321,16 +318,10 @@ impl TimelineState {
                     .filter(|track| track.id == row.track_id)
             })
             .map(|track| {
-                track
-                    .clips
-                    .iter()
-                    .filter(|clip| {
-                        let (left, width) = self.clip_lane_x_span(clip);
-                        !track.is_hidden_take_clip(&clip.id)
-                            && lane_x >= left
-                            && lane_x <= left + width
-                    })
-                    .map(|clip| clip.id.clone())
+                let tempo = ArrangementTempo::new(self);
+                self.clips_in_lane_range(track, &tempo, lane_x, lane_x, false)
+                    .into_iter()
+                    .map(|(index, _, _)| track.clips[index].id.clone())
                     .collect()
             })
             .unwrap_or_default()
