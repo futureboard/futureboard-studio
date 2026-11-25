@@ -301,7 +301,6 @@ impl Timeline {
         self.pending_clip_click = None;
         self.cut_hover = None;
         self.erase_clip_drag = None;
-        self.erase_preview_ids.clear();
         self.automation_drag = None;
         self.automation_curve_drag = None;
         self.automation_marquee = None;
@@ -379,7 +378,6 @@ impl Timeline {
             pen_clip_draw: None,
             range_select_drag: None,
             erase_clip_drag: None,
-            erase_preview_ids: HashSet::new(),
             ara_notes: Default::default(),
             automation_drag: None,
             automation_curve_drag: None,
@@ -491,7 +489,6 @@ impl Timeline {
             pen_clip_draw: None,
             range_select_drag: None,
             erase_clip_drag: None,
-            erase_preview_ids: HashSet::new(),
             ara_notes: Default::default(),
             automation_drag: None,
             automation_curve_drag: None,
@@ -1937,6 +1934,7 @@ impl Timeline {
                 index,
                 &self.state,
                 &ctx.gesture,
+                &ctx.clips,
                 row.height,
                 ctx.on_select_track.clone(),
                 ctx.on_select_clip.clone(),
@@ -1948,7 +1946,7 @@ impl Timeline {
                 ctx.on_erase_start.clone(),
                 ctx.on_erase_clip.clone(),
                 ctx.on_cut_clip.clone(),
-                Some(&self.erase_preview_ids),
+                self.erase_clip_drag.as_ref(),
                 ctx.on_audio_clip_process_preview.clone(),
                 ctx.on_audio_clip_process_commit.clone(),
                 ctx.on_crossfade.clone(),
@@ -2612,18 +2610,20 @@ impl Timeline {
         let Some(erased) = self.erase_clip_drag.take() else {
             return;
         };
-        self.erase_preview_ids.clear();
         if erased.is_empty() {
             return;
         }
-        let snapshots: Vec<ClipSnapshot> = erased
-            .iter()
-            .filter_map(|id| ClipSnapshot::capture(&self.state, id))
+        let ids: Vec<_> = erased.iter().map(String::as_str).collect();
+        let snapshots: Vec<_> = self
+            .state
+            .locate_clips(&ids)
+            .into_iter()
+            .flatten()
+            .map(|slot| ClipSnapshot::at(&self.state.tracks[slot.track], slot.index))
             .collect();
         if snapshots.is_empty() {
             return;
         }
-        self.erase_preview_ids.clear();
         self.run_edit_command(EditCommand::BatchDeleteClips { snapshots }, cx);
     }
 
@@ -2648,7 +2648,6 @@ impl Timeline {
         let before = set.len();
         set.extend(ids);
         if set.len() != before {
-            self.erase_preview_ids = set.clone();
             cx.notify();
         }
     }
@@ -2661,7 +2660,6 @@ impl Timeline {
         if let Some(id) = clip_id {
             set.insert(id);
         }
-        self.erase_preview_ids = set.clone();
         self.erase_clip_drag = Some(set);
         cx.notify();
     }
@@ -3837,8 +3835,7 @@ impl Timeline {
             .state
             .tracks
             .iter()
-            .flat_map(|track| track.clips.iter())
-            .map(|clip| clip.start_beat + clip.duration_beats)
+            .filter_map(|track| track.clips.last_end_beat())
             .reduce(f32::max);
         let tempo = self.state.tempo_lookup();
         let clip_end_seconds = last_clip_end_beat
@@ -3967,7 +3964,6 @@ impl Timeline {
             + m.bottom_panel_height
             + m.status_bar_height;
         let track_view_h = (window_h - used_v).max(DEFAULT_TRACK_HEIGHT);
-        let content_w = self.timeline_content_width();
 
         static VIEWPORT_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *VIEWPORT_DEBUG
@@ -4023,11 +4019,24 @@ impl Timeline {
             // The first move of this drag: nothing has changed yet, so this is
             // the "before" of the one undo step the drop records — every clip
             // that moves with the grabbed one, at its index in its track.
-            let clips: Vec<ClipSnapshot> = self
-                .clip_drag_selection_ids(&drag.clip_id)
-                .iter()
-                .filter_map(|id| ClipSnapshot::capture(&self.state, id))
-                .collect();
+            let selected = &self.state.selection.selected_clip_ids;
+            let ids: Vec<_> = if selected.contains(&drag.clip_id) {
+                selected.iter().map(String::as_str).collect()
+            } else {
+                vec![drag.clip_id.as_str()]
+            };
+            let (clips, locations): (Vec<_>, Vec<_>) = self
+                .state
+                .locate_clips(&ids)
+                .into_iter()
+                .flatten()
+                .map(|slot| {
+                    (
+                        ClipSnapshot::at(&self.state.tracks[slot.track], slot.index),
+                        Some(slot),
+                    )
+                })
+                .unzip();
             let Some(anchor_start) = clips
                 .iter()
                 .find(|snapshot| snapshot.clip.id == drag.clip_id)
@@ -4039,6 +4048,7 @@ impl Timeline {
                 anchor_clip_id: drag.clip_id.clone(),
                 anchor_start,
                 clips,
+                locations,
             });
             // A drag, not a click: the press's deferred selection change is off.
             self.pending_clip_click = None;
@@ -4052,11 +4062,13 @@ impl Timeline {
         }
         self.clip_drag_target_track_index = Some(target_index);
 
-        let Some(move_origin) = self.clip_move_origin.as_ref() else {
+        let Some(move_origin) = self.clip_move_origin.as_mut() else {
             return;
         };
-        // Every clip from its origin plus one anchor delta: the preview never
-        // drifts, and the drop commits exactly these positions.
+        if let std::borrow::Cow::Owned(locations) = move_origin.locations(&self.state) {
+            move_origin.locations = locations;
+        }
+        // Resolve from the original positions, even after many pointer moves.
         let origin_starts: Vec<f32> = move_origin
             .clips
             .iter()
@@ -4067,16 +4079,13 @@ impl Timeline {
             move_origin.anchor_start,
             snapped,
         );
-        let moves: Vec<(String, f32)> = move_origin
-            .clips
-            .iter()
-            .map(|snapshot| snapshot.clip.id.clone())
-            .zip(starts)
-            .collect();
-        for (clip_id, start) in moves {
-            // In place: the preview must not reorder the track's clips, or the
-            // captured indices would no longer say where each clip was.
-            self.state.set_clip_start_in_place(&clip_id, start);
+        for (slot, start) in move_origin.locations.iter().zip(starts) {
+            if let Some(slot) = slot {
+                let track = &mut self.state.tracks[slot.track];
+                if track.clips[slot.index].start_beat != start {
+                    track.clips[slot.index].start_beat = start;
+                }
+            }
         }
 
         let (max_x, max_y) = self.max_scroll_offsets(window);
@@ -4105,69 +4114,45 @@ impl Timeline {
         else {
             return;
         };
-        let clip_ids: Vec<String> = origin
-            .clips
-            .iter()
-            .map(|snapshot| snapshot.clip.id.clone())
-            .collect();
-        let mut target_track_id = None;
-        if let Some(target_index) = target_track_index {
-            let source_index = self
-                .state
-                .tracks
+        let mut locations = origin.locations(&self.state);
+        let target_track_id = target_track_index
+            .and_then(|target| self.state.tracks.get(target))
+            .map(|track| track.id.clone());
+        if let Some(target) = target_track_index.filter(|_| target_track_id.is_some()) {
+            let source = origin
+                .clips
                 .iter()
-                .position(|track| {
-                    origin
-                        .clips
-                        .iter()
-                        .any(|s| s.clip.id == anchor_clip_id && s.track_id == track.id)
-                })
-                .unwrap_or(target_index);
-            let track_delta = target_index as isize - source_index as isize;
-            let max_index = self.state.tracks.len().saturating_sub(1) as isize;
-            for clip_id in &clip_ids {
-                let Some((track_index, start)) =
+                .find(|snapshot| snapshot.clip.id == anchor_clip_id)
+                .and_then(|snapshot| {
                     self.state
                         .tracks
                         .iter()
-                        .enumerate()
-                        .find_map(|(index, track)| {
-                            track
-                                .clips
-                                .iter()
-                                .find(|clip| clip.id == *clip_id)
-                                .map(|clip| (index, clip.start_beat))
-                        })
-                else {
-                    continue;
-                };
-                let Some(track_id) = self
-                    .state
-                    .tracks
-                    .get((track_index as isize + track_delta).clamp(0, max_index) as usize)
-                    .map(|track| track.id.clone())
-                else {
-                    continue;
-                };
+                        .position(|track| track.id == snapshot.track_id)
+                })
+                .unwrap_or(target);
+            if source != target {
                 self.state
-                    .move_clip_to_track_unsnapped(clip_id, &track_id, start);
+                    .move_clip_group_to_tracks(&locations, target as isize - source as isize);
+                let ids: Vec<_> = origin
+                    .clips
+                    .iter()
+                    .map(|snapshot| snapshot.clip.id.as_str())
+                    .collect();
+                locations = std::borrow::Cow::Owned(self.state.locate_clips(&ids));
             }
-            target_track_id = self
-                .state
-                .tracks
-                .get(target_index)
-                .map(|track| track.id.clone());
         }
-        let next: Vec<ClipSnapshot> = clip_ids
-            .iter()
-            .filter_map(|id| ClipSnapshot::capture(&self.state, id))
-            .collect();
-        let previous: Vec<ClipSnapshot> = origin
+        let locations = locations.into_owned();
+        let (previous, next): (Vec<_>, Vec<_>) = origin
             .clips
             .into_iter()
-            .filter(|before| next.iter().any(|after| after.clip.id == before.clip.id))
-            .collect();
-        self.restore_clip_drag_selection(anchor_clip_id, clip_ids, target_track_id);
+            .zip(locations)
+            .filter_map(|(before, location)| {
+                let location = location?;
+                let after = ClipSnapshot::at(&self.state.tracks[location.track], location.index);
+                Some((before, after))
+            })
+            .unzip();
+        self.restore_clip_drag_selection(anchor_clip_id, &next, target_track_id);
         let changed = previous.iter().zip(&next).any(|(before, after)| {
             before.track_id != after.track_id
                 || before.index != after.index
@@ -4209,33 +4194,25 @@ impl Timeline {
         }
     }
 
-    pub(super) fn restore_clip_drag_selection(
+    fn restore_clip_drag_selection(
         &mut self,
         dragged_clip_id: &str,
-        clip_ids: Vec<String>,
+        clips: &[ClipSnapshot],
         fallback_track_id: Option<String>,
     ) {
-        let existing = clip_ids
-            .into_iter()
-            .filter(|id| self.state.find_clip(id).is_some())
-            .collect::<Vec<_>>();
-        if existing.is_empty() {
+        let Some(first) = clips.first() else {
             return;
-        }
-
-        let selected_track_id = self
-            .state
-            .find_clip(dragged_clip_id)
-            .map(|(track, _)| track.id.clone())
+        };
+        self.state.selection.selected_track_id = clips
+            .iter()
+            .find(|snapshot| snapshot.clip.id == dragged_clip_id)
+            .map(|snapshot| snapshot.track_id.clone())
             .or(fallback_track_id)
-            .or_else(|| {
-                existing
-                    .first()
-                    .and_then(|id| self.state.find_clip(id))
-                    .map(|(track, _)| track.id.clone())
-            });
-        self.state.selection.selected_track_id = selected_track_id;
-        self.state.selection.selected_clip_ids = existing;
+            .or_else(|| Some(first.track_id.clone()));
+        self.state.selection.selected_clip_ids = clips
+            .iter()
+            .map(|snapshot| snapshot.clip.id.clone())
+            .collect();
     }
 
     pub(super) fn resolve_clip_drag_target(

@@ -1,7 +1,7 @@
 use crate::components::edit::{lane_press_intent, LanePressIntent};
 use crate::components::timeline::audio_clip::{
-    audio_clip, audio_clip_timeline_geometry, AudioClipProcessCommitCb, AudioClipProcessPreviewCb,
-    CLIP_RESIZE_HANDLE_MIN_W, CLIP_STRIP_MIN_W,
+    audio_clip, AudioClipProcessCommitCb, AudioClipProcessPreviewCb, CLIP_RESIZE_HANDLE_MIN_W,
+    CLIP_STRIP_MIN_W, FADE_HANDLE_HIT,
 };
 use crate::components::timeline::crossfade_overlay::{
     crossfade_handle, crossfade_overlay, visible_crossfade_bounds, CrossfadeGestureCb,
@@ -44,11 +44,12 @@ pub struct MarqueePress {
 pub type MarqueePressCb =
     std::sync::Arc<dyn Fn(&MarqueePress, &mut gpui::Window, &mut gpui::App) + 'static>;
 
-pub fn track_lane(
+pub(crate) fn track_lane(
     track: &TrackState,
     track_index: usize,
     state: &TimelineState,
     gesture: &std::rc::Rc<TimelineGestureContext>,
+    frame: &super::track_lane_view::ClipLaneFrame,
     row_height: f32,
     on_select_track: std::sync::Arc<dyn Fn(&String, &mut gpui::Window, &mut gpui::App) + 'static>,
     on_select_clip: std::sync::Arc<
@@ -104,50 +105,21 @@ pub fn track_lane(
     // create gestures' empty-lane test in the press handler. Captured here
     // because the handler cannot borrow the track.
     let viewport_w = state.viewport.viewport_width.max(1.0);
-    let mut hit_spans = Vec::with_capacity(track.clips.len());
-    let mut visible_clips = Vec::new();
-    for (index, clip) in track.clips.iter().enumerate() {
-        if track.is_hidden_take_clip(&clip.id) {
-            continue;
-        }
-        let (left, width) = if matches!(clip.clip_type, ClipType::Audio { .. }) {
-            audio_clip_timeline_geometry(clip, state)
-        } else {
-            (
-                state.beats_to_x(clip.start_beat),
-                state
-                    .beat_span_px(clip.start_beat, clip.duration_beats)
-                    .max(10.0),
-            )
-        };
-        hit_spans.push((left, left + width));
-        if left + width >= 0.0 && left <= viewport_w {
-            visible_clips.push(index);
-        }
-    }
-    let clips_ref = std::rc::Rc::new(hit_spans);
-
-    // This lane's crossfades, resolved once per render by the same code the
-    // engine snapshot uses, so every clip's drawn fades are the ones it plays.
-    let crossfades = state.audio_crossfades(track);
-    let fade_index = crossfades.index();
-    // Overlay endpoints used to search all C clips for each of F crossfades.
-    let clip_indices: std::collections::HashMap<&str, usize> = if crossfades.is_empty() {
-        Default::default()
-    } else {
-        track
-            .clips
+    let live_edit = frame.live_tempo || frame.live_tracks.contains(&track.id);
+    let visible_clips = state.clips_in_lane_range(track, &frame.tempo, 0.0, viewport_w, live_edit);
+    let clips_ref = std::rc::Rc::new(
+        visible_clips
             .iter()
-            .enumerate()
-            .map(|(index, clip)| (clip.id.as_str(), index))
-            .collect()
-    };
+            .map(|&(_, left, width)| (left, left + width))
+            .collect::<Vec<_>>(),
+    );
+    let crossfades = state.arrangement_crossfades(track, &frame.tempo, live_edit);
     // The ARA plug-in renders this track: clip fades, crossfades and clip gain
     // are drawn but disabled, because the engine does not apply them.
     let ara = track.ara.is_some();
     // Resolve time axes lazily, after culling. A long offscreen session must
     // not resolve a tempo coordinate for every clip on every scroll frame.
-    let tempo = state.tempo_lookup();
+    let tempo = frame.tempo.lookup(state);
     let mut time_axes: std::collections::HashMap<usize, ClipTimeAxis<'_>> = Default::default();
 
     // Takes that are not heard live in the take lanes, not here. Of the rest,
@@ -156,14 +128,14 @@ pub fn track_lane(
     // Stable two-bucket traversal of visible clips: O(V), no sort of C clips.
     let draw_order = visible_clips
         .iter()
-        .filter(|&&index| track.clips[index].muted)
+        .filter(|&&(index, _, _)| track.clips[index].muted)
         .chain(
             visible_clips
                 .iter()
-                .filter(|&&index| !track.clips[index].muted),
+                .filter(|&&(index, _, _)| !track.clips[index].muted),
         );
     let clip_elements: Vec<_> = draw_order
-        .map(|&index| {
+        .map(|&(index, left, width)| {
             let clip = &track.clips[index];
 
             let track_color = track.color;
@@ -172,6 +144,7 @@ pub fn track_lane(
             let on_open = on_open_editor.clone();
             let on_del = on_erase_clip.clone();
             let on_cut = on_cut_clip.clone();
+            let selected = frame.selected.contains(&clip.id);
             let erase_target = erase_preview_ids
                 .map(|s| s.contains(&clip.id))
                 .unwrap_or(false);
@@ -194,7 +167,9 @@ pub fn track_lane(
                         on_del,
                         on_cut,
                         erase_target,
-                        state.effective_clip_fades_indexed(clip, &fade_index),
+                        selected,
+                        (left, width),
+                        crossfades.effective_fades(state, track, index, time),
                         time,
                         ara,
                         ara.then(|| ara_notes.get(&clip.id).cloned()).flatten(),
@@ -214,19 +189,22 @@ pub fn track_lane(
                     on_open,
                     on_del,
                     erase_target,
+                    selected,
+                    (left, width),
                 )
                 .into_any_element(),
                 ClipType::Video { .. } => video_clip(
                     clip,
                     &track.id,
                     track_color,
-                    state,
                     row_height,
                     on_sel_clip,
                     on_clip_context,
                     on_open,
                     on_del,
                     erase_target,
+                    selected,
+                    (left, width),
                 )
                 .into_any_element(),
             }
@@ -244,16 +222,11 @@ pub fn track_lane(
     // be re-trimmed, and there is room for one of the minimum length.
     let pointer = state.active_tool == TimelineTool::Pointer;
     let crossfade_elements: Vec<_> = crossfades
-        .crossfades
-        .iter()
-        .filter_map(|crossfade| {
+        .visible_candidates(state, -FADE_HANDLE_HIT, viewport_w + FADE_HANDLE_HIT)
+        .filter_map(|(crossfade, left_index, right_index)| {
             // Use the same bounds and handle overscan as the overlay itself,
             // before resolving endpoints, time axes or handle feasibility.
             visible_crossfade_bounds(crossfade, state)?;
-            let (left_index, right_index) = (
-                *clip_indices.get(crossfade.left_id.as_str())?,
-                *clip_indices.get(crossfade.right_id.as_str())?,
-            );
             let (left, right) = (&track.clips[left_index], &track.clips[right_index]);
             time_axes
                 .entry(left_index)
@@ -262,26 +235,32 @@ pub fn track_lane(
                 .entry(right_index)
                 .or_insert_with(|| state.clip_time_axis_in(tempo.clone(), right));
             let narrowest = state
-                .clip_lane_x_span(left)
+                .clip_lane_x_span_with_end(left, state.clip_end_in(left, &frame.tempo))
                 .1
-                .min(state.clip_lane_x_span(right).1);
+                .min(
+                    state
+                        .clip_lane_x_span_with_end(right, state.clip_end_in(right, &frame.tempo))
+                        .1,
+                );
+            let left_time = time_axes.get(&left_index)?;
+            let right_time = time_axes.get(&right_index)?;
             let shown = pointer && narrowest >= CLIP_RESIZE_HANDLE_MIN_W;
             // The planner's own feasibility test, asked only for a handle that
             // is drawn and not already disabled by ARA.
             let block = (shown && !ara)
-                .then(|| state.crossfade_adjust_block(left, right))
+                .then(|| state.crossfade_adjust_block_in(left, right, &frame.tempo))
                 .flatten();
             let handle = crossfade_handle(shown, ara, block);
             crossfade_overlay(
                 crossfade,
                 state,
                 &CrossfadeSide {
-                    time: time_axes.get(&left_index)?,
-                    fades: state.effective_clip_fades_indexed(left, &fade_index),
+                    time: left_time,
+                    fades: crossfades.effective_fades(state, track, left_index, left_time),
                 },
                 &CrossfadeSide {
-                    time: time_axes.get(&right_index)?,
-                    fades: state.effective_clip_fades_indexed(right, &fade_index),
+                    time: right_time,
+                    fades: crossfades.effective_fades(state, track, right_index, right_time),
                 },
                 row_height,
                 narrowest >= CLIP_STRIP_MIN_W,

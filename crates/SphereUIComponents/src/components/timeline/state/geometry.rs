@@ -356,13 +356,19 @@ impl TimelineState {
     /// derivation `reconcile_audio_clip_lengths` writes into the model, so a
     /// tempo ramp bends the drawn clip exactly as much as the grid under it.
     pub fn clip_lane_x_span(&self, clip: &ClipState) -> (f32, f32) {
+        let end = clip.start_beat + clip.duration_beats.max(0.0);
+        let end = if matches!(clip.clip_type, ClipType::Audio { .. }) {
+            self.audio_clip_end_beat(clip).map_or(end, |end| end as f32)
+        } else {
+            end
+        };
+        self.clip_lane_x_span_with_end(clip, end)
+    }
+
+    pub(crate) fn clip_lane_x_span_with_end(&self, clip: &ClipState, end: f32) -> (f32, f32) {
         let left = self.beats_to_x(clip.start_beat);
         let width = if matches!(clip.clip_type, ClipType::Audio { .. }) {
-            let end_beat = self
-                .audio_clip_end_beat(clip)
-                // Pending and legacy clips may not have decoded source bounds yet.
-                .unwrap_or_else(|| (clip.start_beat + clip.duration_beats.max(0.0)) as f64);
-            self.beats_to_x(end_beat as f32) - left
+            self.beats_to_x(end) - left
         } else {
             self.beat_span_px(clip.start_beat, clip.duration_beats)
         };

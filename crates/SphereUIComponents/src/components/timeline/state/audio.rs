@@ -727,7 +727,7 @@ mod metadata_tests {
             routing: TrackRouting::default(),
             inserts: Vec::new(),
             automation_lanes: Vec::new(),
-            clips: Vec::new(),
+            clips: Default::default(),
             row_height_px: None,
             soundfont: None,
             volume_automation_read: true,

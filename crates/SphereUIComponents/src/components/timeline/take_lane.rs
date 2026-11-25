@@ -131,8 +131,8 @@ pub fn take_lane(
 
     let clip_block = track
         .clips
-        .iter()
-        .find(|clip| clip.id == take.clip_id)
+        .index_of(&take.clip_id)
+        .and_then(|index| track.clips.get(index))
         .map(|clip| {
             let (left, width) = state.clip_lane_x_span(clip);
             let height = TAKE_LANE_HEIGHT - 2.0 * space::HAIR - 1.0;

@@ -20,9 +20,17 @@ impl Timeline {
         let Some(origin) = self.clip_move_origin.take() else {
             return false;
         };
-        for snapshot in &origin.clips {
-            self.state
-                .set_clip_start_in_place(&snapshot.clip.id, snapshot.clip.start_beat);
+        for (snapshot, slot) in origin
+            .clips
+            .iter()
+            .zip(origin.locations(&self.state).iter())
+        {
+            if let Some(slot) = slot {
+                let track = &mut self.state.tracks[slot.track];
+                if track.clips[slot.index].start_beat != snapshot.clip.start_beat {
+                    track.clips[slot.index].start_beat = snapshot.clip.start_beat;
+                }
+            }
         }
         true
     }
@@ -120,6 +128,66 @@ mod tests {
             .expect("clip")
     }
 
+    #[gpui::test]
+    fn a_group_drop_commits_the_preview_from_the_current_slots(cx: &mut gpui::TestAppContext) {
+        let window = cx.open_window(gpui::size(px(1200.0), px(800.0)), |_, _| {
+            let (mut timeline, first) = timeline_with_clip(4.0);
+            let source = timeline.state.tracks[0].id.clone();
+            let peer = timeline
+                .state
+                .build_midi_clip(&source, 12.0, 4.0)
+                .expect("peer clip");
+            timeline.state.selection.selected_clip_ids = vec![first, peer.id.clone()];
+            timeline.state.tracks[0].clips.push(peer);
+            timeline.state.create_midi_track();
+            timeline
+        });
+        cx.run_until_parked();
+        window
+            .update(cx, |timeline, window, cx| {
+                let before = timeline.state.selection.selected_clip_ids.clone();
+                let item = ClipDragItem {
+                    clip_id: before[0].clone(),
+                    source_track_id: timeline.state.tracks[0].id.clone(),
+                    start_beat: 4.0,
+                };
+                let rows = timeline.state.track_row_layout();
+                let top =
+                    timeline.state.timeline_origin_y() + timeline.state.arrangement_content_top();
+                let origin = gpui::point(px(600.0), px(top + 10.0));
+                timeline.move_dragged_clip_to_position_with_bypass(&item, origin, window, true);
+
+                // A model edit between input events displaces both captured slots.
+                let other = timeline
+                    .state
+                    .build_midi_clip(&item.source_track_id, 24.0, 4.0)
+                    .expect("other clip");
+                let other_id = other.id.clone();
+                timeline.state.tracks[0].clips.insert(0, other);
+                let dx = timeline.state.beats_to_x(8.0) - timeline.state.beats_to_x(4.0);
+                let target = gpui::point(origin.x + px(dx), px(top + rows.rows[1].y + 10.0));
+                timeline.move_dragged_clip_to_position_with_bypass(&item, target, window, true);
+                assert_eq!(timeline.clip_drag_target_track_index, Some(1));
+                assert_eq!(clip_start(timeline, &other_id), 24.0);
+                let preview = [
+                    clip_start(timeline, &before[0]),
+                    clip_start(timeline, &before[1]),
+                ];
+                assert!(preview[0] > 4.0);
+                assert!((preview[1] - preview[0] - 8.0).abs() < 1.0e-5);
+
+                timeline.commit_clip_move(&item.clip_id, Some(1), cx);
+                assert_eq!(timeline.state.tracks[0].clips[0].id, other_id);
+                let landed = &timeline.state.tracks[1].clips;
+                assert_eq!(landed.len(), 2);
+                for (index, clip) in landed.iter().enumerate() {
+                    assert_eq!(clip.id, before[index]);
+                    assert_eq!(clip.start_beat, preview[index]);
+                }
+            })
+            .expect("arrangement test window is open");
+    }
+
     /// The review's case: a clip at beat 4.3 is dragged, Escape is pressed
     /// and the button comes up without a move. The clip must be back at 4.3,
     /// and the drag's later moves and its drop refused, so nothing resnaps it
@@ -132,6 +200,7 @@ mod tests {
             anchor_clip_id: clip_id.clone(),
             anchor_start: 4.3,
             clips: vec![snapshot],
+            locations: timeline.state.locate_clips(&[&clip_id]),
         });
         timeline.state.set_clip_start_in_place(&clip_id, 6.0);
         assert!(timeline.clip_drag_accepted());

@@ -24,14 +24,13 @@
 
 use std::time::Instant;
 
-use crate::components::timeline::audio_clip::audio_clip_timeline_geometry;
 use crate::components::timeline::render::clip_geometry::{
     controller_preview_cached, note_preview_cached, note_previews_built, visible_clip_px_range,
     ClipAxis,
 };
 use crate::components::timeline::timeline_state::{
-    tempo_maps_built, AudioClipStretchState, AudioImportState, ClipState, ClipType,
-    CreateTrackOptions, InputMonitorMode, MidiControllerKind, MidiControllerLane,
+    tempo_maps_built, ArrangementTempo, AudioClipStretchState, AudioImportState, ClipState,
+    ClipType, CreateTrackOptions, InputMonitorMode, MidiControllerKind, MidiControllerLane,
     MidiControllerPoint, MidiNoteState, TempoCurve, TimelineState, TrackRowLayout, TrackType,
 };
 
@@ -241,19 +240,13 @@ impl Session {
         let viewport_w = state.viewport.viewport_width.max(1.0);
         let ppb = state.viewport.pixels_per_beat;
 
+        let tempo = ArrangementTempo::new(state);
         for track in &state.tracks[visible_start..visible_end] {
             work.lanes += 1;
-            for clip in &track.clips {
-                let (left, width) = match clip.clip_type {
-                    ClipType::Audio { .. } => audio_clip_timeline_geometry(clip, state),
-                    _ => (
-                        state.beats_to_x(clip.start_beat),
-                        (clip.duration_beats * ppb).max(10.0),
-                    ),
-                };
-                if left + width < 0.0 || left > viewport_w {
-                    continue;
-                }
+            for (index, left, width) in
+                state.clips_in_lane_range(track, &tempo, 0.0, viewport_w, false)
+            {
+                let clip = &track.clips[index];
                 work.clips += 1;
                 if let ClipType::Midi {
                     notes,
@@ -529,4 +522,269 @@ fn timeline_state_clone_cost_by_session_size() {
         println!("{label:<40} clone {ms:>8.3} ms");
     }
     println!();
+}
+
+/// Keep the visible clip count fixed while appending clips far beyond the window.
+#[test]
+#[ignore = "measurement, not a wall-clock assertion"]
+fn arrangement_offscreen_clip_scaling() {
+    const FRAMES: usize = 40;
+    for count in [1_000, 10_000, 100_000] {
+        let mut session = Session::build(0, 0, 0, 0, 1, count);
+        let state = &mut session.state;
+        let tempo = ArrangementTempo::new(state);
+        let query = |state: &TimelineState, live| {
+            state.clips_in_lane_range(&state.tracks[0], &tempo, 0.0, VIEWPORT_W, live)
+        };
+        let cold_start = Instant::now();
+        let expected = query(state, false);
+        let cold_ms = cold_start.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(expected, query(state, true));
+        let measure = |state: &mut TimelineState, live| {
+            let start = Instant::now();
+            for frame in 0..FRAMES {
+                state.viewport.scroll_x = frame as f32 * 8.0;
+                std::hint::black_box(query(state, live));
+            }
+            start.elapsed().as_secs_f64() * 1000.0 / FRAMES as f64
+        };
+        let scan_ms = measure(state, true);
+        let indexed_ms = measure(state, false);
+        println!("clips={count:>6} visible={:>3} scan_ms={scan_ms:.4} indexed_ms={indexed_ms:.4} cold_ms={cold_ms:.2}", expected.len());
+    }
+}
+
+#[test]
+fn indexed_spans_match_the_drawn_order_through_zoom_scroll_and_tempo_changes() {
+    use crate::components::timeline::timeline_state::TrackTake;
+
+    let mut session = Session::build(0, 0, 0, 0, 1, 200);
+    let state = &mut session.state;
+    let mut short = midi_clip_state(1000, 38.0, 0.001, 0, 0);
+    short.muted = true;
+    state.tracks[0].clips.push(short);
+    let video = ClipState {
+        clip_type: ClipType::Video {
+            file_id: "video".into(),
+            source_path: None,
+        },
+        ..midi_clip_state(1001, 950.0, 3.0, 0, 0)
+    };
+    state.tracks[0].clips.insert(0, video);
+    let hidden_id = state.tracks[0].clips[8].id.clone();
+    let mut take = TrackTake::new("take-1", "Take 1", hidden_id);
+    take.active = false;
+    state.tracks[0].takes.push(take);
+    state.tracks[0]
+        .clips
+        .push(audio_clip_state(1002, 0.0, 400.0));
+    state.tracks[0]
+        .clips
+        .push(midi_clip_state(1003, 590.0, 800.0, 0, 0));
+    state.tracks[0]
+        .clips
+        .push(midi_clip_state(1004, 50_000_000.0, 40.0, 0, 0));
+    for automated in [false, true] {
+        if automated {
+            state
+                .tempo_map
+                .add_or_update_point(0.0, 68.0, TempoCurve::Linear);
+            state
+                .tempo_map
+                .add_or_update_point(927.0, 185.0, TempoCurve::Hold);
+        }
+        state.sync_time_warp();
+        let tempo = ArrangementTempo::new(state);
+        for pps in [0.5, 40.0, 4000.0] {
+            state.viewport.pixels_per_second = pps;
+            state.sync_pixels_per_beat();
+            for beat in [0.0, 38.0, 56.0, 925.0, 1_400.0, 50_000_000.0] {
+                state.viewport.scroll_x = 0.0;
+                state.viewport.scroll_x = state.beats_to_x(beat) + 0.49;
+                for (left, right) in [(0.0, 0.0), (0.0, 1600.0), (-97.0, 321.0)] {
+                    let track = &state.tracks[0];
+                    let expected: Vec<_> = track
+                        .clips
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, clip)| {
+                            let (x, width) = state.clip_lane_x_span(clip);
+                            (x + width >= left
+                                && x <= right
+                                && !track.is_hidden_take_clip(&clip.id))
+                            .then_some((index, x, width))
+                        })
+                        .collect();
+                    assert_eq!(
+                        state.clips_in_lane_range(track, &tempo, left, right, false),
+                        expected,
+                        "automated={automated}, zoom={pps}, beat={beat}, range={left}..{right}",
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn derived_clip_data_refreshes_after_mutation_and_clone() {
+    let mut session = Session::build(0, 0, 0, 0, 1, 2);
+    let state = &mut session.state;
+    // Two staggered clips, with a crossfade controlling both edges.
+    state.tracks[0].clips[1].start_beat = 6.0;
+    let tempo = ArrangementTempo::new(state);
+    let track = &state.tracks[0];
+    let cached = state.arrangement_crossfades(track, &tempo, false);
+    assert_eq!(cached.visible_candidates(state, 0.0, VIEWPORT_W).count(), 1);
+    assert_eq!(cached.visible_candidates(state, 400.0, 500.0).count(), 0);
+    assert_eq!(
+        state
+            .clips_in_lane_range(track, &tempo, 0.0, VIEWPORT_W, false)
+            .len(),
+        2
+    );
+    assert_eq!(track.clips.last_end_beat(), Some(14.0));
+    assert_eq!(track.clips.index_of("clip-audio-1"), Some(1));
+
+    let mut copy = state.clone();
+    copy.tracks[0].clips.swap(0, 1);
+    assert_eq!(copy.tracks[0].clips.index_of("clip-audio-1"), Some(0));
+
+    state.tracks[0].clips[1].start_beat = 1000.0;
+    let track = &state.tracks[0];
+    assert_eq!(track.clips.last_end_beat(), Some(1008.0));
+    let updated = state.arrangement_crossfades(track, &tempo, false);
+    assert_eq!(
+        updated.visible_candidates(state, 0.0, VIEWPORT_W).count(),
+        0
+    );
+    assert_eq!(
+        state
+            .clips_in_lane_range(track, &tempo, 0.0, VIEWPORT_W, false)
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn batch_clip_drop_preserves_destination_order_and_round_trips() {
+    use crate::components::edit::{ClipSnapshot, EditCommand, EditHistory};
+
+    let mut session = Session::build(3, 3, 0, 0, 0, 0);
+    let state = &mut session.state;
+    let order = |state: &TimelineState| {
+        state
+            .tracks
+            .iter()
+            .map(|track| {
+                track
+                    .clips
+                    .iter()
+                    .map(|clip| clip.id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    };
+    let original = order(state);
+    let ids = ["clip-midi-2", "clip-midi-0", "clip-midi-3"];
+    let snapshots = |state: &TimelineState| -> Vec<ClipSnapshot> {
+        state
+            .locate_clips(&ids)
+            .into_iter()
+            .flatten()
+            .map(|slot| ClipSnapshot::at(&state.tracks[slot.track], slot.index))
+            .collect()
+    };
+    let previous = snapshots(state);
+    let slots = state.locate_clips(&ids);
+    state.move_clip_group_to_tracks(&slots, 1);
+    let next = snapshots(state);
+    let moved = order(state);
+    assert_eq!(moved[0], ["clip-midi-1"]);
+    assert_eq!(
+        moved[1],
+        ["clip-midi-4", "clip-midi-5", "clip-midi-2", "clip-midi-0"]
+    );
+    assert_eq!(
+        moved[2],
+        ["clip-midi-6", "clip-midi-7", "clip-midi-8", "clip-midi-3"]
+    );
+    assert!(slots[0]
+        .expect("original slot")
+        .clip(state, ids[0])
+        .is_none());
+
+    let mut history = EditHistory::new(8);
+    history.push(EditCommand::UpdateClips { previous, next });
+    assert!(history.undo(state));
+    assert_eq!(order(state), original);
+    assert!(history.redo(state));
+    assert_eq!(order(state), moved);
+}
+
+/// Exercise the actual GPUI arrangement and its normal input handlers, with
+/// the same visible content over three different project sizes.
+#[gpui::test]
+#[ignore = "headless GPUI timing, not a wall-clock assertion"]
+fn arrangement_gpui_scroll_scaling(cx: &mut gpui::TestAppContext) {
+    use crate::components::timeline::timeline_state::AutoScrollMode;
+    use crate::components::timeline::Timeline;
+    use gpui::{
+        point, px, size, Modifiers, ScrollDelta, ScrollWheelEvent, TouchPhase, VisualTestContext,
+    };
+
+    for count in [1_000, 10_000, 100_000] {
+        let session = Session::build(1, count, 0, 0, 0, 0);
+        let window = cx.open_window(size(px(VIEWPORT_W), px(VIEWPORT_H)), |_, _| {
+            let mut timeline = Timeline::new();
+            timeline.state = session.state;
+            timeline
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        let pointer = window
+            .update(&mut cx, |timeline, _, _| {
+                let state = &timeline.state;
+                point(
+                    px(state.lane_origin_x() + 640.0),
+                    px(state.timeline_origin_y() + state.arrangement_content_top() + 24.0),
+                )
+            })
+            .expect("arrangement test window is open");
+
+        cx.simulate_event(ScrollWheelEvent {
+            position: pointer,
+            delta: ScrollDelta::Pixels(point(px(-8.0), px(0.0))),
+            modifiers: Modifiers::default(),
+            touch_phase: TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+        let mut samples = Vec::new();
+        for frame in 0..24 {
+            window
+                .update(&mut cx, |timeline, _, cx| {
+                    timeline.state.viewport.scroll_x = frame as f32 * 8.0 + 8.0;
+                    cx.notify();
+                })
+                .expect("arrangement test window is open");
+            let started = Instant::now();
+            cx.update(|window, cx| window.draw(cx).clear());
+            samples.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        window
+            .update(&mut cx, |timeline, _, cx| {
+                let state = &mut timeline.state;
+                assert!(state.viewport.scroll_x > 0.0);
+                state.zoom_by(1.2, 640.0);
+                state.follow_playhead = true;
+                state.auto_scroll_mode = AutoScrollMode::Continuous;
+                assert!(state.update_auto_scroll_for_playhead(100.0));
+                cx.notify();
+            })
+            .expect("arrangement test window is open");
+        cx.run_until_parked();
+        samples.sort_unstable_by(f64::total_cmp);
+        let p95 = samples[samples.len() * 95 / 100];
+        println!("GPUI draw while scrolling clips={count:>6} p95_ms={p95:.3}");
+    }
 }

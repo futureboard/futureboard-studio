@@ -246,7 +246,7 @@ impl TimelineState {
         for side in [&mut before, &mut after] {
             for track in &mut side.tracks {
                 if unchanged_clips.contains(&track.id) {
-                    track.clips = Vec::new();
+                    track.clips = TrackClips::default();
                 }
             }
             side.kept_clips = unchanged_clips.clone();

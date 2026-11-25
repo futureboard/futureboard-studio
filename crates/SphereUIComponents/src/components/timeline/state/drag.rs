@@ -109,6 +109,105 @@ pub fn group_move_starts(
         .collect()
 }
 
+/// A slot in the current arrangement. Validate its ID before reusing it
+/// across UI events, where a track or clip can have moved.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ClipLocation {
+    pub track: usize,
+    pub index: usize,
+}
+
+impl ClipLocation {
+    pub(crate) fn clip<'a>(self, state: &'a TimelineState, id: &str) -> Option<&'a ClipState> {
+        state
+            .tracks
+            .get(self.track)?
+            .clips
+            .get(self.index)
+            .filter(|clip| clip.id == id)
+    }
+}
+
+impl TimelineState {
+    pub(crate) fn locate_clips(&self, ids: &[&str]) -> Vec<Option<ClipLocation>> {
+        use std::collections::HashMap;
+        let mut slots: HashMap<_, _> = ids.iter().map(|id| (*id, None)).collect();
+        let mut remaining = slots.len();
+        'tracks: for (track_index, track) in self.tracks.iter().enumerate() {
+            if remaining == 0 {
+                break;
+            }
+            for (index, clip) in track.clips.iter().enumerate() {
+                if let Some(slot @ None) = slots.get_mut(clip.id.as_str()) {
+                    *slot = Some(ClipLocation {
+                        track: track_index,
+                        index,
+                    });
+                    remaining -= 1;
+                    if remaining == 0 {
+                        break 'tracks;
+                    }
+                }
+            }
+        }
+        ids.iter().map(|id| slots[id]).collect()
+    }
+
+    /// Apply the already resolved positions as one batch. Retained clips keep
+    /// their order, followed by arrivals in the gesture's selection order.
+    pub(crate) fn move_clip_group_to_tracks(
+        &mut self,
+        locations: &[Option<ClipLocation>],
+        track_delta: isize,
+    ) {
+        use std::collections::HashMap;
+        let mut by_source: HashMap<usize, HashMap<usize, usize>> = HashMap::new();
+        let mut arrivals = Vec::with_capacity(locations.len());
+        let last_track = self.tracks.len().saturating_sub(1) as isize;
+        for (rank, location) in locations.iter().enumerate() {
+            let Some(location) = location else {
+                arrivals.push(None);
+                continue;
+            };
+            let target = (location.track as isize + track_delta).clamp(0, last_track) as usize;
+            if target == location.track {
+                arrivals.push(None);
+                continue;
+            }
+            arrivals.push(Some((target, None)));
+            by_source
+                .entry(location.track)
+                .or_default()
+                .entry(location.index)
+                .or_insert(rank);
+        }
+        for (source, departing) in by_source {
+            let clips = std::mem::take(&mut self.tracks[source].clips);
+            self.tracks[source].clips = clips
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, clip)| {
+                    if let Some((_, arrival)) = departing
+                        .get(&index)
+                        .and_then(|&rank| arrivals[rank].as_mut())
+                    {
+                        *arrival = Some(clip);
+                        None
+                    } else {
+                        Some(clip)
+                    }
+                })
+                .collect();
+        }
+        for (target, clip) in arrivals.into_iter().flatten() {
+            if let Some(mut clip) = clip {
+                clip.start_beat = clip.start_beat.max(0.0);
+                self.tracks[target].clips.push(clip);
+            }
+        }
+    }
+}
+
 impl TimelineState {
     /// Move a clip to `start_beat` on its own track, in place: its index in the
     /// track, the selection and every other field are left alone. The live

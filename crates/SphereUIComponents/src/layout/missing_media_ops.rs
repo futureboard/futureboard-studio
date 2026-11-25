@@ -756,7 +756,7 @@ mod tests {
             audio_import: AudioImportState::Pending,
             stretch: Default::default(),
         };
-        state.tracks[0].clips = vec![clip("clip-1"), clip("clip-2")];
+        state.tracks[0].clips = vec![clip("clip-1"), clip("clip-2")].into();
 
         let (plugins, audio) = scan_missing(&state);
         assert!(plugins.is_empty());

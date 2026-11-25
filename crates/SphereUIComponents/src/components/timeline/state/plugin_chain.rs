@@ -2165,7 +2165,7 @@ impl TimelineState {
                     meter_peak_hold_l: 0.0,
                     meter_peak_hold_r: 0.0,
                     meter_clip: false,
-                    clips: Vec::new(),
+                    clips: Default::default(),
                     automation_lanes: Vec::new(),
                     lane_mode: TrackLaneMode::Clips,
                     selected_automation_target: None,
