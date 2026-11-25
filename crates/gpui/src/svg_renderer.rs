@@ -194,7 +194,9 @@ impl SvgRenderer {
         })
     }
 
-    pub(crate) fn render_alpha_mask(
+    /// Renders `bytes` (or the asset at `params.path`) at `params.size` as an
+    /// 8-bit coverage mask, one byte per pixel, rows top to bottom.
+    pub fn render_alpha_mask(
         &self,
         params: &RenderSvgParams,
         bytes: Option<&[u8]>,

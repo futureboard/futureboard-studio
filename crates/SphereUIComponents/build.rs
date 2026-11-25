@@ -58,6 +58,8 @@ fn main() {
         .unwrap_or_else(|_| manifest_dir.join("../../.env"));
     println!("cargo:rerun-if-changed={}", dotenv_path.display());
 
+    embed_visualizer_webui(&manifest_dir);
+
     if let Some(url) = resolve_auth_api_url(&dotenv_path) {
         println!("cargo:rustc-env=FUTUREBOARD_AUTH_API_URL={url}");
     }
@@ -76,6 +78,25 @@ fn main() {
                 tone3000_key_policy::DEV_KEY_RUSTC_ENV
             );
         }
+    }
+}
+
+/// Embed the API server's Loudness & Visualizer page (`api_server`), built by
+/// Astro into `apps/native/studio/visualizer-webui/dist`. A tree without a
+/// built page still compiles: the table comes out empty and the server says
+/// how to build it.
+fn embed_visualizer_webui(manifest_dir: &Path) {
+    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo"));
+    let dist = manifest_dir.join("../../apps/native/studio/visualizer-webui/dist");
+    let mut options = builtin_ui_embed::generate::GenerateOptions::from_out_dir(dist, out_dir);
+    options.out_file = options.out_file.with_file_name("api_webui_assets.rs");
+    let report =
+        builtin_ui_embed::generate::generate(&options).expect("embed the visualizer web page");
+    if !report.dist_present {
+        println!(
+            "cargo:warning=Visualizer web page not built; the API server will say so. \
+             Build it with `bun run --cwd apps/native/studio/visualizer-webui build`."
+        );
     }
 }
 

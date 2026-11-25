@@ -447,6 +447,26 @@ impl PluginBridgeSink for SharedRegionSink {
             });
     }
 
+    fn pop_output_midi(&self, out: &mut [DirectAudio::plugin_bridge::BridgeMidiOut]) -> usize {
+        // The engine is this ring's consumer only for instances the Studio
+        // registered as engine-owned (`drain_output_midi` skips those).
+        let ring = &self.region.bridge().midi_out;
+        let mut written = 0;
+        while written < out.len() {
+            let Some(event) = ring.try_pop() else {
+                break;
+            };
+            out[written] = DirectAudio::plugin_bridge::BridgeMidiOut {
+                sample_offset: event.sample_offset,
+                status: event.status,
+                data1: event.data1,
+                data2: event.data2,
+            };
+            written += 1;
+        }
+        written
+    }
+
     fn request_block(&self, frames: u32) {
         let bridge = self.region.bridge();
         // One request at a time: a second one would let the host start on it

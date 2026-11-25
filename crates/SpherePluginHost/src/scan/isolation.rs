@@ -251,10 +251,66 @@ pub fn locate_scanner_binary() -> Result<PathBuf, PluginScanError> {
     ))
 }
 
+/// The 32-bit scanner (`FutureboardPluginScannerX86.exe`), for modules
+/// built for 32-bit Windows: the 64-bit scanner cannot load them. Found
+/// through `FUTUREBOARD_PLUGIN_SCANNER_X86_EXE`, next to the running exe, or
+/// in a development build's `target/x86/i686-pc-windows-msvc/{release,debug}`
+/// under the Cargo binary's own name.
+pub fn locate_x86_scanner_binary() -> Result<PathBuf, PluginScanError> {
+    if let Ok(path) = std::env::var("FUTUREBOARD_PLUGIN_SCANNER_X86_EXE") {
+        let path = PathBuf::from(path);
+        return if path.is_file() {
+            Ok(path)
+        } else {
+            Err(PluginScanError::ScannerBinaryMissing(
+                path.display().to_string(),
+            ))
+        };
+    }
+    let staged = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(X86_SCANNER_FILE)));
+    if let Some(candidate) = staged.as_ref().filter(|path| path.is_file()) {
+        return Ok(candidate.clone());
+    }
+    let dev_root =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/x86/i686-pc-windows-msvc");
+    for profile in ["release", "debug"] {
+        for file in [X86_SCANNER_FILE, "FutureboardPluginScanner.exe"] {
+            let candidate = dev_root.join(profile).join(file);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    Err(PluginScanError::ScannerBinaryMissing(
+        staged
+            .unwrap_or_else(|| PathBuf::from(X86_SCANNER_FILE))
+            .display()
+            .to_string(),
+    ))
+}
+
+const X86_SCANNER_FILE: &str = "FutureboardPluginScannerX86.exe";
+
+/// The scanner that can load `bundle`: the 32-bit one for a module built for
+/// 32-bit Windows, else the default.
+fn scanner_for_bundle(bundle: &Path) -> Result<PathBuf, String> {
+    if crate::module_arch::module_arch(bundle).needs_x86_bridge() {
+        return locate_x86_scanner_binary().map_err(|error| {
+            format!(
+                "32-bit plug-in, and the 32-bit plug-in bridge is not installed ({})",
+                error.message()
+            )
+        });
+    }
+    locate_scanner_binary().map_err(|error| error.message())
+}
+
 pub fn run_isolated_bundle_scan(bundle: &Path) -> Result<BundleScanOutcome, String> {
     let format = bundle_scan_format(bundle)
         .ok_or_else(|| format!("Unsupported plug-in bundle: {}", bundle.display()))?;
-    let scanner = locate_scanner_binary().map_err(|error| error.message())?;
+    let scanner = scanner_for_bundle(bundle)?;
     let mut command = Command::new(&scanner);
     command
         .arg("--format")
@@ -741,6 +797,7 @@ pub fn plugin_descriptor_from_info(info: PluginInfo) -> PluginDescriptor {
         class_id: info.class_id,
         sub_categories: info.sub_categories,
         is_ara: info.is_ara,
+        midi_output: info.midi_output,
         sdk_metadata_loaded: info.sdk_metadata_loaded,
     }
 }
@@ -760,6 +817,7 @@ pub fn plugin_info_from_descriptor(descriptor: &PluginDescriptor) -> PluginInfo 
         sdk_version: None,
         is_shell_child: false,
         is_ara: descriptor.is_ara,
+        midi_output: descriptor.midi_output,
         sdk_metadata_loaded: descriptor.sdk_metadata_loaded,
         load_error: descriptor.error_message.clone(),
     }

@@ -96,6 +96,11 @@ pub struct RuntimeInsert {
     pub cpu_us: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// Audioguard's watch on this insert's output and deadlines.
     pub guard: crate::audioguard::InsertGuard,
+    /// Taken out of a live path by low-latency monitoring
+    /// ([`crate::runtime::RuntimeProject::apply_low_latency_monitoring`]):
+    /// neither processed nor counted as latency. Set and cleared by the audio
+    /// thread every callback; never saved, never shown as the user's bypass.
+    pub latency_bypassed: bool,
     pub callback_process_log_done: bool,
     pub silent_process_blocks: u32,
     /// Consecutive blocks the external plugin host failed to deliver on time
@@ -124,6 +129,11 @@ pub struct RuntimeInsert {
     /// return: the chain skips it, and the return named by the split send
     /// runs it. Resolved from `params["signalBus"]` when the graph is built.
     pub signal_bus: u8,
+    /// Runs after the channel's fader and pan instead of in its chain:
+    /// pre-fader sends and PFL tap before it, the meter, AFL, post-fader
+    /// sends and the channel output after it. From `params["postFader"]`
+    /// ([`POST_FADER_PARAM`]); never set on a wet/dry/wet insert.
+    pub post_fader: bool,
     /// The insert's sidechain key route, from `params["sidechain"]`; `None`
     /// without one. Boxed: almost no insert has one. See [`super::sidechain`].
     pub sidechain: Option<Box<RuntimeSidechain>>,
@@ -140,6 +150,19 @@ pub(super) fn signal_bus_from_params(params: &HashMap<String, Value>) -> u8 {
         Some(bus) if bus.eq_ignore_ascii_case("wdw") => SIGNAL_BUS_WDW,
         _ => SIGNAL_BUS_MAIN,
     }
+}
+
+/// The snapshot param that puts an insert after its channel's fader.
+pub const POST_FADER_PARAM: &str = "postFader";
+
+/// Whether `params` put the insert after the fader. A wet/dry/wet insert runs
+/// on its return, which has no fader of this track's, so it never is.
+pub(super) fn post_fader_from_params(params: &HashMap<String, Value>) -> bool {
+    signal_bus_from_params(params) == SIGNAL_BUS_MAIN
+        && params
+            .get(POST_FADER_PARAM)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
 }
 
 /// One multi-out route: a 1-based plugin output channel pair (`channel_l`,
@@ -251,6 +274,14 @@ impl RuntimeInsert {
             Some(bypassed) => !bypassed,
             None => self.enabled,
         };
-        on && !self.guard.bypassed
+        on && !self.guard.bypassed && !self.latency_bypassed
+    }
+
+    /// Whether the insert's latency is part of its track's path. A bypassed
+    /// insert keeps it (bypassing must not move the track); one low-latency
+    /// monitoring took out of the path does not, which is its point.
+    #[inline]
+    pub fn counts_latency(&self) -> bool {
+        self.enabled && !self.latency_bypassed
     }
 }

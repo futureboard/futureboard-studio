@@ -2,10 +2,10 @@
 # xtask-staged runtime tree.
 #
 # Default package source:
-#   out\release\community\windows-x64
+#   out\release\windows-x64
 #
 # Expected package command:
-#   cargo xtask package --profile release --edition community --plugin all
+#   cargo package-release
 #
 # Examples:
 #   .\build-installer.ps1
@@ -131,7 +131,7 @@ if (-not $AppVersion) {
 # ---------------------------------------------------------------------------
 
 if (-not $SourceDir) {
-    $SourceDir = Join-Path $Root "out\release\community\windows-x64"
+    $SourceDir = Join-Path $Root "out\release\windows-x64"
 }
 elseif (-not [System.IO.Path]::IsPathRooted($SourceDir)) {
     $SourceDir = Join-Path $Root $SourceDir
@@ -145,7 +145,7 @@ Packaged runtime directory not found:
 
 Create it first with:
 
-  cargo xtask package --profile release --edition community --plugin all
+  cargo package-release
 "@
 }
 
@@ -165,7 +165,7 @@ FutureboardNative.exe was not found in the packaged runtime tree:
 
 Run:
 
-  cargo xtask package --profile release --edition community --plugin all
+  cargo package-release
 "@
 }
 

@@ -6,7 +6,9 @@
 //! Windows the window takes the platform's own frame — the OS draws the
 //! caption — and elsewhere a 32 px drawn chrome band does. The Start pane leads
 //! with the templates as tiles and gives the rest of its height to Recent
-//! projects, the list a returning user came for.
+//! projects, a grid of cards with each project's thumbnail
+//! (`{project}/Preview/Thumb.png`, see `project::thumbnail`), what a returning
+//! user came for.
 //!
 //! Three rules the whole file follows, stated once:
 //!
@@ -28,9 +30,9 @@ use std::time::Duration;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, img, px, svg, App, Context, FocusHandle, FontFeatures, FontWeight, InteractiveElement,
-    IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, Rgba, Role, SharedString,
-    StatefulInteractiveElement, Styled, Window, WindowControlArea,
+    div, img, px, svg, App, Context, FontFeatures, FontWeight, InteractiveElement, IntoElement,
+    KeyDownEvent, MouseButton, ParentElement, Render, Rgba, Role, SharedString,
+    StatefulInteractiveElement, Styled, StyledImage, Window, WindowControlArea,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -69,6 +71,12 @@ use crate::theme::{self, elevation, radius, size, space, typography, Colors};
 
 /// Fixed width of the sidebar.
 const SIDEBAR_WIDTH: f32 = 248.0;
+/// How much of the sidebar's plane is painted over a backdrop.
+const SIDEBAR_BACKDROP_WASH: f32 = 0.3;
+/// Narrowest a recent project's card gets before the grid drops a column.
+const CARD_MIN_WIDTH: f32 = 196.0;
+/// The card's text block under its picture: name and when it was opened.
+const CARD_TEXT_HEIGHT: f32 = 52.0;
 /// Narrowest a template tile gets before the row of four wraps to two.
 const TILE_MIN_WIDTH: f32 = 150.0;
 /// Height of a template tile: its glyph plate row, title and description at
@@ -275,9 +283,22 @@ pub struct WelcomeFooterAction {
 pub struct WelcomeWindow {
     active_nav: StartupNav,
     recent_projects: Vec<RecentProject>,
+    /// Each recent project's thumbnail, in list order, once read off the UI
+    /// thread; `None` for a project without one (made before thumbnails, or
+    /// never saved since).
+    recent_thumbs: Vec<Option<Arc<gpui::Image>>>,
+    /// Columns in the recent grid at the last layout, for arrow-key movement.
+    recent_columns: usize,
+    /// The window opened over a backdrop (Mica, the macOS blur): the
+    /// sidebar is drawn see-through so it shows. See
+    /// `platform_chrome::welcome_backdrop`.
+    backdrop: bool,
     selected: Option<WelcomeSelection>,
     callbacks: WelcomeCallbacks,
     project_name_input: TextInputState,
+    /// Filters the Recent grid by name and folder. The selection keeps
+    /// indexing `recent_projects`; it only ever lands on a match.
+    recent_search: TextInputState,
     selected_template: ProjectTemplate,
     project_sample_rate: u32,
     project_bpm: f32,
@@ -321,7 +342,8 @@ pub fn open_next_on_new_project() {
 }
 
 impl WelcomeWindow {
-    pub fn new(callbacks: WelcomeCallbacks, focus_handle: FocusHandle) -> Self {
+    pub fn new(callbacks: WelcomeCallbacks, cx: &mut Context<Self>) -> Self {
+        let focus_handle = cx.focus_handle();
         // A single small JSON read. The `missing` flags it carries are whatever
         // was last persisted; they are re-derived off the UI thread by
         // `spawn_refresh_recent_missing`, so a row can briefly show a stale
@@ -351,6 +373,10 @@ impl WelcomeWindow {
             .with_placeholder(default_name.clone())
             .with_accessible_label(i18n.tr("wizard.field.name"));
         project_name_input.set_value(default_name);
+        let search_label = i18n.tr_or("welcome.recent.search", "Search projects");
+        let recent_search = TextInputState::new("welcome-recent-search", cx.focus_handle())
+            .with_placeholder(search_label.clone())
+            .with_accessible_label(search_label);
 
         let edition = crate::edition::current_edition_info()
             .map(|info| info.edition.to_string())
@@ -369,9 +395,13 @@ impl WelcomeWindow {
             // The list scrolls, so it shows everything the store holds rather
             // than an arbitrary first seven.
             recent_projects: recent.entries().to_vec(),
+            recent_thumbs: vec![None; recent.entries().len()],
+            recent_columns: 1,
+            backdrop: crate::platform_chrome::welcome_has_backdrop(),
             selected: Some(WelcomeSelection::Start(0)),
             callbacks,
             project_name_input,
+            recent_search,
             selected_template: ProjectTemplate::Empty,
             project_sample_rate: schema.general.project_defaults.sample_rate,
             project_bpm: 120.0,
@@ -391,6 +421,37 @@ impl WelcomeWindow {
         }
     }
 
+    /// Show these recent projects and thumbnails instead of the machine's own
+    /// (`ui-preview` only). Skips the background refresh, which would mark
+    /// the made-up paths missing.
+    #[cfg(feature = "ui-preview")]
+    pub(crate) fn preview_recents(
+        &mut self,
+        entries: Vec<RecentProject>,
+        thumbs: Vec<Option<Arc<gpui::Image>>>,
+    ) {
+        self.recent_projects = entries;
+        self.recent_thumbs = thumbs;
+        self.selected = Some(WelcomeSelection::Recent(0));
+        self.bootstrapped = true;
+    }
+
+    /// Type `query` into the Recent search (`ui-preview` only).
+    #[cfg(feature = "ui-preview")]
+    pub(crate) fn preview_search(&mut self, query: &str) {
+        self.recent_search.set_value(query);
+        if let Some(&first) = self.visible_recent().first() {
+            self.selected = Some(WelcomeSelection::Recent(first));
+        }
+    }
+
+    /// Draw as over a backdrop or not (`ui-preview` only): the preview opens
+    /// opaque windows, where a see-through sidebar would show nothing.
+    #[cfg(feature = "ui-preview")]
+    pub(crate) fn preview_backdrop(&mut self, backdrop: bool) {
+        self.backdrop = backdrop;
+    }
+
     /// One-shot startup work that needs a `Context`.
     ///
     /// `new()` is invoked from `cx.new(|cx| …)` in the app layer with only a
@@ -406,7 +467,8 @@ impl WelcomeWindow {
         self.spawn_refresh_recent_missing(cx);
     }
 
-    /// Re-derive the recent list's `missing` flags off the UI thread.
+    /// Re-derive the recent list's `missing` flags, and read the projects'
+    /// thumbnails, off the UI thread.
     ///
     /// Per-entry `Path::exists()` is a synchronous stat that can stall for
     /// hundreds of ms on cloud-backed (OneDrive/Dropbox placeholder) paths, so
@@ -422,18 +484,38 @@ impl WelcomeWindow {
             return;
         }
         cx.spawn(async move |this, cx| {
-            let missing: Vec<bool> = cx
+            let found: Vec<(bool, Option<Vec<u8>>)> = cx
                 .background_executor()
-                .spawn(async move { paths.iter().map(|path| !path.exists()).collect() })
+                .spawn(async move {
+                    paths
+                        .iter()
+                        .map(|path| {
+                            let missing = !path.exists();
+                            let thumb = if missing { None } else { read_thumbnail(path) };
+                            (missing, thumb)
+                        })
+                        .collect()
+                })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 // A length mismatch means the list changed underneath us; drop
                 // the result rather than flag the wrong rows.
-                if missing.len() != this.recent_projects.len() {
+                if found.len() != this.recent_projects.len() {
                     return;
                 }
-                for (entry, &is_missing) in this.recent_projects.iter_mut().zip(&missing) {
-                    entry.missing = is_missing;
+                this.recent_thumbs = found
+                    .iter()
+                    .map(|(_, thumb)| {
+                        thumb.as_ref().map(|bytes| {
+                            Arc::new(gpui::Image::from_bytes(
+                                gpui::ImageFormat::Png,
+                                bytes.clone(),
+                            ))
+                        })
+                    })
+                    .collect();
+                for (entry, (is_missing, _)) in this.recent_projects.iter_mut().zip(&found) {
+                    entry.missing = *is_missing;
                 }
                 cx.notify();
             });
@@ -470,6 +552,14 @@ impl WelcomeWindow {
             }
             return;
         }
+        if self.recent_search.is_focused(window) {
+            self.handle_search_key(event, window, cx);
+            return;
+        }
+        if is_find_shortcut(event) && self.active_nav == StartupNav::Start {
+            self.focus_recent_search(window, cx);
+            return;
+        }
         if let Some(index) = welcome_shortcut_index(event) {
             self.activate_start_row(index, window, cx);
             return;
@@ -494,6 +584,89 @@ impl WelcomeWindow {
             }
             _ => {}
         }
+    }
+
+    /// Keys while the Recent search has focus. Up and Down move through the
+    /// matches and Enter opens the selected one, so a search can end in an
+    /// open project without leaving the keyboard; Left and Right stay with
+    /// the caret. Escape clears the query, then gives focus back.
+    fn handle_search_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let modifiers = event.keystroke.modifiers;
+        let plain = !(modifiers.control || modifiers.alt || modifiers.platform);
+        match event.keystroke.key.as_str() {
+            "up" | "arrow_up" if plain => self.move_selection(-1, cx),
+            "down" | "arrow_down" if plain => {
+                if matches!(self.selected, Some(WelcomeSelection::Recent(_))) {
+                    self.move_selection(1, cx);
+                } else {
+                    self.select_first_recent_match(cx);
+                }
+            }
+            "enter" | "numpad_enter" if !self.recent_search.is_composing() => {
+                if !matches!(self.selected, Some(WelcomeSelection::Recent(_))) {
+                    self.select_first_recent_match(cx);
+                }
+                if let Some(WelcomeSelection::Recent(index)) = self.selected {
+                    self.activate_recent(index, window, cx);
+                }
+            }
+            "escape" if !self.recent_search.is_composing() => {
+                if self.recent_search.value.is_empty() {
+                    window.blur();
+                } else {
+                    self.recent_search.set_value("");
+                    self.recent_search_changed(cx);
+                }
+                cx.notify();
+            }
+            _ => {
+                let before = self.recent_search.value.clone();
+                let _ = self.recent_search.handle_key_ime(event, Some(cx));
+                if self.recent_search.value != before {
+                    self.recent_search_changed(cx);
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    fn focus_recent_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.recent_search.focus_handle, cx);
+        self.recent_search.select_all();
+        cx.notify();
+    }
+
+    /// The recent projects the search lets through, as indices into
+    /// `recent_projects`, in list order.
+    fn visible_recent(&self) -> Vec<usize> {
+        recent_matches(&self.recent_projects, &self.recent_search.value)
+    }
+
+    fn select_first_recent_match(&mut self, cx: &mut Context<Self>) {
+        if let Some(&first) = self.visible_recent().first() {
+            self.selected = Some(WelcomeSelection::Recent(first));
+            cx.notify();
+        }
+    }
+
+    /// A new query hides some cards. A selection on one of them moves to the
+    /// first match, so Enter never opens a project the grid is not showing.
+    fn recent_search_changed(&mut self, cx: &mut Context<Self>) {
+        if let Some(WelcomeSelection::Recent(index)) = self.selected {
+            let visible = self.visible_recent();
+            if !visible.contains(&index) {
+                self.selected = match visible.first() {
+                    Some(&first) => Some(WelcomeSelection::Recent(first)),
+                    None => Some(WelcomeSelection::Start(0)),
+                };
+            }
+        }
+        cx.notify();
     }
 
     /// Switch the centre pane. Every nav change goes through here so the Feed's
@@ -583,21 +756,30 @@ impl WelcomeWindow {
         if self.active_nav != StartupNav::Start {
             return;
         }
-        // Up and Down run between the template tiles and the Recent list
-        // below them, and along that list.
-        let recent_len = self.recent_projects.len();
-        let next = match self.selected {
-            Some(WelcomeSelection::Recent(0)) if delta < 0 => WelcomeSelection::Start(0),
-            Some(WelcomeSelection::Recent(index)) if recent_len > 0 => {
-                let last = recent_len as isize - 1;
-                let target = (index as isize + delta).clamp(0, last) as usize;
-                WelcomeSelection::Recent(target)
+        // Up and Down run between the template tiles and the Recent grid
+        // below them, and a row at a time through the grid.
+        // Positions are within the cards the search lets through; the
+        // selection itself stays an index into `recent_projects`.
+        let visible = self.visible_recent();
+        let columns = self.recent_columns.max(1);
+        let position = match self.selected {
+            Some(WelcomeSelection::Recent(index)) => visible.iter().position(|&i| i == index),
+            _ => None,
+        };
+        let next = match (self.selected, position) {
+            (Some(WelcomeSelection::Recent(_)), Some(at)) if delta < 0 && at < columns => {
+                WelcomeSelection::Start(0)
             }
-            Some(WelcomeSelection::Start(_)) if delta > 0 && recent_len > 0 => {
-                WelcomeSelection::Recent(0)
+            (Some(WelcomeSelection::Recent(_)), Some(at)) => {
+                let last = visible.len() as isize - 1;
+                let target = (at as isize + delta * columns as isize).clamp(0, last) as usize;
+                WelcomeSelection::Recent(visible[target])
             }
-            Some(WelcomeSelection::Start(index)) => WelcomeSelection::Start(index),
-            // Continue, an out-of-range recent index, or nothing selected: land
+            (Some(WelcomeSelection::Start(_)), _) if delta > 0 && !visible.is_empty() => {
+                WelcomeSelection::Recent(visible[0])
+            }
+            (Some(WelcomeSelection::Start(index)), _) => WelcomeSelection::Start(index),
+            // Continue, a hidden or out-of-range recent, or nothing selected: land
             // on the first tile rather than guess.
             _ => WelcomeSelection::Start(0),
         };
@@ -605,10 +787,24 @@ impl WelcomeWindow {
         cx.notify();
     }
 
-    /// Left/Right move along the row of template tiles.
+    /// Left/Right move along the row of template tiles, or through the
+    /// recent grid.
     fn move_selection_column(&mut self, to_right: bool, cx: &mut Context<Self>) {
         if self.active_nav != StartupNav::Start {
             return;
+        }
+        if let Some(WelcomeSelection::Recent(index)) = self.selected {
+            let visible = self.visible_recent();
+            if let Some(at) = visible.iter().position(|&i| i == index) {
+                let next = if to_right {
+                    (at + 1).min(visible.len() - 1)
+                } else {
+                    at.saturating_sub(1)
+                };
+                self.selected = Some(WelcomeSelection::Recent(visible[next]));
+                cx.notify();
+                return;
+            }
         }
         let last = TEMPLATE_TILE_COUNT - 1;
         let next = match self.selected {
@@ -829,10 +1025,147 @@ fn welcome_shortcut_index(event: &KeyDownEvent) -> Option<usize> {
         .position(|(candidate, shift)| *candidate == key && *shift == modifiers.shift)
 }
 
+/// Ctrl+F (Cmd+F on macOS) puts the caret in the Recent search.
+fn is_find_shortcut(event: &KeyDownEvent) -> bool {
+    let modifiers = event.keystroke.modifiers;
+    (modifiers.control || modifiers.platform)
+        && !modifiers.alt
+        && !modifiers.shift
+        && event.keystroke.key.eq_ignore_ascii_case("f")
+}
+
+/// Indices of the recent projects matching `query`, in list order. Every
+/// whitespace-separated word has to appear, ignoring case, in the project's
+/// name or its path, so "mix 2024" finds "Final Mix" kept under a 2024 folder.
+/// An empty query matches everything.
+fn recent_matches(projects: &[RecentProject], query: &str) -> Vec<usize> {
+    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    projects
+        .iter()
+        .enumerate()
+        .filter(|(_, project)| {
+            if words.is_empty() {
+                return true;
+            }
+            let name = project.name.to_lowercase();
+            let path = project.path.to_string_lossy().to_lowercase();
+            words
+                .iter()
+                .all(|word| name.contains(word.as_str()) || path.contains(word.as_str()))
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+impl WelcomeWindow {
+    /// The field platform IME goes to: the Recent search while it has focus,
+    /// the project name otherwise.
+    fn ime_field(&self, window: &Window) -> &TextInputState {
+        if self.recent_search.is_focused(window) {
+            &self.recent_search
+        } else {
+            &self.project_name_input
+        }
+    }
+
+    fn ime_field_mut(&mut self, window: &Window) -> (&mut TextInputState, bool) {
+        if self.recent_search.is_focused(window) {
+            (&mut self.recent_search, true)
+        } else {
+            (&mut self.project_name_input, false)
+        }
+    }
+}
+
 // Route platform IME (CJK/Thai composition + candidate-window positioning) to
-// the project-name field. Coexists with handle_key_with_clipboard; GPUI
+// whichever field has focus. Coexists with handle_key_with_clipboard; GPUI
 // suppresses key dispatch for keystrokes the IME consumes.
-crate::impl_single_input_window_ime!(WelcomeWindow, project_name_input);
+impl gpui::EntityInputHandler for WelcomeWindow {
+    fn text_for_range(
+        &mut self,
+        range: std::ops::Range<usize>,
+        actual_range: &mut Option<std::ops::Range<usize>>,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        self.ime_field(window)
+            .text_for_utf16_range(range, actual_range)
+    }
+
+    fn selected_text_range(
+        &mut self,
+        ignore_disabled_input: bool,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<gpui::UTF16Selection> {
+        self.ime_field(window)
+            .selected_text_range_utf16(ignore_disabled_input)
+    }
+
+    fn marked_text_range(
+        &self,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        self.ime_field(window).marked_text_range_utf16()
+    }
+
+    fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ime_field_mut(window).0.unmark_text();
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range: Option<std::ops::Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (field, is_search) = self.ime_field_mut(window);
+        field.replace_text_in_utf16_range(range, text);
+        if is_search {
+            self.recent_search_changed(cx);
+        }
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range: Option<std::ops::Range<usize>>,
+        new_text: &str,
+        new_selected_range: Option<std::ops::Range<usize>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (field, is_search) = self.ime_field_mut(window);
+        field.replace_and_mark_text_in_utf16_range(range, new_text, new_selected_range);
+        if is_search {
+            self.recent_search_changed(cx);
+        }
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: std::ops::Range<usize>,
+        bounds: gpui::Bounds<gpui::Pixels>,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<gpui::Bounds<gpui::Pixels>> {
+        self.ime_field(window)
+            .bounds_for_utf16_range(range_utf16, bounds)
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: gpui::Point<gpui::Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+}
 
 impl Render for WelcomeWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -855,7 +1188,9 @@ impl Render for WelcomeWindow {
             .flex_col()
             .size_full()
             .font(theme::ui_font())
-            .bg(Colors::surface_window())
+            // Over a backdrop the window's own plane is left clear, so the
+            // sidebar can show it; the main pane paints its own.
+            .when(!self.backdrop, |root| root.bg(Colors::surface_window()))
             .cursor(gpui::CursorStyle::Arrow)
             // Swallow the platform's default click-drag gesture on the Welcome
             // root so static labels/rows never render as "selected" while the
@@ -907,7 +1242,12 @@ impl WelcomeWindow {
         // it cannot do while the scrutinee is still a place expression on self.
         let nav = self.active_nav;
         let center = match nav {
-            StartupNav::Start => self.start_pane(cx, i18n),
+            StartupNav::Start => self.start_pane(
+                f32::from(window.viewport_size().width),
+                self.recent_search.is_focused(window),
+                cx,
+                i18n,
+            ),
             StartupNav::NewProject => new_project_pane(
                 cx,
                 &self.project_name_input,
@@ -943,9 +1283,9 @@ impl WelcomeWindow {
             .flex_row()
             .flex_1()
             .min_h_0()
-            .bg(Colors::surface_base())
             .child(sidebar(
                 cx,
+                self.backdrop,
                 self.active_nav,
                 self.selected,
                 &self.callbacks,
@@ -964,6 +1304,7 @@ impl WelcomeWindow {
                     .flex_1()
                     .min_w_0()
                     .min_h_0()
+                    .bg(Colors::surface_base())
                     .child(center)
                     .when(crate::platform_chrome::welcome_native_frame(), |main| {
                         main.children(crate::components::app_chrome::account_chip().map(|chip| {
@@ -1077,6 +1418,7 @@ fn welcome_chrome(window: &Window) -> impl IntoElement {
 #[allow(clippy::too_many_arguments)]
 fn sidebar(
     cx: &mut Context<WelcomeWindow>,
+    backdrop: bool,
     active: StartupNav,
     selected: Option<WelcomeSelection>,
     callbacks: &WelcomeCallbacks,
@@ -1163,7 +1505,14 @@ fn sidebar(
         .min_h_0()
         .border_r(px(1.0))
         .border_color(Colors::border_subtle())
-        .bg(Colors::surface_sidebar())
+        // Over a backdrop, a light wash of the sidebar's own plane: the
+        // material shows through, and the theme's value still holds where
+        // the system's light/dark setting differs from the app's.
+        .bg(if backdrop {
+            Colors::with_alpha(Colors::surface_sidebar(), SIDEBAR_BACKDROP_WASH)
+        } else {
+            Colors::surface_sidebar()
+        })
         .px(px(space::LOOSE))
         .pt(px(space::BLOCK))
         .pb(px(space::LOOSE))
@@ -1585,7 +1934,13 @@ impl WelcomeWindow {
     /// No primary button here — that is New Project in the sidebar; the tiles
     /// and rows are the actions, and the accent is spent on selection and
     /// focus.
-    fn start_pane(&mut self, cx: &mut Context<Self>, i18n: I18n) -> gpui::AnyElement {
+    fn start_pane(
+        &mut self,
+        viewport_width: f32,
+        search_focused: bool,
+        cx: &mut Context<Self>,
+        i18n: I18n,
+    ) -> gpui::AnyElement {
         let selected = self.selected;
         let mut tiles = div()
             .flex()
@@ -1610,24 +1965,44 @@ impl WelcomeWindow {
             ));
         }
 
-        let paint = row_paint(Colors::surface_input());
+        // The grid's width: the window less the sidebar, the pane's padding,
+        // and the well's own padding and border.
+        let grid_width =
+            (viewport_width - SIDEBAR_WIDTH - space::BLOCK * 2.0 - space::BASE * 2.0 - 2.0)
+                .max(CARD_MIN_WIDTH);
+        let (columns, card_width) = grid_columns(grid_width, CARD_MIN_WIDTH, space::BASE);
+        self.recent_columns = columns;
         let mut well = list_well("welcome-recent-list")
             .flex_1()
             .min_h_0()
             .overflow_y_scroll();
+        let visible = self.visible_recent();
+        let query = self.recent_search.value.trim().to_string();
+        let search_callbacks =
+            bind_mouse_selection(cx.entity().clone(), |this| &mut this.recent_search);
         if self.recent_projects.is_empty() {
             well = well.child(empty_state(i18n.tr("menu.file-open_recent-empty")));
+        } else if visible.is_empty() {
+            well = well.child(empty_state(format!(
+                "{} \u{201c}{query}\u{201d}",
+                i18n.tr_or("welcome.recent.search-empty", "No recent projects match")
+            )));
         } else {
-            for (index, item) in self.recent_projects.iter().enumerate() {
+            let mut grid = div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap(px(space::BASE))
+                .p(px(space::TIGHT));
+            for index in visible.iter().copied() {
+                let item = &self.recent_projects[index];
                 let target = cx.entity().clone();
-                if index > 0 {
-                    well = well.child(row_divider());
-                }
-                well = well.child(recent_row(
+                grid = grid.child(recent_card(
                     index,
                     item,
+                    self.recent_thumbs.get(index).cloned().flatten(),
+                    card_width,
                     selected == Some(WelcomeSelection::Recent(index)),
-                    paint,
                     i18n,
                     move |window, cx| {
                         let _ =
@@ -1635,6 +2010,7 @@ impl WelcomeWindow {
                     },
                 ));
             }
+            well = well.child(grid);
         }
         let recent_count = self.recent_projects.len();
 
@@ -1698,19 +2074,76 @@ impl WelcomeWindow {
                                 i18n.tr("welcome.nav.recent").to_uppercase(),
                             ))
                             .when(recent_count > 0, |header| {
+                                // While a search narrows the grid the count
+                                // says how much of the list is showing.
+                                let count = if query.is_empty() {
+                                    recent_count.to_string()
+                                } else {
+                                    format!("{} / {recent_count}", visible.len())
+                                };
                                 header.child(
                                     div()
                                         .text_size(px(typography::DENSE_CAPTION))
                                         .font_features(tabular_features())
                                         .text_color(Colors::text_faint())
-                                        .child(recent_count.to_string()),
+                                        .child(count),
                                 )
+                            })
+                            .child(div().flex_1())
+                            // Nothing to search in an empty list; the field
+                            // would filter nothing.
+                            .when(recent_count > 0, |header| {
+                                header.child(recent_search_field(
+                                    &self.recent_search,
+                                    search_focused,
+                                    search_callbacks,
+                                    cx.entity().clone(),
+                                ))
                             }),
                     )
                     .child(well),
             )
             .into_any_element()
     }
+}
+
+/// Width of the Recent search field, glyph included.
+const RECENT_SEARCH_WIDTH: f32 = 240.0;
+
+/// The Recent header's search: a glyph and a text field. The field is the
+/// shared text input, so editing, selection and IME behave as everywhere else.
+fn recent_search_field(
+    state: &TextInputState,
+    focused: bool,
+    callbacks: TextInputCallbacks,
+    ime_target: gpui::Entity<WelcomeWindow>,
+) -> impl IntoElement {
+    div()
+        .w(px(RECENT_SEARCH_WIDTH))
+        .flex_shrink_0()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(space::SNUG))
+        .child(
+            svg()
+                .path(assets::ICON_SEARCH_PATH)
+                .size(px(typography::UI_XS))
+                .flex_shrink_0()
+                .text_color(if focused {
+                    Colors::text_secondary()
+                } else {
+                    Colors::text_muted()
+                }),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(text_field_with_callbacks_and_ime(
+                    state, focused, callbacks, ime_target,
+                )),
+        )
 }
 
 /// How many of the Start rows are template tiles: every one but the last,
@@ -1843,16 +2276,38 @@ fn monogram(name: &str) -> String {
         .unwrap_or_else(|| "?".to_string())
 }
 
-/// A recent-project row: monogram, name and folder, then when it was opened.
+/// How many cards of at least `min` fit across `width` with `gap` between
+/// them, and how wide each is when they share the row evenly.
+fn grid_columns(width: f32, min: f32, gap: f32) -> (usize, f32) {
+    let columns = (((width + gap) / (min + gap)).floor() as usize).max(1);
+    let card = (width - gap * (columns - 1) as f32) / columns as f32;
+    (columns, card.floor())
+}
+
+/// Read a project's thumbnail, if it has one. Background thread only.
+fn read_thumbnail(project_file: &std::path::Path) -> Option<Vec<u8>> {
+    let path = crate::project::thumbnail::thumbnail_path(project_file.parent()?);
+    let size = std::fs::metadata(&path).ok()?.len();
+    if size == 0 || size > crate::project::thumbnail::THUMB_MAX_BYTES {
+        return None;
+    }
+    std::fs::read(path).ok()
+}
+
+/// A recent project as a card: its thumbnail, or its monogram when it has
+/// none, over its name and when it was opened.
 ///
-/// A missing project is carried on two channels — a warning badge *and* a
-/// disabled label — rather than by dimming the whole row, and it takes no
-/// pointer affordance because there is nothing to open.
-fn recent_row(
+/// A surface, so it rounds as one, like the template tiles; selection is
+/// the selected fill plus an accent border, on the same geometry. A missing
+/// project is carried on two channels — a warning badge *and* a disabled
+/// name — and takes no pointer affordance, because there is nothing to open.
+#[allow(clippy::too_many_arguments)]
+fn recent_card(
     index: usize,
     recent: &RecentProject,
+    thumbnail: Option<Arc<gpui::Image>>,
+    width: f32,
     selected: bool,
-    paint: RowPaint,
     i18n: I18n,
     on_activate: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
@@ -1869,15 +2324,66 @@ fn recent_row(
     } else {
         format!("{name}. {}", recent.path.to_string_lossy())
     };
-    let initial = monogram(&name);
-    let rest = paint.rest_for(selected);
-    let hover = paint.hover_for(selected);
-    let pressed = paint.pressed_for(selected);
-    let focus = Colors::state_focus_ring();
-    let name_color = if missing {
-        Colors::text_disabled()
+    let plane = Colors::surface_panel();
+    let rest = if selected {
+        Colors::composite(plane, Colors::state_selected())
     } else {
-        Colors::text_primary()
+        plane
+    };
+    let hover = Colors::composite(rest, Colors::state_hover());
+    let pressed = Colors::composite(rest, Colors::state_recessed());
+    let border = if selected {
+        Colors::with_alpha(Colors::accent_primary(), 0.6)
+    } else {
+        Colors::border_subtle()
+    };
+    let focus = Colors::state_focus_ring();
+    let picture_height = (width * 9.0 / 16.0).floor();
+    let inner = radius::inner(radius::SURFACE, 1.0);
+
+    let picture = match thumbnail.filter(|_| !missing) {
+        Some(image) => div()
+            .size_full()
+            .child(
+                img(gpui::ImageSource::Image(image))
+                    .size_full()
+                    .object_fit(gpui::ObjectFit::Cover),
+            )
+            .into_any_element(),
+        None => div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(space::SNUG))
+            .child(
+                div()
+                    .size(px(PLATE + space::LOOSE))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(radius::CONTROL))
+                    .bg(Colors::surface_raised())
+                    .text_size(px(typography::UI_LG))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(if missing {
+                        Colors::text_disabled()
+                    } else {
+                        Colors::text_secondary()
+                    })
+                    .child(monogram(&name)),
+            )
+            .child(
+                div()
+                    .text_size(px(typography::DENSE_CAPTION))
+                    .text_color(Colors::text_faint())
+                    // A missing project says so in its badge below.
+                    .when(!missing, |caption| {
+                        caption.child(i18n.tr_or("welcome.recent.no-preview", "No preview yet"))
+                    }),
+            )
+            .into_any_element(),
     };
 
     div()
@@ -1889,87 +2395,84 @@ fn recent_row(
         .focusable()
         .tab_stop(true)
         .focus_visible(move |style| style.shadow(elevation::focus_ring(focus)))
-        .relative()
         .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(space::LOOSE))
-        .w_full()
-        .h(px(LIST_ROW_HEIGHT))
+        .flex_col()
         .flex_none()
-        .px(px(space::LOOSE))
-        .rounded(px(radius::NONE))
+        .w(px(width))
+        .h(px(picture_height + CARD_TEXT_HEIGHT))
+        .rounded(px(radius::SURFACE))
+        .border(px(1.0))
+        .border_color(border)
         .bg(rest)
-        .when(!missing, |row| {
-            row.cursor(gpui::CursorStyle::PointingHand)
+        .overflow_hidden()
+        .tooltip(crate::components::controls::fb_tooltip(folder))
+        .when(!missing, |card| {
+            card.cursor(gpui::CursorStyle::PointingHand)
                 .hover(move |style| style.bg(hover))
                 .active(move |style| style.bg(pressed))
                 .on_click(move |_event, window, cx| on_activate(window, cx))
         })
-        .when(missing, |row| row.cursor(gpui::CursorStyle::Arrow))
-        .when(selected, |row| row.child(selection_marker()))
+        .when(missing, |card| card.cursor(gpui::CursorStyle::Arrow))
         .child(
+            // The picture is an image, so its plane is the canvas, square at
+            // the bottom where the text block meets it.
             div()
-                .flex()
-                .items_center()
-                .justify_center()
-                .w(px(PLATE))
-                .h(px(PLATE))
                 .flex_none()
-                .rounded(px(radius::CONTROL))
-                .bg(Colors::surface_raised())
-                .text_size(px(typography::UI_SM))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(if missing {
-                    Colors::text_disabled()
-                } else {
-                    Colors::text_secondary()
-                })
-                .child(initial),
+                .w_full()
+                .h(px(picture_height))
+                .rounded_t(px(inner))
+                .overflow_hidden()
+                .bg(Colors::surface_canvas())
+                .border_b(px(1.0))
+                .border_color(Colors::border_subtle())
+                .child(picture),
         )
         .child(
             div()
                 .flex()
                 .flex_col()
                 .justify_center()
+                .gap(px(space::HAIR))
                 .flex_1()
-                .min_w_0()
+                .min_h_0()
+                .px(px(space::LOOSE))
                 .child(
                     div()
                         .truncate()
                         .text_size(px(typography::UI_SM))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(name_color)
+                        .text_color(if missing {
+                            Colors::text_disabled()
+                        } else {
+                            Colors::text_primary()
+                        })
                         .child(name),
                 )
                 .child(
                     div()
-                        .truncate()
-                        .text_size(px(typography::UI_XS))
-                        .text_color(if missing {
-                            Colors::text_disabled()
-                        } else {
-                            Colors::text_faint()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(space::SNUG))
+                        .min_w_0()
+                        .when(missing, |line| {
+                            line.child(fb_badge(
+                                i18n.tr("project.file.missing"),
+                                Colors::semantic_warning(),
+                            ))
                         })
-                        .child(folder),
+                        .when(!missing && !last_opened.is_empty(), |line| {
+                            line.child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(typography::UI_XS))
+                                    .font_features(tabular_features())
+                                    .text_color(Colors::text_muted())
+                                    .child(last_opened),
+                            )
+                        }),
                 ),
         )
-        .when(missing, |row| {
-            row.child(div().flex_none().child(fb_badge(
-                i18n.tr("project.file.missing"),
-                Colors::semantic_warning(),
-            )))
-        })
-        .when(!missing && !last_opened.is_empty(), |row| {
-            row.child(
-                div()
-                    .flex_none()
-                    .text_size(px(typography::DENSE_LABEL))
-                    .font_features(tabular_features())
-                    .text_color(Colors::text_muted())
-                    .child(last_opened),
-            )
-        })
 }
 
 // ── New Project pane ─────────────────────────────────────────────────────────
@@ -2930,5 +3433,31 @@ mod tests {
             "\u{0E1B}"
         );
         assert_eq!(monogram(""), "?");
+    }
+
+    fn recent(name: &str, folder: &str) -> RecentProject {
+        RecentProject {
+            name: name.to_string(),
+            folder_path: Some(format!("D:/{folder}/{name}").into()),
+            path: format!("D:/{folder}/{name}/{name}.fbproj").into(),
+            last_opened_at: 0,
+            missing: false,
+        }
+    }
+
+    #[test]
+    fn the_recent_search_matches_every_word_in_the_name_or_path() {
+        let projects = [
+            recent("Night Drive", "Music"),
+            recent("Final Mix", "2024"),
+            recent("Chorus Sketch", "Music"),
+        ];
+        assert_eq!(recent_matches(&projects, ""), vec![0, 1, 2]);
+        assert_eq!(recent_matches(&projects, "   "), vec![0, 1, 2]);
+        assert_eq!(recent_matches(&projects, "SKETCH"), vec![2]);
+        // One word from the name, one from the folder.
+        assert_eq!(recent_matches(&projects, "mix 2024"), vec![1]);
+        assert_eq!(recent_matches(&projects, "music"), vec![0, 2]);
+        assert!(recent_matches(&projects, "drive 2024").is_empty());
     }
 }

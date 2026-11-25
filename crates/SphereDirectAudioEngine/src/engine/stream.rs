@@ -593,8 +593,17 @@ where
                                 );
                             }
                         }
+                        EngineCommand::SetTrackVcaGain { track_index, value } => {
+                            runtime.update_track_vca_gain_at(track_index, value);
+                        }
                         EngineCommand::SetTrackPan { track_index, value } => {
                             runtime.update_track_pan_at(track_index, value);
+                        }
+                        EngineCommand::SetTrackDualPan {
+                            track_index,
+                            dual_pan,
+                        } => {
+                            runtime.update_track_dual_pan_at(track_index, dual_pan);
                         }
                         EngineCommand::SetTrackMute { track_index, muted } => {
                             if callback_debug_enabled() {

@@ -41,12 +41,18 @@ impl EngineInner {
                 .map(|handle| handle.take_input_channel_peaks());
             if let (Some(input_peaks), Some(project)) = (input_peaks, self.project.lock().as_ref())
             {
+                // Only armed or monitoring audio tracks show their input, and
+                // there are few of them: gather those once, rather than scan
+                // the whole project for each of the meters every tick.
+                let inputs: Vec<_> = project
+                    .tracks
+                    .iter()
+                    .filter(|track| {
+                        track.track_type == "audio" && (track.armed || track.input_monitor)
+                    })
+                    .collect();
                 for meter in &mut tracks {
-                    let Some(track) = project.tracks.iter().find(|track| {
-                        track.id == meter.track_id
-                            && track.track_type == "audio"
-                            && (track.armed || track.input_monitor)
-                    }) else {
+                    let Some(track) = inputs.iter().find(|track| track.id == meter.track_id) else {
                         continue;
                     };
                     if let Some((peak_l, peak_r)) =
@@ -85,7 +91,39 @@ impl EngineInner {
             monitor_active: self.shared.monitor_enabled_any.load(Ordering::Relaxed),
             monitor_peak_l: f32_load(self.shared.monitor_peak_l.load(Ordering::Relaxed)) as f64,
             monitor_peak_r: f32_load(self.shared.monitor_peak_r.load(Ordering::Relaxed)) as f64,
+            speaker_peaks: {
+                let runtime = self.runtime.lock();
+                if runtime.spatial.active() {
+                    runtime
+                        .spatial
+                        .meter
+                        .take(runtime.spatial.bus.channels())
+                        .into_iter()
+                        .map(f64::from)
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            },
         }
+    }
+
+    /// Points the visualizer track tap at `track_id` (or at no track): that
+    /// track's post-fader block is copied into
+    /// [`crate::visualizer_tap::track_tap`] from the next block on. Control
+    /// side. A rebuilt graph starts untapped, so a caller that wants the tap
+    /// to stay sets it again now and then. Returns whether the track exists.
+    pub fn set_visualizer_track_tap(&self, track_id: Option<&str>) -> bool {
+        let runtime = self.runtime.lock();
+        let mut found = false;
+        for track in &runtime.tracks {
+            let tapped = track_id == Some(track.id.as_str());
+            found |= tapped;
+            if track.meter.visualizer_tap.load(Ordering::Relaxed) != tapped {
+                track.meter.visualizer_tap.store(tapped, Ordering::Relaxed);
+            }
+        }
+        found
     }
 
     /// Full-pipeline diagnostics snapshot (Layer 10). Non-destructive — reads
@@ -331,6 +369,11 @@ impl EngineInner {
     }
 
     pub fn get_debug_info(&self) -> JsEngineDebugInfo {
+        // Before the locks below: it takes `project` itself (for the tempo
+        // map), and parking_lot locks are not re-entrant, so taking it under
+        // the guard deadlocked the calling thread — the UI thread, on Play,
+        // whenever FUTUREBOARD_PLAYBACK_DEBUG was set.
+        let transport = self.transport_snapshot();
         // `project` before `runtime`, the order `load_project` takes them in.
         let project = self.project.lock();
         let runtime = self.runtime.lock();
@@ -422,7 +465,6 @@ impl EngineInner {
             })
             .collect();
 
-        let transport = self.transport_snapshot();
         let disk = crate::streaming_source::diagnostics();
 
         JsEngineDebugInfo {

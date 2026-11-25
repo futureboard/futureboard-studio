@@ -36,8 +36,8 @@ use builtin_dsp_core::crossover::FourBandSplitter as BandSplitter;
 use builtin_dsp_core::crossover::TwoBandSplitter;
 use builtin_dsp_core::delay::{Allpass, DelayRing};
 use builtin_dsp_core::{
-    clamp, db_to_linear, flush_denormal, max_filter_frequency, time_constant, ParamDescriptor,
-    PluginCategory, PluginDescriptor, StereoEffect,
+    ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, clamp, db_to_linear,
+    flush_denormal, max_filter_frequency, time_constant,
 };
 use serde::{Deserialize, Serialize};
 
@@ -48,8 +48,8 @@ pub mod ui;
 
 /// Editor-facing parameter id table, re-exported at the crate root so the host
 /// resolves ids the same way for every built-in (`<plugin>::ui_param_index`).
-pub use ipc::{ui_param_id, ui_param_index, UI_PARAM_IDS};
-pub use presets::{factory_presets, FactoryPreset};
+pub use ipc::{UI_PARAM_IDS, ui_param_id, ui_param_index};
+pub use presets::{FactoryPreset, factory_presets};
 
 pub const PLUGIN_ID: &str = "futureboard.imager";
 
@@ -755,11 +755,7 @@ impl Dsp {
     /// multiband is off.
     #[inline]
     fn source_band(&self, band: usize) -> usize {
-        if self.params.multiband {
-            band
-        } else {
-            0
-        }
+        if self.params.multiband { band } else { 0 }
     }
 
     /// The side gain `band` plays at: its width plus the global offset, or

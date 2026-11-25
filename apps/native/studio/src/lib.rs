@@ -136,9 +136,13 @@ fn run() {
     // application ID resolves to Futureboard's own unless a build or runtime
     // override points elsewhere, so a plain checkout gets Rich Presence without
     // any local configuration. Missing Discord itself must not block startup.
-    let discord_rpc_enabled = sphere_ui_components::settings::SettingsSchema::load_from_disk()
-        .general
-        .discord_rpc_enabled;
+    let startup_settings = sphere_ui_components::settings::SettingsSchema::load_from_disk();
+    let discord_rpc_enabled = startup_settings.general.discord_rpc_enabled;
+    // Settings → Experimental → API server: off unless turned on; loopback only.
+    sphere_ui_components::api_server::apply_settings(
+        startup_settings.experimental.api_server,
+        startup_settings.experimental.api_server_port,
+    );
     let discord_rpc = sphere_discord_rpc::DiscordRpcConfig::from_env(env!("CARGO_PKG_VERSION"))
         .and_then(|config| {
             match sphere_discord_rpc::DiscordRpc::start(
@@ -214,6 +218,7 @@ fn run() {
     if let Some(discord_rpc) = discord_rpc {
         discord_rpc.shutdown();
     }
+    sphere_ui_components::api_server::shutdown();
     boot::log("gpui application exited");
 }
 

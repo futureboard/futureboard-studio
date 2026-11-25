@@ -100,6 +100,11 @@ impl StudioLayout {
         let project_name = self.project_session.name.clone();
 
         let defaults = ExportProjectDefaults {
+            // The snapshot's format already answers for the license.
+            surround_layout: match snapshot.spatial.format {
+                solfege_spatialaudio::SpatialFormat::Surround(layout) => Some(layout),
+                _ => None,
+            },
             project_sample_rate: sample_rate,
             master_volume,
             content_end_beat,
@@ -154,6 +159,7 @@ impl StudioLayout {
                 .filter(|engine| engine.is_running())
                 .map(|_| sample_rate)
                 .unwrap_or(0),
+            metadata: tl_state.project_metadata.to_audio_metadata(),
         };
 
         // Default output: <project folder>/Exports/<Name>.wav when the project

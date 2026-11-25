@@ -17,8 +17,13 @@
 //! ```text
 //! cargo build -p sphere-plugin-host --bins
 //! cargo run -p sphere-plugin-host --example plugin_host_probe -- \
-//!     "C:\Program Files\Common Files\VST3\Mix DRUMS.vst3" [--no-editor] [--seconds 4]
+//!     "C:\Program Files\Common Files\VST3\Mix DRUMS.vst3" [--no-editor] [--seconds 4] \
+//!     [--params FILTER]
 //! ```
+//!
+//! `--params FILTER` also asks the host for the parameter list once the
+//! plug-in is prepared, and prints each parameter whose title contains
+//! FILTER (any case; `""` for all) with the value and text the host reports.
 //!
 //! A path may be a directory: every `.vst3` directly inside it is probed.
 
@@ -45,16 +50,21 @@ fn main() {
     let mut paths = Vec::new();
     let mut editor = true;
     let mut seconds = 4.0f32;
+    let mut params: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--no-editor" => editor = false,
             "--seconds" => seconds = args.next().and_then(|s| s.parse().ok()).unwrap_or(seconds),
+            "--params" => params = Some(args.next().unwrap_or_default().to_lowercase()),
             _ => paths.push(PathBuf::from(arg)),
         }
     }
     if paths.is_empty() {
-        eprintln!("usage: plugin_host_probe <plugin.vst3 | folder>... [--no-editor] [--seconds N]");
+        eprintln!(
+            "usage: plugin_host_probe <plugin.vst3 | folder>... [--no-editor] [--seconds N] \
+             [--params FILTER]"
+        );
         std::process::exit(2);
     }
     let plugins: Vec<PathBuf> = paths
@@ -91,7 +101,7 @@ fn main() {
     let mut failures = 0;
     for plugin in &plugins {
         println!("\n=== {}", plugin.display());
-        let outcome = probe(&host, &scanner, plugin, editor, seconds);
+        let outcome = probe(&host, &scanner, plugin, editor, seconds, params.as_deref());
         let ok = matches!(outcome.loaded, Some(Ok(_)))
             && outcome.prepared == Some(true)
             && (!editor || matches!(outcome.editor, Some(Ok(_))))
@@ -169,7 +179,14 @@ fn wait_for<T>(
     None
 }
 
-fn probe(host: &Path, scanner: &Path, plugin: &Path, editor: bool, seconds: f32) -> Outcome {
+fn probe(
+    host: &Path,
+    scanner: &Path,
+    plugin: &Path,
+    editor: bool,
+    seconds: f32,
+    params: Option<&str>,
+) -> Outcome {
     let mut outcome = Outcome::default();
     let (class_id, name) = match scan_class_id(scanner, plugin) {
         Ok(found) => found,
@@ -218,6 +235,39 @@ fn probe(host: &Path, scanner: &Path, plugin: &Path, editor: bool, seconds: f32)
             matches!(event, HostEvent::ProcessingPrepared { .. }).then_some(true)
         })
         .or(Some(false));
+    }
+
+    if let Some(filter) = params.filter(|_| outcome.prepared == Some(true)) {
+        let _ = client.get_plugin_parameters(INSTANCE);
+        let list = wait_for(
+            &client,
+            &mut outcome,
+            Duration::from_secs(30),
+            |event| match event {
+                HostEvent::PluginParameters { parameters, .. } => Some(parameters.clone()),
+                _ => None,
+            },
+        );
+        match list {
+            Some(list) => {
+                println!("  params   {} reported", list.len());
+                for parameter in list
+                    .iter()
+                    .filter(|parameter| parameter.title.to_lowercase().contains(filter))
+                {
+                    println!(
+                        "  param    {:>6} {:<32} {:>9} {:?}",
+                        parameter.id,
+                        parameter.title,
+                        parameter
+                            .value_normalized
+                            .map_or_else(|| "-".to_string(), |value| format!("{:.6}", value.0)),
+                        parameter.value_text
+                    );
+                }
+            }
+            None => println!("  params   no answer"),
+        }
     }
 
     if editor && outcome.host_lost.is_none() && matches!(outcome.loaded, Some(Ok(_))) {

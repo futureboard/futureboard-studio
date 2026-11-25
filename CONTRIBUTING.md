@@ -183,8 +183,8 @@ Projects use a versioned binary format
   editing it, regenerate the native menu with
   `bun run scripts/sync-shared-menu.mjs`. A test fails when a menu label is
   missing from any locale.
-- Translations themselves are contributed through
-  [Crowdin](https://crowdin.com/project/futureboard-studio); see the
+- Translations are edited directly in those catalogs and contributed like any
+  other change; see the
   [translation guide](packages/shared/locales/translation.md).
 
 ---

@@ -371,6 +371,64 @@ impl Chord {
         Self::new((target + 8) % 12, ChordQuality::BlackAdder)
     }
 
+    /// The chord `pitches` (MIDI note numbers, any order, any octave) spell,
+    /// for a live readout of what is sounding.
+    ///
+    /// Every pitch class of the notes is matched against every quality on
+    /// every root among them: exactly first, then with the fifth left out
+    /// (`C E Bb` is `C7`). Where two readings spell the same notes — `C6` and
+    /// `Am7`, every inversion of a diminished seventh — the one rooted on the
+    /// lowest note wins, then the simpler quality. A lowest note that is not
+    /// the root is the slash bass (`C/E`). `None` for fewer than three pitch
+    /// classes or a cluster no quality spells.
+    pub fn from_pitches(pitches: &[u8]) -> Option<Chord> {
+        let lowest = *pitches.iter().min()? % 12;
+        let set = pitches.iter().fold(0u16, |mask, &p| mask | 1 << (p % 12));
+        if set.count_ones() < 3 {
+            return None;
+        }
+        let quality_mask = |root: u8, intervals: &[u8], omit_fifth: bool| -> u16 {
+            intervals
+                .iter()
+                .filter(|&&i| !(omit_fifth && i == 7))
+                .fold(0u16, |mask, &i| mask | 1 << ((root + i) % 12))
+        };
+        for omit_fifth in [false, true] {
+            let mut best: Option<(bool, usize, Chord)> = None;
+            for root in (0u8..12).filter(|pc| set & (1 << pc) != 0) {
+                for (rank, quality) in ChordQuality::ALL.iter().enumerate() {
+                    if *quality == ChordQuality::BlackAdder {
+                        continue;
+                    }
+                    let intervals = quality.intervals();
+                    if omit_fifth && !intervals.contains(&7) {
+                        continue;
+                    }
+                    if quality_mask(root, intervals, omit_fifth) != set {
+                        continue;
+                    }
+                    let on_bass = root == lowest;
+                    let better = match &best {
+                        None => true,
+                        Some((best_on_bass, best_rank, _)) => {
+                            (on_bass, std::cmp::Reverse(rank))
+                                > (*best_on_bass, std::cmp::Reverse(*best_rank))
+                        }
+                    };
+                    if better {
+                        let mut chord = Chord::new(root, *quality);
+                        chord.bass = (lowest != root).then_some(lowest);
+                        best = Some((on_bass, rank, chord));
+                    }
+                }
+            }
+            if let Some((_, _, chord)) = best {
+                return Some(chord);
+            }
+        }
+        None
+    }
+
     /// Bass pitch class: the slash bass, the Black Adder's whole step below
     /// the root, or the root.
     pub fn bass_pc(&self) -> u8 {
@@ -983,6 +1041,195 @@ pub fn alternatives(settings: &GeneratorSettings, next: Option<Chord>) -> Vec<Ch
     out
 }
 
+// ── Palette ─────────────────────────────────────────────────────────────────
+
+/// The broad family a chord belongs to, by its triad: how a palette colours
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ChordFamily {
+    /// Major triads and their extensions (7, maj7, 9, add9, 6…).
+    Major,
+    /// Minor triads and their extensions.
+    Minor,
+    /// Diminished, augmented and suspended chords.
+    Other,
+}
+
+impl ChordQuality {
+    pub fn family(self) -> ChordFamily {
+        match self.triad() {
+            ChordQuality::Major => ChordFamily::Major,
+            ChordQuality::Minor => ChordFamily::Minor,
+            _ => ChordFamily::Other,
+        }
+    }
+}
+
+impl Chord {
+    /// Whether every note of the chord, its bass included, lies in `scale`
+    /// on `tonic`.
+    pub fn fits(&self, scale: Scale, tonic: u8) -> bool {
+        let pcs = scale.pitch_classes(tonic);
+        self.pitch_classes().iter().all(|pc| pcs.contains(pc))
+    }
+}
+
+impl Scale {
+    /// The scale on the same tonic with the other third: a major-family mode
+    /// goes to natural minor, a minor-family one to major. Symmetric scales
+    /// have no parallel and return themselves.
+    pub fn parallel(self) -> Scale {
+        if !self.is_heptatonic() {
+            self
+        } else if self.is_minor() {
+            Scale::Major
+        } else {
+            Scale::Minor
+        }
+    }
+}
+
+/// One row of a [`Palette`]: one kind of chord across the columns.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PaletteRow {
+    pub label: &'static str,
+    /// One cell per column; `None` where the row has nothing of its own to
+    /// offer on that degree.
+    pub cells: Vec<Option<Chord>>,
+}
+
+/// The chords of a key laid out for picking: a column per scale degree, a
+/// row per kind of chord.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Palette {
+    /// The chord heading each column: the degree's triad, or for a symmetric
+    /// scale the first chord on that root.
+    pub columns: Vec<Chord>,
+    pub rows: Vec<PaletteRow>,
+}
+
+/// The palette of `scale` on `tonic`.
+///
+/// A seven-note scale gives a column per degree, and rows of its triads,
+/// sevenths and ninths, suspended and added-ninth colours, the chord of the
+/// same degree in the parallel key, and the dominant seventh leading to the
+/// degree. Rows with nothing to offer are left out. A symmetric scale gives a
+/// column per note and a row per chord quality that fits it.
+pub fn palette(scale: Scale, tonic: u8) -> Palette {
+    let pcs = scale.pitch_classes(tonic);
+    if !scale.is_heptatonic() {
+        return symmetric_palette(scale, tonic);
+    }
+    let triads: Vec<Chord> = (0..7).map(|d| diatonic_triad(tonic, scale, d)).collect();
+    let sevenths: Vec<Chord> = triads.iter().map(|t| t.with_seventh(&pcs)).collect();
+    let per_degree = |f: &dyn Fn(usize, Chord) -> Option<Chord>| -> Vec<Option<Chord>> {
+        triads.iter().enumerate().map(|(d, &t)| f(d, t)).collect()
+    };
+    let parallel = scale.parallel();
+    let rows = vec![
+        PaletteRow {
+            label: "Triad",
+            cells: triads.iter().copied().map(Some).collect(),
+        },
+        PaletteRow {
+            label: "7th",
+            cells: sevenths
+                .iter()
+                .zip(&triads)
+                .map(|(s, t)| (s != t).then_some(*s))
+                .collect(),
+        },
+        PaletteRow {
+            label: "9th",
+            cells: sevenths
+                .iter()
+                .map(|s| {
+                    let ninth = s.with_ninth(&pcs);
+                    (ninth != *s).then_some(ninth)
+                })
+                .collect(),
+        },
+        PaletteRow {
+            label: "sus4",
+            cells: per_degree(&|_, t| {
+                (t.quality.family() != ChordFamily::Other)
+                    .then(|| Chord::new(t.root, ChordQuality::Sus4))
+            }),
+        },
+        PaletteRow {
+            label: "sus2",
+            cells: per_degree(&|_, t| {
+                (t.quality.family() != ChordFamily::Other)
+                    .then(|| Chord::new(t.root, ChordQuality::Sus2))
+            }),
+        },
+        PaletteRow {
+            label: "add9",
+            cells: per_degree(&|_, t| match t.quality {
+                ChordQuality::Major => Some(Chord::new(t.root, ChordQuality::Add9)),
+                ChordQuality::Minor => Some(Chord::new(t.root, ChordQuality::MinorAdd9)),
+                _ => None,
+            }),
+        },
+        PaletteRow {
+            label: "Parallel",
+            cells: per_degree(&|d, t| {
+                let borrowed = diatonic_triad(tonic, parallel, d);
+                (borrowed != t).then_some(borrowed)
+            }),
+        },
+        PaletteRow {
+            label: "V7 of",
+            cells: per_degree(&|d, t| {
+                (d != 0 && t.quality.family() != ChordFamily::Other)
+                    .then(|| Chord::new((t.root + 7) % 12, ChordQuality::Dominant7))
+            }),
+        },
+    ]
+    .into_iter()
+    .filter(|row| row.cells.iter().any(Option::is_some))
+    .collect();
+    Palette {
+        columns: triads,
+        rows,
+    }
+}
+
+fn symmetric_palette(scale: Scale, tonic: u8) -> Palette {
+    let roots = scale.pitch_classes(tonic);
+    let fitting = fitting_chords(scale, tonic);
+    let mut qualities: Vec<ChordQuality> = Vec::new();
+    for chord in &fitting {
+        if !qualities.contains(&chord.quality) {
+            qualities.push(chord.quality);
+        }
+    }
+    let columns = roots
+        .iter()
+        .map(|&root| {
+            fitting
+                .iter()
+                .copied()
+                .find(|c| c.root == root)
+                .unwrap_or(Chord::new(root, ChordQuality::Major))
+        })
+        .collect();
+    let rows = qualities
+        .into_iter()
+        .map(|quality| PaletteRow {
+            label: quality.label(),
+            cells: roots
+                .iter()
+                .map(|&root| {
+                    let chord = Chord::new(root, quality);
+                    fitting.contains(&chord).then_some(chord)
+                })
+                .collect(),
+        })
+        .collect();
+    Palette { columns, rows }
+}
+
 // ── Voicing ─────────────────────────────────────────────────────────────────
 
 /// How chords are laid out as MIDI notes.
@@ -1086,6 +1333,125 @@ fn movement(prev: &[i32], next: &[i32]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn detect(pitches: &[u8]) -> Option<String> {
+        Chord::from_pitches(pitches).map(|chord| chord.name(false))
+    }
+
+    #[test]
+    fn sounding_notes_name_their_chord() {
+        // Root position, any voicing, any octave.
+        assert_eq!(detect(&[60, 64, 67]).as_deref(), Some("C"));
+        assert_eq!(detect(&[57, 72, 76, 60]).as_deref(), Some("Am"));
+        assert_eq!(detect(&[55, 59, 62, 65]).as_deref(), Some("G7"));
+        assert_eq!(detect(&[62, 65, 69, 72]).as_deref(), Some("Dm7"));
+        assert_eq!(detect(&[60, 64, 67, 71]).as_deref(), Some("Cmaj7"));
+        // An inversion is a slash chord.
+        assert_eq!(detect(&[64, 67, 72]).as_deref(), Some("C/E"));
+        // The lowest note settles a spelling two chords share.
+        assert_eq!(detect(&[60, 64, 67, 69]).as_deref(), Some("C6"));
+        assert_eq!(detect(&[57, 60, 64, 67]).as_deref(), Some("Am7"));
+        // A seventh chord with its fifth left out.
+        assert_eq!(detect(&[48, 64, 70]).as_deref(), Some("C7"));
+        // Two notes, or a cluster, name nothing.
+        assert_eq!(detect(&[60, 67]), None);
+        assert_eq!(detect(&[60, 61, 62]), None);
+        assert_eq!(detect(&[]), None);
+    }
+
+    fn row<'a>(palette: &'a Palette, label: &str) -> &'a PaletteRow {
+        palette
+            .rows
+            .iter()
+            .find(|r| r.label == label)
+            .unwrap_or_else(|| panic!("no {label} row"))
+    }
+
+    fn cell_names(row: &PaletteRow) -> Vec<String> {
+        row.cells
+            .iter()
+            .map(|c| c.map_or("-".to_string(), |c| c.name(false)))
+            .collect()
+    }
+
+    #[test]
+    fn the_c_major_palette_reads_by_degree() {
+        let p = palette(Scale::Major, 0);
+        assert_eq!(
+            names(&p.columns, false),
+            ["C", "Dm", "Em", "F", "G", "Am", "Bdim"]
+        );
+        assert_eq!(
+            cell_names(row(&p, "7th")),
+            ["Cmaj7", "Dm7", "Em7", "Fmaj7", "G7", "Am7", "Bm7b5"]
+        );
+        // Em7 and Bm7b5 have no ninth in the key.
+        assert_eq!(
+            cell_names(row(&p, "9th")),
+            ["Cmaj9", "Dm9", "-", "Fmaj9", "G9", "Am9", "-"]
+        );
+        assert_eq!(
+            cell_names(row(&p, "Parallel")),
+            ["Cm", "Ddim", "D#", "Fm", "Gm", "G#", "A#"]
+        );
+        // The tonic and the diminished degree are not tonicised.
+        assert_eq!(
+            cell_names(row(&p, "V7 of")),
+            ["-", "A7", "B7", "C7", "D7", "E7", "-"]
+        );
+        assert!(
+            row(&p, "Triad")
+                .cells
+                .iter()
+                .flatten()
+                .all(|c| c.fits(Scale::Major, 0))
+        );
+    }
+
+    #[test]
+    fn families_follow_the_triad() {
+        assert_eq!(ChordQuality::Dominant7.family(), ChordFamily::Major);
+        assert_eq!(ChordQuality::Add9.family(), ChordFamily::Major);
+        assert_eq!(ChordQuality::Minor7.family(), ChordFamily::Minor);
+        assert_eq!(ChordQuality::MinorAdd9.family(), ChordFamily::Minor);
+        assert_eq!(ChordQuality::HalfDiminished7.family(), ChordFamily::Other);
+        assert_eq!(ChordQuality::Sus4.family(), ChordFamily::Other);
+        assert_eq!(ChordQuality::BlackAdder.family(), ChordFamily::Other);
+    }
+
+    #[test]
+    fn parallel_keys_swap_the_third() {
+        assert_eq!(Scale::Major.parallel(), Scale::Minor);
+        assert_eq!(Scale::Minor.parallel(), Scale::Major);
+        assert_eq!(Scale::Dorian.parallel(), Scale::Major);
+        assert_eq!(Scale::Mixolydian.parallel(), Scale::Minor);
+        assert_eq!(Scale::WholeTone.parallel(), Scale::WholeTone);
+    }
+
+    #[test]
+    fn fitting_is_checked_against_every_note() {
+        assert!(Chord::new(7, ChordQuality::Dominant7).fits(Scale::Major, 0));
+        assert!(!Chord::new(2, ChordQuality::Dominant7).fits(Scale::Major, 0));
+        let mut c_over_f_sharp = Chord::new(0, ChordQuality::Major);
+        c_over_f_sharp.bass = Some(6);
+        assert!(!c_over_f_sharp.fits(Scale::Major, 0));
+    }
+
+    #[test]
+    fn a_symmetric_palette_holds_only_fitting_chords() {
+        let p = palette(Scale::WholeTone, 0);
+        assert_eq!(p.columns.len(), 6);
+        assert!(!p.rows.is_empty());
+        for row in &p.rows {
+            assert_eq!(row.cells.len(), 6);
+            assert!(
+                row.cells
+                    .iter()
+                    .flatten()
+                    .all(|c| c.fits(Scale::WholeTone, 0))
+            );
+        }
+    }
 
     fn names(chords: &[Chord], flats: bool) -> Vec<String> {
         chords.iter().map(|c| c.name(flats)).collect()

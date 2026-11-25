@@ -112,10 +112,7 @@ mod tests {
         let restored = RodhareistState::from_json(&value.to_string()).unwrap();
         assert_eq!(restored.schema_version, SCHEMA_VERSION);
         assert_eq!(restored.params.comp_model, crate::CompModel::Studio);
-        assert_eq!(
-            restored.params.stage_b.comp_model,
-            crate::CompModel::Studio
-        );
+        assert_eq!(restored.params.stage_b.comp_model, crate::CompModel::Studio);
     }
 
     #[test]
@@ -149,6 +146,18 @@ mod tests {
             RodhareistState::from_json(&RodhareistState::new(params.clone()).to_json().unwrap())
                 .unwrap();
         assert_eq!(restored.params, params);
+    }
+
+    #[test]
+    fn legacy_state_without_cab_axis_stays_on_axis_and_plate() {
+        let state = RodhareistState::new(default_params());
+        let mut value = serde_json::to_value(state).unwrap();
+        let params = value["params"].as_object_mut().unwrap();
+        params.remove("cab_axis");
+        params.remove("reverb_model");
+        let restored: RodhareistState = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.params.cab_axis, 0.0);
+        assert_eq!(restored.params.reverb_model, crate::ReverbModel::Plate);
     }
 
     #[test]

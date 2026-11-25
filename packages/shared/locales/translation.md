@@ -16,27 +16,19 @@ Surfaces call `I18n::new(&language)` or `I18n::from_app(cx)`, then `tr` / `tr_va
 
 Menu labels use stable IDs from `native-menu.json` mapped as `menu.{id_with_dots_as_dashes}`.
 
-## Crowdin
+## Contributing a translation
 
-Translation project: [Futureboard Studio on Crowdin](https://crowdin.com/project/futureboard-studio).
+Translations live in this repository and are changed like any other file: edit
+`<locale>/app.ftl` and open a merge request. There is no external translation
+service; the committed catalogs are what ships.
 
-`crowdin.yml` uploads the English catalog as a virtual `app.properties` source
-and downloads translations back to `*/app.ftl`. The explicit `properties` type
-is required because Fluent message IDs do not support the dotted keys used by
-the native runtime. `escape_special_characters: 0` is set, but exported
-translations still arrive with `\:` / `\=` escapes, so the runtime loader
-unescapes `\:`, `\=`, `\#` and `\!`. Do not add `multilingual` to this mapping:
-each downloaded file contains one locale.
-
-The Crowdin integration also pushes its copy of the English source back to
-`en-US/app.ftl` on `l10n_main`. When that copy lags behind `main`, merging
-`l10n_main` silently deletes new English keys. The `i18n.rs` key-coverage test
-catches that; take `main`'s `en-US/app.ftl` when resolving the merge.
-
-To contribute a translation, open the Crowdin project, select a target language,
-and translate the strings in `app.properties`. Keep placeholders such as
-`{ $name }` and `{ $count }` unchanged. Synced translations are committed back
-to the matching locale's `app.ftl` file.
+- Translate the value after `=` only; never change a key.
+- Keep placeholders such as `{ $name }` and `{ $count }` exactly as written
+  (they may move within the sentence), and keep the literal `\n` line breaks.
+- Values are written as-is: no `.properties`-style escaping (`\:`, `\=`, `\#`,
+  `\!`). The `i18n.rs` tests reject a catalog that contains one.
+- Every locale carries every `en-US` key; the `i18n.rs` key-coverage test fails
+  otherwise. A string that is not translated yet keeps its English value.
 
 ## Maintainer pipeline
 

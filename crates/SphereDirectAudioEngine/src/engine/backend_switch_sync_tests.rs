@@ -33,11 +33,13 @@ const ALL_LEVELS: f32 = 0.7;
 
 fn track(id: &str, track_type: &str) -> EngineTrackSnapshot {
     EngineTrackSnapshot {
+        vca_gain: 1.0,
         midi_programs: Vec::new(),
         id: id.to_string(),
         track_type: track_type.to_string(),
         volume: 1.0,
         pan: 0.0,
+        dual_pan: Default::default(),
         muted: false,
         solo: false,
         armed: false,
@@ -45,6 +47,7 @@ fn track(id: &str, track_type: &str) -> EngineTrackSnapshot {
         input_source: EngineTrackInputSourceSnapshot::default(),
         preview_mode: "stereo".to_string(),
         output_track_id: None,
+        midi_fx: Vec::new(),
         inserts: Vec::new(),
         sends: Vec::new(),
         automation_lanes: Vec::new(),
@@ -607,4 +610,210 @@ fn no_drift_over_long_playback_across_a_switch() {
             (beat_sample(beats[2], 44_100), LEVELS[2]),
         ],
     );
+}
+
+/// Three tracks: two behind bridged plug-ins of `latencies`, one dry.
+fn bridged_project(rate: u32) -> EngineProjectSnapshot {
+    let mut snapshot = aligned(rate);
+    snapshot.tracks[0].inserts = vec![bridged_insert("bridged-0")];
+    snapshot.tracks[1].inserts = vec![bridged_insert("bridged-1")];
+    snapshot
+}
+
+fn attach_delay_sinks(engine: &EngineInner, latencies: [u32; 2]) {
+    for (index, latency) in latencies.iter().enumerate() {
+        engine
+            .set_plugin_bridge_sink(
+                format!("bridged-{index}"),
+                Some(DelayBridgeSink::new(*latency)),
+            )
+            .unwrap();
+    }
+}
+
+/// A project sync while playing (any edit: an insert added, a clip's gain)
+/// swaps in a rebuilt graph. The impulses are already inside the compensation
+/// delay lines when it lands, and must still come out of them, on time: the
+/// rebuilt graph's lines used to start empty, so every compensated track
+/// played its delay's worth of silence after each edit.
+#[test]
+fn a_sync_during_playback_keeps_what_the_delay_lines_hold() {
+    const LATENCIES: [u32; 2] = [64, 300];
+    const FRAMES: usize = 480;
+    let engine = engine_with_impulses();
+    let mut stream = TestStream::open(&engine, 48_000, FRAMES as u32);
+    engine.load_project(bridged_project(48_000)).unwrap();
+    attach_delay_sinks(&engine, LATENCIES);
+    engine.load_project(bridged_project(48_000)).unwrap();
+
+    let clip = beat_sample(CLIP_BEAT, 48_000);
+    let at = clip + u64::from(LATENCIES[1]) + FRAMES as u64;
+    engine.seek(3.5).unwrap();
+    engine.play().unwrap();
+    // Play to one block past the clip start: every impulse has gone into
+    // the plug-ins or the delay lines, and none has come out yet.
+    let mut heard = stream.render(&engine, &[FRAMES], 0.51);
+    let position = engine.shared.position_samples.load(Ordering::Relaxed);
+    assert!(position > clip && position < at, "position {position}");
+
+    // A structural edit, so the graph is rebuilt and swapped: a track added.
+    let mut edited = bridged_project(48_000);
+    edited.tracks.insert(3, track("audio-extra", "audio"));
+    engine.load_project(edited).unwrap();
+    heard.extend(stream.render(&engine, &[FRAMES], 0.2));
+    stream.stop(&engine, FRAMES);
+    assert_impulses("across a sync", &heard, &[(at, ALL_LEVELS)]);
+}
+
+/// A bridged plug-in whose latency is longer than the delay lines the graph
+/// was built with: attached after the build, as every plug-in is. The
+/// callback cannot lengthen the lines itself, so the dry tracks played
+/// undelayed — and stayed that way through every later sync, since an
+/// unchanged sync keeps the graph and a rebuild planned without the plug-in's
+/// latency again. The status poll now rebuilds it once, planned with it.
+#[test]
+fn a_long_bridged_latency_is_compensated_once_the_status_poll_runs() {
+    const LATENCIES: [u32; 2] = [9_000, 0];
+    const FRAMES: usize = 256;
+    let engine = engine_with_impulses();
+    let mut stream = TestStream::open(&engine, 48_000, FRAMES as u32);
+    engine.load_project(bridged_project(48_000)).unwrap();
+    attach_delay_sinks(&engine, LATENCIES);
+    // The callback finds a latency the graph was not built for…
+    stream.block(&engine, FRAMES);
+    assert!(engine.shared.pdc_rings_short.load(Ordering::Relaxed));
+    // …and the control thread's regular visit rebuilds it.
+    engine.get_daux_status();
+    assert!(!engine.shared.pdc_rings_short.load(Ordering::Relaxed));
+
+    let at = beat_sample(CLIP_BEAT, 48_000) + u64::from(LATENCIES[0]) + FRAMES as u64;
+    for sync in 0..3 {
+        engine.load_project(bridged_project(48_000)).unwrap();
+        let heard = stream.play_from(&engine, &[FRAMES], 3.9, 0.5);
+        assert_impulses(&format!("after sync {sync}"), &heard, &[(at, ALL_LEVELS)]);
+    }
+    assert!(!engine.shared.pdc_rings_short.load(Ordering::Relaxed));
+}
+
+/// A rebuilt graph is planned with the latency its plug-ins report, so the
+/// swap leaves the plan as it was and the callback has nothing to replan.
+#[test]
+fn a_rebuilt_graph_is_planned_with_its_plugins_latency() {
+    const LATENCIES: [u32; 2] = [64, 300];
+    const FRAMES: usize = 480;
+    let engine = engine_with_impulses();
+    let mut stream = TestStream::open(&engine, 48_000, FRAMES as u32);
+    engine.load_project(bridged_project(48_000)).unwrap();
+    attach_delay_sinks(&engine, LATENCIES);
+    stream.block(&engine, FRAMES);
+    let planned = stream.runtime.latency_graph.track_pdc_delay.clone();
+
+    // A structural edit: one more (dry) track.
+    let mut edited = bridged_project(48_000);
+    edited.tracks.insert(3, track("audio-extra", "audio"));
+    engine.load_project(edited).unwrap();
+    stream.block(&engine, FRAMES);
+    assert_eq!(
+        stream.runtime.latency_replan_count, 0,
+        "replanned at the swap"
+    );
+    assert_eq!(
+        &stream.runtime.latency_graph.track_pdc_delay[..3],
+        &planned[..3]
+    );
+}
+
+/// Low-latency monitoring: an armed track's own latent effect and the
+/// master's are taken out of its path once their latency is over the limit,
+/// and kept when it is not; a track that is not live keeps everything.
+#[test]
+fn low_latency_monitoring_takes_latent_effects_out_of_a_live_path() {
+    const TRACK_LATENCY: u32 = 300;
+    const MASTER_LATENCY: u32 = 600;
+    const FRAMES: usize = 480;
+    let snapshot = || {
+        let mut snapshot = aligned(48_000);
+        snapshot.tracks[0].inserts = vec![bridged_insert("bridged-0")];
+        snapshot.tracks[3].inserts = vec![bridged_insert("bridged-1")];
+        snapshot
+    };
+    let clip = beat_sample(CLIP_BEAT, 48_000);
+    let bridged = |latency: u32| u64::from(latency) + FRAMES as u64;
+    // (limit, track 0 armed, where the three impulses land together)
+    let cases = [
+        (
+            0,
+            true,
+            clip + bridged(TRACK_LATENCY) + bridged(MASTER_LATENCY),
+        ),
+        (256, true, clip),
+        (512, true, clip + bridged(TRACK_LATENCY)),
+        (
+            256,
+            false,
+            clip + bridged(TRACK_LATENCY) + bridged(MASTER_LATENCY),
+        ),
+    ];
+    for (limit, armed, at) in cases {
+        let engine = engine_with_impulses();
+        let mut stream = TestStream::open(&engine, 48_000, FRAMES as u32);
+        engine.load_project(snapshot()).unwrap();
+        attach_delay_sinks(&engine, [TRACK_LATENCY, MASTER_LATENCY]);
+        stream.block(&engine, FRAMES);
+        // Armed on the graph itself: arming through the project would open
+        // the input device.
+        stream.runtime.tracks[0].record_armed = armed;
+        engine.set_low_latency_monitoring(limit);
+        let heard = stream.play_from(&engine, &[FRAMES], 3.9, 0.3);
+        assert_impulses(
+            &format!("limit {limit}, armed {armed}"),
+            &heard,
+            &[(at, ALL_LEVELS)],
+        );
+    }
+}
+
+/// Correct Takes for Interface Latency: on, a take moves earlier by the round
+/// trip measured during it; off, it stays where it was captured, for the
+/// Recording Delay alone to place.
+#[test]
+fn a_take_moves_by_the_interface_round_trip_only_when_asked_to() {
+    let engine = engine_with_impulses();
+    let _stream = TestStream::open(&engine, 48_000, 256);
+    engine.load_project(aligned(48_000)).unwrap();
+    let place = |engine: &EngineInner| {
+        let take = crate::types::JsRecordingResult {
+            track_id: "audio-0".to_string(),
+            file_path: String::new(),
+            relative_path: String::new(),
+            start_beat: CLIP_BEAT,
+            duration_seconds: 1.0,
+            sample_rate: 48_000,
+            channels: 2,
+            metadata_path: String::new(),
+            sample_format: "s32le".to_string(),
+            // 480 samples at 48 kHz: 0.02 beat at 120 BPM.
+            latency_seconds: 0.01,
+            success: true,
+            error: None,
+        };
+        let placement = super::TakePlacement {
+            armed_start_sample: 0,
+            first_capture_sample: u64::MAX,
+            live_tap: false,
+            loopback_tap: false,
+            pdc_bypassed: false,
+            #[cfg(all(target_os = "windows", feature = "asio"))]
+            asio_tap: false,
+        };
+        engine.finish_stop_recording(vec![take], placement)[0].start_beat
+    };
+    let corrected = place(&engine);
+    assert!(
+        (corrected - (CLIP_BEAT - 0.02)).abs() < 1.0e-9,
+        "{corrected}"
+    );
+    engine.set_record_interface_latency_correction(false);
+    let uncorrected = place(&engine);
+    assert!((uncorrected - CLIP_BEAT).abs() < 1.0e-9, "{uncorrected}");
 }

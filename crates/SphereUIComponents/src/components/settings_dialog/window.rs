@@ -71,12 +71,18 @@ impl SettingsWindow {
             on_update,
             on_open_keyboard_shortcuts,
             on_open_plugin_manager,
+            on_open_asio_control_panel: None,
             focus_handle: cx.focus_handle(),
         };
         // Keep Driver Status live without per-frame polling.
         this.schedule_latency_poll(cx);
         this.warm_gpu_device_list(cx);
         this
+    }
+
+    /// What the Audio page's "ASIO Control Panel" button runs.
+    pub fn set_asio_control_panel(&mut self, open: Option<OnOpenPluginManager>) {
+        self.on_open_asio_control_panel = open;
     }
 
     /// Shows `tab` (the preview tool's way in).
@@ -299,6 +305,12 @@ impl SettingsWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A value being typed (Recording Delay) takes its keys first, so
+        // Escape cancels the entry instead of closing the window.
+        if crate::components::inspector::route_numeric_entry_key(event, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
         if event.keystroke.key.as_str() == "escape" && self.open_hardware_combo.take().is_some() {
             self.hardware_combo_anchor = None;
             cx.notify();
@@ -445,6 +457,7 @@ impl Render for SettingsWindow {
             })),
             on_open_keyboard_shortcuts: self.on_open_keyboard_shortcuts.clone(),
             on_open_plugin_manager: self.on_open_plugin_manager.clone(),
+            on_open_asio_control_panel: self.on_open_asio_control_panel.clone(),
         };
 
         let search_mouse_callbacks =

@@ -211,6 +211,9 @@ test-support = [
     "proptest",
 ]
 inspector = ["gpui_macros/inspector"]
+# `Window::render_to_image` outside tests: the app's own frame, drawn again
+# by its renderer and read back (project thumbnails). Never a screen capture.
+render-to-image = []
 leak-detection = ["backtrace"]
 wayland = [
     "bitflags",

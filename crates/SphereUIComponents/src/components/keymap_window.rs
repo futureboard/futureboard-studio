@@ -3,14 +3,19 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, size, uniform_list, App, AppContext, Bounds, Context, FocusHandle, InteractiveElement,
-    IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, ScrollHandle,
+    div, px, size, svg, uniform_list, App, AppContext, Bounds, Context, FocusHandle,
+    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement, Render,
     StatefulInteractiveElement, Styled, UniformListScrollHandle, Window,
     WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind,
 };
 
-use crate::components::controls::{fb_button, fb_field_label, FbButtonKind};
+use crate::assets;
+use crate::components::controls::{
+    fb_badge, fb_button, fb_dock_tab, fb_dock_tab_strip, fb_field_label, fb_icon_button,
+    fb_tooltip, FbButtonKind, FbDockPlanes,
+};
 use crate::components::form::select::{select, SelectOption};
 use crate::components::key_recorder::{key_recorder_field, KeyRecorderState};
 use crate::components::text_input::{
@@ -18,10 +23,10 @@ use crate::components::text_input::{
 };
 use crate::components::title_bar::external_window_titlebar;
 use crate::keymap::{
-    format_keystroke_list, KeymapConflict, KeymapManager, KeymapRow, KeymapScope,
-    PROFILE_DESCRIPTORS,
+    format_keystroke_list, format_keystrokes, KeymapConflict, KeymapManager, KeymapRow,
+    KeymapScope, PROFILE_DESCRIPTORS,
 };
-use crate::theme::{self, Colors};
+use crate::theme::{self, radius, size, space, typography, Colors};
 use crate::window_position::{apply_owner_display, centered_window_bounds};
 
 pub const KEYMAP_WINDOW_WIDTH: f32 = 1200.0;
@@ -29,10 +34,24 @@ pub const KEYMAP_WINDOW_HEIGHT: f32 = 760.0;
 pub const KEYMAP_WINDOW_MIN_WIDTH: f32 = 960.0;
 pub const KEYMAP_WINDOW_MIN_HEIGHT: f32 = 620.0;
 
-const ROW_H: f32 = 26.0;
+const ROW_H: f32 = 28.0;
 const HEADER_H: f32 = 28.0;
-const FOOTER_H: f32 = 24.0;
-const TOPBAR_H: f32 = 36.0;
+const FOOTER_H: f32 = 26.0;
+const TOPBAR_H: f32 = 44.0;
+const SEARCH_W: f32 = 300.0;
+/// Where the search field's text starts: past the glyph drawn over it.
+const SEARCH_TEXT_INSET: f32 = 30.0;
+const PROFILE_W: f32 = 150.0;
+const KEYS_W: f32 = 240.0;
+const SCOPE_W: f32 = 140.0;
+const SOURCE_W: f32 = 140.0;
+/// The selected row's leading accent edge.
+const MARKER_W: f32 = 2.0;
+
+const ICON_JSON_PATH: &str = "icons/menu/braces.svg";
+const ICON_IMPORT_PATH: &str = "icons/menu/file-down.svg";
+const ICON_EXPORT_PATH: &str = "icons/menu/file-up.svg";
+const ICON_RESET_PATH: &str = "icons/menu/rotate-ccw.svg";
 
 pub type KeymapChangedCb = Arc<dyn Fn(KeymapManager, &mut App) + Send + Sync>;
 
@@ -138,8 +157,13 @@ impl KeymapWindow {
             manager,
             on_changed,
             view: ViewMode::Table,
+            // The search glyph is drawn over the field's leading edge, so the
+            // text starts after it.
             search_input: TextInputState::new("keymap-search", cx.focus_handle())
-                .with_placeholder("Filter action names..."),
+                .with_placeholder("Search actions, keys or scopes")
+                .with_accessible_label("Search keybindings")
+                .with_field_height(size::COMFORTABLE)
+                .with_inline_text(SEARCH_TEXT_INSET, gpui::FontWeight::NORMAL),
             filter_query: String::new(),
             filter_pending: String::new(),
             scope_filter: None,
@@ -451,6 +475,43 @@ impl KeymapWindow {
         cx.notify();
     }
 
+    /// Between the table and the profile's JSON. Opening the JSON reloads it
+    /// from the keymap, so it never shows text older than the table.
+    fn toggle_json_view(&mut self, cx: &mut Context<Self>) {
+        self.view = match self.view {
+            ViewMode::Table => {
+                self.json_input
+                    .set_value(self.manager.json_text().unwrap_or_default());
+                ViewMode::Json
+            }
+            ViewMode::Json => ViewMode::Table,
+        };
+        cx.notify();
+    }
+
+    /// Put a changed row back to its profile's key. Rows that were never
+    /// changed have nothing to reset and are left alone.
+    fn reset_row(&mut self, row_id: &str, cx: &mut Context<Self>) {
+        let overridden = self
+            .manager
+            .rows()
+            .iter()
+            .find(|row| row.id == row_id && row.is_user_override)
+            .map(|row| (row.action_id.clone(), row.scope));
+        let Some((action, scope)) = overridden else {
+            return;
+        };
+        self.manager.reset_binding(&action, scope);
+        self.status_message = match self.manager.save_changes() {
+            Ok(()) => Some("Keybinding reset.".into()),
+            Err(error) => Some(error),
+        };
+        self.json_input
+            .set_value(self.manager.json_text().unwrap_or_default());
+        self.publish_changes(cx);
+        cx.notify();
+    }
+
     /// Types into the create dialog's action filter.
     ///
     /// The dialog is modal and has no text input of its own to focus, so the
@@ -557,12 +618,7 @@ impl KeymapWindow {
                 self.search_input.focus_handle.focus(window, cx);
                 cx.notify();
             }
-            (true, "e") => {
-                self.view = ViewMode::Json;
-                self.json_input
-                    .set_value(self.manager.json_text().unwrap_or_default());
-                cx.notify();
-            }
+            (true, "e") => self.toggle_json_view(cx),
             (true, "k") => {
                 self.create_dialog_open = true;
                 self.edit_dialog = Some(EditDialogState::for_new_binding());
@@ -588,20 +644,7 @@ impl KeymapWindow {
                     }
                 } else if matches!(key, "delete" | "backspace") {
                     if let Some(id) = self.selected_row_id.clone() {
-                        let overridden = self
-                            .manager
-                            .rows()
-                            .iter()
-                            .find(|row| row.id == id && row.is_user_override)
-                            .map(|row| (row.action_id.clone(), row.scope));
-                        if let Some((action, scope)) = overridden {
-                            self.manager.reset_binding(&action, scope);
-                            if let Err(error) = self.manager.save_changes() {
-                                self.status_message = Some(error);
-                            }
-                            self.publish_changes(cx);
-                            cx.notify();
-                        }
+                        self.reset_row(&id, cx);
                     }
                 }
             }
@@ -624,6 +667,7 @@ impl Render for KeymapWindow {
         let entity = cx.entity().clone();
         let search_callbacks = bind_mouse_selection(entity.clone(), |this| &mut this.search_input);
         let json_callbacks = bind_mouse_selection(entity.clone(), |this| &mut this.json_input);
+        let json_view_open = self.view == ViewMode::Json;
 
         let on_profile_toggle = {
             let entity = entity.clone();
@@ -648,93 +692,58 @@ impl Render for KeymapWindow {
             .map(|p| SelectOption::new(p.id, p.label))
             .collect();
 
+        // One row: find on the left, the profile and the file actions on the
+        // right, and the one primary action last. Import, export and the JSON
+        // view are quiet glyphs with their names in tooltips — they are
+        // occasional, and four labelled buttons in a row made each of them
+        // shout as loudly as "New Binding".
+        let search_focused = self.search_input.is_focused(window);
         let top_bar = div()
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(8.0))
+            .gap(px(space::BASE))
             .h(px(TOPBAR_H))
-            .px(px(12.0))
-            .border_b(px(1.0))
-            .border_color(Colors::border_subtle())
-            .child(div().w(px(320.0)).child(text_field_with_callbacks(
-                &self.search_input,
-                self.search_input.is_focused(window),
-                search_callbacks,
-            )))
+            .px(px(space::LOOSE))
+            .bg(header_plane())
+            .child(
+                div()
+                    .relative()
+                    .w(px(SEARCH_W))
+                    .flex_shrink_0()
+                    .child(text_field_with_callbacks(
+                        &self.search_input,
+                        search_focused,
+                        search_callbacks,
+                    ))
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(space::LOOSE - 2.0))
+                            .top_0()
+                            .bottom_0()
+                            .flex()
+                            .items_center()
+                            .child(
+                                svg()
+                                    .path(assets::ICON_SEARCH_PATH)
+                                    .size(px(typography::UI_SM))
+                                    .text_color(if search_focused {
+                                        Colors::text_secondary()
+                                    } else {
+                                        Colors::text_faint()
+                                    }),
+                            ),
+                    ),
+            )
             .child(div().flex_1())
-            .child(fb_button(
-                "keymap-edit-json",
-                "Edit in JSON  Ctrl+E",
-                FbButtonKind::Default,
-                true,
-                {
-                    let entity = entity.clone();
-                    move |_, _, cx| {
-                        let _ = entity.update(cx, |this, cx| {
-                            this.view = ViewMode::Json;
-                            this.json_input
-                                .set_value(this.manager.json_text().unwrap_or_default());
-                            cx.notify();
-                        });
-                    }
-                },
-            ))
-            .child(fb_button(
-                "keymap-import",
-                "Import",
-                FbButtonKind::Default,
-                true,
-                {
-                    let entity = entity.clone();
-                    move |_, _, cx| {
-                        let _ = entity.update(cx, |this, cx| this.import_profile(cx));
-                    }
-                },
-            ))
-            .child(fb_button(
-                "keymap-export",
-                "Export",
-                FbButtonKind::Default,
-                true,
-                {
-                    let entity = entity.clone();
-                    move |_, _, cx| {
-                        let _ = entity.update(cx, |this, cx| this.export_profile(cx));
-                    }
-                },
-            ))
-            .child(fb_button(
-                "keymap-create",
-                "Create Keybinding  Ctrl+K",
-                FbButtonKind::Primary,
-                true,
-                {
-                    let entity = entity.clone();
-                    move |_, window: &mut Window, cx: &mut App| {
-                        let _ = entity.update(cx, |this, cx| {
-                            this.create_dialog_open = true;
-                            this.edit_dialog = Some(EditDialogState::for_new_binding());
-                            // Arm here as well as on Ctrl+K. The button and the
-                            // shortcut open the same dialog, and only one of
-                            // them used to start recording — so whether the
-                            // keystroke field listened depended on how you had
-                            // opened it.
-                            this.arm_recorder(window, cx);
-                        });
-                    }
-                },
-            ));
-
-        let profile_row = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(8.0))
-            .h(px(30.0))
-            .px(px(12.0))
-            .child(fb_field_label("Profile"))
-            .child(div().w(px(200.0)).child(select(
+            .child(
+                div()
+                    .text_size(px(typography::UI_XS))
+                    .text_color(Colors::text_faint())
+                    .child("Profile"),
+            )
+            .child(div().w(px(PROFILE_W)).flex_shrink_0().child(select(
                 "keymap-profile",
                 Some(self.manager.active_profile_id()),
                 "Profile",
@@ -744,29 +753,143 @@ impl Render for KeymapWindow {
                 on_profile_toggle,
                 on_profile_change,
             )))
-            .child(div().w(px(12.0)))
-            .child(fb_field_label("Scope"))
-            .children(
+            .child(toolbar_divider())
+            .child(toolbar_icon(
+                "keymap-edit-json",
+                ICON_JSON_PATH,
+                if json_view_open {
+                    "Back to the table  Ctrl+E"
+                } else {
+                    "Edit as JSON  Ctrl+E"
+                },
+                Some(json_view_open),
+                {
+                    let entity = entity.clone();
+                    move |_, _, cx| {
+                        let _ = entity.update(cx, |this, cx| this.toggle_json_view(cx));
+                    }
+                },
+            ))
+            .child(toolbar_icon(
+                "keymap-import",
+                ICON_IMPORT_PATH,
+                "Import a keymap…",
+                None,
+                {
+                    let entity = entity.clone();
+                    move |_, _, cx| {
+                        let _ = entity.update(cx, |this, cx| this.import_profile(cx));
+                    }
+                },
+            ))
+            .child(toolbar_icon(
+                "keymap-export",
+                ICON_EXPORT_PATH,
+                "Export this profile…",
+                None,
+                {
+                    let entity = entity.clone();
+                    move |_, _, cx| {
+                        let _ = entity.update(cx, |this, cx| this.export_profile(cx));
+                    }
+                },
+            ))
+            .child(toolbar_divider())
+            .child(
+                div()
+                    .id("keymap-create-tip")
+                    .tooltip(fb_tooltip("New keybinding  Ctrl+K"))
+                    .child(fb_button(
+                        "keymap-create",
+                        "New Binding",
+                        FbButtonKind::Primary,
+                        true,
+                        {
+                            let entity = entity.clone();
+                            move |_, window: &mut Window, cx: &mut App| {
+                                let _ = entity.update(cx, |this, cx| {
+                                    this.create_dialog_open = true;
+                                    this.edit_dialog = Some(EditDialogState::for_new_binding());
+                                    // Arm here as well as on Ctrl+K. The button and the
+                                    // shortcut open the same dialog, and only one of
+                                    // them used to start recording — so whether the
+                                    // keystroke field listened depended on how you had
+                                    // opened it.
+                                    this.arm_recorder(window, cx);
+                                });
+                            }
+                        },
+                    )),
+            );
+
+        // Scopes are the table's tabs: the active one is cut out of the
+        // header plane and runs into the table, so which slice of the keymap
+        // is showing reads as where you are rather than as a filter setting.
+        let planes = FbDockPlanes {
+            strip: header_plane(),
+            body: Colors::surface_base(),
+        };
+        let conflicts = self.manager.conflict_count();
+        let scope_strip = if json_view_open {
+            fb_dock_tab_strip(planes).child(fb_dock_tab(
+                "keymap-json-tab",
+                format!("{} profile as JSON", self.manager.active_profile_label()),
+                None,
+                true,
+                planes,
+                |_, _, _| {},
+                None,
+            ))
+        } else {
+            fb_dock_tab_strip(planes).children(
                 std::iter::once(None)
                     .chain(KeymapScope::ALL.into_iter().map(Some))
                     .map(|scope| {
                         let entity = entity.clone();
-                        scope_chip(
+                        fb_dock_tab(
                             gpui::SharedString::from(format!(
                                 "keymap-scope-filter-{}",
                                 scope.map_or("all", KeymapScope::key)
                             )),
                             scope.map_or("All", KeymapScope::label),
+                            None,
                             self.scope_filter == scope,
+                            planes,
                             move |_, _, cx| {
                                 let _ = entity.update(cx, |this, cx| {
                                     this.scope_filter = scope;
                                     cx.notify();
                                 });
                             },
+                            None,
                         )
                     }),
-            );
+            )
+        }
+        .child(
+            div()
+                .ml_auto()
+                .h_full()
+                .flex()
+                .items_center()
+                .pr(px(space::TIGHT))
+                .when(conflicts > 0, |el| {
+                    el.gap(px(space::SNUG))
+                        .text_size(px(typography::UI_XS))
+                        .text_color(Colors::status_warning())
+                        .child(
+                            svg()
+                                .path(assets::ICON_TRIANGLE_ALERT_PATH)
+                                .size(px(typography::UI_XS))
+                                .text_color(Colors::status_warning()),
+                        )
+                        .child(if conflicts == 1 {
+                            "1 conflict".to_string()
+                        } else {
+                            format!("{conflicts} conflicts")
+                        })
+                }),
+        );
 
         let header = keymap_table_header();
 
@@ -793,7 +916,13 @@ impl Render for KeymapWindow {
                                 this.open_edit_for_row(&edit_row, window, cx);
                             });
                         };
-                    keymap_row_element(row, selected, on_keystrokes).on_mouse_down(
+                    let reset_entity = entity.clone();
+                    let reset_id = row.id.clone();
+                    let on_reset = move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
+                        cx.stop_propagation();
+                        let _ = reset_entity.update(cx, |this, cx| this.reset_row(&reset_id, cx));
+                    };
+                    keymap_row_element(row, selected, on_keystrokes, on_reset).on_mouse_down(
                         MouseButton::Left,
                         move |event, window, cx| {
                             let _ = entity.update(cx, |this, cx| {
@@ -812,26 +941,39 @@ impl Render for KeymapWindow {
         .size_full()
         .track_scroll(&self.scroll);
 
-        let empty_state = if row_count == 0 {
-            Some(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .h(px(120.0))
-                    .text_color(Colors::text_muted())
-                    .text_size(px(12.0))
-                    .child("No keybindings found"),
-            )
-        } else {
-            None
-        };
+        let empty_state = (row_count == 0).then(|| {
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(space::TIGHT))
+                .child(
+                    div()
+                        .text_size(px(typography::UI_SM))
+                        .text_color(Colors::text_secondary())
+                        .child(if self.filter_query.trim().is_empty() {
+                            "No keybindings in this scope".to_string()
+                        } else {
+                            format!("Nothing matches “{}”", self.filter_query.trim())
+                        }),
+                )
+                .child(
+                    div()
+                        .text_size(px(typography::UI_XS))
+                        .text_color(Colors::text_faint())
+                        .child("Try another scope, or search by action, key or scope name."),
+                )
+        });
 
         let table_view = div()
             .flex()
             .flex_col()
             .flex_1()
             .min_h_0()
+            .bg(Colors::surface_base())
             .child(header)
             .child(
                 div()
@@ -840,45 +982,55 @@ impl Render for KeymapWindow {
                     .relative()
                     .overflow_hidden()
                     .child(table_body)
-                    .child(keymap_scrollbar_thumb(scroll_for_thumb))
+                    .children(crate::components::scrollbar::scroll_handle_scrollbar(
+                        "keymap-table-scrollbar",
+                        &scroll_for_thumb,
+                    ))
                     .children(empty_state),
             );
 
         // Built only while it is shown: the field carries the whole keymap as
         // text, and rebuilding it on every frame of the table view made each
         // click on a row pay for it.
-        let json_view = (self.view == ViewMode::Json).then(|| {
+        let json_view = json_view_open.then(|| {
             div()
                 .flex()
                 .flex_col()
                 .flex_1()
                 .min_h_0()
-                .px(px(12.0))
-                .py(px(8.0))
-                .gap(px(8.0))
+                .bg(Colors::surface_base())
+                .px(px(space::LOOSE))
+                .py(px(space::LOOSE))
+                .gap(px(space::BASE))
+                .child(div().flex_1().min_h_0().child(text_field_with_callbacks(
+                    &self.json_input,
+                    self.json_input.is_focused(window),
+                    json_callbacks,
+                )))
                 .child(
                     div()
                         .flex()
                         .flex_row()
-                        .gap(px(8.0))
-                        .child(fb_button(
-                            "keymap-json-back",
-                            "Back to Table",
-                            FbButtonKind::Default,
-                            true,
-                            {
-                                let entity = entity.clone();
-                                move |_, _, cx| {
-                                    let _ = entity.update(cx, |this, cx| {
-                                        this.view = ViewMode::Table;
-                                        cx.notify();
-                                    });
-                                }
-                            },
-                        ))
+                        .items_center()
+                        .gap(px(space::BASE))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(px(typography::UI_XS))
+                                .text_color(if self.json_error.is_some() {
+                                    Colors::status_error()
+                                } else {
+                                    Colors::text_faint()
+                                })
+                                .child(self.json_error.clone().unwrap_or_else(|| {
+                                    "Changes take effect when applied. Esc returns to the table."
+                                        .to_string()
+                                })),
+                        )
                         .child(fb_button(
                             "keymap-json-apply",
-                            "Apply JSON",
+                            "Apply",
                             FbButtonKind::Primary,
                             true,
                             {
@@ -889,41 +1041,37 @@ impl Render for KeymapWindow {
                             },
                         )),
                 )
-                .child(div().flex_1().min_h_0().child(text_field_with_callbacks(
-                    &self.json_input,
-                    self.json_input.is_focused(window),
-                    json_callbacks,
-                )))
-                .children(self.json_error.as_ref().map(|error| {
-                    div()
-                        .text_color(Colors::status_error())
-                        .text_size(px(11.0))
-                        .child(error.clone())
-                }))
         });
 
+        let total = self.manager.rows().len();
         let footer = div()
             .flex()
             .flex_row()
             .items_center()
+            .gap(px(space::LOOSE))
             .h(px(FOOTER_H))
-            .px(px(12.0))
-            .border_t(px(1.0))
-            .border_color(Colors::border_subtle())
-            .text_size(px(10.0))
-            .text_color(Colors::text_muted())
-            .child(format!(
-                "{} actions · {} visible · profile: {} · {} conflicts",
-                self.manager.rows().len(),
-                row_count,
-                self.manager.active_profile_label(),
-                self.manager.conflict_count()
-            ))
-            .children(self.status_message.as_ref().map(|msg| {
+            .px(px(space::LOOSE))
+            .bg(header_plane())
+            .text_size(px(typography::UI_XS))
+            .text_color(Colors::text_faint())
+            .child(
                 div()
-                    .ml(px(12.0))
-                    .text_color(Colors::status_warning())
-                    .child(msg.clone())
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(match self.status_message.as_ref() {
+                        Some(message) => div()
+                            .text_color(Colors::status_warning())
+                            .child(message.clone()),
+                        None => div().child(
+                            "Click a shortcut or double-click a row to change it · Delete resets a changed one",
+                        ),
+                    }),
+            )
+            .child(div().flex_shrink_0().child(if row_count == total {
+                format!("{total} actions")
+            } else {
+                format!("{row_count} of {total} actions")
             }));
 
         let action_choices = self
@@ -957,7 +1105,7 @@ impl Render for KeymapWindow {
                 }
             }))
             .child(top_bar)
-            .child(profile_row)
+            .child(scope_strip)
             .child(match json_view {
                 Some(json_view) => json_view.into_any_element(),
                 None => table_view.into_any_element(),
@@ -967,28 +1115,80 @@ impl Render for KeymapWindow {
     }
 }
 
+/// The plane the toolbar, the scope tabs and the footer share: the titlebar's
+/// own, so the window's chrome reads as one band above and one below the
+/// table instead of a stack of separately ruled strips.
+fn header_plane() -> gpui::Rgba {
+    Colors::surface_panel_alt()
+}
+
+/// A hairline between toolbar groups.
+fn toolbar_divider() -> impl IntoElement {
+    div()
+        .w(px(1.0))
+        .h(px(size::MICRO))
+        .mx(px(space::TIGHT))
+        .bg(Colors::border_subtle())
+}
+
+/// A quiet toolbar glyph whose name lives in its tooltip.
+fn toolbar_icon(
+    id: &'static str,
+    icon: &'static str,
+    tooltip: &'static str,
+    toggled: Option<bool>,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(gpui::SharedString::from(format!("{id}-tip")))
+        .tooltip(fb_tooltip(tooltip))
+        .child(fb_icon_button(
+            id,
+            icon,
+            tooltip,
+            size::COMFORTABLE,
+            toggled,
+            on_click,
+        ))
+}
+
 fn keymap_table_header() -> impl IntoElement {
     div()
         .flex()
         .flex_row()
+        .items_center()
+        .flex_shrink_0()
         .h(px(HEADER_H))
-        .bg(Colors::surface_panel())
         .border_b(px(1.0))
         .border_color(Colors::border_subtle())
-        .text_size(px(10.0))
+        .text_size(px(typography::DENSE_LABEL))
         .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_color(Colors::text_muted())
-        .child(header_cell("Action", 420.0))
-        .child(vsep())
-        .child(header_cell("Keystrokes", 220.0))
-        .child(vsep())
-        .child(header_cell("Scope", 160.0))
-        .child(vsep())
-        .child(header_cell("Source", 240.0))
+        .text_color(Colors::text_faint())
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .pl(px(space::LOOSE + MARKER_W))
+                .child("Action"),
+        )
+        .child(column(KEYS_W).child("Shortcut"))
+        .child(column(SCOPE_W).child("Scope"))
+        .child(column(SOURCE_W).pr(px(space::LOOSE)).child("Source"))
 }
 
-/// One pill in a row of scope choices — the filter above the table and the
-/// scope picker in the edit dialog.
+/// A fixed-width table column. The Action column takes the rest.
+fn column(width: f32) -> gpui::Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .flex_shrink_0()
+        .w(px(width))
+        .px(px(space::BASE))
+        .overflow_hidden()
+}
+
+/// One pill in a row of scope choices — the scope picker in the edit dialog.
 fn scope_chip(
     id: gpui::SharedString,
     label: &'static str,
@@ -1030,112 +1230,179 @@ fn scope_chip(
         .child(label)
 }
 
-fn header_cell(label: &'static str, width: f32) -> impl IntoElement {
+/// A key combination drawn as a keycap.
+fn keycap(text: String) -> impl IntoElement {
     div()
         .flex()
         .items_center()
-        .w(px(width))
-        .px(px(8.0))
-        .child(label)
+        .flex_shrink_0()
+        .h(px(size::DENSE))
+        .px(px(space::SNUG))
+        .rounded(px(radius::CONTROL_SM))
+        .bg(Colors::surface_panel_raised())
+        .border(px(1.0))
+        .border_color(Colors::border_subtle())
+        .text_size(px(typography::UI_XS))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(Colors::text_primary())
+        .child(text)
 }
 
-fn vsep() -> impl IntoElement {
-    div().w(px(1.0)).h_full().bg(Colors::border_subtle())
+/// An action's menu path split into where it lives and what it is:
+/// `Audio › Tap Tempo › Tap` → (`Audio › Tap Tempo › `, `Tap`).
+fn split_action_label(label: &str) -> (&str, &str) {
+    const SEP: &str = " › ";
+    match label.rfind(SEP) {
+        Some(at) => (&label[..at + SEP.len()], &label[at + SEP.len()..]),
+        None => ("", label),
+    }
 }
 
 fn keymap_row_element(
     row: &KeymapRow,
     selected: bool,
     on_keystrokes: impl Fn(&gpui::MouseDownEvent, &mut Window, &mut App) + 'static,
+    on_reset: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> gpui::Div {
-    let alt = row.id.len() % 2 == 0;
-    let text_color = if row.enabled {
-        Colors::text_primary()
+    let base = Colors::surface_base();
+    let rest = if selected {
+        Colors::composite(base, Colors::state_selected())
     } else {
-        Colors::text_muted()
+        base
     };
-    let keystrokes = format_keystroke_list(&row.keystrokes);
-    // A conflict names what it collides with, so it can be fixed from here.
+    let hover = Colors::composite(rest, Colors::state_hover());
+    let (path, name) = split_action_label(&row.action_label);
+    let keys = format_keystrokes(&row.keystrokes);
+
     let source = if row.is_conflict {
-        format!("Conflicts with {}", row.conflict_with.join(", "))
+        div()
+            .id(gpui::SharedString::from(format!(
+                "keymap-conflict-{}",
+                row.id
+            )))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(space::TIGHT))
+            .text_color(Colors::status_warning())
+            .tooltip(fb_tooltip(format!(
+                "Conflicts with {}",
+                row.conflict_with.join(", ")
+            )))
+            .child(
+                svg()
+                    .path(assets::ICON_TRIANGLE_ALERT_PATH)
+                    .size(px(typography::UI_XS))
+                    .text_color(Colors::status_warning()),
+            )
+            .child("Conflict")
+            .into_any_element()
     } else if row.is_user_override {
-        "Changed".to_string()
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(space::TIGHT))
+            .child(fb_badge("Changed", Colors::accent_primary()))
+            .child(
+                div()
+                    .id(gpui::SharedString::from(format!(
+                        "keymap-reset-tip-{}",
+                        row.id
+                    )))
+                    .tooltip(fb_tooltip("Reset to the profile's key"))
+                    .child(fb_icon_button(
+                        gpui::SharedString::from(format!("keymap-reset-{}", row.id)),
+                        ICON_RESET_PATH,
+                        "Reset to the profile's key",
+                        size::MICRO,
+                        None,
+                        on_reset,
+                    )),
+            )
+            .into_any_element()
     } else {
-        row.source.label().to_string()
+        div()
+            .text_color(Colors::text_faint())
+            .child(row.source.label())
+            .into_any_element()
     };
+
     div()
+        .relative()
         .flex()
         .flex_row()
-        .h(px(ROW_H))
-        .bg(if selected {
-            Colors::accent_soft()
-        } else if alt {
-            Colors::surface_raised()
-        } else {
-            Colors::surface_base()
-        })
-        .text_color(text_color)
-        .text_size(px(11.0))
-        .cursor(gpui::CursorStyle::PointingHand)
-        .child(body_cell(&row.action_label, 420.0))
-        .child(vsep())
-        .child(
-            body_cell(&keystrokes, 220.0)
-                .text_color(if row.keystrokes.is_empty() {
-                    Colors::text_muted()
-                } else {
-                    Colors::text_secondary()
-                })
-                .hover(|style| style.bg(Colors::state_hover()))
-                .on_mouse_down(MouseButton::Left, on_keystrokes),
-        )
-        .child(vsep())
-        .child(body_cell(row.scope.label(), 160.0))
-        .child(vsep())
-        .child(body_cell(&source, 240.0).text_color(if row.is_conflict {
-            Colors::status_warning()
-        } else {
-            Colors::text_muted()
-        }))
-}
-
-fn body_cell(label: &str, width: f32) -> gpui::Div {
-    div()
-        .flex()
         .items_center()
-        .w(px(width))
-        .px(px(8.0))
-        .overflow_hidden()
-        .truncate()
-        .child(label.to_string())
-}
-
-fn keymap_scrollbar_thumb(scroll: ScrollHandle) -> gpui::AnyElement {
-    let viewport_h: f32 = scroll.bounds().size.height.into();
-    let max_y: f32 = scroll.max_offset().y.into();
-    let raw_y: f32 = scroll.offset().y.into();
-    let offset_y: f32 = -raw_y;
-
-    if viewport_h <= 0.0 || max_y <= 0.5 {
-        return div().w(px(0.0)).h(px(0.0)).into_any_element();
-    }
-
-    let content_h = viewport_h + max_y;
-    let min_thumb = 24.0_f32;
-    let thumb_h = ((viewport_h / content_h) * viewport_h).max(min_thumb);
-    let track_room = (viewport_h - thumb_h).max(0.0);
-    let progress = (offset_y / max_y).clamp(0.0, 1.0);
-    let thumb_top = progress * track_room;
-
-    div()
-        .absolute()
-        .top(px(thumb_top))
-        .right(px(2.0))
-        .w(px(4.0))
-        .h(px(thumb_h))
-        .rounded(px(crate::theme::radius::PILL))
-        .bg(Colors::with_alpha(Colors::text_primary(), 0.22))
-        .into_any_element()
+        .w_full()
+        .h(px(ROW_H))
+        .bg(rest)
+        .hover(move |style| style.bg(hover))
+        .text_size(px(typography::UI_SM))
+        .cursor(gpui::CursorStyle::PointingHand)
+        .when(selected, |el| {
+            el.child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(px(MARKER_W))
+                    .bg(Colors::accent_primary()),
+            )
+        })
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .flex_1()
+                .min_w_0()
+                .pl(px(space::LOOSE + MARKER_W))
+                .pr(px(space::BASE))
+                .overflow_hidden()
+                .child(
+                    div()
+                        .flex_shrink(1.0)
+                        .min_w_0()
+                        .truncate()
+                        .text_color(Colors::text_faint())
+                        .child(path.to_string()),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_color(if row.enabled {
+                            Colors::text_primary()
+                        } else {
+                            Colors::text_muted()
+                        })
+                        .child(name.to_string()),
+                ),
+        )
+        .child(
+            column(KEYS_W)
+                .h_full()
+                .gap(px(space::TIGHT))
+                .on_mouse_down(MouseButton::Left, on_keystrokes)
+                .when(keys.is_empty(), |el| {
+                    el.text_size(px(typography::UI_XS))
+                        .text_color(Colors::text_disabled())
+                        .child("Unassigned")
+                })
+                .children(keys.into_iter().map(keycap)),
+        )
+        .child(
+            column(SCOPE_W)
+                .text_size(px(typography::UI_XS))
+                .text_color(Colors::text_muted())
+                .child(row.scope.label()),
+        )
+        .child(
+            column(SOURCE_W)
+                .pr(px(space::LOOSE))
+                .text_size(px(typography::UI_XS))
+                .child(source),
+        )
 }
 
 /// How many actions the create dialog offers at once. The list is filtered by
@@ -1411,6 +1678,47 @@ fn edit_dialog_overlay(
         .into_any_element()
 }
 
+/// The Keymap window over a fresh Default profile, for the preview harness.
+///
+/// `changed` rebinds Undo so one row shows the Changed badge and its reset,
+/// and selects it; `query` is typed into the search field.
+#[cfg(feature = "ui-preview")]
+pub fn open_preview_keymap_window(
+    options: gpui::WindowOptions,
+    changed: bool,
+    query: &'static str,
+    cx: &mut App,
+) -> gpui::Result<WindowHandle<KeymapWindow>> {
+    // An empty data folder of its own: no real overrides leak in.
+    let dir = std::env::temp_dir().join("fb-keymap-preview");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut manager = KeymapManager::new(dir);
+    let selected = changed.then(|| {
+        let _ = manager.tap_binding(
+            "edit:undo",
+            vec!["ctrl+alt+z".into()],
+            KeymapScope::Global,
+            None,
+            true,
+        );
+        manager
+            .rows()
+            .iter()
+            .find(|row| row.is_user_override)
+            .map(|row| row.id.clone())
+    });
+    let on_changed: KeymapChangedCb = Arc::new(|_, _| {});
+    cx.open_window(options, move |_, cx| {
+        cx.new(|cx| {
+            let mut view = KeymapWindow::new(manager, on_changed, cx);
+            view.selected_row_id = selected.flatten();
+            view.search_input.set_value(query);
+            view.filter_query = query.to_string();
+            view
+        })
+    })
+}
+
 pub fn open_keymap_window(
     owner_bounds: Option<Bounds<gpui::Pixels>>,
     manager: KeymapManager,
@@ -1438,4 +1746,28 @@ pub fn open_keymap_window(
         cx.new(|cx| KeymapWindow::new(manager, on_changed, cx))
     })
     .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The table dims where an action lives and brightens what it is.
+    #[test]
+    fn an_action_label_splits_into_its_path_and_its_name() {
+        assert_eq!(
+            split_action_label("Audio › Tap Tempo › Tap"),
+            ("Audio › Tap Tempo › ", "Tap")
+        );
+        assert_eq!(split_action_label("Edit › Undo"), ("Edit › ", "Undo"));
+        assert_eq!(split_action_label("Undo"), ("", "Undo"));
+    }
+
+    /// One keycap per alternative key, in the order they were bound.
+    #[test]
+    fn each_alternative_key_is_its_own_keycap() {
+        let keys = format_keystrokes(&["ctrl+shift+z".into(), "ctrl+y".into()]);
+        assert_eq!(keys.len(), 2);
+        assert!(format_keystrokes(&[]).is_empty());
+    }
 }

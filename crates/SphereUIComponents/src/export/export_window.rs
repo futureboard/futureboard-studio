@@ -1253,7 +1253,9 @@ impl ExportArrangementWindow {
 
         let channels = self.settings.channels;
         let mut channel_track = fb_segmented_track().w_full();
-        for (value, id, label, position) in [
+        // A surround mix offers its own width: one speaker per channel.
+        let surround = self.defaults.surround_layout;
+        let mut channel_modes = vec![
             (
                 ExportChannelMode::Stereo,
                 "export-channels-stereo",
@@ -1264,9 +1266,22 @@ impl ExportArrangementWindow {
                 ExportChannelMode::Mono,
                 "export-channels-mono",
                 i18n.tr_or("export.channels.mono", "Mono"),
-                FbSegment::Last,
+                if surround.is_some() {
+                    FbSegment::Middle
+                } else {
+                    FbSegment::Last
+                },
             ),
-        ] {
+        ];
+        if let Some(layout) = surround {
+            channel_modes.push((
+                ExportChannelMode::Surround,
+                "export-channels-surround",
+                format!("{} ({} ch)", layout.name(), layout.channel_count()),
+                FbSegment::Last,
+            ));
+        }
+        for (value, id, label, position) in channel_modes {
             let target = target.clone();
             channel_track = channel_track.child(fb_segment(
                 id,
@@ -1286,6 +1301,26 @@ impl ExportArrangementWindow {
             i18n.tr_or("export.field.channels", "Channels"),
             channel_track,
         ));
+        if channels == ExportChannelMode::Surround {
+            rows.push(readout_row(
+                i18n.tr_or("export.field.surround", "Surround"),
+                i18n.tr_or(
+                    "export.hint.surround",
+                    "One WAV, a speaker per channel in WAV order. Master inserts do not \
+                     process it.",
+                ),
+            ));
+        } else if let Some(layout) = surround {
+            rows.push(readout_row(
+                i18n.tr_or("export.field.surround", "Surround"),
+                tr_vars_or(
+                    i18n,
+                    "export.hint.surround-folded",
+                    "The { $layout } mix is folded to two channels as Project Settings hears it on two outputs.",
+                    &[("layout", layout.name().to_string())],
+                ),
+            ));
+        }
 
         // Normalization is a real two-pass gain stage on the mixdown only, and
         // a realtime render has one pass — so the option carries the reason,

@@ -2,7 +2,10 @@
 ; Generated for Inno Setup 6.x
 ;
 ; Package source:
-;   ..\..\out\release\community\windows-x64
+;   ..\..\out\release\windows-x64
+;
+; There is one package. Studio picks Community or Professional features at
+; runtime from the licence, so this installer serves every user.
 ;
 ; The entire staged directory tree is copied into the installation directory:
 ;   - FutureboardNative.exe
@@ -16,7 +19,7 @@
 ;   - any additional runtime files or directories
 ;
 ; Recommended package command:
-;   cargo xtask package --profile release --edition community --plugin all
+;   cargo package-release
 ;
 ; build-installer.ps1 may override MySourceDir and MyAppVersion using /D.
 ;
@@ -30,7 +33,7 @@
 #define MyAppIcon "..\..\packages\shared\app\icons\icon.ico"
 
 #ifndef MySourceDir
-#define MySourceDir "..\..\out\release\community\windows-x64"
+#define MySourceDir "..\..\out\release\windows-x64"
 #endif
 
 #ifndef MyAppVersion
@@ -109,6 +112,21 @@ Name: "{group}\{#MyAppName}"; \
     Filename: "{app}\{#MyAppExeName}"; \
     WorkingDir: "{app}"; \
     IconFilename: "{app}\{#MyAppExeName}"
+
+; The Futureboard Visualizer (apps/native/visualizer): a meter and analysis
+; display that docks along the top of the desktop and reads Studio over a
+; shared-memory link. Only when the package carries it (`cargo package-release`
+; without --no-visualizer). It has no icon of its own, so it borrows Studio's.
+#if FileExists(AddBackslash(MySourceDir) + "FutureboardVisualizer.exe")
+#pragma message "Visualizer shortcut included"
+Name: "{group}\Futureboard Visualizer"; \
+    Filename: "{app}\FutureboardVisualizer.exe"; \
+    WorkingDir: "{app}"; \
+    IconFilename: "{app}\{#MyAppExeName}"; \
+    Comment: "Meters and analysis for Futureboard Studio, docked along the top of the desktop"
+#else
+#pragma message "Visualizer not in the package; no shortcut"
+#endif
 
 Name: "{group}\Uninstall {#MyAppName}"; \
     Filename: "{uninstallexe}"

@@ -1,3 +1,4 @@
+use crate::components::timeline::audio_clip::{clip_body_range_zone, ClipBodyPressCb};
 use crate::components::timeline::render::clip_geometry::{
     controller_preview_band_h, controller_preview_cached, midi_controller_default_value,
     midi_controller_kind_label, note_preview_cached, visible_clip_px_range, ControllerPreview,
@@ -5,7 +6,7 @@ use crate::components::timeline::render::clip_geometry::{
 };
 use crate::components::timeline::timeline_state::{
     midi_debug_enabled, ClipDragItem, ClipEdge, ClipResizeDrag, ClipState, ClipType,
-    MidiControllerKind, TimelineState,
+    MidiControllerKind, TimelineState, TimelineTool,
 };
 use crate::theme::Colors;
 use gpui::{
@@ -41,6 +42,7 @@ pub(crate) fn midi_clip(
     on_erase_clip: Option<
         std::sync::Arc<dyn Fn(&String, &mut gpui::Window, &mut gpui::App) + 'static>,
     >,
+    on_body_press: Option<ClipBodyPressCb>,
     erase_target: bool,
     selected: bool,
     (left, width): (f32, f32),
@@ -154,6 +156,18 @@ pub(crate) fn midi_clip(
     };
 
     let on_select = on_select_clip.clone();
+    // The Pointer's range zone over the body; see `clip_body_range_zone`.
+    let body_zone = (state.active_tool == TimelineTool::Pointer)
+        .then_some(on_body_press)
+        .flatten()
+        .map(|press| {
+            let inset = if show_resize_handles {
+                crate::components::timeline::audio_clip::clip_resize_handle_w(width)
+            } else {
+                0.0
+            };
+            clip_body_range_zone(&clip.id, track_id, inset, press, on_open_editor.clone())
+        });
     let context_clip_id = clip.id.clone();
     let erase_cb = on_erase_clip.clone();
     let ctx_cb = on_context_menu.clone();
@@ -282,6 +296,8 @@ pub(crate) fn midi_clip(
             // name (flex_1) fills the bar, so no gap remains. Duration stays in the
             // model and the inspector; resize/trim handles are unaffected.
         }))
+        // Before the edge handles, which keep their columns.
+        .children(body_zone)
         // Left/right edge resize handles (absolute, on top). Each starts a
         // typed `ClipResizeDrag`; `stop_propagation` keeps the body move-drag
         // and track re-select from also firing on an edge grab.

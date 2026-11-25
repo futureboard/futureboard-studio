@@ -27,6 +27,9 @@ pub mod instance_manager;
 /// Cross-process IPC protocol (commands/events + JSON framing) shared by the
 /// main app and the `FutureboardPluginHostX64` process.
 pub mod ipc;
+/// Which processor a plug-in module was built for (PE header / bundle
+/// folders), so 32-bit plug-ins go to the 32-bit host and scanner.
+pub mod module_arch;
 /// Plain-Rust facade over the editor C ABI — always built so the native
 /// binary can drive the IPlugView lifecycle without N-API.
 pub mod native_editor;
@@ -90,4 +93,4 @@ pub use scan::{
     load_au_cache_state, save_au_cache_state, AuScanCacheState, FormatCacheStatus,
     PluginDescriptor, PluginScanError, PluginScanFormat, ScanResultPayload,
 };
-pub use scanner::{discover_plugin_bundles, scan_plugin_bundle};
+pub use scanner::{discover_plugin_bundles, scan_left_work_running, scan_plugin_bundle};

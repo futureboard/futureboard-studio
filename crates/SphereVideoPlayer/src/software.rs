@@ -59,10 +59,10 @@ impl SoftwareDecoder {
         }
         let index = ((seconds * self.info.frame_rate) + 1.0e-6).floor().max(0.0) as u64;
         let index = index.min(self.frame_count - 1);
-        if let Some((current, frame)) = &self.current {
-            if *current == index {
-                return Ok(Arc::clone(frame));
-            }
+        if let Some((current, frame)) = &self.current
+            && *current == index
+        {
+            return Ok(Arc::clone(frame));
         }
 
         let decoded = self
@@ -94,7 +94,7 @@ impl SoftwareDecoder {
 
 /// RGBA8 → BGRA8 (swap the red and blue bytes of every pixel).
 fn rgba_to_bgra_in_place(pixels: &mut [u8]) {
-    for px in pixels.chunks_exact_mut(4) {
+    for px in pixels.as_chunks_mut::<4>().0 {
         px.swap(0, 2);
     }
 }

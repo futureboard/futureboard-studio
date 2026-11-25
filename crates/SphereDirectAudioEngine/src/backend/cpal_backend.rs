@@ -441,9 +441,9 @@ where
     let mut runtime = initial_runtime;
     runtime.retarget_sample_rate(output_sample_rate);
     #[cfg(target_os = "windows")]
-    let mut mmcss_set = false;
+    let mut mmcss_attempted = false;
     #[cfg(not(target_os = "windows"))]
-    let mmcss_set = false;
+    let mmcss_attempted = false;
     // Linux: cpal spawns `cpal_alsa_out` at plain SCHED_OTHER, so the audio
     // thread is preempted by the compositor, plugin editors and the scanner
     // like any other thread. The first callback announces its tid and a helper
@@ -516,9 +516,14 @@ where
 
                 // ── Set MMCSS on first callback invocation ────────────────────
                 #[cfg(target_os = "windows")]
-                if mmcss_priority && !mmcss_set {
-                    mmcss_set = set_mmcss_pro_audio();
-                    shared.mmcss_active.store(mmcss_set, Ordering::Relaxed);
+                if mmcss_priority && !mmcss_attempted {
+                    // Once, whatever the answer: a registration the system
+                    // refused used to be retried, as a system call, on every
+                    // block for the life of the stream.
+                    mmcss_attempted = true;
+                    shared
+                        .mmcss_active
+                        .store(set_mmcss_pro_audio(), Ordering::Relaxed);
                 }
                 #[cfg(not(target_os = "windows"))]
                 let _ = mmcss_priority; // suppress unused warning
@@ -562,7 +567,7 @@ where
                 // on a WASAPI Shared stream: one relaxed load per block.
                 let gain = stage.device_gain(shared.shared_headroom.load(Ordering::Relaxed));
                 write_device_block(data, scratch, gain, &mut dither);
-                let _ = mmcss_set; // suppress unused (non-windows)
+                let _ = mmcss_attempted; // suppress unused (non-windows)
             },
             move |err| {
                 glitch_counter.fetch_add(1, Ordering::Relaxed);

@@ -86,6 +86,10 @@ pub fn setup(cx: &mut App) {
     }));
     sphere_ui_components::settings::install_settings_change_listener(Arc::new(|settings| {
         set_discord_enabled(settings.general.discord_rpc_enabled);
+        sphere_ui_components::api_server::apply_settings(
+            settings.experimental.api_server,
+            settings.experimental.api_server_port,
+        );
     }));
     register_update_provider();
     install_deep_links(cx);
@@ -841,7 +845,7 @@ fn open_welcome_window(cx: &mut App) {
     let welcome_options = welcome_window_options(cx);
     match cx.open_window(welcome_options, |window, cx| {
         window.on_next_frame(|_window, _cx| boot::complete_startup());
-        cx.new(|cx| WelcomeWindow::new(callbacks, cx.focus_handle()))
+        cx.new(|cx| WelcomeWindow::new(callbacks, cx))
     }) {
         Ok(handle) => {
             cx.update_global::<NativeShellWindows, _>(|shell, _| {

@@ -48,7 +48,8 @@ fn add_track_instrument_plugins_from_catalog(
         .unwrap_or_default()
 }
 
-/// The instrument a DrumStep track is created with: the built-in Drum Sampler.
+/// The instrument a DrumStep track is created with when none is picked: the
+/// built-in Drum Sampler.
 const DRUM_STEP_INSTRUMENT_ID: &str = "builtin:drumsampler";
 
 fn dialog_audio_format(format: AudioFormat) -> TrackAudioFormat {
@@ -296,6 +297,11 @@ pub(crate) struct ExternalWindows {
     /// Virtual Speaker — the Control Room's listening simulation.
     pub virtual_speaker:
         Option<gpui::WindowHandle<crate::components::virtual_speaker_window::VirtualSpeakerWindow>>,
+    /// 3D Room Preview — every channel's place in a spatial mix, in 3D.
+    pub room: Option<gpui::WindowHandle<crate::components::room_window::RoomWindow>>,
+    /// The speaker levels the meter tick last read, kept so a snapshot pushed
+    /// between ticks does not blank the 3D Room Preview's meters.
+    pub room_speaker_peaks: Vec<f32>,
     /// SysEx Editor — clip and marker System Exclusive messages.
     pub sysex_editor:
         Option<gpui::WindowHandle<crate::components::sysex_editor_window::SysExEditorWindow>>,
@@ -1487,12 +1493,19 @@ impl StudioLayout {
                                     .state
                                     .set_track_audio_input_connection(&id, connection_id);
                             }
-                            // A DrumStep track always gets the built-in Drum
-                            // Sampler; an Instrument track the VSTi picked.
+                            // A DrumStep track gets the instrument picked for
+                            // it — a VSTi drum kit plays its steps as notes
+                            // like any other — and the built-in Drum Sampler
+                            // when none was; an Instrument track the VSTi
+                            // picked.
                             let hosted_instrument = if dialog.selected_kind
                                 == AddTrackKind::DrumStep
                             {
-                                Some(DRUM_STEP_INSTRUMENT_ID)
+                                dialog
+                                    .instrument_plugin_id
+                                    .as_deref()
+                                    .filter(|id| !id.is_empty())
+                                    .or(Some(DRUM_STEP_INSTRUMENT_ID))
                             } else if dialog.selected_kind == AddTrackKind::Instrument
                                 && dialog.instrument_mode == InstrumentMode::Vsti
                             {
@@ -1864,6 +1877,33 @@ impl StudioLayout {
             });
         }));
 
+        // Audio page: open the running ASIO driver's own panel. A buffer-size
+        // change made there comes back as the driver's reset request, which
+        // the engine answers by reopening the device.
+        let asio_control_panel: Option<crate::components::settings_dialog::OnOpenPluginManager> =
+            self.audio_bridge.engine.clone().map(|engine| {
+                Arc::new(move |_window: &mut gpui::Window, _cx: &mut gpui::App| {
+                    use crate::components::background_tasks::{BackgroundJob, BackgroundTaskKind};
+                    match engine.open_asio_control_panel() {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            BackgroundJob::start(
+                                BackgroundTaskKind::Analysis,
+                                "ASIO Control Panel",
+                            )
+                            .fail("No ASIO device is running.");
+                        }
+                        Err(error) => {
+                            BackgroundJob::start(
+                                BackgroundTaskKind::Analysis,
+                                "ASIO Control Panel",
+                            )
+                            .fail(format!("The driver did not open its panel: {error}"));
+                        }
+                    }
+                }) as crate::components::settings_dialog::OnOpenPluginManager
+            });
+
         let engine_for_latency = self.audio_bridge.engine.clone();
         let deferred_rate = self.audio_bridge.sample_rate_deferred_target.clone();
         let latency_provider: crate::components::settings_dialog::AudioLatencySnapshotProvider =
@@ -1921,6 +1961,9 @@ impl StudioLayout {
             cx,
         ) {
             Ok(handle) => {
+                let _ = handle.update(cx, |settings, _window, _cx| {
+                    settings.set_asio_control_panel(asio_control_panel);
+                });
                 if let Some(tab) = tab {
                     let _ = handle.update(cx, |settings, _window, cx| {
                         settings.set_active_tab(tab, cx);
@@ -2354,7 +2397,11 @@ impl StudioLayout {
         &self,
         cx: &gpui::App,
     ) -> solfege_spatialaudio::SimulationSettings {
-        if let Some(settings) = self.listening_simulation {
+        // Virtual Speaker comes with spatial mixing: without the license it is
+        // off whatever was chosen, so a lapse silences it at the next sync.
+        let licensed = crate::edition::spatial_mix_licensed();
+        if let Some(mut settings) = self.listening_simulation {
+            settings.enabled &= licensed;
             return settings;
         }
         let playback = &self.settings.read(cx).current.playback;
@@ -2379,6 +2426,7 @@ impl StudioLayout {
             settings: self.listening_simulation(cx),
             control_room_in_path: self.timeline.read(cx).state.monitor.control_room_enabled,
             engine_ready: self.audio_bridge.engine.is_some(),
+            licensed: crate::edition::spatial_mix_licensed(),
         }
     }
 
@@ -2391,6 +2439,8 @@ impl StudioLayout {
         cx: &mut Context<Self>,
     ) {
         let before = self.listening_simulation(cx);
+        let mut settings = settings;
+        settings.enabled &= crate::edition::spatial_mix_licensed();
         self.listening_simulation = Some(settings);
         if let Some(engine) = self.audio_bridge.engine.as_ref() {
             let _ = engine.set_listening_simulation(settings);
@@ -2419,6 +2469,194 @@ impl StudioLayout {
         }
         self.notify_status_bar_if_changed(cx);
         cx.notify();
+    }
+
+    /// What the 3D Room Preview draws: every placed channel where it is
+    /// heard at the playhead, the speakers' last levels, the selection.
+    fn room_snapshot(&self, cx: &gpui::App) -> crate::components::room_window::RoomSnapshot {
+        use crate::components::room_window::{RoomSnapshot, RoomSource};
+        use crate::components::timeline::timeline_state::TrackOutputRouting;
+        let state = &self.timeline.read(cx).state;
+        let licensed = crate::edition::spatial_mix_licensed();
+        let heard = state.spatial_mix.heard(licensed);
+        let beat = f64::from(state.transport.playhead_beats);
+        let sources = if heard.is_spatial() {
+            state
+                .tracks
+                .iter()
+                .filter(|track| state.spatially_placed(track))
+                .map(|track| {
+                    let automated = track.spatial_lanes_playing();
+                    RoomSource {
+                        id: track.id.clone(),
+                        name: track.name.clone(),
+                        color: track.color,
+                        heard: if automated {
+                            track.spatial_heard_at(beat)
+                        } else {
+                            track.spatial.sanitized()
+                        },
+                        base: track.spatial.sanitized(),
+                        automated,
+                        bus: match &track.routing.output {
+                            TrackOutputRouting::Bus { bus_id } => {
+                                state.find_track(bus_id).map(|bus| bus.name.clone())
+                            }
+                            _ => None,
+                        },
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        RoomSnapshot {
+            licensed,
+            saved_format: state.spatial_mix.format,
+            format: heard.format,
+            sources,
+            speaker_peaks: if heard.is_spatial() {
+                self.external_windows.room_speaker_peaks.clone()
+            } else {
+                Vec::new()
+            },
+            selected: state.selection.selected_track_id.clone(),
+        }
+    }
+
+    /// Push fresh state to the 3D Room Preview. No-op when it is closed.
+    pub(crate) fn refresh_room_window(&mut self, cx: &mut Context<Self>) {
+        let Some(handle) = self.external_windows.room.clone() else {
+            return;
+        };
+        let snapshot = self.room_snapshot(cx);
+        if handle
+            .update(cx, |view, _window, cx| view.set_snapshot(snapshot, cx))
+            .is_err()
+        {
+            self.external_windows.room = None;
+        }
+    }
+
+    /// The meter tick's share: the speaker levels just read, and the channels
+    /// where automation has them now. Nothing while the window is closed.
+    pub(super) fn tick_room_window(&mut self, speaker_peaks: &[f64], cx: &mut Context<Self>) {
+        if self.external_windows.room.is_none() {
+            return;
+        }
+        self.external_windows.room_speaker_peaks.clear();
+        self.external_windows
+            .room_speaker_peaks
+            .extend(speaker_peaks.iter().map(|peak| *peak as f32));
+        self.refresh_room_window(cx);
+    }
+
+    pub(crate) fn open_room_window(
+        &mut self,
+        owner_bounds: Option<Bounds<gpui::Pixels>>,
+        cx: &mut Context<Self>,
+    ) {
+        // The license may have been renewed since Studio started.
+        crate::edition::refresh_licensed_providers();
+        let snapshot = self.room_snapshot(cx);
+        if let Some(handle) = self.external_windows.room.clone() {
+            if handle
+                .update(cx, |view, window, cx| {
+                    view.set_snapshot(snapshot.clone(), cx);
+                    window.activate_window();
+                })
+                .is_ok()
+            {
+                return;
+            }
+            self.external_windows.room = None;
+        }
+
+        // Each callback defers its Studio work: the window calls it from
+        // inside its own update. Moves reach the engine live, as the Mixer's
+        // room panner's do; the release is one undo step.
+        let owner = cx.entity().clone();
+        let callbacks = crate::components::room_window::RoomCallbacks {
+            on_drag_start: {
+                let owner = owner.clone();
+                Arc::new(move |id: &str, app: &mut gpui::App| {
+                    let id = id.to_string();
+                    StudioLayout::defer_update(&owner, app, move |layout, cx| {
+                        layout
+                            .timeline
+                            .update(cx, |timeline, _cx| timeline.begin_room_edit(&id));
+                    });
+                })
+            },
+            on_drag_preview: {
+                let owner = owner.clone();
+                Arc::new(
+                    move |id: &str,
+                          params: solfege_spatialaudio::SourceParams,
+                          app: &mut gpui::App| {
+                        let id = id.to_string();
+                        StudioLayout::defer_update(&owner, app, move |layout, cx| {
+                            let placed = layout.timeline.update(cx, |timeline, cx| {
+                                timeline.preview_track_room(&id, params, cx)
+                            });
+                            if let (Some(params), Some(engine)) =
+                                (placed, layout.audio_bridge.engine.as_ref())
+                            {
+                                let _ = engine.set_track_spatial(&id, params);
+                            }
+                            let _ = layout.mixer_panel.update(cx, |_, cx| cx.notify());
+                        });
+                    },
+                )
+            },
+            on_drag_commit: {
+                let owner = owner.clone();
+                Arc::new(move |_id: &str, app: &mut gpui::App| {
+                    StudioLayout::defer_update(&owner, app, move |layout, cx| {
+                        layout.timeline.update(cx, |timeline, cx| {
+                            timeline.finish_room_edit("Move in Room", cx)
+                        });
+                        layout.mark_dirty_view_only();
+                        layout.push_mixer_snapshot_to_window(cx);
+                        layout.refresh_room_window(cx);
+                        cx.notify();
+                    });
+                })
+            },
+            on_select: {
+                let owner = owner.clone();
+                Arc::new(move |id: &str, app: &mut gpui::App| {
+                    let id = id.to_string();
+                    StudioLayout::defer_update(&owner, app, move |layout, cx| {
+                        layout.timeline.update(cx, |timeline, cx| {
+                            timeline.state.select_track(&id);
+                            cx.notify();
+                        });
+                        let _ = layout.mixer_panel.update(cx, |_, cx| cx.notify());
+                        layout.refresh_room_window(cx);
+                        cx.notify();
+                    });
+                })
+            },
+            on_open_project_settings: {
+                let owner = owner.clone();
+                Arc::new(move |app: &mut gpui::App| {
+                    StudioLayout::defer_update(&owner, app, move |layout, cx| {
+                        layout.open_project_settings_window(None, cx);
+                    });
+                })
+            },
+        };
+
+        match crate::components::room_window::open_room_window(
+            owner_bounds,
+            snapshot,
+            callbacks,
+            cx,
+        ) {
+            Ok(handle) => self.external_windows.room = Some(handle),
+            Err(err) => eprintln!("[room-preview] failed to open window: {err}"),
+        }
     }
 
     pub(crate) fn open_virtual_speaker_window(
@@ -2669,8 +2907,36 @@ impl StudioLayout {
             time_display_format: timeline.state.time_display_format,
             timecode_rate: timeline.state.timecode_rate,
             spatial_mix: timeline.state.spatial_mix,
+            spatial_licensed: crate::edition::spatial_mix_licensed(),
+            metadata: timeline.state.project_metadata.clone(),
             track_count: timeline.state.tracks.len(),
         }
+    }
+
+    /// Follow the spatial-mix license when it changes while Studio runs — an
+    /// activation, a renewal in the Launcher, or a lapse. The project's own
+    /// spatial settings are untouched; the engine is rebuilt in the format now
+    /// heard, Virtual Speaker follows, and the surfaces that show placement
+    /// are refreshed. One atomic load when nothing changed.
+    pub(super) fn follow_spatial_license(&mut self, cx: &mut Context<Self>) {
+        let licensed = crate::edition::spatial_mix_licensed();
+        if licensed == self.spatial_licensed_seen {
+            return;
+        }
+        self.spatial_licensed_seen = licensed;
+        if self.timeline.read(cx).state.spatial_mix.is_spatial() {
+            self.mark_engine_project_dirty();
+        }
+        let simulation = self.listening_simulation(cx);
+        if let Some(engine) = self.audio_bridge.engine.as_ref() {
+            let _ = engine.set_listening_simulation(simulation);
+        }
+        self.set_listening_simulation(simulation, cx);
+        let _ = self.mixer_panel.update(cx, |_, cx| cx.notify());
+        self.push_mixer_snapshot_to_window(cx);
+        self.push_project_settings_snapshot_to_window(cx);
+        self.refresh_room_window(cx);
+        cx.notify();
     }
 
     /// Push fresh project state to the Project Settings window. No-op when the
@@ -2681,8 +2947,8 @@ impl StudioLayout {
             return;
         };
         let snapshot = self.build_project_settings_snapshot(cx);
-        let _ = handle.update(cx, |view, _window, cx| {
-            if view.set_snapshot(snapshot) {
+        let _ = handle.update(cx, |view, window, cx| {
+            if view.set_snapshot(snapshot, window) {
                 cx.notify();
             }
         });
@@ -2776,6 +3042,17 @@ impl StudioLayout {
                 Arc::new(move |rate, cx| {
                     StudioLayout::defer_update(&owner, cx, move |this, cx| {
                         this.set_project_timecode_rate(rate, cx);
+                        this.push_project_settings_snapshot_to_window(cx);
+                    });
+                })
+            },
+            on_set_metadata_field: {
+                let owner = owner.clone();
+                Arc::new(move |field, value, cx| {
+                    StudioLayout::defer_update(&owner, cx, move |this, cx| {
+                        this.set_project_metadata_field(field, value, cx);
+                        // Also when nothing changed (whitespace only), so the
+                        // field shows the stored value again.
                         this.push_project_settings_snapshot_to_window(cx);
                     });
                 })
@@ -2881,6 +3158,40 @@ impl StudioLayout {
             self.mark_dirty();
             let _ = self.mixer_panel.update(cx, |_, cx| cx.notify());
             self.push_mixer_snapshot_to_window(cx);
+            self.refresh_room_window(cx);
+            cx.notify();
+        }
+    }
+
+    /// Set one project metadata field (title, artist, …) as one undo step.
+    /// Surrounding whitespace is dropped. Saved with the project and written
+    /// into exports; nothing plays differently, so the engine graph is left
+    /// alone.
+    pub(crate) fn set_project_metadata_field(
+        &mut self,
+        field: crate::project::ProjectMetadataField,
+        value: String,
+        cx: &mut Context<Self>,
+    ) {
+        let value = value.trim().to_string();
+        let changed = self.timeline.update(cx, |timeline, cx| {
+            let prev = timeline.state.project_metadata.clone();
+            if prev.get(field) == value {
+                return false;
+            }
+            let mut next = prev.clone();
+            *next.get_mut(field) = value;
+            timeline.run_metadata_edit_command(
+                crate::components::edit::EditCommand::SetProjectMetadata {
+                    prev: Box::new(prev),
+                    next: Box::new(next),
+                },
+                cx,
+            );
+            true
+        });
+        if changed {
+            self.mark_dirty_view_only();
             cx.notify();
         }
     }

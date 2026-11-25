@@ -109,7 +109,21 @@ pub(super) fn compensation_delay_running(runtime: &RuntimeProject, track_index: 
 #[inline]
 pub(super) fn apply_fader(track: &mut RuntimeTrack, frames: usize, beat: f64, smooth: bool) {
     let automation = track.automation_values_at_beat(beat);
-    let volume = automation.volume.unwrap_or(track.volume);
+    // The VCA group's gain rides on top of the fader, automation included.
+    let volume = automation.volume.unwrap_or(track.volume) * track.vca_gain;
+    // A bus's spatial field follows the same gain.
+    track.spatial_state.fader_gain = volume;
+    // Where a placed channel is heard this block: its placement with any
+    // spatial lane applied.
+    if track.spatial.is_some() {
+        let mut heard = track.spatial_params;
+        for param in solfege_spatialaudio::SourceParam::ALL {
+            if let Some(value) = automation.spatial[param.index()] {
+                heard = param.apply(heard, value);
+            }
+        }
+        track.spatial_state.heard = heard;
+    }
     // A spatialised channel is placed by its room position on the way into
     // the master, so its fader carries level only.
     let pan = if track.spatial.is_some() {
@@ -117,6 +131,14 @@ pub(super) fn apply_fader(track: &mut RuntimeTrack, frames: usize, beat: f64, sm
     } else {
         automation.pan.unwrap_or(track.pan)
     };
+    // Dual pan, and the one block that ramps back out of it, run the matrix
+    // path; a channel that never engages Dual takes the balance path below
+    // unchanged.
+    let dual = track.dual_pan.settings.enabled && track.spatial.is_none();
+    if dual || track.dual_pan.engaged {
+        apply_fader_matrix(track, frames, volume, pan, dual, &automation, smooth);
+        return;
+    }
     let (pan_l, pan_r) = pan_gains(pan);
     let target_l = volume * pan_l;
     let target_r = volume * pan_r;
@@ -151,6 +173,69 @@ pub(super) fn apply_fader(track: &mut RuntimeTrack, frames: usize, beat: f64, sm
     track.smoothed_gain_l = target_l;
     track.smoothed_gain_r = target_r;
     log_fader_trace(track, frames, fader_trace_pre, volume, &automation);
+}
+
+/// [`apply_fader`] through a 2x2 matrix: a Dual pan channel, or the block
+/// that takes one back to its balance gains.
+///
+/// In Dual the target is [`crate::dsp::gain::dual_pan_matrix`] at the
+/// channel's (or its automation's) left / right positions, times `volume`.
+/// Leaving Dual, the target is the balance gains as a diagonal matrix, after
+/// which the balance smoother carries on from exactly there. Entering Dual
+/// starts from the balance smoother the same way, so neither switch jumps.
+/// The four gains ramp across the block like the balance pair does. No
+/// allocation.
+#[inline]
+fn apply_fader_matrix(
+    track: &mut RuntimeTrack,
+    frames: usize,
+    volume: f32,
+    pan: f32,
+    dual: bool,
+    automation: &crate::runtime::RuntimeTrackAutomationValues,
+    smooth: bool,
+) {
+    let target = if dual {
+        let settings = track.dual_pan.settings;
+        let left = automation.pan_left.unwrap_or(settings.left);
+        let right = automation.pan_right.unwrap_or(settings.right);
+        crate::dsp::gain::dual_pan_matrix(left, right).map(|g| g * volume)
+    } else {
+        let (pan_l, pan_r) = pan_gains(pan);
+        [volume * pan_l, 0.0, 0.0, volume * pan_r]
+    };
+    let start = if track.dual_pan.engaged {
+        track.dual_pan.matrix
+    } else {
+        [track.smoothed_gain_l, 0.0, 0.0, track.smoothed_gain_r]
+    };
+    let fader_trace_pre = (fader_debug_enabled() && frames > 0).then(|| {
+        track.block_l[..frames]
+            .iter()
+            .fold(0.0f32, |peak, s| peak.max(s.abs()))
+    });
+    let (block_l, block_r) = (&mut track.block_l[..frames], &mut track.block_r[..frames]);
+    if !smooth || frames == 0 {
+        simd::ramp_matrix_stereo(block_l, block_r, target, [0.0; 4]);
+    } else {
+        let inv = 1.0 / frames as f32;
+        let inc = [
+            (target[0] - start[0]) * inv,
+            (target[1] - start[1]) * inv,
+            (target[2] - start[2]) * inv,
+            (target[3] - start[3]) * inv,
+        ];
+        simd::ramp_matrix_stereo(block_l, block_r, start, inc);
+    }
+    fold_preview_mode_block(block_l, block_r, track.preview_mode);
+    track.dual_pan.matrix = target;
+    track.dual_pan.engaged = dual;
+    if !dual {
+        // Back on the balance path from the next block, continuing from here.
+        track.smoothed_gain_l = target[0];
+        track.smoothed_gain_r = target[3];
+    }
+    log_fader_trace(track, frames, fader_trace_pre, volume, automation);
 }
 
 /// Report what [`apply_fader`] measured. `FUTUREBOARD_FADER_DEBUG=1` only, and
@@ -251,7 +336,24 @@ pub(crate) fn route_main_output(
     if let Some(t) = target {
         let accept = t != src_index && is_routing_type(&runtime.tracks[t].track_type);
         if accept {
-            let (src, tgt) = two_mut(&mut runtime.tracks, src_index, t);
+            let crate::runtime::RuntimeProject {
+                tracks, spatial, ..
+            } = runtime;
+            let (src, tgt) = two_mut(tracks, src_index, t);
+            // A bus that keeps its channels' places: this channel is rendered
+            // where it sits, into the bus's field.
+            if let (Some(spatialiser), Some(field)) =
+                (src.spatial.as_mut(), tgt.spatial_state.field.as_mut())
+            {
+                spatialiser.process(
+                    &src.block_l[..frames],
+                    &src.block_r[..frames],
+                    &src.spatial_state.heard,
+                    &spatial.room,
+                    field,
+                );
+                return;
+            }
             simd::add_into(&mut tgt.recv_l[..frames], &src.block_l[..frames]);
             simd::add_into(&mut tgt.recv_r[..frames], &src.block_r[..frames]);
             return;
@@ -265,11 +367,14 @@ pub(crate) fn route_main_output(
             tracks, spatial, ..
         } = runtime;
         let track = &mut tracks[src_index];
+        // A bus that keeps its channels' places adds their field at its fader,
+        // ramped from the gain it ended the last block on.
+        add_spatial_field(track, frames, &mut spatial.bus);
         if let Some(spatialiser) = track.spatial.as_mut() {
             spatialiser.process(
                 &track.block_l[..frames],
                 &track.block_r[..frames],
-                &track.spatial_params,
+                &track.spatial_state.heard,
                 &spatial.room,
                 &mut spatial.bus,
             );
@@ -292,6 +397,45 @@ pub(crate) fn route_main_output(
         out[0] += track.block_l[f];
         out[1] += track.block_r[f];
     }
+}
+
+/// Add a bus's spatial field into the master's spatial `bus` at the bus's
+/// fader, ramped across the block from the gain the last block ended on, and
+/// fold the field's peak into the bus's meter so the strip shows what it
+/// carries. A no-op for every channel without a field. No allocation.
+#[inline]
+pub(super) fn add_spatial_field(
+    track: &mut RuntimeTrack,
+    frames: usize,
+    bus: &mut solfege_spatialaudio::SpatialBus,
+) {
+    let state = &mut track.spatial_state;
+    let Some(field) = state.field.as_ref() else {
+        return;
+    };
+    let start = state.field_gain;
+    let end = state.fader_gain;
+    let frames = frames.min(field.capacity()).min(bus.capacity());
+    let step = if frames > 0 {
+        (end - start) / frames as f32
+    } else {
+        0.0
+    };
+    let mut peak = 0.0f32;
+    for channel in 0..field.channels().min(bus.channels()) {
+        let src = field.channel(channel, frames);
+        let dst = bus.channel_mut(channel, frames);
+        let mut gain = start;
+        for (out, sample) in dst.iter_mut().zip(src) {
+            gain += step;
+            let value = sample * gain;
+            *out += value;
+            peak = peak.max(value.abs());
+        }
+    }
+    state.field_gain = end;
+    track.meter_peak_l = track.meter_peak_l.max(peak);
+    track.meter_peak_r = track.meter_peak_r.max(peak);
 }
 
 /// Put the spatial bus into the interleaved device buffer. Returns the number
@@ -452,7 +596,7 @@ pub(super) fn capture_monitor_taps(
 }
 
 /// Everything a channel does after its insert chain: multi-out, sends, fader,
-/// meter, monitor taps, PDC and routing. The chain itself runs first, in
+/// post-fader inserts, meter, monitor taps, PDC and routing. The chain itself runs first, in
 /// [`run_track_chains`], so that independent channels can process it in
 /// parallel while this part keeps its fixed order on the audio thread.
 ///
@@ -468,6 +612,7 @@ pub(super) fn finish_track_block(
     channels: usize,
     beat: f64,
     emit: bool,
+    transport: RuntimeTransportContext,
 ) {
     // Multi-out: demux this track's bridged-instrument output channels into the
     // child "Out Ch" tracks' receive buffers (no-op unless the insert defines
@@ -507,6 +652,11 @@ pub(super) fn finish_track_block(
         if smooth { fader_target_beat } else { beat },
         smooth,
     );
+    // Post-fader inserts: after the fader and pan, before everything that
+    // hears the channel's output — the post-fader sidechain key, the meter,
+    // AFL, post-fader sends and the route out. They run while the channel is
+    // muted too, like its chain, so they keep time.
+    apply_post_fader_inserts(&mut runtime.tracks[track_index], frames, transport);
     if emit {
         let track = &mut runtime.tracks[track_index];
         track.sidechain_tap.capture(

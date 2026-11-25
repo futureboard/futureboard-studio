@@ -152,6 +152,10 @@ pub struct JsMeterSnapshot {
     /// monitoring hardware output. Not the master bus level.
     pub monitor_peak_l: f64,
     pub monitor_peak_r: f64,
+    /// A spatial mix's speaker feeds (or a binaural mix's two ears), in the
+    /// layout's channel order, peak since the last read and after the master
+    /// fader. Empty in a stereo mix.
+    pub speaker_peaks: Vec<f64>,
 }
 
 /// Per-track plugin latency (sum of enabled native-plugin insert latencies).
@@ -308,6 +312,12 @@ pub struct EngineSpatialSnapshot {
 pub struct EngineSpatialSource {
     pub track_id: String,
     pub params: solfege_spatialaudio::SourceParams,
+    /// A bus or return that keeps its channels' places: what is routed into
+    /// it is rendered where each channel sits, and the bus's fader rides the
+    /// whole field. Its inserts and its own placement hear only what is sent
+    /// to it. Meaningless on any other channel.
+    #[serde(default)]
+    pub keeps_inputs: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -409,6 +419,55 @@ pub struct EngineMidiNoteSnapshot {
     pub pitch_points: Vec<EnginePitchPoint>,
 }
 
+fn default_vca_gain() -> f32 {
+    1.0
+}
+
+/// A channel's Dual pan: the left and the right input are placed on their own.
+///
+/// `enabled == false` is the single balance knob ([`EngineTrackSnapshot::pan`]),
+/// which is what every channel had before this existed. In Dual mode the
+/// stereo block goes through a 2×2 matrix (see
+/// [`crate::dsp::gain::dual_pan_matrix`]); `left` / `right` are each input's
+/// position in `-1.0..=1.0`, and the defaults (`-1`, `+1`) pass the pair
+/// through unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct EngineDualPan {
+    pub enabled: bool,
+    pub left: f32,
+    pub right: f32,
+}
+
+impl Default for EngineDualPan {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            left: -1.0,
+            right: 1.0,
+        }
+    }
+}
+
+impl EngineDualPan {
+    /// The same settings with both positions clamped into `-1.0..=1.0`.
+    #[inline]
+    pub fn sanitized(self) -> Self {
+        let clamp = |v: f32, fallback: f32| {
+            if v.is_finite() {
+                v.clamp(-1.0, 1.0)
+            } else {
+                fallback
+            }
+        };
+        Self {
+            enabled: self.enabled,
+            left: clamp(self.left, -1.0),
+            right: clamp(self.right, 1.0),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineTrackSnapshot {
@@ -416,7 +475,16 @@ pub struct EngineTrackSnapshot {
     #[serde(rename = "type")]
     pub track_type: String,
     pub volume: f32,
+    /// Linear gain of the VCA group the track belongs to, applied on top of
+    /// its fader — automation included. `1.0` outside a VCA, `0.0` while the
+    /// VCA is muted.
+    #[serde(default = "default_vca_gain")]
+    pub vca_gain: f32,
     pub pan: f32,
+    /// Dual pan (independent left / right input positions). Disabled — the
+    /// balance knob above — for snapshots written before it existed.
+    #[serde(default)]
+    pub dual_pan: EngineDualPan,
     pub muted: bool,
     pub solo: bool,
     pub armed: bool,
@@ -428,6 +496,9 @@ pub struct EngineTrackSnapshot {
     pub preview_mode: String,
     pub output_track_id: Option<String>,
     pub inserts: Vec<EngineInsertSnapshot>,
+    /// MIDI FX between the track's MIDI and its instrument, in order.
+    #[serde(default)]
+    pub midi_fx: Vec<EngineMidiFxSnapshot>,
     #[serde(default)]
     pub sends: Vec<EngineSendSnapshot>,
     #[serde(default)]
@@ -613,6 +684,33 @@ impl EngineTrackInputSourceSnapshot {
     }
 }
 
+/// [`EngineMidiFxSnapshot::device`] of a hosted MIDI-effect plug-in slot.
+pub const MIDI_FX_PLUGIN_DEVICE: &str = "plugin";
+
+/// One MIDI FX slot of a track: a built-in device from `sphere_midi_fx`, or
+/// a hosted MIDI-effect plug-in.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineMidiFxSnapshot {
+    /// Stable slot id, unique on its track. A rebuild keeps the running
+    /// device (held notes, arpeggio position) of a slot whose id and device
+    /// are unchanged.
+    pub id: String,
+    /// `sphere_midi_fx::DeviceKind::id` of the device, or
+    /// [`MIDI_FX_PLUGIN_DEVICE`] for a hosted plug-in.
+    pub device: String,
+    /// For a hosted plug-in: the bridge instance id its sink is registered
+    /// under (`AudioEngine::set_plugin_bridge_sink`). The engine consumes
+    /// that instance's MIDI output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_instance_id: Option<String>,
+    pub enabled: bool,
+    /// Parameter values by stable parameter id; a missing one keeps its
+    /// default, an unknown one is ignored.
+    #[serde(default)]
+    pub params: Vec<(String, f32)>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineInsertSnapshot {
@@ -649,7 +747,9 @@ pub struct EngineSendSnapshot {
 #[serde(rename_all = "camelCase")]
 pub struct EngineAutomationTargetSnapshot {
     /// Matches the native UI AutomationTarget tag:
-    /// 0 volume, 1 pan, 2 mute, 3 plugin parameter, 4 send gain.
+    /// 0 volume, 1 pan, 2 mute, 3 plugin parameter, 4 send gain, 5 send
+    /// on/off, 6 insert bypass, 7 Dual pan left, 8 Dual pan right, 9-14 the
+    /// spatial placement (left/right, front/back, height, spread, width, LFE).
     pub tag: u8,
     #[serde(default)]
     pub insert_id: String,

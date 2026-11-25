@@ -6,6 +6,7 @@ pub mod recent;
 pub mod routing_migration;
 pub mod session;
 pub mod template;
+pub mod thumbnail;
 pub mod view;
 
 pub use format::{
@@ -369,6 +370,9 @@ pub struct ProjectInsert {
     /// without one.
     pub sidechain_source: String,
     pub sidechain_post_fader: bool,
+    /// v69: the insert runs after the channel's fader. Older files load
+    /// every insert before it.
+    pub post_fader: bool,
     pub plugin: Option<ProjectPluginInstance>,
 }
 
@@ -385,6 +389,7 @@ impl Default for ProjectInsert {
             signal_bus: 0,
             sidechain_source: String::new(),
             sidechain_post_fader: false,
+            post_fader: false,
             plugin: None,
         }
     }
@@ -462,6 +467,9 @@ pub struct TrackRouting {
     pub program: sphere_midi_service::program::MidiProgramSelection,
     /// v57: place in a spatial mix's square room. Older projects: front centre.
     pub spatial: solfege_spatialaudio::SourceParams,
+    /// v73: a bus or return keeps its channels' places in a spatial mix.
+    /// Older projects: no (the bus is placed as one source).
+    pub spatial_keeps_inputs: bool,
     pub sends: Vec<ProjectSend>,
 }
 
@@ -478,6 +486,7 @@ impl Default for TrackRouting {
             mpe: MpeTrackConfiguration::default(),
             program: Default::default(),
             spatial: Default::default(),
+            spatial_keeps_inputs: false,
             sends: Vec::new(),
         }
     }
@@ -599,6 +608,9 @@ pub struct ProjectTrack {
     pub color_hex: String,
     pub volume_norm: f32,
     pub pan: f32,
+    /// Balance or Dual pan and the two Dual positions (v71+). Older projects
+    /// are Balance.
+    pub dual_pan: crate::components::timeline::timeline_state::DualPan,
     pub muted: bool,
     pub solo: bool,
     pub record_arm: bool,
@@ -629,6 +641,11 @@ pub struct ProjectTrack {
     pub freeze: Option<crate::components::timeline::timeline_state::TrackFreeze>,
     /// A DrumStep track, whose clips open in the step sequencer (v66+).
     pub drum_step: bool,
+    /// The track's MIDI FX chain (v67+). Empty for older projects.
+    pub midi_fx: Vec<crate::components::timeline::timeline_state::MidiFxSlotState>,
+    /// The step view's drum lanes the user chose (v70+). Empty for older
+    /// projects: the default kit.
+    pub step_lanes: Vec<u8>,
 }
 
 /// One persisted recorded take. See
@@ -744,6 +761,22 @@ pub struct ProjectMixer {
     pub tree_expanded_node_ids: Vec<String>,
     pub tree_pinned_channel_ids: Vec<String>,
     pub tree_hidden_channel_ids: Vec<String>,
+    /// v69: the VCA groups, in strip order, each with its member tracks.
+    pub vca_groups: Vec<ProjectVcaGroup>,
+}
+
+/// A saved VCA group (see `timeline_state::VcaGroupState`). Members are listed
+/// here rather than on each track, so a track record stays as it was.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectVcaGroup {
+    pub id: String,
+    pub name: String,
+    /// `#RRGGBB`.
+    pub color: String,
+    /// The VCA fader, on the channel faders' normalized scale.
+    pub level_norm: f32,
+    pub muted: bool,
+    pub members: Vec<String>,
 }
 
 impl Default for ProjectMixer {
@@ -758,6 +791,7 @@ impl Default for ProjectMixer {
             tree_expanded_node_ids: Vec::new(),
             tree_pinned_channel_ids: Vec::new(),
             tree_hidden_channel_ids: Vec::new(),
+            vca_groups: Vec::new(),
         }
     }
 }
@@ -924,6 +958,135 @@ pub struct ProjectChordEvent {
     pub flats: bool,
 }
 
+/// Descriptive tags for the song the project makes, written into exported
+/// audio files (v72+). Free text, all empty by default; nothing is validated.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectMetadata {
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub album_artist: String,
+    pub composer: String,
+    pub genre: String,
+    pub year: String,
+    pub track_number: String,
+    pub comment: String,
+    pub copyright: String,
+    pub isrc: String,
+}
+
+/// One [`ProjectMetadata`] field, so a single field can be edited without
+/// rewriting the others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProjectMetadataField {
+    Title,
+    Artist,
+    Album,
+    AlbumArtist,
+    Composer,
+    Genre,
+    Year,
+    TrackNumber,
+    Comment,
+    Copyright,
+    Isrc,
+}
+
+impl ProjectMetadataField {
+    /// Every field, in display and file order.
+    pub const ALL: [Self; 11] = [
+        Self::Title,
+        Self::Artist,
+        Self::Album,
+        Self::AlbumArtist,
+        Self::Composer,
+        Self::Genre,
+        Self::Year,
+        Self::TrackNumber,
+        Self::Comment,
+        Self::Copyright,
+        Self::Isrc,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Title => "Title",
+            Self::Artist => "Artist",
+            Self::Album => "Album",
+            Self::AlbumArtist => "Album artist",
+            Self::Composer => "Composer",
+            Self::Genre => "Genre",
+            Self::Year => "Year",
+            Self::TrackNumber => "Track number",
+            Self::Comment => "Comment",
+            Self::Copyright => "Copyright",
+            Self::Isrc => "ISRC",
+        }
+    }
+}
+
+impl ProjectMetadata {
+    pub fn get(&self, field: ProjectMetadataField) -> &str {
+        match field {
+            ProjectMetadataField::Title => &self.title,
+            ProjectMetadataField::Artist => &self.artist,
+            ProjectMetadataField::Album => &self.album,
+            ProjectMetadataField::AlbumArtist => &self.album_artist,
+            ProjectMetadataField::Composer => &self.composer,
+            ProjectMetadataField::Genre => &self.genre,
+            ProjectMetadataField::Year => &self.year,
+            ProjectMetadataField::TrackNumber => &self.track_number,
+            ProjectMetadataField::Comment => &self.comment,
+            ProjectMetadataField::Copyright => &self.copyright,
+            ProjectMetadataField::Isrc => &self.isrc,
+        }
+    }
+
+    pub fn get_mut(&mut self, field: ProjectMetadataField) -> &mut String {
+        match field {
+            ProjectMetadataField::Title => &mut self.title,
+            ProjectMetadataField::Artist => &mut self.artist,
+            ProjectMetadataField::Album => &mut self.album,
+            ProjectMetadataField::AlbumArtist => &mut self.album_artist,
+            ProjectMetadataField::Composer => &mut self.composer,
+            ProjectMetadataField::Genre => &mut self.genre,
+            ProjectMetadataField::Year => &mut self.year,
+            ProjectMetadataField::TrackNumber => &mut self.track_number,
+            ProjectMetadataField::Comment => &mut self.comment,
+            ProjectMetadataField::Copyright => &mut self.copyright,
+            ProjectMetadataField::Isrc => &mut self.isrc,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        ProjectMetadataField::ALL
+            .iter()
+            .all(|field| self.get(*field).is_empty())
+    }
+
+    /// The tags an export writes. Empty fields stay unset, so the encoders
+    /// leave them out.
+    pub fn to_audio_metadata(&self) -> sphere_encoder::AudioMetadata {
+        let set = |value: &str| {
+            let value = value.trim();
+            (!value.is_empty()).then(|| value.to_string())
+        };
+        sphere_encoder::AudioMetadata {
+            title: set(&self.title),
+            artist: set(&self.artist),
+            album: set(&self.album),
+            date: set(&self.year),
+            comment: set(&self.comment),
+            album_artist: set(&self.album_artist),
+            composer: set(&self.composer),
+            genre: set(&self.genre),
+            track_number: set(&self.track_number),
+            copyright: set(&self.copyright),
+            isrc: set(&self.isrc),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ProjectSettings {
     pub bpm: f64,
@@ -955,6 +1118,8 @@ pub struct ProjectSettings {
     pub spatial_format: solfege_spatialaudio::SpatialFormat,
     pub spatial_room: solfege_spatialaudio::RoomSettings,
     pub spatial_fold: solfege_spatialaudio::MonitorFold,
+    /// v72: the tags exports carry.
+    pub metadata: ProjectMetadata,
 }
 
 impl Default for ProjectSettings {
@@ -981,6 +1146,7 @@ impl Default for ProjectSettings {
             spatial_format: Default::default(),
             spatial_room: Default::default(),
             spatial_fold: Default::default(),
+            metadata: ProjectMetadata::default(),
         }
     }
 }
@@ -1254,6 +1420,7 @@ fn timeline_insert_to_project(idx: usize, slot: &InsertSlotState) -> ProjectInse
             .sidechain
             .as_ref()
             .is_some_and(|route| route.post_fader),
+        post_fader: slot.post_fader,
         plugin,
     }
 }
@@ -1340,6 +1507,7 @@ pub(crate) fn project_insert_to_timeline(pi: &ProjectInsert) -> InsertSlotState 
                 signal_bus: crate::components::timeline::timeline_state::InsertSignalBus::from_tag(
                     pi.signal_bus,
                 ),
+                post_fader: pi.post_fader,
                 sidechain: (!pi.sidechain_source.is_empty()).then(|| {
                     crate::components::timeline::timeline_state::InsertSidechain {
                         source_track_id: pi.sidechain_source.clone(),
@@ -1541,6 +1709,7 @@ impl From<&TimelineState> for FutureboardProject {
                     color_hex: rgba_to_hex(t.color),
                     volume_norm: t.volume,
                     pan: t.pan,
+                    dual_pan: t.dual_pan,
                     muted: t.muted,
                     solo: t.solo,
                     record_arm: t.armed,
@@ -1562,6 +1731,7 @@ impl From<&TimelineState> for FutureboardProject {
                         mpe: t.routing.mpe.sanitized(),
                         program: t.routing.program.sanitized(),
                         spatial: t.spatial.sanitized(),
+                        spatial_keeps_inputs: t.spatial_keeps_inputs,
                         sends: t
                             .sends
                             .iter()
@@ -1633,6 +1803,8 @@ impl From<&TimelineState> for FutureboardProject {
                     takes_expanded: t.takes_expanded,
                     freeze: t.freeze.clone(),
                     drum_step: t.drum_step,
+                    midi_fx: t.midi_fx.clone(),
+                    step_lanes: t.step_lanes.clone(),
                 }
             })
             .collect();
@@ -1644,6 +1816,7 @@ impl From<&TimelineState> for FutureboardProject {
         project.settings.spatial_format = tl.spatial_mix.format;
         project.settings.spatial_room = tl.spatial_mix.room.sanitized();
         project.settings.spatial_fold = tl.spatial_mix.fold;
+        project.settings.metadata = tl.project_metadata.clone();
         project.settings.tempo_points = tl
             .tempo_map
             .points
@@ -1797,6 +1970,19 @@ impl From<&TimelineState> for FutureboardProject {
             .map(lane_to_project)
             .collect();
         project.mixer.master_automation_expanded = tl.master.automation_expanded;
+        project.mixer.vca_groups = tl
+            .master
+            .vca_groups
+            .iter()
+            .map(|group| ProjectVcaGroup {
+                id: group.id.clone(),
+                name: group.name.clone(),
+                color: rgba_to_hex(group.color),
+                level_norm: group.level,
+                muted: group.muted,
+                members: tl.vca_members(&group.id),
+            })
+            .collect();
         project.mixer.tree_expanded_node_ids = tl.mixer_tree.expanded_list();
         project.mixer.tree_pinned_channel_ids = tl.mixer_tree.pinned_list();
         project.mixer.tree_hidden_channel_ids = tl.mixer_tree.hidden_list();
@@ -1877,6 +2063,7 @@ pub fn apply_to_timeline(
         room: project.settings.spatial_room.sanitized(),
         fold: project.settings.spatial_fold,
     };
+    tl.project_metadata = project.settings.metadata.clone();
     tl.tempo_map = crate::components::timeline::timeline_state::TempoMap::with_points(
         project
             .settings
@@ -2063,6 +2250,20 @@ pub fn apply_to_timeline(
         .collect();
     tl.master.automation_expanded = project.mixer.master_automation_expanded;
     tl.master.selected_automation_target = None;
+    tl.master.vca_groups = project
+        .mixer
+        .vca_groups
+        .iter()
+        .map(
+            |group| crate::components::timeline::timeline_state::VcaGroupState {
+                id: group.id.clone(),
+                name: group.name.clone(),
+                color: hex_to_rgba(&group.color),
+                level: group.level_norm.clamp(0.0, 1.0),
+                muted: group.muted,
+            },
+        )
+        .collect();
     tl.mixer_tree =
         crate::components::timeline::timeline_state::MixerTreeViewState::from_project_lists(
             &project.mixer.tree_expanded_node_ids,
@@ -2328,6 +2529,7 @@ pub fn apply_to_timeline(
             };
             TrackState {
                 spatial: pt.routing.spatial.sanitized(),
+                spatial_keeps_inputs: pt.routing.spatial_keeps_inputs,
                 listen: crate::components::timeline::timeline_state::ListenMode::Off,
                 id: pt.id.clone(),
                 name: pt.name.clone(),
@@ -2337,6 +2539,8 @@ pub fn apply_to_timeline(
                     pt.timebase,
                 ),
                 parent_group_id: pt.parent_group_id.clone(),
+                // Set from the mixer's VCA groups once every track exists.
+                vca_group: None,
                 group_collapsed: pt.group_collapsed,
                 color: hex_to_rgba(&pt.color_hex),
                 volume: pt.volume_norm,
@@ -2346,6 +2550,7 @@ pub fn apply_to_timeline(
                 volume_effective: pt.volume_norm,
                 volume_automation_read: pt.volume_automation_read,
                 pan: pt.pan,
+                dual_pan: pt.dual_pan.sanitized(),
                 muted: pt.muted,
                 solo: pt.solo,
                 armed: pt.record_arm,
@@ -2467,6 +2672,8 @@ pub fn apply_to_timeline(
                 takes_expanded: pt.takes_expanded,
                 freeze: pt.freeze.clone(),
                 drum_step: pt.drum_step,
+                step_lanes: pt.step_lanes.clone(),
+                midi_fx: pt.midi_fx.clone(),
                 solfege: pt.solfege.as_ref().map(|state| SolfegeTrackState {
                     model_path: state
                         .model_path
@@ -2495,8 +2702,21 @@ pub fn apply_to_timeline(
         })
         .collect();
 
+    // Two clips under one id (written by the old multi-clip Duplicate) are
+    // one clip to selection, moves and the engine: clicking either selected
+    // both, and a drag moved or copied the wrong one.
+    tl.repair_duplicate_clip_ids();
+
     // A take whose clip did not load points at nothing.
     tl.prune_orphaned_takes();
+
+    // VCA membership, now that the tracks exist; a member id no track has is
+    // dropped.
+    for group in &project.mixer.vca_groups {
+        for member in &group.members {
+            tl.set_track_vca_group(member, Some(&group.id));
+        }
+    }
 
     let valid_group_ids: std::collections::HashSet<String> = tl
         .tracks
@@ -3033,6 +3253,13 @@ fn desc_to_target(
         6 => T::InsertBypass {
             insert_id: desc.insert_id.clone(),
         },
+        // v71: Dual pan's positions.
+        7 => T::TrackPanLeft,
+        8 => T::TrackPanRight,
+        // v73: the spatial placement.
+        tag @ 9..=14 => solfege_spatialaudio::SourceParam::from_index(usize::from(tag - 9))
+            .map(T::Spatial)
+            .unwrap_or(T::TrackVolume),
         // tag 0: TrackVolume, or a legacy file — derive from the lane name.
         _ => {
             if desc.insert_id.is_empty() && desc.send_id.is_empty() {
@@ -3414,12 +3641,57 @@ mod v33_routing_adapter_tests {
         assert!(!reopened.mixer.master_automation_expanded);
     }
 
+    /// v69 keeps the VCA groups — fader, mute, colour and members — and a
+    /// v68 file has none.
+    #[test]
+    fn v69_round_trips_vca_groups_and_their_members() {
+        use crate::components::timeline::timeline_state::{
+            volume, CreateTrackOptions, InputMonitorMode, TimelineState, TrackType,
+        };
+        let mut tl = TimelineState::default();
+        tl.tracks.clear();
+        let ids: Vec<String> = ["Kick", "Snare", "Bass"]
+            .iter()
+            .map(|name| {
+                tl.create_track(CreateTrackOptions {
+                    name: name.to_string(),
+                    track_type: TrackType::Audio,
+                    color: gpui::rgb(0x336699),
+                    volume: volume::db_to_norm(0.0),
+                    pan: 0.0,
+                    armed: false,
+                    input_monitor: InputMonitorMode::Off,
+                })
+            })
+            .collect();
+        let drums = tl.create_vca_group("Drums", &ids[..2]);
+        tl.set_vca_level(&drums, volume::db_to_norm(-4.5));
+        tl.set_vca_muted(&drums, true);
+
+        let project = FutureboardProject::from(&tl);
+        let bytes = crate::project::format::encode_project(&project);
+        let reopened = crate::project::format::decode_project(&bytes).expect("decode");
+        let mut loaded = TimelineState::default();
+        let _ = apply_to_timeline(&reopened, &mut loaded);
+        let group = loaded.vca_group(&drums).expect("the VCA comes back");
+        assert_eq!(group.name, "Drums");
+        assert!(group.muted);
+        assert!((group.level - volume::db_to_norm(-4.5)).abs() < 1e-6);
+        assert_eq!(loaded.vca_members(&drums), ids[..2].to_vec());
+        assert!(loaded.find_track(&ids[2]).unwrap().vca_group.is_none());
+
+        let old = crate::project::format::encode_project_as(&project, 68);
+        let reopened =
+            crate::project::format::decode_project_with_options(&old, true).expect("decode v68");
+        assert!(reopened.mixer.vca_groups.is_empty());
+    }
+
     #[test]
     fn the_encoder_writes_the_current_format_version() {
         let bytes = crate::project::format::encode_project(&FutureboardProject::new("current"));
         let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
         assert_eq!(version, crate::project::format::PROJECT_VERSION);
-        assert_eq!(crate::project::format::PROJECT_VERSION, 66);
+        assert_eq!(crate::project::format::PROJECT_VERSION, 73);
     }
 
     // ── v35 Master / Monitor output routing ─────────────────────────────────
@@ -4045,6 +4317,48 @@ mod project_settings_persistence_tests {
         assert_eq!(restored.project_key, None);
     }
 
+    /// The metadata edited in Project Settings is saved, restored over a
+    /// timeline that held other tags, undone and redone as one step, and
+    /// becomes the tags an export writes.
+    #[test]
+    fn project_metadata_survives_save_decode_undo_and_reaches_export_tags() {
+        use crate::components::edit::EditCommand;
+
+        let mut timeline = TimelineState::default();
+        timeline.project_metadata = ProjectMetadata {
+            title: "Song".into(),
+            artist: "Band".into(),
+            year: "2026".into(),
+            ..Default::default()
+        };
+        let encoded = crate::project::format::encode_project(&FutureboardProject::from(&timeline));
+        let decoded = crate::project::format::decode_project(&encoded).expect("decode project");
+        let mut restored = TimelineState::default();
+        restored.project_metadata.album = "Stale".into();
+        let _ = apply_to_timeline(&decoded, &mut restored);
+        assert_eq!(restored.project_metadata, timeline.project_metadata);
+
+        let prev = restored.project_metadata.clone();
+        let mut next = prev.clone();
+        *next.get_mut(ProjectMetadataField::Genre) = "Ambient".into();
+        let command = EditCommand::SetProjectMetadata {
+            prev: Box::new(prev.clone()),
+            next: Box::new(next.clone()),
+        };
+        assert!(command.is_metadata_only(), "never rebuilds the audio graph");
+        command.execute(&mut restored);
+        assert_eq!(restored.project_metadata.genre, "Ambient");
+        command.undo(&mut restored);
+        assert_eq!(restored.project_metadata, prev);
+
+        let tags = next.to_audio_metadata();
+        assert_eq!(tags.title.as_deref(), Some("Song"));
+        assert_eq!(tags.date.as_deref(), Some("2026"));
+        assert_eq!(tags.genre.as_deref(), Some("Ambient"));
+        assert_eq!(tags.album, None);
+        assert!(ProjectMetadata::default().to_audio_metadata().is_empty());
+    }
+
     #[test]
     fn mpe_track_configuration_survives_save_decode_and_timeline_restore() {
         let mut timeline = TimelineState::default();
@@ -4129,6 +4443,68 @@ mod project_settings_persistence_tests {
         let _ = apply_to_timeline(&decoded, &mut restored);
         assert_eq!(restored.spatial_mix, timeline.spatial_mix);
         assert_eq!(restored.tracks[0].spatial, placed);
+    }
+
+    /// v73: a bus keeping its channels' places and a spatial lane both
+    /// survive a save; a v72 file has neither.
+    #[test]
+    fn a_kept_bus_and_spatial_lanes_survive_save_and_are_absent_before_v73() {
+        use crate::components::timeline::timeline_state::{AutomationTarget, TrackOutputRouting};
+        use solfege_spatialaudio::SourceParam;
+        let mut timeline = TimelineState::default();
+        let track_id = timeline.create_audio_track();
+        let bus_id = timeline.create_bus_track(std::slice::from_ref(&track_id));
+        assert_eq!(
+            timeline
+                .find_track(&track_id)
+                .expect("track")
+                .routing
+                .output,
+            TrackOutputRouting::Bus {
+                bus_id: bus_id.clone()
+            }
+        );
+        timeline
+            .tracks
+            .iter_mut()
+            .find(|t| t.id == bus_id)
+            .expect("bus")
+            .spatial_keeps_inputs = true;
+        let target = AutomationTarget::Spatial(SourceParam::Height);
+        let lane_id = timeline
+            .ensure_automation_lane(&track_id, target.clone())
+            .expect("lane");
+        timeline
+            .add_automation_point(&track_id, &lane_id, 2.0, 0.75)
+            .expect("point");
+
+        let encoded = crate::project::format::encode_project(&FutureboardProject::from(&timeline));
+        let decoded = crate::project::format::decode_project(&encoded).expect("decode project");
+        let mut restored = TimelineState::default();
+        let _ = apply_to_timeline(&decoded, &mut restored);
+        let bus = restored.find_track(&bus_id).expect("bus restored");
+        assert!(bus.spatial_keeps_inputs);
+        let track = restored.find_track(&track_id).expect("track restored");
+        let lane = track
+            .automation_lanes
+            .iter()
+            .find(|lane| lane.target == target)
+            .expect("spatial lane restored");
+        assert_eq!(lane.points.len(), 1);
+        assert!((lane.points[0].value - 0.75).abs() < 1.0e-6);
+
+        let old =
+            crate::project::format::encode_project_as(&FutureboardProject::from(&timeline), 72);
+        let decoded =
+            crate::project::format::decode_project_with_options(&old, true).expect("decode v72");
+        let mut restored = TimelineState::default();
+        let _ = apply_to_timeline(&decoded, &mut restored);
+        assert!(
+            !restored
+                .find_track(&bus_id)
+                .expect("bus")
+                .spatial_keeps_inputs
+        );
     }
 
     #[test]

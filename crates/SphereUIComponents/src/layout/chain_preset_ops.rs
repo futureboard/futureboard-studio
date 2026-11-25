@@ -117,6 +117,8 @@ fn slot_from_preset(slot: &PresetSlot) -> InsertSlotState {
         // Routing belongs to the project, not to a chain preset.
         sidechain_source: String::new(),
         sidechain_post_fader: false,
+        // A chain preset keeps no fader position: its inserts load pre-fader.
+        post_fader: false,
         plugin: Some(ProjectPluginInstance {
             instance_id: "preset".to_string(),
             format,

@@ -19,6 +19,7 @@ pub mod chord_generator;
 pub mod clock_window;
 pub mod color_picker;
 pub mod combo_box;
+pub mod command_icons;
 pub mod command_palette;
 pub mod context_menu;
 pub mod controls;
@@ -52,6 +53,7 @@ pub mod menu_dropdown;
 pub mod message_box_dialog;
 pub mod midi_editor_window;
 pub mod midi_export_dialog;
+pub mod midi_fx_editor;
 pub mod midi_import_dialog;
 pub mod midi_tools_dialog;
 pub mod missing_media_window;
@@ -66,6 +68,7 @@ pub mod mixer_tree_model;
 pub mod mixer_tree_sidebar;
 pub mod mixer_tree_sidebar_view;
 pub mod raw_pcm_import_dialog;
+pub mod strip_silence_dialog;
 pub use mixer_tree_sidebar_view::MixerTreeSidebar;
 mod mixer_window;
 pub(crate) use mixer_window::{external_mixer_debug, external_mixer_debug_enabled};
@@ -154,10 +157,11 @@ pub mod rodhareist_blocks;
 pub mod rodhareist_panel;
 #[cfg(feature = "builtin-plugin-editor")]
 pub mod rodhareist_window;
+pub mod room3d;
+pub mod room_window;
 pub mod routing_matrix_window;
 #[cfg(feature = "builtin-plugin-editor")]
 pub mod sampler_plate;
-pub mod scroll_thumb;
 pub mod scrollbar;
 pub mod settings_components;
 pub mod settings_dialog;
@@ -187,6 +191,8 @@ pub mod timeline;
 pub mod title_bar;
 pub mod transport_key;
 pub mod transport_perf_meter;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod trigger_plate;
 pub mod update_dialog;
 #[cfg(feature = "builtin-plugin-editor")]
 pub mod verbspace_plate;
@@ -233,6 +239,8 @@ pub use app_chrome::{
 };
 pub use ara_editor_host::AraEditorHost;
 pub use audio_editor::{AudioEditorCallbacks, AudioEditorHost};
+#[cfg(feature = "ui-preview")]
+pub(crate) use audio_tools::open_preview_audio_tool_window;
 pub use audio_tools::{
     apply_preview_to_clip, apply_previews_to_snapshot, open_audio_tool_window, AudioToolCommand,
     AudioToolWindow, AudioToolWindowCallbacks, AudioToolWindowManager, ClipPreviewOverride,
@@ -329,7 +337,7 @@ pub use settings_dialog::{
     open_settings_window, HardwareCombo, OnSettingUpdate, SettingsDialogCallbacks,
     SettingsDialogState, SettingsTab, SettingsWindow,
 };
-pub use sidebar::{sidebar, BrowserCallbacks, SIDEBAR_WIDTH};
+pub use sidebar::{sidebar, BrowserCallbacks, BrowserKindFilter, SIDEBAR_WIDTH};
 pub use slider::slider;
 pub use solfege_editor::{SolfegeEditorPanel, SolfegeEditorTab};
 pub use song_text_panel::{

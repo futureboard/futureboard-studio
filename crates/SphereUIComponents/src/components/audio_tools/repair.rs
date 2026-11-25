@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    canvas, div, px, App, Bounds, Context, FocusHandle, InteractiveElement, IntoElement,
+    canvas, div, px, svg, App, Bounds, Context, FocusHandle, InteractiveElement, IntoElement,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
     ScrollWheelEvent, StatefulInteractiveElement, Styled, Window,
 };
@@ -36,9 +36,9 @@ use SphereAudioProcessor::{
     StftSettings,
 };
 
+use crate::assets;
 use crate::components::audio_editor_spectrogram::{cached_or_analyze, SpectrogramJobParams};
-use crate::components::controls::fb_section_label;
-use crate::components::inspector::inspector_mini_button;
+use crate::components::controls::{fb_button, fb_icon_button, fb_section_label, FbButtonKind};
 use crate::theme::{elevation, radius, size, space, typography, Colors};
 
 use super::canvas::{
@@ -52,8 +52,21 @@ use super::window::AudioToolWindow;
 use super::workspace;
 
 /// Inspector width. Fixed so the canvas never reflows while a value changes.
-const INSPECTOR_WIDTH: f32 = 252.0;
-const CANVAS_HEADER_H: f32 = 28.0;
+const INSPECTOR_WIDTH: f32 = 288.0;
+/// The inspector in a narrow window, beside the collapsed navigator.
+const INSPECTOR_WIDTH_COMPACT: f32 = 256.0;
+/// Below this window width the navigator collapses to its icon rail and the
+/// inspector narrows, so the canvas keeps a usable width.
+const COMPACT_BELOW: f32 = 1_000.0;
+const CANVAS_HEADER_H: f32 = 36.0;
+/// The view switch. Wide enough that "Spectrogram" never truncates in its
+/// third of the track.
+const VIEW_TRACK_W: f32 = 312.0;
+const VIEW_TRACK_W_COMPACT: f32 = 200.0;
+/// Number disc of an inspector step.
+const STEP_DISC: f32 = 20.0;
+/// Icon plate in the inspector header.
+const HEADER_TILE: f32 = 32.0;
 /// Upper bound on the frames one preview pass processes. The worker follows the
 /// viewport, so this caps latency rather than truncating the clip.
 const PREVIEW_MAX_FRAMES: u64 = 20 * 96_000;
@@ -173,7 +186,12 @@ fn has_engine_audition(module: AudioRepairModule) -> bool {
 impl AudioToolWindow {
     // ---------------------------------------------------------------- layout
 
-    pub(super) fn repair_surface(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn repair_surface(
+        &mut self,
+        viewport_width: f32,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let compact = viewport_width < COMPACT_BELOW;
         div()
             .flex()
             .flex_row()
@@ -182,10 +200,11 @@ impl AudioToolWindow {
             .child(repair_module_list(
                 self.repair.module,
                 &self.repair.module_focus,
+                compact,
                 cx,
             ))
-            .child(self.repair_canvas_region(cx))
-            .child(self.repair_inspector(cx))
+            .child(self.repair_canvas_region(compact, cx))
+            .child(self.repair_inspector(compact, cx))
     }
 
     // ------------------------------------------------------------ navigator
@@ -239,7 +258,7 @@ impl AudioToolWindow {
         }
     }
 
-    fn repair_canvas_region(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn repair_canvas_region(&mut self, compact: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let transform = self.repair_transform();
         let overlays = self.repair_overlays();
         let legend = self.repair_legend();
@@ -267,7 +286,7 @@ impl AudioToolWindow {
             .min_w(px(0.0))
             .min_h(px(0.0))
             .flex_col()
-            .child(self.repair_canvas_header(cx))
+            .child(self.repair_canvas_header(compact, cx))
             .child(
                 div()
                     .id("repair-canvas")
@@ -311,6 +330,7 @@ impl AudioToolWindow {
                             .bottom(px(20.0))
                             .child(legend),
                     )
+                    .child(self.repair_zoom_cluster(cx))
                     .children(spectrum)
                     .on_mouse_down(
                         MouseButton::Left,
@@ -339,37 +359,56 @@ impl AudioToolWindow {
             )
     }
 
-    fn repair_canvas_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The canvas toolbar: what to show on the left, overlays on the right.
+    /// Zoom lives on the canvas itself ([`Self::repair_zoom_cluster`]), so the
+    /// row fits beside the collapsed navigator in a narrow window.
+    fn repair_canvas_header(&self, compact: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let view = self.repair.view;
         let log = self.repair.frequency_scale == FrequencyScale::Logarithmic;
         let count = CanvasView::ALL.len();
         div()
             .flex_none()
             .h(px(CANVAS_HEADER_H))
-            .px(px(space::SNUG))
+            .px(px(space::BASE))
             .gap(px(space::SNUG))
             .flex()
             .flex_row()
             .items_center()
+            .overflow_hidden()
             .bg(Colors::surface_panel())
             .border_b(px(1.0))
             .border_color(Colors::border_subtle())
             .child(
-                workspace::segment_track().children(CanvasView::ALL.into_iter().enumerate().map(
-                    |(index, candidate)| {
-                        workspace::compact_segment(
-                            format!("repair-view-{}", candidate.label()),
-                            candidate.label(),
-                            view == candidate,
-                            workspace::segment_position(index, count),
-                            cx.listener(move |this, _, _, cx| {
-                                this.repair.view = candidate;
-                                cx.notify();
+                workspace::segment_track()
+                    .flex_none()
+                    .w(px(if compact {
+                        VIEW_TRACK_W_COMPACT
+                    } else {
+                        VIEW_TRACK_W
+                    }))
+                    .children(
+                        CanvasView::ALL
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, candidate)| {
+                                workspace::compact_segment(
+                                    format!("repair-view-{}", candidate.label()),
+                                    if compact {
+                                        candidate.label()
+                                    } else {
+                                        candidate.long_label()
+                                    },
+                                    view == candidate,
+                                    workspace::segment_position(index, count),
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.repair.view = candidate;
+                                        cx.notify();
+                                    }),
+                                )
                             }),
-                        )
-                    },
-                )),
+                    ),
             )
+            .child(div().flex_1())
             .child(workspace::latch(
                 "repair-log-hz",
                 "Log Hz",
@@ -402,17 +441,52 @@ impl AudioToolWindow {
                     cx.notify();
                 }),
             ))
-            .child(div().flex_1())
-            .child(workspace::ghost_action(
-                "repair-zoom-out",
-                "−",
+            .child(workspace::latch(
+                "repair-spectrum",
+                "Spectrum",
+                self.repair.show_spectrum,
                 true,
+                cx.listener(|this, _, _, cx| {
+                    this.repair.show_spectrum = !this.repair.show_spectrum;
+                    cx.notify();
+                }),
+            ))
+    }
+
+    /// Zoom out, zoom in and fit, floating in the canvas's lower right corner.
+    /// The wheel zooms too; these are the visible, clickable form of it.
+    fn repair_zoom_cluster(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .absolute()
+            .right(px(space::BASE))
+            .bottom(px(space::SECTION + space::TIGHT))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(space::HAIR))
+            .p(px(space::HAIR))
+            .rounded(px(radius::CONTROL))
+            .bg(Colors::with_alpha(Colors::surface_raised(), 0.94))
+            .border(px(1.0))
+            .border_color(Colors::border_subtle())
+            .shadow(elevation::shadow(elevation::OVERLAY))
+            // The canvas under it draws regions on mouse down; a press here
+            // belongs to the buttons.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(fb_icon_button(
+                "repair-zoom-out",
+                assets::ICON_ZOOM_OUT_PATH,
+                "Zoom out",
+                size::MICRO,
+                None,
                 cx.listener(|this, _, _, cx| this.repair_zoom(0.5, cx)),
             ))
-            .child(workspace::ghost_action(
+            .child(fb_icon_button(
                 "repair-zoom-in",
-                "+",
-                true,
+                assets::ICON_ZOOM_IN_PATH,
+                "Zoom in",
+                size::MICRO,
+                None,
                 cx.listener(|this, _, _, cx| this.repair_zoom(2.0, cx)),
             ))
             .child(workspace::ghost_action(
@@ -423,16 +497,6 @@ impl AudioToolWindow {
                     let width = this.repair.canvas_width.get();
                     this.repair.viewport = CanvasViewport::fit(this.repair_window_frames(), width);
                     this.invalidate_repair_preview(cx);
-                    cx.notify();
-                }),
-            ))
-            .child(workspace::latch(
-                "repair-spectrum",
-                "Spectrum",
-                self.repair.show_spectrum,
-                true,
-                cx.listener(|this, _, _, cx| {
-                    this.repair.show_spectrum = !this.repair.show_spectrum;
                     cx.notify();
                 }),
             ))
@@ -513,209 +577,315 @@ impl AudioToolWindow {
 
     // ------------------------------------------------------------ inspector
 
-    fn repair_inspector(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The inspector: what the module is for, its steps in order, the range it
+    /// works on, and the measured result.
+    fn repair_inspector(&self, compact: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let module = self.repair.module;
+        let icon = MODULES[module_list::index_of(module)].icon;
         div()
             .id("repair-inspector")
             .flex_none()
-            .w(px(INSPECTOR_WIDTH))
+            .w(px(if compact {
+                INSPECTOR_WIDTH_COMPACT
+            } else {
+                INSPECTOR_WIDTH
+            }))
             .h_full()
             .flex()
             .flex_col()
-            .gap(px(space::SNUG))
-            .px(px(space::BASE))
-            .py(px(space::BASE))
             .bg(Colors::surface_panel())
             .border_l(px(1.0))
             .border_color(Colors::border_subtle())
             .overflow_y_scroll()
             .child(
                 div()
+                    .flex_none()
                     .flex()
                     .flex_col()
-                    .gap(px(space::HAIR))
+                    .gap(px(space::BASE))
+                    .px(px(space::LOOSE))
+                    .pt(px(space::LOOSE))
+                    .pb(px(space::LOOSE))
+                    .border_b(px(1.0))
+                    .border_color(Colors::border_subtle())
                     .child(
                         div()
-                            .text_size(px(typography::UI_SM))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(Colors::text_primary())
-                            .child(module.label()),
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(space::BASE))
+                            .child(
+                                div()
+                                    .size(px(HEADER_TILE))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(radius::CONTROL))
+                                    .bg(Colors::with_alpha(Colors::accent_primary(), 0.16))
+                                    .child(
+                                        svg()
+                                            .path(icon)
+                                            .size(px(18.0))
+                                            .text_color(Colors::accent_primary()),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .truncate()
+                                    .text_size(px(typography::UI_MD))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(Colors::text_primary())
+                                    .child(module.label()),
+                            ),
                     )
                     .child(
                         div()
-                            .text_size(px(typography::DENSE_CAPTION))
-                            .text_color(Colors::text_muted())
-                            .child(module.canvas_hint()),
+                            .text_size(px(typography::UI_XS))
+                            .text_color(Colors::text_secondary())
+                            .child(module.summary()),
                     ),
             )
-            .children(match module {
-                AudioRepairModule::Denoise => Some(self.denoise_inspector(cx).into_any_element()),
-                AudioRepairModule::DeClick => Some(self.declick_inspector(cx).into_any_element()),
-                AudioRepairModule::DeHum => Some(self.dehum_inspector(cx).into_any_element()),
-                AudioRepairModule::SpectralRepair => {
-                    Some(self.spectral_inspector(cx).into_any_element())
-                }
-                _ => None,
-            })
-            .child(self.region_section(cx))
-            .child(self.result_section())
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(space::SECTION + space::TIGHT))
+                    .px(px(space::LOOSE))
+                    .py(px(space::LOOSE))
+                    .children(match module {
+                        AudioRepairModule::Denoise => {
+                            Some(self.denoise_inspector(cx).into_any_element())
+                        }
+                        AudioRepairModule::DeClick => {
+                            Some(self.declick_inspector(cx).into_any_element())
+                        }
+                        AudioRepairModule::DeHum => {
+                            Some(self.dehum_inspector(cx).into_any_element())
+                        }
+                        AudioRepairModule::SpectralRepair => {
+                            Some(self.spectral_inspector(cx).into_any_element())
+                        }
+                        _ => None,
+                    })
+                    .when(!module.uses_spectral_selection(), |body| {
+                        body.child(self.region_section(cx))
+                    })
+                    .child(self.result_section()),
+            )
     }
 
     fn denoise_inspector(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let learned = self.learned_noise.is_some();
         let sample_rate = self.session.target.sample_rate.max(1) as f32;
+        let from_region = self.repair.region.is_some();
+        let status = if learned {
+            format!(
+                "Learned from {:.2} s of audio.",
+                self.repair.profile_frames as f32 / sample_rate
+            )
+        } else if from_region {
+            "It will learn from your selection. Make sure only noise is in it.".to_string()
+        } else {
+            "Select a moment with only noise in it, like a pause between \
+             phrases, then press Learn Noise."
+                .to_string()
+        };
         div()
             .flex()
             .flex_col()
-            .gap(px(space::TIGHT))
-            .child(fb_section_label("PROFILE"))
-            .child(
-                div()
-                    .text_size(px(typography::DENSE_LABEL))
-                    .text_color(if learned {
-                        Colors::text_secondary()
-                    } else {
-                        Colors::status_warning()
-                    })
-                    .child(if learned {
-                        format!(
-                            "Learned from {:.2} s",
-                            self.repair.profile_frames as f32 / sample_rate
-                        )
-                    } else {
-                        "No profile learned".to_string()
-                    }),
-            )
-            .child(
+            .gap(px(space::SECTION + space::TIGHT))
+            .child(repair_step(
+                1,
+                "Teach it the noise",
+                learned,
                 div()
                     .flex()
-                    .gap(px(space::TIGHT))
-                    .child(inspector_mini_button(
-                        "repair-learn",
-                        "Learn Region",
-                        self.source_pcm.is_some(),
-                        cx.listener(|this, _, _, cx| this.spawn_learn_noise(cx)),
-                    ))
-                    .child(inspector_mini_button(
-                        "repair-forget",
-                        "Clear",
-                        learned,
-                        cx.listener(|this, _, _, cx| {
-                            this.learned_noise = None;
-                            this.repair.profile_frames = 0;
-                            this.repair.mask = None;
-                            this.invalidate_repair_preview(cx);
-                            cx.notify();
-                        }),
-                    )),
-            )
-            .child(fb_section_label("REDUCTION"))
-            .child(repair_param(
-                "Reduction",
-                format!("{:.1} dB", self.denoise.reduction_db),
-                workspace::unipolar_slider(
-                    "repair-dn-reduction",
-                    self.denoise.reduction_db,
-                    0.0,
-                    24.0,
-                    bind_repair(cx, |this, value, cx| {
-                        this.denoise.reduction_db = value;
-                        this.emit_repair_preview(cx);
-                        this.invalidate_repair_preview(cx);
-                    }),
-                    Some(12.0),
-                ),
+                    .flex_col()
+                    .gap(px(space::BASE))
+                    .child(step_note(status))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap(px(space::SNUG))
+                            .child(fb_button(
+                                "repair-learn",
+                                if learned {
+                                    "Learn Again"
+                                } else {
+                                    "Learn Noise"
+                                },
+                                // Commit is the window's one primary action.
+                                FbButtonKind::Default,
+                                self.source_pcm.is_some(),
+                                cx.listener(|this, _, _, cx| this.spawn_learn_noise(cx)),
+                            ))
+                            .when(learned, |row| {
+                                row.child(fb_button(
+                                    "repair-forget",
+                                    "Forget",
+                                    FbButtonKind::Ghost,
+                                    true,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.learned_noise = None;
+                                        this.repair.profile_frames = 0;
+                                        this.repair.mask = None;
+                                        this.invalidate_repair_preview(cx);
+                                        cx.notify();
+                                    }),
+                                ))
+                            }),
+                    )
+                    .into_any_element(),
             ))
-            .child(repair_param(
-                "Threshold",
-                format!("{:.0} dB", self.denoise.threshold_db),
-                workspace::unipolar_slider(
-                    "repair-dn-threshold",
-                    self.denoise.threshold_db,
-                    -80.0,
-                    -12.0,
-                    bind_repair(cx, |this, value, cx| {
-                        this.denoise.threshold_db = value;
-                        this.emit_repair_preview(cx);
-                        this.invalidate_repair_preview(cx);
-                    }),
-                    Some(-48.0),
-                ),
+            .child(repair_step(
+                2,
+                "Choose how much to remove",
+                false,
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(space::LOOSE))
+                    .child(repair_param(
+                        "Reduction",
+                        format!("{:.1} dB", self.denoise.reduction_db),
+                        workspace::unipolar_slider(
+                            "repair-dn-reduction",
+                            self.denoise.reduction_db,
+                            0.0,
+                            24.0,
+                            bind_repair(cx, |this, value, cx| {
+                                this.denoise.reduction_db = value;
+                                this.emit_repair_preview(cx);
+                                this.invalidate_repair_preview(cx);
+                            }),
+                            Some(12.0),
+                        ),
+                    ))
+                    .child(repair_param(
+                        "Threshold",
+                        format!("{:.0} dB", self.denoise.threshold_db),
+                        workspace::unipolar_slider(
+                            "repair-dn-threshold",
+                            self.denoise.threshold_db,
+                            -80.0,
+                            -12.0,
+                            bind_repair(cx, |this, value, cx| {
+                                this.denoise.threshold_db = value;
+                                this.emit_repair_preview(cx);
+                                this.invalidate_repair_preview(cx);
+                            }),
+                            Some(-48.0),
+                        ),
+                    ))
+                    .into_any_element(),
             ))
     }
 
     fn declick_inspector(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let total = self.repair.clicks.len();
         let selected = self.repair.selected_click.min(total.saturating_sub(1));
-        let selected_label = self
-            .repair
-            .clicks
-            .get(selected)
-            .map(|event| {
-                let seconds = (self.repair_window_start() + event.frame as u64) as f32
-                    / self.session.target.sample_rate.max(1) as f32;
-                format!("Event {} of {total} · {seconds:.3} s", selected + 1)
-            })
-            .unwrap_or_else(|| "No events detected".to_string());
+        let sample_rate = self.session.target.sample_rate.max(1) as f32;
+        let found = match total {
+            0 => "No clicks found".to_string(),
+            1 => "1 click found".to_string(),
+            n => format!("{n} clicks found"),
+        };
+        let showing = self.repair.clicks.get(selected).map(|event| {
+            let seconds = (self.repair_window_start() + event.frame as u64) as f32 / sample_rate;
+            format!("Showing click {} at {seconds:.3} s", selected + 1)
+        });
+        let width = self.declick.max_click_width;
         div()
             .flex()
             .flex_col()
-            .gap(px(space::TIGHT))
-            .child(fb_section_label("DETECTION"))
-            .child(repair_param(
-                "Sensitivity",
-                format!("{:.0}%", self.declick.sensitivity * 100.0),
-                workspace::unipolar_slider(
-                    "repair-dc-sensitivity",
-                    self.declick.sensitivity,
-                    0.05,
-                    1.0,
-                    bind_repair(cx, |this, value, cx| {
-                        this.declick.sensitivity = value;
-                        this.invalidate_repair_preview(cx);
-                    }),
-                    Some(0.65),
-                ),
-            ))
-            .child(repair_param(
-                "Max Width",
-                format!("{} smp", self.declick.max_click_width),
-                workspace::unipolar_slider(
-                    "repair-dc-width",
-                    self.declick.max_click_width as f32,
-                    2.0,
-                    64.0,
-                    bind_repair(cx, |this, value, cx| {
-                        this.declick.max_click_width = value.round() as usize;
-                        this.invalidate_repair_preview(cx);
-                    }),
-                    Some(12.0),
-                ),
-            ))
-            .child(fb_section_label("EVENTS"))
-            .child(
-                div()
-                    .text_size(px(typography::DENSE_LABEL))
-                    .text_color(Colors::text_secondary())
-                    .child(selected_label),
-            )
-            .child(
+            .gap(px(space::SECTION + space::TIGHT))
+            .child(repair_step(
+                1,
+                "Find the clicks",
+                total > 0,
                 div()
                     .flex()
-                    .gap(px(space::TIGHT))
-                    .child(inspector_mini_button(
-                        "repair-dc-prev",
-                        "Previous",
-                        total > 0,
-                        cx.listener(|this, _, _, cx| this.step_click(-1, cx)),
+                    .flex_col()
+                    .gap(px(space::LOOSE))
+                    .child(repair_param(
+                        "Sensitivity",
+                        format!("{:.0}%", self.declick.sensitivity * 100.0),
+                        workspace::unipolar_slider(
+                            "repair-dc-sensitivity",
+                            self.declick.sensitivity,
+                            0.05,
+                            1.0,
+                            bind_repair(cx, |this, value, cx| {
+                                this.declick.sensitivity = value;
+                                this.invalidate_repair_preview(cx);
+                            }),
+                            Some(0.65),
+                        ),
                     ))
-                    .child(inspector_mini_button(
-                        "repair-dc-next",
-                        "Next",
-                        total > 0,
-                        cx.listener(|this, _, _, cx| this.step_click(1, cx)),
-                    )),
-            )
+                    .child(repair_param(
+                        "Longest click",
+                        format!(
+                            "{width} smp · {:.2} ms",
+                            width as f32 / sample_rate * 1000.0
+                        ),
+                        workspace::unipolar_slider(
+                            "repair-dc-width",
+                            width as f32,
+                            2.0,
+                            64.0,
+                            bind_repair(cx, |this, value, cx| {
+                                this.declick.max_click_width = value.round() as usize;
+                                this.invalidate_repair_preview(cx);
+                            }),
+                            Some(12.0),
+                        ),
+                    ))
+                    .into_any_element(),
+            ))
+            .child(repair_step(
+                2,
+                "Check what it found",
+                false,
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(space::BASE))
+                    .child(
+                        div()
+                            .text_size(px(typography::UI_SM))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(Colors::text_primary())
+                            .child(found),
+                    )
+                    .child(step_note(showing.unwrap_or_else(|| {
+                        "Raise the sensitivity if you can still hear clicks.".to_string()
+                    })))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap(px(space::SNUG))
+                            .child(fb_button(
+                                "repair-dc-prev",
+                                "Previous",
+                                FbButtonKind::Default,
+                                total > 0,
+                                cx.listener(|this, _, _, cx| this.step_click(-1, cx)),
+                            ))
+                            .child(fb_button(
+                                "repair-dc-next",
+                                "Next",
+                                FbButtonKind::Default,
+                                total > 0,
+                                cx.listener(|this, _, _, cx| this.step_click(1, cx)),
+                            )),
+                    )
+                    .into_any_element(),
+            ))
     }
 
     fn dehum_inspector(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -724,142 +894,243 @@ impl AudioToolWindow {
         div()
             .flex()
             .flex_col()
-            .gap(px(space::TIGHT))
-            .child(fb_section_label("FUNDAMENTAL"))
-            .child(
-                workspace::segment_track().children(options.into_iter().enumerate().map(
-                    |(index, (hz, label))| {
-                        workspace::compact_segment(
-                            format!("repair-hum-{label}"),
-                            label,
-                            (self.dehum.base_hz - hz).abs() < 1.0,
-                            workspace::segment_position(index, count),
-                            cx.listener(move |this, _, _, cx| {
-                                this.dehum.base_hz = hz;
+            .gap(px(space::SECTION + space::TIGHT))
+            .child(repair_step(
+                1,
+                "Pick the mains frequency",
+                false,
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(space::BASE))
+                    .child(workspace::segment_track().children(
+                        options.into_iter().enumerate().map(|(index, (hz, label))| {
+                            workspace::compact_segment(
+                                format!("repair-hum-{label}"),
+                                label,
+                                (self.dehum.base_hz - hz).abs() < 1.0,
+                                workspace::segment_position(index, count),
+                                cx.listener(move |this, _, _, cx| {
+                                    this.dehum.base_hz = hz;
+                                    this.emit_repair_preview(cx);
+                                    this.invalidate_repair_preview(cx);
+                                    cx.notify();
+                                }),
+                            )
+                        }),
+                    ))
+                    .child(step_note(
+                        "50 Hz in most of the world, 60 Hz in North America and a few \
+                         other countries. The yellow lines show where it cuts."
+                            .to_string(),
+                    ))
+                    .into_any_element(),
+            ))
+            .child(repair_step(
+                2,
+                "Choose how much to remove",
+                false,
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(space::LOOSE))
+                    .child(repair_param(
+                        "Overtones",
+                        format!("{}", self.dehum.harmonics),
+                        workspace::unipolar_slider(
+                            "repair-hum-harmonics",
+                            self.dehum.harmonics as f32,
+                            1.0,
+                            10.0,
+                            bind_repair(cx, |this, value, cx| {
+                                this.dehum.harmonics = value.round().clamp(1.0, 10.0) as u8;
                                 this.emit_repair_preview(cx);
                                 this.invalidate_repair_preview(cx);
-                                cx.notify();
                             }),
-                        )
-                    },
-                )),
-            )
-            .child(repair_param(
-                "Harmonics",
-                format!("{}", self.dehum.harmonics),
-                workspace::unipolar_slider(
-                    "repair-hum-harmonics",
-                    self.dehum.harmonics as f32,
-                    1.0,
-                    10.0,
-                    bind_repair(cx, |this, value, cx| {
-                        this.dehum.harmonics = value.round().clamp(1.0, 10.0) as u8;
-                        this.emit_repair_preview(cx);
-                        this.invalidate_repair_preview(cx);
-                    }),
-                    Some(4.0),
-                ),
-            ))
-            .child(repair_param(
-                "Reduction",
-                format!("{:.1} dB", self.dehum.reduction_db),
-                workspace::unipolar_slider(
-                    "repair-hum-reduction",
-                    self.dehum.reduction_db,
-                    0.0,
-                    48.0,
-                    bind_repair(cx, |this, value, cx| {
-                        this.dehum.reduction_db = value;
-                        this.emit_repair_preview(cx);
-                        this.invalidate_repair_preview(cx);
-                    }),
-                    Some(18.0),
-                ),
+                            Some(4.0),
+                        ),
+                    ))
+                    .child(repair_param(
+                        "Reduction",
+                        format!("{:.1} dB", self.dehum.reduction_db),
+                        workspace::unipolar_slider(
+                            "repair-hum-reduction",
+                            self.dehum.reduction_db,
+                            0.0,
+                            48.0,
+                            bind_repair(cx, |this, value, cx| {
+                                this.dehum.reduction_db = value;
+                                this.emit_repair_preview(cx);
+                                this.invalidate_repair_preview(cx);
+                            }),
+                            Some(18.0),
+                        ),
+                    ))
+                    .into_any_element(),
             ))
     }
 
     fn spectral_inspector(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let sample_rate = self.session.target.sample_rate.max(1) as f32;
+        let region = self.repair.region;
+        let drawn = match region {
+            Some(region) => div()
+                .flex()
+                .flex_col()
+                .gap(px(space::BASE))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(space::HAIR))
+                        .child(readout_row(
+                            "Time",
+                            format!(
+                                "{:.3} – {:.3} s",
+                                region.start_frame as f32 / sample_rate,
+                                region.end_frame as f32 / sample_rate
+                            ),
+                        ))
+                        .child(readout_row(
+                            "Pitch range",
+                            format!("{:.0} – {:.0} Hz", region.min_hz, region.max_hz),
+                        )),
+                )
+                .child(div().flex().child(fb_button(
+                    "repair-region-clear",
+                    "Draw Again",
+                    FbButtonKind::Default,
+                    true,
+                    cx.listener(|this, _, _, cx| {
+                        this.repair.region = None;
+                        this.invalidate_repair_preview(cx);
+                        cx.notify();
+                    }),
+                )))
+                .into_any_element(),
+            None => step_note(
+                "Drag on the spectrogram to draw a box around the sound you want \
+                 to change."
+                    .to_string(),
+            )
+            .into_any_element(),
+        };
         div()
             .flex()
             .flex_col()
-            .gap(px(space::TIGHT))
-            .child(fb_section_label("GAIN"))
-            .child(repair_param(
-                "Gain",
-                format!("{:+.1} dB", self.spectral_gain_db),
-                workspace::unipolar_slider(
-                    "repair-sp-gain",
-                    self.spectral_gain_db,
-                    -48.0,
-                    24.0,
-                    bind_repair(cx, |this, value, cx| {
-                        this.spectral_gain_db = value;
-                        this.invalidate_repair_preview(cx);
-                    }),
-                    Some(0.0),
-                ),
+            .gap(px(space::SECTION + space::TIGHT))
+            .child(repair_step(
+                1,
+                "Draw around the sound",
+                region.is_some(),
+                drawn,
             ))
-            .child(inspector_mini_button(
-                "repair-sp-silence",
-                "Silence Region",
-                self.repair.region.is_some(),
-                cx.listener(|this, _, _, cx| {
-                    this.spectral_gain_db = -120.0;
-                    this.invalidate_repair_preview(cx);
-                    cx.notify();
-                }),
+            .child(repair_step(
+                2,
+                "Turn it down",
+                false,
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(space::LOOSE))
+                    .child(repair_param(
+                        "Gain",
+                        if self.spectral_gain_db <= -119.0 {
+                            "Silent".to_string()
+                        } else {
+                            format!("{:+.1} dB", self.spectral_gain_db)
+                        },
+                        workspace::unipolar_slider(
+                            "repair-sp-gain",
+                            self.spectral_gain_db,
+                            -48.0,
+                            24.0,
+                            bind_repair(cx, |this, value, cx| {
+                                this.spectral_gain_db = value;
+                                this.invalidate_repair_preview(cx);
+                            }),
+                            Some(0.0),
+                        ),
+                    ))
+                    .child(div().flex().child(fb_button(
+                        "repair-sp-silence",
+                        "Silence It",
+                        FbButtonKind::Default,
+                        region.is_some(),
+                        cx.listener(|this, _, _, cx| {
+                            this.spectral_gain_db = -120.0;
+                            this.invalidate_repair_preview(cx);
+                            cx.notify();
+                        }),
+                    )))
+                    .into_any_element(),
             ))
     }
 
+    /// Which part of the clip the module works on: all of it, or the part
+    /// drawn on the canvas.
     fn region_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let sample_rate = self.session.target.sample_rate.max(1) as f32;
         let region = self.repair.region;
-        let spectral = self.repair.module.uses_spectral_selection();
         div()
             .flex()
             .flex_col()
-            .gap(px(space::TIGHT))
-            .child(fb_section_label("REGION"))
-            .child(match region {
-                Some(region) => div()
+            .gap(px(space::SNUG))
+            .child(fb_section_label("WORKING ON"))
+            .child(
+                div()
                     .flex()
-                    .flex_col()
-                    .gap(px(space::HAIR))
-                    .child(readout_row(
-                        "Time",
-                        format!(
-                            "{:.3}–{:.3} s",
-                            region.start_frame as f32 / sample_rate,
-                            region.end_frame as f32 / sample_rate
-                        ),
-                    ))
-                    .when(spectral, |this| {
-                        this.child(readout_row(
-                            "Band",
-                            format!("{:.0}–{:.0} Hz", region.min_hz, region.max_hz),
+                    .flex_row()
+                    .items_center()
+                    .gap(px(space::BASE))
+                    .h(px(size::PROMINENT))
+                    .pl(px(space::BASE))
+                    .pr(px(space::TIGHT))
+                    .rounded(px(radius::CONTROL))
+                    .bg(Colors::surface_input())
+                    .border(px(1.0))
+                    .border_color(Colors::border_subtle())
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_size(px(typography::UI_XS))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(Colors::text_primary())
+                            .child(match region {
+                                Some(region) => format!(
+                                    "Selection · {:.3} – {:.3} s",
+                                    region.start_frame as f32 / sample_rate,
+                                    region.end_frame as f32 / sample_rate
+                                ),
+                                None => "Whole clip".to_string(),
+                            }),
+                    )
+                    .when(region.is_none(), |row| {
+                        row.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(typography::DENSE_CAPTION))
+                                .text_color(Colors::text_faint())
+                                .child("Drag on the canvas to pick a part"),
+                        )
+                    })
+                    .when(region.is_some(), |row| {
+                        row.child(fb_icon_button(
+                            "repair-region-clear",
+                            assets::ICON_CLOSE_SMALL_PATH,
+                            "Clear selection",
+                            size::MICRO,
+                            None,
+                            cx.listener(|this, _, _, cx| {
+                                this.repair.region = None;
+                                this.invalidate_repair_preview(cx);
+                                cx.notify();
+                            }),
                         ))
-                    })
-                    .into_any_element(),
-                None => div()
-                    .text_size(px(typography::DENSE_LABEL))
-                    .text_color(Colors::text_muted())
-                    .child(if spectral {
-                        "Drag on the canvas to target a band."
-                    } else {
-                        "Whole window. Drag on the canvas to narrow it."
-                    })
-                    .into_any_element(),
-            })
-            .child(inspector_mini_button(
-                "repair-region-clear",
-                "Clear Region",
-                region.is_some(),
-                cx.listener(|this, _, _, cx| {
-                    this.repair.region = None;
-                    this.invalidate_repair_preview(cx);
-                    cx.notify();
-                }),
-            ))
+                    }),
+            )
     }
 
     /// Before/after figures measured on the previewed range, never estimated.
@@ -867,56 +1138,108 @@ impl AudioToolWindow {
         let stats = self.repair.stats;
         let stale =
             self.repair.diff.as_ref().is_some_and(|diff| diff.stale) || self.repair.preview_busy;
+        let audition_hint = if !has_engine_audition(self.repair.module) {
+            "Audition is not available for this module yet. The canvas shows \
+             what it changes."
+        } else if self.session.preview_enabled {
+            "You are hearing the repair in the project now."
+        } else {
+            "Turn on Audition below to hear it in the project."
+        };
+        let change = stats.map(|stats| {
+            let change = stats.rms_after_db - stats.rms_before_db;
+            if change.abs() < 0.005 {
+                0.0
+            } else {
+                change
+            }
+        });
         div()
             .flex()
             .flex_col()
-            .gap(px(space::TIGHT))
-            .child(fb_section_label("BEFORE / AFTER"))
-            .children(match stats {
-                Some(stats) => vec![
-                    readout_row(
+            .gap(px(space::BASE))
+            .p(px(space::LOOSE))
+            .rounded(px(radius::SURFACE))
+            .bg(Colors::surface_raised())
+            .border(px(1.0))
+            .border_color(Colors::border_subtle())
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(fb_section_label("RESULT"))
+                    .when(stale, |row| {
+                        row.child(
+                            div()
+                                .text_size(px(typography::DENSE_CAPTION))
+                                .text_color(Colors::text_faint())
+                                .child("Updating…"),
+                        )
+                    }),
+            )
+            .child(match change {
+                Some(change) => div()
+                    .flex()
+                    .flex_row()
+                    .items_baseline()
+                    .gap(px(space::SNUG))
+                    .child(
+                        div()
+                            .text_size(px(typography::UI_LG))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(if change < -0.05 {
+                                Colors::accent_primary()
+                            } else {
+                                Colors::text_primary()
+                            })
+                            .child(format!("{change:+.2} dB")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(typography::UI_XS))
+                            .text_color(Colors::text_muted())
+                            .child("change in level"),
+                    )
+                    .into_any_element(),
+                None => div()
+                    .text_size(px(typography::UI_XS))
+                    .text_color(Colors::text_muted())
+                    .child("Nothing to compare yet.")
+                    .into_any_element(),
+            })
+            .children(stats.map(|stats| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(space::HAIR))
+                    .child(readout_row(
                         "Peak",
                         format!(
                             "{:.1} → {:.1} dB",
                             stats.peak_before_db, stats.peak_after_db
                         ),
-                    )
-                    .into_any_element(),
-                    readout_row(
-                        "RMS",
+                    ))
+                    .child(readout_row(
+                        "Average (RMS)",
                         format!("{:.1} → {:.1} dB", stats.rms_before_db, stats.rms_after_db),
+                    ))
+                    .children(stats.coverage.map(|coverage| {
+                        readout_row("Treated as noise", format!("{:.1}%", coverage * 100.0))
+                    }))
+                    .children(
+                        (stats.events > 0)
+                            .then(|| readout_row("Clicks repaired", format!("{}", stats.events))),
                     )
-                    .into_any_element(),
-                    readout_row(
-                        "Change",
-                        format!("{:+.2} dB", stats.rms_after_db - stats.rms_before_db),
-                    )
-                    .into_any_element(),
-                ],
-                None => vec![div()
-                    .text_size(px(typography::DENSE_LABEL))
-                    .text_color(Colors::text_muted())
-                    .child("No preview yet.")
-                    .into_any_element()],
-            })
-            .children(
-                stats
-                    .and_then(|stats| stats.coverage)
-                    .map(|coverage| readout_row("Gated", format!("{:.1}%", coverage * 100.0))),
+            }))
+            .child(
+                div()
+                    .pt(px(space::TIGHT))
+                    .border_t(px(1.0))
+                    .border_color(Colors::border_subtle())
+                    .child(step_note(audition_hint.to_string())),
             )
-            .children(
-                stats
-                    .filter(|stats| stats.events > 0)
-                    .map(|stats| readout_row("Repaired", format!("{} events", stats.events))),
-            )
-            .when(stale, |this| {
-                this.child(
-                    div()
-                        .text_size(px(typography::DENSE_CAPTION))
-                        .text_color(Colors::text_faint())
-                        .child("Recomputing…"),
-                )
-            })
     }
 
     pub(super) fn audition_meter(&self) -> impl IntoElement {
@@ -1610,13 +1933,77 @@ fn spread_mono(mono: &[f32], channels: usize) -> Vec<f32> {
 
 // ------------------------------------------------------------------ elements
 
+/// One numbered step of a module's workflow: a disc and a title, with the
+/// step's controls indented under the title. A finished step's disc turns
+/// into a check, so the panel shows how far along the user is.
+fn repair_step(
+    number: u8,
+    title: &'static str,
+    done: bool,
+    content: gpui::AnyElement,
+) -> impl IntoElement {
+    let disc = div()
+        .size(px(STEP_DISC))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(radius::PILL));
+    let disc = if done {
+        disc.bg(Colors::with_alpha(Colors::status_success(), 0.18))
+            .child(
+                svg()
+                    .path(assets::ICON_CHECK_PATH)
+                    .size(px(12.0))
+                    .text_color(Colors::status_success()),
+            )
+    } else {
+        disc.bg(Colors::surface_raised())
+            .text_size(px(typography::DENSE_LABEL))
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .text_color(Colors::text_secondary())
+            .child(number.to_string())
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(space::BASE))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(space::BASE))
+                .child(disc)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .text_size(px(typography::UI_SM))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(Colors::text_primary())
+                        .child(title),
+                ),
+        )
+        .child(div().pl(px(STEP_DISC + space::BASE)).child(content))
+}
+
+/// A line of guidance under a step.
+fn step_note(text: String) -> impl IntoElement {
+    div()
+        .text_size(px(typography::UI_XS))
+        .text_color(Colors::text_muted())
+        .child(text)
+}
+
 /// Label and value on one line, the control on the next. At the inspector's
 /// fixed width a side-by-side slider would be too short to aim with.
 fn repair_param(label: &'static str, value: String, control: impl IntoElement) -> impl IntoElement {
     div()
         .flex()
         .flex_col()
-        .gap(px(space::HAIR))
+        .gap(px(space::TIGHT))
         .child(
             div()
                 .flex()
@@ -1626,13 +2013,13 @@ fn repair_param(label: &'static str, value: String, control: impl IntoElement) -
                 .h(px(size::MICRO))
                 .child(
                     div()
-                        .text_size(px(typography::DENSE_LABEL))
-                        .text_color(Colors::text_muted())
+                        .text_size(px(typography::UI_XS))
+                        .text_color(Colors::text_secondary())
                         .child(label),
                 )
                 .child(
                     div()
-                        .text_size(px(typography::DENSE_LABEL))
+                        .text_size(px(typography::UI_XS))
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(Colors::text_primary())
                         .child(value),
@@ -1647,16 +2034,16 @@ fn readout_row(label: &'static str, value: String) -> impl IntoElement {
         .flex_row()
         .items_center()
         .justify_between()
-        .h(px(size::MICRO))
+        .h(px(size::MICRO + space::TIGHT))
         .child(
             div()
-                .text_size(px(typography::DENSE_LABEL))
+                .text_size(px(typography::UI_XS))
                 .text_color(Colors::text_muted())
                 .child(label),
         )
         .child(
             div()
-                .text_size(px(typography::DENSE_LABEL))
+                .text_size(px(typography::UI_XS))
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(Colors::text_primary())
                 .child(value),

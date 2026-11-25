@@ -480,6 +480,90 @@ impl PianoRoll {
                 }))
                 .child(label)
         };
+        // Lane Note, on the drum lanes: the same choices the native menu
+        // lists, in a scrolling block (the GM map is 47 notes long).
+        let lane_note = self
+            .drum_rows
+            .get(pitch)
+            .copied()
+            .zip(self.lane_note_context(cx))
+            .map(|(from, context)| {
+                let hover = Colors::composite(Colors::surface_card(), Colors::state_hover());
+                let rows = context
+                    .choices(from)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, choice)| match choice {
+                        LaneNoteChoice::Group(group) => div()
+                            .px(px(8.0))
+                            .pt(px(4.0))
+                            .pb(px(1.0))
+                            .text_size(px(8.5))
+                            .text_color(Colors::text_faint())
+                            .child(group)
+                            .into_any_element(),
+                        LaneNoteChoice::Note {
+                            note,
+                            label,
+                            checked,
+                            enabled,
+                        } => div()
+                            .id(("pr-lane-note", index))
+                            .flex()
+                            .items_center()
+                            .flex_none()
+                            .h(px(20.0))
+                            .px(px(8.0))
+                            .rounded(px(crate::theme::radius::CONTROL_SM))
+                            .text_size(px(10.0))
+                            .text_color(if checked {
+                                Colors::accent_primary()
+                            } else if enabled {
+                                Colors::text_secondary()
+                            } else {
+                                Colors::text_disabled()
+                            })
+                            .when(enabled, |row| {
+                                row.hover(move |s| s.bg(hover))
+                                    .cursor(gpui::CursorStyle::PointingHand)
+                                    .on_click(cx.listener(
+                                        move |this, _: &gpui::ClickEvent, _w, cx| {
+                                            this.set_lane_note(from, note, cx);
+                                        },
+                                    ))
+                            })
+                            .child(label)
+                            .into_any_element(),
+                    })
+                    .collect::<Vec<_>>();
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .px(px(8.0))
+                            .pt(px(2.0))
+                            .text_size(px(10.0))
+                            .text_color(Colors::text_secondary())
+                            .child("Lane Note"),
+                    )
+                    .child(
+                        div()
+                            .id("pr-lane-note-list")
+                            .flex()
+                            .flex_col()
+                            .max_h(px(180.0))
+                            .overflow_y_scroll()
+                            .children(rows),
+                    )
+                    .child(
+                        div()
+                            .h(px(1.0))
+                            .mx(px(4.0))
+                            .my(px(2.0))
+                            .bg(Colors::border_subtle()),
+                    )
+            });
         let panel = div()
             .id("pr-lane-menu")
             .w(px(176.0))
@@ -506,6 +590,7 @@ impl PianoRoll {
                     .text_color(Colors::text_faint())
                     .child(self.step_row_name(pitch)),
             )
+            .children(lane_note)
             .child(row(
                 0,
                 "Fill Every 2 Steps",
@@ -754,6 +839,15 @@ impl Render for PianoRoll {
             None
         };
         let toolbar = self.render_toolbar(cx, clip_id.as_deref());
+        // The chord readout is its own entity (see `chord_readout`); a render
+        // only brings its label up to date with the notes and selection.
+        if self.chord_readout.is_none() {
+            let label = self.chord_label.clone();
+            self.chord_readout =
+                Some(cx.new(|_| super::chord_readout::PianoRollChordReadout::new(label)));
+        }
+        let chord = self.chord_label_now(cx);
+        *self.chord_label.borrow_mut() = chord;
         let footer = self.render_footer(cx, clip_id.as_deref());
 
         let body: gpui::AnyElement = match (score_body, clip_id) {
@@ -2029,6 +2123,10 @@ impl PianoRoll {
                         }),
                 )
             })
+            .when_some(
+                self.chord_readout.clone().filter(|_| clip_id.is_some()),
+                |row, readout| row.child(readout),
+            )
             .child(
                 div()
                     .flex_shrink_0()

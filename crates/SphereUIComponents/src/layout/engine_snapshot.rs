@@ -560,6 +560,18 @@ pub(crate) fn apply_engine_track_input_state(
 /// `enabled` mirrors the UI bypass flag (`!bypassed`), so toggling bypass in
 /// the mixer changes the audio path on the next engine sync. This runs on the
 /// UI thread inside snapshot construction — never the audio callback.
+/// A channel's Dual pan as the engine takes it. Enabled only where Dual is
+/// what the channel plays ([`TrackState::dual_pan_active`]): a mono channel
+/// left in Dual plays its balance knob.
+pub(crate) fn engine_dual_pan(track: &TrackState) -> DirectAudio::types::EngineDualPan {
+    let dual = track.dual_pan.sanitized();
+    DirectAudio::types::EngineDualPan {
+        enabled: track.dual_pan_active(),
+        left: dual.left,
+        right: dual.right,
+    }
+}
+
 fn log_track_insert_chain(track_id: &str, inserts: &[EngineInsertSnapshot]) {
     if inserts.is_empty() || !crate::perf::engine_sync_debug_enabled() {
         return;
@@ -582,6 +594,46 @@ fn log_track_insert_chain(track_id: &str, inserts: &[EngineInsertSnapshot]) {
 /// audio, bus, return, group, master, video — carries audio and nothing but.
 fn track_type_hosts_instrument(track_type: TrackType) -> bool {
     matches!(track_type, TrackType::Instrument | TrackType::Midi)
+}
+
+/// The track's MIDI FX chain for the engine. Only tracks that host an
+/// instrument run one; a slot naming a device this build does not know is
+/// left out (the engine would skip it anyway) but stays in the project.
+///
+/// A hosted plug-in runs only through the plug-in host bridge, where the
+/// engine reads its MIDI output; without the bridge (the legacy in-process
+/// mode) the slot is left out, so its notes pass on unchanged instead of
+/// waiting on a plug-in that is never loaded.
+fn build_engine_midi_fx(
+    track: &timeline_state::TrackState,
+) -> Vec<DirectAudio::types::EngineMidiFxSnapshot> {
+    if !track_type_hosts_instrument(track.track_type) {
+        return Vec::new();
+    }
+    let bridged = super::plugin_bridge_runtime::bridge_enabled();
+    track
+        .midi_fx
+        .iter()
+        .filter_map(|slot| {
+            let plugin_instance_id = match &slot.plugin {
+                Some(plugin) if bridged && slot.device == timeline_state::MIDI_FX_PLUGIN_DEVICE => {
+                    Some(plugin.id.clone())
+                }
+                Some(_) => return None,
+                None => {
+                    slot.kind()?;
+                    None
+                }
+            };
+            Some(DirectAudio::types::EngineMidiFxSnapshot {
+                id: slot.id.clone(),
+                device: slot.device.clone(),
+                plugin_instance_id,
+                enabled: slot.enabled,
+                params: slot.params.clone(),
+            })
+        })
+        .collect()
 }
 
 /// `params["role"]` for a bridged insert, which the engine turns into
@@ -728,6 +780,10 @@ fn build_engine_inserts_for(
                 params.insert("bridge".to_string(), serde_json::json!(true));
                 params.insert("role".to_string(), serde_json::json!(role));
                 params.insert("signalBus".to_string(), signal_bus_json(slot));
+                if slot.post_fader {
+                    // The engine reads it as `runtime::POST_FADER_PARAM`.
+                    params.insert("postFader".to_string(), serde_json::json!(true));
+                }
                 if let Some(route) = &slot.sidechain {
                     // The engine reads it as `runtime::SIDECHAIN_PARAM`.
                     params.insert("sidechain".to_string(), route.to_json());
@@ -797,6 +853,10 @@ fn build_engine_inserts_for(
                 vsti_output_children_json(slot),
             );
             params.insert("signalBus".to_string(), signal_bus_json(slot));
+            if slot.post_fader {
+                // The engine reads it as `runtime::POST_FADER_PARAM`.
+                params.insert("postFader".to_string(), serde_json::json!(true));
+            }
             if let Some(route) = &slot.sidechain {
                 // The engine reads it as `runtime::SIDECHAIN_PARAM`.
                 params.insert("sidechain".to_string(), route.to_json());
@@ -1061,6 +1121,158 @@ pub(super) fn build_engine_project_snapshot_for_export(
     )
 }
 
+/// Every MIDI clip the engine plays, as the project snapshot carries them.
+/// Memoized per clip, so after a note edit only the edited clip is rebuilt;
+/// also what a live MIDI edit sends on its own (`AudioEngine::replace_midi_clips`).
+pub(crate) fn build_engine_midi_clips(
+    state: &TimelineState,
+) -> Vec<std::sync::Arc<EngineMidiClipSnapshot>> {
+    // MIDI clips (Phase 2): notes stay clip-relative; the engine resolves them
+    // to absolute beats/samples. Muted clips are skipped, matching audio clips.
+    let index_by_id = state.track_index_by_id();
+    let midi_clips: Vec<std::sync::Arc<EngineMidiClipSnapshot>> = state
+        .tracks
+        .iter()
+        .flat_map(|track| {
+            // A MIDI track with no Instrument plugin of its own can route its
+            // notes to an Instrument track's plugin instead
+            // (`TrackOutputRouting::Instrument`); everything else (including
+            // an Instrument track's own clips) keeps playing through its own
+            // track id, unchanged.
+            let track_id = state
+                .effective_instrument_indexed(track, &index_by_id)
+                .unwrap_or(&track.id)
+                .to_string();
+            // On a track bound to an ARA generator (a voice synth) the MIDI
+            // clips are that plug-in's regions: it sings them from its own
+            // notes and lyrics, so their notes do not also play the track's
+            // instruments.
+            let ara_regions = track.ara.as_ref().is_some_and(|ara| ara.generator);
+            track.clips.iter().filter_map(move |clip| {
+                if clip.muted || ara_regions {
+                    return None;
+                }
+                let ClipType::Midi {
+                    notes,
+                    controller_lanes,
+                    articulations,
+                    ..
+                } = &clip.clip_type
+                else {
+                    return None;
+                };
+                // Fixed-channel tracks force every event onto one channel
+                // (the pre-existing behavior); PerNote tracks emit each
+                // note's own channel and controller lanes still ride the
+                // track's fixed/default channel (per-channel CC lanes are a
+                // follow-up, not part of this pass).
+                let output_mode = track.routing.output_channel_mode();
+                let lane_channel = output_mode
+                    .resolve(track.routing.default_note_channel())
+                    .raw();
+                let seconds_per_beat = 60.0 / state.bpm.max(1.0);
+                let inputs = MidiClipInputs {
+                    clip,
+                    track_id: &track_id,
+                    notes,
+                    controller_lanes,
+                    articulations,
+                    output_mode,
+                    lane_channel,
+                    seconds_per_beat,
+                    mpe: &track.routing.mpe,
+                };
+                Some(memoized_midi_clip(inputs, || {
+                    // Articulations are applied here — and only here — so realtime
+                    // playback and offline export (same builder) stay equivalent
+                    // and the stored note data is never rewritten. Direction
+                    // chasing is a pure beat lookup over the clip's event list, so
+                    // it is independent of where the transport starts/seeks/loops.
+                    let legato_index = ArticulationLegatoIndex::build(notes, output_mode);
+                    // The evaluated pitch trajectory is built from the *same*
+                    // notes and articulation events the piano roll and the Pitch
+                    // editor render, so what is drawn, what is displayed and what
+                    // is played are one evaluation, not three.
+                    let trajectory =
+                        timeline_state::PitchTrajectory::build(notes, articulations.as_slice());
+                    let voice_of_note = voice_index_per_note(&trajectory, notes.len());
+                    EngineMidiClipSnapshot {
+                        id: clip.id.clone(),
+                        track_id: track_id.clone(),
+                        // A MIDI track playing another track's instrument
+                        // keeps its identity, so its own mute/solo apply.
+                        source_track_id: (*track_id != track.id).then(|| track.id.clone()),
+                        start_beat: clip.start_beat.max(0.0) as f64,
+                        length_beats: clip.duration_beats.max(0.0) as f64,
+                        notes: notes
+                            .iter()
+                            .enumerate()
+                            // Muted notes stay in the clip but emit no runtime event.
+                            .filter(|(_, n)| !n.muted)
+                            .map(|(index, n)| {
+                                let channel = output_mode.resolve(n.channel).raw();
+                                let (length_beats, velocity) = articulated_note_playback(
+                                    n,
+                                    articulations,
+                                    channel,
+                                    &legato_index,
+                                );
+                                EngineMidiNoteSnapshot {
+                                    id: n.id,
+                                    pitch: n.pitch.min(127),
+                                    start_beat: n.start.max(0.0) as f64,
+                                    length_beats: length_beats.max(0.0) as f64,
+                                    velocity,
+                                    channel,
+                                    expression: n.expression.sanitized(),
+                                    // Resolved the same way playback resolves it,
+                                    // so a note with no marking of its own still
+                                    // follows the clip's direction lane.
+                                    articulation: timeline_state::resolve_note_articulation(
+                                        n,
+                                        articulations,
+                                    )
+                                    .and_then(voicebank_articulation_for),
+                                    pitch_points: build_note_pitch_points(
+                                        &trajectory,
+                                        notes,
+                                        &voice_of_note,
+                                        index,
+                                        length_beats,
+                                        seconds_per_beat,
+                                    ),
+                                }
+                            })
+                            .collect(),
+                        controllers: controller_lanes
+                            .iter()
+                            .filter(|lane| !lane.points.is_empty())
+                            .filter_map(|lane| {
+                                let controller = vst3_controller_number(lane.kind)?;
+                                Some(EngineMidiControllerLane {
+                                    controller,
+                                    channel: lane_channel,
+                                    points: lane
+                                        .points
+                                        .iter()
+                                        .map(|p| EngineMidiControllerPoint {
+                                            beat: p.beat.max(0.0) as f64,
+                                            value: p.value.clamp(0.0, 1.0),
+                                        })
+                                        .collect(),
+                                })
+                            })
+                            .collect(),
+                        mpe: track.routing.mpe,
+                    }
+                }))
+            })
+        })
+        .collect();
+    forget_unlisted_midi_clips(&midi_clips);
+    midi_clips
+}
+
 fn build_engine_project_snapshot_inner(
     state: &TimelineState,
     sample_rate: u32,
@@ -1085,7 +1297,10 @@ fn build_engine_project_snapshot_inner(
             // had already made the track quieter — the fader would jump back to
             // being loud until the user let go.
             volume: volume_norm_to_linear(state.display_track_volume(track)),
+            // Its VCA's fader, which the engine multiplies into this one.
+            vca_gain: state.vca_gain_for_track(track),
             pan: track.pan.clamp(-1.0, 1.0),
+            dual_pan: engine_dual_pan(track),
             muted: track.muted,
             solo: track.solo,
             armed: track.armed,
@@ -1110,6 +1325,7 @@ fn build_engine_project_snapshot_inner(
                 log_track_insert_chain(&track.id, &inserts);
                 inserts
             },
+            midi_fx: build_engine_midi_fx(track),
             sends: build_engine_sends(track),
             automation_lanes: build_engine_automation_lanes(track),
             builtin_soundfont_player: track.builtin_soundfont_player,
@@ -1157,7 +1373,9 @@ fn build_engine_project_snapshot_inner(
         id: "master".to_string(),
         track_type: "master".to_string(),
         volume: volume_norm_to_linear(state.display_master_volume()),
+        vca_gain: 1.0,
         pan: 0.0,
+        dual_pan: Default::default(),
         muted: false,
         solo: false,
         armed: false,
@@ -1168,6 +1386,7 @@ fn build_engine_project_snapshot_inner(
         },
         preview_mode: "stereo".to_string(),
         output_track_id: None,
+        midi_fx: Vec::new(),
         inserts: master_inserts,
         sends: Vec::new(),
         automation_lanes: build_engine_automation_lanes_from(
@@ -1311,147 +1530,7 @@ fn build_engine_project_snapshot_inner(
         .collect();
     apply_auto_crossfades(state, &mut clips);
 
-    // MIDI clips (Phase 2): notes stay clip-relative; the engine resolves them
-    // to absolute beats/samples. Muted clips are skipped, matching audio clips.
-    let midi_clips: Vec<std::sync::Arc<EngineMidiClipSnapshot>> = state
-        .tracks
-        .iter()
-        .flat_map(|track| {
-            // A MIDI track with no Instrument plugin of its own can route its
-            // notes to an Instrument track's plugin instead
-            // (`TrackOutputRouting::Instrument`); everything else (including
-            // an Instrument track's own clips) keeps playing through its own
-            // track id, unchanged.
-            let track_id = state
-                .effective_instrument_track_id(&track.id)
-                .unwrap_or_else(|| track.id.clone());
-            // On a track bound to an ARA generator (a voice synth) the MIDI
-            // clips are that plug-in's regions: it sings them from its own
-            // notes and lyrics, so their notes do not also play the track's
-            // instruments.
-            let ara_regions = track.ara.as_ref().is_some_and(|ara| ara.generator);
-            track.clips.iter().filter_map(move |clip| {
-                if clip.muted || ara_regions {
-                    return None;
-                }
-                let ClipType::Midi {
-                    notes,
-                    controller_lanes,
-                    articulations,
-                    ..
-                } = &clip.clip_type
-                else {
-                    return None;
-                };
-                // Fixed-channel tracks force every event onto one channel
-                // (the pre-existing behavior); PerNote tracks emit each
-                // note's own channel and controller lanes still ride the
-                // track's fixed/default channel (per-channel CC lanes are a
-                // follow-up, not part of this pass).
-                let output_mode = track.routing.output_channel_mode();
-                let lane_channel = output_mode
-                    .resolve(track.routing.default_note_channel())
-                    .raw();
-                let seconds_per_beat = 60.0 / state.bpm.max(1.0);
-                let inputs = MidiClipInputs {
-                    clip,
-                    track_id: &track_id,
-                    notes,
-                    controller_lanes,
-                    articulations,
-                    output_mode,
-                    lane_channel,
-                    seconds_per_beat,
-                    mpe: &track.routing.mpe,
-                };
-                Some(memoized_midi_clip(inputs, || {
-                    // Articulations are applied here — and only here — so realtime
-                    // playback and offline export (same builder) stay equivalent
-                    // and the stored note data is never rewritten. Direction
-                    // chasing is a pure beat lookup over the clip's event list, so
-                    // it is independent of where the transport starts/seeks/loops.
-                    let legato_index = ArticulationLegatoIndex::build(notes, output_mode);
-                    // The evaluated pitch trajectory is built from the *same*
-                    // notes and articulation events the piano roll and the Pitch
-                    // editor render, so what is drawn, what is displayed and what
-                    // is played are one evaluation, not three.
-                    let trajectory =
-                        timeline_state::PitchTrajectory::build(notes, articulations.as_slice());
-                    let voice_of_note = voice_index_per_note(&trajectory, notes.len());
-                    EngineMidiClipSnapshot {
-                        id: clip.id.clone(),
-                        track_id: track_id.clone(),
-                        // A MIDI track playing another track's instrument
-                        // keeps its identity, so its own mute/solo apply.
-                        source_track_id: (*track_id != track.id).then(|| track.id.clone()),
-                        start_beat: clip.start_beat.max(0.0) as f64,
-                        length_beats: clip.duration_beats.max(0.0) as f64,
-                        notes: notes
-                            .iter()
-                            .enumerate()
-                            // Muted notes stay in the clip but emit no runtime event.
-                            .filter(|(_, n)| !n.muted)
-                            .map(|(index, n)| {
-                                let channel = output_mode.resolve(n.channel).raw();
-                                let (length_beats, velocity) = articulated_note_playback(
-                                    n,
-                                    articulations,
-                                    channel,
-                                    &legato_index,
-                                );
-                                EngineMidiNoteSnapshot {
-                                    id: n.id,
-                                    pitch: n.pitch.min(127),
-                                    start_beat: n.start.max(0.0) as f64,
-                                    length_beats: length_beats.max(0.0) as f64,
-                                    velocity,
-                                    channel,
-                                    expression: n.expression.sanitized(),
-                                    // Resolved the same way playback resolves it,
-                                    // so a note with no marking of its own still
-                                    // follows the clip's direction lane.
-                                    articulation: timeline_state::resolve_note_articulation(
-                                        n,
-                                        articulations,
-                                    )
-                                    .and_then(voicebank_articulation_for),
-                                    pitch_points: build_note_pitch_points(
-                                        &trajectory,
-                                        notes,
-                                        &voice_of_note,
-                                        index,
-                                        length_beats,
-                                        seconds_per_beat,
-                                    ),
-                                }
-                            })
-                            .collect(),
-                        controllers: controller_lanes
-                            .iter()
-                            .filter(|lane| !lane.points.is_empty())
-                            .filter_map(|lane| {
-                                let controller = vst3_controller_number(lane.kind)?;
-                                Some(EngineMidiControllerLane {
-                                    controller,
-                                    channel: lane_channel,
-                                    points: lane
-                                        .points
-                                        .iter()
-                                        .map(|p| EngineMidiControllerPoint {
-                                            beat: p.beat.max(0.0) as f64,
-                                            value: p.value.clamp(0.0, 1.0),
-                                        })
-                                        .collect(),
-                                })
-                            })
-                            .collect(),
-                        mpe: track.routing.mpe,
-                    }
-                }))
-            })
-        })
-        .collect();
-    forget_unlisted_midi_clips(&midi_clips);
+    let midi_clips = build_engine_midi_clips(state);
 
     let mut snapshot = EngineProjectSnapshot {
         project_id: "futureboard-native".to_string(),
@@ -1541,11 +1620,12 @@ pub(super) fn apply_track_freezes(state: &TimelineState, snapshot: &mut EnginePr
 }
 
 /// The mix's spatial format and every channel's place in the room. Empty of
-/// sources in a stereo mix: nothing reads them there.
+/// sources in a stereo mix: nothing reads them there. Without a spatial-mix
+/// license the engine gets a stereo mix whatever the project saved.
 pub(super) fn build_engine_spatial_snapshot(
     state: &TimelineState,
 ) -> DirectAudio::types::EngineSpatialSnapshot {
-    let mix = state.spatial_mix;
+    let mix = state.spatial_mix.heard_here();
     DirectAudio::types::EngineSpatialSnapshot {
         format: mix.format,
         room: mix.room.sanitized(),
@@ -1557,6 +1637,7 @@ pub(super) fn build_engine_spatial_snapshot(
                 .map(|track| DirectAudio::types::EngineSpatialSource {
                     track_id: track.id.clone(),
                     params: track.spatial.sanitized(),
+                    keeps_inputs: track.spatial_keeps_inputs && track.track_type.is_routing(),
                 })
                 .collect()
         } else {
@@ -1635,21 +1716,26 @@ pub(super) fn log_engine_sync_snapshot(
 /// track sent to an external device has no instrument here; its selection
 /// goes out with its hardware MIDI instead.
 fn attach_midi_programs(state: &TimelineState, tracks: &mut [EngineTrackSnapshot]) {
+    let index_by_id = state.track_index_by_id();
     for track in &state.tracks {
         let selection = track.routing.program.sanitized();
         let Some(program) = selection.program else {
             continue;
         };
         let target = state
-            .effective_instrument_track_id(&track.id)
-            .unwrap_or_else(|| track.id.clone());
+            .effective_instrument_indexed(track, &index_by_id)
+            .unwrap_or(&track.id);
         // A Soundfont Multi takes the selection as the preset of the part
         // (`effective_soundfont_channels`), which also turns the channel into
         // a kit when it picks one; a raw program change could not.
-        if state.find_track(&target).is_some_and(|t| {
-            t.builtin_soundfont_player
-                && t.soundfont_mode == timeline_state::SoundfontPlayerMode::Multi
-        }) {
+        if index_by_id
+            .get(target)
+            .and_then(|&index| state.tracks.get(index))
+            .is_some_and(|t| {
+                t.builtin_soundfont_player
+                    && t.soundfont_mode == timeline_state::SoundfontPlayerMode::Multi
+            })
+        {
             continue;
         }
         let Some(snapshot) = tracks.iter_mut().find(|t| t.id == target) else {

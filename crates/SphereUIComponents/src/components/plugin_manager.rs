@@ -46,7 +46,7 @@ use crate::components::progress_dialog::{
     open_progress_dialog_window, open_standalone_progress_dialog_window, ProgressBarValue,
     ProgressDialogCancelCb, ProgressDialogOptions,
 };
-use crate::components::scroll_thumb::vertical_scrollbar_thumb;
+use crate::components::scrollbar::scroll_handle_scrollbar;
 use crate::components::text_input::{
     bind_mouse_selection, text_field_with_callbacks_and_ime, TextInputCallbacks, TextInputState,
 };
@@ -1037,7 +1037,10 @@ fn rail(
                         .track_scroll(scroll)
                         .child(col),
                 )
-                .child(vertical_scrollbar_thumb(thumb)),
+                .children(scroll_handle_scrollbar(
+                    "plugin-manager-sidebar-scrollbar",
+                    &thumb,
+                )),
         )
 }
 
@@ -1354,7 +1357,10 @@ fn table(
             .relative()
             .size_full()
             .child(list)
-            .child(vertical_scrollbar_thumb(thumb))
+            .children(scroll_handle_scrollbar(
+                "plugin-manager-list-scrollbar",
+                &thumb,
+            ))
             .into_any_element()
     };
 
@@ -2631,6 +2637,7 @@ mod tests {
             format: PluginFormat::Vst3,
             category: "EQ".to_string(),
             is_ara: false,
+            midi_output: false,
             raw_category: None,
             sub_categories: None,
             kind: PluginKind::Effect,
@@ -2710,5 +2717,112 @@ mod tests {
             .map(|p| p.name.as_str())
             .collect();
         assert_eq!(names, vec!["a-ready", "b-crashed"]);
+    }
+
+    /// The real window, with more plug-ins (and vendors) than its list and
+    /// side rail hold: dragging either bar's thumb scrolls it.
+    mod scrollbars {
+        use super::*;
+        use gpui::{
+            Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+            TestAppContext, VisualTestContext, WindowHandle,
+        };
+
+        fn open(cx: &mut TestAppContext) -> (WindowHandle<PluginManagerWindow>, VisualTestContext) {
+            let window = cx.open_window(gpui::size(px(1000.0), px(600.0)), |_, cx| {
+                let mut win = PluginManagerWindow::new(cx);
+                // Never read the user's cache.
+                win.initial_cache_loaded = true;
+                let plugins = (0..120)
+                    .map(|i| RegistryPlugin {
+                        vendor: format!("Vendor {i:03}"),
+                        ..plugin(
+                            &format!("plug-{i:03}"),
+                            PluginStatus::PresetReady,
+                            PluginScanStatus::Success,
+                        )
+                    })
+                    .collect();
+                win.state.apply_cache_load(plugins, 0, I18n::new("en"));
+                // The side rail lists the scan folders.
+                win.state.scan_paths = (0..40)
+                    .map(|i| PathBuf::from(format!("C:/Plugins/Folder {i:02}")))
+                    .collect();
+                win
+            });
+            cx.run_until_parked();
+            // The bars size themselves from the last layout: draw once more.
+            window.update(cx, |_, _, cx| cx.notify()).expect("window");
+            cx.run_until_parked();
+            let vcx = VisualTestContext::from_window(window.into(), cx);
+            (window, vcx)
+        }
+
+        fn drag(vcx: &mut VisualTestContext, from: Point<Pixels>, to: Point<Pixels>) {
+            vcx.simulate_event(MouseDownEvent {
+                button: MouseButton::Left,
+                position: from,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            });
+            for step in 1..=8 {
+                let position = from + (to - from) * (step as f32 / 8.0);
+                vcx.simulate_event(MouseMoveEvent {
+                    position,
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: Modifiers::default(),
+                });
+            }
+            vcx.simulate_event(MouseUpEvent {
+                button: MouseButton::Left,
+                position: to,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            });
+            vcx.run_until_parked();
+        }
+
+        /// Drags the thumb of the bar over `handle`'s region down 80 px and
+        /// returns how far the region scrolled.
+        fn drag_bar(
+            window: WindowHandle<PluginManagerWindow>,
+            vcx: &mut VisualTestContext,
+            handle: impl Fn(&PluginManagerWindow) -> ScrollHandle,
+        ) -> f32 {
+            let (bounds, max) = window
+                .update(vcx, |win, _, _| {
+                    let h = handle(win);
+                    (h.bounds(), f32::from(h.max_offset().y))
+                })
+                .expect("window");
+            assert!(max > 0.5, "the region must overflow for this test");
+            let x = f32::from(bounds.right()) - crate::components::scrollbar::THICKNESS * 0.5;
+            let y = f32::from(bounds.top()) + 6.0;
+            drag(
+                vcx,
+                gpui::point(px(x), px(y)),
+                gpui::point(px(x), px(y + 80.0)),
+            );
+            window
+                .update(vcx, |win, _, _| -f32::from(handle(win).offset().y))
+                .expect("window")
+        }
+
+        #[gpui::test]
+        fn the_plugin_list_thumb_drags(cx: &mut TestAppContext) {
+            let (window, mut vcx) = open(cx);
+            let scrolled = drag_bar(window, &mut vcx, |win| {
+                win.list_scroll.0.borrow().base_handle.clone()
+            });
+            assert!(scrolled > 80.0, "the list scrolled {scrolled} px");
+        }
+
+        #[gpui::test]
+        fn the_side_rail_thumb_drags(cx: &mut TestAppContext) {
+            let (window, mut vcx) = open(cx);
+            let scrolled = drag_bar(window, &mut vcx, |win| win.sidebar_scroll.clone());
+            assert!(scrolled > 80.0, "the side rail scrolled {scrolled} px");
+        }
     }
 }

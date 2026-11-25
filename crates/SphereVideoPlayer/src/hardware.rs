@@ -6,9 +6,15 @@
 //! which hands back NV12 / P010 planes in presentation order. Only the frame
 //! that is actually shown is converted to BGRA.
 //!
-//! H.264 and HEVC only. Anything else — another codec, another container, a
-//! machine with no accelerant for the stream — fails [`HardwareDecoder::open`]
-//! and the caller uses the software path.
+//! H.264, HEVC, AV1 and VP9. Anything else — another codec, another
+//! container, a machine with no accelerant for the stream — fails
+//! [`HardwareDecoder::open`] and the caller uses the software path.
+//!
+//! On Windows an accelerant offers a codec only when the GPU has the DXVA
+//! profile *and* Windows has a Media Foundation decoder for it. HEVC, AV1 and
+//! VP9 decoders ship as Microsoft Store extensions ("HEVC / AV1 / VP9 Video
+//! Extensions"); editions without them (LTSC) decode those in software even on
+//! a GPU that supports them.
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -63,6 +69,10 @@ impl HardwareDecoder {
         let (codec, config) = match t.codec() {
             Some(CodecConfig::Avc(c)) => (CodecFamily::H264, c.to_bytes()),
             Some(CodecConfig::Hevc(c)) => (CodecFamily::Hevc, c.to_bytes()),
+            // av1C: the decoder primes itself with its sequence header OBUs.
+            Some(CodecConfig::Av1(c)) => (CodecFamily::Av1, c.to_bytes()),
+            // VP9 carries everything in-band; vpcC is not needed.
+            Some(CodecConfig::Vp9(_)) => (CodecFamily::Vp9, Vec::new()),
             Some(other) => {
                 return Err(VideoError::Backend(format!(
                     "{} has no GPU decode path",
@@ -80,7 +90,7 @@ impl HardwareDecoder {
         let format = MediaFormat::encoded(codec, config, width, height);
         let (_flavor, decoder) = MediaRoster::roster()
             .video_decoder(&format, AccelPolicy::HardwareOnly)
-            .map_err(|e| backend("no GPU decoder", e))?;
+            .map_err(|e| backend(&format!("no GPU decoder{}", extension_hint(codec)), e))?;
 
         let duration_seconds = t.duration as f64 / f64::from(t.timescale);
         let frame_rate = if t.duration > 0 {
@@ -167,10 +177,10 @@ impl HardwareDecoder {
         let sync = t.sync_sample_before(index);
         let target = self.pts_us(t.presentation_pts(index).unwrap_or(0));
 
-        if let Some((pts, frame)) = &self.current {
-            if *pts == target {
-                return Ok(Arc::clone(frame));
-            }
+        if let Some((pts, frame)) = &self.current
+            && *pts == target
+        {
+            return Ok(Arc::clone(frame));
         }
 
         // Read forward when the target is ahead and no keyframe lies between
@@ -205,14 +215,15 @@ impl HardwareDecoder {
         }
 
         // The last picture at or before the target, else the first after it.
-        let chosen = match self.pending.iter().rposition(|p| p.pts <= target) {
-            Some(i) => i,
-            None => 0,
-        };
+        let chosen = self
+            .pending
+            .iter()
+            .rposition(|p| p.pts <= target)
+            .unwrap_or_default();
         let picture = self
             .pending
             .drain(..=chosen)
-            .last()
+            .next_back()
             .ok_or(VideoError::EndOfStream)?;
         self.floor_pts = Some(picture.pts);
 
@@ -260,6 +271,20 @@ impl HardwareDecoder {
             timestamp_seconds: picture.pts as f64 / 1_000_000.0,
             bgra,
         })
+    }
+}
+
+/// What a Windows machine needs installed before its GPU can take `codec`
+/// (see the module docs), for the "why is this in software" log line.
+fn extension_hint(codec: CodecFamily) -> &'static str {
+    if !cfg!(windows) {
+        return "";
+    }
+    match codec {
+        CodecFamily::Hevc => " (needs the Microsoft HEVC Video Extensions)",
+        CodecFamily::Av1 => " (needs the Microsoft AV1 Video Extension)",
+        CodecFamily::Vp9 => " (needs the Microsoft VP9 Video Extensions)",
+        _ => "",
     }
 }
 
@@ -378,12 +403,12 @@ fn semi_planar_to_bgra(src: &SemiPlanar<'_>, width: usize, matrix: YuvMatrix, ou
         .for_each(|(row, line)| {
             let y_row = row * src.y_stride;
             let uv_row = (row / 2) * src.uv_stride;
-            for (x, px) in line.chunks_exact_mut(4).enumerate() {
+            for (x, px) in line.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 let y = SemiPlanar::sample(src.y, y_row + x * bytes, bytes);
                 let c = uv_row + (x / 2) * 2 * bytes;
                 let cb = SemiPlanar::sample(src.uv, c, bytes);
                 let cr = SemiPlanar::sample(src.uv, c + bytes, bytes);
-                px.copy_from_slice(&matrix.to_bgra(y, cb, cr));
+                *px = matrix.to_bgra(y, cb, cr);
             }
         });
 }
@@ -465,12 +490,13 @@ mod tests {
         assert!(out[0] >= 250 && out[1] >= 250 && out[2] >= 250, "{out:?}");
     }
 
-    /// When this machine has a GPU decoder for H.264, its picture must match
-    /// the software decode of the same frame (same matrix, same crop).
-    #[test]
-    fn gpu_and_software_agree_on_a_real_clip() {
+    /// When this machine has a GPU decoder for the clip's codec, its picture
+    /// must match the software decode of the same frame (same matrix, same
+    /// crop). Skips where the machine has none.
+    fn assert_gpu_matches_software(fixture: &str) {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../mkff/testdata/tiny_baseline_64x64.mp4");
+            .join("../mkff/testdata")
+            .join(fixture);
         let mut gpu = match HardwareDecoder::open(&path) {
             Ok(d) => d,
             Err(e) => {
@@ -504,6 +530,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn gpu_and_software_agree_on_h264() {
+        assert_gpu_matches_software("tiny_baseline_64x64.mp4");
+    }
+
+    /// AV1 needs the GPU's AV1 profile and (on Windows) the AV1 Video
+    /// Extension; the clip that motivated it played at ~25 fps in software.
+    #[test]
+    fn gpu_and_software_agree_on_av1() {
+        assert_gpu_matches_software("codecs/av1_aac.mp4");
+    }
+
     const W: u32 = 256;
     const H: u32 = 96;
     const FPS: u32 = 30;
@@ -516,10 +554,10 @@ mod tests {
     fn moving_bar(i: u64) -> Vec<u8> {
         let x0 = (i * BAR_STEP) as usize;
         let mut rgba = vec![0u8; (W * H * 4) as usize];
-        for (p, px) in rgba.chunks_exact_mut(4).enumerate() {
+        for (p, px) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let x = p % W as usize;
             let v = if (x0..x0 + 6).contains(&x) { 235 } else { 40 };
-            px.copy_from_slice(&[v, v, v, 255]);
+            *px = [v, v, v, 255];
         }
         rgba
     }
@@ -529,7 +567,9 @@ mod tests {
         let w = frame.width as usize;
         let row = &frame.bgra[(frame.height as usize / 2) * w * 4..][..w * 4];
         let x = row
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .position(|p| p[1] > 140)
             .expect("no bar");
         x as u64 / BAR_STEP

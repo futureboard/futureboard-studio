@@ -478,7 +478,12 @@ EmbedEditorRuntimeDetection embed_detect_editor_runtime(const std::string& plugi
   const std::wstring arch = embed_webview_runtime_arch_subdir();
 
   static const wchar_t* kBaseRel[] = {
+#if defined(_WIN64)
       L"", L"Contents\\Resources", L"Contents\\x86_64-win",
+#else
+      // The 32-bit plug-in bridge loads a bundle's 32-bit build.
+      L"", L"Contents\\Resources", L"Contents\\x86-win",
+#endif
       L"Contents\\Resources\\WebView2", L"Contents\\Resources\\CEF",
       L"Contents\\Resources\\Chromium", L"Contents\\Resources\\Browser",
       L"Contents\\Resources\\runtimes", L"Contents\\Resources\\bin",

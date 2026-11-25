@@ -47,6 +47,9 @@ pub enum PopupItem {
         shortcut: Option<String>,
         checked: bool,
         enabled: bool,
+        /// The glyph drawn at the row's start, where the platform can draw
+        /// one (Windows, once a rasteriser is registered).
+        icon: Option<MenuIcon>,
     },
     /// A group caption: shown, never chosen.
     Header(String),
@@ -62,6 +65,52 @@ pub enum PopupItem {
 pub type PopupResultCb = Box<dyn FnOnce(Option<String>, &mut Window, &mut App) + 'static>;
 
 /// Whether this platform shows popup menus natively.
+/// A menu row's glyph: an SVG, drawn in `tint` (RGB).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MenuIcon {
+    pub svg: &'static str,
+    pub tint: [u8; 3],
+}
+
+/// Turns an SVG into a `size`×`size` coverage mask, one byte per pixel.
+type IconRasterizer = Box<dyn Fn(&'static str, u32) -> Option<Vec<u8>>>;
+
+thread_local! {
+    /// Set by the app (`set_icon_rasterizer`). A crate that mounts this file
+    /// without one simply shows no icons.
+    static ICON_RASTERIZER: std::cell::RefCell<Option<IconRasterizer>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install what draws menu icons. Menus are built on the UI thread, so it
+/// lives there. A later call replaces it.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub fn set_icon_rasterizer(rasterize: impl Fn(&'static str, u32) -> Option<Vec<u8>> + 'static) {
+    ICON_RASTERIZER.with(|slot| *slot.borrow_mut() = Some(Box::new(rasterize)));
+}
+
+/// Whether a rasteriser is installed.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub fn has_icon_rasterizer() -> bool {
+    ICON_RASTERIZER.with(|slot| slot.borrow().is_some())
+}
+
+/// `icon` as `size`×`size` premultiplied BGRA pixels, rows top to bottom.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn icon_pixels(icon: &MenuIcon, size: u32) -> Option<Vec<u8>> {
+    let mask = ICON_RASTERIZER.with(|slot| slot.borrow().as_ref()?(icon.svg, size))?;
+    if mask.len() != (size * size) as usize {
+        return None;
+    }
+    let [r, g, b] = icon.tint;
+    let mut pixels = Vec::with_capacity(mask.len() * 4);
+    for alpha in mask {
+        let premultiply = |channel: u8| ((channel as u16 * alpha as u16 + 127) / 255) as u8;
+        pixels.extend_from_slice(&[premultiply(b), premultiply(g), premultiply(r), alpha]);
+    }
+    Some(pixels)
+}
+
 pub fn available() -> bool {
     cfg!(any(target_os = "windows", target_os = "macos"))
 }
@@ -144,13 +193,17 @@ mod win32 {
     use gpui::{App, Bounds, Pixels, Point, Window};
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-    use windows::Win32::Graphics::Gdi::ClientToScreen;
+    use windows::Win32::Graphics::Gdi::{
+        ClientToScreen, CreateDIBSection, DeleteObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+        DIB_RGB_COLORS, HBITMAP,
+    };
     use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreatePopupMenu, DestroyMenu, GetAncestor, PostMessageW, SetForegroundWindow,
-        TrackPopupMenuEx, GA_ROOT, HMENU, MENU_ITEM_FLAGS, MF_CHECKED, MF_DISABLED, MF_GRAYED,
-        MF_POPUP, MF_SEPARATOR, MF_STRING, TPMPARAMS, TPM_LEFTALIGN, TPM_RETURNCMD,
-        TPM_RIGHTBUTTON, TPM_TOPALIGN, TPM_VERTICAL, WM_APP, WM_NCDESTROY,
+        SetMenuItemInfoW, TrackPopupMenuEx, GA_ROOT, HMENU, MENUITEMINFOW, MENU_ITEM_FLAGS,
+        MF_CHECKED, MF_DISABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MIIM_BITMAP,
+        TPMPARAMS, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN, TPM_VERTICAL,
+        WM_APP, WM_NCDESTROY,
     };
 
     use super::{row_text, PopupItem, PopupResultCb};
@@ -200,6 +253,8 @@ mod win32 {
     /// A menu waiting for its window to take [`WM_FB_POPUP`].
     struct Request {
         items: Vec<PopupItem>,
+        /// The window's scale factor: icons are drawn at its DPI.
+        scale: f32,
         /// Screen point, physical pixels.
         at: POINT,
         /// Screen rectangle to keep clear, physical pixels.
@@ -283,6 +338,7 @@ mod win32 {
                 key,
                 Request {
                     items,
+                    scale,
                     at,
                     exclude,
                     reply: reply.clone(),
@@ -354,7 +410,9 @@ mod win32 {
     /// Builds the menu, tracks it until it closes, returns the choice.
     fn track(hwnd: HWND, request: &Request) -> Option<String> {
         let mut commands: Vec<String> = Vec::new();
-        let menu = build(&request.items, &mut commands)?;
+        let mut bitmaps: Vec<HBITMAP> = Vec::new();
+        let icon_px = (MENU_ICON_PX * request.scale).round().max(1.0) as u32;
+        let menu = build(&request.items, &mut commands, icon_px, &mut bitmaps)?;
         crate::native_win32_menu::theme_popups_for(hwnd);
         let mut params = TPMPARAMS {
             cbSize: std::mem::size_of::<TPMPARAMS>() as u32,
@@ -377,6 +435,10 @@ mod win32 {
                 request.exclude.is_some().then_some(&mut params as *mut _),
             );
             let _ = DestroyMenu(menu);
+            // The menu no longer refers to them.
+            for bitmap in bitmaps {
+                let _ = DeleteObject(bitmap.into());
+            }
             picked.0 as usize
         };
         picked
@@ -388,9 +450,73 @@ mod win32 {
         text.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
+    /// A menu icon's edge at 100 % scale: the size Windows draws a menu
+    /// row's bitmap at.
+    const MENU_ICON_PX: f32 = 16.0;
+
+    /// Test hook: build `items` with icons of `icon_px`, report whether every
+    /// command row got its bitmap, and free everything.
+    #[cfg(test)]
+    pub(super) fn builds_with_bitmaps(items: &[PopupItem], icon_px: u32) -> bool {
+        let mut commands = Vec::new();
+        let mut bitmaps = Vec::new();
+        let Some(menu) = build(items, &mut commands, icon_px, &mut bitmaps) else {
+            return false;
+        };
+        let rows = items
+            .iter()
+            .filter(|item| matches!(item, PopupItem::Command { icon: Some(_), .. }))
+            .count();
+        // SAFETY: freeing the menu and bitmaps built just above.
+        unsafe {
+            let _ = DestroyMenu(menu);
+            for bitmap in &bitmaps {
+                let _ = DeleteObject((*bitmap).into());
+            }
+        }
+        rows > 0 && bitmaps.len() == rows
+    }
+
+    /// `icon` as a 32-bit premultiplied bitmap Windows can draw beside a row,
+    /// or `None` without a rasteriser. The caller deletes it.
+    fn icon_bitmap(icon: &super::MenuIcon, size: u32) -> Option<HBITMAP> {
+        let pixels = super::icon_pixels(icon, size)?;
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: size as i32,
+                // Negative: rows top to bottom, as the pixels are.
+                biHeight: -(size as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: a DIB section of exactly `pixels.len()` bytes, filled once
+        // while this function still owns it.
+        unsafe {
+            let bitmap = CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+            if bits.is_null() {
+                let _ = DeleteObject(bitmap.into());
+                return None;
+            }
+            std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits as *mut u8, pixels.len());
+            Some(bitmap)
+        }
+    }
+
     /// One popup level. Its submenus are owned by it and go with
-    /// `DestroyMenu` on the root.
-    fn build(items: &[PopupItem], commands: &mut Vec<String>) -> Option<HMENU> {
+    /// `DestroyMenu` on the root. Icon bitmaps are pushed to `bitmaps`, for
+    /// the caller to delete once the menu is gone.
+    fn build(
+        items: &[PopupItem],
+        commands: &mut Vec<String>,
+        icon_px: u32,
+        bitmaps: &mut Vec<HBITMAP>,
+    ) -> Option<HMENU> {
         // SAFETY: creating and filling a menu this function owns.
         unsafe {
             let menu = CreatePopupMenu().ok()?;
@@ -420,6 +546,7 @@ mod win32 {
                         shortcut,
                         checked,
                         enabled,
+                        icon,
                     } => {
                         commands.push(command.clone());
                         let id = FIRST_ID + commands.len() - 1;
@@ -432,6 +559,18 @@ mod win32 {
                         }
                         let text = wide(&row_text(label, shortcut.as_deref()));
                         let _ = AppendMenuW(menu, flags, id, PCWSTR(text.as_ptr()));
+                        if let Some(bitmap) =
+                            icon.as_ref().and_then(|icon| icon_bitmap(icon, icon_px))
+                        {
+                            let info = MENUITEMINFOW {
+                                cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+                                fMask: MIIM_BITMAP,
+                                hbmpItem: bitmap,
+                                ..Default::default()
+                            };
+                            let _ = SetMenuItemInfoW(menu, id as u32, false, &info);
+                            bitmaps.push(bitmap);
+                        }
                         last_was_separator = false;
                     }
                     PopupItem::Submenu {
@@ -439,7 +578,7 @@ mod win32 {
                         enabled,
                         items,
                     } => {
-                        let Some(child) = build(items, commands) else {
+                        let Some(child) = build(items, commands, icon_px, bitmaps) else {
                             continue;
                         };
                         let mut flags: MENU_ITEM_FLAGS = MF_POPUP;
@@ -467,6 +606,49 @@ mod appkit;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A rasterised icon is the mask in the tint, premultiplied, as BGRA.
+    #[test]
+    fn an_icon_is_its_mask_in_the_tint() {
+        set_icon_rasterizer(|_, size| {
+            let mut mask = vec![0u8; (size * size) as usize];
+            mask[0] = 255;
+            mask[1] = 128;
+            Some(mask)
+        });
+        let icon = MenuIcon {
+            svg: "<svg/>",
+            tint: [200, 100, 50],
+        };
+        let pixels = icon_pixels(&icon, 4).expect("pixels");
+        assert_eq!(pixels.len(), 4 * 4 * 4);
+        assert_eq!(&pixels[0..4], &[50, 100, 200, 255]);
+        assert_eq!(&pixels[4..8], &[25, 50, 100, 128]);
+        assert_eq!(&pixels[8..12], &[0, 0, 0, 0]);
+        // A mask of the wrong size is refused rather than misdrawn.
+        set_icon_rasterizer(|_, _| Some(vec![255; 3]));
+        assert!(icon_pixels(&icon, 4).is_none());
+    }
+
+    /// Windows gets a real bitmap for the row.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn an_icon_becomes_a_menu_bitmap() {
+        set_icon_rasterizer(|_, size| Some(vec![255; (size * size) as usize]));
+        let icons = [MenuIcon {
+            svg: "<svg/>",
+            tint: [255, 255, 255],
+        }];
+        let items = vec![PopupItem::Command {
+            label: "Delete".into(),
+            command: "clip:delete".into(),
+            shortcut: None,
+            checked: false,
+            enabled: true,
+            icon: Some(icons[0]),
+        }];
+        assert!(win32::builds_with_bitmaps(&items, 16));
+    }
 
     #[test]
     fn a_literal_ampersand_is_not_a_mnemonic() {

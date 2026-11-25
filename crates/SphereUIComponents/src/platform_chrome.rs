@@ -5,7 +5,8 @@
 //! scattering platform conditionals.
 
 use gpui::{
-    point, px, Pixels, Point, TitlebarOptions, WindowDecorations, WindowKind, WindowOptions,
+    point, px, Pixels, Point, TitlebarOptions, WindowBackgroundAppearance, WindowDecorations,
+    WindowKind, WindowOptions,
 };
 
 /// Product name shared by native window chrome and OS-level window metadata.
@@ -297,10 +298,59 @@ pub fn welcome_native_frame() -> bool {
     native_tool_window_frame()
 }
 
+/// First Windows build with `DWMWA_SYSTEMBACKDROP_TYPE`, the DWM attribute
+/// GPUI sets for Mica (Windows 11 22H2).
+#[cfg(target_os = "windows")]
+const WINDOWS_MICA_MIN_BUILD: u32 = 22_621;
+
+/// The material behind the Welcome window's sidebar.
+///
+/// - **Windows 11 22H2+:** Mica. GPUI renders through DirectComposition with a
+///   premultiplied-alpha swap chain, so every transparent pixel the window
+///   draws shows the backdrop DWM puts behind it. Not where DirectComposition
+///   is turned off (`GPUI_DISABLE_DIRECT_COMPOSITION`), or on an older build,
+///   where a transparent pixel would show the desktop itself.
+/// - **macOS:** the system blur, an `NSVisualEffectView` behind the content.
+/// - **Elsewhere:** none; the window stays opaque.
+pub fn welcome_backdrop() -> WindowBackgroundAppearance {
+    #[cfg(target_os = "windows")]
+    {
+        static BACKDROP: std::sync::OnceLock<WindowBackgroundAppearance> =
+            std::sync::OnceLock::new();
+        *BACKDROP.get_or_init(|| {
+            let composition_off = std::env::var("GPUI_DISABLE_DIRECT_COMPOSITION")
+                .is_ok_and(|value| value == "true" || value == "1");
+            let mica = crate::components::title_bar::windows_build_number()
+                .is_some_and(|build| build >= WINDOWS_MICA_MIN_BUILD);
+            if mica && !composition_off {
+                WindowBackgroundAppearance::MicaBackdrop
+            } else {
+                WindowBackgroundAppearance::Opaque
+            }
+        })
+    }
+    #[cfg(target_os = "macos")]
+    {
+        WindowBackgroundAppearance::Blurred
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        WindowBackgroundAppearance::Opaque
+    }
+}
+
+/// Whether the Welcome window opens over a backdrop, so its sidebar is drawn
+/// see-through. See [`welcome_backdrop`].
+pub fn welcome_has_backdrop() -> bool {
+    welcome_backdrop() != WindowBackgroundAppearance::Opaque
+}
+
 /// The Welcome window's options: [`studio_window_options`], with the OS caption
-/// titled after the app where [`welcome_native_frame`] holds.
+/// titled after the app where [`welcome_native_frame`] holds, over the
+/// [`welcome_backdrop`].
 pub fn welcome_window_options() -> WindowOptions {
     let mut options = studio_window_options();
+    options.window_background = welcome_backdrop();
     if welcome_native_frame() {
         options.titlebar = Some(TitlebarOptions {
             title: Some(APP_WINDOW_TITLE.into()),

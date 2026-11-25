@@ -81,6 +81,14 @@ impl TimelineState {
             insert_map.push((slot.id.clone(), copy_id.clone()));
             inserts.push(slot.copy_as(copy_id, states.get(&slot.id).cloned()));
         }
+        // The MIDI FX chain comes along; a plug-in in it is a new instance
+        // too, under a fresh id, and is loaded with the inserts.
+        let mut midi_fx = source.midi_fx.clone();
+        for plugin in midi_fx.iter_mut().filter_map(|fx| fx.plugin.as_mut()) {
+            let copy_id = self.next_insert_slot_id_for(&track_id);
+            insert_map.push((plugin.id.clone(), copy_id.clone()));
+            *plugin = plugin.copy_as(copy_id, states.get(&plugin.id).cloned());
+        }
         let new_insert_id = |old: &str| {
             insert_map
                 .iter()
@@ -189,6 +197,7 @@ impl TimelineState {
             automation_lanes,
             selected_automation_target,
             inserts,
+            midi_fx,
             instrument_plugin_instance_id,
             sends,
             ..source

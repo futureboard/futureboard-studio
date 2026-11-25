@@ -45,11 +45,13 @@ impl Drop for FontFile {
 
 fn soundfont_track(id: &str, font: &FontFile, preset: (i32, i32)) -> EngineTrackSnapshot {
     EngineTrackSnapshot {
+        vca_gain: 1.0,
         midi_programs: Vec::new(),
         id: id.to_string(),
         track_type: "instrument".to_string(),
         volume: 1.0,
         pan: 0.0,
+        dual_pan: Default::default(),
         muted: false,
         solo: false,
         armed: false,
@@ -57,6 +59,7 @@ fn soundfont_track(id: &str, font: &FontFile, preset: (i32, i32)) -> EngineTrack
         input_source: Default::default(),
         preview_mode: "stereo".to_string(),
         output_track_id: None,
+        midi_fx: Vec::new(),
         inserts: Vec::new(),
         sends: Vec::new(),
         automation_lanes: Vec::new(),
@@ -77,11 +80,13 @@ fn soundfont_track(id: &str, font: &FontFile, preset: (i32, i32)) -> EngineTrack
 
 fn master_track() -> EngineTrackSnapshot {
     EngineTrackSnapshot {
+        vca_gain: 1.0,
         midi_programs: Vec::new(),
         id: "master".to_string(),
         track_type: "master".to_string(),
         volume: 1.0,
         pan: 0.0,
+        dual_pan: Default::default(),
         muted: false,
         solo: false,
         armed: false,
@@ -89,6 +94,7 @@ fn master_track() -> EngineTrackSnapshot {
         input_source: Default::default(),
         preview_mode: "stereo".to_string(),
         output_track_id: None,
+        midi_fx: Vec::new(),
         inserts: Vec::new(),
         sends: Vec::new(),
         automation_lanes: Vec::new(),

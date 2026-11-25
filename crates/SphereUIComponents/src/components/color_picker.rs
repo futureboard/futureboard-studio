@@ -833,10 +833,39 @@ pub fn color_picker_swatch_field(
     hex_field_callbacks: TextInputCallbacks,
     callbacks: ColorPickerCallbacks,
 ) -> impl IntoElement {
+    color_picker_auto_swatch_field(
+        id,
+        edge,
+        glyph,
+        color::auto_color_for_index(0),
+        state,
+        presets,
+        placement,
+        hex_focused,
+        hex_field_callbacks,
+        callbacks,
+    )
+}
+
+/// [`color_picker_swatch_field`] for an object whose Auto colour is already
+/// known — a track about to be created gets the palette colour for its index
+/// — so the swatch shows that colour while the picker is on Auto rather than
+/// the palette's first.
+#[allow(clippy::too_many_arguments)]
+pub fn color_picker_auto_swatch_field(
+    id: impl Into<gpui::ElementId>,
+    edge: f32,
+    glyph: Option<&'static str>,
+    auto_color: Rgba,
+    state: &ColorPickerState,
+    presets: &[Rgba],
+    placement: ColorPickerPlacement,
+    hex_focused: bool,
+    hex_field_callbacks: TextInputCallbacks,
+    callbacks: ColorPickerCallbacks,
+) -> impl IntoElement {
     let value = state.value();
-    let color = value
-        .color
-        .unwrap_or_else(|| color::auto_color_for_index(0));
+    let color = value.color.unwrap_or(auto_color);
     let on_toggle = callbacks.on_toggle.clone();
     let hover = Colors::composite(color, Colors::state_hover());
     let trigger = div()

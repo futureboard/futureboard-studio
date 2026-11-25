@@ -1,7 +1,8 @@
 //! Project Settings window.
 //!
 //! Everything here belongs to *the open project*, not to the application:
-//! tempo, meter, key, and the sample rate the project is worked at. Application
+//! tempo, meter, key, the sample rate the project is worked at, and the
+//! metadata its exports are tagged with. Application
 //! preferences (themes, keymaps, plugin folders, audio devices, the defaults
 //! used when creating a *new* project) stay in the Settings window — the two
 //! were previously reached through the same surface, which made "Project
@@ -11,7 +12,9 @@
 //! through callbacks, so `TimelineState` remains the owner of the project values
 //! shown. Nothing here mutates project state directly and
 //! nothing here caches an edit: a value changes on screen because the studio
-//! accepted it and pushed a new snapshot.
+//! accepted it and pushed a new snapshot. The one draft is the text of a
+//! metadata field while it has focus; it is sent when the field loses focus
+//! or on Enter, and Escape puts the stored value back.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -20,8 +23,8 @@ use gpui::prelude::FluentBuilder;
 use gpui::{
     div, px, size, App, AppContext, Bounds, Context, DragMoveEvent, FocusHandle,
     InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render,
-    StatefulInteractiveElement, Styled, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowHandle, WindowKind,
+    StatefulInteractiveElement, Styled, Subscription, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowHandle, WindowKind,
 };
 
 use crate::components::app_chrome::{next_bpm_drag_id, BpmDrag, BpmDragSample};
@@ -34,10 +37,14 @@ use crate::components::settings_layout::{
     settings_daw_row_with_description, settings_section_card, settings_section_hint,
     settings_section_title, settings_status_badge, settings_value_readout,
 };
+use crate::components::text_input::{
+    bind_mouse_selection, text_field_with_callbacks_and_ime, TextInputAction, TextInputState,
+};
 use crate::components::timeline::timeline_state::{
     MidiScale, ScaleKind, ScaleRoot, TimeDisplayFormat, TimecodeRate,
 };
 use crate::components::title_bar::external_window_titlebar;
+use crate::project::{ProjectMetadata, ProjectMetadataField};
 use crate::theme::{self, radius, size, space, typography, Colors};
 use crate::window_position::{apply_owner_display, centered_window_bounds};
 
@@ -91,6 +98,12 @@ pub struct ProjectSettingsSnapshot {
     pub timecode_rate: TimecodeRate,
     /// Stereo, binaural, or a speaker layout, and the room it is heard in.
     pub spatial_mix: crate::components::timeline::timeline_state::SpatialMix,
+    /// Whether this machine's license grants spatial mixing. Without it the
+    /// spatial formats are offered as Professional features and a spatial
+    /// project plays as stereo.
+    pub spatial_licensed: bool,
+    /// Tags written into exported files.
+    pub metadata: ProjectMetadata,
     pub track_count: usize,
 }
 
@@ -110,6 +123,8 @@ impl Default for ProjectSettingsSnapshot {
             time_display_format: TimeDisplayFormat::default(),
             timecode_rate: TimecodeRate::default(),
             spatial_mix: Default::default(),
+            spatial_licensed: false,
+            metadata: ProjectMetadata::default(),
             track_count: 0,
         }
     }
@@ -133,6 +148,9 @@ pub struct ProjectSettingsCallbacks {
     pub on_set_spatial_mix: Arc<
         dyn Fn(crate::components::timeline::timeline_state::SpatialMix, &mut App) + Send + Sync,
     >,
+    /// One metadata field's new text, sent when its field loses focus or on
+    /// Enter.
+    pub on_set_metadata_field: Arc<dyn Fn(ProjectMetadataField, String, &mut App) + Send + Sync>,
     pub on_close: Arc<dyn Fn(&mut Window, &mut App) + Send + Sync>,
 }
 
@@ -150,29 +168,193 @@ pub struct ProjectSettingsWindow {
     snapshot: ProjectSettingsSnapshot,
     callbacks: ProjectSettingsCallbacks,
     open_menu: Option<OpenMenu>,
+    /// One field per [`ProjectMetadataField::ALL`] entry, in that order.
+    metadata_inputs: Vec<TextInputState>,
+    /// Sends a metadata field's text when it loses focus.
+    _metadata_blur: Vec<Subscription>,
+}
+
+/// Element id of a metadata field.
+fn metadata_input_id(field: ProjectMetadataField) -> &'static str {
+    match field {
+        ProjectMetadataField::Title => "project-settings-metadata-title",
+        ProjectMetadataField::Artist => "project-settings-metadata-artist",
+        ProjectMetadataField::Album => "project-settings-metadata-album",
+        ProjectMetadataField::AlbumArtist => "project-settings-metadata-album-artist",
+        ProjectMetadataField::Composer => "project-settings-metadata-composer",
+        ProjectMetadataField::Genre => "project-settings-metadata-genre",
+        ProjectMetadataField::Year => "project-settings-metadata-year",
+        ProjectMetadataField::TrackNumber => "project-settings-metadata-track-number",
+        ProjectMetadataField::Comment => "project-settings-metadata-comment",
+        ProjectMetadataField::Copyright => "project-settings-metadata-copyright",
+        ProjectMetadataField::Isrc => "project-settings-metadata-isrc",
+    }
+}
+
+/// Format hint shown in an empty metadata field, where one helps.
+fn metadata_placeholder(field: ProjectMetadataField) -> Option<&'static str> {
+    match field {
+        ProjectMetadataField::Year => Some("YYYY"),
+        ProjectMetadataField::TrackNumber => Some("e.g. 3 or 3/12"),
+        ProjectMetadataField::Isrc => Some("e.g. GBAYE2600001"),
+        _ => None,
+    }
+}
+
+/// Fields a WAV file has no agreed RIFF INFO tag for, so only FLAC and Opus
+/// exports carry them.
+fn metadata_not_in_wav(field: ProjectMetadataField) -> bool {
+    matches!(
+        field,
+        ProjectMetadataField::AlbumArtist
+            | ProjectMetadataField::Composer
+            | ProjectMetadataField::Isrc
+    )
 }
 
 impl ProjectSettingsWindow {
     fn new(
         snapshot: ProjectSettingsSnapshot,
         callbacks: ProjectSettingsCallbacks,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let mut metadata_inputs = Vec::with_capacity(ProjectMetadataField::ALL.len());
+        let mut metadata_blur = Vec::with_capacity(ProjectMetadataField::ALL.len());
+        for (index, field) in ProjectMetadataField::ALL.into_iter().enumerate() {
+            let mut input = TextInputState::new(metadata_input_id(field), cx.focus_handle())
+                .with_accessible_label(field.label());
+            if let Some(placeholder) = metadata_placeholder(field) {
+                input = input.with_placeholder(placeholder);
+            }
+            input.set_value(snapshot.metadata.get(field));
+            metadata_blur.push(cx.on_blur(
+                &input.focus_handle,
+                window,
+                move |this, _window, cx| {
+                    this.commit_metadata_field(index, cx);
+                },
+            ));
+            metadata_inputs.push(input);
+        }
         Self {
             focus_handle: cx.focus_handle(),
             snapshot,
             callbacks,
             open_menu: None,
+            metadata_inputs,
+            _metadata_blur: metadata_blur,
         }
     }
 
     /// Adopt a snapshot pushed by the studio. Returns `true` when anything
-    /// changed, so the caller only notifies on a real update.
-    pub fn set_snapshot(&mut self, snapshot: ProjectSettingsSnapshot) -> bool {
-        if self.snapshot == snapshot {
-            return false;
+    /// changed, so the caller only notifies on a real update. A metadata field
+    /// being typed into keeps its draft; every other field shows the stored
+    /// value.
+    pub fn set_snapshot(&mut self, snapshot: ProjectSettingsSnapshot, window: &Window) -> bool {
+        let mut changed = false;
+        for (index, field) in ProjectMetadataField::ALL.into_iter().enumerate() {
+            let input = &mut self.metadata_inputs[index];
+            let stored = snapshot.metadata.get(field);
+            if !input.is_focused(window) && input.value != stored {
+                input.set_value(stored);
+                changed = true;
+            }
         }
-        self.snapshot = snapshot;
+        if self.snapshot != snapshot {
+            self.snapshot = snapshot;
+            changed = true;
+        }
+        changed
+    }
+
+    /// Send metadata field `index`'s text to the studio, unless it is what is
+    /// stored already (surrounding whitespace aside), in which case the field
+    /// just shows the stored value again.
+    fn commit_metadata_field(&mut self, index: usize, cx: &mut Context<Self>) {
+        let field = ProjectMetadataField::ALL[index];
+        let value = self.metadata_inputs[index].value.trim().to_string();
+        if value == self.snapshot.metadata.get(field) {
+            if self.metadata_inputs[index].value != value {
+                self.metadata_inputs[index].set_value(value);
+                cx.notify();
+            }
+            return;
+        }
+        // The studio defers its work, so this cannot re-enter the window.
+        (self.callbacks.on_set_metadata_field)(field, value, cx);
+    }
+
+    /// Send the metadata field that has focus, if one does. Closing the window
+    /// does not blur it first.
+    fn commit_focused_metadata(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if let Some(index) = self.focused_metadata_index(window) {
+            self.commit_metadata_field(index, cx);
+        }
+    }
+
+    fn focused_metadata_index(&self, window: &Window) -> Option<usize> {
+        self.metadata_inputs
+            .iter()
+            .position(|input| input.is_focused(window))
+    }
+
+    /// The field the OS input handler talks to: the focused one, else the
+    /// first (the handler is only registered while a field has focus).
+    fn ime_field(&mut self, window: &Window) -> &mut TextInputState {
+        let index = self.focused_metadata_index(window).unwrap_or(0);
+        &mut self.metadata_inputs[index]
+    }
+
+    /// Keys for a focused metadata field. Returns `false` when no field has
+    /// focus. Printable text and IME composition arrive through the OS input
+    /// handler (`EntityInputHandler` below), so character keys keep
+    /// propagating: on Windows a handled KeyDown never becomes the WM_CHAR
+    /// that carries the text.
+    fn metadata_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(index) = self.focused_metadata_index(window) else {
+            return false;
+        };
+        if event.keystroke.key == "tab" {
+            // Next or previous field; the one left behind sends on blur.
+            cx.stop_propagation();
+            let count = self.metadata_inputs.len();
+            let next = if event.keystroke.modifiers.shift {
+                (index + count - 1) % count
+            } else {
+                (index + 1) % count
+            };
+            self.metadata_inputs[next].select_all();
+            self.metadata_inputs[next].focus_handle.focus(window, cx);
+            cx.notify();
+            return true;
+        }
+        match self.metadata_inputs[index].handle_key_ime(event, Some(cx)) {
+            TextInputAction::Submit => {
+                // Leaving the field sends it (on blur).
+                cx.stop_propagation();
+                self.focus_handle.focus(window, cx);
+            }
+            TextInputAction::Cancel => {
+                // Escape puts the stored value back and leaves the field; the
+                // window stays open.
+                cx.stop_propagation();
+                let stored = self
+                    .snapshot
+                    .metadata
+                    .get(ProjectMetadataField::ALL[index])
+                    .to_string();
+                self.metadata_inputs[index].set_value(stored);
+                self.focus_handle.focus(window, cx);
+            }
+            TextInputAction::Consumed | TextInputAction::Pass => {}
+        }
+        cx.notify();
         true
     }
 
@@ -187,9 +369,18 @@ impl ProjectSettingsWindow {
 }
 
 impl Render for ProjectSettingsWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let snapshot = self.snapshot.clone();
-        let on_close = self.callbacks.on_close.clone();
+        // Closing sends the metadata field being typed into first.
+        let on_close: Arc<dyn Fn(&mut Window, &mut App) + Send + Sync> = {
+            let on_close = self.callbacks.on_close.clone();
+            let this = cx.entity().downgrade();
+            Arc::new(move |window, cx| {
+                let _ = this.update(cx, |this, cx| this.commit_focused_metadata(window, cx));
+                on_close(window, cx);
+            })
+        };
+        let on_close_titlebar = on_close.clone();
 
         let mut root = div()
             .relative()
@@ -201,6 +392,9 @@ impl Render for ProjectSettingsWindow {
             .font(theme::ui_font())
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if this.metadata_key_down(event, window, cx) {
+                    return;
+                }
                 if event.keystroke.key.as_str() != "escape" {
                     return;
                 }
@@ -214,7 +408,7 @@ impl Render for ProjectSettingsWindow {
             .child(external_window_titlebar(
                 "Project Settings",
                 "project-settings-close",
-                move |window, cx| on_close(window, cx),
+                move |window, cx| on_close_titlebar(window, cx),
             ))
             .child(project_header(&snapshot))
             .child(
@@ -232,9 +426,10 @@ impl Render for ProjectSettingsWindow {
                     .child(self.key_section(&snapshot, cx))
                     .child(self.timebase_section(&snapshot, cx))
                     .child(self.audio_section(&snapshot, cx))
-                    .child(self.spatial_section(&snapshot, cx)),
+                    .child(self.spatial_section(&snapshot, cx))
+                    .child(self.metadata_section(window, cx)),
             )
-            .child(footer(self.callbacks.on_close.clone()));
+            .child(footer(on_close));
 
         if self.open_menu.is_some() {
             let target = cx.entity().clone();
@@ -534,9 +729,10 @@ impl ProjectSettingsWindow {
         &self,
         snapshot: &ProjectSettingsSnapshot,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> gpui::AnyElement {
         use solfege_spatialaudio::{MonitorFold, SpatialFormat};
         let mix = snapshot.spatial_mix;
+        let licensed = snapshot.spatial_licensed;
         let format_label = |format: SpatialFormat| match format {
             SpatialFormat::Stereo => "Stereo".to_string(),
             SpatialFormat::Binaural => "Binaural (headphones)".to_string(),
@@ -549,7 +745,19 @@ impl ProjectSettingsWindow {
             "-",
             SpatialFormat::CHOICES
                 .iter()
-                .map(|format| SelectOption::new(format.token().to_string(), format_label(*format)))
+                .map(|format| {
+                    let option =
+                        SelectOption::new(format.token().to_string(), format_label(*format));
+                    // Without the license only Stereo can be chosen; the rest
+                    // say what they need instead of disappearing.
+                    if format.is_spatial() && !licensed {
+                        option
+                            .disabled(true)
+                            .description("Futureboard Professional")
+                    } else {
+                        option
+                    }
+                })
                 .collect(),
             false,
             move |value, this, cx| {
@@ -630,7 +838,19 @@ impl ProjectSettingsWindow {
             )
         };
 
+        if mix.held_back(licensed) {
+            let held = format!(
+                "Saved as {}. Spatial mixing is part of Futureboard Professional: here the                  project plays and exports as a stereo mix, and every channel keeps its place                  in the room for when it is opened with a license.",
+                format_label(mix.format)
+            );
+            return section("Spatial", held)
+                .child(settings_daw_row_with_description("Format", None, format))
+                .into_any_element();
+        }
         let hint = match mix.format {
+            SpatialFormat::Stereo if !licensed => {
+                "Channels pan left and right. Binaural and surround mixing come with                  Futureboard Professional."
+            }
             SpatialFormat::Stereo => "Channels pan left and right.",
             SpatialFormat::Binaural => {
                 "Every channel is placed in a room around the listener, for headphones. \
@@ -679,6 +899,7 @@ impl ProjectSettingsWindow {
                     fold_row,
                 ))
             })
+            .into_any_element()
     }
 
     fn audio_section(
@@ -730,6 +951,36 @@ impl ProjectSettingsWindow {
                         )
                     })),
             ))
+    }
+
+    /// Metadata — the tags exports carry. Each field is sent when it loses
+    /// focus or on Enter; empty fields are left out of the files.
+    fn metadata_section(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity = cx.entity();
+        let rows = ProjectMetadataField::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(index, field)| {
+                let input = &self.metadata_inputs[index];
+                let control = text_field_with_callbacks_and_ime(
+                    input,
+                    input.is_focused(window),
+                    bind_mouse_selection(entity.clone(), move |this| {
+                        &mut this.metadata_inputs[index]
+                    }),
+                    entity.clone(),
+                );
+                settings_daw_row_with_description(
+                    field.label(),
+                    metadata_not_in_wav(field).then(|| "FLAC and Opus only".to_string()),
+                    control,
+                )
+            });
+        section(
+            "Metadata",
+            "Written into exported WAV, FLAC and Opus files. Empty fields are left out.",
+        )
+        .children(rows)
     }
 
     fn bpm_scrub_field(&self, bpm: f32) -> gpui::AnyElement {
@@ -818,7 +1069,7 @@ impl ProjectSettingsWindow {
 }
 
 /// A settings card: title, one-line purpose, then rows.
-fn section(title: &'static str, hint: &'static str) -> gpui::Div {
+fn section(title: &'static str, hint: impl Into<String>) -> gpui::Div {
     settings_section_card()
         .flex_shrink_0()
         .child(settings_section_title(title))
@@ -959,8 +1210,97 @@ pub fn open_project_settings_window(
     options.window_background = WindowBackgroundAppearance::Opaque;
     apply_owner_display(&mut options, owner_bounds, cx);
 
-    crate::dialog_frame::open_dialog_window(cx, options, move |_window, cx| {
-        cx.new(|cx| ProjectSettingsWindow::new(snapshot, callbacks, cx))
+    crate::dialog_frame::open_dialog_window(cx, options, move |window, cx| {
+        cx.new(|cx| ProjectSettingsWindow::new(snapshot, callbacks, window, cx))
     })
     .map_err(|error| error.to_string())
+}
+
+/// The OS input handler, for whichever metadata field has focus: text and IME
+/// composition (Thai, CJK, dead keys) reach the field here, not through
+/// key-down. `impl_single_input_window_ime!` serves one field; this window has
+/// one per metadata tag, so it routes by focus.
+impl gpui::EntityInputHandler for ProjectSettingsWindow {
+    fn text_for_range(
+        &mut self,
+        range: std::ops::Range<usize>,
+        actual_range: &mut Option<std::ops::Range<usize>>,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        self.ime_field(window)
+            .text_for_utf16_range(range, actual_range)
+    }
+
+    fn selected_text_range(
+        &mut self,
+        ignore_disabled_input: bool,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<gpui::UTF16Selection> {
+        self.ime_field(window)
+            .selected_text_range_utf16(ignore_disabled_input)
+    }
+
+    fn marked_text_range(
+        &self,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        let index = self.focused_metadata_index(window).unwrap_or(0);
+        self.metadata_inputs[index].marked_text_range_utf16()
+    }
+
+    fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ime_field(window).unmark_text();
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range: Option<std::ops::Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ime_field(window)
+            .replace_text_in_utf16_range(range, text);
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range: Option<std::ops::Range<usize>>,
+        new_text: &str,
+        new_selected_range: Option<std::ops::Range<usize>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ime_field(window).replace_and_mark_text_in_utf16_range(
+            range,
+            new_text,
+            new_selected_range,
+        );
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: std::ops::Range<usize>,
+        bounds: gpui::Bounds<gpui::Pixels>,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<gpui::Bounds<gpui::Pixels>> {
+        self.ime_field(window)
+            .bounds_for_utf16_range(range_utf16, bounds)
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: gpui::Point<gpui::Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
 }

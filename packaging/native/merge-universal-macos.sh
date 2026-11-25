@@ -32,9 +32,9 @@ fi
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
-X64_DIR="${1:-$ROOT/out/release/community/macos-x64}"
-ARM64_DIR="${2:-$ROOT/out/release/community/macos-arm64}"
-OUT_DIR="${3:-$ROOT/out/release/community/macos-universal}"
+X64_DIR="${1:-$ROOT/out/release/macos-x64}"
+ARM64_DIR="${2:-$ROOT/out/release/macos-arm64}"
+OUT_DIR="${3:-$ROOT/out/release/macos-universal}"
 
 # Must match crate::platform::platform_folder / the triple xtask records.
 UNIVERSAL_PLATFORM="macos-universal"
@@ -43,7 +43,7 @@ UNIVERSAL_TARGET="universal-apple-darwin"
 for dir in "$X64_DIR" "$ARM64_DIR"; do
   if [[ ! -d "$dir" ]]; then
     echo "error: package directory not found: $dir" >&2
-    echo "run: cargo run -p xtask -- package --profile release --edition community \\" >&2
+    echo "run: cargo run -p xtask -- package --profile release \\" >&2
     echo "       --plugin all --target x86_64-apple-darwin   (and aarch64-apple-darwin)" >&2
     exit 1
   fi

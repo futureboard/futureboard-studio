@@ -1,0 +1,321 @@
+stages:
+  - lint
+  - build_and_test
+
+variables:
+  GIT_DEPTH: "1"
+  GIT_SUBMODULE_STRATEGY: "none"
+  # Redirect CARGO_HOME inside project dir so GitLab cache can persist it
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+  CARGO_BUILD_JOBS: "2"
+  FUTUREBOARD_AUTH_API_URL: "https://futureboard.studio"
+  # .github/workflows/set-cef-path.sh is shared with GitHub Actions: it reads
+  # GITHUB_WORKSPACE / RUNNER_OS / RUNNER_ARCH and appends CEF_PATH to the
+  # GITHUB_ENV file. Jobs run it, then load that file into their shell.
+  GITHUB_WORKSPACE: "$CI_PROJECT_DIR"
+  GITHUB_ENV: "$CI_PROJECT_DIR/.cef-path.env"
+  # One toolchain everywhere, matching local development: a newer rustfmt
+  # reformats code that the pinned one accepts.
+  RUST_VERSION: "1.99.0"
+  RUST_IMAGE: "rust:1.99.0-bookworm"
+
+workflow:
+  auto_cancel:
+    on_new_commit: interruptible
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH =~ /^(main|master|dev)$/
+    - if: $CI_PIPELINE_SOURCE == "web" # Equivalent to workflow_dispatch
+
+default:
+  interruptible: true
+
+# ---------------------------------------------------------------------------
+# Reusable Anchors & Templates
+# ---------------------------------------------------------------------------
+
+.linux-runner:
+  image: ubuntu:24.04
+  variables:
+    RUNNER_OS: Linux
+    RUNNER_ARCH: X64
+  tags:
+    - saas-linux-small-amd64 # Replace with your Linux runner tag if self-hosted
+
+# Linux jobs that only need a Rust toolchain on Debian (apt still available).
+.linux-rust-runner:
+  extends: .linux-runner
+  image: $RUST_IMAGE
+
+# GitLab.com hosted macOS runners need a Premium/Ultimate plan. macOS jobs run
+# only when the CI/CD variable MACOS_RUNNER_AVAILABLE is "true" (set it once a
+# macOS runner with this tag is available to the project).
+.macos-rules:
+  rules:
+    - if: $MACOS_RUNNER_AVAILABLE == "true"
+
+.macos-runner:
+  extends: .macos-rules
+  variables:
+    RUNNER_OS: macOS
+    RUNNER_ARCH: ARM64
+  tags:
+    - saas-macos-medium-m1 # Replace with your macOS arm64 runner tag
+  before_script:
+    - export PATH="$HOME/.cargo/bin:$HOME/.bun/bin:$PATH"
+    - LIBCLANG_PATH="$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib"
+    - test -f "$LIBCLANG_PATH/libclang.dylib"
+    - export LIBCLANG_PATH
+
+.windows-runner:
+  variables:
+    RUNNER_OS: Windows
+    RUNNER_ARCH: X64
+  tags:
+    - saas-windows-medium-amd64 # Replace with your Windows runner tag
+  before_script:
+    # Assumes Git Bash is in PATH on Windows runner; invoke scripts via bash.
+    # The hosted Windows image has no Rust: install it into CARGO_HOME.
+    - $env:PATH = "$env:CARGO_HOME\bin;$env:USERPROFILE\.bun\bin;$env:PATH"
+    - |
+      if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+        Invoke-WebRequest -UseBasicParsing -Uri https://win.rustup.rs/x86_64 -OutFile "$env:TEMP\rustup-init.exe"
+        & "$env:TEMP\rustup-init.exe" -y --no-modify-path --profile minimal --default-toolchain $env:RUST_VERSION --component rustfmt,clippy
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      }
+    - cargo --version
+
+.rust-cef-cache:
+  cache:
+    key:
+      prefix: "ci-v2-cargo-cef-$CI_JOB_NAME_SLUG"
+      files:
+        - Cargo.lock
+    paths:
+      - .cargo/registry/
+      - .cargo/git/
+      - target/
+      - build/cef/
+    policy: pull-push
+
+# ---------------------------------------------------------------------------
+# Stage 1: Fast Lint & Metadata Checks (Linux)
+# ---------------------------------------------------------------------------
+
+version-format:
+  stage: lint
+  extends: .linux-runner
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq nodejs
+  script:
+    - set -euo pipefail
+    - VERSION="$(node -p "require('./version.json').version")"
+    - 'echo "version.json: $VERSION"'
+    - |
+      if ! [[ "$VERSION" =~ ^[0-9]{4}\.(0|[1-9][0-9]?)\.(0|[1-9][0-9]?)(-[0-9A-Za-z.-]+)?$ ]]; then
+        echo "ERROR: '$VERSION' is not YYYY.M.D[-prerelease] (no zero padding, e.g. 2026.8.8-beta1)"
+        exit 1
+      fi
+    - MONTH="${BASH_REMATCH[1]}"
+    - DAY="${BASH_REMATCH[2]}"
+    - |
+      if [ "$MONTH" -lt 1 ] || [ "$MONTH" -gt 12 ]; then
+        echo "ERROR: month '$MONTH' in '$VERSION' is out of range"
+        exit 1
+      fi
+      if [ "$DAY" -lt 1 ] || [ "$DAY" -gt 31 ]; then
+        echo "ERROR: day '$DAY' in '$VERSION' is out of range"
+        exit 1
+      fi
+    - node scripts/sync-version.mjs --check
+
+packaging-scripts:
+  stage: lint
+  extends: .linux-runner
+  script:
+    - |
+      set -euo pipefail
+      for script in .github/workflows/*.sh packaging/native/*.sh packaging/linux/*.sh; do
+        bash -n "$script"
+        echo "ok: $script"
+      done
+      rust_version="$(sed -n 's/.*CEF_SHORT_VERSION: &str = "\([^"]*\)".*/\1/p' crates/SphereWebView/src/lib.rs)"
+      script_version="$(sed -n 's/^cef_version="\([^"]*\)".*/\1/p' .github/workflows/set-cef-path.sh)"
+      echo "lib.rs: $rust_version, set-cef-path.sh: $script_version"
+      test -n "$rust_version" && test "$rust_version" = "$script_version"
+
+cargo-deny:
+  stage: lint
+  extends: .linux-runner
+  variables:
+    CARGO_DENY_VERSION: "0.20.2"
+    CARGO_DENY_SHA256: "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f"
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq curl ca-certificates git build-essential
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+    - export PATH="$CARGO_HOME/bin:$PATH"
+  script:
+    - set -euo pipefail
+    - git submodule update --init --depth=1 --checkout -- external/cpal
+    - name="cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl"
+    - curl -fsSL --retry 3 -o "/tmp/${name}.tar.gz" "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/${name}.tar.gz"
+    - echo "${CARGO_DENY_SHA256}  /tmp/${name}.tar.gz" | sha256sum -c -
+    - tar -xzf "/tmp/${name}.tar.gz" -C /tmp
+    - install -m755 "/tmp/${name}/cargo-deny" "${CARGO_HOME}/bin/cargo-deny"
+    - cargo deny --version
+    - cargo deny --locked check advisories bans sources
+    # Non-blocking license report (equivalent to continue-on-error: true)
+    - cargo deny --locked check licenses || echo "License check reported warnings (non-blocking)"
+
+# ---------------------------------------------------------------------------
+# Stage 2: Cross-Platform Formatting, Clippy, Tests & Plugins
+# ---------------------------------------------------------------------------
+
+rust-fmt-linux:
+  stage: build_and_test
+  extends: .linux-rust-runner
+  before_script:
+    - rustup component add rustfmt
+  script:
+    - cargo fmt --all --check
+
+rust-fmt-windows:
+  stage: build_and_test
+  extends: .windows-runner
+  script:
+    - cargo fmt --all --check
+
+rust-fmt-macos:
+  stage: build_and_test
+  extends: .macos-runner
+  script:
+    - cargo fmt --all --check
+
+rust-clippy-test-linux:
+  stage: build_and_test
+  extends:
+    - .linux-runner
+    - .rust-cef-cache
+  before_script:
+    - apt-get update -y
+    - |
+      apt-get install -y --no-install-recommends \
+        curl ca-certificates git unzip build-essential cmake pkg-config \
+        libarchive-tools fakeroot rpm libopenjp2-tools libasound2-dev \
+        libgtk-4-dev libglib2.0-dev libx11-dev libxkbcommon-dev \
+        libxkbcommon-x11-dev libxcb1-dev libxcb-xfixes0-dev libxcb-shape0-dev \
+        libxcb-render-util0-dev libxcb-composite0-dev libxi-dev \
+        libgl1-mesa-dev libfontconfig1-dev libssl-dev
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain "$RUST_VERSION" --component clippy
+    - curl -fsSL https://bun.sh/install | bash
+    - export PATH="$CARGO_HOME/bin:$HOME/.bun/bin:$PATH"
+  script:
+    - set -euo pipefail
+    - bash .github/workflows/submodules-init.sh
+    - bash .github/workflows/set-cef-path.sh
+    - set -a && . "$GITHUB_ENV" && set +a
+    - cargo run -p SphereWebView --example install_cef --features installer
+    - export CRASHPAD_CACHE_DIR="$(cargo run -q -p xtask -- crashpad-prebuilt --target-dir target/studio)"
+    - cargo clippy-studio --all-targets -- -D warnings
+    - cargo test-studio
+
+rust-clippy-test-macos:
+  stage: build_and_test
+  extends:
+    - .macos-runner
+    - .rust-cef-cache
+  script:
+    - set -euo pipefail
+    - bash .github/workflows/submodules-init.sh
+    - bash .github/workflows/set-cef-path.sh
+    - set -a && . "$GITHUB_ENV" && set +a
+    - cargo run -p SphereWebView --example install_cef --features installer
+    - export CRASHPAD_CACHE_DIR="$(cargo run -q -p xtask -- crashpad-prebuilt --target-dir target/studio)"
+    - cargo clippy-studio --all-targets -- -D warnings
+    - cargo test-studio
+
+rust-clippy-test-windows:
+  stage: build_and_test
+  extends:
+    - .windows-runner
+    - .rust-cef-cache
+  script:
+    - bash .github/workflows/submodules-init.sh
+    - bash -c 'bash .github/workflows/set-cef-path.sh && set -a && . "$GITHUB_ENV" && set +a && cargo run -p SphereWebView --example install_cef --features installer'
+    - $env:CRASHPAD_CACHE_DIR = $(cargo run -q -p xtask -- crashpad-prebuilt --target-dir target/studio)
+    - cargo clippy-studio --all-targets -- -D warnings
+    - cargo test-studio
+
+macos-intel-cross:
+  stage: build_and_test
+  extends:
+    - .macos-runner
+    - .rust-cef-cache
+  variables:
+    MACOSX_DEPLOYMENT_TARGET: "11.0"
+  script:
+    - set -euo pipefail
+    - rustup target add x86_64-apple-darwin
+    - bash .github/workflows/submodules-init.sh
+    - bash .github/workflows/set-cef-path.sh x86_64-apple-darwin
+    - set -a && . "$GITHUB_ENV" && set +a
+    - cargo run -p SphereWebView --example install_cef --features installer -- --target x86_64-apple-darwin
+    - |
+      cargo check --target x86_64-apple-darwin \
+        -p futureboard_native \
+        -p sphere-plugin-host \
+        -p futureboard_cef_helper \
+        --features sphere-plugin-host/plugin-host-bin,sphere-plugin-host/plugin-scanner-bin
+
+# ---------------------------------------------------------------------------
+# VST3 Plugins (Windows enforced; Linux/macOS allow_failure: true)
+# ---------------------------------------------------------------------------
+
+.vst3-base:
+  stage: build_and_test
+  parallel:
+    matrix:
+      - PLUGIN: [rodhareist_vst3, voxtune_vst3, whitesharp_vst3]
+  cache:
+    key:
+      prefix: "vst3-v1-$PLUGIN-$CI_RUNNER_EXECUTABLE_ARCH"
+      files:
+        - vstplugins/$PLUGIN/Cargo.lock
+    paths:
+      - .cargo/registry/
+      - .cargo/git/
+      - vstplugins/$PLUGIN/target/
+
+vst3-plugins-windows:
+  extends:
+    - .vst3-base
+    - .windows-runner
+  script:
+    - git submodule update --init --depth=1 --checkout -- packages/shared/lucide packages/shared/tabler-icons
+    - cd vstplugins/$env:PLUGIN
+    - cargo check --locked --all-targets
+
+vst3-plugins-linux:
+  extends:
+    - .vst3-base
+    - .linux-rust-runner
+  allow_failure: true # Mirrors continue-on-error: ${{ matrix.os != 'windows-latest' }}
+  script:
+    - set -euo pipefail
+    - git submodule update --init --depth=1 --checkout -- packages/shared/lucide packages/shared/tabler-icons
+    - apt-get update -y
+    - |
+      apt-get install -y --no-install-recommends         build-essential cmake pkg-config libasound2-dev libgtk-4-dev libgtk-3-dev         libglib2.0-dev libx11-dev libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev         libxcb1-dev libxcb-xfixes0-dev libxcb-shape0-dev libxcb-render-util0-dev         libxcb-composite0-dev libxi-dev libgl1-mesa-dev libfontconfig1-dev libssl-dev
+    - cd "vstplugins/${PLUGIN}"
+    - cargo check --locked --all-targets
+
+vst3-plugins-macos:
+  extends:
+    - .vst3-base
+    - .macos-runner
+  allow_failure: true
+  script:
+    - set -euo pipefail
+    - git submodule update --init --depth=1 --checkout -- packages/shared/lucide packages/shared/tabler-icons
+    - cd "vstplugins/${PLUGIN}"
+    - cargo check --locked --all-targets

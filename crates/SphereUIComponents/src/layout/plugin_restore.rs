@@ -88,6 +88,12 @@ impl StudioLayout {
                     targets.push(target);
                 }
             }
+            // Plug-ins in the MIDI FX chain load like inserts.
+            for plugin in track.midi_fx.iter().filter_map(|fx| fx.plugin.as_ref()) {
+                if let Some(target) = target_from_slot(&track.id, &track_name, plugin, false) {
+                    targets.push(target);
+                }
+            }
         }
 
         let master_name = "Master".to_string();

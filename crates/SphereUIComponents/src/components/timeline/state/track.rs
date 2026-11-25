@@ -223,6 +223,92 @@ impl TrackType {
     }
 }
 
+/// How a channel's pan control places its signal. Saved with the track (v71).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PanMode {
+    /// One balance knob: [`TrackState::pan`].
+    #[default]
+    Balance,
+    /// Independent positions for the left and the right input
+    /// ([`DualPan::left`] / [`DualPan::right`]).
+    Dual,
+}
+
+impl PanMode {
+    /// Stable tag for the project file.
+    pub fn to_tag(self) -> u8 {
+        match self {
+            Self::Balance => 0,
+            Self::Dual => 1,
+        }
+    }
+
+    /// Unknown tags read as Balance, the mode every older file had.
+    pub fn from_tag(tag: u8) -> Self {
+        match tag {
+            1 => Self::Dual,
+            _ => Self::Balance,
+        }
+    }
+}
+
+/// A channel's Dual pan: the mode, and where each input sits in Dual.
+///
+/// `left` / `right` are kept while the mode is Balance, so switching back
+/// to Dual restores them. The defaults (left input hard left, right input hard
+/// right) leave the stereo image as it is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DualPan {
+    pub mode: PanMode,
+    /// The left input's position, `-1.0..=1.0`.
+    pub left: f32,
+    /// The right input's position, `-1.0..=1.0`.
+    pub right: f32,
+}
+
+/// Which Dual position a control moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DualPanSide {
+    Left,
+    Right,
+}
+
+impl Default for DualPan {
+    fn default() -> Self {
+        Self {
+            mode: PanMode::Balance,
+            left: DualPan::DEFAULT_LEFT,
+            right: DualPan::DEFAULT_RIGHT,
+        }
+    }
+}
+
+impl DualPan {
+    pub const DEFAULT_LEFT: f32 = -1.0;
+    pub const DEFAULT_RIGHT: f32 = 1.0;
+
+    pub fn is_dual(&self) -> bool {
+        self.mode == PanMode::Dual
+    }
+
+    /// Both positions clamped into `-1.0..=1.0`; a non-finite one goes back
+    /// to its default.
+    pub fn sanitized(self) -> Self {
+        let clamp = |v: f32, fallback: f32| {
+            if v.is_finite() {
+                v.clamp(-1.0, 1.0)
+            } else {
+                fallback
+            }
+        };
+        Self {
+            mode: self.mode,
+            left: clamp(self.left, Self::DEFAULT_LEFT),
+            right: clamp(self.right, Self::DEFAULT_RIGHT),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrackState {
     pub id: String,
@@ -240,6 +326,9 @@ pub struct TrackState {
     pub timebase: TrackTimebase,
     /// Parent arrangement group, if any. Only `TrackType::Group` ids are valid.
     pub parent_group_id: Option<String>,
+    /// The VCA group whose fader rides on this track's, if any (see
+    /// [`super::vca`]). Saved with the project (v69).
+    pub vca_group: Option<String>,
     /// Folder presentation state. Meaningful only for `TrackType::Group`.
     pub group_collapsed: bool,
     pub color: gpui::Rgba,
@@ -261,10 +350,18 @@ pub struct TrackState {
     pub volume_automation_read: bool,
     /// Pan position in `-1.0..=1.0`. `-1.0` is hard left, `+1.0` is hard right.
     pub pan: f32,
+    /// Balance or Dual pan, and the two Dual positions. Saved with the track
+    /// (v71). See [`TrackState::dual_pan_active`] for when Dual is heard.
+    pub dual_pan: DualPan,
     /// Where this channel sits in the square room when the project's mix is
     /// spatial (binaural or surround); the pan above applies in stereo. Saved
     /// with the track (v57).
     pub spatial: solfege_spatialaudio::SourceParams,
+    /// A bus or return that keeps its channels' places in a spatial mix: each
+    /// channel routed into it is placed where it sits, and the bus's fader
+    /// rides them all. Its inserts and its own place apply only to what is
+    /// sent to it. Saved with the track (v73); ignored on other channels.
+    pub spatial_keeps_inputs: bool,
     pub muted: bool,
     pub solo: bool,
     pub armed: bool,
@@ -300,6 +397,9 @@ pub struct TrackState {
     /// only descriptor + transient state; the runtime owns the actual
     /// plugin processor.
     pub inserts: Vec<InsertSlotState>,
+    /// MIDI FX between this track's MIDI and its instrument, in order
+    /// (Instrument and MIDI tracks; generators first). Saved (v67).
+    pub midi_fx: Vec<MidiFxSlotState>,
     /// Canonical MIDI destination for this instrument track — the
     /// `plugin_instance_id` of the first enabled instrument insert (e.g.
     /// `insert-track-1-1`). Set when a VSTi is assigned; used for piano
@@ -349,11 +449,29 @@ pub struct TrackState {
     /// MIDI clips open in the MIDI editor's step sequencer. Its clips are
     /// ordinary MIDI clips — this only picks the editor's view. Saved (v66).
     pub drum_step: bool,
+    /// The drum lanes this track's step view lists: the notes the user put on
+    /// it with Lane Note, ascending. Empty is the default kit (see
+    /// `piano_roll::drum_map`). The lanes name notes only — the hits are the
+    /// clips' own notes at those pitches. Saved (v70).
+    pub step_lanes: Vec<u8>,
 }
 
 impl TrackState {
     pub fn is_frozen(&self) -> bool {
         self.freeze.is_some()
+    }
+
+    /// Whether this channel can be put in Dual pan: a stereo channel. A mono
+    /// channel has one input to place, which is the balance knob's job.
+    pub fn supports_dual_pan(&self) -> bool {
+        self.routing.audio_format == TrackAudioFormat::Stereo
+    }
+
+    /// Whether Dual pan is what this channel plays and shows: Dual chosen on
+    /// a channel that supports it. A Dual setting left on a channel since made
+    /// mono is kept, and plays as Balance.
+    pub fn dual_pan_active(&self) -> bool {
+        self.dual_pan.is_dual() && self.supports_dual_pan()
     }
 }
 
@@ -373,6 +491,32 @@ impl TrackState {
         self.automation_lanes.iter().any(|l| {
             l.plays() && matches!(l.target, AutomationTarget::TrackVolume) && !l.points.is_empty()
         })
+    }
+
+    /// Whether any spatial placement lane with points is playing on this
+    /// channel (switched on, not overridden by hand).
+    pub fn spatial_lanes_playing(&self) -> bool {
+        self.automation_lanes.iter().any(|l| {
+            l.plays() && matches!(l.target, AutomationTarget::Spatial(_)) && !l.points.is_empty()
+        })
+    }
+
+    /// Where the channel is heard at `beat`: its placement with every playing
+    /// spatial lane applied, as the engine applies them. The base placement
+    /// when no lane plays.
+    pub fn spatial_heard_at(&self, beat: f64) -> solfege_spatialaudio::SourceParams {
+        let mut heard = self.spatial;
+        for lane in &self.automation_lanes {
+            let AutomationTarget::Spatial(param) = lane.target else {
+                continue;
+            };
+            if !lane.plays() || lane.points.is_empty() {
+                continue;
+            }
+            let value = super::evaluate_automation(&lane.points, beat, lane.target.default_value());
+            heard = param.apply(heard, value);
+        }
+        heard.sanitized()
     }
 
     /// The normalized volume the UI fader / readout should display: the
@@ -557,7 +701,9 @@ impl TimelineState {
         let id = self.next_track_id();
         let track_type = options.track_type;
         self.tracks.push(TrackState {
+            vca_group: None,
             spatial: Default::default(),
+            spatial_keeps_inputs: false,
             listen: ListenMode::Off,
             id: id.clone(),
             name: options.name,
@@ -571,6 +717,7 @@ impl TimelineState {
             volume_effective: options.volume.clamp(0.0, 1.0),
             volume_automation_read: true,
             pan: options.pan.clamp(-1.0, 1.0),
+            dual_pan: DualPan::default(),
             muted: false,
             solo: false,
             armed: options.armed,
@@ -584,6 +731,7 @@ impl TimelineState {
             automation_lanes: Vec::new(),
             lane_mode: TrackLaneMode::Clips,
             selected_automation_target: None,
+            midi_fx: Vec::new(),
             inserts: Vec::new(),
             sends: Vec::new(),
             routing: TrackRoutingState::for_track_type(track_type),
@@ -591,6 +739,7 @@ impl TimelineState {
             takes_expanded: false,
             freeze: None,
             drum_step: false,
+            step_lanes: Vec::new(),
             instrument_plugin_instance_id: None,
             builtin_soundfont_player: false,
             soundfont_path: None,

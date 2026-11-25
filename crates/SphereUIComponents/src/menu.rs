@@ -242,6 +242,7 @@ mod tests {
             "window:performance",
             "window:process-explorer",
             "window:virtual-speaker",
+            "window:room-preview",
             "panel:toggle-bottom",
         ] {
             assert!(
@@ -264,6 +265,33 @@ mod tests {
             .items
             .iter()
             .any(|item| item.command.as_deref() == Some("chords:open-generator")));
+    }
+
+    /// Audio › Audio to MIDI runs the same three commands as an audio clip's
+    /// Convert to MIDI menu.
+    #[test]
+    fn audio_to_midi_is_in_the_audio_menu() {
+        let audio = MenuManifest::load()
+            .menus
+            .iter()
+            .find(|menu| menu.id == "audio")
+            .expect("audio menu");
+        let submenu = audio
+            .items
+            .iter()
+            .find(|item| item.id == "audio.audio_to_midi")
+            .expect("Audio to MIDI submenu");
+        assert_eq!(submenu.kind, MenuItemKind::Submenu);
+        let commands: Vec<_> = submenu
+            .children
+            .iter()
+            .filter_map(|item| item.command.as_deref())
+            .collect();
+        let expected: Vec<_> = crate::audio_to_midi::ConvertMode::ALL
+            .into_iter()
+            .map(|mode| mode.command())
+            .collect();
+        assert_eq!(commands, expected);
     }
 
     /// A malformed manifest degrades to the fallback shell rather than

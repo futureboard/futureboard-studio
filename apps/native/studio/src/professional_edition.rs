@@ -81,6 +81,54 @@ mod notation {
     notation_module!(score_editor);
 }
 
+/// The audio-to-MIDI engine behind an audio clip's Convert to MIDI. Built
+/// like the notation engine: its files declare their modules through
+/// `audio_to_midi_module!`, so the same sources build here and in the
+/// engine's standalone test package.
+#[allow(dead_code)]
+mod audio_to_midi {
+    macro_rules! audio_to_midi_module {
+        ($name:ident) => {
+            pub mod $name {
+                include!(concat!(
+                    env!("OUT_DIR"),
+                    "/futureboard-professional/audio_to_midi/",
+                    stringify!($name),
+                    ".rs"
+                ));
+            }
+        };
+    }
+
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/futureboard-professional/audio_to_midi/engine.rs"
+    ));
+
+    /// The engine as the shared UI's converter: the clip's mono samples in,
+    /// its notes out, in the shared crate's types.
+    pub fn converter() -> sphere_ui_components::audio_to_midi::AudioToMidiConverter {
+        use sphere_ui_components::audio_to_midi::{ConvertMode, ConvertedNote};
+        std::sync::Arc::new(|samples: &[f32], sample_rate: u32, mode: ConvertMode| {
+            let mode = match mode {
+                ConvertMode::Melody => model::Mode::Melody,
+                ConvertMode::Drums => model::Mode::Drums,
+                ConvertMode::Chords => model::Mode::Chords,
+            };
+            model::transcribe(samples, sample_rate, mode)
+                .into_iter()
+                .map(|note| ConvertedNote {
+                    start_seconds: note.start,
+                    duration_seconds: note.duration,
+                    pitch: note.pitch,
+                    velocity: note.velocity,
+                    bend: note.bend,
+                })
+                .collect()
+        })
+    }
+}
+
 pub use license_activation_dialog::open_license_activation_window;
 
 /// Open the License window over the given owner window.
@@ -136,6 +184,14 @@ pub fn install_licensed_providers() -> Result<(), String> {
     sphere_ui_components::score_view::set_score_view_provider(
         licensed.then(notation::score_editor::provider),
     );
+    // So does Convert to MIDI on audio clips.
+    sphere_ui_components::audio_to_midi::set_audio_to_midi_converter(
+        licensed.then(audio_to_midi::converter),
+    );
+    // And spatial mixing: the surround and binaural formats, the room panner
+    // and Room window, multichannel export and Virtual Speaker. A spatial
+    // project opened without it plays as stereo and keeps its placement.
+    sphere_ui_components::edition::set_spatial_mix_licensed(licensed);
 
     #[cfg(target_os = "windows")]
     {
@@ -160,9 +216,9 @@ pub fn install_licensed_providers() -> Result<(), String> {
 /// Providers install from the sealed license file with no network involved, so
 /// this cannot delay the DAW opening however the licensing service is doing.
 ///
-/// A lapsed license is not re-pulled here: renewal belongs to the Futureboard
-/// Launcher, which is the only program that talks to the activation service.
-/// The License window says so, and offers to open it.
+/// Studio never talks to the activation service itself: renewal and activation
+/// run `fbactivate`, the Launcher's activation tool, in the background and from
+/// the License window.
 pub fn install() -> Result<(), String> {
     sphere_ui_components::edition::set_edition_provider(std::sync::Arc::new(edition_info));
     // Lets the About panel open the License window without the shared crate
@@ -179,10 +235,18 @@ pub fn install() -> Result<(), String> {
     // Professional build only adds licensing on top of that identity.
 
     // Purely local: the sealed license file is read and verified against this
-    // machine, with no network at any point. Renewal and activation live in the
-    // Futureboard Launcher now, so there is nothing to spawn here and nothing
-    // that can delay the DAW opening.
+    // machine, with no network at any point, so nothing can delay the DAW
+    // opening.
     install_licensed_providers()?;
+    // The activation tool's automatic re-check (daily for a cloud license, the
+    // last week of an offline one) runs on its own thread, so the 30-day check
+    // happens even when the Launcher is never opened. What it renews or lapses
+    // reaches the providers when it finishes.
+    license_activation_dialog::spawn_startup_check(|| {
+        if let Err(error) = install_licensed_providers() {
+            eprintln!("[License] refreshing licensed providers failed: {error}");
+        }
+    });
     // The Launcher can renew after this point — it may start Studio and renew a
     // moment later — so the shared UI asks again when it is about to show what
     // the license grants.
@@ -305,16 +369,20 @@ mod tests {
 
         super::install_licensed_providers().expect("installing must not fail");
 
+        // The ASIO host is a Windows provider. Linux verifies the same token
+        // and leaves that backend unregistered.
+        let expect_asio = cfg!(target_os = "windows") && licensed;
+
         assert_eq!(
             DirectAudio::asio_support_enabled(),
-            licensed,
-            "an ASIO host must be registered if and only if a verified license grants it"
+            expect_asio,
+            "an ASIO host is registered when this is Windows and a verified license grants it"
         );
         assert_eq!(
             DirectAudio::backend::BackendKind::allowed_for_current_platform()
                 .contains(&DirectAudio::backend::BackendKind::Asio),
-            licensed,
-            "the backend list must offer ASIO if and only if a verified license grants it"
+            expect_asio,
+            "the backend list offers ASIO when this is Windows and a verified license grants it"
         );
     }
 }

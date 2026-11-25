@@ -3,13 +3,12 @@
 //! `FutureboardJam` is a much smaller thing to package than Studio, and the
 //! difference is the point of this module rather than an accident of it. Studio
 //! ships a CEF runtime, two sidecar processes it spawns from its own directory,
-//! and per-edition feature sets. The jam client ships one
-//! executable: it hosts no plug-ins, spawns nothing, and has no editions —
-//! there is no Professional jam, because a jam is a network client, not a
-//! licensed feature.
+//! and, where the private sources exist, the Professional code. The jam client
+//! ships one executable: it hosts no plug-ins, spawns nothing, and has no
+//! Professional code — a jam is a network client, not a licensed feature.
 //!
 //! So this is deliberately not routed through [`crate::package`]. Reusing that
-//! pipeline would mean threading "no CEF, no sidecars, no plugins, no edition"
+//! pipeline would mean threading "no CEF, no sidecars, no plugins, no licence"
 //! through every stage of it, which is more conditional machinery than the
 //! whole task is worth — and every one of those conditions is a way for a jam
 //! package to fail on a rule that does not apply to it. What *is* shared is the
@@ -33,11 +32,12 @@ pub const JAM_BINARY: &str = "FutureboardJam";
 
 /// Cargo target directory.
 ///
-/// The Community one, shared on purpose: the jam client depends on the same
-/// `sphere_ui_components` and `sphere_directaudioengine` as the Community
-/// Studio build, with the same features, so a third target directory would
-/// recompile the entire workspace for no difference in output.
-const TARGET_DIR: &str = "target/community";
+/// Studio's, shared on purpose: the jam client depends on the same
+/// `sphere_ui_components` and `sphere_directaudioengine` as Studio, so a
+/// separate target directory would recompile the entire workspace. Where the
+/// package adds the Professional features, Cargo keeps both feature sets of
+/// the shared crates side by side in the same directory.
+const TARGET_DIR: &str = crate::platform::TARGET_DIR;
 
 pub struct JamOptions {
     pub profile: String,
@@ -94,11 +94,8 @@ pub fn run(options: &JamOptions) -> Result<PathBuf> {
 
 /// Where a jam package lands.
 ///
-/// One rule for every profile — `out/<profile>/jam/<platform>` — rather than
-/// Studio's dev special case. Studio's layout drops the edition on `dev`
-/// because a developer package has no edition to name; the jam client has no
-/// edition on *any* profile, so there is nothing to drop and no reason for the
-/// path to change shape with the profile.
+/// One rule for every profile — `out/<profile>/jam/<platform>` — beside
+/// Studio's `out/<profile>/<platform>`, so the two never share a folder.
 pub fn final_output_dir(out_root: &Path, profile: &str, platform: &str) -> PathBuf {
     out_root.join(profile).join("jam").join(platform)
 }
@@ -192,11 +189,9 @@ fn wanted_executable(artifact: &Artifact) -> Option<(String, PathBuf)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{TARGET_DIR, final_output_dir, staging_dir};
+    use super::{final_output_dir, staging_dir};
     use std::path::Path;
 
-    /// The jam client has no editions, so its path never grows one — including
-    /// on `dev`, where Studio's layout drops the edition segment instead.
     #[test]
     fn the_output_path_has_the_same_shape_on_every_profile() {
         let out = Path::new("out");
@@ -217,12 +212,7 @@ mod tests {
     fn staging_never_collides_with_a_studio_package() {
         let out = Path::new("out");
         let jam = staging_dir(out, "release", "windows-x64");
-        let studio = crate::staging::staging_dir(
-            out,
-            "release",
-            crate::platform::Edition::Community,
-            "windows-x64",
-        );
+        let studio = crate::staging::staging_dir(out, "release", "windows-x64");
         assert_ne!(jam, studio);
         assert!(
             jam.to_string_lossy().contains("jam-"),
@@ -230,11 +220,12 @@ mod tests {
         );
     }
 
-    /// Sharing the Community target directory is what stops a jam build from
-    /// recompiling the whole workspace: the two builds want the same crates
-    /// with the same features.
+    /// Nor may their final folders overlap: publishing one replaces its folder.
     #[test]
-    fn the_build_shares_the_community_target_directory() {
-        assert_eq!(TARGET_DIR, crate::platform::Edition::Community.target_dir());
+    fn output_never_collides_with_a_studio_package() {
+        let out = Path::new("out");
+        let jam = final_output_dir(out, "release", "windows-x64");
+        let studio = crate::staging::final_output_dir(out, "release", "windows-x64");
+        assert!(!jam.starts_with(&studio) && !studio.starts_with(&jam));
     }
 }

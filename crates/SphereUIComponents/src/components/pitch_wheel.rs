@@ -478,7 +478,13 @@ fn fs_wheel(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 
     thread_local! {
         /// `None` = not tried yet; `Some(None)` = unavailable on this machine.
-        static WHEEL_GPU: RefCell<Option<Option<WheelGpu>>> = const { RefCell::new(None) };
+        ///
+        /// Never dropped, like the visualizer's context: Studio ends in
+        /// `ExitProcess`, which runs thread-local destructors after wgpu's
+        /// own state is gone, and dropping a device there aborted the process
+        /// on every quit after a wheel had been drawn. The OS reclaims it.
+        static WHEEL_GPU: std::mem::ManuallyDrop<RefCell<Option<Option<WheelGpu>>>> =
+            const { std::mem::ManuallyDrop::new(RefCell::new(None)) };
     }
 
     fn gpu_debug() -> bool {

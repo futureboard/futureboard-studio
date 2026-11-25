@@ -25,11 +25,11 @@ use crate::registry::{
 };
 
 /// 1 → 2 added `plugins.sub_categories`; 2 → 3 added `plugins.is_ara`; 3 → 4
-/// added `plugins.preset_path`. Every migration is additive (`ALTER TABLE ADD
-/// COLUMN`) and read paths tolerate the column's absence, so a database written
-/// by an older build keeps loading and an older build keeps reading a database
-/// written by this one.
-const SCHEMA_VERSION: i32 = 4;
+/// added `plugins.preset_path`; 4 → 5 added `plugins.midi_output`. Every
+/// migration is additive (`ALTER TABLE ADD COLUMN`) and read paths tolerate the
+/// column's absence, so a database written by an older build keeps loading and
+/// an older build keeps reading a database written by this one.
+const SCHEMA_VERSION: i32 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginScanStatus {
@@ -93,6 +93,10 @@ pub struct PluginCatalogEntry {
     /// The plug-in registers an ARA main factory. Cached so the picker can offer
     /// ARA without re-opening every module at startup.
     pub is_ara: bool,
+    /// The VST3 component exposes an event output bus (the scan instantiates
+    /// it once to read its buses). Cached so the MIDI FX picker can offer
+    /// MIDI-effect plug-ins without re-opening every module at startup.
+    pub midi_output: bool,
     pub path: PathBuf,
     pub class_id: Option<String>,
     pub bundle_id: Option<String>,
@@ -148,6 +152,7 @@ impl PluginCatalogEntry {
             version: self.version.clone(),
             sdk_metadata_loaded: self.scan_status.is_usable(),
             is_ara: self.is_ara,
+            midi_output: self.midi_output,
             preset_path: self.preset_path.clone().unwrap_or_default(),
             scanned_at_ms: parse_iso8601_to_ms(self.last_scanned_at.as_deref()).unwrap_or(0),
             status,
@@ -205,6 +210,7 @@ impl From<&RegistryPlugin> for PluginCatalogEntry {
             category,
             sub_categories: p.sub_categories.clone(),
             is_ara: p.is_ara,
+            midi_output: p.midi_output,
             path: p.path.clone(),
             class_id: p.class_id.clone(),
             bundle_id: None,
@@ -341,7 +347,8 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
              error TEXT,
              metadata_json TEXT,
              search_text TEXT NOT NULL,
-             preset_path TEXT
+             preset_path TEXT,
+             midi_output INTEGER NOT NULL DEFAULT 0
          );
          CREATE TABLE IF NOT EXISTS plugin_scan_runs (
              id TEXT PRIMARY KEY,
@@ -392,6 +399,22 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         // that belongs to a different plug-in of the same name.
         conn.execute_batch("ALTER TABLE plugins ADD COLUMN preset_path TEXT")?;
     }
+    if !has_column(conn, "plugins", "midi_output")? {
+        conn.execute_batch(
+            "ALTER TABLE plugins ADD COLUMN midi_output INTEGER NOT NULL DEFAULT 0",
+        )?;
+        // Same problem as `is_ara`: whether a VST3 has an event output bus is
+        // only knowable by instantiating its component, and every existing VST3
+        // row was scanned before the scanner did that. Defaulting to 0 would
+        // assert "not a MIDI effect" about chord tools and arpeggiators that
+        // are, so those rows are marked stale for the next incremental scan.
+        // Only VST3 rows: CLAP and AU MIDI effects are classified from metadata
+        // the row already holds, so rescanning them would change nothing.
+        conn.execute_batch(
+            "UPDATE plugins SET file_modified_at = NULL, file_size = NULL
+              WHERE format = 'VST3'",
+        )?;
+    }
     conn.execute(
         "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', ?1)",
         params![SCHEMA_VERSION.to_string()],
@@ -439,11 +462,18 @@ pub fn read_all(conn: &Connection) -> rusqlite::Result<Vec<PluginCatalogEntry>> 
     } else {
         "NULL"
     };
+    // And for `midi_output`: a pre-v5 database read-only offers no VST3 MIDI
+    // effects until the next writable scan migrates and refills it.
+    let midi_output_expr = if has_column(conn, "plugins", "midi_output")? {
+        "midi_output"
+    } else {
+        "0"
+    };
     let mut stmt = conn.prepare(&format!(
         "SELECT id, format, name, vendor, category, path, class_id, bundle_id, version,
                 is_instrument, is_effect, scan_status, validation_level, disabled, favorite,
                 file_modified_at, file_size, last_scanned_at, error, metadata_json, search_text,
-                {sub_categories_expr}, {is_ara_expr}, {preset_path_expr}
+                {sub_categories_expr}, {is_ara_expr}, {preset_path_expr}, {midi_output_expr}
            FROM plugins
           ORDER BY favorite DESC, vendor COLLATE NOCASE ASC, name COLLATE NOCASE ASC"
     ))?;
@@ -459,6 +489,7 @@ pub fn read_all(conn: &Connection) -> rusqlite::Result<Vec<PluginCatalogEntry>> 
             category: row.get(4)?,
             sub_categories: row.get(21)?,
             is_ara: row.get::<_, i64>(22)? != 0,
+            midi_output: row.get::<_, i64>(24)? != 0,
             path: PathBuf::from(path),
             class_id: row.get(6)?,
             bundle_id: row.get(7)?,
@@ -558,6 +589,23 @@ pub fn last_scan_ms(conn: &Connection) -> rusqlite::Result<i64> {
 ///
 /// Returns the number of rows removed. Favorites on surviving rows are kept
 /// (the upsert deliberately does not overwrite `favorite`).
+/// Bumped by every write that changes the catalog's rows (or removes the
+/// database), so a window holding a copy of the list — the insert picker, the
+/// Add Track instrument list, the Browser's Instruments tab — can tell its copy
+/// is stale without reading the database. The Plug-in Manager scans in its own
+/// window; without this, the main window kept the list it read at startup until
+/// the app was reopened.
+static CATALOG_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The catalog's revision in this process. See [`CATALOG_REVISION`].
+pub fn catalog_revision() -> u64 {
+    CATALOG_REVISION.load(std::sync::atomic::Ordering::Acquire)
+}
+
+fn note_catalog_changed() {
+    CATALOG_REVISION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
 pub fn replace_plugins(
     conn: &mut Connection,
     entries: &[PluginCatalogEntry],
@@ -590,6 +638,7 @@ pub fn replace_plugins(
         removed as u32
     };
     tx.commit()?;
+    note_catalog_changed();
     Ok(removed)
 }
 
@@ -602,7 +651,9 @@ pub fn upsert_plugins(
 ) -> rusqlite::Result<()> {
     let tx = conn.transaction()?;
     upsert_within(&tx, entries)?;
-    tx.commit()
+    tx.commit()?;
+    note_catalog_changed();
+    Ok(())
 }
 
 fn upsert_within(
@@ -615,9 +666,9 @@ fn upsert_within(
                 (id, format, name, vendor, category, path, class_id, bundle_id, version,
                  is_instrument, is_effect, scan_status, validation_level, disabled, favorite,
                  file_modified_at, file_size, last_scanned_at, error, metadata_json, search_text,
-                 sub_categories, is_ara, preset_path)
+                 sub_categories, is_ara, preset_path, midi_output)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                     ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
+                     ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
              ON CONFLICT(id) DO UPDATE SET
                 format = excluded.format,
                 name = excluded.name,
@@ -640,7 +691,8 @@ fn upsert_within(
                 metadata_json = excluded.metadata_json,
                 search_text = excluded.search_text,
                 is_ara = excluded.is_ara,
-                preset_path = excluded.preset_path",
+                preset_path = excluded.preset_path,
+                midi_output = excluded.midi_output",
         )?;
         for e in entries {
             stmt.execute(params![
@@ -670,6 +722,7 @@ fn upsert_within(
                 e.preset_path
                     .as_ref()
                     .map(|path| path.to_string_lossy().into_owned()),
+                e.midi_output as i64,
             ])?;
         }
     }
@@ -711,6 +764,7 @@ pub fn record_scan_run(
 /// Delete every plug-in row. Scan-run / failure history is preserved.
 pub fn clear_plugins(conn: &Connection) -> rusqlite::Result<u32> {
     let n = conn.execute("DELETE FROM plugins", [])?;
+    note_catalog_changed();
     Ok(n as u32)
 }
 
@@ -729,6 +783,7 @@ pub fn delete_database_file() -> Result<(), String> {
             std::fs::remove_file(&target).map_err(|e| e.to_string())?;
         }
     }
+    note_catalog_changed();
     Ok(())
 }
 
@@ -904,6 +959,21 @@ mod tests {
         assert_eq!(super::count_rows(&conn).unwrap(), 1);
     }
 
+    /// A window holding a copy of the list learns a write happened from the
+    /// revision alone. (The revision is process-wide and other tests write
+    /// too, so only "it moved on" is checked, never "it stayed".)
+    #[test]
+    fn writes_to_the_catalog_move_its_revision() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        super::init_schema(&conn).unwrap();
+        let before = super::catalog_revision();
+        super::upsert_plugins(&mut conn, &[]).unwrap();
+        let after_upsert = super::catalog_revision();
+        assert!(after_upsert > before);
+        super::clear_plugins(&conn).unwrap();
+        assert!(super::catalog_revision() > after_upsert);
+    }
+
     #[test]
     fn replacing_drops_rows_the_scan_did_not_produce() {
         use std::path::PathBuf;
@@ -926,6 +996,7 @@ mod tests {
             category: None,
             sub_categories: Some("Fx|EQ".into()),
             is_ara: false,
+            midi_output: true,
             path: PathBuf::from("C:/x.vst3"),
             class_id: None,
             bundle_id: None,
@@ -950,6 +1021,9 @@ mod tests {
         // And the tags round-trip, so a restart classifies the same way.
         let rows = super::read_all(&conn).unwrap();
         assert_eq!(rows[0].sub_categories.as_deref(), Some("Fx|EQ"));
+        // …the VST3 event-output flag, so the MIDI FX picker sees it…
+        assert!(rows[0].midi_output);
+        assert!(rows[0].to_registry_plugin().is_midi_effect());
         // …and so does the `.pst` the row points at.
         assert_eq!(
             rows[0].preset_path.as_deref(),
@@ -997,6 +1071,67 @@ mod tests {
                 .unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].preset_path, cached);
+    }
+
+    #[test]
+    fn a_v4_database_gains_midi_output_and_rescans_vst3_rows_only() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE plugins (
+                 id TEXT PRIMARY KEY, format TEXT NOT NULL, name TEXT NOT NULL,
+                 vendor TEXT, category TEXT, sub_categories TEXT,
+                 is_ara INTEGER NOT NULL DEFAULT 0, path TEXT NOT NULL, class_id TEXT,
+                 bundle_id TEXT, version TEXT, is_instrument INTEGER NOT NULL DEFAULT 0,
+                 is_effect INTEGER NOT NULL DEFAULT 1, scan_status TEXT NOT NULL,
+                 validation_level TEXT, disabled INTEGER NOT NULL DEFAULT 0,
+                 favorite INTEGER NOT NULL DEFAULT 0, file_modified_at TEXT, file_size INTEGER,
+                 last_scanned_at TEXT, error TEXT, metadata_json TEXT, search_text TEXT NOT NULL,
+                 preset_path TEXT
+             );
+             INSERT INTO plugins (id, format, name, path, sub_categories, scan_status,
+                                  file_modified_at, file_size, search_text) VALUES
+             ('vst3:chords', 'VST3', 'Chords', 'C:/c.vst3', 'Instrument', 'success',
+              '2026-01-01T00:00:00Z', 10, 'chords'),
+             ('clap:arp', 'CLAP', 'Arp', 'C:/a.clap', 'note-effect', 'success',
+              '2026-01-01T00:00:00Z', 20, 'arp');",
+        )
+        .unwrap();
+        // Read as-is (a read-only open cannot migrate): no VST3 MIDI effects yet,
+        // while the CLAP one is already known from its features.
+        let before = super::read_all(&conn).unwrap();
+        let by_id = |rows: &[super::PluginCatalogEntry], id: &str| {
+            rows.iter().find(|r| r.id == id).cloned().unwrap()
+        };
+        assert!(!by_id(&before, "vst3:chords").midi_output);
+        assert!(by_id(&before, "clap:arp")
+            .to_registry_plugin()
+            .is_midi_effect());
+
+        super::init_schema(&conn).unwrap();
+        assert!(super::has_column(&conn, "plugins", "midi_output").unwrap());
+        let after = super::read_all(&conn).unwrap();
+        let vst3 = by_id(&after, "vst3:chords");
+        let clap = by_id(&after, "clap:arp");
+        // The VST3 row is stale so the next incremental scan probes its buses…
+        assert!(vst3.file_modified_at.is_none());
+        assert!(vst3.file_size.is_none());
+        assert!(!vst3.midi_output);
+        // …the CLAP row keeps its signature: nothing about it would change.
+        assert_eq!(
+            clap.file_modified_at.as_deref(),
+            Some("2026-01-01T00:00:00Z")
+        );
+        assert_eq!(clap.file_size, Some(20));
+
+        // A second open does not re-run the migration.
+        conn.execute(
+            "UPDATE plugins SET file_modified_at = 'x', file_size = 1 WHERE id = 'vst3:chords'",
+            [],
+        )
+        .unwrap();
+        super::init_schema(&conn).unwrap();
+        let again = by_id(&super::read_all(&conn).unwrap(), "vst3:chords");
+        assert_eq!(again.file_modified_at.as_deref(), Some("x"));
     }
 
     #[test]

@@ -15,7 +15,8 @@ pub use global::{
     global_keymap_shortcut, init_global_keymap, set_global_keymap, shortcut_for_command,
     shortcut_tooltip,
 };
-pub use manager::{format_keystroke_list, profile_label, shortcut_debug_enabled, KeymapManager};
+pub use manager::{
+    format_keystroke_list, format_keystrokes, profile_label, shortcut_debug_enabled, KeymapManager};
 pub use model::{
     KeyBinding, KeymapConflict, KeymapProfile, KeymapRow, KeymapScope, KeymapSource,
     ProfileDescriptor, ResolvedKeyBinding, PROFILE_DESCRIPTORS, USER_OVERRIDES_FILE,

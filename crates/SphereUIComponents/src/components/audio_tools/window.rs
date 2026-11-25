@@ -1198,8 +1198,9 @@ fn tonic_index(tonic: SphereAudioProcessor::PitchClass) -> usize {
 }
 
 impl Render for AudioToolWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let kind = self.session.tool_kind;
+        let viewport_width = f32::from(window.viewport_size().width);
         let analysis = kind.is_analysis_only();
         let on_close = self.callbacks.on_close.clone();
         let target = self.session.target.clone();
@@ -1275,7 +1276,7 @@ impl Render for AudioToolWindow {
                     .min_h(px(0.0))
                     .min_w(px(0.0))
                     .overflow_hidden()
-                    .child(self.tool_body(cx)),
+                    .child(self.tool_body(viewport_width, cx)),
             )
             .child(workspace::workflow_bar(
                 workspace::workflow_row()
@@ -1355,7 +1356,7 @@ impl Render for AudioToolWindow {
 }
 
 impl AudioToolWindow {
-    fn tool_body(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn tool_body(&mut self, viewport_width: f32, cx: &mut Context<Self>) -> impl IntoElement {
         match self.session.tool_kind {
             AudioToolKind::SpectrumAnalyzer => self.spectrum_body(cx).into_any_element(),
             AudioToolKind::Loudness => self.loudness_body(cx).into_any_element(),
@@ -1368,7 +1369,9 @@ impl AudioToolWindow {
             AudioToolKind::DcOffset => self.dc_body(cx).into_any_element(),
             AudioToolKind::BpmAnalysis => self.bpm_body(cx).into_any_element(),
             AudioToolKind::KeyAnalysis => self.key_body(cx).into_any_element(),
-            AudioToolKind::AudioRepair => self.repair_surface(cx).into_any_element(),
+            AudioToolKind::AudioRepair => {
+                self.repair_surface(viewport_width, cx).into_any_element()
+            }
             AudioToolKind::SpectralProcessor => self.spectral_body(cx).into_any_element(),
             AudioToolKind::SpectrogramSettings => {
                 self.spectrogram_settings_body(cx).into_any_element()
@@ -2389,6 +2392,33 @@ impl AudioToolWindow {
     }
 }
 
+/// Opens a tool window for the UI preview (`ui-preview` only), with no host
+/// behind it: commands go nowhere and there is no project folder. The repair
+/// surface starts on `module`.
+#[cfg(feature = "ui-preview")]
+pub(crate) fn open_preview_audio_tool_window(
+    kind: AudioToolKind,
+    target: AudioToolTarget,
+    module: AudioRepairModule,
+    options: gpui::WindowOptions,
+    cx: &mut App,
+) -> gpui::Result<WindowHandle<AudioToolWindow>> {
+    let timeline = cx.new(|_| Timeline::new());
+    let callbacks = AudioToolWindowCallbacks {
+        on_command: Arc::new(|_, _| {}),
+        project_folder: Arc::new(|_| None),
+        on_close: Arc::new(|_, _, _| {}),
+    };
+    let session = AudioToolSession::new(kind, target);
+    cx.open_window(options, move |_, cx| {
+        cx.new(|cx| {
+            let mut window = AudioToolWindow::new(session, timeline, callbacks, cx);
+            window.activate_repair_module(module, cx);
+            window
+        })
+    })
+}
+
 pub fn open_audio_tool_window(
     kind: AudioToolKind,
     target: AudioToolTarget,
@@ -2414,7 +2444,7 @@ pub fn open_audio_tool_window(
     ));
     apply_owner_display(&mut options, owner_bounds, cx);
     let session = AudioToolSession::new(kind, target);
-    cx.open_window(options, move |_window, cx| {
+    crate::dialog_frame::open_dialog_window(cx, options, move |_window, cx| {
         cx.new(|cx| AudioToolWindow::new(session, timeline, callbacks, cx))
     })
     .map_err(|e| e.to_string())

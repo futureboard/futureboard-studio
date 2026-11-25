@@ -23,6 +23,10 @@ use crate::components::{external_mixer_debug, external_mixer_debug_enabled, Mixe
 use super::engine_snapshot::{apply_engine_track_input_state, volume_norm_to_linear};
 use super::{ContextMenuRequest, ContextMenuTarget, ContextTarget, MixerWindow, StudioLayout};
 
+/// Command prefix of the pan mode menu: `{prefix}{track_id}|balance` or
+/// `{prefix}{track_id}|dual`.
+pub(crate) const PAN_MODE_COMMAND_PREFIX: &str = "mixer:pan-mode|";
+
 /// Mixer-panel view state — horizontal scroll, the shared insert/send section
 /// heights, and the transient splitter-drag anchors. `StudioLayout` decomposition
 /// slice. Manual `Default` (insert/send sections start at their default px).
@@ -318,7 +322,8 @@ impl StudioLayout {
             tree_sidebar_enabled: self.mixer_view.tree_sidebar_enabled,
             tree_sidebar_collapsed: self.mixer_view.tree_sidebar_collapsed,
             tree_sidebar_width_px: self.mixer_view.tree_sidebar_width_px,
-            spatial_format: timeline.state.spatial_mix.format,
+            spatial_format: timeline.state.spatial_mix.heard_here().format,
+            spatial_placed: timeline.state.spatially_placed_ids(),
             // Filled by `push_mixer_snapshot_to_window`: building the entries
             // needs `&mut Context`, which a snapshot clone does not have.
             context_menu: None,
@@ -370,6 +375,85 @@ impl StudioLayout {
             snapshot.selected_track_id,
             snapshot.mixer_scroll_x,
         )
+    }
+
+    /// The pan mode menu of a channel: Balance or Dual Pan, the current one
+    /// checked. Dual is offered only on a stereo channel.
+    pub(crate) fn pan_mode_entries(
+        &self,
+        track_id: &str,
+        cx: &gpui::App,
+    ) -> Vec<crate::components::context_menu::ContextMenuEntry> {
+        use crate::components::context_menu::ContextMenuEntry;
+        let state = &self.timeline.read(cx).state;
+        let Some(track) = state.find_track(track_id) else {
+            return vec![ContextMenuEntry::disabled_item("Track unavailable", "noop")];
+        };
+        let dual = track.dual_pan_active();
+        let mut entries = vec![
+            ContextMenuEntry::Header("Pan".to_string()),
+            ContextMenuEntry::checked_item(
+                "Balance".to_string(),
+                format!("{PAN_MODE_COMMAND_PREFIX}{track_id}|balance"),
+                !dual,
+            ),
+        ];
+        if track.supports_dual_pan() {
+            entries.push(ContextMenuEntry::checked_item(
+                "Dual Pan".to_string(),
+                format!("{PAN_MODE_COMMAND_PREFIX}{track_id}|dual"),
+                dual,
+            ));
+        } else {
+            entries.push(ContextMenuEntry::disabled_item(
+                "Dual Pan (stereo channels only)",
+                "noop",
+            ));
+        }
+        entries
+    }
+
+    /// Run one row of the pan mode menu: switch the channel's mode as one undo
+    /// step and push it to the engine live. Returns `false` for a command
+    /// that is not one.
+    pub(crate) fn dispatch_pan_mode_command(
+        &mut self,
+        command_id: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        use crate::components::timeline::timeline_state::PanMode;
+        let Some(rest) = command_id.strip_prefix(PAN_MODE_COMMAND_PREFIX) else {
+            return false;
+        };
+        let Some((track_id, mode)) = rest.rsplit_once('|') else {
+            return true;
+        };
+        let mode = match mode {
+            "balance" => PanMode::Balance,
+            "dual" => PanMode::Dual,
+            _ => return true,
+        };
+        let changed = self.timeline.update(cx, |timeline, cx| {
+            timeline.set_track_pan_mode(track_id, mode, cx)?;
+            timeline
+                .state
+                .find_track(track_id)
+                .map(super::engine_snapshot::engine_dual_pan)
+        });
+        let Some(dual) = changed else {
+            return true;
+        };
+        if let Some(engine) = self.audio_bridge.engine.as_ref() {
+            // Positions first, so the matrix is right on the block Dual engages.
+            let _ = engine.update_track_param(track_id, "panLeft", f64::from(dual.left));
+            let _ = engine.update_track_param(track_id, "panRight", f64::from(dual.right));
+            let mode = if dual.enabled { 1.0 } else { 0.0 };
+            let _ = engine.update_track_param(track_id, "panMode", mode);
+        }
+        self.mark_dirty_view_only();
+        self.push_mixer_snapshot_to_window(cx);
+        cx.notify();
+        true
     }
 
     pub(crate) fn push_mixer_snapshot_to_window(&mut self, cx: &mut Context<Self>) {
@@ -1594,6 +1678,55 @@ impl StudioLayout {
             }
         });
 
+        // Dual pan positions: live like the balance knob (`SetTrackDualPan`),
+        // each drag folding into one undo step.
+        let audio_engine_dual = self.audio_bridge.engine.clone();
+        let timeline_dual = self.timeline.clone();
+        let owner_dual = owner.clone();
+        let on_dual_pan_change: std::sync::Arc<
+            dyn Fn(&(String, timeline_state::DualPanSide, f32), &mut Window, &mut gpui::App)
+                + 'static,
+        > = std::sync::Arc::new(move |(id, side, v), _w, cx| {
+            let Some(dual) = timeline_dual.update(cx, |t, cx| t.nudge_dual_pan(id, *side, *v, cx))
+            else {
+                return;
+            };
+            StudioLayout::defer_update(&owner_dual, cx, |this, cx| {
+                this.mark_dirty_view_only();
+                this.push_mixer_snapshot_to_window(cx);
+            });
+            if let Some(engine) = audio_engine_dual.as_ref() {
+                let (param, value) = match side {
+                    timeline_state::DualPanSide::Left => ("panLeft", dual.left),
+                    timeline_state::DualPanSide::Right => ("panRight", dual.right),
+                };
+                let _ = engine.update_track_param(id, param, f64::from(value));
+            }
+        });
+
+        // Pan right-click: the pan mode menu (Balance / Dual Pan), anchored
+        // at the click.
+        let on_pan_mode_menu: std::sync::Arc<
+            dyn Fn(&(String, f32, f32), &mut Window, &mut gpui::App) + 'static,
+        > = {
+            let this = owner.clone();
+            std::sync::Arc::new(move |(track_id, x, y): &(String, f32, f32), window, cx| {
+                let (track_id, x, y) = (track_id.clone(), *x, *y);
+                let window_id = window.window_handle().window_id();
+                StudioLayout::defer_update(&this, cx, move |this, cx| {
+                    this.try_open_context_menu(
+                        ContextMenuRequest::new(
+                            window_id,
+                            x,
+                            y,
+                            ContextMenuTarget::Extended(ContextTarget::PanMode { track_id }),
+                        ),
+                        cx,
+                    );
+                });
+            })
+        };
+
         let audio_engine_spatial = self.audio_bridge.engine.clone();
         let timeline_spatial = self.timeline.clone();
         let owner_spatial = owner.clone();
@@ -1612,7 +1745,8 @@ impl StudioLayout {
                 this.push_mixer_snapshot_to_window(cx);
             });
         });
-        let spatial_format = self.timeline.read(cx).state.spatial_mix.format;
+        let spatial_format = self.timeline.read(cx).state.spatial_mix.heard_here().format;
+        let spatial_placed = self.timeline.read(cx).state.spatially_placed_ids();
 
         let audio_engine = self.audio_bridge.engine.clone();
         let timeline_mute = self.timeline.clone();
@@ -2455,8 +2589,11 @@ impl StudioLayout {
             on_volume_drag_preview,
             on_volume_drag_commit,
             on_pan_change,
+            on_dual_pan_change,
+            on_pan_mode_menu: Some(on_pan_mode_menu),
             on_spatial_change,
             spatial_format,
+            spatial_placed,
             on_toggle_mute,
             on_toggle_solo,
             on_toggle_arm,
@@ -2517,6 +2654,45 @@ impl StudioLayout {
             on_open_output_picker,
             on_remove_send,
             on_send_gain_change,
+            on_vca_level: {
+                let this = owner.clone();
+                std::sync::Arc::new(move |(group, level): &(String, f32), _w, cx| {
+                    let (group, level) = (group.clone(), *level);
+                    StudioLayout::defer_update(&this, cx, move |this, cx| {
+                        this.set_vca_level(&group, level, cx);
+                    });
+                })
+            },
+            on_toggle_vca_mute: {
+                let this = owner.clone();
+                std::sync::Arc::new(move |group: &String, _w, cx| {
+                    let group = group.clone();
+                    StudioLayout::defer_update(&this, cx, move |this, cx| {
+                        this.toggle_vca_mute(&group, cx);
+                    });
+                })
+            },
+            on_delete_vca: {
+                let this = owner.clone();
+                std::sync::Arc::new(move |group: &String, _w, cx| {
+                    let group = group.clone();
+                    StudioLayout::defer_update(&this, cx, move |this, cx| {
+                        this.delete_vca(&group, cx);
+                    });
+                })
+            },
+            on_set_send_pre_fader: {
+                let this = owner.clone();
+                std::sync::Arc::new(
+                    move |(track_id, send_id, pre_fader): &(String, String, bool), _w, cx| {
+                        let (track_id, send_id, pre_fader) =
+                            (track_id.clone(), send_id.clone(), *pre_fader);
+                        StudioLayout::defer_update(&this, cx, move |this, cx| {
+                            this.set_send_pre_fader(&track_id, &send_id, pre_fader, cx);
+                        });
+                    },
+                )
+            },
             on_reorder_send,
             on_clear_solos: Some({
                 let timeline = self.timeline.clone();
@@ -2612,6 +2788,195 @@ impl StudioLayout {
         self.load_copied_inserts(&drop.to_track, std::slice::from_ref(&copy_id), cx);
         self.after_channel_chain_edit(cx, "duplicate_insert");
         true
+    }
+
+    /// The selected channels in a new VCA. One undo step.
+    pub(crate) fn create_vca_from_selection(&mut self, cx: &mut Context<Self>) {
+        if !crate::components::mixer_panel::pro_mixing() {
+            return;
+        }
+        let members: Vec<String> = {
+            let state = &self.timeline.read(cx).state;
+            state
+                .selection
+                .selected_track_ids
+                .iter()
+                .filter(|id| state.find_track(id).is_some())
+                .cloned()
+                .collect()
+        };
+        let edit = self.begin_track_edit(
+            TrackEditScope {
+                master: true,
+                ..TrackEditScope::tracks(members.clone())
+            },
+            cx,
+        );
+        self.timeline.update(cx, |timeline, _| {
+            timeline.state.create_vca_group("", &members);
+        });
+        self.commit_track_edit("New VCA", edit, cx);
+        self.vca_changed("vca_create", cx);
+    }
+
+    /// Put `track_id` in VCA `group`, or take it out of any (`None`).
+    pub(crate) fn set_track_vca(
+        &mut self,
+        track_id: &str,
+        group: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        if !crate::components::mixer_panel::pro_mixing() {
+            return;
+        }
+        let edit = self.begin_track_edit(TrackEditScope::tracks([track_id.to_string()]), cx);
+        let changed = self.timeline.update(cx, |timeline, _| {
+            timeline.state.set_track_vca_group(track_id, group)
+        });
+        if !changed {
+            return;
+        }
+        self.commit_track_edit("Assign VCA", edit, cx);
+        self.vca_changed("vca_assign", cx);
+    }
+
+    /// Remove VCA `group`; its members go back to their own faders.
+    pub(crate) fn delete_vca(&mut self, group: &str, cx: &mut Context<Self>) {
+        if !crate::components::mixer_panel::pro_mixing() {
+            return;
+        }
+        let members = self.timeline.read(cx).state.vca_members(group);
+        let edit = self.begin_track_edit(
+            TrackEditScope {
+                master: true,
+                ..TrackEditScope::tracks(members)
+            },
+            cx,
+        );
+        self.timeline.update(cx, |timeline, _| {
+            timeline.state.delete_vca_group(group);
+        });
+        self.commit_track_edit("Delete VCA", edit, cx);
+        self.vca_changed("vca_delete", cx);
+    }
+
+    /// Move VCA `group`'s fader. A drag folds into one undo step; each member
+    /// hears it live (`vcaGain`), with no project sync.
+    pub(crate) fn set_vca_level(&mut self, group: &str, level: f32, cx: &mut Context<Self>) {
+        if !crate::components::mixer_panel::pro_mixing() {
+            return;
+        }
+        let edit = self.begin_track_edit(TrackEditScope::master(), cx);
+        let changed = self
+            .timeline
+            .update(cx, |timeline, _| timeline.state.set_vca_level(group, level));
+        self.commit_track_edit_folded("VCA Level", edit, cx);
+        if changed {
+            self.push_vca_gains_live(group, cx);
+            self.mark_dirty_view_only();
+            self.push_mixer_snapshot_to_window(cx);
+            let _ = self.mixer_panel.update(cx, |_, cx| cx.notify());
+        }
+    }
+
+    /// Mute or unmute VCA `group`, which silences or restores its members.
+    pub(crate) fn toggle_vca_mute(&mut self, group: &str, cx: &mut Context<Self>) {
+        if !crate::components::mixer_panel::pro_mixing() {
+            return;
+        }
+        let edit = self.begin_track_edit(TrackEditScope::master(), cx);
+        let changed = self.timeline.update(cx, |timeline, _| {
+            let muted = timeline.state.vca_group(group).is_some_and(|vca| vca.muted);
+            timeline.state.set_vca_muted(group, !muted)
+        });
+        if !changed {
+            return;
+        }
+        self.commit_track_edit("VCA Mute", edit, cx);
+        self.push_vca_gains_live(group, cx);
+        self.mark_dirty();
+        self.push_mixer_snapshot_to_window(cx);
+        cx.notify();
+    }
+
+    /// Send each member of VCA `group` the gain it now puts on them.
+    fn push_vca_gains_live(&self, group: &str, cx: &mut Context<Self>) {
+        let Some(engine) = self.audio_bridge.engine.as_ref() else {
+            return;
+        };
+        let state = &self.timeline.read(cx).state;
+        for member in state.vca_members(group) {
+            if let Some(track) = state.find_track(&member) {
+                let gain = state.vca_gain_for_track(track);
+                let _ = engine.update_track_param(&member, "vcaGain", f64::from(gain));
+            }
+        }
+    }
+
+    /// After a VCA's membership or existence changed: the snapshot carries
+    /// every track's VCA gain, so the engine takes it with a project sync.
+    fn vca_changed(&mut self, reason: &'static str, cx: &mut Context<Self>) {
+        self.mark_dirty();
+        self.audio_bridge.project_dirty = true;
+        self.schedule_audio_project_sync(cx, false, reason);
+        self.push_mixer_snapshot_to_window(cx);
+        cx.notify();
+    }
+
+    /// What `inserts` (a channel's dynamics processors) take off together
+    /// right now, in dB, positive: the sum of the reduction each publishes
+    /// with its telemetry. One lock of the bridge for all of them, atomic
+    /// loads under it — the meter overlay calls this every frame it paints.
+    /// 0 with no bridge, or before a processor has published anything.
+    pub(crate) fn mixer_gain_reduction_db(&self, inserts: &[String]) -> f32 {
+        let Some(runtime) = self.plugin_editors.bridge_runtime.as_ref() else {
+            return 0.0;
+        };
+        let Ok(bridge) = runtime.lock() else {
+            return 0.0;
+        };
+        inserts
+            .iter()
+            .filter_map(|id| bridge.builtin_meter_frame(id))
+            .map(|frame| frame.gain_reduction_db.max(0.0))
+            .sum()
+    }
+
+    /// Tap a send before or after its track's fader. One undo step; the engine
+    /// moves the tap with the project resync.
+    pub(crate) fn set_send_pre_fader(
+        &mut self,
+        track_id: &str,
+        send_id: &str,
+        pre_fader: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !crate::components::mixer_panel::pro_mixing() {
+            return;
+        }
+        let edit = self.begin_track_edit(TrackEditScope::tracks([track_id.to_string()]), cx);
+        let changed = self.timeline.update(cx, |timeline, _| {
+            timeline
+                .state
+                .set_send_pre_fader(track_id, send_id, pre_fader)
+        });
+        if !changed {
+            return;
+        }
+        self.commit_track_edit(
+            if pre_fader {
+                "Send Pre-Fader"
+            } else {
+                "Send Post-Fader"
+            },
+            edit,
+            cx,
+        );
+        self.mark_dirty();
+        self.audio_bridge.project_dirty = true;
+        self.schedule_audio_project_sync(cx, false, "mixer_send_pre_fader");
+        self.push_mixer_snapshot_to_window(cx);
+        cx.notify();
     }
 
     /// Commit a dropped send: same channel only, resolved against the live
@@ -2976,13 +3341,16 @@ fn clone_track_for_mixer_detail(track: &TrackState, include_detail: bool) -> Tra
         ara,
         timebase,
         parent_group_id,
+        vca_group,
         group_collapsed,
         color,
         volume,
         volume_effective,
         volume_automation_read,
         pan,
+        dual_pan,
         spatial,
+        spatial_keeps_inputs,
         muted,
         solo,
         armed,
@@ -2998,6 +3366,7 @@ fn clone_track_for_mixer_detail(track: &TrackState, include_detail: bool) -> Tra
         lane_mode,
         selected_automation_target,
         inserts,
+        midi_fx,
         instrument_plugin_instance_id,
         builtin_soundfont_player,
         soundfont_path,
@@ -3019,6 +3388,8 @@ fn clone_track_for_mixer_detail(track: &TrackState, include_detail: bool) -> Tra
         takes_expanded: _,
         freeze,
         drum_step,
+        // The step view's lane list: the mixer has no step view.
+        step_lanes: _,
     } = track;
     TrackState {
         // Preserved, not reset: the mixer strip renders its PFL/AFL buttons
@@ -3030,13 +3401,16 @@ fn clone_track_for_mixer_detail(track: &TrackState, include_detail: bool) -> Tra
         ara: ara.clone(),
         timebase: *timebase,
         parent_group_id: parent_group_id.clone(),
+        vca_group: vca_group.clone(),
         group_collapsed: *group_collapsed,
         color: *color,
         volume: *volume,
         volume_effective: *volume_effective,
         volume_automation_read: *volume_automation_read,
         pan: *pan,
+        dual_pan: *dual_pan,
         spatial: *spatial,
+        spatial_keeps_inputs: *spatial_keeps_inputs,
         muted: *muted,
         solo: *solo,
         armed: *armed,
@@ -3051,6 +3425,7 @@ fn clone_track_for_mixer_detail(track: &TrackState, include_detail: bool) -> Tra
         takes_expanded: false,
         freeze: freeze.clone(),
         drum_step: *drum_step,
+        step_lanes: Vec::new(),
         automation_lanes: if include_detail {
             automation_lanes.clone()
         } else {
@@ -3062,6 +3437,12 @@ fn clone_track_for_mixer_detail(track: &TrackState, include_detail: bool) -> Tra
             inserts.clone()
         } else {
             track.instrument_insert().cloned().into_iter().collect()
+        },
+        // Detail like the effect chain: only strips in view draw it.
+        midi_fx: if include_detail {
+            midi_fx.clone()
+        } else {
+            Vec::new()
         },
         instrument_plugin_instance_id: instrument_plugin_instance_id.clone(),
         builtin_soundfont_player: *builtin_soundfont_player,

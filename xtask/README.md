@@ -2,10 +2,11 @@
 
 `xtask` is the Futureboard workspace task runner. It has two jobs:
 
-- **`build-all` / `check-all`** — chain the per-edition cargo aliases
-  (`build-ce`, `build-professional-win`, …) from `.cargo/config.toml`, because
-  Cargo aliases cannot chain commands. The Windows-only Professional alias is
-  skipped automatically on non-Windows hosts unless a Windows target is passed.
+- **`build-all` / `check-all`** — run one workspace build / check into
+  `target/studio`. On Windows and Linux, when the private `crates/ExclusiveEdition`
+  sources are present, they add the Professional features
+  (`futureboard_native/professional,sphere_directaudioengine/asio`)
+  automatically. The ASIO SDK toolchain runs only for Windows targets.
 - **`package`** — build `FutureboardNative` and stage a clean, runnable
   application tree into `out/`, kept separate from the Cargo `target/` cache.
 
@@ -58,10 +59,7 @@ out/
 │     ├─ Resources/
 │     └─ build-info.json
 └─ release/
-   ├─ community/
-   │  └─ windows-x64/         # cargo package-ce
-   └─ professional/
-      └─ windows-x64/         # cargo package-professional
+   └─ windows-x64/            # cargo package-release
 ```
 
 There is deliberately **no `CEF/` folder and no `PluginUI/` folder** — CEF ships
@@ -69,8 +67,12 @@ flat beside the executable (its default resolution base), and each plugin's Reac
 UI is embedded inside the plugin's own dynamic library. Package validation
 actively rejects either directory.
 
-- `dev` profile → `out/dev/<platform>` (edition omitted).
-- any other profile → `out/<profile>/<edition>/<platform>`.
+Every profile stages into `out/<profile>/<platform>` (`dev` →
+`out/dev/<platform>`). There is one package: Studio decides Community or
+Professional features at runtime from the licence, and the Professional code is
+compiled in on Windows and Linux when the private `crates/ExclusiveEdition`
+sources are present.
+Cargo builds into the shared `target/studio` directory.
 
 Target triples map to readable platform folders
 (`x86_64-pc-windows-msvc → windows-x64`, `aarch64-apple-darwin → macos-arm64`,
@@ -83,29 +85,15 @@ Development package (fast, unoptimized):
 ```powershell
 cargo package-dev
 # equivalent to:
-cargo run -p xtask -- package --profile dev --edition community
+cargo run -p xtask -- package --profile dev
 ```
 
-Community release:
+Release package:
 
 ```powershell
-cargo package-ce
+cargo package-release
 # equivalent to:
-cargo run -p xtask -- package `
-  --profile release `
-  --target x86_64-pc-windows-msvc `
-  --edition community
-```
-
-Professional release (requires the private `crates/ExclusiveEdition/` source tree):
-
-```powershell
-cargo package-professional
-# equivalent to:
-cargo run -p xtask -- package `
-  --profile release `
-  --target x86_64-pc-windows-msvc `
-  --edition professional
+cargo run -p xtask -- package --profile release --plugin all
 ```
 
 Optional flags:
@@ -122,7 +110,7 @@ Optional flags:
   - a comma-separated list of crate names, e.g. `rodharerist,equz8`.
 
   ```powershell
-  cargo xtask package --profile release --edition community --plugin all
+  cargo xtask package --profile release --plugin all
   ```
 
   `--plugins` (no value) is a legacy alias for `--plugin all`. All eight built-in
@@ -131,7 +119,7 @@ Optional flags:
   runtime. Normal packages fail when `build/cef` is unavailable.
 - `--no-bundle` — skip wrapping a macOS package into `Futureboard Studio.app`.
   On macOS hosts, `package` otherwise runs `packaging/native/bundle-macos.sh`
-  and writes `out/<profile>/<edition>/<platform>-app/Futureboard Studio.app`
+  and writes `out/<profile>/<platform>-app/Futureboard Studio.app`
   with Apple's required `Contents/` layout (never `Content/`).
 
 ## CEF runtime staging (shared, flat)
@@ -218,7 +206,7 @@ cargo build --message-format=json-render-diagnostics ...
 
 and parses the `compiler-artifact` JSON messages to read the exact executable
 path Cargo produced. This works across custom target triples, profiles, and the
-per-edition target directories.
+shared `target/studio` directory.
 
 ## Adding runtime files to the staging manifest
 
@@ -251,10 +239,10 @@ Written into every package:
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "application": "Futureboard Studio",
   "binary": "FutureboardNative.exe",
-  "edition": "community",
+  "professional": false,
   "profile": "release",
   "target": "x86_64-pc-windows-msvc",
   "platform": "windows-x64",
@@ -267,7 +255,9 @@ Written into every package:
 }
 ```
 
-`version` comes from the `futureboard_native` package version. Git and toolchain
+`professional` records whether the Professional code was compiled in (`false`
+for a public checkout). `version` comes from the `futureboard_native` package
+version. Git and toolchain
 fields are best-effort — a missing `git`/toolchain yields `null` rather than
 failing the package.
 
@@ -277,7 +267,7 @@ failing the package.
 build → collect artifacts → create staging → copy files → validate → publish
 ```
 
-Staging happens in `out/.staging/<platform>-<edition>-<profile>/`. Only after
+Staging happens in `out/.staging/<platform>-<profile>/`. Only after
 validation passes is the staging directory renamed into its final location
 (moving any previous package aside first, restored on failure). A failed package
 never leaves `out/` half-updated, and unrelated directories under `out/` are

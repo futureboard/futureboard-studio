@@ -21,6 +21,7 @@ members = [
     "crates/SphereAudioProcessor",
     "crates/SphereStemExtractor",
     "crates/SphereMidiService",
+    "crates/SphereMidiFx",
     "crates/SphereDiscordRPC",
     "crates/SpherePlatform",
     "crates/SphereWebView",
@@ -64,6 +65,9 @@ members = [
     "crates/BuiltinAudioPlugins/crates/airboost",
     "crates/BuiltinAudioPlugins/crates/deesser",
     "crates/BuiltinAudioPlugins/crates/duckstep",
+    "crates/BuiltinAudioPlugins/crates/trigger",
+    "crates/RodhareistEngine",
+    "crates/VisualizerLink",
     "crates/solfege_spatialaudio",
     "xtask",
 ]
@@ -115,10 +119,13 @@ sphere-audio-plugins = { path = "crates/SphereAudioPlugins" }
 sphere-encoder = { path = "crates/SphereEncoder", features = ["opus"] }
 sphere-graphic-engine = { path = "crates/SphereGraphicEngine" }
 sphere-midi-service = { path = "crates/SphereMidiService", package = "SphereMidiService" }
+sphere-midi-fx = { path = "crates/SphereMidiFx" }
 sphere-plugin-host = { path = "crates/SpherePluginHost", default-features = false }
 livestage-engine = { path = "crates/LiveStageEngine", default-features = false }
 sphere-soundfont-player = { path = "crates/SphereSoundfontPlayer", package = "SphereSoundfontPlayer" }
 solfege_spatialaudio = { path = "crates/solfege_spatialaudio" }
+# Shared-memory link to the native visualizer app (apps/native/visualizer).
+visualizer_link = { path = "crates/VisualizerLink" }
 # Video preview/reference decoding for the arrangement Video Track, on MKFF:
 # GPU (mkff-mediakit accelerants) for H.264/HEVC MP4/MOV, mkff-codecs software
 # decode for everything else — no FFmpeg/libav anywhere.
@@ -175,6 +182,7 @@ zapp = { path = "crates/BuiltinAudioPlugins/crates/zapp" }
 airboost = { path = "crates/BuiltinAudioPlugins/crates/airboost" }
 deesser = { path = "crates/BuiltinAudioPlugins/crates/deesser" }
 duckstep = { path = "crates/BuiltinAudioPlugins/crates/duckstep" }
+trigger = { path = "crates/BuiltinAudioPlugins/crates/trigger" }
 
 # MIT/Apache-2.0 DSP libraries used by BuiltinAudioPlugins.
 biquad = "0.6"
@@ -574,7 +582,7 @@ unicode-segmentation = "1.10"
 # Database / plugin registry
 # =============================================================================
 
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 clap = { version = "4.5", features = ["derive"] }
 pbkdf2 = "0.12"
 tar = "0.4"

@@ -18,9 +18,9 @@
 
 use builtin_dsp_core::time_constant;
 
+use super::AmpModel;
 use super::nonlinear::{PushPullParams, TriodeParams, TriodeState};
 use super::smooth::{Oversampler4x, Oversampler8x, Smoothed};
-use super::AmpModel;
 
 const MAX_PREAMP_STAGES: usize = 4;
 const CONTROL_SMOOTH_SECONDS: f32 = 0.012;

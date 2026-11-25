@@ -758,6 +758,7 @@ mod tests {
             version: None,
             sdk_metadata_loaded: true,
             is_ara: false,
+            midi_output: false,
             preset_path: PathBuf::new(),
             scanned_at_ms: 0,
             status: PluginStatus::PresetReady,

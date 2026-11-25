@@ -15,24 +15,21 @@ use super::*;
 impl Timeline {
     /// Put the clips of an uncommitted clip move back where the gesture found
     /// them and forget the move. The preview only ever moves clips along
-    /// their own track, in place. Returns whether a move was in flight.
+    /// their own track, in place; a range move's clips also come back whole
+    /// (see `clip_range`). Returns whether a move was in flight.
     pub(super) fn revert_clip_move(&mut self) -> bool {
-        let Some(origin) = self.clip_move_origin.take() else {
-            return false;
-        };
-        for (snapshot, slot) in origin
-            .clips
-            .iter()
-            .zip(origin.locations(&self.state).iter())
-        {
-            if let Some(slot) = slot {
-                let track = &mut self.state.tracks[slot.track];
-                if track.clips[slot.index].start_beat != snapshot.clip.start_beat {
-                    track.clips[slot.index].start_beat = snapshot.clip.start_beat;
+        let moved = match self.clip_move_origin.take() {
+            Some(origin) => {
+                for snapshot in &origin.clips {
+                    self.state
+                        .set_clip_start_in_place(&snapshot.clip.id, snapshot.clip.start_beat);
                 }
+                true
             }
-        }
-        true
+            None => false,
+        };
+        let split = self.revert_range_move_split();
+        moved || split
     }
 
     /// What a cancel does to the clip drag, without a window or context:

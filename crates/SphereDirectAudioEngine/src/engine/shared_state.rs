@@ -189,6 +189,11 @@ pub struct SharedState {
     pub guard_ahead_frames: AtomicU64,
     /// Device blocks the ring could not supply in time.
     pub guard_misses: AtomicU64,
+    /// The playing graph's delay compensation needs longer delay lines than
+    /// were reserved for it: a plug-in reported more latency than the graph
+    /// was planned with. Set by the callback, taken by the control thread,
+    /// which rebuilds the graph planned with that latency.
+    pub pdc_rings_short: AtomicBool,
     /// Blocks rendered in the device callback that took longer than the block
     /// lasts: the device ran out of audio, whatever the protection level. The
     /// at-risk count (`dropout_count`) also holds blocks merely close to it.
@@ -235,6 +240,14 @@ pub struct SharedState {
     /// A take is recording with delay compensation bypassed. The audio
     /// thread follows it in place ([`crate::runtime::RuntimeProject::follow_pdc_bypass`]).
     pub record_pdc_bypass: AtomicBool,
+    /// Settings → Playback → Low-Latency Monitoring: effects reporting more
+    /// latency than this, in samples, are taken out of live paths. `0` is off.
+    pub low_latency_limit_samples: AtomicU32,
+    /// Settings → Playback → Correct Takes for Interface Latency: a finished
+    /// take moves earlier by the round trip through the interface (measured,
+    /// or as the driver reports it). Off, only the Recording Delay and the
+    /// mix's own path move it.
+    pub record_interface_latency_correction: AtomicBool,
     /// Monotonic generation of the latency-compensation graph (bumped on PDC
     /// toggle). Stamped into the offline-export snapshot for graph-version parity.
     pub latency_graph_version: AtomicU64,
@@ -367,6 +380,9 @@ impl Default for SharedState {
             guard_engaged: AtomicBool::new(false),
             guard_ahead_frames: AtomicU64::new(0),
             guard_misses: AtomicU64::new(0),
+            pdc_rings_short: AtomicBool::new(false),
+            low_latency_limit_samples: AtomicU32::new(0),
+            record_interface_latency_correction: AtomicBool::new(true),
             callback_overruns: AtomicU64::new(0),
             guard_output_mutes: AtomicU64::new(0),
             guard_output_reason: AtomicU8::new(0),

@@ -1,4 +1,4 @@
-//! Note transforms behind the MIDI editor's tools panel: quantize, length,
+//! Note transforms behind the MIDI editor's tools panel: quantize, swing, length,
 //! time stretch, transpose, chord voicing and strum.
 //!
 //! Every function here is a pure, in-place rewrite of the start, duration or
@@ -581,24 +581,78 @@ pub fn stretch_notes(
         }
         note.start = start;
         note.duration = duration;
-        if let Some(curve) = note.pitch_curve.as_mut() {
-            for point in &mut curve.points {
-                point.beat *= factor;
-            }
+        scale_note_expression(note, factor);
+    }
+    changed
+}
+
+/// Scale a note's own curves (pitch curve and expression lanes, timed from
+/// its start) by `factor`, so they keep their place in a resized note.
+fn scale_note_expression(note: &mut MidiNoteState, factor: f32) {
+    if let Some(curve) = note.pitch_curve.as_mut() {
+        for point in &mut curve.points {
+            point.beat *= factor;
         }
-        let expression = &mut note.expression;
-        for curve in [
-            &mut expression.pitch,
-            &mut expression.pressure,
-            &mut expression.timbre,
-        ]
-        .into_iter()
-        .chain(expression.custom.iter_mut().map(|lane| &mut lane.curve))
-        {
-            for point in &mut curve.points {
-                point.position *= factor;
-            }
+    }
+    let expression = &mut note.expression;
+    for curve in [
+        &mut expression.pitch,
+        &mut expression.pressure,
+        &mut expression.timbre,
+    ]
+    .into_iter()
+    .chain(expression.custom.iter_mut().map(|lane| &mut lane.curve))
+    {
+        for point in &mut curve.points {
+            point.position *= factor;
         }
+    }
+}
+
+/// Where swing moves clip beat `beat`: every second `step` (the off-beat)
+/// is delayed by `amount × step / 3`, the same delay [`QuantizeSpec`]'s
+/// swing gives its odd grid lines, and the time between is warped linearly.
+/// On-beats stay put, a note just after the off-beat moves with it, and a
+/// played note keeps its distance from the line it was played against.
+pub fn swing_beat(beat: f32, step: f32, amount: f32) -> f32 {
+    let delay = amount.clamp(0.0, 1.0) * step / 3.0;
+    let pair = 2.0 * step;
+    let base = (beat / pair).floor() * pair;
+    let into = beat - base;
+    let warped = if into <= step {
+        into * (step + delay) / step
+    } else {
+        step + delay + (into - step) * (step - delay) / step
+    };
+    base + warped
+}
+
+/// Swing the notes on a `step` grid without quantizing them: starts and ends
+/// move by [`swing_beat`], so a run of straight eighths becomes long-short
+/// pairs that still join up, and a note's curves scale with its new length.
+/// `amount` is `0..=1`, `1` putting the off-beat on the triplet (2:1).
+pub fn swing_notes(
+    notes: &mut [MidiNoteState],
+    ids: &HashSet<u64>,
+    step: f32,
+    amount: f32,
+) -> usize {
+    if !step.is_finite() || step <= 0.0 || amount <= 0.0 {
+        return 0;
+    }
+    let mut changed = 0;
+    for note in selected(notes, ids) {
+        let start = swing_beat(note.start, step, amount).max(0.0);
+        let end = swing_beat(note.start + note.duration, step, amount);
+        let duration = (end - start).max(MIN_NOTE_BEATS);
+        if !changed_f32(start, note.start) && !changed_f32(duration, note.duration) {
+            continue;
+        }
+        let factor = duration / note.duration.max(MIN_NOTE_BEATS);
+        note.start = start;
+        note.duration = duration;
+        scale_note_expression(note, factor);
+        changed += 1;
     }
     changed
 }
@@ -1230,6 +1284,57 @@ mod tests {
         };
         quantize_notes(&mut notes, &ids, swung, QuantizeTarget::Start);
         assert!((notes[0].start - 0.5 * 4.0 / 3.0).abs() < 1e-5);
+    }
+
+    /// Swing delays the off-beat to the same place the quantize swing puts
+    /// it, leaves the on-beats alone, and keeps a legato line joined.
+    #[test]
+    fn swing_delays_offbeats_and_keeps_a_line_joined() {
+        let mut notes: Vec<_> = (0..4).map(|i| note(60, i as f32 * 0.5, 0.5)).collect();
+        let ids = all(&notes);
+        assert_eq!(swing_notes(&mut notes, &ids, 0.5, 1.0), 4);
+        let triplet = 0.5 * 4.0 / 3.0;
+        assert!((notes[0].start - 0.0).abs() < 1e-5);
+        assert!((notes[1].start - triplet).abs() < 1e-5);
+        assert!((notes[2].start - 1.0).abs() < 1e-5);
+        assert!((notes[3].start - (1.0 + triplet)).abs() < 1e-5);
+        for pair in notes.windows(2) {
+            assert!((pair[0].start + pair[0].duration - pair[1].start).abs() < 1e-5);
+        }
+        // The last note still ends on the beat.
+        assert!((notes[3].start + notes[3].duration - 2.0).abs() < 1e-5);
+    }
+
+    /// A played off-beat keeps its distance from the line it was played
+    /// against, and notes outside the selection or a zero amount stay put.
+    #[test]
+    fn swing_keeps_the_played_feel_and_only_touches_the_selection() {
+        assert!((swing_beat(0.52, 0.5, 0.5) - (0.5 + 0.5 / 6.0 + 0.02 * (2.5 / 3.0))).abs() < 1e-5);
+        assert!((swing_beat(4.0, 0.25, 1.0) - 4.0).abs() < 1e-5);
+
+        let mut notes = vec![note(60, 0.25, 0.25), note(62, 0.75, 0.25)];
+        let ids: HashSet<u64> = [notes[0].id].into_iter().collect();
+        assert_eq!(swing_notes(&mut notes, &ids, 0.25, 0.0), 0);
+        assert_eq!(swing_notes(&mut notes, &ids, 0.25, 1.0), 1);
+        assert!((notes[0].start - 0.25 * 4.0 / 3.0).abs() < 1e-5);
+        assert!((notes[1].start - 0.75).abs() < 1e-5);
+    }
+
+    /// A note's curves scale with the length swing gives it.
+    #[test]
+    fn swing_scales_the_notes_expression_with_its_length() {
+        let mut first = note(60, 0.0, 0.5);
+        first
+            .expression
+            .pressure
+            .points
+            .push(sphere_midi_service::ExpressionPoint::new(0.5, 1.0));
+        let mut notes = vec![first];
+        let ids = all(&notes);
+        swing_notes(&mut notes, &ids, 0.5, 1.0);
+        let length = notes[0].duration;
+        assert!((length - 0.5 * 4.0 / 3.0).abs() < 1e-5);
+        assert!((notes[0].expression.pressure.points[0].position - length).abs() < 1e-5);
     }
 
     #[test]

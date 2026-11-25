@@ -423,19 +423,8 @@ fn opus_head(channels: u8, pre_skip: u16, input_sample_rate: u32) -> Vec<u8> {
 /// metadata as `FIELD=value` Vorbis comments.
 fn opus_tags(metadata: &AudioMetadata) -> Vec<u8> {
     let vendor = format!("Futureboard Studio ({})", opus::version());
-    let comments = metadata.vorbis_comments();
-    let mut tags = Vec::with_capacity(64);
-    tags.extend_from_slice(b"OpusTags");
-    tags.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
-    tags.extend_from_slice(vendor.as_bytes());
-    tags.extend_from_slice(&(comments.len() as u32).to_le_bytes());
-    for (field, value) in comments {
-        let length = field.len() + 1 + value.len();
-        tags.extend_from_slice(&(length as u32).to_le_bytes());
-        tags.extend_from_slice(field.as_bytes());
-        tags.push(b'=');
-        tags.extend_from_slice(value.as_bytes());
-    }
+    let mut tags = b"OpusTags".to_vec();
+    tags.extend_from_slice(&metadata.vorbis_comment_body(&vendor));
     tags
 }
 
@@ -670,6 +659,12 @@ mod tests {
             album: None,
             date: Some("2026-11-09".into()),
             comment: Some("  ".into()),
+            album_artist: Some("Various".into()),
+            composer: Some("Writer".into()),
+            genre: Some("Ambient".into()),
+            track_number: Some("3".into()),
+            copyright: Some("(c) 2026".into()),
+            isrc: Some("USRC17607839".into()),
         };
         let mut encoder = OpusEncoder::create(
             &path,
@@ -705,7 +700,20 @@ mod tests {
         }
         assert_eq!(at, tags.len());
         // Unset and blank fields are left out.
-        assert_eq!(comments, ["TITLE=Song", "ARTIST=Band", "DATE=2026-11-09"]);
+        assert_eq!(
+            comments,
+            [
+                "TITLE=Song",
+                "ARTIST=Band",
+                "ALBUMARTIST=Various",
+                "COMPOSER=Writer",
+                "GENRE=Ambient",
+                "DATE=2026-11-09",
+                "TRACKNUMBER=3",
+                "COPYRIGHT=(c) 2026",
+                "ISRC=USRC17607839",
+            ]
+        );
         let _ = std::fs::remove_file(path);
     }
 

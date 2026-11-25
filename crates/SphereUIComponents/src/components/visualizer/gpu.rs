@@ -328,7 +328,20 @@ impl GpuContext {
     pub fn shares_textures(&self) -> bool {
         self.shared
     }
+
+    /// The device, for other renderers that draw on the same adapter (the
+    /// 3D Room Preview).
+    pub(crate) fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    pub(crate) fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
 }
+
+/// The colour format every target GPUI imports is in.
+pub(crate) const TARGET_FORMAT: wgpu::TextureFormat = FORMAT;
 
 /// The adapter to render on, and whether shared textures work on it.
 fn pick_adapter(adapter_luid: Option<u64>) -> Result<(wgpu::Adapter, bool), String> {
@@ -411,7 +424,9 @@ pub struct Surface {
     fresh: bool,
 }
 
-struct Target {
+/// An off-screen colour target GPUI can composite: shared with GPUI's
+/// adapter where it can be, read back otherwise.
+pub(crate) struct Target {
     width: u32,
     height: u32,
     texture: wgpu::Texture,
@@ -631,11 +646,35 @@ impl Surface {
             }
         }
 
+        self.fresh = false;
+        present(&context, &self.target, encoder)
+    }
+}
+
+impl Target {
+    pub(crate) fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    pub(crate) fn view(&self) -> &wgpu::TextureView {
+        &self.view
+    }
+}
+
+/// Submit `encoder` (which drew into `target`) and hand the finished frame
+/// over: the shared handle once the GPU is done, or the pixels read back.
+pub(crate) fn present(
+    context: &GpuContext,
+    target: &Target,
+    mut encoder: wgpu::CommandEncoder,
+) -> Result<Presented, String> {
+    let (width, height) = target.size();
+    {
         let padded_row = (width * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
             * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-        if let Some(readback) = self.target.readback.as_ref() {
+        if let Some(readback) = target.readback.as_ref() {
             encoder.copy_texture_to_buffer(
-                self.target.texture.as_image_copy(),
+                target.texture.as_image_copy(),
                 wgpu::TexelCopyBufferInfo {
                     buffer: readback,
                     layout: wgpu::TexelCopyBufferLayout {
@@ -652,10 +691,9 @@ impl Surface {
             );
         }
         context.queue.submit(Some(encoder.finish()));
-        self.fresh = false;
 
         #[cfg(target_os = "windows")]
-        if let Some(shared) = self.target.shared.as_ref() {
+        if let Some(shared) = target.shared.as_ref() {
             // GPUI copies from the texture as soon as it has the handle, on
             // another API: the frame has to be complete first.
             context
@@ -672,8 +710,7 @@ impl Surface {
             });
         }
 
-        let readback = self
-            .target
+        let readback = target
             .readback
             .as_ref()
             .ok_or("visualizer target has neither a shared handle nor a readback buffer")?;
@@ -711,7 +748,7 @@ fn create_vertex_buffer(device: &wgpu::Device, capacity: u64) -> wgpu::Buffer {
     })
 }
 
-fn create_target(
+pub(crate) fn create_target(
     context: &GpuContext,
     width: u32,
     height: u32,

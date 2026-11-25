@@ -35,10 +35,43 @@ const MAX_WORKERS: usize = 8;
 const BLOCKS_PER_WORKER: usize = 2;
 
 /// `fLaC` plus the STREAMINFO block header: last-metadata-block flag, type 0,
-/// and its 34-byte length.
+/// and its 34-byte length. The flag is cleared when a VORBIS_COMMENT block
+/// follows (see [`FlacEncoder::write_stream_header`]).
 const STREAMINFO_HEADER: [u8; 8] = [b'f', b'L', b'a', b'C', 0x80, 0x00, 0x00, 0x22];
 /// Size of the STREAMINFO block body.
 const STREAMINFO_BYTES: u64 = 34;
+/// Last-metadata-block flag in a metadata block header's first byte.
+const LAST_METADATA_BLOCK: u8 = 0x80;
+/// Metadata block type of a VORBIS_COMMENT block.
+const VORBIS_COMMENT_BLOCK: u8 = 4;
+/// Largest metadata block body the 24-bit length field can describe.
+const MAX_METADATA_BLOCK_BYTES: usize = (1 << 24) - 1;
+/// Vendor string of the VORBIS_COMMENT block.
+const VENDOR: &str = "Futureboard Studio";
+
+/// The VORBIS_COMMENT metadata block (header and body) for `metadata`, always
+/// the last metadata block. Empty when there is nothing to write, or when the
+/// tags would not fit a metadata block (they are dropped rather than failing
+/// the export).
+fn vorbis_comment_block(metadata: &AudioMetadata) -> Vec<u8> {
+    if metadata.is_empty() {
+        return Vec::new();
+    }
+    let body = metadata.vorbis_comment_body(VENDOR);
+    if body.len() > MAX_METADATA_BLOCK_BYTES {
+        tracing::warn!(
+            "FLAC tags left out: {} bytes do not fit a metadata block",
+            body.len()
+        );
+        return Vec::new();
+    }
+    let length = (body.len() as u32).to_be_bytes();
+    let mut block = Vec::with_capacity(4 + body.len());
+    block.push(LAST_METADATA_BLOCK | VORBIS_COMMENT_BLOCK);
+    block.extend_from_slice(&length[1..]);
+    block.extend_from_slice(&body);
+    block
+}
 
 pub struct FlacEncoder {
     writer: BufWriter<File>,
@@ -62,7 +95,8 @@ pub struct FlacEncoder {
     /// Frame bytes written so far (excluding `fLaC` + STREAMINFO).
     frame_bytes: u64,
     quantizer: Quantizer,
-    metadata: AudioMetadata,
+    /// The VORBIS_COMMENT block written after STREAMINFO; empty for none.
+    comment_block: Vec<u8>,
     finalized: bool,
 }
 
@@ -140,11 +174,13 @@ impl FlacEncoder {
             sink: ByteSink::new(),
             frame_bytes: 0,
             quantizer: Quantizer::for_file(path.as_ref()),
-            metadata,
+            comment_block: vorbis_comment_block(&metadata),
             finalized: false,
         };
-        // Placeholder STREAMINFO, patched on finalize.
+        // Placeholder STREAMINFO, patched on finalize. The tags follow it and
+        // are final from the start.
         encoder.write_stream_header()?;
+        encoder.writer.write_all(&encoder.comment_block)?;
         Ok(encoder)
     }
 
@@ -168,13 +204,18 @@ impl FlacEncoder {
     }
 
     /// `fLaC` and the STREAMINFO block as `stream_info` stands, at the
-    /// writer's current position.
+    /// writer's current position. STREAMINFO is the last metadata block
+    /// unless a VORBIS_COMMENT block follows it.
     fn write_stream_header(&mut self) -> Result<(), EncodeError> {
         self.sink.clear();
         self.stream_info
             .write(&mut self.sink)
             .map_err(|err| flac_error("STREAMINFO serialize", err))?;
-        self.writer.write_all(&STREAMINFO_HEADER)?;
+        let mut header = STREAMINFO_HEADER;
+        if !self.comment_block.is_empty() {
+            header[4] &= !LAST_METADATA_BLOCK;
+        }
+        self.writer.write_all(&header)?;
         self.writer.write_all(self.sink.as_slice())?;
         Ok(())
     }
@@ -336,10 +377,6 @@ impl AudioEncoder for FlacEncoder {
         }
         self.finalized = true;
 
-        if !self.metadata.is_empty() {
-            tracing::debug!("FLAC metadata tags are not yet written (TODO Vorbis comments)");
-        }
-
         self.encode_pending()?;
         let total_samples = self.context.total_samples();
         self.stream_info.set_md5_digest(&self.context.md5_digest());
@@ -354,7 +391,7 @@ impl AudioEncoder for FlacEncoder {
             .set_block_sizes(self.block_size, self.block_size)
             .map_err(|err| flac_error("STREAMINFO block size", err))?;
 
-        // Patch the placeholder STREAMINFO in place.
+        // Patch the placeholder STREAMINFO in place; the tags after it stay.
         self.writer.flush()?;
         self.writer.seek(SeekFrom::Start(0))?;
         self.write_stream_header()?;
@@ -367,7 +404,10 @@ impl AudioEncoder for FlacEncoder {
             channels: self.spec.channels,
             sample_format: self.spec.sample_format,
             frames_written: total_samples as u64,
-            bytes_written: STREAMINFO_HEADER.len() as u64 + STREAMINFO_BYTES + self.frame_bytes,
+            bytes_written: STREAMINFO_HEADER.len() as u64
+                + STREAMINFO_BYTES
+                + self.comment_block.len() as u64
+                + self.frame_bytes,
         })
     }
 }
@@ -647,6 +687,92 @@ mod tests {
             encode(&other, AudioDither::Tpdf),
             "each file gets its own dither"
         );
+    }
+
+    /// Tags land in a VORBIS_COMMENT block right after STREAMINFO, which then
+    /// stops being the last metadata block; the frames follow the tags, the
+    /// header patch on finalize leaves them in place, and the first frame
+    /// starts where the last block ends. Without tags STREAMINFO stays last.
+    #[test]
+    fn tags_are_a_vorbis_comment_block_after_streaminfo() {
+        let path = temp_path("tags");
+        let metadata = AudioMetadata {
+            title: Some("Song".into()),
+            artist: Some("Band".into()),
+            genre: Some("Ambient".into()),
+            isrc: Some("USRC17607839".into()),
+            comment: Some("  ".into()),
+            ..AudioMetadata::default()
+        };
+        let mut enc = FlacEncoder::create(
+            &path,
+            spec(48_000, 2, AudioSampleFormat::I16),
+            FlacEncodeOptions::default(),
+            metadata,
+        )
+        .unwrap();
+        enc.write_interleaved_f32(&signal(5_000, 2)).unwrap();
+        let summary = enc.finalize().unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(summary.bytes_written, bytes.len() as u64);
+
+        assert_eq!(&bytes[0..4], b"fLaC");
+        assert_eq!(bytes[4], 0x00, "STREAMINFO, not last");
+        assert_eq!(&bytes[5..8], &[0, 0, 34]);
+        let total = (u64::from(bytes[21] & 0x0F) << 32)
+            | u64::from(u32::from_be_bytes(bytes[22..26].try_into().unwrap()));
+        assert_eq!(total, 5_000, "STREAMINFO was patched");
+
+        let at = 8 + 34;
+        assert_eq!(bytes[at], 0x84, "VORBIS_COMMENT, last");
+        let length = u32::from_be_bytes([0, bytes[at + 1], bytes[at + 2], bytes[at + 3]]) as usize;
+        let body = &bytes[at + 4..at + 4 + length];
+        let u32_at = |at: usize| u32::from_le_bytes(body[at..at + 4].try_into().unwrap()) as usize;
+        let vendor_len = u32_at(0);
+        assert_eq!(&body[4..4 + vendor_len], VENDOR.as_bytes());
+        let mut cursor = 4 + vendor_len;
+        let count = u32_at(cursor);
+        cursor += 4;
+        let mut comments = Vec::new();
+        for _ in 0..count {
+            let len = u32_at(cursor);
+            cursor += 4;
+            comments.push(std::str::from_utf8(&body[cursor..cursor + len]).unwrap());
+            cursor += len;
+        }
+        assert_eq!(cursor, body.len());
+        assert_eq!(
+            comments,
+            [
+                "TITLE=Song",
+                "ARTIST=Band",
+                "GENRE=Ambient",
+                "ISRC=USRC17607839"
+            ]
+        );
+        // The first frame (fixed-blocksize sync) follows the last block.
+        let frames = at + 4 + length;
+        assert_eq!(&bytes[frames..frames + 2], &[0xff, 0xf8]);
+
+        // Blank tags only: STREAMINFO is the only, and last, block.
+        let path = temp_path("no-tags");
+        let mut enc = FlacEncoder::create(
+            &path,
+            spec(48_000, 2, AudioSampleFormat::I16),
+            FlacEncodeOptions::default(),
+            AudioMetadata {
+                title: Some(" ".into()),
+                ..AudioMetadata::default()
+            },
+        )
+        .unwrap();
+        enc.write_interleaved_f32(&signal(500, 2)).unwrap();
+        enc.finalize().unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(bytes[4], 0x80);
+        assert_eq!(&bytes[42..44], &[0xff, 0xf8]);
     }
 
     /// LiveStage's recorder builds its options as `..AudioEncodeOptions::

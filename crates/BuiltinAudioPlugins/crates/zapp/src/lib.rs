@@ -21,10 +21,10 @@
 //! rather than clicking.
 
 use biquad::{Biquad, Coefficients, DirectForm1};
-use builtin_dsp_core::delay::{smoothing_step, Smoothed};
+use builtin_dsp_core::delay::{Smoothed, smoothing_step};
 use builtin_dsp_core::{
-    clamp, db_to_linear, flush_denormal, linear_to_db, make_eq_coefficients, max_filter_frequency,
-    time_constant, ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect,
+    ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, clamp, db_to_linear,
+    flush_denormal, linear_to_db, make_eq_coefficients, max_filter_frequency, time_constant,
 };
 use serde::{Deserialize, Serialize};
 
@@ -33,11 +33,11 @@ pub mod oversample;
 pub mod presets;
 pub mod ui;
 
-pub use ipc::{ui_param_id, ui_param_index, UI_PARAM_IDS};
+pub use ipc::{UI_PARAM_IDS, ui_param_id, ui_param_index};
 pub use oversample::TAPS_PER_PHASE;
-pub use presets::{factory_presets, FactoryPreset};
+pub use presets::{FactoryPreset, factory_presets};
 
-use oversample::{AntiAlias, Ring, MAX_FACTOR};
+use oversample::{AntiAlias, MAX_FACTOR, Ring};
 
 pub const PLUGIN_ID: &str = "futureboard.zapp";
 
@@ -209,11 +209,7 @@ impl Oversampling {
 
     /// The delay this setting adds, at the host rate.
     pub const fn latency_samples(self) -> usize {
-        if self.factor() > 1 {
-            TAPS_PER_PHASE
-        } else {
-            0
-        }
+        if self.factor() > 1 { TAPS_PER_PHASE } else { 0 }
     }
 }
 

@@ -321,11 +321,11 @@ let
 
       cat > $app/build-info.json <<EOF
       {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "application": "Futureboard Studio",
         "binary": "FutureboardNative",
         "sidecars": ["FutureboardPluginHostX64", "FutureboardPluginScanner"],
-        "edition": "community",
+        "professional": false,
         "profile": "release",
         "target": "${stdenv.hostPlatform.rust.rustcTarget}",
         "platform": "linux-x64",

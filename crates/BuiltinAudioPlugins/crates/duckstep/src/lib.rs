@@ -24,10 +24,10 @@
 //! milliseconds and switches at the bottom of the dip rather than clicking.
 
 use biquad::{Biquad, Coefficients, DirectForm1};
-use builtin_dsp_core::delay::{smoothing_step, DelayRing, Smoothed};
+use builtin_dsp_core::delay::{DelayRing, Smoothed, smoothing_step};
 use builtin_dsp_core::{
-    clamp, db_to_linear, flush_denormal, linear_to_db, make_eq_coefficients, max_filter_frequency,
-    time_constant, ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect,
+    ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, clamp, db_to_linear,
+    flush_denormal, linear_to_db, make_eq_coefficients, max_filter_frequency, time_constant,
 };
 use serde::{Deserialize, Serialize};
 
@@ -35,9 +35,9 @@ pub mod ipc;
 pub mod presets;
 pub mod ui;
 
-pub use ipc::{ui_param_id, ui_param_index, UI_PARAM_IDS};
+pub use ipc::{UI_PARAM_IDS, ui_param_id, ui_param_index};
 pub use presets::{
-    factory_presets, DetectorPreset, FactoryPreset, ShapePreset, DETECTOR_PRESETS, SHAPE_PRESETS,
+    DETECTOR_PRESETS, DetectorPreset, FactoryPreset, SHAPE_PRESETS, ShapePreset, factory_presets,
 };
 
 pub const PLUGIN_ID: &str = "futureboard.duckstep";
@@ -1636,8 +1636,14 @@ mod tests {
         };
         let silent_key = duck(Source::External, 0.0);
         let loud_key = duck(Source::External, 1.0);
-        assert!(silent_key > 0.009, "a silent key leaves the track alone: {silent_key}");
-        assert!(loud_key < silent_key * 0.7, "a loud key ducks it: {loud_key} vs {silent_key}");
+        assert!(
+            silent_key > 0.009,
+            "a silent key leaves the track alone: {silent_key}"
+        );
+        assert!(
+            loud_key < silent_key * 0.7,
+            "a loud key ducks it: {loud_key} vs {silent_key}"
+        );
         let internal = duck(Source::Internal, 1.0);
         assert!(
             (internal - silent_key).abs() < 1.0e-4,

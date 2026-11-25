@@ -92,6 +92,76 @@ pub enum ClipCutGesture {
 pub type AudioClipCutCb =
     std::sync::Arc<dyn Fn(&ClipCutGesture, &mut gpui::Window, &mut gpui::App) + 'static>;
 
+/// A Pointer press in an audio or MIDI clip's body, below the top band that
+/// moves the clip (see [`clip_body_range_zone`]). The timeline turns it into a
+/// click, a time-range drag or a range move (`Timeline::begin_clip_body_press`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClipBodyPress {
+    pub clip_id: String,
+    pub track_id: String,
+    /// Raw window pixels of the press.
+    pub window_x: f32,
+    pub window_y: f32,
+    /// Cmd/Ctrl: a click toggles the clip in the selection.
+    pub additive: bool,
+}
+
+pub type ClipBodyPressCb =
+    std::sync::Arc<dyn Fn(&ClipBodyPress, &mut gpui::Window, &mut gpui::App) + 'static>;
+
+/// The Pointer's range zone: a clip's body between its edge handles, below
+/// the top band ([`SMART_CUT_TOP_CLEARANCE`]) that keeps moving the clip and
+/// holds its corner fade handles. A press here selects the clip as a press on
+/// the clip does, a drag draws a time range instead of moving the clip, and a
+/// double-click still opens the editor. It stops the press, so the clip's own
+/// drag never starts from it.
+///
+/// Option/Alt is left to the clip: an Option-drag clones it and an Option
+/// click in the cut zone splits it. Controls drawn after this zone (the
+/// inline gain) take their own presses first.
+pub(crate) fn clip_body_range_zone(
+    clip_id: &str,
+    track_id: &str,
+    inset_x: f32,
+    on_press: ClipBodyPressCb,
+    on_open_editor: Option<std::sync::Arc<dyn Fn(&mut gpui::Window, &mut gpui::App) + 'static>>,
+) -> gpui::Div {
+    let clip_id = clip_id.to_string();
+    let track_id = track_id.to_string();
+    div()
+        .absolute()
+        .left(px(inset_x))
+        .right(px(inset_x))
+        .top(px(SMART_CUT_TOP_CLEARANCE))
+        .bottom_0()
+        .cursor(gpui::CursorStyle::IBeam)
+        .on_mouse_down(
+            gpui::MouseButton::Left,
+            move |event: &gpui::MouseDownEvent, window, cx| {
+                if event.modifiers.alt {
+                    return;
+                }
+                cx.stop_propagation();
+                on_press(
+                    &ClipBodyPress {
+                        clip_id: clip_id.clone(),
+                        track_id: track_id.clone(),
+                        window_x: event.position.x.into(),
+                        window_y: event.position.y.into(),
+                        additive: event.modifiers.control || event.modifiers.platform,
+                    },
+                    window,
+                    cx,
+                );
+                if event.click_count >= 2 {
+                    if let Some(open) = on_open_editor.as_ref() {
+                        open(window, cx);
+                    }
+                }
+            },
+        )
+}
+
 /// Clips at least this wide get the wider edge handle, so the Smart Tool's
 /// duration zone can be found without hunting for a 6 px strip.
 const CLIP_WIDE_HANDLE_MIN_W: f32 = 64.0;
@@ -740,9 +810,10 @@ fn clip_badge(hue: gpui::Rgba) -> gpui::Div {
         .text_color(hue)
 }
 
-/// Height of the band along a clip's top edge the Smart Tool's cut zone leaves
-/// free, so the corner fade handles have the corners to themselves.
-const SMART_CUT_TOP_CLEARANCE: f32 = 12.0;
+/// Height of the band along a clip's top edge the Smart Tool's cut zone and
+/// the range zone leave free: the corner fade handles have the corners to
+/// themselves, and a drag from the band moves the clip.
+pub(crate) const SMART_CUT_TOP_CLEARANCE: f32 = 12.0;
 
 /// Farthest the pointer may travel between press and release for a click in
 /// the cut zone to split: GPUI's own drag threshold, past which it is a drag.
@@ -1178,6 +1249,7 @@ pub(crate) fn audio_clip(
         std::sync::Arc<dyn Fn(&String, &mut gpui::Window, &mut gpui::App) + 'static>,
     >,
     on_cut_clip: Option<AudioClipCutCb>,
+    on_body_press: Option<ClipBodyPressCb>,
     erase_target: bool,
     selected: bool,
     (left, width): (f32, f32),
@@ -1408,6 +1480,22 @@ pub(crate) fn audio_clip(
                 .flatten()
                 .map(|cut| smart_cut_zone(&clip.id, id_num, resize_handle_w, cut)),
         )
+        // Pointer: the body below the top band selects a time range; see
+        // `clip_body_range_zone`. After the cut zone, so a plain press is the
+        // range zone's; before the strip, so the inline gain stays on top.
+        .children(pointer.then_some(on_body_press).flatten().map(|press| {
+            clip_body_range_zone(
+                &clip.id,
+                track_id,
+                if show_resize_handles {
+                    resize_handle_w
+                } else {
+                    0.0
+                },
+                press,
+                on_open_editor.clone(),
+            )
+        }))
         // The label row: the clip's name on a plate of its own fill, and at
         // the far end the badges and the gain chip. It floats over the
         // bottom of the waveform rather than taking a strip from it, and the

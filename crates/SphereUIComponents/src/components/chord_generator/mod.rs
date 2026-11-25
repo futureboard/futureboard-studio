@@ -1,30 +1,38 @@
-//! Chord Generator: an independent utility window for writing a progression
-//! on a small timeline, then handing it to the arrangement.
+//! Chord Generator: an independent utility window for writing a chord
+//! progression from a palette, then handing it to the arrangement.
 //!
-//! The window is a three-lane timeline:
+//! - **Palette** — the chords of a key laid out by scale degree (columns)
+//!   and kind (rows: triads, sevenths, ninths, suspended and added colours,
+//!   the parallel key's chords, secondary dominants). Each chord is coloured
+//!   by family and marked by whether all its notes lie in the song's key.
+//!   The arrows step the palette round the circle of fifths away from the
+//!   song key for more distant colours; Home brings it back; Parallel swaps
+//!   major and minor. Click a chord to hear it, double-click to add it, drag
+//!   it into the sequence.
+//! - **Sequence** — sections of chords played back to back. A chord dropped
+//!   inside a section joins it; dropped at a section's edge or past the end
+//!   it starts a new section. Chords move by their body (Alt copies), stretch
+//!   by their right edge, and Shift-click selects several; a section moves by
+//!   its tab (Alt copies). Under the chords, **Comp** and **Bass** lanes hold
+//!   performance patterns saying how the chords are played; double-click an
+//!   empty stretch to add one.
+//! - **Fill Section** writes a generated progression in the chosen style into
+//!   the selected section's unlocked chords, or as a new section.
 //!
-//! - **Chords** — chord regions. A progression pattern from the browser is
-//!   dropped onto it; each chord can then be moved, stretched, swapped for an
-//!   alternative, re-rolled, locked or deleted.
-//! - **Comp** and **Bass** — performance-pattern regions (sustain, pulse,
-//!   arpeggio, strum…; root, walking…) saying how the chords above them are
-//!   played. Where no pattern lies, that lane is silent.
-//!
-//! Regions move by their body and stretch by their right edge, snapped to the
-//! beat; a region overwrites what it lands on in its lane. Every gesture is a
-//! live preview committed once on release, and every edit is one undo step
-//! (window-local: nothing here touches the project until it is exported).
-//!
-//! Export goes to the Studio as a [`ChordGeneratorCommand`]: the chords to the
-//! Chord Track, or the rendered Comp + Bass performance as one MIDI clip —
-//! from the footer buttons at the playhead, or by dragging the footer handle
-//! onto the arrangement, where the Studio resolves the drop against the main
-//! window's live pointer.
+//! Every gesture is a transient preview committed once on release, and every
+//! edit is one undo step (window-local: nothing here touches the project
+//! until it is exported). Export goes to the Studio as a
+//! [`ChordGeneratorCommand`]: the chords to the Chord Track, or the rendered
+//! Comp + Bass performance as one MIDI clip — from the footer buttons at the
+//! playhead, or by dragging the footer handle onto the arrangement, where the
+//! Studio resolves the drop against the main window's live pointer.
 
 mod model;
+mod palette_view;
+mod sequence;
+mod side_panel;
 
 use std::cell::Cell;
-use std::f32::consts::TAU;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -32,49 +40,50 @@ use std::time::{Duration, Instant};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     canvas, div, px, size, AnyElement, App, AppContext, Bounds, Context, FocusHandle,
-    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Pixels, Point, Render, StatefulInteractiveElement, Styled, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind,
+    InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseButton, MouseMoveEvent,
+    MouseUpEvent, ParentElement, Pixels, Point, Render, Rgba, StatefulInteractiveElement, Styled,
+    Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind,
 };
 use sphere_midi_service::chords::{
-    alternatives, generate, pitch_name, progression_patterns, voice_progression, Chord,
-    Colors as ChordColors, GeneratorSettings, Richness, Rng, Scale, Style, VoicingOptions,
+    alternatives, generate, pitch_name, Chord, ChordFamily, Colors as ChordColors,
+    GeneratorSettings, Richness, Rng, Scale, Style, VoicingOptions,
 };
-use sphere_midi_service::performance::{
-    render_performance, BassPattern, CompPattern, GeneratedNote,
-};
+use sphere_midi_service::performance::{render_performance, GeneratedNote};
 
-use self::model::{snap, Arrangement, Content, History, Lane, Region, BEATS_PER_BAR, MIN_LENGTH};
+use self::model::{
+    snap, Arrangement, History, Insert, Lane, Pattern, Placed, Region, BEATS_PER_BAR, MIN_LENGTH,
+};
 use crate::assets;
 use crate::components::controls::{
-    fb_button, fb_checkbox, fb_section_label, fb_segment, fb_segmented_track, fb_tooltip,
-    FbButtonKind, FbSegment,
+    fb_button, fb_checkbox, fb_icon_button, fb_section_label, fb_segment, fb_segmented_track,
+    fb_tooltip, FbButtonKind, FbSegment,
 };
-use crate::components::pitch_wheel::{self, fifths_pitch_class, ring, WheelFrame};
 use crate::components::timeline::timeline_state::ChordPlacement;
 use crate::components::title_bar::external_window_titlebar;
 use crate::theme::{radius, space, typography, Colors};
 use crate::window_position::{apply_owner_display, centered_window_bounds};
 
 pub const CHORD_GENERATOR_WIDTH: f32 = 1120.0;
-pub const CHORD_GENERATOR_HEIGHT: f32 = 720.0;
-const MIN_WIDTH: f32 = 980.0;
-const MIN_HEIGHT: f32 = 640.0;
-const BROWSER_W: f32 = 236.0;
-const INSPECTOR_W: f32 = 232.0;
-const WHEEL_SIZE: f32 = 168.0;
-/// Timeline geometry: lane label column, ruler, lane heights, region inset,
-/// stretch handle width.
+pub const CHORD_GENERATOR_HEIGHT: f32 = 760.0;
+pub(crate) const MIN_WIDTH: f32 = 980.0;
+pub(crate) const MIN_HEIGHT: f32 = 640.0;
+/// Right column: the pitch wheel and the selection's properties.
+const SIDE_W: f32 = 248.0;
+const WHEEL_SIZE: f32 = 148.0;
+/// Sequence geometry: lane label column, ruler, lane heights, region inset,
+/// stretch handle width, section tab height.
 const LABEL_W: f32 = 64.0;
-const RULER_H: f32 = 22.0;
+const RULER_H: f32 = 20.0;
+const CHORD_LANE_H: f32 = 76.0;
+const PATTERN_LANE_H: f32 = 30.0;
 const REGION_INSET: f32 = 3.0;
 const EDGE_W: f32 = 6.0;
-/// Beats a region snaps to.
+const SECTION_TAB_H: f32 = 16.0;
+/// How close to a section's edge a dropped chord starts a new section
+/// beside it rather than joining it.
+const SECTION_EDGE_PX: f32 = 12.0;
+/// Beats a chord or pattern snaps to.
 const GRID: f64 = 1.0;
-/// Length of each chord of a dropped progression pattern.
-const PATTERN_CHORD_BEATS: f64 = BEATS_PER_BAR;
-/// Progressions generated this session, kept in the browser.
-const RECENT: usize = 12;
 /// Pointer travel before a press becomes a drag.
 const DRAG_THRESHOLD: f32 = 4.0;
 const FRAME: Duration = Duration::from_millis(16);
@@ -82,13 +91,6 @@ const SETTLE_SECONDS: f32 = 0.12;
 /// How long a clicked chord rings.
 const AUDITION_SECONDS: f64 = 1.4;
 const LENGTHS: [u32; 4] = [4, 8, 16, 32];
-
-fn lane_height(lane: Lane) -> f32 {
-    match lane {
-        Lane::Chords => 60.0,
-        Lane::Comp | Lane::Bass => 44.0,
-    }
-}
 
 /// What the window asks the Studio to do.
 pub enum ChordGeneratorCommand {
@@ -132,6 +134,15 @@ pub struct ChordGeneratorCallbacks {
     pub on_close: Arc<dyn Fn(Bounds<Pixels>, &mut App) + Send + Sync>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum Selection {
+    None,
+    /// Chords of the sequence, in the order they were picked.
+    Chords(Vec<u64>),
+    Section(u64),
+    Region(u64),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegionMode {
     Move,
@@ -139,32 +150,24 @@ enum RegionMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum BrowserItem {
-    /// Index into [`ChordGeneratorWindow::library`].
-    Progression(usize),
-    Comp(CompPattern),
-    Bass(BassPattern),
-}
-
-impl BrowserItem {
-    fn lane(self) -> Lane {
-        match self {
-            BrowserItem::Progression(_) => Lane::Chords,
-            BrowserItem::Comp(_) => Lane::Comp,
-            BrowserItem::Bass(_) => Lane::Bass,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
 enum PressKind {
+    /// A sequence chord: its body moves it, its right edge stretches it.
+    Chord {
+        id: u64,
+        stretch: bool,
+        original_beats: f64,
+    },
+    /// A section's tab.
+    Section(u64),
+    /// A Comp or Bass pattern region.
     Region {
         id: u64,
         mode: RegionMode,
         original: Region,
     },
-    Browser(BrowserItem),
-    /// The footer handle: the whole timeline to the arrangement.
+    /// A palette chord.
+    Palette(Chord),
+    /// The footer handle: the whole sequence to the arrangement.
     Export,
 }
 
@@ -173,34 +176,31 @@ struct Press {
     kind: PressKind,
     origin: Point<Pixels>,
     dragging: bool,
+    /// Shift was held at the press (adds to the chord selection).
+    shift: bool,
+    /// Alt is held: a move becomes a copy.
+    copy: bool,
 }
 
-/// Where a browser item would land.
-#[derive(Debug, Clone, PartialEq)]
-struct Ghost {
-    lane: Lane,
-    start: f64,
-    length: f64,
-    /// The region the drop would restyle rather than overwrite.
-    onto: Option<u64>,
+/// Where a dragged chord or section would land.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DropMarker {
+    at: Insert,
+    beat: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BrowserTab {
-    Progressions,
-    Performance,
+enum PopoverKind {
+    Tonic,
+    Scale,
+    Style,
+    Colour,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum Popover {
-    Scale(Point<Pixels>),
-}
-
-/// A progression in the browser.
-#[derive(Debug, Clone)]
-struct LibraryEntry {
-    chords: Vec<Chord>,
-    generated: bool,
+struct Popover {
+    kind: PopoverKind,
+    at: Point<Pixels>,
 }
 
 /// Notes being played through the audition callback.
@@ -212,31 +212,36 @@ struct Playback {
     beat: f64,
     end: f64,
     bpm: f64,
-    /// Draw the playhead (timeline playback, not an audition).
+    /// Draw the playhead (sequence playback, not an audition).
     timeline: bool,
 }
 
 pub struct ChordGeneratorWindow {
     callbacks: ChordGeneratorCallbacks,
     focus: FocusHandle,
+    /// The song's key, and the generator's style and colours.
     settings: GeneratorSettings,
+    /// Fifths the palette is stepped away from the song key.
+    palette_steps: i32,
+    /// The palette shows the parallel mode of its key.
+    palette_parallel: bool,
+    /// The palette chord last clicked: the wheel shows it until a sequence
+    /// chord is picked.
+    palette_pick: Option<Chord>,
     seed: u64,
     voicing: VoicingOptions,
     arrangement: Arrangement,
     /// The arrangement as a live gesture would leave it.
     preview: Option<Arrangement>,
     history: History,
-    selected: Option<u64>,
-    tab: BrowserTab,
-    /// Progressions generated this session, newest first.
-    recent: Vec<Vec<Chord>>,
+    selection: Selection,
     press: Option<Press>,
-    ghost: Option<Ghost>,
+    marker: Option<DropMarker>,
     popover: Option<Popover>,
     playback: Option<Playback>,
     status: Option<String>,
-    /// Painted bounds of the timeline's content column (ruler + lanes), for
-    /// mapping a browser drag onto a lane.
+    /// Painted bounds of the sequence's content column (ruler + lanes), for
+    /// mapping the pointer to beats.
     lanes_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     // Wheel animation.
     shown_energy: [f32; 12],
@@ -248,11 +253,54 @@ pub struct ChordGeneratorWindow {
 
 impl ChordGeneratorWindow {
     fn new(callbacks: ChordGeneratorCallbacks, cx: &mut Context<Self>) -> Self {
+        Self::with_seed(callbacks, time_seed(), cx)
+    }
+
+    /// The window as the UI preview renders it: nothing to play through or
+    /// export to, and a fixed opening progression.
+    #[cfg(feature = "ui-preview")]
+    pub(crate) fn for_preview(seed: u64, cx: &mut Context<Self>) -> Self {
+        let callbacks = ChordGeneratorCallbacks {
+            on_command: Arc::new(|_, _| None),
+            audition: Arc::new(|_, _, _| false),
+            project_bpm: Arc::new(|_| 120.0),
+            on_close: Arc::new(|_, _| {}),
+        };
+        let mut window = Self::with_seed(callbacks, seed, cx);
+        // A second section, so the preview shows how sections read.
+        let chords = generate(
+            &GeneratorSettings {
+                length: 3,
+                richness: Richness::Sevenths,
+                ..window.settings
+            },
+            seed ^ 0x2,
+        );
+        window.arrangement.fill_section(None, &chords);
+        window
+    }
+
+    /// [`Self::for_preview`] with the palette a fifth away from the song key
+    /// and the second section selected.
+    #[cfg(feature = "ui-preview")]
+    pub(crate) fn for_preview_browsing(seed: u64, cx: &mut Context<Self>) -> Self {
+        let mut window = Self::for_preview(seed, cx);
+        window.palette_steps = 1;
+        if let Some(section) = window.arrangement.sections().get(1) {
+            window.selection = Selection::Section(section.id);
+        }
+        window
+    }
+
+    fn with_seed(callbacks: ChordGeneratorCallbacks, seed: u64, cx: &mut Context<Self>) -> Self {
         let mut window = Self {
             callbacks,
             focus: cx.focus_handle(),
             settings: GeneratorSettings::default(),
-            seed: time_seed(),
+            palette_steps: 0,
+            palette_parallel: false,
+            palette_pick: None,
+            seed,
             voicing: VoicingOptions {
                 bass: false,
                 ..VoicingOptions::default()
@@ -260,11 +308,9 @@ impl ChordGeneratorWindow {
             arrangement: Arrangement::default(),
             preview: None,
             history: History::default(),
-            selected: None,
-            tab: BrowserTab::Progressions,
-            recent: Vec::new(),
+            selection: Selection::None,
             press: None,
-            ghost: None,
+            marker: None,
             popover: None,
             playback: None,
             status: None,
@@ -275,23 +321,72 @@ impl ChordGeneratorWindow {
             window_active: true,
             _activation: None,
         };
-        // Open on a fresh progression with a sustained comp and a root bass,
-        // so Play sounds straight away.
+        // Open on a generated section with a sustained comp and a root bass
+        // under it, so Play sounds straight away.
         let chords = generate(&window.settings, window.seed);
-        window.remember(chords.clone());
-        window.place_progression(&chords, 0.0);
-        window.selected = window.arrangement.lane(Lane::Chords).next().map(|r| r.id);
+        window.arrangement.fill_section(None, &chords);
+        let end = window.arrangement.chords_end();
+        for lane in Lane::ALL {
+            window
+                .arrangement
+                .place_pattern(0.0, end, lane.default_pattern());
+        }
+        if let Some(first) = window.arrangement.placed().first() {
+            window.selection = Selection::Chords(vec![first.slot.id]);
+        }
         window.ensure_ticking(cx);
         window
     }
 
     // ── State helpers ───────────────────────────────────────────────────────
 
+    /// Spell in flats in the song's key.
     fn flats(&self) -> bool {
         self.settings.scale.prefers_flats(self.settings.tonic)
     }
 
-    /// What the timeline shows: the live gesture's result, or the committed
+    /// Spell `chord` in flats? A chord rooted in the song's scale follows
+    /// the key; one rooted a lowered step away (♭II, ♭III, ♭VI, ♭VII, the
+    /// borrowed and Neapolitan colours) is spelled flat, so a borrowed E♭ in
+    /// C major does not read as D♯.
+    fn chord_flats(&self, chord: &Chord) -> bool {
+        self.pc_flats(chord.root)
+    }
+
+    /// Spell pitch class `pc` in flats? See [`Self::chord_flats`].
+    fn pc_flats(&self, pc: u8) -> bool {
+        let tonic = self.settings.tonic;
+        if self.settings.scale.pitch_classes(tonic).contains(&pc) {
+            return self.flats();
+        }
+        matches!((pc + 12 - tonic) % 12, 1 | 3 | 8 | 10) || self.flats()
+    }
+
+    fn chord_name(&self, chord: &Chord) -> String {
+        chord.name(self.chord_flats(chord))
+    }
+
+    /// The key the palette shows.
+    fn palette_key(&self) -> (u8, Scale) {
+        let tonic = (self.settings.tonic as i32 + 7 * self.palette_steps).rem_euclid(12) as u8;
+        let scale = if self.palette_parallel {
+            self.settings.scale.parallel()
+        } else {
+            self.settings.scale
+        };
+        (tonic, scale)
+    }
+
+    fn palette_is_home(&self) -> bool {
+        self.palette_steps == 0 && !self.palette_parallel
+    }
+
+    /// Whether every note of `chord` lies in the song's key.
+    fn in_song_key(&self, chord: &Chord) -> bool {
+        chord.fits(self.settings.scale, self.settings.tonic)
+    }
+
+    /// What the sequence shows: the live gesture's result, or the committed
     /// arrangement.
     fn shown(&self) -> &Arrangement {
         self.preview.as_ref().unwrap_or(&self.arrangement)
@@ -304,12 +399,7 @@ impl ChordGeneratorWindow {
         if self.arrangement != before {
             self.history.record(before);
         }
-        if self
-            .selected
-            .is_some_and(|id| self.arrangement.find(id).is_none())
-        {
-            self.selected = None;
-        }
+        self.drop_stale_selection();
         self.ensure_ticking(cx);
         cx.notify();
     }
@@ -333,107 +423,53 @@ impl ChordGeneratorWindow {
     }
 
     fn drop_stale_selection(&mut self) {
-        if self
-            .selected
-            .is_some_and(|id| self.arrangement.find(id).is_none())
-        {
-            self.selected = None;
-        }
-    }
-
-    fn remember(&mut self, chords: Vec<Chord>) {
-        self.recent.retain(|c| *c != chords);
-        self.recent.insert(0, chords);
-        self.recent.truncate(RECENT);
-    }
-
-    /// Browser progressions: this session's generated ones, then the style's
-    /// templates in the current key.
-    fn library(&self) -> Vec<LibraryEntry> {
-        self.recent
-            .iter()
-            .map(|chords| LibraryEntry {
-                chords: chords.clone(),
-                generated: true,
-            })
-            .chain(
-                progression_patterns(&self.settings)
-                    .into_iter()
-                    .map(|chords| LibraryEntry {
-                        chords,
-                        generated: false,
-                    }),
-            )
-            .collect()
-    }
-
-    /// Place a progression at `start` (one bar per chord). A Comp or Bass
-    /// lane with nothing on it at all gets a plain pattern under the new
-    /// chords, so they sound; a lane already in use is left as written.
-    fn place_progression(&mut self, chords: &[Chord], start: f64) -> Vec<u64> {
-        let items: Vec<(Content, f64)> = chords
-            .iter()
-            .map(|&chord| {
-                (
-                    Content::Chord {
-                        chord,
-                        locked: false,
-                    },
-                    PATTERN_CHORD_BEATS,
-                )
-            })
-            .collect();
-        let ids = self.arrangement.place_sequence(start, &items);
-        let length = chords.len() as f64 * PATTERN_CHORD_BEATS;
-        if self.arrangement.lane(Lane::Comp).next().is_none() {
-            self.arrangement
-                .place(start, length, Content::Comp(CompPattern::Sustain));
-        }
-        if self.arrangement.lane(Lane::Bass).next().is_none() {
-            self.arrangement
-                .place(start, length, Content::Bass(BassPattern::Root));
-        }
-        ids
-    }
-
-    // ── Progression edits ───────────────────────────────────────────────────
-
-    /// A new progression over the Chords lane from the start, keeping locked
-    /// chords where they are.
-    fn regenerate(&mut self, cx: &mut Context<Self>) {
-        let mut rng = Rng::new(self.seed ^ time_seed());
-        self.seed = rng.next_u64();
-        let chords = generate(&self.settings, self.seed);
-        self.remember(chords.clone());
-        self.edit(cx, |this| {
-            let locked: Vec<Region> = this
-                .arrangement
-                .lane(Lane::Chords)
-                .filter(|r| matches!(r.content, Content::Chord { locked: true, .. }))
-                .copied()
-                .collect();
-            this.arrangement.clear_lane(Lane::Chords, |_| true);
-            this.place_progression(&chords, 0.0);
-            for region in locked {
-                this.arrangement
-                    .place(region.start, region.length, region.content);
+        let arrangement = &self.arrangement;
+        self.selection = match std::mem::replace(&mut self.selection, Selection::None) {
+            Selection::Chords(mut ids) => {
+                ids.retain(|id| arrangement.find_slot(*id).is_some());
+                if ids.is_empty() {
+                    Selection::None
+                } else {
+                    Selection::Chords(ids)
+                }
             }
-            this.selected = this.arrangement.lane(Lane::Chords).next().map(|r| r.id);
-        });
-        self.status = Some(format!(
-            "New {} progression{}",
-            self.settings.style.label(),
-            if self
-                .arrangement
-                .lane(Lane::Chords)
-                .any(|r| matches!(r.content, Content::Chord { locked: true, .. }))
-            {
-                " — locked chords kept"
-            } else {
-                ""
+            Selection::Section(id) if arrangement.section_index(id).is_some() => {
+                Selection::Section(id)
             }
-        ));
+            Selection::Region(id) if arrangement.find_region(id).is_some() => Selection::Region(id),
+            _ => Selection::None,
+        };
     }
+
+    fn selected_chords(&self) -> Vec<u64> {
+        match &self.selection {
+            Selection::Chords(ids) => ids.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The one selected chord, with its place.
+    fn selected_slot(&self) -> Option<Placed> {
+        match &self.selection {
+            Selection::Chords(ids) if ids.len() == 1 => self.arrangement.find_slot(ids[0]),
+            _ => None,
+        }
+    }
+
+    /// The section a Fill or an added chord goes to: the selected section,
+    /// or the selected chord's.
+    fn target_section(&self) -> Option<u64> {
+        match &self.selection {
+            Selection::Section(id) => Some(*id),
+            Selection::Chords(ids) => ids
+                .first()
+                .and_then(|id| self.arrangement.section_of(*id))
+                .map(|index| self.arrangement.sections()[index].id),
+            _ => None,
+        }
+    }
+
+    // ── Key and palette ─────────────────────────────────────────────────────
 
     fn set_tonic(&mut self, tonic: u8, cx: &mut Context<Self>) {
         let delta = tonic as i32 - self.settings.tonic as i32;
@@ -450,7 +486,39 @@ impl ChordGeneratorWindow {
             delta
         };
         self.settings.tonic = tonic;
+        self.palette_steps = 0;
+        self.palette_parallel = false;
+        self.palette_pick = None;
         self.edit(cx, |this| this.arrangement.transpose(delta));
+        self.status = Some(format!(
+            "Song key {} {} — the sequence moved with it",
+            pitch_name(tonic, self.flats()),
+            self.settings.scale.label()
+        ));
+    }
+
+    fn set_scale(&mut self, scale: Scale, cx: &mut Context<Self>) {
+        self.settings.scale = scale;
+        self.palette_steps = 0;
+        self.palette_parallel = false;
+        cx.notify();
+    }
+
+    fn step_palette(&mut self, delta: i32, cx: &mut Context<Self>) {
+        // Twelve fifths come back round; keep the count readable.
+        self.palette_steps = (self.palette_steps + delta).clamp(-6, 6);
+        cx.notify();
+    }
+
+    fn palette_home(&mut self, cx: &mut Context<Self>) {
+        self.palette_steps = 0;
+        self.palette_parallel = false;
+        cx.notify();
+    }
+
+    fn toggle_parallel(&mut self, cx: &mut Context<Self>) {
+        self.palette_parallel = !self.palette_parallel;
+        cx.notify();
     }
 
     fn update_settings(
@@ -462,41 +530,103 @@ impl ChordGeneratorWindow {
         cx.notify();
     }
 
-    fn selected_region(&self) -> Option<Region> {
-        self.selected
-            .and_then(|id| self.arrangement.find(id))
-            .copied()
+    // ── Sequence edits ──────────────────────────────────────────────────────
+
+    /// Where a double-clicked palette chord goes: after the selected chord,
+    /// at the end of the selected section, or at the end of the last one.
+    fn add_destination(&self) -> Insert {
+        let arrangement = &self.arrangement;
+        if let Some(placed) = self.selected_slot() {
+            let section = &arrangement.sections()[placed.section_index];
+            let index = section
+                .slots
+                .iter()
+                .position(|s| s.id == placed.slot.id)
+                .map_or(section.slots.len(), |i| i + 1);
+            return Insert::Into {
+                section: section.id,
+                index,
+            };
+        }
+        let section = self
+            .target_section()
+            .or_else(|| arrangement.sections().last().map(|s| s.id));
+        match section.and_then(|id| arrangement.section_index(id)) {
+            Some(index) => Insert::Into {
+                section: arrangement.sections()[index].id,
+                index: arrangement.sections()[index].slots.len(),
+            },
+            None => Insert::NewSection(arrangement.sections().len()),
+        }
     }
 
-    /// The chord after `region` on the Chords lane.
-    fn next_chord(&self, region: &Region) -> Option<Chord> {
-        self.arrangement
-            .lane(Lane::Chords)
-            .find(|r| r.start >= region.end() - 1e-9)
-            .and_then(|r| r.content.chord())
-    }
-
-    fn set_chord(&mut self, id: u64, chord: Chord, cx: &mut Context<Self>) {
+    fn insert_palette_chord(&mut self, chord: Chord, at: Insert, cx: &mut Context<Self>) {
+        let mut placed = Vec::new();
         self.edit(cx, |this| {
-            this.arrangement.set_content(
-                id,
-                Content::Chord {
-                    chord,
-                    locked: true,
-                },
-            );
+            placed = this
+                .arrangement
+                .insert_chords(at, &[(chord, BEATS_PER_BAR)]);
+            if !placed.is_empty() {
+                this.selection = Selection::Chords(placed.clone());
+            }
         });
-        self.audition_region(id, cx);
+        self.palette_pick = None;
+        self.status = Some(if placed.is_empty() {
+            "The sequence is full — 32 bars".to_string()
+        } else {
+            format!("Added {}", self.chord_name(&chord))
+        });
+    }
+
+    /// Generate a progression into the target section's unlocked chords, or
+    /// as a new section.
+    fn fill(&mut self, cx: &mut Context<Self>) {
+        let target = self.target_section();
+        let length = target
+            .and_then(|id| self.arrangement.section_index(id))
+            .map_or(4, |index| self.arrangement.sections()[index].slots.len());
+        let mut rng = Rng::new(self.seed ^ time_seed());
+        self.seed = rng.next_u64();
+        let settings = GeneratorSettings {
+            length,
+            ..self.settings
+        };
+        let chords = generate(&settings, self.seed);
+        let mut filled = None;
+        self.edit(cx, |this| {
+            filled = this.arrangement.fill_section(target, &chords);
+            if let Some(id) = filled {
+                this.selection = Selection::Section(id);
+            }
+        });
+        let label = filled
+            .and_then(|id| self.arrangement.section_index(id))
+            .map(section_label);
+        self.status = Some(match (target, label) {
+            (_, None) => "The sequence is full — 32 bars".to_string(),
+            (Some(_), Some(label)) => format!(
+                "Section {label}: new {} progression — locked chords kept",
+                self.settings.style.label()
+            ),
+            (None, Some(label)) => format!(
+                "Section {label}: new {} progression",
+                self.settings.style.label()
+            ),
+        });
+    }
+
+    fn swap_chord(&mut self, id: u64, chord: Chord, cx: &mut Context<Self>) {
+        self.edit(cx, |this| {
+            this.arrangement.set_chord(id, chord, true);
+        });
+        self.audition_slot(id, cx);
     }
 
     fn reroll(&mut self, id: u64, cx: &mut Context<Self>) {
-        let Some(region) = self.arrangement.find(id).copied() else {
+        let Some(current) = self.arrangement.find_slot(id).map(|p| p.slot.chord) else {
             return;
         };
-        let Some(current) = region.content.chord() else {
-            return;
-        };
-        let choices: Vec<Chord> = alternatives(&self.settings, self.next_chord(&region))
+        let choices: Vec<Chord> = alternatives(&self.settings, self.arrangement.next_chord(id))
             .into_iter()
             .filter(|c| *c != current)
             .collect();
@@ -506,40 +636,52 @@ impl ChordGeneratorWindow {
         let mut rng = Rng::new(time_seed() ^ id);
         let chord = choices[rng.below(choices.len())];
         self.edit(cx, |this| {
-            this.arrangement.set_content(
-                id,
-                Content::Chord {
-                    chord,
-                    locked: false,
-                },
-            );
+            this.arrangement.set_chord(id, chord, false);
         });
-        self.audition_region(id, cx);
+        self.audition_slot(id, cx);
     }
 
     fn toggle_lock(&mut self, id: u64, cx: &mut Context<Self>) {
         self.edit(cx, |this| {
-            if let Some(Content::Chord { chord, locked }) =
-                this.arrangement.find(id).map(|r| r.content)
-            {
-                this.arrangement.set_content(
-                    id,
-                    Content::Chord {
-                        chord,
-                        locked: !locked,
-                    },
-                );
+            if let Some(placed) = this.arrangement.find_slot(id) {
+                this.arrangement.set_locked(id, !placed.slot.locked);
             }
         });
     }
 
-    fn delete_selected(&mut self, cx: &mut Context<Self>) {
-        if let Some(id) = self.selected {
-            self.edit(cx, |this| {
-                this.arrangement.remove(id);
-                this.selected = None;
-            });
+    fn duplicate_section(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(index) = self.arrangement.section_index(id) else {
+            return;
+        };
+        let mut copy = None;
+        self.edit(cx, |this| {
+            copy = this.arrangement.move_section(id, index + 1, true);
+            if let Some(copy) = copy {
+                this.selection = Selection::Section(copy);
+            }
+        });
+        if copy.is_none() {
+            self.status = Some("No room for a copy — the sequence holds 32 bars".to_string());
         }
+    }
+
+    fn delete_selection(&mut self, cx: &mut Context<Self>) {
+        let selection = self.selection.clone();
+        self.edit(cx, |this| {
+            match selection {
+                Selection::Chords(ids) => {
+                    this.arrangement.remove_chords(&ids);
+                }
+                Selection::Section(id) => {
+                    this.arrangement.remove_section(id);
+                }
+                Selection::Region(id) => {
+                    this.arrangement.remove_region(id);
+                }
+                Selection::None => {}
+            }
+            this.selection = Selection::None;
+        });
     }
 
     fn set_bars(&mut self, bars: u32, cx: &mut Context<Self>) {
@@ -549,61 +691,31 @@ impl ChordGeneratorWindow {
     fn clear(&mut self, cx: &mut Context<Self>) {
         self.stop_playback(cx);
         self.edit(cx, |this| {
-            for lane in Lane::ALL {
-                this.arrangement.clear_lane(lane, |_| true);
-            }
-            this.selected = None;
+            this.arrangement.clear();
+            this.selection = Selection::None;
         });
-        self.status = Some("Timeline cleared — Undo brings it back".to_string());
+        self.status = Some("Sequence cleared — Undo brings it back".to_string());
     }
 
-    /// Add a browser item without dragging: a progression after the last
-    /// chord; a pattern over the whole progression.
-    fn add_item(&mut self, item: BrowserItem, cx: &mut Context<Self>) {
-        let start = self.arrangement.chords_end();
-        match item {
-            BrowserItem::Progression(index) => {
-                let Some(entry) = self.library().get(index).cloned() else {
-                    return;
-                };
-                self.edit(cx, |this| {
-                    let ids = this.place_progression(&entry.chords, start);
-                    this.selected = ids.first().copied();
-                });
-                self.status = Some(format!("Added {} chords", entry.chords.len()));
-            }
-            BrowserItem::Comp(_) | BrowserItem::Bass(_) => {
-                let end = self.arrangement.chords_end().max(BEATS_PER_BAR);
-                self.drop_pattern(item, 0.0, end, None, cx);
-            }
-        }
-    }
-
-    fn content_for(item: BrowserItem) -> Option<Content> {
-        match item {
-            BrowserItem::Comp(p) => Some(Content::Comp(p)),
-            BrowserItem::Bass(p) => Some(Content::Bass(p)),
-            BrowserItem::Progression(_) => None,
-        }
-    }
-
-    fn drop_pattern(
-        &mut self,
-        item: BrowserItem,
-        start: f64,
-        length: f64,
-        onto: Option<u64>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(content) = Self::content_for(item) else {
+    /// Fill the empty stretch of `lane` around `beat` with its default
+    /// pattern.
+    fn add_pattern_at(&mut self, lane: Lane, beat: f64, cx: &mut Context<Self>) {
+        let Some((start, length)) = self.arrangement.gap_at(lane, beat) else {
             return;
         };
-        self.edit(cx, |this| match onto {
-            Some(id) => {
-                this.arrangement.set_content(id, content);
-                this.selected = Some(id);
+        self.edit(cx, |this| {
+            if let Some(id) = this
+                .arrangement
+                .place_pattern(start, length, lane.default_pattern())
+            {
+                this.selection = Selection::Region(id);
             }
-            None => this.selected = this.arrangement.place(start, length, content),
+        });
+    }
+
+    fn set_region_pattern(&mut self, id: u64, pattern: Pattern, cx: &mut Context<Self>) {
+        self.edit(cx, |this| {
+            this.arrangement.set_pattern(id, pattern);
         });
     }
 
@@ -618,36 +730,28 @@ impl ChordGeneratorWindow {
         )
     }
 
-    /// Chords for the Chord Track: each lasts until the next one starts (a
-    /// gap holds the chord before it); `offset` is where the first starts.
+    /// Chords for the Chord Track, back to back from the start.
     fn placements(&self) -> (f64, Vec<ChordPlacement>) {
-        let chords: Vec<&Region> = self.arrangement.lane(Lane::Chords).collect();
-        let flats = self.flats();
-        let offset = chords.first().map_or(0.0, |r| r.start);
-        let placements = chords
-            .iter()
-            .enumerate()
-            .filter_map(|(i, r)| {
-                let length = chords
-                    .get(i + 1)
-                    .map_or(r.length, |next| next.start - r.start);
-                r.content.chord().map(|chord| ChordPlacement {
-                    chord,
-                    flats,
-                    length_beats: length,
-                })
+        let placements = self
+            .arrangement
+            .placed()
+            .into_iter()
+            .map(|p| ChordPlacement {
+                chord: p.slot.chord,
+                flats: self.chord_flats(&p.slot.chord),
+                length_beats: p.slot.beats,
             })
             .collect();
-        (offset, placements)
+        (0.0, placements)
     }
 
-    /// The whole timeline as one clip's notes and length.
+    /// The whole sequence as one clip's notes and length.
     fn clip(&self) -> (Vec<GeneratedNote>, f64) {
         let notes = self.performance_notes(&self.arrangement);
         let end = notes
             .iter()
             .map(|n| n.start + n.length)
-            .fold(self.arrangement.content_end(), f64::max);
+            .fold(self.arrangement.chords_end(), f64::max);
         (notes, end)
     }
 
@@ -751,26 +855,9 @@ impl ChordGeneratorWindow {
         self.start_playback(notes, end, true, cx);
     }
 
-    /// Sound one chord region, voiced as it sits in the progression, with
-    /// its bass note.
-    fn audition_region(&mut self, id: u64, cx: &mut Context<Self>) {
-        let spans = self.arrangement.chord_spans();
-        let Some(index) = spans.iter().position(|s| {
-            self.arrangement
-                .find(id)
-                .is_some_and(|r| (r.start - s.start).abs() < 1e-9 && r.lane() == Lane::Chords)
-        }) else {
-            return;
-        };
-        let voiced = voice_progression(
-            &spans.iter().map(|s| s.chord).collect::<Vec<_>>(),
-            VoicingOptions {
-                bass: true,
-                ..self.voicing
-            },
-        );
+    fn held_chord(&self, voiced: &[u8], cx: &App) -> (Vec<GeneratedNote>, f64) {
         let length = AUDITION_SECONDS * self.bpm(cx) / 60.0;
-        let notes = voiced[index]
+        let notes = voiced
             .iter()
             .map(|&pitch| GeneratedNote {
                 pitch,
@@ -779,67 +866,39 @@ impl ChordGeneratorWindow {
                 velocity: 88,
             })
             .collect();
+        (notes, length)
+    }
+
+    /// Sound one sequence chord, voiced as it sits in the progression, with
+    /// its bass note.
+    fn audition_slot(&mut self, id: u64, cx: &mut Context<Self>) {
+        let placed = self.arrangement.placed();
+        let Some(index) = placed.iter().position(|p| p.slot.id == id) else {
+            return;
+        };
+        let chords: Vec<Chord> = placed.iter().map(|p| p.slot.chord).collect();
+        let voiced = sphere_midi_service::chords::voice_progression(
+            &chords,
+            VoicingOptions {
+                bass: true,
+                ..self.voicing
+            },
+        );
+        let (notes, length) = self.held_chord(&voiced[index], cx);
         self.start_playback(notes, length, false, cx);
     }
 
-    /// Hear a browser item: a progression as held chords, a pattern played
-    /// over the current chords.
-    fn audition_item(&mut self, item: BrowserItem, cx: &mut Context<Self>) {
-        let mut trial = Arrangement::default();
-        match item {
-            BrowserItem::Progression(index) => {
-                let Some(entry) = self.library().get(index).cloned() else {
-                    return;
-                };
-                let items: Vec<(Content, f64)> = entry
-                    .chords
-                    .iter()
-                    .map(|&chord| {
-                        (
-                            Content::Chord {
-                                chord,
-                                locked: false,
-                            },
-                            PATTERN_CHORD_BEATS,
-                        )
-                    })
-                    .collect();
-                let length = items.len() as f64 * PATTERN_CHORD_BEATS;
-                trial.place_sequence(0.0, &items);
-                trial.place(0.0, length, Content::Comp(CompPattern::Sustain));
-                trial.place(0.0, length, Content::Bass(BassPattern::Root));
-            }
-            BrowserItem::Comp(_) | BrowserItem::Bass(_) => {
-                // Two bars of the current chords with this pattern.
-                trial = self.arrangement.clone();
-                let end = trial.chords_end().min(2.0 * BEATS_PER_BAR);
-                if end <= 0.0 {
-                    self.status = Some("Add chords first to hear a pattern".to_string());
-                    cx.notify();
-                    return;
-                }
-                trial.clear_lane(item.lane(), |_| true);
-                if let Some(content) = Self::content_for(item) {
-                    trial.place(0.0, end, content);
-                }
-                let other = if item.lane() == Lane::Comp {
-                    Lane::Bass
-                } else {
-                    Lane::Comp
-                };
-                trial.clear_lane(other, |_| true);
-                let notes: Vec<GeneratedNote> = self
-                    .performance_notes(&trial)
-                    .into_iter()
-                    .filter(|n| n.start < end)
-                    .collect();
-                self.start_playback(notes, end, false, cx);
-                return;
-            }
-        }
-        let notes = self.performance_notes(&trial);
-        let end = trial.content_end();
-        self.start_playback(notes, end, false, cx);
+    /// Sound a palette chord on its own, with its bass note.
+    fn audition_chord(&mut self, chord: Chord, cx: &mut Context<Self>) {
+        let voiced = sphere_midi_service::chords::voice_progression(
+            &[chord],
+            VoicingOptions {
+                bass: true,
+                ..self.voicing
+            },
+        );
+        let (notes, length) = self.held_chord(&voiced[0], cx);
+        self.start_playback(notes, length, false, cx);
     }
 
     // ── Commands ────────────────────────────────────────────────────────────
@@ -892,31 +951,34 @@ impl ChordGeneratorWindow {
 
     // ── Gestures ────────────────────────────────────────────────────────────
 
-    /// Pixels per beat and the content column's width, from the window's
-    /// fixed layout.
+    /// Pixels per beat of the sequence, from its painted width (or, before
+    /// the first paint, from the window's fixed layout).
     fn pixels_per_beat(&self, window: &Window) -> f32 {
-        let width = timeline_content_width(window);
-        width / self.shown().total_beats().max(1.0) as f32
+        sequence_content_width(window) / self.shown().total_beats().max(1.0) as f32
     }
 
-    fn begin_press(&mut self, kind: PressKind, origin: Point<Pixels>, cx: &mut Context<Self>) {
+    fn begin_press(
+        &mut self,
+        kind: PressKind,
+        origin: Point<Pixels>,
+        modifiers: Modifiers,
+        cx: &mut Context<Self>,
+    ) {
         self.popover = None;
         self.press = Some(Press {
             kind,
             origin,
             dragging: false,
+            shift: modifiers.shift,
+            copy: modifiers.alt,
         });
         cx.notify();
     }
 
     fn cancel_gesture(&mut self) {
-        if let Some(press) = self.press.take() {
-            if press.dragging && press.kind == PressKind::Export {
-                // The Studio's ghost is cleared by the caller's DragCancel.
-            }
-        }
+        self.press = None;
         self.preview = None;
-        self.ghost = None;
+        self.marker = None;
     }
 
     /// Whether a window-local point is over this window. A drag released
@@ -940,17 +1002,44 @@ impl ChordGeneratorWindow {
         }
         let dx: f32 = (event.position.x - press.origin.x).into();
         let dy: f32 = (event.position.y - press.origin.y).into();
-        if !press.dragging {
-            if dx.hypot(dy) < DRAG_THRESHOLD {
-                return;
-            }
-            press.dragging = true;
-            self.press = Some(press);
+        if !press.dragging && dx.hypot(dy) < DRAG_THRESHOLD {
+            return;
         }
+        press.dragging = true;
+        press.copy = event.modifiers.alt;
+        self.press = Some(press);
+        let ppb = self.pixels_per_beat(window).max(1.0) as f64;
         match press.kind {
+            PressKind::Chord {
+                id,
+                stretch: true,
+                original_beats,
+            } => {
+                let beats = snap(original_beats + dx as f64 / ppb, GRID).max(MIN_LENGTH);
+                let mut preview = self.arrangement.clone();
+                preview.resize_chord(id, beats);
+                self.preview = Some(preview);
+                self.status = Some(format!("Length {}", beats_label(beats)));
+            }
+            PressKind::Chord { .. } | PressKind::Palette(_) => {
+                self.marker = self.marker_at(event.position, false);
+                self.status = Some(match (self.marker, press.kind) {
+                    (None, _) => "Drop on the sequence".to_string(),
+                    (Some(m), PressKind::Palette(_)) => drop_hint(m.at, "Release to add"),
+                    (Some(m), _) if press.copy => drop_hint(m.at, "Release to copy"),
+                    (Some(m), _) => drop_hint(m.at, "Release to move"),
+                });
+            }
+            PressKind::Section(_) => {
+                self.marker = self.marker_at(event.position, true);
+                self.status = Some(if press.copy {
+                    "Release to copy the section here".to_string()
+                } else {
+                    "Release to move the section here".to_string()
+                });
+            }
             PressKind::Region { id, mode, original } => {
-                let ppb = self.pixels_per_beat(window).max(1.0);
-                let delta = dx as f64 / ppb as f64;
+                let delta = dx as f64 / ppb;
                 let mut preview = self.arrangement.clone();
                 match mode {
                     RegionMode::Move => {
@@ -965,14 +1054,6 @@ impl ChordGeneratorWindow {
                     }
                 }
                 self.preview = Some(preview);
-            }
-            PressKind::Browser(item) => {
-                self.ghost = self.ghost_at(item, event.position, window);
-                self.status = Some(match &self.ghost {
-                    Some(g) if g.onto.is_some() => "Release to use this pattern here".to_string(),
-                    Some(g) => format!("Release to place at {}", bar_beat(g.start)),
-                    None => format!("Drop on the {} lane", item.lane().label()),
-                });
             }
             PressKind::Export => {
                 if Self::over_self(event.position, window) {
@@ -993,69 +1074,33 @@ impl ChordGeneratorWindow {
         cx.notify();
     }
 
-    /// Where `item` would land under the pointer, if over its lane.
-    fn ghost_at(
-        &self,
-        item: BrowserItem,
-        position: Point<Pixels>,
-        window: &Window,
-    ) -> Option<Ghost> {
+    /// Where a chord (or, with `sections_only`, a section) dropped at
+    /// `position` would go, if over the chord lane.
+    fn marker_at(&self, position: Point<Pixels>, sections_only: bool) -> Option<DropMarker> {
         let bounds = self.lanes_bounds.get()?;
         let x: f32 = (position.x - bounds.origin.x).into();
         let y: f32 = (position.y - bounds.origin.y).into();
         let width: f32 = bounds.size.width.into();
-        if x < 0.0 || x > width {
+        if x < -SECTION_EDGE_PX || x > width + SECTION_EDGE_PX {
             return None;
         }
-        let lane = lane_at(y - RULER_H)?;
-        if lane != item.lane() {
+        if y < 0.0 || y > RULER_H + CHORD_LANE_H + space::BASE {
             return None;
         }
-        let ppb = self.pixels_per_beat(window).max(1.0) as f64;
-        let beat = (x as f64 / ppb).floor().max(0.0);
         let arrangement = &self.arrangement;
-        match item {
-            BrowserItem::Progression(index) => {
-                let count = self.library().get(index)?.chords.len();
-                Some(Ghost {
-                    lane,
-                    start: snap(beat, GRID),
-                    length: count as f64 * PATTERN_CHORD_BEATS,
-                    onto: None,
-                })
-            }
-            BrowserItem::Comp(_) | BrowserItem::Bass(_) => {
-                if let Some(region) = arrangement.region_at(lane, beat) {
-                    return Some(Ghost {
-                        lane,
-                        start: region.start,
-                        length: region.length,
-                        onto: Some(region.id),
-                    });
-                }
-                // Into empty space: up to the next region of the lane, or
-                // over the rest of the chords (at least a bar).
-                let next = arrangement
-                    .lane(lane)
-                    .map(|r| r.start)
-                    .filter(|&s| s > beat)
-                    .fold(f64::INFINITY, f64::min);
-                let wanted = (arrangement.chords_end() - beat).max(BEATS_PER_BAR);
-                Some(Ghost {
-                    lane,
-                    start: beat,
-                    length: wanted.min(next - beat).max(MIN_LENGTH),
-                    onto: None,
-                })
-            }
-        }
+        let ppb = width / arrangement.total_beats().max(1.0) as f32;
+        let at = drop_target(arrangement, x.max(0.0), ppb, sections_only);
+        Some(DropMarker {
+            at,
+            beat: arrangement.insert_beat(at),
+        })
     }
 
-    /// End a press. `released_at` is `(point, over this window)` for a
-    /// mouse-up; `None` when the gesture was abandoned.
+    /// End a press. `released_at` is `(point, over this window, modifiers)`
+    /// for a mouse-up; `None` when the gesture was abandoned.
     fn finish_press(
         &mut self,
-        released_at: Option<(Point<Pixels>, bool)>,
+        released_at: Option<(Point<Pixels>, bool, Modifiers)>,
         _window: &Window,
         cx: &mut Context<Self>,
     ) {
@@ -1063,64 +1108,113 @@ impl ChordGeneratorWindow {
             return;
         };
         let released = released_at.is_some();
-        let over_self = released_at.is_some_and(|(_, over)| over);
+        let over_self = released_at.is_some_and(|(_, over, _)| over);
+        let copy = released_at.map_or(press.copy, |(_, _, m)| m.alt);
+        let marker = self.marker.take();
+        let preview = self.preview.take();
+        if press.dragging {
+            self.status = None;
+        }
         match press.kind {
+            PressKind::Chord { id, stretch, .. } => {
+                if press.dragging {
+                    match (stretch, released && over_self) {
+                        (true, true) => {
+                            if let Some(preview) = preview {
+                                self.edit(cx, |this| this.arrangement = preview);
+                            }
+                        }
+                        (false, true) => {
+                            if let Some(marker) = marker {
+                                let mut ids = self.selected_chords();
+                                if !ids.contains(&id) {
+                                    ids = vec![id];
+                                }
+                                self.edit(cx, |this| {
+                                    let landed =
+                                        this.arrangement.move_chords(&ids, marker.at, copy);
+                                    if !landed.is_empty() {
+                                        this.selection = Selection::Chords(landed);
+                                    }
+                                });
+                            }
+                        }
+                        _ => {}
+                    }
+                } else if released {
+                    self.palette_pick = None;
+                    self.selection = match (press.shift, &self.selection) {
+                        (true, Selection::Chords(ids)) => {
+                            let mut ids = ids.clone();
+                            if let Some(i) = ids.iter().position(|x| *x == id) {
+                                ids.remove(i);
+                            } else {
+                                ids.push(id);
+                            }
+                            if ids.is_empty() {
+                                Selection::None
+                            } else {
+                                Selection::Chords(ids)
+                            }
+                        }
+                        _ => Selection::Chords(vec![id]),
+                    };
+                    self.audition_slot(id, cx);
+                }
+            }
+            PressKind::Section(id) => {
+                if press.dragging {
+                    if let (
+                        true,
+                        Some(DropMarker {
+                            at: Insert::NewSection(to),
+                            ..
+                        }),
+                    ) = (released && over_self, marker)
+                    {
+                        let mut landed = None;
+                        self.edit(cx, |this| {
+                            landed = this.arrangement.move_section(id, to, copy);
+                            if let Some(landed) = landed {
+                                this.selection = Selection::Section(landed);
+                            }
+                        });
+                        if landed.is_none() {
+                            self.status =
+                                Some("No room for a copy — the sequence holds 32 bars".to_string());
+                        }
+                    }
+                } else if released {
+                    self.selection = Selection::Section(id);
+                }
+            }
             PressKind::Region { id, .. } => {
-                let preview = self.preview.take();
                 if press.dragging {
                     if let (true, Some(preview)) = (released, preview) {
                         self.edit(cx, |this| this.arrangement = preview);
-                        self.selected = Some(id);
+                        self.selection = Selection::Region(id);
                     }
-                    self.status = None;
                 } else if released {
-                    self.selected = Some(id);
-                    if self
-                        .arrangement
-                        .find(id)
-                        .is_some_and(|r| r.lane() == Lane::Chords)
-                    {
-                        self.audition_region(id, cx);
-                    }
+                    self.selection = Selection::Region(id);
                 }
             }
-            PressKind::Browser(item) => {
-                let ghost = self.ghost.take();
+            PressKind::Palette(chord) => {
                 if press.dragging {
-                    if let (true, Some(ghost)) = (released && over_self, ghost) {
-                        match item {
-                            BrowserItem::Progression(index) => {
-                                if let Some(entry) = self.library().get(index).cloned() {
-                                    self.edit(cx, |this| {
-                                        let ids =
-                                            this.place_progression(&entry.chords, ghost.start);
-                                        this.selected = ids.first().copied();
-                                    });
-                                    self.status =
-                                        Some(format!("Placed {} chords", entry.chords.len()));
-                                }
-                            }
-                            _ => {
-                                self.drop_pattern(item, ghost.start, ghost.length, ghost.onto, cx);
-                                self.status = None;
-                            }
-                        }
-                    } else {
-                        self.status = None;
+                    if let (true, Some(marker)) = (released && over_self, marker) {
+                        self.insert_palette_chord(chord, marker.at, cx);
                     }
                 } else if released {
-                    self.audition_item(item, cx);
+                    self.palette_pick = Some(chord);
+                    self.audition_chord(chord, cx);
                 }
             }
             PressKind::Export => {
                 if press.dragging {
                     if over_self || !released {
                         self.run(ChordGeneratorCommand::DragCancel, cx);
-                        self.status = None;
                     } else {
                         let (offset_beats, chords) = self.placements();
                         let (notes, length_beats) = self.clip();
-                        self.status = None;
                         self.run(
                             ChordGeneratorCommand::DragEnd {
                                 chords,
@@ -1134,23 +1228,20 @@ impl ChordGeneratorWindow {
                 }
             }
         }
+        self.ensure_ticking(cx);
         cx.notify();
     }
 
     // ── Wheel animation ─────────────────────────────────────────────────────
 
-    /// The chord the wheel shows: under the playhead while the timeline
-    /// plays, else the selected one.
+    /// The chord the wheel shows: under the playhead while the sequence
+    /// plays, else the palette chord just clicked, else the selected one.
     fn focus_chord(&self) -> Option<Chord> {
         if let Some(playback) = self.playback.as_ref().filter(|p| p.timeline) {
-            return self
-                .arrangement
-                .region_at(Lane::Chords, playback.beat)
-                .and_then(|r| r.content.chord());
+            return self.arrangement.slot_at(playback.beat).map(|s| s.chord);
         }
-        self.selected
-            .and_then(|id| self.arrangement.find(id))
-            .and_then(|r| r.content.chord())
+        self.palette_pick
+            .or_else(|| self.selected_slot().map(|p| p.slot.chord))
     }
 
     fn wheel_target(&self) -> [f32; 12] {
@@ -1221,48 +1312,40 @@ impl ChordGeneratorWindow {
         }
     }
 
-    // ── Render: controls ────────────────────────────────────────────────────
+    // ── Render: toolbar ─────────────────────────────────────────────────────
 
-    fn controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let flats = self.flats();
-        let tonic = self.settings.tonic;
-        let keys = fb_segmented_track().children((0..12u8).map(|pc| {
-            fb_segment(
-                ("chordgen-key", pc as usize),
-                pitch_name(pc, flats),
-                pc == tonic,
-                segment_position(pc as usize, 12),
-                cx.listener(move |this, _, _, cx| this.set_tonic(pc, cx)),
-            )
-        }));
-        let scale_trigger = div().id("chordgen-scale").w(px(190.0)).child(
-            crate::components::combo_box::combo_box_trigger(
-                "chordgen-scale-trigger",
-                self.settings.scale.label(),
-                matches!(self.popover, Some(Popover::Scale(_))),
-                cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+    fn popover_trigger(
+        &self,
+        id: &'static str,
+        kind: PopoverKind,
+        label: String,
+        width: f32,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let open = self.popover.is_some_and(|p| p.kind == kind);
+        div()
+            .flex_none()
+            .w(px(width))
+            .child(crate::components::combo_box::combo_box_trigger(
+                id,
+                label,
+                open,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
                     cx.stop_propagation();
                     this.popover = match this.popover {
-                        Some(Popover::Scale(_)) => None,
-                        _ => Some(Popover::Scale(event.position)),
+                        Some(p) if p.kind == kind => None,
+                        _ => Some(Popover {
+                            kind,
+                            at: event.position,
+                        }),
                     };
                     cx.notify();
                 }),
-            ),
-        );
-        let styles =
-            fb_segmented_track().children(Style::ALL.iter().enumerate().map(|(index, style)| {
-                let style = *style;
-                fb_segment(
-                    ("chordgen-style", index),
-                    style.label(),
-                    self.settings.style == style,
-                    segment_position(index, Style::ALL.len()),
-                    cx.listener(move |this, _, _, cx| {
-                        this.update_settings(cx, |s| s.style = style);
-                    }),
-                )
-            }));
+            ))
+    }
+
+    fn toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let flats = self.flats();
         let richness_options = [
             (Richness::Triads, "Triads"),
             (Richness::Sevenths, "7ths"),
@@ -1282,974 +1365,129 @@ impl ChordGeneratorWindow {
                 )
             },
         ));
-        let voicings = [(false, "Close"), (true, "Open")];
-        let voicing = fb_segmented_track().children(voicings.iter().enumerate().map(
-            |(index, (open, label))| {
-                let open = *open;
-                fb_segment(
-                    ("chordgen-voicing", index),
-                    *label,
-                    self.voicing.open == open,
-                    segment_position(index, voicings.len()),
-                    cx.listener(move |this, _, _, cx| {
-                        this.voicing.open = open;
-                        cx.notify();
-                    }),
-                )
-            },
-        ));
-        let colors = self.settings.colors;
-        let color_toggle = |id: &'static str,
-                            label: &'static str,
-                            on: bool,
-                            cx: &mut Context<Self>,
-                            set: fn(&mut ChordColors, bool)| {
-            div().flex_none().child(fb_checkbox(
-                id,
-                label,
-                on,
-                true,
-                cx.listener(move |this, _, _, cx| {
-                    this.update_settings(cx, |s| set(&mut s.colors, !on));
-                }),
-            ))
+        let colours_on = colour_options()
+            .iter()
+            .filter(|(_, _, get, _)| get(&self.settings.colors))
+            .count();
+        let colour_label = match colours_on {
+            0 => "Colour".to_string(),
+            n => format!("Colour · {n}"),
         };
-
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(space::BASE))
-            .px(px(space::SECTION))
-            .py(px(space::LOOSE))
-            .border_b(px(1.0))
-            .border_color(Colors::border_subtle())
-            .child(labeled_row(
-                "KEY",
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(space::LOOSE))
-                    .child(div().flex_1().min_w(px(0.0)).child(keys))
-                    .child(scale_trigger),
-            ))
-            .child(labeled_row(
-                "STYLE",
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(space::LOOSE))
-                    .child(div().flex_1().min_w(px(0.0)).child(styles))
-                    .child(div().w(px(210.0)).child(richness)),
-            ))
-            .child(labeled_row(
-                "COLOR",
-                div()
-                    .flex()
-                    .flex_row()
-                    .flex_wrap()
-                    .items_center()
-                    .gap(px(space::BASE))
-                    .child(div().w(px(150.0)).child(voicing))
-                    .child(color_toggle(
-                        "chordgen-sus",
-                        "Sus",
-                        colors.sus,
-                        cx,
-                        |c, v| c.sus = v,
-                    ))
-                    .child(color_toggle(
-                        "chordgen-borrowed",
-                        "Borrowed",
-                        colors.borrowed,
-                        cx,
-                        |c, v| c.borrowed = v,
-                    ))
-                    .child(color_toggle(
-                        "chordgen-secondary",
-                        "Secondary dominants",
-                        colors.secondary_dominants,
-                        cx,
-                        |c, v| c.secondary_dominants = v,
-                    ))
-                    .child(color_toggle(
-                        "chordgen-passing",
-                        "Passing diminished",
-                        colors.passing_diminished,
-                        cx,
-                        |c, v| c.passing_diminished = v,
-                    ))
-                    .child(color_toggle(
-                        "chordgen-blackadder",
-                        "Black Adder",
-                        colors.black_adder,
-                        cx,
-                        |c, v| c.black_adder = v,
-                    )),
-            ))
-    }
-
-    // ── Render: browser ─────────────────────────────────────────────────────
-
-    fn browser(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let tabs = [
-            (BrowserTab::Progressions, "Progressions"),
-            (BrowserTab::Performance, "Patterns"),
-        ];
-        let tab_track =
-            fb_segmented_track().children(tabs.iter().enumerate().map(|(index, (tab, label))| {
-                let tab = *tab;
-                fb_segment(
-                    ("chordgen-tab", index),
-                    *label,
-                    self.tab == tab,
-                    segment_position(index, tabs.len()),
-                    cx.listener(move |this, _, _, cx| {
-                        this.tab = tab;
-                        cx.notify();
-                    }),
-                )
-            }));
-        let pressed = self.press.and_then(|p| match p.kind {
-            PressKind::Browser(item) => Some(item),
-            _ => None,
-        });
-        let mut items: Vec<AnyElement> = Vec::new();
-        match self.tab {
-            BrowserTab::Progressions => {
-                let flats = self.flats();
-                let tonic = self.settings.tonic;
-                let library = self.library();
-                let generated = library.iter().filter(|e| e.generated).count();
-                for (index, entry) in library.iter().enumerate() {
-                    if index == 0 && generated > 0 {
-                        items.push(list_heading("GENERATED"));
-                    }
-                    if index == generated {
-                        items.push(list_heading("STYLE PATTERNS"));
-                    }
-                    let title = entry
-                        .chords
-                        .iter()
-                        .map(|c| c.roman(tonic))
-                        .collect::<Vec<_>>()
-                        .join(" – ");
-                    let detail = entry
-                        .chords
-                        .iter()
-                        .map(|c| c.name(flats))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    let item = BrowserItem::Progression(index);
-                    items.push(self.browser_card(
-                        ("chordgen-prog", index),
-                        title,
-                        Some(detail),
-                        None,
-                        item,
-                        pressed == Some(item),
-                        cx,
-                    ));
-                }
-            }
-            BrowserTab::Performance => {
-                items.push(list_heading("COMP"));
-                for (index, pattern) in CompPattern::ALL.iter().enumerate() {
-                    let item = BrowserItem::Comp(*pattern);
-                    items.push(self.browser_card(
-                        ("chordgen-comp", index),
-                        pattern.label().to_string(),
-                        None,
-                        Some(pattern.onsets()),
-                        item,
-                        pressed == Some(item),
-                        cx,
-                    ));
-                }
-                items.push(list_heading("BASS"));
-                for (index, pattern) in BassPattern::ALL.iter().enumerate() {
-                    let item = BrowserItem::Bass(*pattern);
-                    items.push(self.browser_card(
-                        ("chordgen-bass", index),
-                        pattern.label().to_string(),
-                        None,
-                        Some(pattern.onsets()),
-                        item,
-                        pressed == Some(item),
-                        cx,
-                    ));
-                }
-            }
-        }
-        div()
-            .flex_none()
-            .w(px(BROWSER_W))
-            .flex()
-            .flex_col()
-            .gap(px(space::BASE))
-            .child(tab_track)
-            .child(
-                div()
-                    .id("chordgen-browser")
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .gap(px(space::TIGHT))
-                    .children(items),
-            )
-            .child(
-                div()
-                    .text_size(px(typography::UI_XS))
-                    .text_color(Colors::text_faint())
-                    .child("Click to hear · double-click to add · drag onto a lane"),
-            )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn browser_card(
-        &self,
-        id: impl Into<gpui::ElementId>,
-        title: String,
-        detail: Option<String>,
-        rhythm: Option<Vec<f64>>,
-        item: BrowserItem,
-        pressed: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let rest = Colors::surface_panel();
-        let fill = if pressed {
-            Colors::composite(rest, Colors::state_selected())
+        let playing = self.playback.as_ref().is_some_and(|p| p.timeline);
+        let has_chords = self.arrangement.chord_count() > 0;
+        let fill_label = if self.target_section().is_some() {
+            "Fill Section"
         } else {
-            rest
+            "New Section"
         };
-        let hover = Colors::composite(fill, Colors::state_hover());
+        let module = |label: &'static str| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(space::SNUG))
+                .child(fb_section_label(label))
+        };
         div()
-            .id(id)
-            .flex_none()
-            .flex()
-            .flex_col()
-            .gap(px(space::HAIR))
-            .px(px(space::BASE))
-            .py(px(space::SNUG))
-            .rounded(px(radius::CONTROL))
-            .bg(fill)
-            .border(px(1.0))
-            .border_color(if pressed {
-                Colors::with_alpha(Colors::accent_primary(), 0.85)
-            } else {
-                Colors::border_subtle()
-            })
-            .cursor(gpui::CursorStyle::OpenHand)
-            .hover(move |s| s.bg(hover))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                    if event.click_count >= 2 {
-                        this.press = None;
-                        this.add_item(item, cx);
-                        return;
-                    }
-                    this.begin_press(PressKind::Browser(item), event.position, cx);
-                }),
-            )
-            .child(
-                div()
-                    .text_size(px(typography::UI_SM))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(Colors::text_primary())
-                    .truncate()
-                    .child(title),
-            )
-            .children(detail.map(|d| {
-                div()
-                    .text_size(px(typography::UI_XS))
-                    .text_color(Colors::text_muted())
-                    .truncate()
-                    .child(d)
-            }))
-            .children(
-                rhythm.map(|onsets| rhythm_glyph(&onsets, BROWSER_W - 2.0 * space::BASE - 2.0)),
-            )
-            .into_any_element()
-    }
-
-    // ── Render: timeline ────────────────────────────────────────────────────
-
-    fn timeline(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let arrangement = self.shown();
-        let bars = arrangement.bars();
-        let total = arrangement.total_beats();
-        let width = timeline_content_width(window);
-        let ppb = width / total.max(1.0) as f32;
-        let flats = self.flats();
-        let tonic = self.settings.tonic;
-
-        let length =
-            fb_segmented_track().children(LENGTHS.iter().enumerate().map(|(index, &n)| {
-                fb_segment(
-                    ("chordgen-bars", index),
-                    format!("{n}"),
-                    bars == n,
-                    segment_position(index, LENGTHS.len()),
-                    cx.listener(move |this, _, _, cx| this.set_bars(n, cx)),
-                )
-            }));
-        let header = div()
             .flex()
             .flex_row()
             .items_center()
-            .justify_between()
-            .gap(px(space::BASE))
+            .gap(px(space::LOOSE))
+            .px(px(space::SECTION))
+            .py(px(space::BASE))
+            .border_b(px(1.0))
+            .border_color(Colors::border_subtle())
             .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_baseline()
-                    .gap(px(space::BASE))
-                    .child(fb_section_label("TIMELINE"))
+                module("KEY")
+                    .child(self.popover_trigger(
+                        "chordgen-tonic",
+                        PopoverKind::Tonic,
+                        pitch_name(self.settings.tonic, flats).to_string(),
+                        60.0,
+                        cx,
+                    ))
+                    .child(self.popover_trigger(
+                        "chordgen-scale",
+                        PopoverKind::Scale,
+                        self.settings.scale.label().to_string(),
+                        136.0,
+                        cx,
+                    )),
+            )
+            .child(
+                module("GENERATE")
+                    .child(self.popover_trigger(
+                        "chordgen-style",
+                        PopoverKind::Style,
+                        self.settings.style.label().to_string(),
+                        98.0,
+                        cx,
+                    ))
+                    .child(div().flex_none().w(px(184.0)).child(richness))
+                    .child(self.popover_trigger(
+                        "chordgen-colour",
+                        PopoverKind::Colour,
+                        colour_label,
+                        98.0,
+                        cx,
+                    ))
                     .child(
                         div()
-                            .text_size(px(typography::UI_XS))
-                            .text_color(Colors::text_muted())
-                            .child(format!(
-                                "{} chords · {} bars",
-                                arrangement.lane(Lane::Chords).count(),
-                                bars
+                            .id("chordgen-fill-tip")
+                            .tooltip(fb_tooltip(
+                                "Write a progression in this style into the selected section's \
+                                 unlocked chords, or as a new section (G)",
+                            ))
+                            .child(fb_button(
+                                "chordgen-fill",
+                                fill_label,
+                                FbButtonKind::Primary,
+                                true,
+                                cx.listener(|this, _, _, cx| this.fill(cx)),
                             )),
                     ),
             )
+            .child(div().flex_1())
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(space::BASE))
-                    .child(
-                        div()
-                            .text_size(px(typography::UI_XS))
-                            .text_color(Colors::text_muted())
-                            .child("Bars"),
-                    )
-                    .child(div().w(px(150.0)).child(length))
+                    .gap(px(space::TIGHT))
                     .child(fb_button(
-                        "chordgen-clear",
-                        "Clear",
-                        FbButtonKind::Ghost,
-                        !self.arrangement.is_empty(),
-                        cx.listener(|this, _, _, cx| this.clear(cx)),
-                    )),
-            );
-
-        // Ruler: bar numbers where they fit.
-        let label_every = (1..=8u32)
-            .find(|n| *n as f32 * BEATS_PER_BAR as f32 * ppb >= 26.0)
-            .unwrap_or(8);
-        let ruler = div()
-            .relative()
-            .h(px(RULER_H))
-            .border_b(px(1.0))
-            .border_color(Colors::border_subtle())
-            .children((0..bars).filter(|b| b % label_every == 0).map(|bar| {
-                div()
-                    .absolute()
-                    .left(px(bar as f32 * BEATS_PER_BAR as f32 * ppb + space::TIGHT))
-                    .top(px(space::TIGHT))
-                    .text_size(px(typography::UI_XS))
-                    .font_features(tabular_features())
-                    .text_color(Colors::text_muted())
-                    .child(format!("{}", bar + 1))
-            }));
-
-        let lanes = Lane::ALL.map(|lane| {
-            let height = lane_height(lane);
-            let regions: Vec<AnyElement> = arrangement
-                .lane(lane)
-                .map(|region| self.region(region, ppb, height, flats, tonic, cx))
-                .collect();
-            let ghost = self.ghost.as_ref().filter(|g| g.lane == lane).map(|g| {
-                let x = g.start as f32 * ppb;
-                let w = (g.length as f32 * ppb).max(2.0);
-                let h = height - 2.0 * REGION_INSET;
-                div()
-                    .absolute()
-                    .left(px(x))
-                    .top(px(REGION_INSET))
-                    .w(px(w))
-                    .h(px(h))
-                    .rounded(px(radius::clamped(radius::CONTROL_SM, w, h)))
-                    .bg(Colors::with_alpha(Colors::accent_primary(), 0.16))
-                    .border(px(1.0))
-                    .border_color(Colors::with_alpha(Colors::accent_primary(), 0.85))
-            });
-            let empty = arrangement.lane(lane).next().is_none() && self.ghost.is_none();
-            div()
-                .id(("chordgen-lane", lane as usize))
-                .relative()
-                .h(px(height))
-                .border_b(px(1.0))
-                .border_color(Colors::border_subtle())
-                // A click on empty lane space clears the selection.
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        if this.selected.take().is_some() {
-                            cx.notify();
-                        }
-                    }),
-                )
-                .when(empty, |lane_el| {
-                    lane_el.child(
-                        div()
-                            .absolute()
-                            .inset_0()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(px(typography::UI_XS))
-                            .text_color(Colors::text_faint())
-                            .child(match lane {
-                                Lane::Chords => "Drop a progression here",
-                                Lane::Comp => "Drop a comp pattern — this lane is silent",
-                                Lane::Bass => "Drop a bass pattern — this lane is silent",
-                            }),
-                    )
-                })
-                .children(regions)
-                .children(ghost)
-        });
-
-        let labels = div()
-            .flex_none()
-            .w(px(LABEL_W))
-            .flex()
-            .flex_col()
-            .border_r(px(1.0))
-            .border_color(Colors::border_subtle())
-            .child(
-                div()
-                    .h(px(RULER_H))
-                    .border_b(px(1.0))
-                    .border_color(Colors::border_subtle()),
-            )
-            .children(Lane::ALL.map(|lane| {
-                div()
-                    .h(px(lane_height(lane)))
-                    .px(px(space::BASE))
-                    .flex()
-                    .items_center()
-                    .border_b(px(1.0))
-                    .border_color(Colors::border_subtle())
-                    .text_size(px(typography::UI_XS))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(Colors::text_secondary())
-                    .child(lane.label())
-            }));
-
-        // Grid (bars lead, beats recede) under the regions; the painted
-        // bounds are kept for mapping browser drags onto lanes.
-        let bounds_cell = self.lanes_bounds.clone();
-        let bar_line = Colors::border_normal();
-        let beat_line = Colors::with_alpha(Colors::border_subtle(), 0.6);
-        let grid = canvas(
-            move |bounds, _, _| bounds_cell.set(Some(bounds)),
-            move |bounds, _, window, _| {
-                let ox: f32 = bounds.origin.x.into();
-                let oy: f32 = bounds.origin.y.into();
-                let h: f32 = bounds.size.height.into();
-                let beats = total.round() as usize;
-                for beat in 0..=beats {
-                    let x = ox + beat as f32 * ppb;
-                    let bar = beat % BEATS_PER_BAR as usize == 0;
-                    if !bar && ppb < 6.0 {
-                        continue;
-                    }
-                    window.paint_quad(gpui::fill(
-                        Bounds::new(
-                            gpui::point(px(x), px(oy + RULER_H)),
-                            gpui::size(px(1.0), px(h - RULER_H)),
-                        ),
-                        if bar { bar_line } else { beat_line },
-                    ));
-                }
-            },
-        )
-        .absolute()
-        .inset_0();
-
-        let playhead = self.playback.as_ref().filter(|p| p.timeline).map(|p| {
-            div()
-                .absolute()
-                .left(px(p.beat as f32 * ppb))
-                .top_0()
-                .bottom_0()
-                .w(px(1.0))
-                .bg(Colors::accent_primary())
-        });
-
-        let content = div()
-            .flex_1()
-            .min_w(px(0.0))
-            .relative()
-            .flex()
-            .flex_col()
-            .child(grid)
-            .child(ruler)
-            .children(lanes)
-            .children(playhead);
-
-        div()
-            .flex_1()
-            .min_w(px(0.0))
-            .flex()
-            .flex_col()
-            .gap(px(space::BASE))
-            .child(header)
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .rounded(px(radius::SURFACE))
-                    .overflow_hidden()
-                    .bg(Colors::surface_canvas())
-                    .border(px(1.0))
-                    .border_color(Colors::border_subtle())
-                    .child(labels)
-                    .child(content),
-            )
-            .child(
-                div()
-                    .text_size(px(typography::UI_XS))
-                    .text_color(Colors::text_faint())
-                    .child(
-                        "Drag a region to move it, its right edge to stretch it · Delete removes · ⌘Z undoes",
-                    ),
-            )
-    }
-
-    fn region(
-        &self,
-        region: &Region,
-        ppb: f32,
-        lane_h: f32,
-        flats: bool,
-        tonic: u8,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let x = region.start as f32 * ppb;
-        let w = (region.length as f32 * ppb).max(2.0);
-        let h = lane_h - 2.0 * REGION_INSET;
-        let selected = self.selected == Some(region.id);
-        let rest = Colors::surface_raised();
-        let fill = if selected {
-            Colors::composite(rest, Colors::state_selected())
-        } else {
-            rest
-        };
-        let id = region.id;
-        let original = *region;
-        let (title, detail, locked) = match region.content {
-            Content::Chord { chord, locked } => {
-                (chord.name(flats), Some(chord.roman(tonic)), locked)
-            }
-            Content::Comp(p) => (p.label().to_string(), None, false),
-            Content::Bass(p) => (p.label().to_string(), None, false),
-        };
-        let onsets = match region.content {
-            Content::Comp(p) => Some(p.onsets()),
-            Content::Bass(p) => Some(p.onsets()),
-            Content::Chord { .. } => None,
-        };
-        let ticks = onsets.filter(|_| ppb * 0.5 >= 2.5).map(|onsets| {
-            let bars = (region.length / BEATS_PER_BAR).ceil() as usize;
-            let mut xs = Vec::new();
-            for bar in 0..bars {
-                for onset in &onsets {
-                    let beat = bar as f64 * BEATS_PER_BAR + onset;
-                    if beat < region.length - 1e-9 {
-                        xs.push(beat as f32 * ppb);
-                    }
-                }
-            }
-            div()
-                .absolute()
-                .left_0()
-                .right_0()
-                .bottom(px(space::HAIR))
-                .h(px(5.0))
-                .children(xs.into_iter().map(|x| {
-                    div()
-                        .absolute()
-                        .left(px(x))
-                        .top_0()
-                        .w(px(2.0))
-                        .h(px(5.0))
-                        .bg(Colors::with_alpha(Colors::text_secondary(), 0.7))
-                }))
-        });
-        div()
-            .id(("chordgen-region", id))
-            .absolute()
-            .left(px(x))
-            .top(px(REGION_INSET))
-            .w(px(w))
-            .h(px(h))
-            .rounded(px(radius::clamped(radius::CONTROL_SM, w, h)))
-            .overflow_hidden()
-            .bg(fill)
-            .border(px(1.0))
-            .border_color(if selected {
-                Colors::with_alpha(Colors::accent_primary(), 0.9)
-            } else {
-                Colors::border_normal()
-            })
-            .cursor(gpui::CursorStyle::OpenHand)
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                    cx.stop_propagation();
-                    this.begin_press(
-                        PressKind::Region {
-                            id,
-                            mode: RegionMode::Move,
-                            original,
-                        },
-                        event.position,
-                        cx,
-                    );
-                }),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left(px(space::SNUG))
-                    .top(px(space::TIGHT))
-                    .right(px(EDGE_W))
-                    .flex()
-                    .flex_col()
-                    .overflow_hidden()
+                        "chordgen-play",
+                        if playing { "Stop" } else { "Play" },
+                        FbButtonKind::Default,
+                        has_chords,
+                        cx.listener(|this, _, _, cx| this.toggle_playback(cx)),
+                    ))
                     .child(
                         div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(space::HAIR))
-                            .child(
-                                div()
-                                    .text_size(px(if lane_h > 50.0 {
-                                        typography::UI_MD
-                                    } else {
-                                        typography::UI_XS
-                                    }))
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(Colors::text_primary())
-                                    .whitespace_nowrap()
-                                    .child(title),
-                            )
-                            .when(locked, |row| {
-                                row.child(
-                                    gpui::svg()
-                                        .path(assets::ICON_LOCK_PATH)
-                                        .w(px(10.0))
-                                        .h(px(10.0))
-                                        .text_color(Colors::text_muted()),
-                                )
-                            }),
+                            .id("chordgen-undo-tip")
+                            .tooltip(fb_tooltip("Undo (Ctrl+Z)"))
+                            .child(fb_icon_button(
+                                "chordgen-undo",
+                                assets::ICON_UNDO_PATH,
+                                "Undo",
+                                crate::theme::size::DEFAULT,
+                                None,
+                                cx.listener(|this, _, _, cx| this.undo(cx)),
+                            )),
                     )
-                    .children(detail.map(|d| {
+                    .child(
                         div()
-                            .text_size(px(typography::UI_XS))
-                            .text_color(Colors::text_muted())
-                            .whitespace_nowrap()
-                            .child(d)
-                    })),
-            )
-            .children(ticks)
-            .child(
-                div()
-                    .id(("chordgen-region-edge", id))
-                    .absolute()
-                    .right_0()
-                    .top_0()
-                    .bottom_0()
-                    .w(px(EDGE_W))
-                    .cursor(gpui::CursorStyle::ResizeLeftRight)
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                            cx.stop_propagation();
-                            this.begin_press(
-                                PressKind::Region {
-                                    id,
-                                    mode: RegionMode::Stretch,
-                                    original,
-                                },
-                                event.position,
-                                cx,
-                            );
-                        }),
+                            .id("chordgen-redo-tip")
+                            .tooltip(fb_tooltip("Redo (Ctrl+Shift+Z)"))
+                            .child(fb_icon_button(
+                                "chordgen-redo",
+                                assets::ICON_REDO_PATH,
+                                "Redo",
+                                crate::theme::size::DEFAULT,
+                                None,
+                                cx.listener(|this, _, _, cx| this.redo(cx)),
+                            )),
                     ),
             )
-            .into_any_element()
-    }
-
-    // ── Render: inspector ───────────────────────────────────────────────────
-
-    fn wheel(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let scale_pcs = self.settings.scale.pitch_classes(self.settings.tonic);
-        let mut in_key = [false; 12];
-        for pc in &scale_pcs {
-            in_key[*pc as usize] = true;
-        }
-        let chord = self.focus_chord();
-        let frame = WheelFrame {
-            size: WHEEL_SIZE,
-            scale: window.scale_factor(),
-            energy: self.shown_energy,
-            in_key,
-            tonic: chord.map(|c| c.root as usize),
-            sweep: None,
-            beat_phase: None,
-            bar_phase: 0.0,
-        };
-        let painted = pitch_wheel::render_wgpu(&frame, cx)
-            .unwrap_or_else(|| pitch_wheel::render_gpui(&frame));
-        let flats = self.flats();
-        let radius = WHEEL_SIZE * 0.5;
-        let tonic = self.settings.tonic as usize;
-        let labels = (0..12).map(move |position| {
-            let pc = fifths_pitch_class(position);
-            let angle = (position as f32 + 0.5) * TAU / 12.0;
-            let r = radius * ring::LABEL;
-            let x = radius + r * angle.sin();
-            let y = radius - r * angle.cos();
-            div()
-                .absolute()
-                .left(px(x - 12.0))
-                .top(px(y - 7.0))
-                .w(px(24.0))
-                .h(px(14.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_size(px(typography::DENSE_CAPTION))
-                .font_weight(if pc == tonic {
-                    gpui::FontWeight::BOLD
-                } else {
-                    gpui::FontWeight::MEDIUM
-                })
-                .text_color(if in_key[pc] {
-                    Colors::text_secondary()
-                } else {
-                    Colors::text_faint()
-                })
-                .child(pitch_name(pc as u8, flats))
-        });
-        let disc = WHEEL_SIZE * ring::DISC;
-        let centre = div()
-            .absolute()
-            .left(px(radius - disc))
-            .top(px(radius - disc))
-            .size(px(disc * 2.0))
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .children(chord.map(|c| {
-                div()
-                    .text_size(px(18.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(Colors::text_primary())
-                    .child(c.name(flats))
-            }))
-            .children(chord.map(|c| {
-                div()
-                    .text_size(px(typography::UI_XS))
-                    .text_color(Colors::accent_primary())
-                    .child(c.roman(self.settings.tonic))
-            }));
-        div()
-            .relative()
-            .flex_none()
-            .size(px(WHEEL_SIZE))
-            .child(painted)
-            .children(labels)
-            .child(centre)
-    }
-
-    fn inspector(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let flats = self.flats();
-        let tonic = self.settings.tonic;
-        let wheel = self.wheel(window, cx);
-        let mut body: Vec<AnyElement> = Vec::new();
-        match self.selected_region() {
-            Some(region) => {
-                let id = region.id;
-                body.push(
-                    div()
-                        .text_size(px(typography::UI_XS))
-                        .font_features(tabular_features())
-                        .text_color(Colors::text_muted())
-                        .child(format!(
-                            "{} · {}",
-                            bar_beat(region.start),
-                            beats_label(region.length)
-                        ))
-                        .into_any_element(),
-                );
-                match region.content {
-                    Content::Chord { chord, locked } => {
-                        let notes = chord
-                            .pitch_classes()
-                            .into_iter()
-                            .map(|pc| pitch_name(pc, flats))
-                            .collect::<Vec<_>>()
-                            .join(" · ");
-                        body.push(
-                            div()
-                                .text_size(px(typography::UI_XS))
-                                .text_color(Colors::text_secondary())
-                                .child(notes)
-                                .into_any_element(),
-                        );
-                        body.push(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .gap(px(space::TIGHT))
-                                .child(fb_button(
-                                    "chordgen-lock",
-                                    if locked { "Unlock" } else { "Lock" },
-                                    FbButtonKind::Default,
-                                    true,
-                                    cx.listener(move |this, _, _, cx| this.toggle_lock(id, cx)),
-                                ))
-                                .child(fb_button(
-                                    "chordgen-reroll",
-                                    "Re-roll",
-                                    FbButtonKind::Default,
-                                    true,
-                                    cx.listener(move |this, _, _, cx| this.reroll(id, cx)),
-                                ))
-                                .child(fb_button(
-                                    "chordgen-delete",
-                                    "Delete",
-                                    FbButtonKind::Ghost,
-                                    true,
-                                    cx.listener(|this, _, _, cx| this.delete_selected(cx)),
-                                ))
-                                .into_any_element(),
-                        );
-                        body.push(list_heading("ALTERNATIVES"));
-                        let options = alternatives(&self.settings, self.next_chord(&region));
-                        body.push(
-                            div()
-                                .id("chordgen-alternatives")
-                                .flex_1()
-                                .min_h(px(0.0))
-                                .overflow_y_scroll()
-                                .flex()
-                                .flex_col()
-                                .children(options.into_iter().enumerate().map(|(i, option)| {
-                                    choice_row(
-                                        ("chordgen-alt", i),
-                                        option.name(flats),
-                                        option.roman(tonic),
-                                        option == chord,
-                                    )
-                                    .on_click(cx.listener(
-                                        move |this, _, _, cx| this.set_chord(id, option, cx),
-                                    ))
-                                }))
-                                .into_any_element(),
-                        );
-                    }
-                    Content::Comp(current) => {
-                        body.push(list_heading("COMP PATTERN"));
-                        body.push(
-                            div()
-                                .id("chordgen-comp-choices")
-                                .flex_1()
-                                .min_h(px(0.0))
-                                .overflow_y_scroll()
-                                .flex()
-                                .flex_col()
-                                .children(CompPattern::ALL.iter().enumerate().map(|(i, p)| {
-                                    let p = *p;
-                                    choice_row(
-                                        ("chordgen-comp-pick", i),
-                                        p.label().to_string(),
-                                        String::new(),
-                                        p == current,
-                                    )
-                                    .on_click(cx.listener(
-                                        move |this, _, _, cx| {
-                                            this.edit(cx, |this| {
-                                                this.arrangement.set_content(id, Content::Comp(p));
-                                            });
-                                        },
-                                    ))
-                                }))
-                                .into_any_element(),
-                        );
-                        body.push(delete_button(cx));
-                    }
-                    Content::Bass(current) => {
-                        body.push(list_heading("BASS PATTERN"));
-                        body.push(
-                            div()
-                                .id("chordgen-bass-choices")
-                                .flex_1()
-                                .min_h(px(0.0))
-                                .overflow_y_scroll()
-                                .flex()
-                                .flex_col()
-                                .children(BassPattern::ALL.iter().enumerate().map(|(i, p)| {
-                                    let p = *p;
-                                    choice_row(
-                                        ("chordgen-bass-pick", i),
-                                        p.label().to_string(),
-                                        String::new(),
-                                        p == current,
-                                    )
-                                    .on_click(cx.listener(
-                                        move |this, _, _, cx| {
-                                            this.edit(cx, |this| {
-                                                this.arrangement.set_content(id, Content::Bass(p));
-                                            });
-                                        },
-                                    ))
-                                }))
-                                .into_any_element(),
-                        );
-                        body.push(delete_button(cx));
-                    }
-                }
-            }
-            None => {
-                body.push(
-                    div()
-                        .text_size(px(typography::UI_XS))
-                        .text_color(Colors::text_muted())
-                        .child(format!(
-                            "{} {} — select a chord or pattern on the timeline to edit it",
-                            pitch_name(tonic, flats),
-                            self.settings.scale.label()
-                        ))
-                        .into_any_element(),
-                );
-            }
-        }
-        div()
-            .flex_none()
-            .w(px(INSPECTOR_W))
-            .flex()
-            .flex_col()
-            .gap(px(space::BASE))
-            .child(div().flex().justify_center().child(wheel))
-            .children(body)
     }
 
     // ── Render: footer and popover ──────────────────────────────────────────
@@ -2259,8 +1497,7 @@ impl ChordGeneratorWindow {
             "Plays on the selected instrument track · export at the playhead or drag onto the arrangement"
                 .to_string()
         });
-        let has_chords = self.arrangement.lane(Lane::Chords).next().is_some();
-        let playing = self.playback.as_ref().is_some_and(|p| p.timeline);
+        let has_chords = self.arrangement.chord_count() > 0;
         let exporting = self
             .press
             .is_some_and(|p| p.dragging && p.kind == PressKind::Export);
@@ -2284,27 +1521,6 @@ impl ChordGeneratorWindow {
                     .text_color(Colors::text_muted())
                     .child(status),
             )
-            .child(fb_button(
-                "chordgen-undo",
-                "Undo",
-                FbButtonKind::Ghost,
-                true,
-                cx.listener(|this, _, _, cx| this.undo(cx)),
-            ))
-            .child(fb_button(
-                "chordgen-redo",
-                "Redo",
-                FbButtonKind::Ghost,
-                true,
-                cx.listener(|this, _, _, cx| this.redo(cx)),
-            ))
-            .child(fb_button(
-                "chordgen-play",
-                if playing { "Stop" } else { "Play" },
-                FbButtonKind::Ghost,
-                has_chords,
-                cx.listener(|this, _, _, cx| this.toggle_playback(cx)),
-            ))
             .child(
                 div()
                     .id("chordgen-drag-all")
@@ -2335,7 +1551,12 @@ impl ChordGeneratorWindow {
                         el.on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
-                                this.begin_press(PressKind::Export, event.position, cx);
+                                this.begin_press(
+                                    PressKind::Export,
+                                    event.position,
+                                    event.modifiers,
+                                    cx,
+                                );
                             }),
                         )
                     })
@@ -2372,31 +1593,138 @@ impl ChordGeneratorWindow {
                 has_chords,
                 cx.listener(|this, _, _, cx| this.export_clip(cx)),
             ))
-            .child(fb_button(
-                "chordgen-generate",
-                "Generate",
-                FbButtonKind::Primary,
-                true,
-                cx.listener(|this, _, _, cx| this.regenerate(cx)),
-            ))
     }
 
     fn popover(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let Popover::Scale(point) = self.popover?;
+        let Popover { kind, at } = self.popover?;
+        let (w, h) = match kind {
+            PopoverKind::Tonic => (204.0_f32, 132.0_f32),
+            PopoverKind::Scale => (220.0, 360.0),
+            PopoverKind::Style => (180.0, 230.0),
+            PopoverKind::Colour => (230.0, 196.0),
+        };
         let viewport = window.viewport_size();
-        let (w, h) = (220.0_f32, 360.0_f32);
         let vw: f32 = viewport.width.into();
         let vh: f32 = viewport.height.into();
-        let x: f32 = point.x.into();
-        let y: f32 = point.y.into();
+        let x: f32 = at.x.into();
+        let y: f32 = at.y.into();
         let left = x.min(vw - w - space::BASE).max(space::BASE);
-        let top = (y + space::TIGHT)
-            .min(vh - h - space::BASE)
-            .max(space::BASE);
-        let current = self.settings.scale;
+        let top = (y + space::BASE).min(vh - h - space::BASE).max(space::BASE);
+        let body: Vec<AnyElement> = match kind {
+            PopoverKind::Tonic => {
+                let flats = self.flats();
+                let tonic = self.settings.tonic;
+                vec![div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap(px(space::TIGHT))
+                    .children((0..12u8).map(|pc| {
+                        let rest = if pc == tonic {
+                            Colors::composite(Colors::surface_card(), Colors::state_selected())
+                        } else {
+                            Colors::surface_raised()
+                        };
+                        let hover = Colors::composite(rest, Colors::state_hover());
+                        div()
+                            .id(("chordgen-tonic-item", pc as usize))
+                            .w(px(44.0))
+                            .h(px(crate::theme::size::DEFAULT))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(radius::CONTROL))
+                            .bg(rest)
+                            .border(px(1.0))
+                            .border_color(if pc == tonic {
+                                Colors::with_alpha(Colors::accent_primary(), 0.85)
+                            } else {
+                                Colors::border_subtle()
+                            })
+                            .hover(move |s| s.bg(hover))
+                            .cursor(gpui::CursorStyle::PointingHand)
+                            .text_size(px(typography::UI_SM))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(Colors::text_primary())
+                            .child(pitch_name(pc, flats))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.popover = None;
+                                this.set_tonic(pc, cx);
+                            }))
+                    }))
+                    .into_any_element()]
+            }
+            PopoverKind::Scale => {
+                let current = self.settings.scale;
+                Scale::ALL
+                    .iter()
+                    .enumerate()
+                    .map(|(index, scale)| {
+                        let scale = *scale;
+                        let detail = if scale.is_heptatonic() {
+                            String::new()
+                        } else {
+                            "symmetric".to_string()
+                        };
+                        choice_row(
+                            ("chordgen-scale-item", index),
+                            scale.label().to_string(),
+                            detail,
+                            scale == current,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.popover = None;
+                            this.set_scale(scale, cx);
+                        }))
+                        .into_any_element()
+                    })
+                    .collect()
+            }
+            PopoverKind::Style => {
+                let current = self.settings.style;
+                Style::ALL
+                    .iter()
+                    .enumerate()
+                    .map(|(index, style)| {
+                        let style = *style;
+                        choice_row(
+                            ("chordgen-style-item", index),
+                            style.label().to_string(),
+                            String::new(),
+                            style == current,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.popover = None;
+                            this.update_settings(cx, |s| s.style = style);
+                        }))
+                        .into_any_element()
+                    })
+                    .collect()
+            }
+            PopoverKind::Colour => {
+                let colors = self.settings.colors;
+                colour_options()
+                    .iter()
+                    .map(|&(id, label, get, set)| {
+                        let on = get(&colors);
+                        div()
+                            .child(fb_checkbox(
+                                id,
+                                label,
+                                on,
+                                true,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.update_settings(cx, |s| set(&mut s.colors, !on));
+                                }),
+                            ))
+                            .into_any_element()
+                    })
+                    .collect()
+            }
+        };
         Some(
             div()
-                .id("chordgen-scale-menu")
+                .id("chordgen-popover")
                 .absolute()
                 .left(px(left))
                 .top(px(top))
@@ -2410,28 +1738,16 @@ impl ChordGeneratorWindow {
                 .shadow_lg()
                 .flex()
                 .flex_col()
+                .gap(px(if kind == PopoverKind::Colour {
+                    space::TIGHT
+                } else {
+                    0.0
+                }))
                 .overflow_y_scroll()
                 // Clicks inside the menu must not reach the root's
                 // click-away handler before the item's own click fires.
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .children(Scale::ALL.iter().enumerate().map(|(index, scale)| {
-                    let scale = *scale;
-                    let detail = if scale.is_heptatonic() {
-                        String::new()
-                    } else {
-                        "symmetric".to_string()
-                    };
-                    choice_row(
-                        ("chordgen-scale-item", index),
-                        scale.label().to_string(),
-                        detail,
-                        scale == current,
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.popover = None;
-                        this.update_settings(cx, |s| s.scale = scale);
-                    }))
-                }))
+                .children(body)
                 .into_any_element(),
         )
     }
@@ -2440,9 +1756,9 @@ impl ChordGeneratorWindow {
 impl Render for ChordGeneratorWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dragging = self.press.is_some_and(|p| p.dragging);
-        // While a press is live, listen window-wide: region and browser drags
-        // cross element bounds, and the export drag leaves this window on its
-        // way to the arrangement.
+        // While a press is live, listen window-wide: drags cross element
+        // bounds, and the export drag leaves this window on its way to the
+        // arrangement.
         let tracker = self.press.is_some().then(|| {
             let this = cx.weak_entity();
             let up = this.clone();
@@ -2462,7 +1778,7 @@ impl Render for ChordGeneratorWindow {
                         }
                         let over = ChordGeneratorWindow::over_self(event.position, w);
                         let _ = up.update(cx, |this, cx| {
-                            this.finish_press(Some((event.position, over)), w, cx)
+                            this.finish_press(Some((event.position, over, event.modifiers)), w, cx)
                         });
                     });
                 },
@@ -2471,8 +1787,9 @@ impl Render for ChordGeneratorWindow {
             .inset_0()
         });
         let popover = self.popover(window, cx);
-        let inspector = self.inspector(window, cx);
-        let timeline = self.timeline(window, cx);
+        let side = self.side_panel(window, cx);
+        let sequence = self.sequence(window, cx);
+        let palette = self.palette(cx);
 
         div()
             .size_full()
@@ -2507,9 +1824,11 @@ impl Render for ChordGeneratorWindow {
                     "z" if command && modifiers.shift => this.redo(cx),
                     "z" if command => this.undo(cx),
                     "y" if command => this.redo(cx),
-                    "backspace" | "delete" if this.press.is_none() => this.delete_selected(cx),
+                    "backspace" | "delete" if this.press.is_none() => this.delete_selection(cx),
                     "space" => this.toggle_playback(cx),
-                    "g" if !modifiers.modified() => this.regenerate(cx),
+                    "g" if !modifiers.modified() => this.fill(cx),
+                    "left" if !modifiers.modified() => this.step_palette(-1, cx),
+                    "right" if !modifiers.modified() => this.step_palette(1, cx),
                     _ => {}
                 }
             }))
@@ -2527,7 +1846,7 @@ impl Render for ChordGeneratorWindow {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseUpEvent, window, cx| {
-                    this.finish_press(Some((event.position, true)), window, cx);
+                    this.finish_press(Some((event.position, true, event.modifiers)), window, cx);
                 }),
             )
             .child(external_window_titlebar(
@@ -2540,18 +1859,26 @@ impl Render for ChordGeneratorWindow {
                     }
                 },
             ))
-            .child(self.controls(cx))
+            .child(self.toolbar(cx))
             .child(
                 div()
                     .flex_1()
                     .min_h(px(0.0))
                     .flex()
-                    .flex_row()
+                    .flex_col()
                     .gap(px(space::SECTION))
                     .p(px(space::SECTION))
-                    .child(self.browser(cx))
-                    .child(timeline)
-                    .child(inspector),
+                    .child(sequence)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h(px(0.0))
+                            .flex()
+                            .flex_row()
+                            .gap(px(space::SECTION))
+                            .child(palette)
+                            .child(side),
+                    ),
             )
             .child(self.footer(cx))
             .children(popover)
@@ -2577,7 +1904,7 @@ pub fn open_chord_generator_window(
     options.window_background = WindowBackgroundAppearance::Opaque;
     options.window_min_size = Some(size(px(MIN_WIDTH), px(MIN_HEIGHT)));
     apply_owner_display(&mut options, owner_bounds, cx);
-    cx.open_window(options, move |window, cx| {
+    crate::dialog_frame::open_dialog_window(cx, options, move |window, cx| {
         let view = cx.new(|cx| {
             let mut generator = ChordGeneratorWindow::new(callbacks, cx);
             generator._activation =
@@ -2595,24 +1922,129 @@ pub fn open_chord_generator_window(
 
 // ── Small pieces ────────────────────────────────────────────────────────────
 
-/// Width of the timeline's content column: the window less its fixed-width
-/// columns, padding and the lane labels.
-fn timeline_content_width(window: &Window) -> f32 {
+/// Width of the sequence's content column: the window less the body
+/// padding, the lane-label column and the panel's two border pixels.
+fn sequence_content_width(window: &Window) -> f32 {
     let viewport: f32 = window.viewport_size().width.into();
-    (viewport - 4.0 * space::SECTION - BROWSER_W - INSPECTOR_W - LABEL_W - 3.0).max(120.0)
+    (viewport - 2.0 * space::SECTION - LABEL_W - 2.0).max(120.0)
 }
 
-/// The lane under `y`, measured from the top of the first lane.
-fn lane_at(y: f32) -> Option<Lane> {
-    let mut top = 0.0;
-    for lane in Lane::ALL {
-        let height = lane_height(lane);
-        if y >= top && y < top + height {
-            return Some(lane);
+/// Where a drop at `x` pixels into the sequence goes. Inside a section it
+/// joins at the nearest chord boundary, within [`SECTION_EDGE_PX`] of a
+/// section's edge (or past the end) it starts a new section there. With
+/// `sections_only`, only section boundaries count.
+fn drop_target(arrangement: &Arrangement, x: f32, ppb: f32, sections_only: bool) -> Insert {
+    let mut start = 0.0_f64;
+    for (index, section) in arrangement.sections().iter().enumerate() {
+        let end = start + section.beats();
+        let (sx, ex) = (start as f32 * ppb, end as f32 * ppb);
+        if x <= ex {
+            if sections_only {
+                return Insert::NewSection(if x - sx < ex - x { index } else { index + 1 });
+            }
+            if x - sx < SECTION_EDGE_PX {
+                return Insert::NewSection(index);
+            }
+            if ex - x < SECTION_EDGE_PX {
+                return Insert::NewSection(index + 1);
+            }
+            let mut at = start;
+            let mut slot_index = section.slots.len();
+            for (k, slot) in section.slots.iter().enumerate() {
+                if x < (at + slot.beats * 0.5) as f32 * ppb {
+                    slot_index = k;
+                    break;
+                }
+                at += slot.beats;
+            }
+            return Insert::Into {
+                section: section.id,
+                index: slot_index,
+            };
         }
-        top += height;
+        start = end;
     }
-    None
+    Insert::NewSection(arrangement.sections().len())
+}
+
+fn drop_hint(at: Insert, verb: &str) -> String {
+    match at {
+        Insert::NewSection(_) => format!("{verb} as a new section"),
+        Insert::Into { .. } => format!("{verb} into this section"),
+    }
+}
+
+/// `A`, `B`, … `Z`, `AA`, … for section index `index`.
+fn section_label(index: usize) -> String {
+    let mut n = index;
+    let mut label = String::new();
+    loop {
+        label.insert(0, (b'A' + (n % 26) as u8) as char);
+        if n < 26 {
+            break;
+        }
+        n = n / 26 - 1;
+    }
+    label
+}
+
+/// The colour a chord's family is drawn in.
+fn family_color(chord: &Chord) -> Rgba {
+    match chord.quality.family() {
+        ChordFamily::Major => Colors::harmony_major(),
+        ChordFamily::Minor => Colors::harmony_minor(),
+        ChordFamily::Other => Colors::harmony_other(),
+    }
+}
+
+/// The in-key mark: a filled dot when every note is in the song's key, a
+/// ring when some are not.
+fn key_dot(in_key: bool, color: Rgba) -> impl IntoElement {
+    let d = 7.0;
+    div()
+        .flex_none()
+        .size(px(d))
+        .rounded(px(radius::PILL))
+        .border(px(1.5))
+        .border_color(color)
+        .when(in_key, |dot| dot.bg(color))
+}
+
+type ColourOption = (
+    &'static str,
+    &'static str,
+    fn(&ChordColors) -> bool,
+    fn(&mut ChordColors, bool),
+);
+
+fn colour_options() -> [ColourOption; 5] {
+    [
+        ("chordgen-sus", "Sus", |c| c.sus, |c, v| c.sus = v),
+        (
+            "chordgen-borrowed",
+            "Borrowed",
+            |c| c.borrowed,
+            |c, v| c.borrowed = v,
+        ),
+        (
+            "chordgen-secondary",
+            "Secondary dominants",
+            |c| c.secondary_dominants,
+            |c, v| c.secondary_dominants = v,
+        ),
+        (
+            "chordgen-passing",
+            "Passing diminished",
+            |c| c.passing_diminished,
+            |c, v| c.passing_diminished = v,
+        ),
+        (
+            "chordgen-blackadder",
+            "Black Adder",
+            |c| c.black_adder,
+            |c, v| c.black_adder = v,
+        ),
+    ]
 }
 
 fn tabular_features() -> gpui::FontFeatures {
@@ -2660,16 +2092,6 @@ fn segment_position(index: usize, count: usize) -> FbSegment {
         (i, n) if i + 1 == n => FbSegment::Last,
         _ => FbSegment::Middle,
     }
-}
-
-fn labeled_row(label: &'static str, content: impl IntoElement) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(space::LOOSE))
-        .child(div().w(px(52.0)).flex_none().child(fb_section_label(label)))
-        .child(div().flex_1().min_w(px(0.0)).child(content))
 }
 
 fn list_heading(label: &'static str) -> AnyElement {
@@ -2724,51 +2146,18 @@ fn choice_row(
         )
 }
 
-fn delete_button(cx: &mut Context<ChordGeneratorWindow>) -> AnyElement {
-    div()
-        .flex()
-        .flex_row()
-        .child(fb_button(
-            "chordgen-delete-pattern",
-            "Delete",
-            FbButtonKind::Ghost,
-            true,
-            cx.listener(|this, _, _, cx| this.delete_selected(cx)),
-        ))
-        .into_any_element()
-}
-
-/// A bar of the pattern's rhythm: a tick per hit, beats marked underneath.
-fn rhythm_glyph(onsets: &[f64], width: f32) -> impl IntoElement {
-    let per_beat = width / BEATS_PER_BAR as f32;
-    div()
-        .relative()
-        .w(px(width))
-        .h(px(10.0))
-        .children((0..BEATS_PER_BAR as usize).map(move |beat| {
-            div()
-                .absolute()
-                .left(px(beat as f32 * per_beat))
-                .bottom_0()
-                .w(px(1.0))
-                .h(px(3.0))
-                .bg(Colors::border_normal())
-        }))
-        .children(onsets.iter().map(move |&at| {
-            div()
-                .absolute()
-                .left(px(at as f32 * per_beat))
-                .top_0()
-                .w(px(3.0))
-                .h(px(6.0))
-                .rounded(px(radius::MICRO))
-                .bg(Colors::accent_primary())
-        }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sphere_midi_service::chords::ChordQuality;
+
+    fn two_sections() -> Arrangement {
+        let mut a = Arrangement::default();
+        let bar = |root| (Chord::new(root, ChordQuality::Major), BEATS_PER_BAR);
+        a.insert_chords(Insert::NewSection(0), &[bar(0), bar(9)]);
+        a.insert_chords(Insert::NewSection(1), &[bar(5), bar(7)]);
+        a
+    }
 
     #[test]
     fn positions_read_as_bars_and_beats() {
@@ -2782,14 +2171,48 @@ mod tests {
     }
 
     #[test]
-    fn lanes_stack_under_the_ruler() {
-        assert_eq!(lane_at(1.0), Some(Lane::Chords));
-        assert_eq!(lane_at(lane_height(Lane::Chords) + 1.0), Some(Lane::Comp));
+    fn sections_are_lettered() {
+        assert_eq!(section_label(0), "A");
+        assert_eq!(section_label(25), "Z");
+        assert_eq!(section_label(26), "AA");
+        assert_eq!(section_label(27), "AB");
+    }
+
+    #[test]
+    fn a_drop_joins_a_section_or_starts_one_at_its_edges() {
+        let a = two_sections();
+        // Two sections of two bars at 10 px a beat: 0–80 and 80–160.
+        let ppb = 10.0;
+        let first = a.sections()[0].id;
+        let second = a.sections()[1].id;
+        assert_eq!(drop_target(&a, 3.0, ppb, false), Insert::NewSection(0));
         assert_eq!(
-            lane_at(lane_height(Lane::Chords) + lane_height(Lane::Comp) + 1.0),
-            Some(Lane::Bass)
+            drop_target(&a, 30.0, ppb, false),
+            Insert::Into {
+                section: first,
+                index: 1
+            }
         );
-        assert_eq!(lane_at(-1.0), None);
-        assert_eq!(lane_at(1000.0), None);
+        assert_eq!(
+            drop_target(&a, 60.0, ppb, false),
+            Insert::Into {
+                section: first,
+                index: 2
+            }
+        );
+        assert_eq!(drop_target(&a, 75.0, ppb, false), Insert::NewSection(1));
+        assert_eq!(drop_target(&a, 85.0, ppb, false), Insert::NewSection(1));
+        assert_eq!(
+            drop_target(&a, 95.0, ppb, false),
+            Insert::Into {
+                section: second,
+                index: 0
+            }
+        );
+        assert_eq!(drop_target(&a, 400.0, ppb, false), Insert::NewSection(2));
+        // Sections move to the nearest section boundary.
+        assert_eq!(drop_target(&a, 30.0, ppb, true), Insert::NewSection(0));
+        assert_eq!(drop_target(&a, 50.0, ppb, true), Insert::NewSection(1));
+        assert_eq!(drop_target(&a, 130.0, ppb, true), Insert::NewSection(2));
     }
 }

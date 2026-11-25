@@ -178,12 +178,14 @@ unsafe fn build(
                     last_was_separator = false;
                 }
             }
+            // AppKit rows are drawn without the icon for now.
             PopupItem::Command {
                 label,
                 command,
                 shortcut,
                 checked,
                 enabled,
+                icon: _,
             } => {
                 let (key, modifiers) = shortcut
                     .as_deref()

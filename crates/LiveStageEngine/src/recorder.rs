@@ -211,7 +211,10 @@ fn open_encoder(
             format,
             // A long take outgrows RIFF's 4 GiB (93 minutes of a stereo
             // 96 kHz float strip); RF64 lets the same file keep going.
-            wav: WavEncodeOptions { rf64: true },
+            wav: WavEncodeOptions {
+                rf64: true,
+                ..Default::default()
+            },
             ..AudioEncodeOptions::default()
         },
     )

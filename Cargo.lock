@@ -3513,6 +3513,7 @@ dependencies = [
  "gpui_macos",
  "gpui_windows",
  "rand 0.9.4",
+ "rfd",
  "semver",
  "serde",
  "serde_json",
@@ -4230,11 +4231,11 @@ dependencies = [
 
 [[package]]
 name = "hashlink"
-version = "0.9.1"
+version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ba4ff7128dee98c7dc9794b6a411377e1404dba1c97deb8d1a55297bd25d8af"
+checksum = "a596f1b20ed2cc5ecac41a164aaebc7258057060f06c0cf7a2ba3991ee7990fb"
 dependencies = [
- "hashbrown 0.14.5",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -5043,9 +5044,9 @@ dependencies = [
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.28.0"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c10584274047cb335c23d3e61bcef8e323adae7c5c8c760540f73610177fc3f"
+checksum = "14a5f01b87b92705d07b433c06f96cbc764637d81a0bffb5734ce17cf0f9a2b3"
 dependencies = [
  "cc",
  "pkg-config",
@@ -7618,6 +7619,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rodhareist_engine"
+version = "2026.11.13-beta2.0.1"
+dependencies = [
+ "builtin_dsp_core",
+ "rodharerist",
+]
+
+[[package]]
 name = "rodharerist"
 version = "2026.11.13-beta2.0.1"
 dependencies = [
@@ -7637,6 +7646,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
 
 [[package]]
+name = "rsqlite-vfs"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c51c9ae4df8a7fba42103df5c621fa3c37eccf3a3c650879e90fc48b11cc192c"
+dependencies = [
+ "hashbrown 0.16.1",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "rubato"
 version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7650,9 +7669,9 @@ dependencies = [
 
 [[package]]
 name = "rusqlite"
-version = "0.31.0"
+version = "0.41.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b838eba278d213a8beaf485bd313fd580ca4505a00d5871caeb1457c55322cae"
+checksum = "da9bba6f3506135e120a6586df05be18b48d18896600646a4bec8f993d91a594"
 dependencies = [
  "bitflags 2.13.2",
  "fallible-iterator",
@@ -7660,6 +7679,7 @@ dependencies = [
  "hashlink",
  "libsqlite3-sys",
  "smallvec",
+ "sqlite-wasm-rs",
 ]
 
 [[package]]
@@ -8591,6 +8611,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "sphere-midi-fx"
+version = "2026.11.13-beta2.0.1"
+
+[[package]]
 name = "sphere-plugin-host"
 version = "2026.11.13-beta2.0.1"
 dependencies = [
@@ -8624,6 +8648,7 @@ dependencies = [
  "slicer",
  "sphere_directaudioengine",
  "transient",
+ "trigger",
  "verbspace",
  "waygate",
  "whitesharp",
@@ -8644,7 +8669,7 @@ dependencies = [
 
 [[package]]
 name = "sphere_directaudioengine"
-version = "2026.10.16-beta1.4.4"
+version = "2026.11.13-beta2.0.1"
 dependencies = [
  "SphereMidiService",
  "SphereSoundfontPlayer",
@@ -8671,6 +8696,7 @@ dependencies = [
  "sphere-audio-plugins",
  "sphere-audio-processor",
  "sphere-encoder",
+ "sphere-midi-fx",
  "windows 0.61.3",
  "windows-registry 0.5.3",
  "zbus",
@@ -8686,6 +8712,7 @@ dependencies = [
  "SphereWebView",
  "airboost",
  "base64",
+ "builtin_ui_embed",
  "burnlimit",
  "clipper67",
  "compresser",
@@ -8731,13 +8758,17 @@ dependencies = [
  "sphere-encoder",
  "sphere-graphic-engine",
  "sphere-jam-client",
+ "sphere-midi-fx",
  "sphere-plugin-host",
  "sphere-video-player",
  "sphere_directaudioengine",
  "sphere_voxtune",
  "transient",
+ "trigger",
+ "tungstenite",
  "unicode-segmentation",
  "verbspace",
+ "visualizer_link",
  "waygate",
  "wgpu",
  "whitesharp",
@@ -8799,6 +8830,18 @@ checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
 dependencies = [
  "base64ct",
  "der",
+]
+
+[[package]]
+name = "sqlite-wasm-rs"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc3efc0da82635d7e1ced0053bbbfa8c7ab9645d0bf36ceb4f7127bb85315d75"
+dependencies = [
+ "cc",
+ "js-sys",
+ "rsqlite-vfs",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -9891,6 +9934,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "trigger"
+version = "2026.11.13-beta2.0.1"
+dependencies = [
+ "biquad",
+ "builtin_dsp_core",
+ "quicksampler",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10329,6 +10383,14 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "visualizer_link"
+version = "2026.11.13-beta2.0.1"
+dependencies = [
+ "libc",
+ "windows 0.61.3",
+]
 
 [[package]]
 name = "voxtune"

@@ -1,0 +1,27 @@
+{
+  "name": "futureboard-visualizer-webui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Futureboard Studio's Loudness & Visualizer page, served by the Studio API server (Settings → Experimental → API server).",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@astrojs/react": "^4.4.0",
+    "animejs": "catalog:",
+    "astro": "^5.15.0",
+    "d3": "^7.9.0",
+    "react": "catalog:",
+    "react-dom": "catalog:"
+  },
+  "devDependencies": {
+    "@types/d3": "^7.4.3",
+    "@types/react": "catalog:",
+    "@types/react-dom": "catalog:",
+    "typescript": "catalog:"
+  }
+}

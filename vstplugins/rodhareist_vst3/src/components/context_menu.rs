@@ -192,6 +192,7 @@ fn popup_items(entries: Vec<ContextMenuEntry>) -> Vec<crate::native_popup_menu::
                 shortcut,
                 checked: false,
                 enabled: !disabled,
+                icon: None,
             },
         })
         .collect()

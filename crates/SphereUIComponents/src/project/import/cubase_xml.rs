@@ -177,11 +177,13 @@ pub(super) fn import(path: &Path) -> Result<FutureboardProject, ProjectError> {
             // imported tracks start at unity rather than at an invented value.
             volume_norm: volume::db_to_norm(0.0),
             pan: 0.0,
+            dual_pan: Default::default(),
             muted: false,
             solo: false,
             record_arm: false,
             input_monitor: InputMonitorMode::Off,
             routing: TrackRouting::default(),
+            midi_fx: Vec::new(),
             inserts: Vec::new(),
             automation_lanes: Vec::new(),
             clips,
@@ -193,6 +195,7 @@ pub(super) fn import(path: &Path) -> Result<FutureboardProject, ProjectError> {
             takes_expanded: false,
             freeze: None,
             drum_step: false,
+            step_lanes: Vec::new(),
         });
     }
 

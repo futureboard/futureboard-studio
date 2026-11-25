@@ -1,5 +1,6 @@
 //! Compact DAW-style boxed list rows — reusable for MIDI / audio / plug-in / GPU device lists.
 
+use gpui::prelude::FluentBuilder;
 use gpui::{
     div, px, svg, App, Div, InteractiveElement, IntoElement, ParentElement, Role,
     StatefulInteractiveElement, Styled, Window,
@@ -127,25 +128,52 @@ pub fn box_list_toggle(
     enabled: bool,
     on_toggle: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
+    toggle_switch(id, enabled, true, on_toggle)
+}
+
+/// [`box_list_toggle`] without its ON/OFF word, for a table whose column
+/// header already names what the switch does.
+pub fn box_list_switch(
+    id: impl Into<gpui::ElementId>,
+    enabled: bool,
+    on_toggle: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    toggle_switch(id, enabled, false, on_toggle)
+}
+
+fn toggle_switch(
+    id: impl Into<gpui::ElementId>,
+    enabled: bool,
+    labelled: bool,
+    on_toggle: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
     div()
         .id(id)
+        .role(Role::Switch)
+        .aria_toggled(if enabled {
+            gpui::Toggled::True
+        } else {
+            gpui::Toggled::False
+        })
         .flex()
         .flex_row()
         .items_center()
         .gap(px(5.0))
         .cursor(gpui::CursorStyle::PointingHand)
         .on_click(on_toggle)
-        .child(
-            div()
-                .text_size(px(9.0))
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(if enabled {
-                    Colors::accent_primary()
-                } else {
-                    Colors::text_faint()
-                })
-                .child(if enabled { "ON" } else { "OFF" }),
-        )
+        .when(labelled, |row| {
+            row.child(
+                div()
+                    .text_size(px(9.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(if enabled {
+                        Colors::accent_primary()
+                    } else {
+                        Colors::text_faint()
+                    })
+                    .child(if enabled { "ON" } else { "OFF" }),
+            )
+        })
         .child(
             div()
                 .relative()

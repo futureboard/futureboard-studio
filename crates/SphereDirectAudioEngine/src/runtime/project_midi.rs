@@ -402,12 +402,18 @@ impl RuntimeProject {
             // sink — no id lookups, String clones, or Vec collects per block.
             let track_ix = mt.track_index.filter(|&ti| ti < self.tracks.len());
             let instrument_ix = track_ix.and_then(|ti| self.tracks[ti].midi_instrument_insert_ix);
-            let bridge_sink = track_ix.zip(instrument_ix).and_then(|(ti, ix)| {
-                self.tracks[ti]
-                    .inserts
-                    .get(ix)
-                    .and_then(|insert| insert.bridge_sink.clone())
-            });
+            // A track with MIDI FX hands everything to `midi_block_events`:
+            // the chain runs there, and the instrument (bridged or not) is fed
+            // the result at render time.
+            let bridge_sink = track_ix
+                .zip(instrument_ix)
+                .filter(|&(ti, _)| self.tracks[ti].midi_fx.is_none())
+                .and_then(|(ti, ix)| {
+                    self.tracks[ti]
+                        .inserts
+                        .get(ix)
+                        .and_then(|insert| insert.bridge_sink.clone())
+                });
             if trace {
                 // Trace-only diagnostics. The clip-overlap scan (and its Vec)
                 // is allowed here because the flag is off in production.

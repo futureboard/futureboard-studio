@@ -25,7 +25,7 @@ use gpui::{
 };
 
 use crate::components::controls::{fb_button, FbButtonKind};
-use crate::components::scroll_thumb::vertical_scrollbar_thumb;
+use crate::components::scrollbar::scroll_handle_scrollbar;
 use crate::components::title_bar::external_window_titlebar;
 use crate::i18n::I18n;
 use crate::theme::{self, size as sizes, space, typography, Colors};
@@ -470,7 +470,7 @@ fn table(
             .relative()
             .size_full()
             .child(list)
-            .child(vertical_scrollbar_thumb(thumb))
+            .children(scroll_handle_scrollbar("missing-media-scrollbar", &thumb))
             .into_any_element()
     };
 

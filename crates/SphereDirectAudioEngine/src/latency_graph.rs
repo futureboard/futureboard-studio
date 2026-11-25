@@ -39,7 +39,7 @@ pub fn strip_plugin_latency_samples(track: &RuntimeTrack) -> u32 {
     let from_inserts: u32 = track
         .inserts
         .iter()
-        .filter(|insert| insert.enabled)
+        .filter(|insert| insert.counts_latency())
         .map(|insert| {
             insert
                 .vst3
@@ -141,7 +141,7 @@ pub fn wdw_bus_latency_samples(track: &RuntimeTrack) -> u32 {
     for insert in &track.inserts {
         let observed = insert.chain_latency_samples.saturating_sub(before);
         before = before.max(insert.chain_latency_samples);
-        if insert.signal_bus != crate::runtime::SIGNAL_BUS_WDW || !insert.enabled {
+        if insert.signal_bus != crate::runtime::SIGNAL_BUS_WDW || !insert.counts_latency() {
             continue;
         }
         let reported = insert
@@ -154,11 +154,60 @@ pub fn wdw_bus_latency_samples(track: &RuntimeTrack) -> u32 {
     total
 }
 
+/// Latency of the inserts `track` runs after its fader
+/// ([`crate::runtime::RuntimeInsert::post_fader`]): the part of its output
+/// latency that its fader, pre-fader sends and PFL come before.
+///
+/// Per insert this is the step the refresh path observed for it, or, before
+/// any refresh, what an in-process VST3 reports — as for
+/// [`wdw_bus_latency_samples`]. Allocation-free.
+pub fn post_fader_latency_samples(track: &RuntimeTrack) -> u32 {
+    if !track.inserts.iter().any(|insert| insert.post_fader) {
+        return 0;
+    }
+    let mut before = track
+        .soundfont_player
+        .as_ref()
+        .map(crate::runtime::RuntimeSoundfontPlayer::latency_samples)
+        .unwrap_or(0);
+    let mut total = 0u32;
+    for insert in &track.inserts {
+        let observed = insert.chain_latency_samples.saturating_sub(before);
+        before = before.max(insert.chain_latency_samples);
+        if !insert.post_fader || !insert.counts_latency() {
+            continue;
+        }
+        let reported = insert
+            .vst3
+            .as_ref()
+            .filter(|vst3| vst3.is_ready())
+            .map_or(0, |vst3| vst3.get_latency_samples().max(0) as u32);
+        total = total.saturating_add(observed.max(reported));
+    }
+    total
+}
+
+/// Latency at the point `send` taps `track`, given the track's output latency:
+/// a pre-fader send taps before the track's post-fader inserts.
+#[inline]
+fn send_tap_latency(track: &RuntimeTrack, send: &crate::runtime::RuntimeSend, output: u32) -> u32 {
+    if send.pre_fader {
+        output.saturating_sub(post_fader_latency_samples(track))
+    } else {
+        output
+    }
+}
+
 /// The track a main output feeds, or `None` when it reaches the master sum
 /// directly. This is the same index the render path routes on, so compensation
 /// is planned against the routing that actually runs.
 #[inline]
 fn resolve_output_target_index(track_index: usize, tracks: &[RuntimeTrack]) -> Option<usize> {
+    // A channel placed into a bus's spatial field meets the master directly:
+    // the field skips the bus's chain and only rides its fader.
+    if crate::runtime::spatial_field_target(tracks, track_index).is_some() {
+        return None;
+    }
     tracks[track_index].output_track_index
 }
 
@@ -390,7 +439,7 @@ pub fn recompute_runtime_latency_graph(
                     continue;
                 }
                 if send.return_track_index == Some(idx) {
-                    feed_max = feed_max.max(output_latency[src_idx]);
+                    feed_max = feed_max.max(send_tap_latency(track, send, output_latency[src_idx]));
                 }
             }
             // Main-output → bus/return feeds also contribute upstream latency.
@@ -403,7 +452,11 @@ pub fn recompute_runtime_latency_graph(
             // the child planned as a zero-latency path and took the full
             // compensation on top, landing late by the instrument's latency,
             // which moved with every buffer-size change.
-            for insert in track.inserts.iter().filter(|insert| insert.enabled) {
+            for insert in track
+                .inserts
+                .iter()
+                .filter(|insert| insert.counts_latency())
+            {
                 if insert
                     .vsti_output_children
                     .iter()
@@ -471,8 +524,8 @@ pub fn recompute_runtime_latency_graph(
             }
             for (slot, send) in track.sends.iter().enumerate() {
                 if let Some(ret_idx) = send.return_track_index.filter(|&ret| ret < n) {
-                    send_pdc_delay[idx][slot] =
-                        feed_latency(ret_idx).saturating_sub(output_latency[idx]);
+                    send_pdc_delay[idx][slot] = feed_latency(ret_idx)
+                        .saturating_sub(send_tap_latency(track, send, output_latency[idx]));
                 }
             }
         }
@@ -572,8 +625,10 @@ mod tests {
 
     fn track(id: &str, ty: &str, plugin_latency: u32, sends: Vec<RuntimeSend>) -> RuntimeTrack {
         RuntimeTrack {
+            vca_gain: 1.0,
             spatial: None,
             spatial_params: Default::default(),
+            spatial_state: Default::default(),
             active_voices: 0,
             ara_renderers: Vec::new(),
             ara_l: Vec::new(),
@@ -598,6 +653,9 @@ mod tests {
             preview_mode: RuntimePreviewMode::Stereo,
             output_track_id: None,
             output_track_index: None,
+            midi_fx: None,
+            midi_fx_hold: Vec::new(),
+            midi_fx_plugins: Default::default(),
             inserts: Vec::new(),
             sends,
             automation_lanes: Vec::new(),
@@ -628,6 +686,7 @@ mod tests {
             plugin_latency_samples: plugin_latency,
             smoothed_gain_l: 1.0,
             smoothed_gain_r: 1.0,
+            dual_pan: Default::default(),
             wdw_return_index: None,
             sidechain_tap: Default::default(),
         }

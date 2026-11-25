@@ -503,6 +503,90 @@ impl TimelineState {
         }
     }
 
+    /// Whether `track` is placed in the room in the mix as it plays here: the
+    /// mix is spatial (and licensed), the channel is not the master, and it
+    /// either sums into the master or is routed into a bus that keeps its
+    /// channels' places and itself sums into the master. The same rule the
+    /// engine places channels by.
+    pub fn spatially_placed(&self, track: &TrackState) -> bool {
+        self.spatially_placed_when(track, self.spatial_mix.heard_here().is_spatial())
+    }
+
+    /// [`Self::spatially_placed`] with whether the mix is heard as spatial
+    /// given, rather than read from the license.
+    pub fn spatially_placed_when(&self, track: &TrackState, spatial: bool) -> bool {
+        if !spatial || track.track_type == TrackType::Master {
+            return false;
+        }
+        match &track.routing.output {
+            TrackOutputRouting::Bus { bus_id } => self.find_track(bus_id).is_some_and(|bus| {
+                bus.spatial_keeps_inputs
+                    && bus.track_type.is_routing()
+                    && matches!(bus.routing.output, TrackOutputRouting::Main)
+            }),
+            _ => true,
+        }
+    }
+
+    /// Every channel [`Self::spatially_placed`], for the Mixer's strips.
+    /// Empty in a mix heard as stereo.
+    pub fn spatially_placed_ids(&self) -> std::sync::Arc<std::collections::HashSet<String>> {
+        let spatial = self.spatial_mix.heard_here().is_spatial();
+        std::sync::Arc::new(
+            self.tracks
+                .iter()
+                .filter(|track| self.spatially_placed_when(track, spatial))
+                .map(|track| track.id.clone())
+                .collect(),
+        )
+    }
+
+    /// Whether `bus` keeps its channels' places as the mix plays here.
+    pub fn keeps_inputs_heard(&self, bus: &TrackState) -> bool {
+        self.spatial_mix.heard_here().is_spatial()
+            && bus.spatial_keeps_inputs
+            && bus.track_type.is_routing()
+            && matches!(bus.routing.output, TrackOutputRouting::Main)
+    }
+
+    /// A hand move of a channel's placement overrides the spatial lanes of
+    /// the parameters it changed, as the pan knob does for Pan.
+    pub fn override_spatial_automation(
+        &mut self,
+        track_id: &str,
+        prev: solfege_spatialaudio::SourceParams,
+        next: solfege_spatialaudio::SourceParams,
+    ) {
+        for param in solfege_spatialaudio::SourceParam::ALL {
+            if (param.normalized(&prev) - param.normalized(&next)).abs() > 1.0e-5 {
+                self.override_automation(track_id, |t| *t == AutomationTarget::Spatial(param));
+            }
+        }
+    }
+
+    /// Set a channel's Dual pan (mode and both positions). Returns `true`
+    /// when anything changed. Moving a Dual position by hand overrides that
+    /// position's automation, as the balance knob does for Pan.
+    pub fn set_track_dual_pan(&mut self, track_id: &str, dual_pan: DualPan) -> bool {
+        let next = dual_pan.sanitized();
+        let Some(prev) = self.find_track(track_id).map(|t| t.dual_pan) else {
+            return false;
+        };
+        if prev == next {
+            return false;
+        }
+        if (prev.left - next.left).abs() > 1.0e-5 {
+            self.override_automation(track_id, |t| matches!(t, AutomationTarget::TrackPanLeft));
+        }
+        if (prev.right - next.right).abs() > 1.0e-5 {
+            self.override_automation(track_id, |t| matches!(t, AutomationTarget::TrackPanRight));
+        }
+        if let Some(t) = self.tracks.iter_mut().find(|t| t.id == track_id) {
+            t.dual_pan = next;
+        }
+        true
+    }
+
     pub fn begin_track_pan_preview(&mut self, track_id: &str) {
         if self.track_pan_gesture_origin.contains_key(track_id) {
             return;

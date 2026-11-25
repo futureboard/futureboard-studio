@@ -1,6 +1,6 @@
 use super::*;
 use crate::measure::{
-    self, dsp_for, frames_for, impulse_response, measure, modulation_spread_hz, Metrics,
+    self, Metrics, dsp_for, frames_for, impulse_response, measure, modulation_spread_hz,
 };
 
 const SR: f32 = measure::SR;
@@ -1025,8 +1025,10 @@ fn every_preset_sounds_like_its_name() {
         assert!(sheen(&plate) > sheen(other), "{plate:?} vs {other:?}");
     }
     // A plate has no discrete reflections.
-    assert!(decay_profile(&plate_params, SR)
-        .early
-        .iter()
-        .all(|e| e.gain == 0.0));
+    assert!(
+        decay_profile(&plate_params, SR)
+            .early
+            .iter()
+            .all(|e| e.gain == 0.0)
+    );
 }

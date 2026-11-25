@@ -19,7 +19,7 @@
 //! routing, MIDI — is not drawn; the host's format is shown read-only.
 //!
 //! The design is laid out at 1024 × 768 and scaled to the window by the
-//! plate kit (`plate`), in its own palette and in Outfit / IBM Plex Mono.
+//! plate kit (`plate`), in its own palette and in Outfit / Barlow.
 
 use std::time::{Duration, Instant};
 
@@ -556,6 +556,7 @@ fn model_desc(label: &str) -> &'static str {
         "Drum Chamber" => "Medium room, darker than the hall.",
         "Ambience" => "A very short early field. Almost no tail.",
         "Dark Hall" => "Hall length with the top rolled off.",
+        "Live Room" => "Modulated room. A separate tank from the plate and the hall.",
         "Air EQ" => "A very high shelf and wide bells.",
         "Bass Shelf" => "The low shelf sits lower. Bells stay broad.",
         "Presence EQ" => "The high shelf comes in around the presence band.",

@@ -18,11 +18,13 @@ fn assert_real_picture(frame: &VideoFrame) {
     assert_eq!(frame.bgra.len(), expected);
     let (min, max) = frame
         .bgra
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|p| (u32::from(p[0]) + u32::from(p[1]) + u32::from(p[2])) / 3)
         .fold((255u32, 0u32), |(lo, hi), v| (lo.min(v), hi.max(v)));
     assert!(max > min + 8, "flat picture {min}..{max}");
-    assert!(frame.bgra.chunks_exact(4).all(|p| p[3] == 255));
+    assert!(frame.bgra.as_chunks::<4>().0.iter().all(|p| p[3] == 255));
 }
 
 fn exercise(rel: &str) -> VideoDecoder {

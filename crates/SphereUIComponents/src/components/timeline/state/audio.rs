@@ -720,11 +720,13 @@ mod metadata_tests {
             color_hex: "#56C7C9".to_string(),
             volume_norm: 1.0,
             pan: 0.0,
+            dual_pan: Default::default(),
             muted: false,
             solo: false,
             record_arm: false,
             input_monitor: crate::project::InputMonitorMode::Off,
             routing: TrackRouting::default(),
+            midi_fx: Vec::new(),
             inserts: Vec::new(),
             automation_lanes: Vec::new(),
             clips: Default::default(),
@@ -736,6 +738,7 @@ mod metadata_tests {
             takes_expanded: false,
             freeze: None,
             drum_step: false,
+            step_lanes: Vec::new(),
         };
         track.clips.push(ProjectClip {
             id: "c1".to_string(),

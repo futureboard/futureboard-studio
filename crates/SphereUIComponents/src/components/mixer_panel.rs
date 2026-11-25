@@ -39,7 +39,7 @@ use crate::assets;
 use crate::components::fader::fader_with_drag_callbacks;
 use crate::components::knob::knob_bipolar;
 use crate::components::mixer_meter_layer::{
-    clip_region, meter_slot, peak_readout_text, peak_slot, ClipRegion, MeterSource,
+    clip_region, meter_slot, peak_readout_text, peak_slot, reduction_slot, ClipRegion, MeterSource,
     SharedMeterLayout, VstiMeterFallback, PEAK_TEXT_SIZE,
 };
 use crate::components::mixer_render::{MixerRenderSnapshot, MixerRenderViewport, MixerStripGeom};
@@ -56,14 +56,16 @@ use crate::components::timeline::timeline_state::{
     vsti_output_child_channels_for_bus_layout, vsti_output_child_insert_id, GroupTree,
     InsertLoadStatus, InsertPluginFormat, InsertSignalBus, InsertSlotState, ListenMode,
     MasterBusState, MonitorBusState, SendSlotState, TrackOutputRouting, TrackState, TrackType,
-    MASTER_TRACK_ID,
+    VcaGroupState, MASTER_TRACK_ID,
 };
 use crate::components::timeline::vu_meter::meter_surface;
 use crate::i18n::I18n;
 use crate::theme::{typography, Colors};
 
 mod callbacks;
+mod channel_eq;
 mod console;
+mod dynamics;
 pub(crate) use console::describe_room_position;
 mod drag;
 mod split;
@@ -193,6 +195,16 @@ fn header_pill(
 }
 
 /// A group of header toggles with its caption.
+/// Whether this is the Professional Edition, which owns the advanced mixing
+/// tools: the EQ curve, pre/post-fader sends and inserts, the gain-reduction
+/// meter and VCA groups. The edition provider's gate
+/// ([`crate::edition::professional_features_available`]), never a check of
+/// its own. Community still plays, shows and saves what a Professional
+/// session set — a pre-fader send stays pre-fader — it only cannot change it.
+pub(crate) fn pro_mixing() -> bool {
+    crate::edition::professional_features_available()
+}
+
 fn header_group(caption: String, pills: Vec<gpui::AnyElement>) -> impl IntoElement {
     div()
         .flex()
@@ -352,19 +364,34 @@ pub fn mixer_sub_header(header: MixerHeader<'_>, i18n: I18n) -> impl IntoElement
         )
         .child(header_group(
             i18n.tr_or("mixer.header.show", "SHOW"),
-            vec![
-                section_pill("mixer-show-io", "I/O".to_string(), MixerSection::Io),
-                section_pill(
+            [
+                Some(section_pill(
+                    "mixer-show-io",
+                    "I/O".to_string(),
+                    MixerSection::Io,
+                )),
+                // The EQ curve is Professional mixing.
+                pro_mixing().then(|| {
+                    section_pill(
+                        "mixer-show-eq",
+                        i18n.tr_or("mixer.header.eq", "EQ"),
+                        MixerSection::Eq,
+                    )
+                }),
+                Some(section_pill(
                     "mixer-show-inserts",
                     i18n.tr_or("mixer.header.inserts", "Inserts"),
                     MixerSection::Inserts,
-                ),
-                section_pill(
+                )),
+                Some(section_pill(
                     "mixer-show-sends",
                     i18n.tr_or("mixer.header.sends", "Sends"),
                     MixerSection::Sends,
-                ),
-            ],
+                )),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
         ))
         .child(header_group(
             i18n.tr_or("mixer.header.strips", "STRIPS"),
@@ -628,6 +655,28 @@ fn strip_top_row(
         .h(px(console::TOP_ROW_H))
         .pl(px(1.0))
         .child(console::section_caption(type_label))
+        // In a VCA: its level also follows that VCA's fader. Shown in every
+        // edition, since every edition plays it.
+        .when(track.vca_group.is_some(), |row| {
+            row.child(
+                div()
+                    .id(gpui::SharedString::from(format!(
+                        "mixer-vca-tag-{}",
+                        track.id
+                    )))
+                    .flex_none()
+                    .px(px(2.0))
+                    .rounded(px(crate::theme::radius::MICRO))
+                    .bg(Colors::state_hover())
+                    .text_size(px(type_scale::CAPTION))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(Colors::text_secondary())
+                    .tooltip(crate::components::controls::fb_tooltip(
+                        "In a VCA: this channel's level also follows the VCA fader",
+                    ))
+                    .child("VCA"),
+            )
+        })
         .children(folder_chip)
         .children(
             vsti_output_group.map(|(group_key, expanded, count, callbacks)| {
@@ -1210,6 +1259,157 @@ fn is_plugin_preset_path(path: &std::path::Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("pst"))
 }
 
+/// Whether the mixer's EQ curve reads `slot`'s settings from the values its
+/// host reports (a Pro-Q), so a change made in the plug-in has to be asked
+/// for again before the curve shows it. The built-in EQs draw from their
+/// mirrored state and need nothing.
+pub(crate) fn eq_curve_reads_host_values(slot: &InsertSlotState) -> bool {
+    matches!(
+        channel_eq::EqKind::of(slot),
+        Some(channel_eq::EqKind::ProQ(_))
+    )
+}
+
+/// The channel's EQ: the curve its EQ inserts (EQ-Z8, EQ-ZX, Pro-Q) make
+/// together, 20 Hz to 20 kHz across, ±[`console::EQ_RANGE_DB`] up the side.
+/// A click opens the first of them. A channel with no EQ keeps the slot as an
+/// empty well, so the racks under it stay on one line across the mixer.
+fn eq_section(
+    track_id: &str,
+    inserts: &[InsertSlotState],
+    callbacks: &MixerCallbacks,
+    base: gpui::Rgba,
+    i18n: I18n,
+) -> gpui::AnyElement {
+    let well = console::well(base);
+    // Names the slot on a strip with no EQ; a curve says what it is itself.
+    let caption = div()
+        .absolute()
+        .top(px(1.0))
+        .left(px(3.0))
+        .text_size(px(type_scale::CAPTION))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(Colors::text_muted())
+        .child(i18n.tr_or("mixer.header.eq", "EQ"));
+    let shell = div()
+        .id(gpui::SharedString::from(format!("mix-eq-{track_id}")))
+        .relative()
+        .flex_none()
+        .w_full()
+        .h(px(console::EQ_H))
+        .rounded(px(crate::theme::radius::MICRO))
+        .bg(well)
+        .overflow_hidden();
+    let Some(eq) = channel_eq::channel_eq(inserts) else {
+        return shell
+            .tooltip(crate::components::controls::fb_tooltip(
+                "No EQ on this channel. An EQ-Z8, EQ-ZX or Pro-Q insert draws its curve here.",
+            ))
+            .child(caption)
+            .into_any_element();
+    };
+
+    let mut tooltip = eq.names.join(" → ");
+    if eq.pending {
+        tooltip.push_str("\nWaiting for the plug-in to report its settings.");
+    } else if !eq.live {
+        tooltip.push_str("\nBypassed or switched off.");
+    }
+    tooltip.push_str("\nClick to open the EQ.");
+
+    let open = (track_id.to_string(), eq.first.0, eq.first.1.clone());
+    let on_open = callbacks.on_open_insert_editor.clone();
+    let hover = Colors::composite(well, Colors::state_hover());
+    let ink = if eq.live {
+        Colors::accent_primary()
+    } else {
+        Colors::text_disabled()
+    };
+    let grid = Colors::border_subtle();
+    let db = eq.db;
+    shell
+        .cursor(gpui::CursorStyle::PointingHand)
+        .hover(move |style| style.bg(hover))
+        .tooltip(crate::components::controls::fb_tooltip(tooltip))
+        .on_click(move |_event, window, cx| on_open(&open, window, cx))
+        .child(
+            gpui::canvas(
+                |_, _, _| (),
+                move |bounds, _, window, _| paint_eq_curve(bounds, &db, ink, grid, window),
+            )
+            .size_full(),
+        )
+        .into_any_element()
+}
+
+/// Paints an EQ curve into `bounds`: the 0 dB line and the 100 Hz / 1 kHz /
+/// 10 kHz marks, then the curve over the area it lifts or cuts.
+fn paint_eq_curve(
+    bounds: gpui::Bounds<gpui::Pixels>,
+    db: &[f32],
+    ink: gpui::Rgba,
+    grid: gpui::Rgba,
+    window: &mut gpui::Window,
+) {
+    if db.len() < 2 {
+        return;
+    }
+    let x0 = f32::from(bounds.origin.x);
+    let y0 = f32::from(bounds.origin.y);
+    let width = f32::from(bounds.size.width);
+    let height = f32::from(bounds.size.height);
+    // A pixel in from the well's edges, so a full cut still shows.
+    let half = (height / 2.0 - 1.5).max(1.0);
+    let zero_y = y0 + height / 2.0;
+    let y_at = |level: f32| {
+        zero_y
+            - level.clamp(-console::EQ_RANGE_DB, console::EQ_RANGE_DB) / console::EQ_RANGE_DB * half
+    };
+    let x_at = |fraction: f32| x0 + fraction * width;
+
+    let rule = |window: &mut gpui::Window, origin: (f32, f32), size: (f32, f32)| {
+        window.paint_quad(gpui::fill(
+            gpui::Bounds::new(
+                gpui::point(px(origin.0), px(origin.1)),
+                gpui::size(px(size.0), px(size.1)),
+            ),
+            grid,
+        ));
+    };
+    rule(window, (x0, zero_y.floor()), (width, 1.0));
+    for hz in [100.0, 1_000.0, 10_000.0] {
+        let x = x_at(channel_eq::freq_fraction(hz)).floor();
+        rule(window, (x, y0), (1.0, height));
+    }
+
+    let last = (db.len() - 1) as f32;
+    let points: Vec<(f32, f32)> = db
+        .iter()
+        .enumerate()
+        .map(|(index, level)| (x_at(index as f32 / last), y_at(*level)))
+        .collect();
+
+    let mut area = gpui::PathBuilder::fill();
+    area.move_to(gpui::point(px(points[0].0), px(zero_y)));
+    for &(x, y) in &points {
+        area.line_to(gpui::point(px(x), px(y)));
+    }
+    area.line_to(gpui::point(px(points[points.len() - 1].0), px(zero_y)));
+    area.close();
+    if let Ok(path) = area.build() {
+        window.paint_path(path, Colors::with_alpha(ink, 0.22));
+    }
+
+    let mut line = gpui::PathBuilder::stroke(px(1.25));
+    line.move_to(gpui::point(px(points[0].0), px(points[0].1)));
+    for &(x, y) in &points[1..] {
+        line.line_to(gpui::point(px(x), px(y)));
+    }
+    if let Ok(path) = line.build() {
+        window.paint_path(path, ink);
+    }
+}
+
 fn inserts_section(
     track: &TrackState,
     callbacks: &MixerCallbacks,
@@ -1226,7 +1426,15 @@ fn inserts_section(
     let at_max = insert_chain_full(used);
 
     let mut chips = div().flex().flex_col().flex_none();
-    for (insert_index, slot) in track.inserts.iter().enumerate().skip(first_shown) {
+    let mut post_shown = false;
+    for (insert_index, slot) in rack_order(&track.inserts) {
+        if insert_index < first_shown {
+            continue;
+        }
+        if slot.post_fader && !post_shown {
+            chips = chips.child(post_fader_divider(&track.id));
+            post_shown = true;
+        }
         let dnd = (insert_index >= floor).then(|| {
             (
                 FxSlotDrag::for_slot(&track.id, slot, insert_index, &track.automation_lanes),
@@ -1305,6 +1513,54 @@ fn inserts_section(
     )
 }
 
+/// A chain in the order its rack lists it: the pre-fader inserts, then the
+/// post-fader ones — the order the engine runs them — each group in chain
+/// order, with each insert's index in the chain. An insert added after a
+/// post-fader one still runs before the fader, so it lists above the divider.
+fn rack_order(inserts: &[InsertSlotState]) -> impl Iterator<Item = (usize, &InsertSlotState)> {
+    let pre = inserts
+        .iter()
+        .enumerate()
+        .filter(|(_, slot)| !slot.post_fader);
+    let post = inserts
+        .iter()
+        .enumerate()
+        .filter(|(_, slot)| slot.post_fader);
+    pre.chain(post)
+}
+
+/// Where a rack's post-fader inserts start: a caption on a rule. The slots
+/// above it run before the channel fader, the ones under it after it. Moved
+/// from either side with the insert's right-click menu.
+fn post_fader_divider(owner_id: &str) -> impl IntoElement {
+    div()
+        .id(gpui::SharedString::from(format!(
+            "insert-post-divider-{owner_id}"
+        )))
+        .flex()
+        .flex_none()
+        .flex_row()
+        .items_center()
+        .gap(px(3.0))
+        .h(px(POST_DIVIDER_H))
+        .tooltip(crate::components::controls::fb_tooltip(
+            "Post-fader: the inserts below run after the channel fader. \
+             Right-click an insert to move it.",
+        ))
+        .child(
+            div()
+                .flex_none()
+                .text_size(px(type_scale::CAPTION))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(Colors::text_muted())
+                .child("POST"),
+        )
+        .child(div().flex_1().h(px(1.0)).bg(console::rule()))
+}
+
+/// Height of [`post_fader_divider`].
+const POST_DIVIDER_H: f32 = 12.0;
+
 /// The end of a rack's chain: the drop strip after the last slot, and
 /// "+ Insert" (one trailing empty slot; a chain has no slot limit, so it is
 /// always offered — the rack scrolls).
@@ -1367,7 +1623,12 @@ fn master_inserts_section(
     let at_max = insert_chain_full(used);
 
     let mut chips = div().flex().flex_col().flex_none();
-    for (insert_index, slot) in master.inserts.iter().enumerate() {
+    let mut post_shown = false;
+    for (insert_index, slot) in rack_order(&master.inserts) {
+        if slot.post_fader && !post_shown {
+            chips = chips.child(post_fader_divider(MASTER_TRACK_ID));
+            post_shown = true;
+        }
         // The master keeps no automation lanes of its own.
         let dnd = (
             FxSlotDrag::for_slot(MASTER_TRACK_ID, slot, insert_index, &[]),
@@ -1496,6 +1757,11 @@ fn send_level_text(gain_db: f32) -> String {
 const SEND_GRIP_W: f32 = 9.0;
 /// Width of a send row's remove zone (right).
 const SEND_REMOVE_W: f32 = 14.0;
+/// Width of a send row's Pre switch: "PRE" on a pre-fader send, between its
+/// name and its level, and the hover button over a post-fader send's name.
+const SEND_PRE_W: f32 = 17.0;
+/// The Pre switch on a narrow strip, where it reads "P".
+const SEND_PRE_NARROW_W: f32 = 9.0;
 
 /// One send: where it goes, and how much of this channel goes there.
 ///
@@ -1545,7 +1811,14 @@ fn send_chip(
     };
     let norm = send_norm(gain_db);
     let level_text = send_level_text(gain_db);
-    let tooltip = format!("{target_name} · {level_text} dB");
+    let tooltip = format!(
+        "{target_name} · {level_text} dB · {}",
+        if send.pre_fader {
+            "Pre-fader"
+        } else {
+            "Post-fader"
+        }
+    );
     let gain_drag_id = format!("mixer-send-gain-{}-{}", track_id, send.id);
     let gain_pair = (track_id.to_string(), send.id.clone());
     let gain_change = callbacks.on_send_gain_change.clone();
@@ -1668,6 +1941,88 @@ fn send_chip(
                 .text_color(text)
                 .child(target_name.to_string()),
         )
+        // A pre-fader send says so between its name and its level: "PRE",
+        // "P" on a narrow strip. A click puts it back after the fader.
+        .when(send.pre_fader && !send.wdw, |row| {
+            let toggle = callbacks.on_set_send_pre_fader.clone();
+            let pair = (track_id.to_string(), send.id.clone());
+            let narrow = split::strip_width() < split::STRIP_WIDTH_WIDE;
+            row.child(
+                div()
+                    .id(gpui::SharedString::from(format!("send-pre-{}", send.id)))
+                    .relative()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .w(px(if narrow {
+                        SEND_PRE_NARROW_W
+                    } else {
+                        SEND_PRE_W
+                    }))
+                    .h_full()
+                    .text_size(px(type_scale::CAPTION))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(Colors::state_monitor())
+                    .child(if narrow { "P" } else { "PRE" })
+                    // Community shows the tap; the Professional Edition
+                    // changes it.
+                    .map(|zone| {
+                        if pro_mixing() {
+                            zone.cursor(gpui::CursorStyle::PointingHand)
+                                .hover(|style| style.text_color(Colors::text_primary()))
+                                .tooltip(crate::components::controls::fb_tooltip(
+                                    "Pre-fader: taps before the channel fader. Click for post-fader",
+                                ))
+                                .on_click(move |_event, window, cx| {
+                                    toggle(&(pair.0.clone(), pair.1.clone(), false), window, cx);
+                                })
+                        } else {
+                            zone.tooltip(crate::components::controls::fb_tooltip(
+                                "Pre-fader: taps before the channel fader. \
+                                 Changed in the Professional Edition",
+                            ))
+                        }
+                    })
+                    .occlude(),
+            )
+        })
+        // A post-fader send offers the switch under the pointer only, over
+        // the start of its name — the left-hand twin of the remove zone — so
+        // a row of ordinary sends keeps its names. A wet/dry/wet split send
+        // is post-fader by design and has none.
+        .when(!send.pre_fader && !send.wdw && pro_mixing(), |row| {
+            let toggle = callbacks.on_set_send_pre_fader.clone();
+            let pair = (track_id.to_string(), send.id.clone());
+            row.child(
+                div()
+                    .id(gpui::SharedString::from(format!("send-pre-{}", send.id)))
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px(SEND_GRIP_W))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(SEND_PRE_W))
+                    .text_size(px(type_scale::CAPTION))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(gpui::transparent_black())
+                    .cursor(gpui::CursorStyle::PointingHand)
+                    .group_hover("fb-send-row", move |style| {
+                        style.bg(remove_hover).text_color(Colors::text_faint())
+                    })
+                    .hover(|style| style.text_color(Colors::text_primary()))
+                    .tooltip(crate::components::controls::fb_tooltip(
+                        "Post-fader. Click to tap before the channel fader",
+                    ))
+                    .child("PRE")
+                    .on_click(move |_event, window, cx| {
+                        toggle(&(pair.0.clone(), pair.1.clone(), true), window, cx);
+                    })
+                    .occlude(),
+            )
+        })
         .child(
             div()
                 .relative()
@@ -1877,8 +2232,10 @@ fn pan_section(
     callbacks: &MixerCallbacks,
     base: gpui::Rgba,
 ) -> gpui::AnyElement {
-    // A spatial mix places the channel in the room instead of panning it.
-    if callbacks.spatial_format.is_spatial() {
+    // A spatial mix places the channel in the room instead of panning it —
+    // when the channel is placed at all: one sent to an ordinary bus still
+    // pans into it.
+    if callbacks.spatial_format.is_spatial() && callbacks.spatial_placed.contains(&track.id) {
         let track_id = track.id.clone();
         let on_spatial = callbacks.on_spatial_change.clone();
         return console::room_panner(
@@ -1889,6 +2246,24 @@ fn pan_section(
             move |params, w, cx| on_spatial(&(track_id.clone(), params), w, cx),
         )
         .into_any_element();
+    }
+    // Right-click on the pan row: its mode menu (Balance / Dual Pan), not
+    // the strip's. Stops here so the strip menu does not open too.
+    let pan_menu = callbacks.on_pan_mode_menu.clone().map(|cb| {
+        let track_id = track.id.clone();
+        move |event: &gpui::MouseDownEvent, window: &mut gpui::Window, cx: &mut gpui::App| {
+            cx.stop_propagation();
+            let x: f32 = event.position.x.into();
+            let y: f32 = event.position.y.into();
+            cb(&(track_id.clone(), x, y), window, cx);
+        }
+    });
+    if track.dual_pan_active() {
+        return dual_pan_section(track, callbacks)
+            .when_some(pan_menu, |row, on_menu| {
+                row.on_mouse_down(gpui::MouseButton::Right, on_menu)
+            })
+            .into_any_element();
     }
     let track_id = track.id.clone();
     let pan_cb = callbacks.on_pan_change.clone();
@@ -1901,6 +2276,9 @@ fn pan_section(
         .justify_start()
         .gap(px(2.0))
         .h(px(console::PAN_H))
+        .when_some(pan_menu, |row, on_menu| {
+            row.on_mouse_down(gpui::MouseButton::Right, on_menu)
+        })
         .child(knob_bipolar(
             format!("mix-pan-{}", track.id),
             track.pan,
@@ -1930,6 +2308,83 @@ fn pan_section(
                 .child(console::format_pan(track.pan)),
         )
         .into_any_element()
+}
+
+/// Dual pan's diameter: two knobs share the row the balance knob has alone.
+const DUAL_PAN_KNOB_SIZE: f32 = 22.0;
+
+/// The pan row of a channel in Dual pan: one knob per input, side by side,
+/// each with its side and its position printed under it. Same height as the
+/// balance knob's row, so switching modes moves nothing else on the strip.
+/// A double-click puts a knob back to its default (the left input hard left,
+/// the right input hard right).
+fn dual_pan_section(track: &TrackState, callbacks: &MixerCallbacks) -> gpui::Div {
+    use crate::components::timeline::timeline_state::{DualPan, DualPanSide};
+    let dual = track.dual_pan;
+    let column = |side: DualPanSide| {
+        let (value, default, caption, id) = match side {
+            DualPanSide::Left => (dual.left, DualPan::DEFAULT_LEFT, "L", "l"),
+            DualPanSide::Right => (dual.right, DualPan::DEFAULT_RIGHT, "R", "r"),
+        };
+        let track_id = track.id.clone();
+        let on_change = callbacks.on_dual_pan_change.clone();
+        let at_default = (value - default).abs() < 0.005;
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .items_center()
+            .gap(px(2.0))
+            .child(knob_bipolar(
+                format!("mix-pan-{id}-{}", track.id),
+                value,
+                -1.0,
+                1.0,
+                DUAL_PAN_KNOB_SIZE,
+                track.color,
+                None,
+                default,
+                move |pan: &f32, w: &mut gpui::Window, cx: &mut gpui::App| {
+                    on_change(&(track_id.clone(), side, *pan), w, cx)
+                },
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_none()
+                    .items_baseline()
+                    .gap(px(2.0))
+                    .h(px(11.0))
+                    .child(
+                        div()
+                            .text_size(px(type_scale::CAPTION))
+                            .text_color(Colors::text_muted())
+                            .child(caption),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(type_scale::CAPTION + 0.5))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(if at_default {
+                                Colors::text_muted()
+                            } else {
+                                Colors::text_primary()
+                            })
+                            .child(console::format_pan(value)),
+                    ),
+            )
+    };
+    div()
+        .flex()
+        .flex_row()
+        .flex_none()
+        .items_start()
+        .justify_center()
+        .gap(px(4.0))
+        .h(px(console::PAN_H))
+        .child(column(DualPanSide::Left))
+        .child(column(DualPanSide::Right))
 }
 
 /// The fader bay: cap, meter, and the channel's gain printed under both.
@@ -2020,6 +2475,33 @@ fn strip_meter(
         )
         .into_any_element(),
     }
+}
+
+/// `meter`, with the Professional Edition's gain-reduction meter beside it
+/// when `inserts` hold a built-in dynamics processor in the signal path and
+/// the meter layer paints this strip. Anything else is `meter` as it was.
+fn with_reduction_meter(
+    meter: gpui::AnyElement,
+    meter_layer: Option<&SharedMeterLayout>,
+    source: MeterSource,
+    inserts: &[InsertSlotState],
+) -> gpui::AnyElement {
+    let Some(layout) = meter_layer.filter(|_| pro_mixing()) else {
+        return meter;
+    };
+    let reducing = dynamics::reduction_inserts(inserts);
+    if reducing.is_empty() {
+        return meter;
+    }
+    div()
+        .flex()
+        .flex_row()
+        .flex_none()
+        .h_full()
+        .gap(px(1.0))
+        .child(meter)
+        .child(reduction_slot(layout, source, reducing))
+        .into_any_element()
 }
 
 /// The peak readout's content: a slot the meter layer prints into, or — in
@@ -2400,6 +2882,7 @@ fn section_gap() -> gpui::AnyElement {
 struct StripSections {
     top: gpui::AnyElement,
     io: gpui::AnyElement,
+    eq: gpui::AnyElement,
     inserts: gpui::AnyElement,
     sends: gpui::AnyElement,
     pan: gpui::AnyElement,
@@ -2419,6 +2902,7 @@ fn strip_body(
     let StripSections {
         top,
         io,
+        eq,
         inserts,
         sends,
         pan,
@@ -2438,6 +2922,9 @@ fn strip_body(
         .child(top);
     if view.show_io {
         body = body.child(section_gap()).child(io);
+    }
+    if view.show_eq && pro_mixing() {
+        body = body.child(section_gap()).child(eq);
     }
     body = body.child(section_gap());
     let after = |target: MixerSplitTarget| match handles {
@@ -2578,6 +3065,7 @@ fn channel_strip(
         )
         .into_any_element(),
         io: io_block(track, all_tracks, input_label, id_num, base, callbacks).into_any_element(),
+        eq: eq_section(&track.id, &track.inserts, callbacks, base, i18n),
         inserts: inserts_section(track, callbacks, insert_h, base, i18n).into_any_element(),
         sends: sends_section(track, all_tracks, callbacks, send_h, base, i18n).into_any_element(),
         pan: pan_section(track, callbacks, base),
@@ -2585,7 +3073,16 @@ fn channel_strip(
             track,
             callbacks,
             is_selected,
-            strip_meter(track, index, meter_layer, None),
+            with_reduction_meter(
+                strip_meter(track, index, meter_layer, None),
+                meter_layer,
+                MeterSource::Track {
+                    id: track.id.clone(),
+                    index,
+                    vsti: None,
+                },
+                &track.inserts,
+            ),
             peak_readout(
                 meter_layer,
                 MeterSource::Track {
@@ -2802,6 +3299,7 @@ fn vsti_output_sub_strip(
             callbacks,
         )
         .into_any_element(),
+        eq: eq_section(&child_track.id, &child_track.inserts, callbacks, base, i18n),
         // Real per-bus insert rack: the backing child track is a genuine Bus
         // model track, so its FX chain is added/bypassed/reordered by child
         // track id and processed by the engine's pass-2 routing chain for
@@ -2817,7 +3315,16 @@ fn vsti_output_sub_strip(
             // `sub_track` is the child with the plug-in meter fallback
             // already applied, for the inline meter; the meter layer
             // applies the same fallback itself at paint time.
-            strip_meter(&sub_track, child_index, meter_layer, vsti_fallback.clone()),
+            with_reduction_meter(
+                strip_meter(&sub_track, child_index, meter_layer, vsti_fallback.clone()),
+                meter_layer,
+                MeterSource::Track {
+                    id: sub_track.id.clone(),
+                    index: child_index,
+                    vsti: None,
+                },
+                &child_track.inserts,
+            ),
             peak_readout(
                 meter_layer,
                 MeterSource::Track {
@@ -2920,6 +3427,7 @@ pub(crate) fn master_strip(
                 callbacks.on_master_output_picker.clone(),
             ))
             .into_any_element(),
+        eq: eq_section(MASTER_TRACK_ID, &master.inserts, callbacks, base, i18n),
         inserts: master_inserts_section(master, callbacks, insert_h, base, i18n).into_any_element(),
         // The master takes no sends, but it keeps their slot: every fixed row
         // below this point then lands on the same baseline as the channels
@@ -2937,14 +3445,19 @@ pub(crate) fn master_strip(
                 Some(on_master_reset),
             )
             .into_any_element(),
-            pinned_meter(
+            with_reduction_meter(
+                pinned_meter(
+                    meter_layer,
+                    MeterSource::Master,
+                    master.meter_level_l,
+                    master.meter_level_r,
+                    master.meter_peak_hold_l,
+                    master.meter_peak_hold_r,
+                    master.meter_clip,
+                ),
                 meter_layer,
                 MeterSource::Master,
-                master.meter_level_l,
-                master.meter_level_r,
-                master.meter_peak_hold_l,
-                master.meter_peak_hold_r,
-                master.meter_clip,
+                &master.inserts,
             ),
             peak_readout(
                 meter_layer,
@@ -3289,6 +3802,8 @@ pub(crate) fn monitor_strip(
                 callbacks.on_monitor_output_picker.clone(),
             ))
             .into_any_element(),
+        // The Control Room has no inserts, so no EQ: it keeps the slot.
+        eq: pinned_rack_spacer(console::EQ_H).into_any_element(),
         inserts: pinned_rack_spacer(insert_h).into_any_element(),
         sends: pinned_rack_spacer(send_h).into_any_element(),
         // The monitor level, as a knob in the pan slot: the Control Room has
@@ -3420,10 +3935,153 @@ const MIXER_OVERSCAN: usize = 1;
 /// Height of the row under the channel strips that holds their scrollbar.
 pub(crate) const MIXER_SCROLLBAR_ROW: f32 = crate::components::scrollbar::THICKNESS;
 
-/// Width of the pinned Master and Control Room pair and the rule before it.
+/// Width of the pinned strips — the VCAs, the Master and the Control Room —
+/// and the rule before them.
 pub(crate) fn mixer_pinned_width() -> f32 {
-    2.0 * strip_width() + 1.0
+    (2 + split::vca_strip_count()) as f32 * strip_width() + 1.0
 }
+
+/// The VCA strips the pinned area shows for `master`: its VCA groups, in the
+/// Professional Edition. Also records their count for the width arithmetic.
+fn pinned_vca_groups(master: &MasterBusState) -> &[VcaGroupState] {
+    let groups: &[VcaGroupState] = if pro_mixing() {
+        &master.vca_groups
+    } else {
+        &[]
+    };
+    split::set_mixer_vca_strips(groups.len());
+    groups
+}
+
+/// A VCA group's strip: its fader and mute, and nothing that carries audio —
+/// no meter, inserts, sends or pan, only their space, so every row lines up
+/// with the channels'. The fader rides on every member's (see
+/// `timeline_state::vca`).
+fn vca_strip(
+    group: &VcaGroupState,
+    index: usize,
+    callbacks: &MixerCallbacks,
+    split: &MixerSplit,
+    strip_available_px: f32,
+) -> impl IntoElement {
+    let base = console::pinned_surface();
+    let (insert_h, send_h) = clamp_mixer_section_heights_for_strip(
+        split.insert_px,
+        split.send_px,
+        strip_available_px.max(STRIP_MIN_HEIGHT),
+    );
+    let id_num = PINNED_VCA_ID_BASE + index;
+    let level_cb = callbacks.on_vca_level.clone();
+    let level_id = group.id.clone();
+    let on_level = move |level: &f32, w: &mut gpui::Window, cx: &mut gpui::App| {
+        level_cb(&(level_id.clone(), *level), w, cx);
+    };
+    let reset_cb = callbacks.on_vca_level.clone();
+    let reset_id = group.id.clone();
+    let on_reset = move |w: &mut gpui::Window, cx: &mut gpui::App| {
+        reset_cb(&(reset_id.clone(), volume::db_to_norm(0.0)), w, cx);
+    };
+    let mute_cb = callbacks.on_toggle_vca_mute.clone();
+    let mute_id = group.id.clone();
+    let on_mute = move |_: &gpui::MouseDownEvent, w: &mut gpui::Window, cx: &mut gpui::App| {
+        mute_cb(&mute_id, w, cx)
+    };
+    let delete_cb = callbacks.on_delete_vca.clone();
+    let delete_id = group.id.clone();
+
+    let top = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .flex_none()
+        .h(px(console::TOP_ROW_H))
+        .pl(px(1.0))
+        .child(console::section_caption("VCA".to_string()))
+        .child(
+            div()
+                .id(gpui::SharedString::from(format!("vca-delete-{}", group.id)))
+                .px(px(3.0))
+                .text_size(px(type_scale::LABEL))
+                .text_color(Colors::text_faint())
+                .cursor(gpui::CursorStyle::PointingHand)
+                .hover(|style| style.text_color(Colors::text_primary()))
+                .tooltip(crate::components::controls::fb_tooltip(
+                    "Delete VCA — its channels keep their own faders",
+                ))
+                .child("×")
+                .on_click(move |_event, window, cx| delete_cb(&delete_id, window, cx)),
+        );
+    let sections = StripSections {
+        top: top.into_any_element(),
+        io: pinned_rack_spacer(console::IO_BLOCK_H).into_any_element(),
+        eq: pinned_rack_spacer(console::EQ_H).into_any_element(),
+        inserts: pinned_rack_spacer(insert_h).into_any_element(),
+        sends: pinned_rack_spacer(send_h).into_any_element(),
+        pan: pinned_rack_spacer(console::PAN_H).into_any_element(),
+        fader: fader_bay(
+            fader_with_drag_callbacks(
+                format!("mix-fader-vca-{}", group.id),
+                group.level,
+                None::<fn(&f32, &mut gpui::Window, &mut gpui::App)>,
+                Some(on_level),
+                None::<fn(&mut gpui::Window, &mut gpui::App)>,
+                Some(on_reset),
+            )
+            .into_any_element(),
+            // Nothing passes through a VCA: no level to meter.
+            div()
+                .flex_none()
+                .w(px(
+                    crate::components::timeline::vu_meter::STEREO_METER_WIDTH,
+                ))
+                .into_any_element(),
+            div().into_any_element(),
+            volume::format_db(group.level),
+            group.muted,
+            None,
+        )
+        .into_any_element(),
+        buttons: div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w_full()
+            .h(px(console::BUTTONS_H))
+            // One row, at the channels' toggle height, like their M S R I.
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_none()
+                    .w_full()
+                    .h(px(console::TOGGLE_H))
+                    .child(console::toggle(
+                        ("vca-m-btn", id_num).into(),
+                        "M",
+                        group.muted.into(),
+                        Colors::state_mute(),
+                        base,
+                        console::TOGGLE_H,
+                        on_mute,
+                    )),
+            )
+            .into_any_element(),
+    };
+    pinned_shell(base)
+        .id(gpui::SharedString::from(format!("vca-strip-{}", group.id)))
+        .child(console::color_bar(group.color))
+        .child(strip_body(sections, split.view, Some((id_num, split))))
+        .child(console::name_plate(
+            group.color,
+            None,
+            group.name.clone(),
+            false,
+        ))
+}
+
+/// Element-id numbers for the VCA strips' splitter handles and toggles.
+const PINNED_VCA_ID_BASE: usize = 1_000;
 
 /// Width of the scrolling channel-strip row in a mixer `window_w` wide with a
 /// `tree_w` tree beside it. The one measure the strips are laid out with and
@@ -3892,6 +4550,8 @@ pub fn mixer_panel(
 ) -> impl IntoElement {
     let _shell = crate::perf::PerfScope::enter("MixerShell");
     crate::perf::count("mixer_shell_layout_count", 1);
+    // The pinned VCA strips' count, before anything measures the strip row.
+    let _ = pinned_vca_groups(master);
 
     let on_master = callbacks.on_master_volume_change.clone();
     // What the panel actually has, and what a strip needs. They are not the
@@ -4395,6 +5055,14 @@ pub(crate) fn mixer_master_strip_pinned(
         .flex_row()
         .flex_none()
         .h_full()
+        .children(
+            pinned_vca_groups(master)
+                .iter()
+                .enumerate()
+                .map(|(index, group)| {
+                    vca_strip(group, index, callbacks, split, strip_available_px)
+                }),
+        )
         .child(master_strip(
             master,
             on_master,

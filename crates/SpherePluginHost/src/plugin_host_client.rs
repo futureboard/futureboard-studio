@@ -53,6 +53,12 @@ impl std::error::Error for PluginHostClientError {}
 
 const BINARY_STEM: &str = "FutureboardPluginHostX64";
 
+/// The 32-bit host, for plug-ins built for 32-bit Windows
+/// ([`crate::module_arch::ModuleArch::needs_x86_bridge`]). Staged next to the
+/// 64-bit one; it is the same program built for `i686-pc-windows-msvc`, whose
+/// Cargo binary keeps the 64-bit name until the packager renames it.
+pub const X86_BINARY_STEM: &str = "FutureboardPluginHostX86";
+
 /// Strip main-app-only renderer/compositor environment from the plugin-host
 /// child process before spawning it.
 ///
@@ -258,6 +264,17 @@ pub fn log_bridge_env() {
 /// `target/{debug,release}`. `FUTUREBOARD_PLUGIN_HOST` is a legacy alias for the
 /// explicit override. The returned path is logged by [`PluginHostClient::spawn_bridge`].
 pub fn resolve_host_exe() -> (PathBuf, bool) {
+    resolve_host_exe_for(false)
+}
+
+/// [`resolve_host_exe`] for the 64-bit host (`x86 == false`) or the 32-bit
+/// one. The 32-bit host is found through `FUTUREBOARD_PLUGIN_HOST_X86_EXE`,
+/// next to the running exe, or in a development build's
+/// `target/x86/i686-pc-windows-msvc/{release,debug}`.
+pub fn resolve_host_exe_for(x86: bool) -> (PathBuf, bool) {
+    if x86 {
+        return resolve_x86_host_exe();
+    }
     for var in ["FUTUREBOARD_PLUGIN_HOST_EXE", "FUTUREBOARD_PLUGIN_HOST"] {
         if let Ok(path) = std::env::var(var) {
             let path = PathBuf::from(path);
@@ -310,6 +327,40 @@ pub fn resolve_host_exe() -> (PathBuf, bool) {
     (PathBuf::from(BINARY_STEM), false)
 }
 
+fn resolve_x86_host_exe() -> (PathBuf, bool) {
+    if let Ok(path) = std::env::var("FUTUREBOARD_PLUGIN_HOST_X86_EXE") {
+        let path = PathBuf::from(path);
+        let exists = path.is_file();
+        return (path, exists);
+    }
+    let staged = |dir: &Path| dir.join(format!("{X86_BINARY_STEM}.exe"));
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    if let Some(dir) = &exe_dir {
+        let candidate = staged(dir);
+        if candidate.is_file() {
+            return (candidate, true);
+        }
+    }
+    // A development build: `cargo build --target i686-pc-windows-msvc
+    // --target-dir target/x86`, under the Cargo binary's own name.
+    let dev_root =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/x86/i686-pc-windows-msvc");
+    for profile in ["release", "debug"] {
+        for stem in [X86_BINARY_STEM, BINARY_STEM] {
+            let candidate = dev_root.join(profile).join(format!("{stem}.exe"));
+            if candidate.is_file() {
+                return (candidate, true);
+            }
+        }
+    }
+    let fallback = exe_dir
+        .map(|dir| staged(&dir))
+        .unwrap_or_else(|| PathBuf::from(format!("{X86_BINARY_STEM}.exe")));
+    (fallback, false)
+}
+
 /// Resolve the host executable, erroring if it cannot be found. Used by tests.
 pub fn locate_plugin_host_binary() -> Result<PathBuf, PluginHostClientError> {
     let (path, exists) = resolve_host_exe();
@@ -351,6 +402,14 @@ impl PluginHostClient {
         Self::spawn_bridge_with_config(&PluginHostSpawnConfig::default())
     }
 
+    /// Spawn the 32-bit bridge host, for a plug-in built for 32-bit Windows.
+    pub fn spawn_bridge_x86() -> Result<Self, PluginHostClientError> {
+        Self::spawn_bridge_with_config(&PluginHostSpawnConfig {
+            x86: true,
+            ..PluginHostSpawnConfig::default()
+        })
+    }
+
     /// Spawn the bridge host with explicit session / main-window configuration.
     pub fn spawn_bridge_with_config(
         config: &PluginHostSpawnConfig,
@@ -358,7 +417,7 @@ impl PluginHostClient {
         let current_exe = std::env::current_exe()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "<unknown>".into());
-        let (exe, exists) = resolve_host_exe();
+        let (exe, exists) = resolve_host_exe_for(config.x86);
         eprintln!("[plugin-bridge] current_exe={current_exe}");
         eprintln!("[plugin-bridge] resolved_host_exe={}", exe.display());
         eprintln!("[plugin-bridge] exists={exists}");

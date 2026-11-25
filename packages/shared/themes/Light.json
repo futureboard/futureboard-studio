@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "futureboard.light",
   "name": "Futureboard Light",
-  "version": "2.1.0",
+  "version": "2.3.0",
   "author": "Futureboard Studio",
   "appearance": "light",
   "targets": [
@@ -72,7 +72,8 @@
       "tick": "#00000018",
       "scaleText": "#5C616B",
       "groove": "#E2E5EA",
-      "thumbBorder": "#00000038"
+      "thumbBorder": "#00000038",
+      "sliderThumb": "#FFFFFF"
     },
     "knob": {
       "background": "#EDEFF3",
@@ -205,6 +206,11 @@
       "blackKey": "#2A2D33",
       "keySeam": "#C8CCD3",
       "keyLabel": "#5B616C"
+    },
+    "harmony": {
+      "major": "#B4651C",
+      "minor": "#3A64C8",
+      "other": "#6A707B"
     },
     "track": {
       "audio": "#0F9B8C",

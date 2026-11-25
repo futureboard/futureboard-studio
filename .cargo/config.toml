@@ -1,60 +1,36 @@
 [alias]
-# Build the full workspace as Community Edition.
-build-ce = [
+# There is one package: Studio picks Community or Professional features at
+# runtime from the licence. These aliases build the workspace into the shared
+# `target/studio` directory the packager uses. `cargo xtask build-all` /
+# `check-all` run them with the Professional features added when this checkout
+# has the private sources (Windows only, since ASIO is Windows-only).
+build-studio = [
     "build",
     "--workspace",
     "--target-dir",
-    "target/community",
+    "target/studio",
 ]
-
-# Build the Windows Professional Edition with ASIO.
-build-professional-win = [
-    "build",
-    "--workspace",
-    "--features",
-    "futureboard_native/professional,sphere_directaudioengine/asio",
-    "--target-dir",
-    "target/professional",
-]
-
-# Check Community Edition in its isolated target directory.
-check-ce = [
+check-studio = [
     "check",
     "--workspace",
     "--target-dir",
-    "target/community",
+    "target/studio",
 ]
 
-# Check Windows Professional Edition in its isolated target directory.
-check-professional-win = [
-    "check",
-    "--workspace",
-    "--features",
-    "futureboard_native/professional,sphere_directaudioengine/asio",
-    "--target-dir",
-    "target/professional",
-]
-
-# Community Edition quality gates (CI uses these).
-clippy-ce = [
+# Quality gates (CI uses these).
+clippy-studio = [
     "clippy",
     "--workspace",
     "--target-dir",
-    "target/community",
+    "target/studio",
 ]
-test-ce = [
+test-studio = [
     "test",
     "--workspace",
     "--target-dir",
-    "target/community",
+    "target/studio",
 ]
 
-# Cargo unifies features within one build graph, so each edition must use
-# a separate target directory to avoid overwriting or reusing app artifacts.
-# Aliases cannot chain commands, so cross-edition combos live in the xtask:
-#   cargo xtask build-all [--release]   → build-ce, then Professional on Windows
-#   cargo xtask check-all               → check-ce, then Professional on Windows
-#   cargo xtask build-all --target x86_64-pc-windows-msvc → include Windows
 xtask = ["run", "--package", "xtask", "--"]
 
 # WhiteSharp VST3/CLAP is a separate workspace. Same arguments as `cargo xtask`
@@ -84,9 +60,8 @@ rodhareist-vst3 = [
 
 # Binary packaging / staging into `out/` (see xtask/README.md). These build the
 # app and stage a clean runnable tree separate from the Cargo `target/` cache.
-#   cargo package-dev         → out/dev/<platform>
-#   cargo package-ce          → out/release/community/<platform>
-#   cargo package-professional   → out/release/professional/<platform>
+#   cargo package-dev       → out/dev/<platform>
+#   cargo package-release   → out/release/<platform>
 # The host target triple is used by default; pass `--target <triple>` to cross
 # the mapping to another platform folder.
 package-dev = [
@@ -97,10 +72,8 @@ package-dev = [
     "package",
     "--profile",
     "dev",
-    "--edition",
-    "community",
 ]
-package-ce = [
+package-release = [
     "run",
     "--package",
     "xtask",
@@ -108,19 +81,8 @@ package-ce = [
     "package",
     "--profile",
     "release",
-    "--edition",
-    "community",
-]
-package-professional = [
-    "run",
-    "--package",
-    "xtask",
-    "--",
-    "package",
-    "--profile",
-    "release",
-    "--edition",
-    "professional",
+    "--plugin",
+    "all",
 ]
 
 # Do not set CEF_PATH or LIBCLANG_PATH globally here. Cargo has no target-scoped
@@ -132,3 +94,10 @@ package-professional = [
 # `external/ARA_SDK` and `external/vst3sdk` from the repository root in
 # `crates/Ara2Bridge/ara2-bridge-companion/build.rs`, with `ARA_SDK_DIR` /
 # `ARA_VST3_SDK_DIR` left as opt-in overrides for out-of-tree SDK experiments.
+
+# The 32-bit plug-in bridge (`FutureboardPluginHostX86.exe` and its scanner)
+# is the only thing built for this target. It links the C runtime statically
+# so it runs on machines without the 32-bit Visual C++ runtime installed,
+# which a 64-bit Studio install does not bring.
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

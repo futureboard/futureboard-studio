@@ -1,14 +1,28 @@
+//! The arrangement's track header.
+//!
+//! ```txt
+//! ┌──┬──────────────────────────────────────────────┬──┐
+//! │ 1│ [M|S|●|◐]  Name ··········· [♪] [A|❄]         │▮▮│
+//! │ ⌁│ ━━━━━━━━━━━━●──────────  -3.0 dB   (◜)  L20    │▮▮│
+//! └──┴──────────────────────────────────────────────┴──┘
+//!  tab  the toggles the hand plays first, then the name;   meter
+//!       lane modes at the end; level and the pan knob below
+//! ```
+//!
+//! The tab carries the track's number and colour and the glyph of its type,
+//! and fills with the colour while the track is selected. Below the default
+//! row height the header keeps only its first line.
+
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, svg, AppContext, DragMoveEvent, InteractiveElement, IntoElement, ParentElement,
-    Render, StatefulInteractiveElement, Styled, Window,
+    div, px, svg, AppContext, InteractiveElement, IntoElement, ParentElement, Render,
+    StatefulInteractiveElement, Styled, Window,
 };
 
 use crate::assets;
 use crate::components::controls::fb_tooltip;
-use crate::components::fader::{db_value_pill, horizontal_fader_with_drag_callbacks};
-use crate::components::knob::format_pan_label;
-use crate::components::spin_drag::SpinDrag;
+use crate::components::fader::slim_horizontal_fader_with_drag_callbacks;
+use crate::components::knob::{format_pan_label, knob_bipolar_with_gesture, KnobGesture};
 use crate::components::text_input::{
     text_field_with_callbacks_and_ime, TextInputCallbacks, TextInputState,
 };
@@ -168,17 +182,13 @@ impl Render for TrackDragPreview {
 const GLYPH_SM: f32 = 10.0;
 const GLYPH_MD: f32 = 11.0;
 
-/// Height of the pan readout. Below the 16 px pill tier because it shares a row
-/// with a 24 px fader and has to leave the plate its breathing room.
-const PAN_PILL_H: f32 = 14.0;
-
 /// How far each folder level indents a row, and where the outermost folder's
-/// rail sits: just inside the row's own 3 px colour strip. A row inside
+/// rail sits: just past the row's number tab. A row inside
 /// folders draws one rail per level, in that folder's colour, so the tree reads
 /// down the column the way the rows stack, at any depth, with no frame to
 /// break where a member's own folder starts or ends.
 const FOLDER_INDENT: f32 = space::LOOSE;
-const FOLDER_RAIL_X: f32 = 3.0 + space::TIGHT;
+const FOLDER_RAIL_X: f32 = TRACK_TAB_W + space::TIGHT;
 const FOLDER_RAIL_W: f32 = 2.0;
 /// The deepest level that still indents. Deeper rows line up with it, so a
 /// deep tree cannot push the name and controls out of the fixed-width column;
@@ -302,35 +312,39 @@ fn folder_menu_button(
         )
 }
 
-/// One latching track-state toggle inside the M/S/R/I/A strip.
+/// What a toggle shows: a letter, an icon, or the record dot.
+#[derive(Clone, Copy)]
+enum SegmentGlyph {
+    Letter(&'static str),
+    Icon(&'static str),
+    Dot,
+}
+
+/// Diameter of the record dot.
+const RECORD_DOT: f32 = 7.0;
+
+/// One latching toggle inside a touching group.
 ///
-/// The five toggles are a *touching group*, so the contract's rule for any
-/// touching pair applies: the segments share one hairline instead of each
-/// carrying its own border, and only the group's outer corners round. Their
-/// corners are not rounded here at all — the group clips them, which is what
-/// keeps a shared edge from leaving a notch of background between two arcs.
+/// The toggles of a group share one hairline instead of each carrying its own
+/// border, and only the group's outer corners round: the group clips them, so
+/// a shared edge never leaves a notch of background between two arcs.
 ///
 /// Latched state is carried on fill *and* glyph — `Colors::latched`'s wash
 /// under the semantic hue at full strength. The third channel, the latched
-/// border, moves to the strip: the divider next to a latched segment takes that
-/// hue, so the boundary reads as belonging to the lit toggle. A per-segment
-/// border cannot survive here, because the neighbour's border would overlap it
-/// on the shared edge and half of it would disappear.
-///
-/// `divider` is `None` for the first segment — there is nothing to its left but
-/// the group's own frame. A segment that is not `enabled` keeps its place in
-/// the strip, dimmed, and takes no press; its tooltip says why.
+/// border, moves to the dividers: the hairline next to a latched toggle takes
+/// that hue (see [`latch_divider`]). `divider` is `None` for the first
+/// toggle. One that is not `enabled` keeps its place, dimmed, takes no press,
+/// and its tooltip says why.
 #[allow(clippy::too_many_arguments)]
 fn latch_segment(
     id: gpui::ElementId,
-    label: &'static str,
-    icon: Option<&'static str>,
+    glyph: SegmentGlyph,
     tooltip: String,
     active: bool,
     enabled: bool,
     semantic: gpui::Rgba,
     divider: Option<gpui::Rgba>,
-    on_click: impl Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+    on_click: LatchPressHandler,
 ) -> impl IntoElement {
     let base = Colors::surface_panel_alt();
     let rest = if active {
@@ -372,24 +386,24 @@ fn latch_segment(
             seg.border_l(px(1.0)).border_color(color)
         });
 
-    if let Some(path) = icon {
-        seg.child(
+    match glyph {
+        SegmentGlyph::Letter(label) => seg.child(label),
+        SegmentGlyph::Icon(path) => seg.child(
             svg()
                 .path(path)
                 .w(px(GLYPH_SM))
                 .h(px(GLYPH_SM))
                 .text_color(fg),
-        )
-    } else {
-        seg.child(label)
+        ),
+        SegmentGlyph::Dot => seg.child(div().size(px(RECORD_DOT)).rounded(px(radius::PILL)).bg(fg)),
     }
 }
 
-/// Colour of the hairline between two segments.
+/// Colour of the hairline between two toggles.
 ///
 /// A divider that touches a latched toggle takes that toggle's latched border
-/// hue, so the strip still encodes state on a border channel even though no
-/// segment owns one.
+/// hue, so the group still encodes state on a border channel even though no
+/// toggle owns one.
 fn latch_divider(left: Option<gpui::Rgba>, right: Option<gpui::Rgba>) -> gpui::Rgba {
     let base = Colors::surface_panel_alt();
     match (left, right) {
@@ -401,53 +415,52 @@ fn latch_divider(left: Option<gpui::Rgba>, right: Option<gpui::Rgba>) -> gpui::R
 type LatchPressHandler =
     Box<dyn Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static>;
 
-/// The toggle handlers, bundled so the strip's signature stays readable.
-/// `on_freeze` is `None` on a track that cannot be frozen.
-struct LatchStripHandlers<M, S, R, I, A> {
-    on_mute: M,
-    on_solo: S,
-    on_arm: R,
-    on_input: I,
-    on_automation: A,
-    on_freeze: Option<LatchPressHandler>,
+/// The frame of a touching group. It owns the border, the corner radius and
+/// the hit area: `size::hit_target` grows a control with transparent padding,
+/// and padding on a toggle would push it off its neighbour, so the toggles
+/// are `size::DENSE` (20 px) squares and the group carries the 2 px above and
+/// below that lifts the row to the 24 px comfortable target.
+fn touching_group(inner: gpui::Div) -> impl IntoElement {
+    div()
+        .py(px(size::hit_target(size::DENSE)))
+        .flex_none()
+        .child(
+            inner
+                .flex()
+                .flex_row()
+                .items_center()
+                .flex_none()
+                .rounded(px(radius::CONTROL_SM))
+                .border(px(1.0))
+                .border_color(Colors::border_subtle())
+                .overflow_hidden(),
+        )
 }
 
-/// The M/S/R/I/A strip: five latching toggles as one touching group.
-///
-/// The group owns the frame, the corner radius and the hit area. The hit area
-/// has to live here rather than on each toggle: `size::hit_target` grows a
-/// control with transparent padding, and padding on a segment would push it off
-/// its neighbour — the one thing this strip exists to prevent. So the segments
-/// are `size::DENSE` (20 px) squares and the strip carries the 2 px above and
-/// below that lifts the row to the 24 px comfortable target.
-#[allow(clippy::too_many_arguments)]
-fn latch_strip<M, S, R, I, A>(
+/// The press handlers of the state toggles.
+struct StateStripHandlers {
+    on_mute: LatchPressHandler,
+    on_solo: LatchPressHandler,
+    on_arm: LatchPressHandler,
+    on_input: LatchPressHandler,
+}
+
+/// Mute, Solo, Record and Monitor: the toggles a player hits by muscle
+/// memory, first in the row so they sit in the same place on every track
+/// whatever its name. A folder has no input, so it keeps Mute and Solo.
+fn state_strip(
     track: &TrackState,
-    is_automation: bool,
     id_num: usize,
-    handlers: LatchStripHandlers<M, S, R, I, A>,
-) -> impl IntoElement
-where
-    M: Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
-    S: Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
-    R: Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
-    I: Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
-    A: Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
-{
+    handlers: StateStripHandlers,
+) -> impl IntoElement {
     let is_folder = track.track_type == TrackType::Group;
     let frozen = track.is_frozen();
-    // Hue when latched, `None` when not — the divider colouring reads this to
-    // decide which side of each seam is lit.
-    let states: [Option<gpui::Rgba>; 6] = [
+    let monitoring = track.input_monitor.is_active(track.armed);
+    let lit = [
         track.muted.then(Colors::state_mute),
         track.solo.then(Colors::state_solo),
         track.armed.then(Colors::state_arm),
-        track
-            .input_monitor
-            .is_active(track.armed)
-            .then(Colors::state_monitor),
-        is_automation.then(Colors::state_automation),
-        frozen.then(Colors::state_freeze),
+        monitoring.then(Colors::state_monitor),
     ];
     // A frozen track plays its bounce: there is nothing to record into or
     // monitor until it is unfrozen.
@@ -458,110 +471,328 @@ where
             label.to_string()
         }
     };
+    let StateStripHandlers {
+        on_mute,
+        on_solo,
+        on_arm,
+        on_input,
+    } = handlers;
 
+    touching_group(
+        div()
+            .child(latch_segment(
+                ("mute-btn", id_num).into(),
+                SegmentGlyph::Letter("M"),
+                "Mute".to_string(),
+                track.muted,
+                true,
+                Colors::state_mute(),
+                None,
+                on_mute,
+            ))
+            .child(latch_segment(
+                ("solo-btn", id_num).into(),
+                SegmentGlyph::Letter("S"),
+                "Solo".to_string(),
+                track.solo,
+                true,
+                Colors::state_solo(),
+                Some(latch_divider(lit[0], lit[1])),
+                on_solo,
+            ))
+            .when(!is_folder, |strip| {
+                strip
+                    .child(latch_segment(
+                        ("arm-btn", id_num).into(),
+                        SegmentGlyph::Dot,
+                        unless_frozen("Record Arm"),
+                        track.armed,
+                        !frozen,
+                        Colors::state_arm(),
+                        Some(latch_divider(lit[1], lit[2])),
+                        on_arm,
+                    ))
+                    .child(latch_segment(
+                        ("input-btn", id_num).into(),
+                        SegmentGlyph::Icon(assets::ICON_VOLUME_2_PATH),
+                        unless_frozen("Input Monitoring"),
+                        monitoring,
+                        !frozen,
+                        Colors::state_monitor(),
+                        Some(latch_divider(lit[2], lit[3])),
+                        on_input,
+                    ))
+            }),
+    )
+}
+
+/// Automation and Freeze: modes of the lane rather than of the signal, at
+/// the row's end, apart from the toggles played during a take.
+fn mode_strip(
+    track: &TrackState,
+    is_automation: bool,
+    id_num: usize,
+    on_automation: LatchPressHandler,
+    on_freeze: Option<LatchPressHandler>,
+) -> impl IntoElement {
+    let frozen = track.is_frozen();
+    touching_group(
+        div()
+            .child(latch_segment(
+                ("auto-btn", id_num).into(),
+                SegmentGlyph::Icon(assets::ICON_AUTOMATION_PATH),
+                if is_automation {
+                    "Automation: showing the lane's automation".to_string()
+                } else {
+                    "Automation".to_string()
+                },
+                is_automation,
+                true,
+                Colors::state_automation(),
+                None,
+                on_automation,
+            ))
+            .when_some(on_freeze, |strip, on_freeze| {
+                strip.child(latch_segment(
+                    ("freeze-btn", id_num).into(),
+                    SegmentGlyph::Icon(assets::ICON_SNOWFLAKE_PATH),
+                    if frozen {
+                        "Unfreeze Track".to_string()
+                    } else {
+                        "Freeze Track: render it and turn its plug-ins off".to_string()
+                    },
+                    frozen,
+                    true,
+                    Colors::state_freeze(),
+                    Some(latch_divider(
+                        is_automation.then(Colors::state_automation),
+                        frozen.then(Colors::state_freeze),
+                    )),
+                    on_freeze,
+                ))
+            }),
+    )
+}
+
+/// The glyph for a track's type, shown in its tab.
+fn track_type_icon(track_type: TrackType) -> &'static str {
+    match track_type {
+        TrackType::Audio => assets::ICON_AUDIO_LINES_PATH,
+        TrackType::Midi => assets::ICON_MUSIC_PATH,
+        TrackType::Instrument => assets::ICON_KEYBOARD_PATH,
+        TrackType::Bus => assets::ICON_GIT_MERGE_PATH,
+        TrackType::Return => assets::ICON_ROUTE_PATH,
+        TrackType::Group => assets::ICON_FOLDER_PATH,
+        TrackType::Master => assets::ICON_SLIDERS_HORIZONTAL_PATH,
+        TrackType::Video => assets::ICON_FILM_PATH,
+    }
+}
+
+fn track_type_name(track_type: TrackType) -> &'static str {
+    match track_type {
+        TrackType::Audio => "Audio track",
+        TrackType::Midi => "MIDI track",
+        TrackType::Instrument => "Instrument track",
+        TrackType::Bus => "Bus",
+        TrackType::Return => "FX return",
+        TrackType::Group => "Folder",
+        TrackType::Master => "Master",
+        TrackType::Video => "Video track",
+    }
+}
+
+/// Width of the number tab at the header's left edge.
+pub const TRACK_TAB_W: f32 = 24.0;
+/// The solid edge of the tab, in line with the lane's own colour stripe.
+const TAB_EDGE_W: f32 = 3.0;
+/// Below this row height the tab shows the number alone.
+const TAB_GLYPH_MIN_ROW: f32 = 44.0;
+
+/// The number tab: the track's position, its colour, and the glyph of its
+/// type. Selected, it fills with the colour, the strongest cue in the column
+/// for which rows the next command acts on. It is a drag handle too.
+fn number_tab(
+    track: &TrackState,
+    number: usize,
+    selected: bool,
+    row_height: f32,
+    id_num: usize,
+    drag: TrackDragItem,
+) -> impl IntoElement {
+    let fill = if selected {
+        track.color
+    } else {
+        Colors::with_alpha(track.color, 0.16)
+    };
+    let ink = if selected {
+        Colors::text_inverse()
+    } else {
+        Colors::text_secondary()
+    };
+    let glyph = if selected {
+        Colors::text_inverse()
+    } else {
+        track.color
+    };
     div()
-        // Transparent padding, not a taller strip: the visible group stays
-        // 20 px so the header reads tight, and the clickable band is 24.
-        .py(px(size::hit_target(size::DENSE)))
-        .flex_shrink_0()
+        .id(("track-tab", id_num))
+        .relative()
+        .flex_none()
+        .w(px(TRACK_TAB_W))
+        .h_full()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(space::TIGHT))
+        // The number sits on the first line's centre: the row's padding plus
+        // half of the 24 px toggle band, less half the number's own height.
+        .pt(px(space::SNUG + size::DEFAULT / 2.0 - 7.0))
+        .pl(px(TAB_EDGE_W))
+        .bg(fill)
+        .border_r(px(1.0))
+        .border_color(Colors::border_subtle())
+        .cursor(gpui::CursorStyle::OpenHand)
+        .tooltip(fb_tooltip(format!(
+            "{} {number}: drag to reorder",
+            track_type_name(track.track_type)
+        )))
+        .on_drag(drag, |drag, _offset, _window, cx| {
+            cx.new(|_| TrackDragPreview {
+                name: drag.name.clone(),
+                color: drag.color,
+            })
+        })
         .child(
             div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .flex_shrink_0()
-                // No gap. This is the whole point of the strip: five toggles a
-                // player hits by muscle memory, sharing edges the way a console
-                // does, instead of five islands two pixels apart.
-                .rounded(px(radius::CONTROL_SM))
-                .border(px(1.0))
-                .border_color(Colors::border_subtle())
-                // Clips the segments' square corners to the group's rounded
-                // ones, so the outer corners round and every inner edge stays
-                // square without a single per-segment radius.
-                .overflow_hidden()
-                .child(latch_segment(
-                    ("mute-btn", id_num).into(),
-                    "M",
-                    None,
-                    "Mute".to_string(),
-                    track.muted,
-                    true,
-                    Colors::state_mute(),
-                    None,
-                    handlers.on_mute,
-                ))
-                .child(latch_segment(
-                    ("solo-btn", id_num).into(),
-                    "S",
-                    None,
-                    "Solo".to_string(),
-                    track.solo,
-                    true,
-                    Colors::state_solo(),
-                    Some(latch_divider(states[0], states[1])),
-                    handlers.on_solo,
-                ))
-                .when(!is_folder, |strip| {
-                    strip
-                        .child(latch_segment(
-                            ("arm-btn", id_num).into(),
-                            "R",
-                            None,
-                            unless_frozen("Record Arm"),
-                            track.armed,
-                            !frozen,
-                            Colors::state_arm(),
-                            Some(latch_divider(states[1], states[2])),
-                            handlers.on_arm,
-                        ))
-                        .child(latch_segment(
-                            ("input-btn", id_num).into(),
-                            "I",
-                            None,
-                            unless_frozen("Input Monitoring"),
-                            track.input_monitor.is_active(track.armed),
-                            !frozen,
-                            Colors::state_monitor(),
-                            Some(latch_divider(states[2], states[3])),
-                            handlers.on_input,
-                        ))
-                })
-                // Automation mode toggle — switches the lane between Clip and
-                // Automation editing.
-                .child(latch_segment(
-                    ("auto-btn", id_num).into(),
-                    "A",
-                    None,
-                    "Automation".to_string(),
-                    is_automation,
-                    true,
-                    Colors::state_automation(),
-                    Some(if is_folder {
-                        latch_divider(states[1], states[4])
-                    } else {
-                        latch_divider(states[3], states[4])
-                    }),
-                    handlers.on_automation,
-                ))
-                .when_some(handlers.on_freeze, |strip, on_freeze| {
-                    strip.child(latch_segment(
-                        ("freeze-btn", id_num).into(),
-                        "F",
-                        Some(assets::ICON_SNOWFLAKE_PATH),
-                        if frozen {
-                            "Unfreeze Track".to_string()
-                        } else {
-                            "Freeze Track: render it and turn its plug-ins off".to_string()
-                        },
-                        frozen,
-                        true,
-                        Colors::state_freeze(),
-                        Some(latch_divider(states[4], states[5])),
-                        on_freeze,
-                    ))
-                }),
+                .absolute()
+                .left_0()
+                .top_0()
+                .bottom_0()
+                .w(px(TAB_EDGE_W))
+                .bg(track.color),
         )
+        .child(
+            div()
+                .h(px(14.0))
+                .flex()
+                .items_center()
+                .text_size(px(typography::DENSE_LABEL))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(ink)
+                .child(number.to_string()),
+        )
+        .when(row_height >= TAB_GLYPH_MIN_ROW, |tab| {
+            tab.child(
+                svg()
+                    .path(track_type_icon(track.track_type))
+                    .w(px(GLYPH_MD))
+                    .h(px(GLYPH_MD))
+                    .text_color(glyph),
+            )
+        })
+}
+
+/// Width of the dB value beside the level bar.
+const DB_READOUT_W: f32 = 48.0;
+/// Width of the pan value beside the knob.
+const PAN_READOUT_W: f32 = 28.0;
+/// The pan knob: the mixer's, at the size of the toggles above it.
+const PAN_KNOB: f32 = 22.0;
+/// Height of the level line: the knob's.
+const LEVEL_LINE_H: f32 = PAN_KNOB;
+
+/// A value beside its control: the number, and a quieter unit.
+fn readout(width: f32, value: String, unit: Option<&'static str>) -> impl IntoElement {
+    div()
+        .flex_none()
+        .w(px(width))
+        .flex()
+        .flex_row()
+        .items_baseline()
+        .justify_end()
+        .gap(px(2.0))
+        .child(
+            div()
+                .text_size(px(typography::UI_XS))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(Colors::text_secondary())
+                .child(value),
+        )
+        .children(unit.map(|unit| {
+            div()
+                .text_size(px(typography::DENSE_CAPTION))
+                .text_color(Colors::text_muted())
+                .child(unit)
+        }))
+}
+
+/// Pan as a knob: a vertical drag turns it, Shift turns it finely, and a
+/// double-click or Alt-click centres it. One drag is one undo step.
+fn pan_knob(
+    track: &TrackState,
+    on_start: TrackCallback,
+    on_preview: VolumeCallback,
+    on_commit: VolumeCommitCallback,
+    on_change: VolumeCallback,
+) -> impl IntoElement {
+    let start_id = track.id.clone();
+    let end_id = track.id.clone();
+    let preview_id = track.id.clone();
+    let reset_id = track.id.clone();
+    knob_bipolar_with_gesture(
+        format!("track-pan-{}", track.id),
+        track.pan,
+        -1.0,
+        1.0,
+        PAN_KNOB,
+        // The track's colour, as on its mixer strip.
+        track.color,
+        0.0,
+        KnobGesture {
+            on_start: Some(std::rc::Rc::new(move |window, cx| {
+                on_start(&start_id, window, cx)
+            })),
+            on_end: Some(std::rc::Rc::new(move |window, cx| {
+                on_commit(&end_id, window, cx)
+            })),
+        },
+        move |pan: &f32, window: &mut gpui::Window, cx: &mut gpui::App| {
+            on_preview(&(preview_id.clone(), *pan), window, cx)
+        },
+        move |pan: &f32, window: &mut gpui::Window, cx: &mut gpui::App| {
+            on_change(&(reset_id.clone(), *pan), window, cx)
+        },
+    )
+}
+
+/// In place of the pan knob on a channel in Dual pan: a balance value would
+/// be wrong, so the header says which mode the channel is in and leaves the
+/// two positions to the mixer strip (whose pan right-click switches modes).
+/// Spans the knob and its readout, so the row keeps its width.
+fn dual_pan_badge(track: &TrackState) -> impl IntoElement {
+    let dual = track.dual_pan;
+    div()
+        .id(gpui::SharedString::from(format!(
+            "track-dual-pan-{}",
+            track.id
+        )))
+        .flex_none()
+        .w(px(PAN_KNOB + PAN_READOUT_W))
+        .h(px(PAN_KNOB))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(radius::CONTROL_SM))
+        .bg(Colors::surface_badge())
+        .text_size(px(typography::DENSE_CAPTION))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(Colors::text_secondary())
+        .tooltip(fb_tooltip(format!(
+            "Dual pan: L input {} / R input {}. Right-click the mixer pan to switch to Balance.",
+            format_pan_label(dual.left),
+            format_pan_label(dual.right)
+        )))
+        .child("Dual")
 }
 
 /// The takes chip beside the name: how many takes the track holds, and the
@@ -868,8 +1099,6 @@ pub fn track_header(
             );
         }
     };
-    let pan_id = track_id.clone();
-    let pan_drag_key = format!("track-pan-{}", track.id);
     let on_pan_change = callbacks.on_pan_change.clone();
     let on_pan_drag_start = callbacks.on_pan_drag_start.clone();
     let on_pan_drag_preview = callbacks.on_pan_drag_preview.clone();
@@ -891,6 +1120,14 @@ pub fn track_header(
     let begin_rename = callbacks.on_begin_rename.clone();
     let rename_track_id = track_id.clone();
 
+    let drag_item = TrackDragItem {
+        track_id: drag_track_id,
+        origin_index: index,
+        name: drag_name,
+        color: drag_color,
+        is_group,
+    };
+
     div()
         .flex()
         .flex_row()
@@ -905,9 +1142,6 @@ pub fn track_header(
         // own — see `header_tint`.
         .bg(header_base)
         .opacity(if is_dragging { 0.62 } else { 1.0 })
-        // Stronger right border so the header column reads as a distinct
-        // pane rather than blending into the lane area. The inner accent
-        // strip on the right keeps the overall feel subtle.
         .border_r(px(1.0))
         .border_color(Colors::border_strong())
         .border_b(px(1.0))
@@ -924,8 +1158,14 @@ pub fn track_header(
         .when_some(header_tint, |header, tint| {
             header.child(div().absolute().inset_0().bg(tint))
         })
-        // Left accent strip — same column as the track lane stripe.
-        .child(div().w(px(3.0)).h_full().flex_none().bg(track.color))
+        .child(number_tab(
+            track,
+            index + 1,
+            is_selected,
+            row_height,
+            id_num,
+            drag_item.clone(),
+        ))
         // One rail per enclosing folder, in its colour, outermost first.
         .children(folder.rails.iter().enumerate().map(|(level, color)| {
             let level = level.min(FOLDER_MAX_INDENT_LEVELS.saturating_sub(1));
@@ -941,25 +1181,38 @@ pub fn track_header(
             div()
                 .flex()
                 .flex_col()
-                // Two-row layout spreads; compact (single row) centers vertically.
-                .when(show_controls, |c| c.justify_between())
+                // 6 + 24 + 4 + 22 + 6 = 62: both lines inside the default
+                // 72 px row.
+                .gap(px(space::TIGHT))
+                // One line centres in a short row; two stack from the top of
+                // a tall one, so a taller row grows the lane, not gaps.
                 .when(!show_controls, |c| c.justify_center())
                 .flex_1()
                 .min_w_0()
                 // Rows inside folders indent one step per level, past their
                 // folders' rails.
                 .pl(px(space::BASE + folder.indent()))
-                .pr(px(space::BASE))
+                .pr(px(space::SNUG))
                 .py(px(space::SNUG))
-                // Row 1: name + type badge + per-track buttons
+                // Line 1: toggles, name, lane modes.
                 .child(
                     div()
                         .flex()
                         .flex_row()
                         .items_center()
-                        .justify_between()
+                        .gap(px(space::SNUG))
                         .w_full()
                         .min_w(px(0.0))
+                        .child(state_strip(
+                            track,
+                            id_num,
+                            StateStripHandlers {
+                                on_mute: Box::new(on_mute),
+                                on_solo: Box::new(on_solo),
+                                on_arm: Box::new(on_arm),
+                                on_input: Box::new(on_input),
+                            },
+                        ))
                         .child(
                             div()
                                 .flex()
@@ -968,155 +1221,100 @@ pub fn track_header(
                                 .gap(px(space::TIGHT))
                                 .flex_1()
                                 .min_w(px(0.0))
+                                .h(px(size::DEFAULT))
                                 .overflow_hidden()
                                 .id(("track-drag-zone", id_num))
-                                .cursor(gpui::CursorStyle::PointingHand)
-                                .on_drag(
-                                    TrackDragItem {
-                                        track_id: drag_track_id,
-                                        origin_index: index,
-                                        name: drag_name.clone(),
-                                        color: drag_color,
-                                        is_group,
-                                    },
-                                    move |drag, _offset, _window, cx| {
-                                        cx.new(|_| TrackDragPreview {
-                                            name: drag.name.clone(),
-                                            color: drag.color,
-                                        })
-                                    },
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        // A 20 px affordance, not a 22x30 slab:
-                                        // the grip is the quietest control in
-                                        // the row and was the tallest thing in
-                                        // it, which is what made the name row
-                                        // sit off-centre against the mixer's.
-                                        .w(px(size::DENSE))
-                                        .h(px(size::DENSE))
-                                        .rounded(px(radius::CONTROL_SM))
-                                        .id(("track-drag-handle", id_num))
-                                        .cursor(gpui::CursorStyle::PointingHand)
-                                        .hover(|s| s.bg(Colors::surface_hover()))
-                                        .child(
-                                            svg()
-                                                .path(assets::ICON_GRIP_VERTICAL_PATH)
-                                                .w(px(GLYPH_MD))
-                                                .h(px(GLYPH_MD))
-                                                .text_color(Colors::text_faint()),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap(px(space::TIGHT))
-                                        .min_w(px(0.0))
-                                        .flex_1()
-                                        .overflow_hidden()
-                                        .when(is_group, |row| {
-                                            row.child(
-                                                div()
-                                                    .id(("folder-collapse", id_num))
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .w(px(size::MICRO))
-                                                    .h(px(size::MICRO))
-                                                    .rounded(px(radius::CONTROL_SM))
-                                                    .hover(|style| {
-                                                        style.bg(Colors::surface_hover())
-                                                    })
-                                                    .on_mouse_down(
-                                                        gpui::MouseButton::Left,
-                                                        move |_event, window, cx| {
-                                                            toggle_group_collapsed(
-                                                                &collapse_group_id,
-                                                                window,
-                                                                cx,
-                                                            );
-                                                            cx.stop_propagation();
-                                                        },
-                                                    )
-                                                    .occlude()
-                                                    .child(
-                                                        svg()
-                                                            .path(if track.group_collapsed {
-                                                                assets::ICON_CHEVRON_RIGHT_PATH
-                                                            } else {
-                                                                assets::ICON_CHEVRON_DOWN_PATH
-                                                            })
-                                                            .w(px(GLYPH_SM))
-                                                            .h(px(GLYPH_SM))
-                                                            .text_color(Colors::text_secondary()),
-                                                    ),
+                                .on_drag(drag_item, move |drag, _offset, _window, cx| {
+                                    cx.new(|_| TrackDragPreview {
+                                        name: drag.name.clone(),
+                                        color: drag.color,
+                                    })
+                                })
+                                .when(is_group, |row| {
+                                    row.child(
+                                        div()
+                                            .id(("folder-collapse", id_num))
+                                            .flex()
+                                            .flex_none()
+                                            .items_center()
+                                            .justify_center()
+                                            .w(px(size::MICRO))
+                                            .h(px(size::MICRO))
+                                            .rounded(px(radius::CONTROL_SM))
+                                            .cursor(gpui::CursorStyle::PointingHand)
+                                            .hover(|style| style.bg(Colors::surface_hover()))
+                                            .tooltip(fb_tooltip(if track.group_collapsed {
+                                                "Open folder"
+                                            } else {
+                                                "Close folder"
+                                            }))
+                                            .on_mouse_down(
+                                                gpui::MouseButton::Left,
+                                                move |_event, window, cx| {
+                                                    toggle_group_collapsed(
+                                                        &collapse_group_id,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                    cx.stop_propagation();
+                                                },
                                             )
-                                            // The folder's own colour, not the
-                                            // accent: cyan marks what is
-                                            // active, and a folder is not.
+                                            .occlude()
                                             .child(
                                                 svg()
                                                     .path(if track.group_collapsed {
-                                                        assets::ICON_FOLDER_PATH
+                                                        assets::ICON_CHEVRON_RIGHT_PATH
                                                     } else {
-                                                        assets::ICON_FOLDER_OPEN_PATH
+                                                        assets::ICON_CHEVRON_DOWN_PATH
                                                     })
-                                                    .w(px(GLYPH_MD))
-                                                    .h(px(GLYPH_MD))
-                                                    .text_color(track.color),
-                                            )
+                                                    .w(px(GLYPH_SM))
+                                                    .h(px(GLYPH_SM))
+                                                    .text_color(Colors::text_secondary()),
+                                            ),
+                                    )
+                                })
+                                .child(match rename {
+                                    // The field stops its own presses, so
+                                    // editing never reselects the track or
+                                    // starts a reorder drag.
+                                    Some(rename) => div()
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .ml(px(-TRACK_NAME_FIELD_INSET))
+                                        .child(text_field_with_callbacks_and_ime(
+                                            &rename.input,
+                                            rename.focused,
+                                            rename.callbacks.clone(),
+                                            rename.ime_target.clone(),
+                                        ))
+                                        .into_any_element(),
+                                    None => div()
+                                        .id(("track-name", id_num))
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .overflow_hidden()
+                                        .truncate()
+                                        .text_size(px(typography::UI_SM))
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(Colors::text_primary())
+                                        .child(track.name.clone())
+                                        .on_click(move |event, window, cx| {
+                                            if opens_track_rename(event, cx.has_active_drag()) {
+                                                begin_rename(&rename_track_id, window, cx);
+                                            }
                                         })
-                                        .child(match rename {
-                                            // The field stops its own presses,
-                                            // so editing never reselects the
-                                            // track or starts a reorder drag.
-                                            Some(rename) => div()
-                                                .flex_1()
-                                                .min_w(px(0.0))
-                                                .ml(px(-TRACK_NAME_FIELD_INSET))
-                                                .child(text_field_with_callbacks_and_ime(
-                                                    &rename.input,
-                                                    rename.focused,
-                                                    rename.callbacks.clone(),
-                                                    rename.ime_target.clone(),
-                                                ))
-                                                .into_any_element(),
-                                            None => div()
-                                                .id(("track-name", id_num))
-                                                .flex_1()
-                                                .min_w(px(0.0))
-                                                .overflow_hidden()
-                                                .truncate()
-                                                .text_size(px(typography::UI_SM))
-                                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                                .text_color(Colors::text_primary())
-                                                .child(track.name.clone())
-                                                .on_click(move |event, window, cx| {
-                                                    if opens_track_rename(
-                                                        event,
-                                                        cx.has_active_drag(),
-                                                    ) {
-                                                        begin_rename(&rename_track_id, window, cx);
-                                                    }
-                                                })
-                                                .into_any_element(),
-                                        })
-                                        .when(is_group && track.group_collapsed, |row| {
-                                            row.child(folder_member_badge(folder.members))
-                                        })
-                                        .when(!track.takes.is_empty(), |row| {
-                                            row.child(takes_chip(
-                                                track,
-                                                id_num,
-                                                callbacks.on_toggle_takes.clone(),
-                                            ))
-                                        }),
-                                ),
+                                        .into_any_element(),
+                                })
+                                .when(is_group && track.group_collapsed, |row| {
+                                    row.child(folder_member_badge(folder.members))
+                                })
+                                .when(!track.takes.is_empty(), |row| {
+                                    row.child(takes_chip(
+                                        track,
+                                        id_num,
+                                        callbacks.on_toggle_takes.clone(),
+                                    ))
+                                }),
                         )
                         .when_some(
                             callbacks
@@ -1127,173 +1325,75 @@ pub fn track_header(
                                 row.child(instrument_header_button(track, id_num, on_open))
                             },
                         )
-                        .child(latch_strip(
+                        .child(mode_strip(
                             track,
                             is_automation,
                             id_num,
-                            LatchStripHandlers {
-                                on_mute,
-                                on_solo,
-                                on_arm,
-                                on_input,
-                                on_automation,
-                                on_freeze,
-                            },
+                            Box::new(on_automation),
+                            on_freeze,
                         ))
                         .when_some(folder_menu, |row, (track_id, on_open)| {
                             row.child(folder_menu_button(id_num, track_id, on_open))
                         }),
                 )
-                // Row 2: horizontal volume fader + pan pill + dB pill. The
-                // meter has the header's right edge to itself.
-                // Only rendered when the row is tall enough to hold it; the
-                // compact header (short rows) shows just row 1.
+                // Line 2: level and pan, only where the row is tall enough
+                // to hold it; a short row keeps line 1 alone.
                 .when(show_controls, |col| {
                     col.child(
                         div()
                             .flex()
                             .flex_row()
-                            .items_center()
-                            .gap(px(space::SNUG))
-                            .w_full()
-                            .px(px(space::SNUG))
-                            // 24px horizontal fader + 2px vertical padding on
-                            // each side keeps the two-row header at its exact
-                            // 72px intrinsic height.
-                            .py(px(space::HAIR))
-                            .rounded(px(radius::CONTROL))
-                            // The same recessed plane the transport readout and
-                            // the mixer's fader well use. It was a 16%-alpha
-                            // wash with a 3%-alpha border — a plate you could
-                            // not actually see, which is why the control row
-                            // read as loose parts instead of one instrument.
-                            .bg(Colors::surface_canvas())
-                            .border(px(1.0))
-                            .border_color(Colors::border_subtle())
-                            // Presses on the fader and pan stop here, short of
-                            // the row: a drag on one of several selected tracks
-                            // moves them all, which only works while the
-                            // selection is still there. Their drags were
-                            // already registered on the controls themselves.
+                            // Presses on the bar and the knob stop here, short
+                            // of the row: a drag on one of several selected
+                            // tracks moves them all, which only works while
+                            // the selection is still there. The drags
+                            // themselves were registered on the controls.
                             .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
                                 cx.stop_propagation()
                             })
-                            // Mixer fader geometry, rotated for the compact
-                            // horizontal TrackHeader control row.
-                            .child(horizontal_fader_with_drag_callbacks(
+                            .items_center()
+                            .gap(px(space::SNUG))
+                            .h(px(LEVEL_LINE_H))
+                            .child(slim_horizontal_fader_with_drag_callbacks(
                                 format!("track-vol-{}", track.id),
                                 state.display_track_volume(track),
-                                Colors::accent_primary(),
+                                if is_selected {
+                                    Colors::accent_primary()
+                                } else {
+                                    Colors::with_alpha(Colors::accent_primary(), 0.7)
+                                },
                                 Some(on_volume_drag_start),
                                 Some(on_volume_drag_preview),
                                 Some(on_volume_drag_commit),
                                 Some(on_volume_reset),
                             ))
-                            // Pan readout — compact bordered label matching the
-                            // dB pill alongside it. Vertical drag scrubs pan;
-                            // Shift gives fine control and double-click resets C.
-                            .child({
-                                let border = if is_selected {
-                                    let mut c = track.color;
-                                    c.a = 0.55;
-                                    c
-                                } else {
-                                    Colors::border_default()
-                                };
-                                let drag_key = pan_drag_key.clone();
-                                let drag_start_cb = on_pan_drag_start.clone();
-                                let drag_preview_cb = on_pan_drag_preview.clone();
-                                let drag_commit_cb = on_pan_drag_commit.clone();
-                                let drag_track_id = pan_id.clone();
-                                let start_track_id = pan_id.clone();
-                                let commit_track_id = pan_id.clone();
-                                let commit_track_id_out = pan_id.clone();
-                                let reset_cb = on_pan_change.clone();
-                                let reset_track_id = pan_id.clone();
-                                let start_pan = track.pan;
-                                div()
-                                    .id(("track-pan-spinner", id_num))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .min_w(px(size::COMFORTABLE))
-                                    .px(px(space::TIGHT))
-                                    .h(px(PAN_PILL_H))
-                                    // A 14 px control takes the small tier. At
-                                    // `CONTROL` it read rounder than the 16 px
-                                    // state pills stacked directly above it.
-                                    .rounded(px(radius::CONTROL_SM))
-                                    // One step up from the plate it sits in, so the readout
-                                    // reads as a control on the plate rather than
-                                    // a hole through it.
-                                    .bg(Colors::surface_panel_alt())
-                                    .border(px(1.0))
-                                    .border_color(border)
-                                    .text_size(px(typography::DENSE_CAPTION))
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(Colors::text_secondary())
-                                    .cursor(gpui::CursorStyle::ResizeUpDown)
-                                    .hover(|style| {
-                                        style
-                                            .bg(Colors::surface_control_hover())
-                                            .border_color(Colors::border_strong())
-                                    })
-                                    .child(format_pan_label(track.pan))
-                                    .on_drag(
-                                        SpinDrag::new(drag_key.clone(), f64::from(start_pan)),
-                                        move |drag, _offset, window, cx| {
-                                            drag.begin();
-                                            drag_start_cb(&start_track_id, window, cx);
-                                            cx.new(|_| drag.clone())
-                                        },
-                                    )
-                                    .on_drag_move::<SpinDrag>(
-                                        move |event: &DragMoveEvent<SpinDrag>, window, cx| {
-                                            let drag = event.drag(cx);
-                                            if !drag.matches(&drag_key) {
-                                                return;
-                                            }
-                                            let current_y: f32 = event.event.position.y.into();
-                                            let sensitivity = if event.event.modifiers.shift {
-                                                0.002
-                                            } else {
-                                                2.0 / 150.0
-                                            };
-                                            let next = drag.value_at(
-                                                current_y,
-                                                sensitivity,
-                                                -1.0,
-                                                1.0,
-                                                Some(0.001),
-                                            )
-                                                as f32;
-                                            drag_preview_cb(
-                                                &(drag_track_id.clone(), next),
-                                                window,
-                                                cx,
-                                            );
-                                        },
-                                    )
-                                    .on_mouse_up(gpui::MouseButton::Left, move |_, window, cx| {
-                                        drag_commit_cb(&commit_track_id, window, cx)
-                                    })
-                                    .on_mouse_up_out(
-                                        gpui::MouseButton::Left,
-                                        move |_, window, cx| {
-                                            on_pan_drag_commit(&commit_track_id_out, window, cx)
-                                        },
-                                    )
-                                    .on_click(move |event, window, cx| {
-                                        if event.click_count() >= 2 {
-                                            reset_cb(&(reset_track_id.clone(), 0.0), window, cx);
-                                        }
-                                    })
-                            })
-                            // Bordered dB pill
-                            .child(db_value_pill(
+                            .child(readout(
+                                DB_READOUT_W,
                                 volume::format_db(state.display_track_volume(track)),
-                                is_selected,
-                            )),
+                                Some("dB"),
+                            ))
+                            .when(!track.dual_pan_active(), |row| {
+                                row.child(div().flex_none().ml(px(space::TIGHT)).child(pan_knob(
+                                    track,
+                                    on_pan_drag_start,
+                                    on_pan_drag_preview,
+                                    on_pan_drag_commit,
+                                    on_pan_change,
+                                )))
+                                .child(readout(
+                                    PAN_READOUT_W,
+                                    format_pan_label(track.pan),
+                                    None,
+                                ))
+                            })
+                            .when(track.dual_pan_active(), |row| {
+                                row.child(
+                                    div()
+                                        .flex_none()
+                                        .ml(px(space::TIGHT))
+                                        .child(dual_pan_badge(track)),
+                                )
+                            }),
                     )
                 }),
         )

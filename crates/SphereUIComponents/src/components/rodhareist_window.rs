@@ -1619,10 +1619,7 @@ impl Render for RodhareistEditorWindow {
             .into_any_element(),
             knob_value,
         };
-        // Rodhareist sets its numbers in Barlow; the other plates keep Plex Mono.
-        let content = plate::with_number_face(plate::NumberFace::Barlow, || {
-            rodhareist_panel(self, &frame, fields, window, cx)
-        });
+        let content = rodhareist_panel(self, &frame, fields, window, cx);
 
         div()
             .relative()

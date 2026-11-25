@@ -23,10 +23,10 @@
 //! milliseconds and switches at the bottom of the dip rather than clicking.
 
 use biquad::{Biquad, Coefficients, DirectForm1};
-use builtin_dsp_core::delay::{smoothing_step, DelayRing, Smoothed};
+use builtin_dsp_core::delay::{DelayRing, Smoothed, smoothing_step};
 use builtin_dsp_core::{
-    clamp, db_to_linear, flush_denormal, linear_to_db, make_eq_coefficients, time_constant,
-    ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect,
+    ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, clamp, db_to_linear,
+    flush_denormal, linear_to_db, make_eq_coefficients, time_constant,
 };
 use serde::{Deserialize, Serialize};
 
@@ -34,8 +34,8 @@ pub mod ipc;
 pub mod presets;
 pub mod ui;
 
-pub use ipc::{ui_param_id, ui_param_index, UI_PARAM_IDS};
-pub use presets::{factory_presets, FactoryPreset};
+pub use ipc::{UI_PARAM_IDS, ui_param_id, ui_param_index};
+pub use presets::{FactoryPreset, factory_presets};
 
 pub const PLUGIN_ID: &str = "futureboard.deesser";
 
@@ -779,11 +779,7 @@ impl StereoEffect for Dsp {
         let wide = self.active.mode == Mode::Wide;
         let process = |x: f32, band: f32, on: bool| -> f32 {
             if !on {
-                if listen {
-                    0.0
-                } else {
-                    x
-                }
+                if listen { 0.0 } else { x }
             } else if listen {
                 band
             } else {

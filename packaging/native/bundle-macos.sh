@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bundle the xtask-staged Community Edition runtime into a macOS .app.
+# Bundle the xtask-staged runtime package into a macOS .app.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -12,13 +12,13 @@ if [[ -z "$PACKAGE_DIR" ]]; then
   # A universal package (see merge-universal-macos.sh) is preferred over a
   # single-architecture one when both are present.
   for candidate in macos-universal macos-arm64 macos-x64; do
-    if [[ -d "$ROOT/out/release/community/$candidate" ]]; then
-      PACKAGE_DIR="$ROOT/out/release/community/$candidate"
+    if [[ -d "$ROOT/out/release/$candidate" ]]; then
+      PACKAGE_DIR="$ROOT/out/release/$candidate"
       break
     fi
   done
   if [[ -z "$PACKAGE_DIR" ]]; then
-    PACKAGE_DIR="$(find "$ROOT/out/release/community" -mindepth 1 -maxdepth 1 -type d -name 'macos-*' -print -quit 2>/dev/null || true)"
+    PACKAGE_DIR="$(find "$ROOT/out/release" -mindepth 1 -maxdepth 1 -type d -name 'macos-*' -print -quit 2>/dev/null || true)"
   fi
 fi
 
@@ -51,7 +51,7 @@ FRAMEWORKS="$CONTENTS/Frameworks"
 
 if [[ -z "$PACKAGE_DIR" || ! -f "$PACKAGE_DIR/FutureboardNative" ]]; then
   echo "error: xtask macOS runtime package not found: ${PACKAGE_DIR:-<none>}" >&2
-  echo "run: cargo xtask package --profile release --edition community --plugin all" >&2
+  echo "run: cargo xtask package --profile release --plugin all" >&2
   exit 1
 fi
 

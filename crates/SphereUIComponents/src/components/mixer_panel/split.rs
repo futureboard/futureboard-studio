@@ -33,10 +33,25 @@ pub(crate) fn set_mixer_strips_wide(wide: bool) {
     STRIPS_WIDE.store(wide, Ordering::Relaxed);
 }
 
+/// How many VCA strips sit pinned beside the Master. Mirrored here for the
+/// same reason as [`STRIPS_WIDE`]: the pinned width is read by the strip
+/// viewport arithmetic as well as by the strips. UI thread only; written by
+/// [`set_mixer_vca_strips`] whenever a mixer surface lays out its strips.
+static VCA_STRIPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn vca_strip_count() -> usize {
+    VCA_STRIPS.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_mixer_vca_strips(count: usize) {
+    VCA_STRIPS.store(count, Ordering::Relaxed);
+}
+
 /// The strip sections the mixer header's SHOW buttons turn on and off.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MixerSection {
     Io,
+    Eq,
     Inserts,
     Sends,
 }
@@ -46,6 +61,7 @@ pub enum MixerSection {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct MixerView {
     pub show_io: bool,
+    pub show_eq: bool,
     pub show_inserts: bool,
     pub show_sends: bool,
     pub wide: bool,
@@ -55,6 +71,7 @@ impl Default for MixerView {
     fn default() -> Self {
         Self {
             show_io: true,
+            show_eq: true,
             show_inserts: true,
             show_sends: true,
             wide: false,
@@ -66,6 +83,7 @@ impl MixerView {
     pub fn shows(self, section: MixerSection) -> bool {
         match section {
             MixerSection::Io => self.show_io,
+            MixerSection::Eq => self.show_eq,
             MixerSection::Inserts => self.show_inserts,
             MixerSection::Sends => self.show_sends,
         }
@@ -74,6 +92,7 @@ impl MixerView {
     pub fn toggled(mut self, section: MixerSection) -> Self {
         match section {
             MixerSection::Io => self.show_io = !self.show_io,
+            MixerSection::Eq => self.show_eq = !self.show_eq,
             MixerSection::Inserts => self.show_inserts = !self.show_inserts,
             MixerSection::Sends => self.show_sends = !self.show_sends,
         }
@@ -110,7 +129,7 @@ pub(crate) const LOWER_CONTROL_MIN_H: f32 = super::console::PAN_H
     + super::console::BUTTONS_H;
 
 /// Everything on a strip that is not the two racks: the colour bar, the body's
-/// padding, the type row, the I/O block, both splitter handles, the lower
+/// padding, the type row, the I/O block, the EQ curve, both splitter handles, the lower
 /// console at its floor, and the name plate. The racks are the only sections
 /// that resize, so this is the height they may never eat into — and, with both
 /// racks at their own floor, the whole of what a strip cannot be shorter than
@@ -121,6 +140,8 @@ pub(crate) const STRIP_FIXED_H: f32 = super::console::COLOR_BAR_H
     + super::console::TOP_ROW_H
     + super::console::SECTION_GAP
     + super::console::IO_BLOCK_H
+    + super::console::SECTION_GAP
+    + super::console::EQ_H
     + super::console::SECTION_GAP
     + (SEC_SPLITTER_H * 2.0)
     + LOWER_CONTROL_MIN_H
@@ -323,6 +344,8 @@ mod tests {
             + console::TOP_ROW_H
             + console::SECTION_GAP
             + console::IO_BLOCK_H
+            + console::SECTION_GAP
+            + console::EQ_H
             + console::SECTION_GAP
     }
 

@@ -9,7 +9,7 @@
 
 use gpui::{Context, Window};
 
-use super::{plural, CcCurveKind, LaneAction, PianoRoll, VelocityOperation};
+use super::{plural, CcCurveKind, LaneAction, LaneNoteChoice, PianoRoll, VelocityOperation};
 use crate::native_popup_menu::{self, PopupItem};
 
 fn command(label: impl Into<String>, id: impl Into<String>, checked: bool) -> PopupItem {
@@ -19,6 +19,7 @@ fn command(label: impl Into<String>, id: impl Into<String>, checked: bool) -> Po
         shortcut: None,
         checked,
         enabled: true,
+        icon: None,
     }
 }
 
@@ -95,17 +96,59 @@ impl PianoRoll {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let items = vec![
-            PopupItem::Header(self.step_row_name(row).to_string()),
+        let mut items = vec![PopupItem::Header(self.step_row_name(row).to_string())];
+        // The drum lanes' note (not the Sampler Rack's, whose pad notes are
+        // dragged on the row).
+        let lane_note = self
+            .drum_rows
+            .get(row)
+            .copied()
+            .zip(self.lane_note_context(cx));
+        if let Some((from, context)) = &lane_note {
+            let notes = context
+                .choices(*from)
+                .into_iter()
+                .map(|choice| match choice {
+                    LaneNoteChoice::Group(group) => PopupItem::Header(group.to_string()),
+                    LaneNoteChoice::Note {
+                        note,
+                        label,
+                        checked,
+                        enabled,
+                    } => PopupItem::Command {
+                        label,
+                        command: format!("note:{note}"),
+                        shortcut: None,
+                        checked,
+                        enabled,
+                        icon: None,
+                    },
+                })
+                .collect();
+            items.push(PopupItem::Submenu {
+                label: "Lane Note".to_string(),
+                enabled: true,
+                items: notes,
+            });
+            items.push(PopupItem::Separator);
+        }
+        let from = lane_note.map(|(from, _)| from);
+        items.extend([
             command("Fill Every 2 Steps", "fill:2", false),
             command("Fill Every 4 Steps", "fill:4", false),
             command("Randomize Velocity (±15%)", "random", false),
             PopupItem::Separator,
             command("Clear Row", "clear", false),
-        ];
+        ]);
         self.show_native_menu(
             items,
             move |editor, chosen, cx| {
+                if let (Some(from), Some(to)) = (from, index_after(chosen, "note:")) {
+                    if let Ok(to) = u8::try_from(to) {
+                        editor.set_lane_note(from, to, cx);
+                    }
+                    return;
+                }
                 let action = match chosen {
                     "fill:2" => LaneAction::FillEvery(2),
                     "fill:4" => LaneAction::FillEvery(4),

@@ -1490,7 +1490,8 @@ mod imp {
                     INVALID_HANDLE_VALUE,
                     None,
                     PAGE_READWRITE,
-                    (size >> 32) as u32,
+                    // `usize` is 32 bits in the 32-bit host.
+                    ((size as u64) >> 32) as u32,
                     size as u32,
                     &wide,
                 )
@@ -1744,6 +1745,53 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The 64-bit Studio and the 32-bit plug-in host
+    /// (`FutureboardPluginHostX86.exe`) map the same region, so its layout
+    /// must not depend on the word size. Run on both targets
+    /// (`--target i686-pc-windows-msvc` too); a layout change updates these
+    /// numbers along with [`BRIDGE_LAYOUT_VERSION`].
+    #[test]
+    fn the_region_is_laid_out_alike_in_32_and_64_bit_processes() {
+        use std::mem::offset_of;
+        let layout = [
+            ("size", SharedAudioBridge::SIZE),
+            ("align", std::mem::align_of::<SharedAudioBridge>()),
+            ("request_seq", offset_of!(SharedAudioBridge, request_seq)),
+            ("done_seq", offset_of!(SharedAudioBridge, done_seq)),
+            (
+                "transport_tempo_bits",
+                offset_of!(SharedAudioBridge, transport_tempo_bits),
+            ),
+            ("spectrum_seq", offset_of!(SharedAudioBridge, spectrum_seq)),
+            (
+                "sidechain_frames",
+                offset_of!(SharedAudioBridge, sidechain_frames),
+            ),
+            ("midi", offset_of!(SharedAudioBridge, midi)),
+            ("params", offset_of!(SharedAudioBridge, params)),
+            ("midi_out", offset_of!(SharedAudioBridge, midi_out)),
+            ("audio_in", offset_of!(SharedAudioBridge, audio_in)),
+            ("audio_out", offset_of!(SharedAudioBridge, audio_out)),
+        ];
+        eprintln!("{layout:?}");
+        assert_eq!(layout, EXPECTED_REGION_LAYOUT);
+    }
+
+    const EXPECTED_REGION_LAYOUT: [(&str, usize); 12] = [
+        ("size", 608_304),
+        ("align", 8),
+        ("request_seq", 32),
+        ("done_seq", 40),
+        ("transport_tempo_bits", 80),
+        ("spectrum_seq", 708),
+        ("sidechain_frames", 2_068),
+        ("midi", 2_072),
+        ("params", 10_272),
+        ("midi_out", 75_816),
+        ("audio_in", 84_016),
+        ("audio_out", 346_160),
+    ];
 
     #[test]
     fn header_round_trips_in_process() {

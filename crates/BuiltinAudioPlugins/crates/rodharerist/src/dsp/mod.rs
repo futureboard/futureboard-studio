@@ -35,6 +35,7 @@ mod flanger;
 mod gate;
 mod handoff;
 mod ir;
+mod live_room;
 mod mod_stage;
 mod nam;
 mod nonlinear;
@@ -50,8 +51,8 @@ mod wah;
 mod wav;
 
 use builtin_dsp_core::{
-    clamp, db_to_linear, time_constant, ParamDescriptor, PluginCategory, PluginDescriptor,
-    StereoEffect,
+    ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, clamp, db_to_linear,
+    time_constant,
 };
 
 use cab::Cabinet;
@@ -62,13 +63,13 @@ use eq::EqStage;
 use gate::NoiseGate;
 pub use handoff::Retired;
 pub use ir::{
-    prepare_ir_runtime, IrInfo, IrLoadError, IrLoader, PreparedIrRuntime, MAX_IR_SECONDS,
-    PARTITION as IR_PARTITION_SAMPLES,
+    IrInfo, IrLoadError, IrLoader, MAX_IR_SECONDS, PARTITION as IR_PARTITION_SAMPLES,
+    PreparedIrRuntime, prepare_ir_runtime,
 };
 use mod_stage::ModStage;
 pub use nam::{
-    prepare_nam_runtime, NamCaptureInfo, NamLoadError, NamLoader, PreparedNamRuntime,
-    NAM_BLOCK as NAM_BLOCK_SAMPLES,
+    NAM_BLOCK as NAM_BLOCK_SAMPLES, NamCaptureInfo, NamLoadError, NamLoader, PreparedNamRuntime,
+    prepare_nam_runtime,
 };
 use reverb::PlateReverb;
 pub use tone_stage::ToneEngineKind;
@@ -1399,6 +1400,9 @@ pub enum ReverbModel {
     Ambience,
     /// "Dark Hall" — hall length with the top rolled off.
     DarkHall,
+    /// "Live Room" — a modulated figure-8 tank. Not a retune of the comb bank
+    /// the models above share. See `dsp::live_room`.
+    LiveRoom,
 }
 
 impl ReverbModel {
@@ -1411,6 +1415,7 @@ impl ReverbModel {
         Self::Chamber,
         Self::Ambience,
         Self::DarkHall,
+        Self::LiveRoom,
     ];
 
     pub fn from_model_id(id: &str) -> Option<Self> {
@@ -1423,6 +1428,7 @@ impl ReverbModel {
             "chamber" => Some(Self::Chamber),
             "ambience" => Some(Self::Ambience),
             "dark_hall" => Some(Self::DarkHall),
+            "live_room" => Some(Self::LiveRoom),
             _ => None,
         }
     }
@@ -1980,8 +1986,13 @@ pub struct Params {
     pub reverb_shimmer: f32,
 
     // Cabinet.
-    pub cab_mic: f32,  // 0..100 % (mic position / brightness)
-    pub cab_dist: f32, // 0..100 % (distance / roll-off)
+    pub cab_mic: f32,  // 0..100 % (cone position: 0 center, 100 rim)
+    pub cab_dist: f32, // 0..100 % (distance: 0 on the cloth, 100 far)
+    /// Microphone angle off the dust-cap axis, 0..100 (0 = on axis).
+    /// Missing from older saves, which then stay on axis and keep the tone
+    /// they were saved with.
+    #[serde(default)]
+    pub cab_axis: f32,
 
     // Wah (defaults are a mid-heel pedal; the stage starts out of the path).
     #[serde(default = "default_wah_pos")]
@@ -2456,6 +2467,7 @@ pub fn default_params() -> Params {
         reverb_shimmer: default_reverb_shimmer(),
         cab_mic: 20.0,
         cab_dist: 40.0,
+        cab_axis: 0.0,
         wah_pos: default_wah_pos(),
         wah_res: default_wah_res(),
         wah_sens: default_wah_sens(),
@@ -2715,6 +2727,14 @@ pub fn descriptor() -> PluginDescriptor {
                 id: "cab_dist",
                 name: "Cab Distance",
                 default_value: 40.0,
+                min: 0.0,
+                max: 100.0,
+                unit: "%",
+            },
+            ParamDescriptor {
+                id: "cab_axis",
+                name: "Cab Axis",
+                default_value: 0.0,
                 min: 0.0,
                 max: 100.0,
                 unit: "%",
@@ -3586,6 +3606,7 @@ impl Dsp {
             reverb_shimmer: clamp(params.reverb_shimmer, 0.0, 100.0),
             cab_mic: clamp(params.cab_mic, 0.0, 100.0),
             cab_dist: clamp(params.cab_dist, 0.0, 100.0),
+            cab_axis: clamp(params.cab_axis, 0.0, 100.0),
             wah_pos: clamp(params.wah_pos, 0.0, 10.0),
             wah_res: clamp(params.wah_res, 0.0, 10.0),
             wah_sens: clamp(params.wah_sens, 0.0, 10.0),
@@ -3910,9 +3931,9 @@ impl Dsp {
                 p.reverb_shimmer,
             );
         }
-        if moved!(cab_model, mic_model, cab_mic, cab_dist) {
+        if moved!(cab_model, mic_model, cab_mic, cab_dist, cab_axis) {
             self.cab
-                .configure(p.cab_model, p.mic_model, p.cab_mic, p.cab_dist);
+                .configure(p.cab_model, p.mic_model, p.cab_mic, p.cab_dist, p.cab_axis);
         }
 
         // Second instances. Same `configure` calls against the same stage
@@ -4319,6 +4340,7 @@ pub fn apply_to_params(p: &mut Params, id: &str, value: f32) -> bool {
         "reverb_shimmer" => p.reverb_shimmer = value,
         "cab_mic" => p.cab_mic = value,
         "cab_dist" => p.cab_dist = value,
+        "cab_axis" => p.cab_axis = value,
         "wah_pos" => p.wah_pos = value,
         "wah_res" => p.wah_res = value,
         "wah_sens" => p.wah_sens = value,
@@ -4457,11 +4479,7 @@ fn set_row(p: &mut Params, kind: StageKind, value: f32) {
 /// applying `amp_model` resets `tone_engine` to Classic.
 pub fn ui_values(p: &Params) -> Vec<(&'static str, f32)> {
     fn b(v: bool) -> f32 {
-        if v {
-            1.0
-        } else {
-            0.0
-        }
+        if v { 1.0 } else { 0.0 }
     }
     fn model_index<T: PartialEq + Copy>(all: &[T], value: T) -> f32 {
         all.iter().position(|m| *m == value).unwrap_or(0) as f32
@@ -4540,6 +4558,7 @@ pub fn ui_values(p: &Params) -> Vec<(&'static str, f32)> {
     out.push(("reverb_shimmer", p.reverb_shimmer));
     out.push(("cab_mic", p.cab_mic));
     out.push(("cab_dist", p.cab_dist));
+    out.push(("cab_axis", p.cab_axis));
     out.push(("cab_mic_type", p.mic_model.index() as f32));
     out.push(("wah_pos", p.wah_pos));
     out.push(("wah_res", p.wah_res));
@@ -6154,7 +6173,7 @@ mod tests {
         assert!(dsp.apply_ui_param("path_slot_0", 2.0)); // Amp first
         assert!(dsp.apply_ui_param("path_slot_1", 0.0)); // Gate
         assert!(dsp.apply_ui_param("path_slot_2", -1.0)); // clear
-                                                          // Remaining slots still have defaults until overwritten — sanitize packs.
+        // Remaining slots still have defaults until overwritten — sanitize packs.
         let mut order = [None; PATH_SLOTS];
         order[0] = Some(StageKind::Amp);
         order[1] = Some(StageKind::Cab);
@@ -6256,6 +6275,7 @@ mod tests {
             ("room", ReverbModel::Room),
             ("hall", ReverbModel::Hall),
             ("shimmer", ReverbModel::Shimmer),
+            ("live_room", ReverbModel::LiveRoom),
         ];
         let mut rendered = Vec::with_capacity(ids.len());
 
@@ -8062,6 +8082,11 @@ mod telemetry_tests {
             Some(ReverbModel::Spring)
         );
         assert_eq!(ReverbModel::ALL[4], ReverbModel::Spring);
+        assert_eq!(ReverbModel::ALL[8], ReverbModel::LiveRoom);
+        assert_eq!(
+            ReverbModel::from_model_id("live_room"),
+            Some(ReverbModel::LiveRoom)
+        );
         assert_eq!(WahModel::ALL[1], WahModel::TouchWah);
         assert_eq!(WahModel::from_model_id("bass_wah"), Some(WahModel::BassWah));
         assert_eq!(WahModel::ALL[2], WahModel::BassWah);
@@ -8101,9 +8126,11 @@ mod telemetry_tests {
         assert_eq!(CabModel::from_index(46), CabModel::Tangerine4x12);
         assert_eq!(CabModel::from_index(50), CabModel::T75Straight);
         assert_eq!(CabModel::ALL[11], CabModel::Ir);
-        assert!(StageKind::default_path()
-            .iter()
-            .all(|s| *s != Some(StageKind::Pitch)));
+        assert!(
+            StageKind::default_path()
+                .iter()
+                .all(|s| *s != Some(StageKind::Pitch))
+        );
         assert_eq!(default_params().transpose_semi, 0.0);
         assert_eq!(default_params().delay_sync, DelaySync::Free);
         assert!((effective_delay_ms(DelaySync::Quarter, 420.0, 120.0) - 500.0).abs() < 1.0e-3);

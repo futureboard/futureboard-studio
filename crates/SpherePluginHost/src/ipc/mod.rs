@@ -736,7 +736,29 @@ pub struct HostPluginParameter {
     pub hidden: bool,
     #[serde(default)]
     pub read_only: bool,
+    /// The parameter's normalized value when the list was read; `None` from a
+    /// host that does not report one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_normalized: Option<NormalizedValue>,
+    /// The plug-in's own text for that value ("1000.0 Hz", "+3.00 dB",
+    /// "Bell"); empty when it gives none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub value_text: String,
 }
+
+/// A parameter's normalized value (0..1) on the wire. Compared bit for bit,
+/// so the messages that carry one keep `Eq`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct NormalizedValue(pub f64);
+
+impl PartialEq for NormalizedValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
+impl Eq for NormalizedValue {}
 
 fn default_editor_resizable() -> bool {
     true

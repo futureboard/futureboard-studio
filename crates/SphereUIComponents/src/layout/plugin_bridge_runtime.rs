@@ -19,6 +19,10 @@ pub(crate) struct BridgePluginDescriptor {
     /// instantiates through the right native bridge. `None` leaves the host to
     /// detect it from `plugin_path`.
     pub format: Option<String>,
+    /// The engine reads this instance's MIDI output (a plug-in in a MIDI FX
+    /// chain), so the Studio's drain leaves its `midi_out` ring alone: the
+    /// ring has one consumer.
+    pub engine_reads_midi_out: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -207,6 +211,7 @@ mod tests {
             class_id: "class".to_string(),
             display_name: "Plug".to_string(),
             format: None,
+            engine_reads_midi_out: false,
         }
     }
 
@@ -236,6 +241,46 @@ mod tests {
             HostIsolation::Instance.key_for(&kontakt_a, false),
             HostIsolation::Instance.key_for(&kontakt_b, false)
         );
+    }
+
+    /// A 32-bit module goes to a 32-bit host of its own, under every
+    /// isolation, and two instances of it share that host per module.
+    #[test]
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    fn a_32_bit_module_gets_a_32_bit_host() {
+        let dir = std::env::temp_dir().join(format!("fb-x86-key-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut image = vec![0u8; 0x86];
+        image[..2].copy_from_slice(b"MZ");
+        image[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        image[0x80..0x84].copy_from_slice(b"PE\0\0");
+        image[0x84..0x86].copy_from_slice(&0x014cu16.to_le_bytes());
+        let old = dir.join("Old Synth.dll");
+        std::fs::write(&old, &image).unwrap();
+        image[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes());
+        let new = dir.join("New Synth.dll");
+        std::fs::write(&new, &image).unwrap();
+
+        let old_a = descriptor("insert-1", old.to_str().unwrap());
+        let old_b = descriptor("insert-2", old.to_str().unwrap());
+        let new = descriptor("insert-3", new.to_str().unwrap());
+        for isolation in [
+            HostIsolation::Shared,
+            HostIsolation::Module,
+            HostIsolation::Instance,
+        ] {
+            let key = isolation.key_for(&old_a, false);
+            assert!(key.starts_with(super::X86_HOST_KEY_PREFIX), "{key}");
+            assert!(!isolation
+                .key_for(&new, false)
+                .starts_with(super::X86_HOST_KEY_PREFIX));
+            assert_ne!(key, isolation.key_for(&new, false));
+        }
+        assert_eq!(
+            HostIsolation::Module.key_for(&old_a, false),
+            HostIsolation::Module.key_for(&old_b, false)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #436: which instances a reopened stream leaves alone, which only need
@@ -313,9 +358,16 @@ fn normalize_persisted_au_state(state: &[u8]) -> Vec<u8> {
 }
 
 impl BridgeHost {
+    /// Start a host process for `key`: the 32-bit host when the key is one
+    /// [`HostIsolation::key_for`] gave a 32-bit module.
     fn spawn(key: String) -> Result<Self, PluginHostClientError> {
-        eprintln!("[plugin-bridge] ensure_host key={key} -> spawn");
-        let mut client = PluginHostClient::spawn_bridge()?;
+        let x86 = key.starts_with(X86_HOST_KEY_PREFIX);
+        eprintln!("[plugin-bridge] ensure_host key={key} x86={x86} -> spawn");
+        let mut client = if x86 {
+            PluginHostClient::spawn_bridge_x86()?
+        } else {
+            PluginHostClient::spawn_bridge()?
+        };
         let host_pid = Some(client.pid());
         // The host emits Ready on startup; retain it for any caller that wants
         // to poll, but do not block insert on a second handshake.
@@ -432,11 +484,12 @@ impl BridgeHost {
         out: &mut Vec<(String, SpherePluginHost::audio_bridge::SharedMidiEvent)>,
     ) {
         for (instance_id, region) in &self.shared_audio {
+            let loaded = self.loaded.get(instance_id);
+            if loaded.is_some_and(|loaded| loaded.descriptor.engine_reads_midi_out) {
+                continue;
+            }
             let ring = &region.bridge().midi_out;
-            let track_id = self
-                .loaded
-                .get(instance_id)
-                .map(|loaded| loaded.descriptor.track_id.as_str());
+            let track_id = loaded.map(|loaded| loaded.descriptor.track_id.as_str());
             while let Some(event) = ring.try_pop() {
                 if let Some(track_id) = track_id {
                     out.push((track_id.to_string(), event));
@@ -1365,7 +1418,20 @@ impl HostIsolation {
         })
     }
 
+    /// The host an instance goes to. A module built for 32-bit Windows can
+    /// only load in the 32-bit host, so its key carries
+    /// [`X86_HOST_KEY_PREFIX`]: it never shares a process with a 64-bit
+    /// plug-in, whatever the isolation.
     fn key_for(self, descriptor: &BridgePluginDescriptor, builtin: bool) -> String {
+        let key = self.key_for_arch(descriptor, builtin);
+        if !builtin && descriptor_needs_x86_bridge(descriptor) {
+            format!("{X86_HOST_KEY_PREFIX}{key}")
+        } else {
+            key
+        }
+    }
+
+    fn key_for_arch(self, descriptor: &BridgePluginDescriptor, builtin: bool) -> String {
         match self {
             Self::Shared => "shared".to_string(),
             Self::Instance => format!("instance:{}", descriptor.insert_id),
@@ -1380,6 +1446,21 @@ impl HostIsolation {
             }
         }
     }
+}
+
+/// Host keys of 32-bit hosts start with this.
+pub(crate) const X86_HOST_KEY_PREFIX: &str = "x86:";
+
+/// Whether the descriptor's module was built for 32-bit Windows and has to
+/// load in `FutureboardPluginHostX86.exe`. Read from the module's PE header
+/// or bundle folders when the instance is first placed, never by loading it.
+fn descriptor_needs_x86_bridge(descriptor: &BridgePluginDescriptor) -> bool {
+    if descriptor.plugin_path.is_empty() {
+        return false;
+    }
+    let arch =
+        SpherePluginHost::module_arch::module_arch(std::path::Path::new(&descriptor.plugin_path));
+    arch.needs_x86_bridge()
 }
 
 /// A host process that went away, with everything that was loaded in it.

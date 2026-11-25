@@ -334,7 +334,7 @@ impl DirectXRenderer {
     /// window would show for this scene, read without capturing the screen.
     /// The next `draw` clears and redraws the buffer, so presenting stays
     /// untouched.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(feature = "test-support", feature = "render-to-image"))]
     pub(crate) fn render_to_image(&mut self, scene: &Scene) -> Result<image::RgbaImage> {
         self.encode(scene, WindowBackgroundAppearance::Opaque)?;
         let devices = self.devices.as_ref().context("devices missing")?;

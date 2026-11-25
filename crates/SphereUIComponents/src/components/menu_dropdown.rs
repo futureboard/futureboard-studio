@@ -117,6 +117,7 @@ pub fn popup_items(items: &[MenuItem], i18n: I18n) -> Vec<crate::native_popup_me
                         command: command.unwrap_or_default(),
                         shortcut: item.live_shortcut(),
                         checked: item.kind != MenuItemKind::Normal && item.checked,
+                        icon: None,
                     }
                 }
             }
@@ -158,6 +159,7 @@ pub fn native_menu_element(
             if crate::native_popup_menu::is_open(window) {
                 return;
             }
+            crate::components::command_icons::install_menu_icon_rasterizer(cx);
             let close = on_close.clone();
             let shown = crate::native_popup_menu::show(
                 window,

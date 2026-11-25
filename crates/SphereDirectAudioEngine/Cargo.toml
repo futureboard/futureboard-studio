@@ -1,6 +1,6 @@
 [package]
 name = "sphere_directaudioengine"
-version = "2026.10.16-beta1.4.4"
+version = "2026.11.13-beta2.0.1"
 edition = "2021"
 description = "SphereDirectAudioEngine — native Rust audio backend for Futureboard Studio"
 license.workspace = true
@@ -44,6 +44,7 @@ ebur128.workspace = true
 solfege_spatialaudio.workspace = true
 sphere-audio-plugins.workspace = true
 sphere-midi-service.workspace = true
+sphere-midi-fx.workspace = true
 sphere-encoder.workspace = true
 sphere-soundfont-player.workspace = true
 solfege-audio.workspace = true

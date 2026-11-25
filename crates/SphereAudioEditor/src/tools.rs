@@ -230,6 +230,47 @@ impl AudioRepairModule {
         }
     }
 
+    /// What the module fixes, in a few plain words. The navigator's second
+    /// line, so a row says what it is for and not only what it is called.
+    pub const fn purpose(self) -> &'static str {
+        match self {
+            Self::Denoise => "Hiss and background noise",
+            Self::DeClick => "Clicks, pops and crackle",
+            Self::DeHum => "Mains hum and buzz",
+            Self::SpectralRepair => "Paint out a single sound",
+            Self::DeReverb => "Room echo",
+            Self::DeBleed => "Spill from other mics",
+            Self::DeFeedback => "Ringing feedback",
+            Self::DrumSilencer => "Drums inside a mix",
+        }
+    }
+
+    /// One or two sentences on what the module does and how to use it, for
+    /// the top of the inspector.
+    pub const fn summary(self) -> &'static str {
+        match self {
+            Self::Denoise => {
+                "Removes steady noise such as hiss, fans or air conditioning. \
+                 Teach it what the noise sounds like, then choose how much to take away."
+            }
+            Self::DeClick => {
+                "Finds short clicks and pops and smooths them over. \
+                 Set how hard it looks, then step through what it found."
+            }
+            Self::DeHum => {
+                "Removes the hum mains power leaves in a recording, \
+                 together with its overtones."
+            }
+            Self::SpectralRepair => {
+                "Turns down one sound you draw around on the spectrogram, \
+                 like a cough, a phone or a squeak."
+            }
+            Self::DeReverb | Self::DeBleed | Self::DeFeedback | Self::DrumSilencer => {
+                "Not available in this build yet."
+            }
+        }
+    }
+
     /// What the module draws on the processing canvas. Shown in the inspector
     /// so the overlay is self-describing.
     pub const fn canvas_hint(self) -> &'static str {
@@ -266,6 +307,14 @@ mod tests {
     fn analyzers_follow_selection_by_default() {
         assert!(AudioToolKind::SpectrumAnalyzer.default_follow_selection());
         assert!(!AudioToolKind::Normalize.default_follow_selection());
+    }
+
+    #[test]
+    fn every_repair_module_explains_itself() {
+        for module in AudioRepairModule::ALL {
+            assert!(!module.purpose().is_empty());
+            assert!(module.summary().ends_with('.'));
+        }
     }
 
     #[test]

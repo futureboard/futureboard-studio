@@ -14,8 +14,8 @@ use super::{
     ProjectSongTextEvent, ProjectSongTextEventKind, ProjectSoundfontPlayer, ProjectTake,
     ProjectTempoPoint, ProjectTimelineMarker, ProjectTimelineRegion, ProjectTrack,
     ProjectTrackAudioFormat, ProjectTrackMidiInputRouting, ProjectTrackOutputRouting,
-    ProjectTrackType, SoundfontEnvelope, SoundfontPlayerMode, SoundfontRenderQuality, TrackRouting,
-    V33TrackInputRouting,
+    ProjectTrackType, ProjectVcaGroup, SoundfontEnvelope, SoundfontPlayerMode,
+    SoundfontRenderQuality, TrackRouting, V33TrackInputRouting,
 };
 use crate::components::timeline::timeline_state::{
     AudioClipStretchState, StretchAlgorithm, StretchMode, WarpMarker,
@@ -180,7 +180,32 @@ pub const PROJECT_MAGIC: &[u8; 8] = b"FBSTUD1\0";
 /// pre-v65 binding is not one.
 /// v66 appends a flag after it: the track is a DrumStep track (an Instrument
 /// track whose MIDI clips open in the step sequencer). A pre-v66 track is not.
-pub const PROJECT_VERSION: u32 = 66;
+/// v67 appends the track's MIDI FX chain after it: a count, then per slot its
+/// id, device id, enabled flag and its parameter values (a count of
+/// `(param id, f32)` pairs). A pre-v67 track has none.
+/// v68 appends to each MIDI FX slot a flag and, when set, the hosted plug-in
+/// it runs, written as an insert (identity, format, opaque state). A pre-v68
+/// slot hosts none.
+/// v69 appends a flag to each insert after its sidechain route: the insert
+/// runs after the channel's fader. A pre-v69 insert runs before it. It also
+/// appends the VCA groups after the master automation: a count, then per
+/// group its id, name, colour, fader level, mute and member track ids. A
+/// pre-v69 project has none.
+/// v70 appends the track's step lanes to the end of each track block: a count,
+/// then one note each. A pre-v70 track has none (the default drum kit).
+/// v71 appends the track's pan mode to the end of each track block (`0`
+/// Balance, `1` Dual) and the two Dual pan positions (left input, right
+/// input). A pre-v71 track is Balance with the Dual defaults (-1, +1). It
+/// also adds automation target tags 7 and 8, Dual pan left and right.
+/// v72 adds the project metadata (title, artist, album, album artist,
+/// composer, genre, year, track number, comment, copyright, ISRC) as an
+/// `FMET` trailing section, written only when a field is set. A pre-v72
+/// project has none, and a v72 file without the section has none either.
+/// v73 appends a flag to the end of each track block: a bus or return keeps
+/// its channels' places in a spatial mix. A pre-v73 track does not. It also
+/// adds automation target tags 9-14, the spatial placement (left/right,
+/// front/back, height, spread, width, LFE).
+pub const PROJECT_VERSION: u32 = 73;
 
 /// Oldest on-disk format version whose migration to the current one is
 /// supported (see [`super::migrate`]): v30, which introduced arrangement
@@ -691,6 +716,10 @@ fn encode_insert(w: &mut FbWriter, ins: &ProjectInsert, version: u32) {
     if version >= 64 {
         w.write_str(&ins.sidechain_source);
         w.write_bool(ins.sidechain_post_fader);
+    }
+    // v69: the insert runs after the channel's fader.
+    if version >= 69 {
+        w.write_bool(ins.post_fader);
     }
 }
 
@@ -1246,6 +1275,83 @@ fn encode_track(w: &mut FbWriter, t: &ProjectTrack, version: u32) {
     if version >= 66 {
         w.write_bool(t.drum_step);
     }
+    // v67: the MIDI FX chain.
+    if version >= 67 {
+        w.write_u32(t.midi_fx.len() as u32);
+        for slot in &t.midi_fx {
+            w.write_str(&slot.id);
+            w.write_str(&slot.device);
+            w.write_bool(slot.enabled);
+            w.write_u32(slot.params.len() as u32);
+            for (id, value) in &slot.params {
+                w.write_str(id);
+                w.write_f32(*value);
+            }
+            // v68: the hosted plug-in, as an insert.
+            if version >= 68 {
+                w.write_bool(slot.plugin.is_some());
+                if let Some(plugin) = &slot.plugin {
+                    encode_insert(w, &super::timeline_insert_to_project(0, plugin), version);
+                }
+            }
+        }
+    }
+    // v70: the step view's drum lanes.
+    if version >= 70 {
+        w.write_u32(t.step_lanes.len() as u32);
+        for note in &t.step_lanes {
+            w.write_u8(*note);
+        }
+    }
+    // v71: Dual pan.
+    if version >= 71 {
+        w.write_u8(t.dual_pan.mode.to_tag());
+        w.write_f32(t.dual_pan.left);
+        w.write_f32(t.dual_pan.right);
+    }
+    // v73: the bus keeps its channels' places in a spatial mix.
+    if version >= 73 {
+        w.write_bool(t.routing.spatial_keeps_inputs);
+    }
+}
+
+/// v67: a track's MIDI FX chain. Counts only size the first allocation
+/// ([`prealloc`]); a count past the data ends in `UnexpectedEof`.
+fn decode_midi_fx(
+    r: &mut FbReader,
+    version: u32,
+) -> Result<Vec<crate::components::timeline::timeline_state::MidiFxSlotState>, ProjectError> {
+    let count = r.read_u32()? as usize;
+    let mut slots = Vec::with_capacity(prealloc(count));
+    for _ in 0..count {
+        let id = r.read_str()?;
+        let device = r.read_str()?;
+        let enabled = r.read_bool()?;
+        let param_count = r.read_u32()? as usize;
+        let mut params = Vec::with_capacity(prealloc(param_count));
+        for _ in 0..param_count {
+            let key = r.read_str()?;
+            let value = r.read_f32()?;
+            params.push((key, value));
+        }
+        let plugin = if version >= 68 && r.read_bool()? {
+            Some(super::project_insert_to_timeline(&decode_insert(
+                r, version,
+            )?))
+        } else {
+            None
+        };
+        slots.push(
+            crate::components::timeline::timeline_state::MidiFxSlotState {
+                id,
+                device,
+                enabled,
+                params,
+                plugin,
+            },
+        );
+    }
+    Ok(slots)
 }
 
 /// v28: built-in Soundfont Player instrument state. A leading flag keeps the
@@ -1660,6 +1766,21 @@ fn encode_body_versioned(project: &FutureboardProject, version: u32) -> Vec<u8> 
             encode_automation_lane(&mut w, lane, version);
         }
         w.write_u8(u8::from(project.mixer.master_automation_expanded));
+        // v69: the VCA groups, each with its members.
+        if version >= 69 {
+            w.write_u32(project.mixer.vca_groups.len() as u32);
+            for group in &project.mixer.vca_groups {
+                w.write_str(&group.id);
+                w.write_str(&group.name);
+                w.write_str(&group.color);
+                w.write_f32(group.level_norm);
+                w.write_bool(group.muted);
+                w.write_u32(group.members.len() as u32);
+                for member in &group.members {
+                    w.write_str(member);
+                }
+            }
+        }
     }
 
     // Tracks
@@ -1846,9 +1967,12 @@ fn encode_body_versioned(project: &FutureboardProject, version: u32) -> Vec<u8> 
     encode_view_section(&mut w, &project.view);
 
     // Trailing sections (v54+), each named by its magic: see
-    // `decode_trailing_sections`. The ARA extension is written only when there
-    // is something to say.
+    // `decode_trailing_sections`. The ARA extension and the metadata are
+    // written only when there is something to say.
     encode_ara_extension(&mut w, project);
+    if version >= 72 {
+        encode_metadata_section(&mut w, &project.settings.metadata);
+    }
 
     w.into_bytes()
 }
@@ -1865,6 +1989,50 @@ fn encode_body_versioned(project: &FutureboardProject, version: u32) -> Vec<u8> 
 /// Magic of the ARA extension section, "FARA" in file order. Stable: a magic
 /// is never reused for something else.
 const SECTION_ARA: u32 = u32::from_le_bytes(*b"FARA");
+/// Magic of the project metadata section (v72), "FMET" in file order.
+const SECTION_METADATA: u32 = u32::from_le_bytes(*b"FMET");
+
+// ── Project metadata (v72+) ──────────────────────────────────────────────────
+//
+// The payload of the `FMET` section: a u32 field count, then that many
+// strings in `ProjectMetadataField::ALL` order. A later build may append
+// fields; a reader takes the ones it knows and ignores the rest.
+
+fn encode_metadata_section(w: &mut FbWriter, metadata: &super::ProjectMetadata) {
+    if metadata.is_empty() {
+        return;
+    }
+    let mut payload = FbWriter::new();
+    payload.write_u32(super::ProjectMetadataField::ALL.len() as u32);
+    for field in super::ProjectMetadataField::ALL {
+        payload.write_str(metadata.get(field));
+    }
+    w.write_u32(SECTION_METADATA);
+    w.write_bytes(&payload.into_bytes());
+}
+
+/// Read an `FMET` payload. Never fails: a damaged payload keeps the fields
+/// read before the damage.
+fn decode_metadata_section(section: &[u8]) -> super::ProjectMetadata {
+    let mut metadata = super::ProjectMetadata::default();
+    let mut r = FbReader::new(section);
+    let Ok(count) = r.read_u32() else {
+        return metadata;
+    };
+    for field in super::ProjectMetadataField::ALL
+        .into_iter()
+        .take(count as usize)
+    {
+        match read_bounded_str(&mut r) {
+            Ok(value) => *metadata.get_mut(field) = value,
+            Err(_) => {
+                project_load_log(format_args!("project metadata truncated; ignored"));
+                break;
+            }
+        }
+    }
+    metadata
+}
 
 // ── ARA extension (v54+) ─────────────────────────────────────────────────────
 //
@@ -2154,11 +2322,20 @@ struct AraExtension {
     deferred: Vec<ProjectAraDeferred>,
 }
 
+/// What the sections after the view section held.
+#[derive(Debug, Default)]
+struct TrailingSections {
+    ara: AraExtension,
+    /// `None` for a file without an `FMET` section.
+    metadata: Option<super::ProjectMetadata>,
+}
+
 /// Read the sections after the view section. Never fails: a section whose
 /// magic is unknown (a newer build's) is skipped whole, and damaged framing
 /// ends the read, keeping what was read before it.
-fn decode_trailing_sections(r: &mut FbReader) -> AraExtension {
+fn decode_trailing_sections(r: &mut FbReader) -> TrailingSections {
     let mut ara: Option<AraExtension> = None;
+    let mut metadata: Option<super::ProjectMetadata> = None;
     while r.remaining() > 0 {
         let Ok(magic) = r.read_u32() else {
             project_load_log(format_args!("trailing section header truncated; ignored"));
@@ -2173,10 +2350,16 @@ fn decode_trailing_sections(r: &mut FbReader) -> AraExtension {
         match magic {
             // One ARA extension per file; a second is damage, not data.
             SECTION_ARA if ara.is_none() => ara = Some(decode_ara_extension(payload)),
+            SECTION_METADATA if metadata.is_none() => {
+                metadata = Some(decode_metadata_section(payload))
+            }
             _ => {}
         }
     }
-    ara.unwrap_or_default()
+    TrailingSections {
+        ara: ara.unwrap_or_default(),
+        metadata,
+    }
 }
 
 /// Read an ARA extension section's payload. Never fails: an unreadable record
@@ -2635,6 +2818,32 @@ fn decode_plugin_instance(r: &mut FbReader) -> Result<ProjectPluginInstance, Pro
     })
 }
 
+fn decode_vca_groups(r: &mut FbReader) -> Result<Vec<ProjectVcaGroup>, ProjectError> {
+    let count = r.read_u32()? as usize;
+    let mut groups = Vec::with_capacity(count.min(256));
+    for _ in 0..count {
+        let id = r.read_str()?;
+        let name = r.read_str()?;
+        let color = r.read_str()?;
+        let level_norm = r.read_f32()?;
+        let muted = r.read_bool()?;
+        let member_count = r.read_u32()? as usize;
+        let mut members = Vec::with_capacity(member_count.min(4096));
+        for _ in 0..member_count {
+            members.push(r.read_str()?);
+        }
+        groups.push(ProjectVcaGroup {
+            id,
+            name,
+            color,
+            level_norm,
+            muted,
+            members,
+        });
+    }
+    Ok(groups)
+}
+
 fn decode_insert(r: &mut FbReader, version: u32) -> Result<ProjectInsert, ProjectError> {
     let id = r.read_str()?;
     let slot_index = r.read_u32()?;
@@ -2683,6 +2892,7 @@ fn decode_insert(r: &mut FbReader, version: u32) -> Result<ProjectInsert, Projec
     } else {
         (String::new(), false)
     };
+    let post_fader = version >= 69 && r.read_bool()?;
     Ok(ProjectInsert {
         id,
         slot_index,
@@ -2694,6 +2904,7 @@ fn decode_insert(r: &mut FbReader, version: u32) -> Result<ProjectInsert, Projec
         signal_bus,
         sidechain_source,
         sidechain_post_fader,
+        post_fader,
         plugin,
     })
 }
@@ -3261,6 +3472,7 @@ fn decode_track(r: &mut FbReader, version: u32) -> Result<ProjectTrack, ProjectE
             mpe: MpeTrackConfiguration::default(),
             program: Default::default(),
             spatial: Default::default(),
+            spatial_keeps_inputs: false,
             sends: Vec::new(),
         }
     } else {
@@ -3419,6 +3631,38 @@ fn decode_track(r: &mut FbReader, version: u32) -> Result<ProjectTrack, ProjectE
 
     // v66: a DrumStep track. A pre-v66 track is not one.
     let drum_step = version >= 66 && r.read_bool()?;
+    // v67: the MIDI FX chain. A pre-v67 track has none.
+    let midi_fx = if version >= 67 {
+        decode_midi_fx(r, version)?
+    } else {
+        Vec::new()
+    };
+    // v70: the step view's drum lanes. A pre-v70 track has the default kit.
+    let step_lanes = if version >= 70 {
+        let count = r.read_u32()? as usize;
+        let mut lanes = Vec::with_capacity(prealloc(count));
+        for _ in 0..count {
+            lanes.push(r.read_u8()? & 0x7F);
+        }
+        lanes
+    } else {
+        Vec::new()
+    };
+    // v71: Dual pan. A pre-v71 track is Balance.
+    let dual_pan = if version >= 71 {
+        crate::components::timeline::timeline_state::DualPan {
+            mode: crate::components::timeline::timeline_state::PanMode::from_tag(r.read_u8()?),
+            left: r.read_f32()?,
+            right: r.read_f32()?,
+        }
+        .sanitized()
+    } else {
+        crate::components::timeline::timeline_state::DualPan::default()
+    };
+    // v73: a bus that keeps its channels' places. A pre-v73 one does not.
+    if version >= 73 {
+        routing.spatial_keeps_inputs = r.read_bool()?;
+    }
 
     // v55: folder members play through their folder (see `PROJECT_VERSION`).
     if version < 55
@@ -3446,6 +3690,7 @@ fn decode_track(r: &mut FbReader, version: u32) -> Result<ProjectTrack, ProjectE
         color_hex,
         volume_norm,
         pan,
+        dual_pan,
         muted,
         solo,
         record_arm,
@@ -3462,6 +3707,8 @@ fn decode_track(r: &mut FbReader, version: u32) -> Result<ProjectTrack, ProjectE
         takes_expanded,
         freeze,
         drum_step,
+        midi_fx,
+        step_lanes,
     })
 }
 
@@ -3527,6 +3774,12 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
         (lanes, r.read_u8()? != 0)
     } else {
         (Vec::new(), false)
+    };
+    // v69: the VCA groups, written after the master automation.
+    let vca_groups = if version >= 69 {
+        decode_vca_groups(&mut r)?
+    } else {
+        Vec::new()
     };
 
     let track_count = r.read_u32()? as usize;
@@ -3901,12 +4154,19 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
     // the view section has no ARA extension: its documents restore by ID
     // alone.
     let mut ara_documents = ara_documents;
-    let (ara_orphans, ara_deferred) = if version >= 54 {
-        let extension = decode_trailing_sections(&mut r);
+    let (ara_orphans, ara_deferred, metadata) = if version >= 54 {
+        let trailing = decode_trailing_sections(&mut r);
+        let extension = trailing.ara;
         join_ara_identities(&mut ara_documents, extension.identities);
-        (extension.orphans, extension.deferred)
+        // Project metadata (v72+). Only a v72 file can hold it.
+        let metadata = if version >= 72 {
+            trailing.metadata.unwrap_or_default()
+        } else {
+            super::ProjectMetadata::default()
+        };
+        (extension.orphans, extension.deferred, metadata)
     } else {
-        (Vec::new(), Vec::new())
+        (Vec::new(), Vec::new(), super::ProjectMetadata::default())
     };
 
     Ok(FutureboardProject {
@@ -3944,6 +4204,7 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
             spatial_format,
             spatial_room,
             spatial_fold,
+            metadata,
         },
         tracks,
         mixer: ProjectMixer {
@@ -3951,6 +4212,7 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
             master_inserts,
             master_automation_lanes,
             master_automation_expanded,
+            vca_groups,
             tree_expanded_node_ids,
             tree_pinned_channel_ids,
             tree_hidden_channel_ids,
@@ -4699,6 +4961,7 @@ mod tests {
             signal_bus: 0,
             sidechain_source: String::new(),
             sidechain_post_fader: false,
+            post_fader: false,
             plugin: None,
         });
 
@@ -4783,6 +5046,37 @@ mod tests {
             .expect("v63 decode");
         assert!(old.tracks[0].inserts[0].sidechain_source.is_empty());
         assert!(!old.tracks[0].inserts[0].sidechain_post_fader);
+    }
+
+    /// v69 keeps an insert's place after the fader; a v68 file has every
+    /// insert before it, and the fields written ahead of the flag still read.
+    #[test]
+    fn insert_post_fader_roundtrips_v69_and_is_pre_fader_on_v68() {
+        let mut project = FutureboardProject::new("Post Fader");
+        let mut track = track_with_clip(empty_clip_with_stretch(sample_stretch()));
+        track.clips.clear();
+        track.inserts.push(ProjectInsert {
+            id: "limiter".to_string(),
+            sidechain_source: "kick".to_string(),
+            post_fader: true,
+            ..ProjectInsert::default()
+        });
+        project.tracks.push(track);
+        project.mixer.master_inserts.push(ProjectInsert {
+            id: "dither".to_string(),
+            post_fader: true,
+            ..ProjectInsert::default()
+        });
+
+        let decoded = decode_project(&encode_project(&project)).expect("v69 decode");
+        assert!(decoded.tracks[0].inserts[0].post_fader);
+        assert_eq!(decoded.tracks[0].inserts[0].sidechain_source, "kick");
+        assert!(decoded.mixer.master_inserts[0].post_fader);
+
+        let old = decode_project_with_options(&encode_project_as(&project, 68), true)
+            .expect("v68 decode");
+        assert!(!old.tracks[0].inserts[0].post_fader);
+        assert!(!old.mixer.master_inserts[0].post_fader);
     }
 
     #[test]
@@ -5255,6 +5549,185 @@ mod tests {
         assert_eq!(old.tracks[1].clips.len(), 1);
     }
 
+    /// v70 saves a track's step lanes (the notes Lane Note put on its drum
+    /// lane list) and the track after it still reads in place; a v69 file
+    /// has none, which is the default kit.
+    #[test]
+    fn step_lanes_roundtrip_v70_and_are_empty_on_v69() {
+        let mut project = FutureboardProject::new("kontakt kit");
+        let mut drums = track_with_clip(empty_clip_with_stretch(sample_stretch()));
+        drums.drum_step = true;
+        drums.step_lanes = vec![24, 36, 38, 44, 127];
+        project.tracks.push(drums);
+        project
+            .tracks
+            .push(track_with_clip(empty_clip_with_stretch(sample_stretch())));
+
+        let decoded = decode_project(&encode_project(&project)).unwrap();
+        assert_eq!(decoded.tracks[0].step_lanes, vec![24, 36, 38, 44, 127]);
+        assert!(decoded.tracks[1].step_lanes.is_empty());
+        assert_eq!(decoded.tracks[1].clips.len(), 1);
+
+        let old = decode_project_with_options(&encode_project_as(&project, 69), true).unwrap();
+        assert!(old.tracks[0].step_lanes.is_empty());
+        assert!(old.tracks[0].drum_step);
+        assert_eq!(old.tracks[1].clips.len(), 1);
+    }
+
+    /// v71 saves a track's pan mode and both Dual pan positions, plus Dual
+    /// pan automation lanes (tags 7 / 8), and the track after it still reads
+    /// in place; a v70 file is Balance with the Dual defaults.
+    #[test]
+    fn dual_pan_roundtrips_v71_and_is_balance_on_v70() {
+        use crate::components::timeline::timeline_state::{DualPan, PanMode};
+        let mut project = FutureboardProject::new("dual pan");
+        let mut narrowed = track_with_clip(empty_clip_with_stretch(sample_stretch()));
+        narrowed.dual_pan = DualPan {
+            mode: PanMode::Dual,
+            left: -1.0,
+            right: 0.4,
+        };
+        let lane = |tag: u8, value: f32| AutomationLane {
+            id: format!("lane-{tag}"),
+            parameter_name: "Pan".to_string(),
+            target: AutomationTargetDesc {
+                tag,
+                ..Default::default()
+            },
+            enabled: true,
+            visible: true,
+            mode: 0,
+            points: vec![AutomationPoint {
+                beat: 0.0,
+                value,
+                curve: 0,
+                tension: 0.0,
+            }],
+        };
+        narrowed.automation_lanes = vec![lane(7, 0.25), lane(8, 0.75)];
+        project.tracks.push(narrowed);
+        project
+            .tracks
+            .push(track_with_clip(empty_clip_with_stretch(sample_stretch())));
+
+        let decoded = decode_project(&encode_project(&project)).unwrap();
+        let dual = decoded.tracks[0].dual_pan;
+        assert_eq!(dual.mode, PanMode::Dual);
+        assert_eq!((dual.left, dual.right), (-1.0, 0.4));
+        let tags: Vec<u8> = decoded.tracks[0]
+            .automation_lanes
+            .iter()
+            .map(|lane| lane.target.tag)
+            .collect();
+        assert_eq!(tags, vec![7, 8]);
+        assert_eq!(decoded.tracks[1].dual_pan, DualPan::default());
+        assert_eq!(decoded.tracks[1].clips.len(), 1);
+
+        let old = decode_project_with_options(&encode_project_as(&project, 70), true).unwrap();
+        assert_eq!(old.tracks[0].dual_pan, DualPan::default());
+        assert_eq!(old.tracks[0].dual_pan.mode, PanMode::Balance);
+        assert_eq!(old.tracks[1].clips.len(), 1);
+    }
+
+    /// A channel's Dual pan and its Dual pan lanes survive the whole trip:
+    /// timeline state, project, file, project, timeline state.
+    #[test]
+    fn dual_pan_survives_save_and_load_of_the_timeline() {
+        use crate::components::timeline::timeline_state::{
+            AutomationTarget, DualPan, PanMode, TimelineState,
+        };
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let track_id = state.create_audio_track();
+        let dual = DualPan {
+            mode: PanMode::Dual,
+            left: -0.5,
+            right: 0.25,
+        };
+        assert!(state.set_track_dual_pan(&track_id, dual));
+        state.ensure_automation_lane(&track_id, AutomationTarget::TrackPanLeft);
+        state.ensure_automation_lane(&track_id, AutomationTarget::TrackPanRight);
+
+        let project = FutureboardProject::from(&state);
+        let decoded = decode_project(&encode_project(&project)).expect("decode");
+        let mut restored = TimelineState::default();
+        let warnings = crate::project::apply_to_timeline(&decoded, &mut restored);
+        assert!(warnings.is_empty(), "load warnings: {warnings:?}");
+        let track = restored.find_track(&track_id).expect("track restored");
+        assert_eq!(track.dual_pan, dual);
+        assert!(track.dual_pan_active());
+        let targets: Vec<AutomationTarget> = track
+            .automation_lanes
+            .iter()
+            .map(|lane| lane.target.clone())
+            .collect();
+        assert!(targets.contains(&AutomationTarget::TrackPanLeft));
+        assert!(targets.contains(&AutomationTarget::TrackPanRight));
+    }
+
+    /// v67 saves a track's MIDI FX chain (device, bypass, every parameter)
+    /// and the track after it still reads in place; a v66 file has none.
+    #[test]
+    fn a_midi_fx_chain_roundtrips_v67_and_is_empty_on_v66() {
+        use crate::components::timeline::timeline_state::MidiFxSlotState;
+        let mut project = FutureboardProject::new("arps");
+        let mut keys = track_with_clip(empty_clip_with_stretch(sample_stretch()));
+        let mut arp = MidiFxSlotState::new("mfx-1".into(), sphere_midi_fx::DeviceKind::Arpeggiator);
+        arp.params.retain(|(id, _)| id != "swing");
+        arp.params.push(("swing".into(), 33.5));
+        let mut chord = MidiFxSlotState::new("mfx-2".into(), sphere_midi_fx::DeviceKind::Chord);
+        chord.enabled = false;
+        keys.midi_fx = vec![arp.clone(), chord.clone()];
+        project.tracks.push(keys);
+        project
+            .tracks
+            .push(track_with_clip(empty_clip_with_stretch(sample_stretch())));
+
+        let decoded = decode_project(&encode_project(&project)).unwrap();
+        assert_eq!(decoded.tracks[0].midi_fx, vec![arp, chord]);
+        assert!(decoded.tracks[1].midi_fx.is_empty());
+        assert_eq!(decoded.tracks[1].clips.len(), 1);
+
+        let old = decode_project_with_options(&encode_project_as(&project, 66), true).unwrap();
+        assert!(old.tracks[0].midi_fx.is_empty());
+        assert_eq!(old.tracks[1].clips.len(), 1);
+    }
+
+    /// v68 saves the plug-in a MIDI FX slot hosts — identity and its opaque
+    /// state — and the slots after it still read in place.
+    #[test]
+    fn a_hosted_midi_fx_plugin_roundtrips_v68() {
+        use crate::components::timeline::timeline_state::{
+            InsertPluginFormat, InsertSlotState, MidiFxSlotState,
+        };
+        let mut project = FutureboardProject::new("hosted");
+        let mut keys = track_with_clip(empty_clip_with_stretch(sample_stretch()));
+        let mut plugin = InsertSlotState::empty("insert-t1-7");
+        plugin.plugin_id = Some("ABCDEF0123456789ABCDEF0123456789".into());
+        plugin.plugin_path = Some(std::path::PathBuf::from("C:/VST3/Arp.vst3"));
+        plugin.plugin_format = Some(InsertPluginFormat::Vst3);
+        plugin.display_name = "Arp Plug".into();
+        plugin.vst3_state = Some(std::sync::Arc::new(vec![1, 2, 3, 250]));
+        let hosted = MidiFxSlotState::hosting("mfx-1".into(), plugin);
+        let after = MidiFxSlotState::new("mfx-2".into(), sphere_midi_fx::DeviceKind::Scale);
+        keys.midi_fx = vec![hosted, after.clone()];
+        project.tracks.push(keys);
+
+        let decoded = decode_project(&encode_project(&project)).unwrap();
+        let fx = &decoded.tracks[0].midi_fx;
+        assert_eq!(fx.len(), 2);
+        let plugin = fx[0].plugin.as_ref().expect("hosted plug-in");
+        assert_eq!(plugin.id, "insert-t1-7");
+        assert_eq!(plugin.display_name, "Arp Plug");
+        assert_eq!(plugin.plugin_format, Some(InsertPluginFormat::Vst3));
+        assert_eq!(plugin.vst3_state.as_deref(), Some(&vec![1, 2, 3, 250]));
+        assert_eq!(fx[1], after);
+
+        let old = decode_project_with_options(&encode_project_as(&project, 67), true).unwrap();
+        assert!(old.tracks[0].midi_fx[0].plugin.is_none());
+        assert_eq!(old.tracks[0].midi_fx[1], after);
+    }
+
     #[test]
     fn a_v41_clip_binding_is_consumed_and_the_body_stays_aligned() {
         // v41 wrote an ARA presence byte per clip. v42 no longer writes it, but
@@ -5523,11 +5996,13 @@ mod tests {
             color_hex: "#56C7C9".to_string(),
             volume_norm: 1.0,
             pan: 0.0,
+            dual_pan: Default::default(),
             muted: false,
             solo: false,
             record_arm: false,
             input_monitor: InputMonitorMode::Off,
             routing: TrackRouting::default(),
+            midi_fx: Vec::new(),
             inserts: Vec::new(),
             automation_lanes: Vec::new(),
             clips: vec![clip],
@@ -5539,6 +6014,7 @@ mod tests {
             takes_expanded: false,
             freeze: None,
             drum_step: false,
+            step_lanes: Vec::new(),
         }
     }
 
@@ -6491,5 +6967,125 @@ mod tests {
         );
         assert_eq!(documents[0].written_with, None);
         assert_eq!(documents[1].written_with, Some(sample_ara_identity()));
+    }
+
+    fn sample_metadata() -> super::super::ProjectMetadata {
+        super::super::ProjectMetadata {
+            title: "Song".into(),
+            artist: "Band".into(),
+            album: "Record".into(),
+            album_artist: "Various".into(),
+            composer: "Writer".into(),
+            genre: "Ambient".into(),
+            year: "2026".into(),
+            track_number: "3/12".into(),
+            comment: "Mixed late, ไทย, 日本語".into(),
+            copyright: "(c) 2026".into(),
+            isrc: "GBAYE2600001".into(),
+        }
+    }
+
+    /// v72 saves every metadata field, next to an ARA extension and with the
+    /// tracks before it intact; an empty set writes no section at all.
+    #[test]
+    fn project_metadata_roundtrips_v72() {
+        let mut project = FutureboardProject::new("tagged");
+        project
+            .tracks
+            .push(track_with_clip(empty_clip_with_stretch(sample_stretch())));
+        project.ara_documents = vec![ara_document("track-1", Some(sample_ara_identity()))];
+        let bare = encode_body(&project);
+        project.settings.metadata = sample_metadata();
+
+        let decoded = decode_project(&encode_project(&project)).unwrap();
+        assert_eq!(decoded.settings.metadata, sample_metadata());
+        assert_eq!(decoded.tracks[0].clips.len(), 1);
+        assert_eq!(
+            decoded.ara_documents[0].written_with,
+            Some(sample_ara_identity())
+        );
+
+        let tagged = encode_body(&project);
+        assert_eq!(&tagged[..bare.len()], &bare[..], "the section is appended");
+        assert_eq!(
+            &tagged[bare.len()..bare.len() + 4],
+            &SECTION_METADATA.to_le_bytes()
+        );
+
+        // One field set: only that field comes back.
+        project.settings.metadata = super::super::ProjectMetadata {
+            isrc: "GBAYE2600001".into(),
+            ..Default::default()
+        };
+        let decoded = decode_project(&encode_project(&project)).unwrap();
+        assert_eq!(decoded.settings.metadata.isrc, "GBAYE2600001");
+        assert_eq!(decoded.settings.metadata.title, "");
+
+        project.settings.metadata = Default::default();
+        assert_eq!(encode_body(&project), bare, "nothing written when empty");
+    }
+
+    /// A file saved before v72 opens with no metadata and everything else in
+    /// place, and an `FMET` section in an older file is not read.
+    #[test]
+    fn project_metadata_is_empty_before_v72() {
+        let mut project = FutureboardProject::new("older");
+        project
+            .tracks
+            .push(track_with_clip(empty_clip_with_stretch(sample_stretch())));
+        project.settings.metadata = sample_metadata();
+        for version in [70, 71] {
+            let old =
+                decode_project_with_options(&encode_project_as(&project, version), true).unwrap();
+            assert_eq!(old.settings.metadata, Default::default(), "v{version}");
+            assert_eq!(old.tracks[0].clips.len(), 1, "v{version}");
+            assert_eq!(old.name, "older");
+        }
+
+        project.settings.metadata = Default::default();
+        let mut body = encode_body_versioned(&project, 70);
+        let mut payload = FbWriter::new();
+        payload.write_u32(1);
+        payload.write_str("not a v70 field");
+        body.extend_from_slice(&trailing_section(SECTION_METADATA, &payload.into_bytes()));
+        let old = decode_project_with_options(&project_bytes_with_version(body, 70), true)
+            .expect("trailing sections never fail a load");
+        assert_eq!(old.settings.metadata, Default::default());
+    }
+
+    /// The `FMET` payload is read field by field: fields a later build
+    /// appends are ignored, and damage keeps the fields read before it.
+    #[test]
+    fn a_metadata_section_from_a_later_build_or_damaged_still_loads() {
+        let project = FutureboardProject::new("future tags");
+        let bare = encode_body(&project);
+        let load = |payload: Vec<u8>| {
+            let mut body = bare.clone();
+            body.extend_from_slice(&trailing_section(SECTION_METADATA, &payload));
+            decode_project(&project_bytes_with_version(body, PROJECT_VERSION))
+                .expect("trailing sections never fail a load")
+                .settings
+                .metadata
+        };
+
+        let mut later = FbWriter::new();
+        later.write_u32(13);
+        for field in super::super::ProjectMetadataField::ALL {
+            later.write_str(sample_metadata().get(field));
+        }
+        later.write_str("a twelfth field");
+        later.write_str("a thirteenth field");
+        assert_eq!(load(later.into_bytes()), sample_metadata());
+
+        let mut damaged = FbWriter::new();
+        damaged.write_u32(11);
+        damaged.write_str("Song");
+        damaged.write_str("Band");
+        let mut damaged = damaged.into_bytes();
+        damaged.extend_from_slice(&[0xff, 0xff, 0xff, 0x7f]); // a length past the end
+        let metadata = load(damaged);
+        assert_eq!(metadata.title, "Song");
+        assert_eq!(metadata.artist, "Band");
+        assert_eq!(metadata.album, "");
     }
 }

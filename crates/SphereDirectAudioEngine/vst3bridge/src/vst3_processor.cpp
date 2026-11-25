@@ -1942,7 +1942,12 @@ daux_detect_editor_runtime(const std::string &plugin_path) {
   static const wchar_t *kBaseRel[] = {
       L"", // bundle root
       L"Contents\\Resources",
+#if defined(_WIN64)
       L"Contents\\x86_64-win",
+#else
+      // The 32-bit plug-in bridge loads a bundle's 32-bit build.
+      L"Contents\\x86-win",
+#endif
       L"Contents\\Resources\\WebView2",
       L"Contents\\Resources\\CEF",
       L"Contents\\Resources\\Chromium",
@@ -5892,6 +5897,15 @@ daux_append_parameter_json(Steinberg::Vst::IEditController *controller,
   const bool read_only =
       (info.flags & Steinberg::Vst::ParameterInfo::kIsReadOnly) != 0;
   const double value_normalized = controller->getParamNormalized(info.id);
+  // The plug-in's own rendering of the current value ("1.00 kHz", "+3.0 dB",
+  // "Bell"): the only portable way to read a plain value, since a VST3's
+  // normalized-to-plain mapping is its own.
+  std::string value_text;
+  Steinberg::Vst::String128 text{};
+  if (controller->getParamStringByValue(info.id, value_normalized, text) ==
+      Steinberg::kResultOk) {
+    value_text = vst3_tchar_to_utf8(text);
+  }
 
   std::string json = "{";
   json += "\"id\":" + std::to_string(info.id) + ",";
@@ -5902,7 +5916,8 @@ daux_append_parameter_json(Steinberg::Vst::IEditController *controller,
       std::string("\"automatable\":") + (automatable ? "true" : "false") + ",";
   json += std::string("\"hidden\":") + (hidden ? "true" : "false") + ",";
   json += std::string("\"read_only\":") + (read_only ? "true" : "false") + ",";
-  json += "\"value_normalized\":" + std::to_string(value_normalized);
+  json += "\"value_normalized\":" + std::to_string(value_normalized) + ",";
+  json += "\"value_text\":" + daux_json_escape(value_text);
   json += "}";
   return json;
 }

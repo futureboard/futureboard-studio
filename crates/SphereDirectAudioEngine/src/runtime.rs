@@ -85,6 +85,10 @@ mod midi;
 pub use self::midi::*;
 mod midi_build;
 pub use self::midi_build::*;
+mod midi_fx;
+pub use self::midi_fx::*;
+mod midi_fx_plugin;
+pub use self::midi_fx_plugin::RuntimeMidiFxPlugins;
 mod solo;
 pub(crate) use self::solo::*;
 mod project_buffers;
@@ -187,6 +191,15 @@ pub struct RuntimeProject {
     /// Times the audio thread has recomputed the compensation plan
     /// ([`Self::refresh_runtime_latency_graph`]). Diagnostics only.
     pub latency_replan_count: u64,
+    /// The compensation plan needs longer delay lines than the control thread
+    /// reserved, so some tracks play uncompensated. Set and cleared by
+    /// [`Self::refresh_runtime_latency_graph`]; the callback publishes it as
+    /// [`crate::engine::SharedState::pdc_rings_short`] for the control thread
+    /// to rebuild the graph with lines long enough.
+    pub pdc_rings_short: bool,
+    /// Low-latency monitoring has an insert out of a live path, so the next
+    /// [`Self::apply_low_latency_monitoring`] has to run even when it is off.
+    pub low_latency_bypass_any: bool,
     /// When set, the render path ramps track/master fader gains across each block
     /// toward their target. Playback and offline export enable this so fader
     /// automation follows the same envelope. See `apply_fader`.

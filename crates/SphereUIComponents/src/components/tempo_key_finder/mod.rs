@@ -1335,7 +1335,7 @@ pub fn open_tempo_key_finder_window(
     options.window_background = WindowBackgroundAppearance::Opaque;
     options.window_min_size = Some(size(px(MIN_WIDTH), px(MIN_HEIGHT)));
     apply_owner_display(&mut options, owner_bounds, cx);
-    cx.open_window(options, move |window, cx| {
+    crate::dialog_frame::open_dialog_window(cx, options, move |window, cx| {
         let view = cx.new(|cx| {
             let mut finder = TempoKeyFinderWindow::new(target, callbacks, cx);
             finder._activation = Some(cx.observe_window_activation(window, |this, window, cx| {

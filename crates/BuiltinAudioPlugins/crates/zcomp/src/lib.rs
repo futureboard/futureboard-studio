@@ -11,8 +11,8 @@
 //! schema, metering, and the [`StereoEffect`] wiring the host sees.
 
 use builtin_dsp_core::{
-    db_to_linear, mix, time_constant, ParamDescriptor, PluginCategory, PluginDescriptor,
-    StereoEffect,
+    ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, db_to_linear, mix,
+    time_constant,
 };
 use serde::{Deserialize, Serialize};
 
@@ -21,12 +21,12 @@ pub mod ipc;
 pub mod presets;
 pub mod ui;
 
-pub use dsp::{curve_reduction_db, model_coeffs, CellFrame, ModelCoeffs};
-pub use ipc::{ui_param_id, ui_param_index, UI_PARAM_IDS};
-pub use presets::{factory_presets, FactoryPreset};
+pub use dsp::{CellFrame, ModelCoeffs, curve_reduction_db, model_coeffs};
+pub use ipc::{UI_PARAM_IDS, ui_param_id, ui_param_index};
+pub use presets::{FactoryPreset, factory_presets};
 
-use builtin_dsp_core::delay::{smoothing_step, Smoothed};
-use dsp::{glide, GainCell};
+use builtin_dsp_core::delay::{Smoothed, smoothing_step};
+use dsp::{GainCell, glide};
 
 pub const PLUGIN_ID: &str = "futureboard.zcomp";
 

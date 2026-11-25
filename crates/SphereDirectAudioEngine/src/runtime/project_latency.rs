@@ -16,6 +16,175 @@ impl RuntimeProject {
         self.ensure_pdc_delay_capacity();
     }
 
+    /// Plan again with the latency the attached plug-ins report now. Control
+    /// thread only: it allocates.
+    ///
+    /// `build` plans before the bridge sinks are attached, so a fresh graph
+    /// counted every bridged insert as latency-free. The audio thread then
+    /// found the real latency on its first blocks and replanned there: every
+    /// compensated track's delay jumped right after the swap, and when the
+    /// real path no longer fitted the rings `build` had reserved, those tracks
+    /// went uncompensated until the next swap, which planned the same way
+    /// again. Planned here, with the sinks in place and the stream's period,
+    /// the audio thread's refresh finds nothing to change.
+    pub fn plan_latency_with_attached_plugins(&mut self, bridge_period_frames: u32) {
+        if bridge_period_frames == 0 {
+            return;
+        }
+        self.bridge_period_frames = bridge_period_frames;
+        for track in &mut self.tracks {
+            track.plugin_latency_samples =
+                Self::observe_track_latency_samples(track, bridge_period_frames);
+        }
+        self.plan_latency_and_pdc();
+    }
+
+    /// Low-latency monitoring: take every effect whose own latency is over
+    /// `limit_samples` out of the paths a performer hears live — each armed or
+    /// input-monitoring track, the buses its output runs through and the
+    /// master — so what they play is not held back behind a lookahead limiter
+    /// or a linear-phase EQ. `0` turns it off. Audio thread, once per
+    /// callback; allocation-free, and free when off with nothing taken out.
+    ///
+    /// The limit is compared with what the plug-in itself reports, not with
+    /// the bridge's one-block handshake every hosted plug-in shares: counted,
+    /// a limit under the device buffer would take out every plug-in at once.
+    /// Instruments stay, or an armed instrument track would go silent. An
+    /// insert taken out is neither processed nor counted as latency, so delay
+    /// compensation replans without it, and both come back the callback after
+    /// its track stops being live.
+    pub fn apply_low_latency_monitoring(&mut self, limit_samples: u32) {
+        if limit_samples == 0 && !self.low_latency_bypass_any {
+            return;
+        }
+        for track in &mut self.tracks {
+            for insert in &mut track.inserts {
+                insert.latency_bypassed = false;
+            }
+        }
+        self.low_latency_bypass_any = false;
+        if limit_samples == 0 {
+            return;
+        }
+        let count = self.tracks.len();
+        let master = self.audio_graph.master_index;
+        let mut any_live = false;
+        for start in 0..count {
+            let live = {
+                let track = &self.tracks[start];
+                track.record_armed || track.monitor_enabled
+            };
+            if !live {
+                continue;
+            }
+            any_live = true;
+            // Along the track's output to the master, a bounded walk.
+            let mut at = Some(start);
+            let mut hops = 0;
+            while let Some(index) = at {
+                if hops >= count {
+                    break;
+                }
+                hops += 1;
+                self.low_latency_bypass_any |=
+                    Self::take_latency_out(&mut self.tracks[index], limit_samples);
+                at = self.tracks[index].output_track_index;
+            }
+        }
+        if any_live {
+            if let Some(master) = master.filter(|master| *master < count) {
+                self.low_latency_bypass_any |=
+                    Self::take_latency_out(&mut self.tracks[master], limit_samples);
+            }
+        }
+    }
+
+    /// Mark the effects on `track` whose own latency is over `limit`.
+    /// Returns whether it marked any.
+    fn take_latency_out(track: &mut RuntimeTrack, limit: u32) -> bool {
+        let instrument = track.midi_instrument_insert_ix;
+        let mut any = false;
+        for (index, insert) in track.inserts.iter_mut().enumerate() {
+            if !insert.enabled {
+                continue;
+            }
+            let own = if insert.kind_tag == RuntimeInsertKind::ExternalBridge {
+                if !insert.bridge_is_effect {
+                    continue;
+                }
+                insert
+                    .bridge_sink
+                    .as_ref()
+                    .map_or(0, |sink| sink.reported_latency_samples())
+            } else {
+                if Some(index) == instrument {
+                    continue;
+                }
+                insert
+                    .vst3
+                    .as_ref()
+                    .filter(|vst3| vst3.is_ready())
+                    .map_or(0, |vst3| vst3.get_latency_samples().max(0) as u32)
+            };
+            if own > limit {
+                insert.latency_bypassed = true;
+                any = true;
+            }
+        }
+        any
+    }
+
+    /// Carry the delay compensation history of `previous` into this graph at
+    /// a swap. Audio thread, at the swap; copies, allocates nothing.
+    ///
+    /// A rebuilt graph's rings start empty, so every compensated track and
+    /// send used to play its delay's worth of silence after any edit made
+    /// during playback (an insert added, a route or a clip's gain changed): a
+    /// gap on most of the mix. The audio feeding a ring is the same stream
+    /// before and after the swap, so the new ring takes the newest samples the
+    /// old one holds for the same track (and the same send), as many as its
+    /// own delay reads back.
+    pub fn inherit_pdc_delay_lines(&mut self, previous: &RuntimeProject) {
+        let plan = &self.latency_graph;
+        for (index, track) in self.tracks.iter_mut().enumerate() {
+            // Tracks keep their places across most edits: check that first.
+            let old = match previous.tracks.get(index) {
+                Some(old) if old.id == track.id => old,
+                _ => match previous.tracks.iter().find(|old| old.id == track.id) {
+                    Some(old) => old,
+                    None => continue,
+                },
+            };
+            let delay = plan.track_pdc_delay.get(index).copied().unwrap_or(0) as usize;
+            carry_pdc_history(
+                (&old.pdc_delay_l, &old.pdc_delay_r, old.pdc_write_pos),
+                (
+                    &mut track.pdc_delay_l,
+                    &mut track.pdc_delay_r,
+                    &mut track.pdc_write_pos,
+                ),
+                delay,
+            );
+            for (send_index, send) in track.sends.iter_mut().enumerate() {
+                let Some(old_send) = old.sends.iter().find(|old| old.id == send.id) else {
+                    continue;
+                };
+                let delay = plan
+                    .send_pdc_delay
+                    .get(index)
+                    .and_then(|row| row.get(send_index))
+                    .copied()
+                    .unwrap_or(0) as usize;
+                let line = &mut send.pdc;
+                carry_pdc_history(
+                    (&old_send.pdc.l, &old_send.pdc.r, old_send.pdc.write_pos),
+                    (&mut line.l, &mut line.r, &mut line.write_pos),
+                    delay,
+                );
+            }
+        }
+    }
+
     /// Latency the track's own strip contributes, observed from the live
     /// processors (bridged inserts add the one-block handshake at the
     /// configured `bridge_period_frames` on top of what the host reports).
@@ -31,11 +200,14 @@ impl RuntimeProject {
     ) -> u32 {
         // The built-in Soundfont Player sits ahead of the inserts, so its
         // decimation delay is part of the track's path either way.
+        // Hosted MIDI FX hand the instrument its notes a bridge period late
+        // (plus whatever the plug-in reports), so they delay the whole track.
         let instrument = track
             .soundfont_player
             .as_ref()
             .map(RuntimeSoundfontPlayer::latency_samples)
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .saturating_add(track.midi_fx_plugins.latency_samples(bridge_period_frames));
         if track.inserts.is_empty() {
             return track.plugin_latency_samples.max(instrument);
         }
@@ -49,10 +221,11 @@ impl RuntimeProject {
         })
     }
 
-    /// Latency one insert adds to its track, or 0 while it is disabled.
+    /// Latency one insert adds to its track, or 0 while it is disabled or
+    /// out of a live path ([`RuntimeInsert::counts_latency`]).
     #[inline]
     pub(super) fn insert_latency_samples(insert: &RuntimeInsert, bridge_period_frames: u32) -> u32 {
-        if !insert.enabled {
+        if !insert.counts_latency() {
             return 0;
         }
         // A sidechain whose key arrives late delays the insert's main input
@@ -91,6 +264,7 @@ impl RuntimeProject {
             .as_ref()
             .map(RuntimeSoundfontPlayer::latency_samples)
             .unwrap_or(0)
+            .saturating_add(track.midi_fx_plugins.latency_samples(bridge_period_frames))
             .saturating_add(track.ara_latency_samples);
         for insert in &mut track.inserts {
             chain =
@@ -372,6 +546,7 @@ impl RuntimeProject {
         );
         self.latency_replan_count = self.latency_replan_count.wrapping_add(1);
         let refitted = self.fit_pdc_delay_capacity_realtime();
+        self.pdc_rings_short = !refitted;
 
         if pdc_debug_enabled() {
             if !refitted {
@@ -397,4 +572,30 @@ impl RuntimeProject {
         }
         true
     }
+}
+
+/// Copy the newest `wanted` samples a PDC ring holds into a fresh ring, so
+/// that a read `d` samples back (`d <= wanted`) in the new ring finds what the
+/// old ring was written `d` samples ago. The samples land, oldest first, at
+/// the end of the new ring, and its write cursor goes to the start. Rings too
+/// short for `wanted` carry what they can. Allocation-free.
+fn carry_pdc_history(
+    (old_l, old_r, old_write): (&[f32], &[f32], usize),
+    (new_l, new_r, new_write): (&mut [f32], &mut [f32], &mut usize),
+    wanted: usize,
+) {
+    let old_len = old_l.len().min(old_r.len());
+    let new_len = new_l.len().min(new_r.len());
+    let count = wanted.min(old_len).min(new_len);
+    if count == 0 {
+        return;
+    }
+    let newest_end = old_write % old_len;
+    for k in 0..count {
+        let from = (newest_end + old_len - count + k) % old_len;
+        let to = new_len - count + k;
+        new_l[to] = old_l[from];
+        new_r[to] = old_r[from];
+    }
+    *new_write = 0;
 }

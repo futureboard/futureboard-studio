@@ -26,8 +26,9 @@ pub struct SendSlotState {
     /// from the track list on render).
     pub target_name: String,
     pub enabled: bool,
-    /// `true` = tap before the source track fader; `false` = post-fader.
-    /// Realtime currently honours post-fader only (pre-fader is a refinement).
+    /// `true` = tap before the source track fader (after its pre-fader
+    /// inserts); `false` = post-fader (after its post-fader inserts). The
+    /// engine taps each where it says.
     pub pre_fader: bool,
     pub gain_db: f32,
     /// Created for a Rodhareist wet/dry/wet split. Ordinary sends are `false`,
@@ -448,6 +449,31 @@ impl TimelineState {
         }
     }
 
+    /// [`Self::effective_instrument_track_id`] for a track already in hand,
+    /// resolving its target through `index_by_id` (from
+    /// [`Self::track_index_by_id`]). For passes over every track: the lookup
+    /// by id is a scan, and a scan per track made those passes quadratic.
+    pub fn effective_instrument_indexed<'a>(
+        &'a self,
+        track: &'a TrackState,
+        index_by_id: &std::collections::HashMap<&str, usize>,
+    ) -> Option<&'a str> {
+        match track.track_type {
+            TrackType::Instrument => Some(track.id.as_str()),
+            TrackType::Midi => match &track.routing.output {
+                TrackOutputRouting::Instrument {
+                    track_id: target_id,
+                } => index_by_id
+                    .get(target_id.as_str())
+                    .and_then(|&index| self.tracks.get(index))
+                    .filter(|target| target.track_type == TrackType::Instrument)
+                    .map(|target| target.id.as_str()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     pub fn set_track_output_routing(&mut self, track_id: &str, output: TrackOutputRouting) -> bool {
         if let Some(t) = self.tracks.iter_mut().find(|t| t.id == track_id) {
             if t.routing.output != output {
@@ -800,6 +826,26 @@ impl TimelineState {
             track_id,
             |target| matches!(target, AutomationTarget::SendLevel { send_id: id } if id == send_id),
         );
+        true
+    }
+
+    /// Tap a send before (`true`) or after (`false`) its track's fader.
+    /// Refuses a wet/dry/wet split send, which is post-fader by design: its
+    /// return replaces part of the channel's own output. Returns whether it
+    /// changed.
+    pub fn set_send_pre_fader(&mut self, track_id: &str, send_id: &str, pre_fader: bool) -> bool {
+        let Some(send) = self
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == track_id)
+            .and_then(|track| track.sends.iter_mut().find(|send| send.id == send_id))
+        else {
+            return false;
+        };
+        if send.wdw || send.pre_fader == pre_fader {
+            return false;
+        }
+        send.pre_fader = pre_fader;
         true
     }
 
@@ -1623,6 +1669,91 @@ mod tests {
         );
         assert!(state.set_insert_signal_bus(&audio, &vst, InsertSignalBus::Main));
         assert!(!state.set_insert_signal_bus(&audio, &slot_id, InsertSignalBus::Wdw));
+    }
+
+    /// An insert moved after the fader joins the front of the post-fader
+    /// group; one moved back ends the pre-fader group. An instrument, or an
+    /// insert already where it is asked to go, refuses.
+    #[test]
+    fn inserts_move_after_the_fader_and_back_keeping_the_chain_grouped() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let audio = create_track(&mut state, TrackType::Audio, "Vox");
+        let ids: Vec<String> = (0..3)
+            .map(|_| {
+                let id = state.add_insert(&audio).expect("insert");
+                let slot = state
+                    .insert_slots_mut(&audio)
+                    .unwrap()
+                    .iter_mut()
+                    .find(|slot| slot.id == id)
+                    .unwrap();
+                slot.plugin_id = Some("vst3:test".to_string());
+                slot.plugin_format = Some(InsertPluginFormat::Vst3);
+                slot.plugin_is_instrument = Some(false);
+                id
+            })
+            .collect();
+        let order = |state: &TimelineState| -> Vec<(String, bool)> {
+            state
+                .insert_slots(&audio)
+                .unwrap()
+                .iter()
+                .map(|slot| (slot.id.clone(), slot.post_fader))
+                .collect()
+        };
+        let at = |i: usize, post: bool| (ids[i].clone(), post);
+
+        assert!(state.set_insert_post_fader(&audio, &ids[0], true));
+        assert_eq!(order(&state), vec![at(1, false), at(2, false), at(0, true)]);
+        assert!(state.set_insert_post_fader(&audio, &ids[1], true));
+        assert_eq!(order(&state), vec![at(2, false), at(1, true), at(0, true)]);
+        assert!(
+            !state.set_insert_post_fader(&audio, &ids[1], true),
+            "already there"
+        );
+        assert!(state.set_insert_post_fader(&audio, &ids[0], false));
+        assert_eq!(order(&state), vec![at(2, false), at(0, false), at(1, true)]);
+
+        state
+            .insert_slots_mut(&audio)
+            .unwrap()
+            .iter_mut()
+            .find(|slot| slot.id == ids[2])
+            .unwrap()
+            .plugin_is_instrument = Some(true);
+        assert!(
+            !state.set_insert_post_fader(&audio, &ids[2], true),
+            "an instrument makes the signal; it has no place after its fader"
+        );
+    }
+
+    /// A send switches between its pre- and post-fader taps; a wet/dry/wet
+    /// split send refuses to leave post-fader.
+    #[test]
+    fn a_send_switches_pre_and_post_but_a_split_send_stays_post() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let audio = create_track(&mut state, TrackType::Audio, "Vox");
+        let verb = create_track(&mut state, TrackType::Return, "Verb");
+        let send = state.add_send_to_target(&audio, &verb).expect("send");
+        let pre = |state: &TimelineState| state.find_track(&audio).unwrap().sends[0].pre_fader;
+
+        assert!(state.set_send_pre_fader(&audio, &send, true));
+        assert!(pre(&state));
+        assert!(!state.set_send_pre_fader(&audio, &send, true), "no change");
+        assert!(state.set_send_pre_fader(&audio, &send, false));
+        assert!(!pre(&state));
+
+        state
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == audio)
+            .unwrap()
+            .sends[0]
+            .wdw = true;
+        assert!(!state.set_send_pre_fader(&audio, &send, true));
+        assert!(!pre(&state));
     }
 
     /// The sidechain picker offers every other track but those the insert's

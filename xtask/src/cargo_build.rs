@@ -3,7 +3,7 @@
 //! We never assume `target/<profile>/FutureboardNative.exe`. Cargo is run with
 //! `--message-format=json-render-diagnostics`; the emitted `compiler-artifact`
 //! messages tell us exactly where each binary landed, which keeps working across
-//! custom target triples, profiles and per-edition target directories.
+//! custom target triples, profiles and target directories.
 //!
 //! The application ships more than one executable: at runtime
 //! `FutureboardNative.exe` spawns two sidecar processes it resolves *next to
@@ -25,7 +25,10 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, anyhow, bail};
 use cargo_metadata::{Artifact, Message};
 
-use crate::platform::{Edition, dynamic_library_extension, host_target};
+use crate::platform::{
+    PROFESSIONAL_FEATURES, TARGET_DIR, dynamic_library_extension, host_target,
+    includes_professional, requires_asio_toolchain,
+};
 use crate::{crashpad, jobs, toolchain};
 
 /// The Futureboard workspace root (xtask lives at `<root>/xtask`).
@@ -34,13 +37,6 @@ fn workspace_root() -> PathBuf {
         .parent()
         .expect("xtask must live under the workspace root")
         .to_path_buf()
-}
-
-/// Whether the build targets Windows, where ASIO exists at all.
-fn target_is_windows(target: Option<&str>) -> bool {
-    target
-        .map(|triple| triple.contains("windows"))
-        .unwrap_or(cfg!(target_os = "windows"))
 }
 
 /// The application package and its primary binary.
@@ -84,24 +80,23 @@ pub struct BuildOutput {
     /// The SHA-256-verified Crashpad prebuilt this build linked, for targets
     /// that use one. Packaging checks the staged handler against it.
     pub crashpad_prebuilt: Option<crashpad::Prebuilt>,
+    /// Whether the Professional code was compiled in (see
+    /// [`includes_professional`]).
+    pub professional: bool,
 }
 
-/// Build the application and its sidecars for the requested profile / target /
-/// edition, returning the actual executable paths parsed from Cargo's output.
-pub fn build(
-    profile: &str,
-    target: Option<&str>,
-    edition: Edition,
-    cef_path: Option<&Path>,
-) -> Result<BuildOutput> {
+/// Build the application and its sidecars for the requested profile / target,
+/// returning the actual executable paths parsed from Cargo's output.
+pub fn build(profile: &str, target: Option<&str>, cef_path: Option<&Path>) -> Result<BuildOutput> {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let workspace = workspace_root();
-    let target_dir = workspace.join(edition.target_dir());
+    let target_dir = workspace.join(TARGET_DIR);
     let target_triple = match target {
         Some(target) => target.to_owned(),
         None => host_target()?,
     };
     let target_is_macos = target_triple.ends_with("apple-darwin");
+    let professional = includes_professional(&workspace, &target_triple);
 
     let mut command = Command::new(&cargo);
     command
@@ -110,7 +105,7 @@ pub fn build(
         // `CARGO_TARGET_DIR`. Crashpad's prebuilt setup uses that environment
         // variable when copying crashpad_handler, so keep both paths explicit
         // and identical or the handler lands under apps/native/target instead
-        // of the edition target used by the package.
+        // of the target used by the package.
         .env("CARGO_TARGET_DIR", &target_dir)
         .arg("build")
         .arg("--message-format=json-render-diagnostics")
@@ -183,25 +178,31 @@ pub fn build(
         command.env("CEF_PATH", cef_path);
     }
 
-    // The Professional build compiles `asio-sys`, which needs the Steinberg SDK
-    // and libclang. Resolving them here — rather than letting `asio-sys` fetch
-    // the SDK into %TEMP% — is what stops a half-extracted download from being
-    // compiled against forever after.
-    if edition == Edition::Professional && target_is_windows(target) {
-        toolchain::prepare_professional(&workspace_root())?.apply(&mut command);
+    // Windows Professional code compiles `asio-sys`, which needs the Steinberg
+    // SDK and libclang. Resolving them here — rather than letting `asio-sys`
+    // fetch the SDK into %TEMP% — is what stops a half-extracted download from
+    // being compiled against forever after. Linux uses the same Professional
+    // feature and does not compile `asio-sys`.
+    if professional && requires_asio_toolchain(&target_triple) {
+        toolchain::prepare_professional(&workspace)?.apply(&mut command);
     }
 
-    // Merge the edition features with the sidecar bin features into one
+    // Merge the Professional features with the sidecar bin features into one
     // `--features`, so a single build graph unifies shared-dependency features
     // (no rebuild thrash between the app and its sidecars).
-    let features = merged_features(edition);
+    let features = merged_features(professional);
     if !features.is_empty() {
         command.args(["--features", &features]);
     }
 
     eprintln!(
-        "[xtask] building {APP_BINARY} + sidecars (edition={edition}, profile={profile}, target={})",
-        target.unwrap_or("<host>")
+        "[xtask] building {APP_BINARY} + sidecars (profile={profile}, target={}, professional code: {})",
+        target.unwrap_or("<host>"),
+        if professional {
+            "included"
+        } else {
+            "not in this checkout"
+        }
     );
 
     // Artifacts arrive as JSON on stdout; let rendered diagnostics/progress
@@ -275,6 +276,7 @@ pub fn build(
         sidecar_executables,
         cef_helper_executable,
         crashpad_prebuilt,
+        professional,
     })
 }
 
@@ -517,7 +519,7 @@ fn reset_stale_cef_wrapper(
 
     // `cargo clean --package` can leave a CMake/Ninja build tree behind when
     // the build script failed before Cargo recorded its output. Remove only
-    // direct `cef-dll-sys-*` directories under this edition/profile cache so
+    // direct `cef-dll-sys-*` directories under this profile cache so
     // the next CMake configure regenerates compiler and archive rules.
     for cef_build_dir in cef_build_dirs {
         if cef_build_dir.parent() != Some(build_dir.as_path())
@@ -597,12 +599,12 @@ fn is_gnu_llvm_archiver(archiver: &str) -> bool {
     matches!(name.as_str(), "llvm-ar" | "llvm-ar.exe")
 }
 
-/// Comma-joined `--features` value combining edition features (if any) with the
-/// sidecar bin features.
-fn merged_features(edition: Edition) -> String {
+/// Comma-joined `--features` value combining the Professional features (when
+/// compiled in) with the sidecar bin features.
+fn merged_features(professional: bool) -> String {
     let mut features: Vec<&str> = Vec::new();
-    if let Some(edition_features) = edition.cargo_features() {
-        features.push(edition_features);
+    if professional {
+        features.push(PROFESSIONAL_FEATURES);
     }
     features.extend_from_slice(SIDECAR_FEATURES);
     features.join(",")
@@ -720,17 +722,17 @@ mod tests {
     }
 
     #[test]
-    fn community_features_are_sidecar_only() {
+    fn without_professional_code_the_features_are_sidecar_only() {
         assert_eq!(
-            merged_features(Edition::Community),
+            merged_features(false),
             "sphere-plugin-host/plugin-host-bin,sphere-plugin-host/plugin-scanner-bin"
         );
     }
 
     #[test]
-    fn professional_features_prepend_edition_flags() {
+    fn professional_code_prepends_its_features() {
         assert_eq!(
-            merged_features(Edition::Professional),
+            merged_features(true),
             "futureboard_native/professional,sphere_directaudioengine/asio,\
 sphere-plugin-host/plugin-host-bin,sphere-plugin-host/plugin-scanner-bin"
         );

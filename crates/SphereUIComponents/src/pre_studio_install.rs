@@ -284,6 +284,7 @@ fn restore_bridge_target(
         class_id: slot.plugin_id.clone().unwrap_or_default(),
         display_name: slot.display_name.clone(),
         format: slot.plugin_format.map(|f| f.label().to_string()),
+        engine_reads_midi_out: false,
     };
 
     let Ok(mut bridge) = runtime.lock() else {

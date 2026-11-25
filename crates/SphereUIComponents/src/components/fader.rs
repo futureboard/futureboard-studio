@@ -39,6 +39,12 @@ const HORIZONTAL_THUMB_H: f32 = 22.0;
 const HORIZONTAL_RAIL_CENTER_Y: f32 = HORIZONTAL_FADER_HEIGHT / 2.0;
 const HORIZONTAL_RAIL_H: f32 = 2.0;
 const HORIZONTAL_ACCENT_LINE_W: f32 = 2.0;
+/// The slim level bar: a 4 px groove with a round 10 px cap, in a 16 px band
+/// the drag listens on.
+pub const SLIM_FADER_HEIGHT: f32 = 16.0;
+const SLIM_THUMB: f32 = 10.0;
+const SLIM_RAIL_H: f32 = 4.0;
+const SLIM_UNITY_TICK_H: f32 = 8.0;
 
 #[derive(Clone, Debug)]
 pub struct FaderDrag {
@@ -611,8 +617,8 @@ pub fn fader_with_drag_callbacks(
         })
 }
 
-/// Mixer-style fader rotated for compact horizontal surfaces such as a
-/// TrackHeader. Drag lifecycle matches [`fader_with_drag_callbacks`].
+/// Mixer-style fader rotated for compact horizontal surfaces. Drag lifecycle
+/// matches [`fader_with_drag_callbacks`].
 pub fn horizontal_fader_with_drag_callbacks(
     id: impl Into<gpui::SharedString>,
     value_norm: f32,
@@ -622,18 +628,142 @@ pub fn horizontal_fader_with_drag_callbacks(
     on_drag_commit: Option<impl Fn(&mut Window, &mut App) + 'static>,
     on_double_click_reset: Option<impl Fn(&mut Window, &mut App) + 'static>,
 ) -> impl IntoElement {
-    let id_str: gpui::SharedString = id.into();
-    let id_string = id_str.to_string();
     let value = value_norm.clamp(0.0, 1.0);
+    horizontal_drag_surface(
+        id.into(),
+        value,
+        HorizontalGeometry {
+            height: HORIZONTAL_FADER_HEIGHT,
+            thumb_w: HORIZONTAL_THUMB_W,
+            min_w: 36.0,
+        },
+        horizontal_fader_rail(value, accent),
+        on_drag_start,
+        on_drag_preview,
+        on_drag_commit,
+        on_double_click_reset,
+    )
+}
+
+/// A slim level bar for dense rows such as a track header: a 4 px groove
+/// filled to the level, a tick at unity, and a round cap. Same drag as the
+/// mixer fader: relative travel, Shift for fine steps, double-click or
+/// Alt-click back to unity.
+pub fn slim_horizontal_fader_with_drag_callbacks(
+    id: impl Into<gpui::SharedString>,
+    value_norm: f32,
+    accent: gpui::Rgba,
+    on_drag_start: Option<impl Fn(&f32, &mut Window, &mut App) + 'static>,
+    on_drag_preview: Option<impl Fn(&f32, &mut Window, &mut App) + 'static>,
+    on_drag_commit: Option<impl Fn(&mut Window, &mut App) + 'static>,
+    on_double_click_reset: Option<impl Fn(&mut Window, &mut App) + 'static>,
+) -> impl IntoElement {
+    let value = value_norm.clamp(0.0, 1.0);
+    horizontal_drag_surface(
+        id.into(),
+        value,
+        HorizontalGeometry {
+            height: SLIM_FADER_HEIGHT,
+            thumb_w: SLIM_THUMB,
+            min_w: 36.0,
+        },
+        slim_fader_rail(value, accent),
+        on_drag_start,
+        on_drag_preview,
+        on_drag_commit,
+        on_double_click_reset,
+    )
+}
+
+/// The slim bar's drawing: groove, level fill, unity tick and cap, all along
+/// the cap's travel (inset by half the cap) so the fill ends under its centre.
+fn slim_fader_rail(value: f32, accent: gpui::Rgba) -> gpui::Div {
+    let inset = SLIM_THUMB / 2.0;
+    let mid = SLIM_FADER_HEIGHT / 2.0;
+    div().relative().w_full().h(px(SLIM_FADER_HEIGHT)).child(
+        div()
+            .absolute()
+            .left(px(inset))
+            .right(px(inset))
+            .top_0()
+            .bottom_0()
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .top(px(mid - SLIM_RAIL_H / 2.0))
+                    .h(px(SLIM_RAIL_H))
+                    .rounded(px(crate::theme::radius::PILL))
+                    .bg(Colors::fader_rail())
+                    .child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .top_0()
+                            .bottom_0()
+                            .w(relative(value))
+                            .rounded(px(crate::theme::radius::PILL))
+                            .bg(Colors::with_alpha(accent, 0.85)),
+                    ),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(relative(volume::db_to_norm(0.0)))
+                    .ml(-px(0.5))
+                    .top(px(mid - SLIM_UNITY_TICK_H / 2.0))
+                    .w(px(1.0))
+                    .h(px(SLIM_UNITY_TICK_H))
+                    .bg(Colors::with_alpha(Colors::fader_tick(), 0.7)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(relative(value))
+                    .ml(-px(SLIM_THUMB / 2.0))
+                    .top(px(mid - SLIM_THUMB / 2.0))
+                    .size(px(SLIM_THUMB))
+                    .rounded(px(crate::theme::radius::PILL))
+                    .bg(Colors::surface_raised())
+                    .border(px(1.0))
+                    .border_color(Colors::fader_thumb_border()),
+            ),
+    )
+}
+
+/// Size of a horizontal drag surface: its height, the cap width its travel is
+/// inset by, and how narrow it may get.
+struct HorizontalGeometry {
+    height: f32,
+    thumb_w: f32,
+    min_w: f32,
+}
+
+/// The drag behaviour every horizontal fader shares, around whatever `rail`
+/// draws it.
+#[allow(clippy::too_many_arguments)]
+fn horizontal_drag_surface(
+    id: gpui::SharedString,
+    value: f32,
+    geometry: HorizontalGeometry,
+    rail: gpui::Div,
+    on_drag_start: Option<impl Fn(&f32, &mut Window, &mut App) + 'static>,
+    on_drag_preview: Option<impl Fn(&f32, &mut Window, &mut App) + 'static>,
+    on_drag_commit: Option<impl Fn(&mut Window, &mut App) + 'static>,
+    on_double_click_reset: Option<impl Fn(&mut Window, &mut App) + 'static>,
+) -> impl IntoElement {
+    let id_string = id.to_string();
+    let thumb_w = geometry.thumb_w;
 
     div()
-        .id(gpui::ElementId::Name(id_str))
-        .h(px(HORIZONTAL_FADER_HEIGHT))
+        .id(gpui::ElementId::Name(id))
+        .h(px(geometry.height))
         .flex_1()
-        .min_w(px(36.0))
+        .min_w(px(geometry.min_w))
         .relative()
         .cursor(gpui::CursorStyle::ResizeLeftRight)
-        .child(horizontal_fader_rail(value, accent))
+        .child(rail)
         .on_drag(
             FaderDrag::new(id_string.clone()),
             move |drag, _offset, window, cx| {
@@ -657,7 +787,7 @@ pub fn horizontal_fader_with_drag_callbacks(
                 return;
             }
             let x: f32 = event.event.position.x.into();
-            let span = fader_drag_span(f32::from(event.bounds.size.width) - HORIZONTAL_THUMB_W);
+            let span = fader_drag_span(f32::from(event.bounds.size.width) - thumb_w);
             let new_value = drag_to(drag, value, x, event.event.modifiers.shift, span, |dx| dx);
             if fader_map_debug_enabled() {
                 eprintln!(

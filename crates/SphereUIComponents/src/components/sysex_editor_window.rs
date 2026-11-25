@@ -1170,7 +1170,7 @@ pub fn open_sysex_editor_window(
     options.window_background = WindowBackgroundAppearance::Opaque;
     options.window_min_size = Some(size(px(480.0), px(380.0)));
     apply_owner_display(&mut options, owner_bounds, cx);
-    cx.open_window(options, move |_window, cx| {
+    crate::dialog_frame::open_dialog_window(cx, options, move |_window, cx| {
         let view = cx.new(|cx| SysExEditorView::new(timeline, cx));
         cx.new(|_| SysExEditorWindow { view, on_close })
     })

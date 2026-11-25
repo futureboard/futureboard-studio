@@ -40,6 +40,37 @@ impl Default for PickerFilter {
     }
 }
 
+/// Where a plug-in comes from: Futureboard's own, or a plug-in format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginSource {
+    Builtin,
+    Format(PluginFormat),
+}
+
+impl PluginSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Builtin => "Built-in",
+            Self::Format(format) => format.label(),
+        }
+    }
+
+    pub fn matches(self, plugin: &SpherePluginHost::RegistryPlugin) -> bool {
+        match self {
+            Self::Builtin => plugin.is_builtin(),
+            Self::Format(format) => !plugin.is_builtin() && plugin.format == format,
+        }
+    }
+}
+
+/// A chip above the list. Chips compose with the kind tab, the rail and the
+/// search; `None` clears that row of chips.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PickerFacet {
+    Source(Option<PluginSource>),
+    Category(Option<String>),
+}
+
 /// The kind tabs across the top of the picker. They compose with the rail, so
 /// "Favorites" under "Instruments" is the favourite instruments.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -69,7 +100,10 @@ pub struct PluginFilterState {
     pub kind: KindTab,
     pub sidebar: PickerFilter,
     pub format: Option<PluginFormat>,
+    /// The source chip (Built-in, VST3, CLAP…).
+    pub source: Option<PluginSource>,
     pub vendor: Option<String>,
+    /// The category chip, as a normalized category label.
     pub category: Option<String>,
 }
 
@@ -82,9 +116,6 @@ pub struct PluginPickerState {
     pub selected_id: Option<String>,
     pub highlighted_index: usize,
     pub show_details: bool,
-    /// Whether the rail's vendor list is unfolded. Folded by default: a
-    /// library with a few hundred vendors buried the rest of the rail.
-    pub vendors_expanded: bool,
 }
 
 impl PluginPickerState {
@@ -103,7 +134,6 @@ impl PluginPickerState {
             selected_id: None,
             highlighted_index: 0,
             show_details: true,
-            vendors_expanded: false,
         }
     }
 
@@ -134,14 +164,18 @@ impl PluginPickerState {
         sidebar_filter: PickerFilter,
         desired_kind: PluginInsertKind,
     ) -> Self {
-        // Kind is a tab now, not a rail entry: a caller asking for the
-        // instrument or effect rail gets that tab with the whole library under
-        // it.
-        let (kind, sidebar) = match sidebar_filter {
-            PickerFilter::Instruments => (KindTab::Instruments, PickerFilter::All),
-            PickerFilter::Effects => (KindTab::Effects, PickerFilter::All),
-            other => (KindTab::All, other),
-        };
+        // Kind is a tab and source/category are chips, not rail entries: a
+        // caller asking for one of those rails gets the tab or chip instead,
+        // with the whole library on the rail.
+        let mut filters = PluginFilterState::default();
+        match sidebar_filter {
+            PickerFilter::Instruments => filters.kind = KindTab::Instruments,
+            PickerFilter::Effects => filters.kind = KindTab::Effects,
+            PickerFilter::Builtin => filters.source = Some(PluginSource::Builtin),
+            PickerFilter::Format(format) => filters.source = Some(PluginSource::Format(format)),
+            PickerFilter::Category(category) => filters.category = Some(category),
+            other => filters.sidebar = other,
+        }
         Self {
             is_open: true,
             insert_target: PluginInsertTarget {
@@ -151,16 +185,11 @@ impl PluginPickerState {
                 next_slot_index,
                 desired_kind,
             },
-            filters: PluginFilterState {
-                kind,
-                sidebar,
-                ..PluginFilterState::default()
-            },
+            filters,
             query: String::new(),
             selected_id: None,
             highlighted_index: 0,
             show_details,
-            vendors_expanded: false,
         }
     }
 
@@ -183,6 +212,14 @@ impl PluginPickerState {
         if self.highlighted_index >= visible_len {
             self.highlighted_index = visible_len - 1;
         }
+    }
+
+    pub fn set_facet(&mut self, facet: PickerFacet) {
+        match facet {
+            PickerFacet::Source(source) => self.filters.source = source,
+            PickerFacet::Category(category) => self.filters.category = category,
+        }
+        self.reset_selection_for_filter_change();
     }
 
     pub fn set_sidebar_filter(&mut self, filter: PickerFilter) {
@@ -224,6 +261,28 @@ mod tests {
         );
         assert_eq!(state.filters.kind, KindTab::Instruments);
         assert_eq!(state.filters.sidebar, PickerFilter::All);
-        assert!(!state.vendors_expanded);
+    }
+
+    /// The rail no longer lists sources or categories; a caller asking for
+    /// one opens on the matching chip.
+    #[test]
+    fn a_source_or_category_request_opens_on_that_chip() {
+        let open = |filter| {
+            PluginPickerState::open_for_with_filter(
+                "t1",
+                "Bass",
+                TrackType::Audio,
+                0,
+                true,
+                filter,
+                PluginInsertKind::Effect,
+            )
+        };
+        let builtin = open(PickerFilter::Builtin);
+        assert_eq!(builtin.filters.source, Some(PluginSource::Builtin));
+        assert_eq!(builtin.filters.sidebar, PickerFilter::All);
+        let eq = open(PickerFilter::Category("EQ".into()));
+        assert_eq!(eq.filters.category.as_deref(), Some("EQ"));
+        assert_eq!(eq.filters.sidebar, PickerFilter::All);
     }
 }

@@ -110,6 +110,20 @@ pub fn snap_beat_against_meter(
     super::musical_snap::snap_beat(beats as f64, snap.to_musical(), bypass) as f32
 }
 
+/// [`snap_beat_against_meter`], but to the start of the cell `beats` falls in
+/// (see [`super::musical_snap::floor_beat`]): where a clip drawn by a click
+/// in a bar starts.
+pub fn cell_start_against_meter(
+    beats: f32,
+    snap: SnapSettings,
+    time_signature_map: &TimeSignatureMap,
+    bypass: bool,
+) -> f32 {
+    let mut snap = snap;
+    snap.beats_per_bar = time_signature_map.beats_per_bar_at_beat(beats as f64);
+    super::musical_snap::floor_beat(beats as f64, snap.to_musical(), bypass).max(0.0) as f32
+}
+
 /// Snap a song-axis beat for an automation lane through the shared
 /// meter-aware grid ([`super::musical_snap::MeterGrid`]) — the grid the piano
 /// roll's notes and controller lanes snap to. "1 Bar" lands on the bar lines
@@ -226,6 +240,11 @@ impl TimelineGestureContext {
 
     pub fn snap_beats_with_bypass(&self, beats: f32, bypass: bool) -> f32 {
         snap_beat_against_meter(beats, self.snap, &self.time_signature_map, bypass)
+    }
+
+    /// See [`cell_start_against_meter`].
+    pub fn cell_start_with_bypass(&self, beats: f32, bypass: bool) -> f32 {
+        cell_start_against_meter(beats, self.snap, &self.time_signature_map, bypass)
     }
 
     pub fn snap_time(&self, seconds: f32) -> f32 {
@@ -422,6 +441,16 @@ impl TimelineState {
     /// Snap a beat value, optionally bypassing the grid (Shift held during drag).
     pub fn snap_beats_with_bypass(&self, beats: f32, bypass: bool) -> f32 {
         snap_beat_against_meter(
+            beats,
+            SnapSettings::from_timeline(self),
+            &self.time_signature_map,
+            bypass,
+        )
+    }
+
+    /// See [`cell_start_against_meter`].
+    pub fn cell_start_with_bypass(&self, beats: f32, bypass: bool) -> f32 {
+        cell_start_against_meter(
             beats,
             SnapSettings::from_timeline(self),
             &self.time_signature_map,

@@ -193,6 +193,8 @@ pub const UI_PARAM_IDS: &[&str] = &[
     "pitch_row",       // 164
     "transpose_semi",  // 165
     "transpose_cents", // 166
+    // Microphone angle. Appended: an index in this table is an ABI.
+    "cab_axis", // 167
 ];
 
 /// String id → wire index. Linear scan over a small table — control/UI
@@ -211,8 +213,8 @@ pub fn ui_param_id(index: u32) -> Option<&'static str> {
 mod tests {
     use super::*;
     use crate::dsp::{
-        apply_to_params, default_params, ui_values, AmpModel, CabModel, DelayModel, DriveModel,
-        Dsp, EqModel, ModModel, ReverbModel, StageKind, ToneEngineKind, WahModel,
+        AmpModel, CabModel, DelayModel, DriveModel, Dsp, EqModel, ModModel, ReverbModel, StageKind,
+        ToneEngineKind, WahModel, apply_to_params, default_params, ui_values,
     };
 
     #[test]
@@ -244,7 +246,7 @@ mod tests {
     /// accidental reorder/insert must fail here, loudly.
     #[test]
     fn wire_indices_are_pinned() {
-        assert_eq!(UI_PARAM_IDS.len(), 167);
+        assert_eq!(UI_PARAM_IDS.len(), 168);
         assert_eq!(ui_param_index("power"), Some(0));
         assert_eq!(ui_param_index("gate_on"), Some(3));
         assert_eq!(ui_param_index("drive_model"), Some(10));
@@ -320,6 +322,7 @@ mod tests {
         assert_eq!(ui_param_index("pitch_row"), Some(164));
         assert_eq!(ui_param_index("transpose_semi"), Some(165));
         assert_eq!(ui_param_index("transpose_cents"), Some(166));
+        assert_eq!(ui_param_index("cab_axis"), Some(167));
     }
 
     /// Every block that can run on one side has its channel on the wire,
@@ -537,6 +540,7 @@ mod tests {
             "chamber",
             "ambience",
             "dark_hall",
+            "live_room",
         ];
         for (i, id) in reverb.iter().enumerate() {
             assert_eq!(

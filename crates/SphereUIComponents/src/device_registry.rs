@@ -123,6 +123,16 @@ fn resilient_midi_scan_with(
 /// Single non-blocking enumeration attempt. A lone transient empty result does
 /// not erase a previously healthy cache; two consecutive manual scans confirm
 /// that all devices were actually disconnected.
+/// Stand in these devices for the machine's own (`ui-preview` only), so a
+/// preview of the MIDI page does not depend on what is plugged in.
+#[cfg(feature = "ui-preview")]
+pub(crate) fn preview_set_midi_devices(devices: Vec<DetectedMidiDevice>) {
+    let mut s = state().write().unwrap();
+    s.midi = devices;
+    s.midi_scanned = true;
+    s.midi_revision = s.midi_revision.wrapping_add(1);
+}
+
 pub fn scan_midi() -> u64 {
     let start = Instant::now();
     let devices = scan_midi_ports();

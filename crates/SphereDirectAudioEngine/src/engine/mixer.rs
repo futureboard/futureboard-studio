@@ -144,6 +144,7 @@ impl EngineInner {
                     .push(crate::types::EngineSpatialSource {
                         track_id: track_id.to_string(),
                         params,
+                        keeps_inputs: false,
                     }),
             }
             project.tracks.iter().position(|t| t.id == track_id)
@@ -428,7 +429,10 @@ impl EngineInner {
             return self.set_master_volume(value as f32);
         }
 
-        if !matches!(param_id, "volume" | "pan" | "muted" | "solo") {
+        if matches!(param_id, "panMode" | "panLeft" | "panRight") {
+            return self.update_track_dual_pan_param(track_id, param_id, value);
+        }
+        if !matches!(param_id, "volume" | "vcaGain" | "pan" | "muted" | "solo") {
             return self.update_track_param_other(track_id, param_id, value);
         }
         // Resolved here, against the mirror of the graph the callback holds
@@ -446,6 +450,10 @@ impl EngineInner {
         };
         let live = match param_id {
             "volume" => self.send_command(EngineCommand::SetTrackVolume {
+                track_index,
+                value: value as f32,
+            }),
+            "vcaGain" => self.send_command(EngineCommand::SetTrackVcaGain {
                 track_index,
                 value: value as f32,
             }),
@@ -485,6 +493,9 @@ impl EngineInner {
                 "volume" => {
                     runtime.update_track_volume(track_id, value as f32);
                 }
+                "vcaGain" => {
+                    runtime.update_track_vca_gain(track_id, value as f32);
+                }
                 "pan" => runtime.update_track_pan(track_id, value as f32),
                 "muted" => runtime.update_track_mute(track_id, value != 0.0),
                 "solo" => runtime.update_track_solo(track_id, value != 0.0),
@@ -495,6 +506,7 @@ impl EngineInner {
             if let Some(track) = project.tracks.iter_mut().find(|t| t.id == track_id) {
                 match param_id {
                     "volume" => track.volume = value as f32,
+                    "vcaGain" => track.vca_gain = value as f32,
                     "pan" => track.pan = value as f32,
                     "muted" => track.muted = value != 0.0,
                     "solo" => track.solo = value != 0.0,
@@ -502,6 +514,49 @@ impl EngineInner {
                 }
             }
         }
+    }
+
+    /// One field of a channel's Dual pan, live: `panMode` (`>= 0.5` is Dual),
+    /// `panLeft` / `panRight` (`-1.0..=1.0`).
+    ///
+    /// The whole setting travels in one `SetTrackDualPan`, built from the
+    /// control thread's mirror with this field changed, so the callback never
+    /// sees a half-applied mode. The mirror and the stored snapshot follow,
+    /// like [`Self::mirror_live_track_control`] does for pan.
+    fn update_track_dual_pan_param(
+        &self,
+        track_id: &str,
+        param_id: &str,
+        value: f64,
+    ) -> Result<(), SphereAudioError> {
+        let (track_index, dual_pan) = {
+            let runtime = self.runtime.lock();
+            let Some(index) = runtime.tracks.iter().position(|t| t.id == track_id) else {
+                return Ok(());
+            };
+            let mut dual_pan = runtime.tracks[index].dual_pan.settings;
+            match param_id {
+                "panMode" => dual_pan.enabled = value >= 0.5,
+                "panLeft" => dual_pan.left = value as f32,
+                _ => dual_pan.right = value as f32,
+            }
+            (index, dual_pan.sanitized())
+        };
+        let live = self.send_command(EngineCommand::SetTrackDualPan {
+            track_index,
+            dual_pan,
+        });
+        if live.is_ok() {
+            self.runtime
+                .lock()
+                .update_track_dual_pan(track_id, dual_pan);
+            if let Some(project) = self.project.lock().as_mut() {
+                if let Some(track) = project.tracks.iter_mut().find(|t| t.id == track_id) {
+                    track.dual_pan = dual_pan;
+                }
+            }
+        }
+        live
     }
 
     pub(super) fn update_track_param_other(

@@ -310,6 +310,7 @@ impl RuntimeProject {
         // Worst-case interleaved multi-out read: every bridge channel enabled.
         let min_scratch_multi = min_scratch * MAX_VSTI_OUTPUT_CHANNELS as usize;
         for track in &mut self.tracks {
+            track.midi_fx_plugins.resolve(sinks);
             for insert in &mut track.inserts {
                 if insert.kind_tag == RuntimeInsertKind::ExternalBridge {
                     insert.bridge_sink = sinks.get(&insert.id).cloned();

@@ -15,6 +15,10 @@ path = "src/lib.rs"
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 
+# Embeds the API server's Loudness & Visualizer page (see build.rs).
+[build-dependencies]
+builtin-ui-embed = { workspace = true, features = ["generate"] }
+
 [[bin]]
 name = "preview"
 path = "src/bin/preview.rs"
@@ -56,6 +60,7 @@ builtin-plugin-editor = [
     "dep:airboost",
     "dep:deesser",
     "dep:duckstep",
+    "dep:trigger",
     "dep:imager",
     "dep:burnlimit",
     "dep:clipper67",
@@ -76,7 +81,7 @@ builtin-plugin-editor = [
 # "duplicate resource" / LNK1123 at link time on Windows due to Cargo feature
 # unification. Other default features (font-kit, wayland, x11) are re-enabled
 # so non-Windows targets keep working unchanged.
-gpui.workspace = true
+gpui = { workspace = true, features = ["render-to-image"] }
 # Frame containers for the off-screen plugin-editor surface: CEF hands back raw
 # BGRA bytes, gpui's `RenderImage` wants them as `image::Frame`s.
 image.workspace = true
@@ -88,6 +93,8 @@ smallvec.workspace = true
 # IMPORTANT: UI components are used by the standalone `futureboard_native` app.
 # Disable Node/N-API surfaces so native builds don't try to link against `napi_*`.
 sphere_directaudioengine.workspace = true
+# Shared-memory link to the native visualizer app (src/visualizer_link.rs).
+visualizer_link.workspace = true
 solfege_spatialaudio.workspace = true
 sphere-audio-processor.workspace = true
 sphere-audio-editor.workspace = true
@@ -117,6 +124,7 @@ zapp = { workspace = true, optional = true }
 airboost = { workspace = true, optional = true }
 deesser = { workspace = true, optional = true }
 duckstep = { workspace = true, optional = true }
+trigger = { workspace = true, optional = true }
 imager = { workspace = true, optional = true }
 burnlimit = { workspace = true, optional = true }
 clipper67 = { workspace = true, optional = true }
@@ -138,6 +146,8 @@ sphere-soundfont-player.workspace = true
 sphere-video-player.workspace = true
 # Raw (headerless) PCM import: decode with the user's layout, write a WAV.
 mkff-audio.workspace = true
+# MIDI FX device catalogue (parameter descriptions for the rack and editors).
+sphere-midi-fx.workspace = true
 fbmx-runtime.workspace = true
 solfege-model.workspace = true
 # Cross-platform user directories for the file browser default location.
@@ -170,6 +180,11 @@ sphere-encoder.workspace = true
 # (cursor movement / deletion must not split emoji, Thai marks, or combining
 # sequences). Already used transitively by gpui's text system.
 unicode-segmentation.workspace = true
+# Settings → Experimental → API server: a loopback HTTP + WebSocket endpoint
+# for the Loudness & Visualizer web page. Blocking handshake only, like
+# LiveStage's server — no async runtime, no TLS.
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+builtin-ui-embed.workspace = true
 
 # Win32 for the main-app-owned plugin **content child HWND** (host-process
 # editor ownership). Same workspace version the app already links transitively.

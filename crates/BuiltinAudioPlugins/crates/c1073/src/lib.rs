@@ -5,10 +5,10 @@
 //! mild class-A style tanh saturation.
 
 use biquad::{Biquad, Coefficients, DirectForm1};
-use builtin_dsp_core::delay::{smoothing_step, Smoothed};
+use builtin_dsp_core::delay::{Smoothed, smoothing_step};
 use builtin_dsp_core::{
-    clamp, db_to_linear, make_eq_coefficients, mix, ParamDescriptor, PluginCategory,
-    PluginDescriptor, StereoEffect,
+    ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, clamp, db_to_linear,
+    make_eq_coefficients, mix,
 };
 
 pub const PLUGIN_ID: &str = "futureboard.c1073";

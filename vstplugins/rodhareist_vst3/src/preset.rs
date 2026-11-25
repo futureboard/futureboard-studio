@@ -84,7 +84,7 @@ pub fn write_state_preset(path: &Path, preset: &StatePreset) -> Result<(), Strin
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let metadata = PresetMetadata {
-        preset_format: "Mochi preset: Futureboard",
+        preset_format: "Futureboard preset",
         version: 1,
         created_at: now_millis(),
         plugin_metadata: PresetPluginMetadata {

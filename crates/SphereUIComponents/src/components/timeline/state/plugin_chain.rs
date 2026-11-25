@@ -288,6 +288,11 @@ pub struct PluginParameterState {
     pub hidden: bool,
     pub read_only: bool,
     pub unit: String,
+    /// The plug-in's own text for `value_normalized` as the host last read
+    /// it ("1000.0 Hz", "Bell"). Empty when the host gave none, and cleared
+    /// when Studio changes the value itself, since the text no longer
+    /// describes it.
+    pub value_text: String,
 }
 
 /// Which mix bus an insert processes on.
@@ -397,6 +402,11 @@ pub struct InsertSlotState {
     pub pending_open_editor: bool,
     /// Mix bus this insert processes on. Missing project data is [`InsertSignalBus::Main`].
     pub signal_bus: InsertSignalBus,
+    /// Whether this insert runs after the channel's fader (and pan) instead of
+    /// before it. Pre-fader sends and PFL tap before it; post-fader sends,
+    /// AFL, the meter and the channel output hear it. Never set on an
+    /// instrument or a wet/dry/wet insert. Saved with the project (v69).
+    pub post_fader: bool,
     /// The track feeding this insert's sidechain input, or `None`. Saved with
     /// the project; the engine refuses a source that would close a loop.
     pub sidechain: Option<InsertSidechain>,
@@ -450,9 +460,19 @@ impl InsertSlotState {
             multiout_collapsed: false,
             pending_open_editor: false,
             signal_bus: InsertSignalBus::Main,
+            post_fader: false,
             sidechain: None,
             vst3_state: None,
         }
+    }
+
+    /// Whether this insert may be moved after the fader: a loaded effect on
+    /// the main bus. An instrument makes the channel's signal, so it has no
+    /// place after its fader; a wet/dry/wet insert runs on its return.
+    pub fn can_be_post_fader(&self) -> bool {
+        !self.is_empty()
+            && self.plugin_is_instrument != Some(true)
+            && self.signal_bus == InsertSignalBus::Main
     }
 
     pub fn is_empty(&self) -> bool {
@@ -694,10 +714,13 @@ impl TimelineState {
             .and_then(|slots| slots.get(slot_index))
     }
 
+    /// The insert `insert_id` on `track_id` — or the plug-in instance of that
+    /// id in its MIDI FX chain, which loads, restores and saves like one.
     pub fn find_insert_slot(&self, track_id: &str, insert_id: &str) -> Option<&InsertSlotState> {
         self.insert_slots(track_id)?
             .iter()
             .find(|slot| slot.id == insert_id)
+            .or_else(|| self.midi_fx_plugin(track_id, insert_id))
     }
 
     /// Put a VST3 insert on the main chain or the wet/dry/wet return.
@@ -724,6 +747,39 @@ impl TimelineState {
             return false;
         }
         slot.signal_bus = bus;
+        // The return has no fader of this track's to sit after.
+        if bus == InsertSignalBus::Wdw {
+            slot.post_fader = false;
+        }
+        true
+    }
+
+    /// Put an insert before (`false`) or after (`true`) its channel's fader.
+    ///
+    /// The chain keeps its pre-fader inserts first and its post-fader ones
+    /// after them, each group in its own order, so the order the rack shows
+    /// is the order the engine runs. An insert moved after the fader becomes
+    /// the first post-fader insert; one moved back becomes the last
+    /// pre-fader one. Refuses what [`InsertSlotState::can_be_post_fader`]
+    /// refuses, and returns whether anything changed.
+    pub fn set_insert_post_fader(&mut self, track_id: &str, insert_id: &str, post: bool) -> bool {
+        let Some(slots) = self.insert_slots_mut(track_id) else {
+            return false;
+        };
+        let Some(index) = slots.iter().position(|slot| slot.id == insert_id) else {
+            return false;
+        };
+        let slot = &slots[index];
+        if slot.post_fader == post || (post && !slot.can_be_post_fader()) {
+            return false;
+        }
+        let mut moved = slots.remove(index);
+        moved.post_fader = post;
+        let first_post = slots
+            .iter()
+            .position(|slot| slot.post_fader)
+            .unwrap_or(slots.len());
+        slots.insert(first_post, moved);
         true
     }
 
@@ -876,10 +932,13 @@ impl TimelineState {
     /// Whether any channel — every track and the master — holds `insert_id`.
     fn insert_id_in_use(&self, insert_id: &str) -> bool {
         self.master.inserts.iter().any(|slot| slot.id == insert_id)
-            || self
-                .tracks
-                .iter()
-                .any(|track| track.inserts.iter().any(|slot| slot.id == insert_id))
+            || self.tracks.iter().any(|track| {
+                track.inserts.iter().any(|slot| slot.id == insert_id)
+                    || track
+                        .midi_fx
+                        .iter()
+                        .any(|fx| fx.plugin.as_ref().is_some_and(|p| p.id == insert_id))
+            })
     }
 
     pub(super) fn next_insert_slot_id_for(&self, owner_id: &str) -> String {
@@ -1040,10 +1099,16 @@ impl TimelineState {
         state: PluginRuntimeState,
         host_pid: Option<u32>,
     ) -> bool {
-        let Some(slots) = self.insert_slots_mut(track_id) else {
-            return false;
+        let in_chain = self
+            .insert_slots(track_id)
+            .is_some_and(|slots| slots.iter().any(|i| i.id == insert_id));
+        let slot = if in_chain {
+            self.insert_slots_mut(track_id)
+                .and_then(|slots| slots.iter_mut().find(|i| i.id == insert_id))
+        } else {
+            self.midi_fx_plugin_mut(track_id, insert_id)
         };
-        let Some(slot) = slots.iter_mut().find(|i| i.id == insert_id) else {
+        let Some(slot) = slot else {
             return false;
         };
         let status = match &state {
@@ -1879,6 +1944,7 @@ impl TimelineState {
             return false;
         }
         param.value_normalized = value;
+        param.value_text.clear();
         // A hand edit in Studio's parameter editor: its lane stops playing
         // until Re-Enable Automation. A plug-in's own window does not report
         // its edits here yet (host values are read when it loads), so moves
@@ -2142,7 +2208,9 @@ impl TimelineState {
             self.tracks.insert(
                 insert_at,
                 TrackState {
+                    vca_group: None,
                     spatial: Default::default(),
+                    spatial_keeps_inputs: false,
                     listen: ListenMode::Off,
                     id: child_id,
                     name,
@@ -2156,6 +2224,7 @@ impl TimelineState {
                     volume_effective: volume::db_to_norm(0.0),
                     volume_automation_read: true,
                     pan: 0.0,
+                    dual_pan: Default::default(),
                     muted: false,
                     solo: false,
                     armed: false,
@@ -2169,6 +2238,7 @@ impl TimelineState {
                     automation_lanes: Vec::new(),
                     lane_mode: TrackLaneMode::Clips,
                     selected_automation_target: None,
+                    midi_fx: Vec::new(),
                     inserts: Vec::new(),
                     instrument_plugin_instance_id: None,
                     builtin_soundfont_player: false,
@@ -2188,6 +2258,7 @@ impl TimelineState {
                     takes_expanded: false,
                     freeze: None,
                     drum_step: false,
+                    step_lanes: Vec::new(),
                 },
             );
             insert_at += 1;
@@ -2576,6 +2647,7 @@ mod insert_move_tests {
                 hidden: false,
                 read_only: false,
                 unit: String::new(),
+                value_text: String::new(),
             });
         }
         let before = state.find_insert_slot(&a, &fx2).unwrap().clone();

@@ -1166,6 +1166,23 @@ impl AudioEngine {
             .load_project_as_of(snapshot, insert_param_revision)
     }
 
+    /// A MIDI edit, live: replace the loaded project's MIDI clips and swap
+    /// the new note schedule in, without reloading the project. `Ok(false)`
+    /// when no project is loaded or a full load is under way — send the whole
+    /// project with [`Self::load_project_as_of`] instead.
+    /// Opens the running ASIO driver's control panel. `Ok(false)` when the
+    /// engine is not running an ASIO device (or this build has no ASIO).
+    pub fn open_asio_control_panel(&self) -> Result<bool, SphereAudioError> {
+        self.inner.open_asio_control_panel()
+    }
+
+    pub fn replace_midi_clips(
+        &self,
+        midi_clips: Vec<std::sync::Arc<crate::types::EngineMidiClipSnapshot>>,
+    ) -> Result<bool, SphereAudioError> {
+        self.inner.replace_midi_clips(midi_clips)
+    }
+
     /// Revision of the newest plug-in parameter edit; read it as a project
     /// snapshot is taken.
     pub fn insert_param_revision(&self) -> u64 {
@@ -1376,6 +1393,24 @@ impl AudioEngine {
             .set_insert_param(track_id, insert_id, param_id, value)
     }
 
+    /// Set a MIDI FX parameter on a track's running chain, live (no graph
+    /// rebuild). `false` when there is no such running slot / parameter.
+    pub fn set_midi_fx_param(
+        &self,
+        track_id: &str,
+        slot_id: &str,
+        param_id: &str,
+        value: f32,
+    ) -> bool {
+        self.inner
+            .set_midi_fx_param(track_id, slot_id, param_id, value)
+    }
+
+    /// Bypass or re-enable a MIDI FX slot on a track's running chain, live.
+    pub fn set_midi_fx_enabled(&self, track_id: &str, slot_id: &str, enabled: bool) -> bool {
+        self.inner.set_midi_fx_enabled(track_id, slot_id, enabled)
+    }
+
     /// Clone the live runtime VST3 processor handle for an insert, if it has a
     /// ready native plugin instance. The GPUI PluginView uses this to open the
     /// editor from the *existing* instance/controller — never a new one — so
@@ -1453,6 +1488,13 @@ impl AudioEngine {
         self.inner.get_meters()
     }
 
+    /// Route `track_id`'s post-fader audio to the visualizer track tap
+    /// (`DirectAudio::track_tap`), or stop with `None`. Returns whether the
+    /// track exists in the running graph.
+    pub fn set_visualizer_track_tap(&self, track_id: Option<&str>) -> bool {
+        self.inner.set_visualizer_track_tap(track_id)
+    }
+
     /// Full audio-input pipeline diagnostics (Layer 10). Non-destructive — safe
     /// to poll alongside [`AudioEngine::meters`]. Use for a dev diagnostics
     /// panel or console dump to verify raw/bus/track input peaks at a glance.
@@ -1521,6 +1563,17 @@ impl AudioEngine {
     /// compensation bypassed (Settings → Recording).
     pub fn set_record_pdc_bypass_enabled(&self, enabled: bool) {
         self.inner.set_record_pdc_bypass_enabled(enabled);
+    }
+
+    /// Settings → Playback → Low-Latency Monitoring (`0` off). See
+    /// [`crate::engine::EngineInner::set_low_latency_monitoring`].
+    pub fn set_low_latency_monitoring(&self, limit_samples: u32) {
+        self.inner.set_low_latency_monitoring(limit_samples);
+    }
+
+    /// Settings → Playback → Correct Takes for Interface Latency.
+    pub fn set_record_interface_latency_correction(&self, enabled: bool) {
+        self.inner.set_record_interface_latency_correction(enabled);
     }
 
     /// Settings → Audio → Shared Headroom: lower the WASAPI Shared device

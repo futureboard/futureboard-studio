@@ -1,5 +1,4 @@
 use super::*;
-use crate::components::BottomTab;
 
 impl Render for StudioLayout {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -375,7 +374,7 @@ impl Render for StudioLayout {
                     && crate::native_popup_menu::available()
                 {
                     let checks = self.menu_check_states(cx);
-                    let history = self.history_menu_states(cx);
+                    let history = self.menu_command_states(cx);
                     Some(components::menu_bar::native_menu_picker(
                         menu_anchor,
                         viewport_width,
@@ -411,7 +410,7 @@ impl Render for StudioLayout {
                         );
                         crate::menu::patch_command_states(
                             &mut runtime_menu.items,
-                            &self.history_menu_states(cx),
+                            &self.menu_command_states(cx),
                         );
                         components::menu_dropdown::menu_dropdown(
                             &runtime_menu,
@@ -627,6 +626,17 @@ impl Render for StudioLayout {
                         cx.entity().clone(),
                         |layout: &mut StudioLayout| &mut layout.automation_picker_search_input,
                     );
+                    let toggle_target = cx.entity().clone();
+                    let on_toggle_group: crate::components::timeline::automation_target_picker::AutomationTargetPickerToggleCb =
+                        Arc::new(move |key: &String, _window, cx| {
+                            let key = key.clone();
+                            let _ = toggle_target.update(cx, |this, cx| {
+                                if !this.automation_picker_open_groups.remove(&key) {
+                                    this.automation_picker_open_groups.insert(key);
+                                }
+                                cx.notify();
+                            });
+                        });
                     Some(
                         automation_target_picker_overlay(
                             &model,
@@ -641,6 +651,8 @@ impl Render for StudioLayout {
                             on_popover_command.clone(),
                             on_close_popover.clone(),
                             search_callbacks,
+                            &self.automation_picker_open_groups,
+                            on_toggle_group,
                         )
                         .into_any_element(),
                     )
@@ -836,12 +848,19 @@ impl Render for StudioLayout {
                         });
                     }
                 }),
-                on_toggle_vendors: Arc::new({
+                on_select_facet: Arc::new({
                     let this = cx.entity().clone();
-                    move |_: &(), _w, cx| {
+                    move |facet: &crate::components::plugin_picker::PickerFacet, _w, cx| {
+                        let facet = facet.clone();
                         let _ = this.update(cx, |this, cx| {
-                            this.plugin_picker.vendors_expanded =
-                                !this.plugin_picker.vendors_expanded;
+                            this.plugin_picker.set_facet(facet);
+                            if let Some(index) = this.plugin_search_index.as_ref() {
+                                ensure_default_highlight(
+                                    &mut this.plugin_picker,
+                                    index,
+                                    &this.plugin_picker_prefs,
+                                );
+                            }
                             cx.notify();
                         });
                     }
@@ -1091,6 +1110,14 @@ impl Render for StudioLayout {
                     cx.stop_propagation();
                     return;
                 }
+                // A number being typed into in the Inspector takes every key
+                // first — Space, Enter, digits and Escape belong to the field
+                // until it is done, not to the transport or the selection.
+                if components::inspector::route_numeric_entry_key(event, window, cx) {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    return;
+                }
                 let modifiers = event.keystroke.modifiers;
                 if !event.is_held {
                     // A fresh press: nothing from the last one is still owed a
@@ -1144,6 +1171,7 @@ impl Render for StudioLayout {
                         || this.handle_add_track_dialog_key(event, window, cx)
                         || this.handle_plugin_picker_key(event, window, cx)
                         || this.handle_automation_picker_key(event, window, cx)
+                        || this.handle_midi_fx_picker_key(event, window, cx)
                         || this.handle_project_switcher_key(event, window, cx)
                         || this.handle_inspector_key(event, window, cx)
                         || this.handle_browser_key(event, window, cx);
@@ -1682,18 +1710,15 @@ impl Render for StudioLayout {
             } else {
                 None
             })
-            // The editor measures the waveform lanes. Hosting the playhead
-            // here keeps its ticks out of the dock's cached view path.
-            .children(
-                (show_bottom_docked && self.active_bottom_tab() != BottomTab::Mixer)
-                    .then(|| self.audio_editor.read(cx).playhead_overlay()),
-            )
             // The docked mixer's meters, painted over the bottom panel from
             // outside it so a meter tick never rebuilds the panel.
             .children(
                 (show_bottom_docked && self.docked_mixer_meters_visible())
                     .then(|| self.mixer_meter_overlay.clone()),
             )
+            // The Audio Editor's playhead, likewise: a transport tick moves
+            // the line without rebuilding the docked editor.
+            .children(self.audio_editor_playhead_layer(cx))
             .child({
                 let _s = crate::perf::PerfScope::enter("StatusBar");
                 self.status_bar.clone()
@@ -1761,37 +1786,74 @@ impl Render for StudioLayout {
     }
 }
 
-/// Dock tab strip height. The tabs sit flush against the bottom divider so the
-/// selected indicator can share that edge.
-const RIGHT_DOCK_TAB_STRIP_HEIGHT: f32 = crate::theme::size::COMFORTABLE;
-/// Tab height inside the strip.
-const RIGHT_DOCK_TAB_HEIGHT: f32 = RIGHT_DOCK_TAB_STRIP_HEIGHT;
-/// Tab glyph. One step below the section icon so the label leads.
-const RIGHT_DOCK_TAB_ICON: f32 = 12.0;
+/// The pop-out button's slot at the end of the strip. Reserved on every tab,
+/// so the tabs keep their widths when it comes and goes.
+const RIGHT_DOCK_POPOUT_SLOT: f32 = 22.0;
 
+/// The right dock's two planes: the strip is the trench, the panels below
+/// paint `surface.panel`, and the active tab joins that.
+fn right_dock_planes() -> components::controls::FbDockPlanes {
+    components::controls::FbDockPlanes {
+        strip: Colors::surface_panel_alt(),
+        body: Colors::surface_panel(),
+    }
+}
+
+/// The right dock's view picker: a row of named tabs sharing the dock's width
+/// equally, the active one cut out of the panel below it (the shared dock tab
+/// shape the bottom panel uses).
+///
+/// Every tab spells its name. The dock is `INSPECTOR_WIDTH` (292) wide, which
+/// holds five short names at an equal share but not five padded ones, so the
+/// tabs fill the row rather than size to their labels, and truncate before
+/// they would push a neighbour off the edge.
 pub(super) fn right_dock_tab_bar(
     active: RightDockTab,
     owner: Entity<StudioLayout>,
 ) -> impl IntoElement {
+    let select = owner.clone();
+    right_dock_tab_strip(
+        active,
+        std::rc::Rc::new(move |tab, cx| {
+            let _ = select.update(cx, |layout, cx| {
+                layout.panels.inspector = true;
+                layout.right_dock_tab = tab;
+                layout.set_active_panel(tab.active_panel(), cx);
+            });
+        }),
+        std::rc::Rc::new(move |kind, window, cx| {
+            let bounds = Some(window.bounds());
+            let _ = owner.update(cx, |layout, cx| {
+                layout.open_song_text_external_window(kind, bounds, cx);
+            });
+        }),
+    )
+}
+
+/// Picks a right dock view.
+type RightDockSelect = std::rc::Rc<dyn Fn(RightDockTab, &mut gpui::App)>;
+/// Opens a song text view in its own window.
+type RightDockPopout =
+    std::rc::Rc<dyn Fn(components::SongTextPanelKind, &mut Window, &mut gpui::App)>;
+
+/// The strip itself, with what its clicks do passed in.
+fn right_dock_tab_strip(
+    active: RightDockTab,
+    on_select: RightDockSelect,
+    on_popout: RightDockPopout,
+) -> gpui::Stateful<gpui::Div> {
     let popout_kind = match active {
         RightDockTab::Inspector | RightDockTab::Solfege => None,
         RightDockTab::ChordDisplay => Some(components::SongTextPanelKind::ChordDisplay),
         RightDockTab::LyricDisplay => Some(components::SongTextPanelKind::LyricDisplay),
         RightDockTab::LyricEditor => Some(components::SongTextPanelKind::LyricEditor),
     };
-    let mut row = div()
+    let mut row = components::controls::fb_dock_tab_strip(right_dock_planes())
         .id("right-dock-tabs")
         .role(Role::TabList)
         .aria_label("Right panel")
-        .h(px(RIGHT_DOCK_TAB_STRIP_HEIGHT))
         .flex_shrink_0()
-        .flex()
-        .items_center()
-        .px(px(crate::theme::space::TIGHT))
-        .gap(px(crate::theme::space::HAIR))
-        .border_b(px(1.0))
-        .border_color(Colors::border_subtle())
-        .bg(Colors::surface_panel());
+        .px(px(crate::theme::space::TIGHT));
     for tab in [
         RightDockTab::Inspector,
         RightDockTab::Solfege,
@@ -1799,128 +1861,71 @@ pub(super) fn right_dock_tab_bar(
         RightDockTab::LyricDisplay,
         RightDockTab::LyricEditor,
     ] {
-        row = row.child(right_dock_tab_button(tab, active, owner.clone()));
+        row = row.child(right_dock_tab_button(tab, active, on_select.clone()));
     }
-    row.child(div().flex_1()).children(popout_kind.map(|kind| {
-        let target = owner.clone();
-        components::icon_button(
-            Some(crate::assets::ICON_MAXIMIZE_PATH),
-            "Open in a separate window",
-            px(20.0),
-            px(20.0),
-            px(11.0),
-            Colors::text_muted(),
-        )
-        .id("right-dock-popout")
-        .role(Role::Button)
-        .aria_label("Open panel in a separate window")
-        .focusable()
-        .tab_stop(true)
-        .focus_visible(|style| style.bg(Colors::surface_control_hover()))
-        .cursor(gpui::CursorStyle::PointingHand)
-        .on_click(move |_, window, cx| {
-            let bounds = Some(window.bounds());
-            let _ = target.update(cx, |layout, cx| {
-                layout.open_song_text_external_window(kind, bounds, cx);
-            });
-        })
-    }))
+    row.child(
+        div()
+            .w(px(RIGHT_DOCK_POPOUT_SLOT))
+            .h_full()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_end()
+            .children(popout_kind.map(|kind| {
+                components::icon_button(
+                    Some(crate::assets::ICON_MAXIMIZE_PATH),
+                    "Open in a separate window",
+                    px(20.0),
+                    px(20.0),
+                    px(11.0),
+                    Colors::text_muted(),
+                )
+                .id("right-dock-popout")
+                .role(Role::Button)
+                .aria_label("Open panel in a separate window")
+                .focusable()
+                .tab_stop(true)
+                .focus_visible(|style| style.bg(Colors::surface_control_hover()))
+                .cursor(gpui::CursorStyle::PointingHand)
+                .on_click(move |_, window, cx| on_popout(kind, window, cx))
+            })),
+    )
+}
+
+/// The right dock strip with `active` selected and clicks that do nothing
+/// (`ui-preview` only).
+#[cfg(feature = "ui-preview")]
+pub(crate) fn preview_right_dock_tab_strip(active: RightDockTab) -> gpui::AnyElement {
+    right_dock_tab_strip(
+        active,
+        std::rc::Rc::new(|_, _| {}),
+        std::rc::Rc::new(|_, _, _| {}),
+    )
+    .into_any_element()
 }
 
 fn right_dock_tab_button(
     tab: RightDockTab,
     active: RightDockTab,
-    owner: Entity<StudioLayout>,
+    on_select: RightDockSelect,
 ) -> impl IntoElement {
-    let selected = tab == active;
-    let (icon, label) = match tab {
-        RightDockTab::Inspector => (crate::assets::ICON_SLIDERS_HORIZONTAL_PATH, "Inspect"),
-        RightDockTab::Solfege => (crate::assets::ICON_AUDIO_LINES_PATH, "Solfege"),
-        RightDockTab::ChordDisplay => (crate::assets::ICON_MUSIC_PATH, "Chords"),
-        RightDockTab::LyricDisplay => (crate::assets::ICON_NEWSPAPER_PATH, "Lyrics"),
-        RightDockTab::LyricEditor => (crate::assets::ICON_PENCIL_PATH, "Edit"),
+    // Short names for the tab, the full ones for its tooltip and screen readers.
+    let (label, name) = match tab {
+        RightDockTab::Inspector => ("Inspect", "Inspector"),
+        RightDockTab::Solfege => ("Solfege", "Solfege"),
+        RightDockTab::ChordDisplay => ("Chords", "Chord display"),
+        RightDockTab::LyricDisplay => ("Lyrics", "Lyric display"),
+        RightDockTab::LyricEditor => ("Edit", "Lyric editor"),
     };
-    // A tab is a text target with an indicator, not a button-shaped block: the
-    // five of them sit in a 4 px strip, and five filled pills there read as a
-    // toolbar rather than as one control that picks a view. Selection is carried
-    // on two channels — accent text *and* the underline — so it survives a theme
-    // where the accent is low-contrast.
-    //
-    // Only the selected tab spells its name. Five labelled tabs plus the pop-out
-    // button need about 320 px and the dock is `INSPECTOR_WIDTH` (292), so the
-    // last one was pushed off the panel edge. Collapsing the rest to their glyph
-    // both fits and makes the current view unmistakable; the name stays
-    // reachable through the tooltip and the accessible label.
-    let text = if selected {
-        Colors::accent_primary()
-    } else {
-        Colors::tab_text_muted()
-    };
-    // Hover is attached unconditionally and resolves to the tab's own colour
-    // while it is selected, so the selected tab simply has nothing to lift to.
-    let hover_text = if selected {
-        text
-    } else {
-        Colors::text_primary()
-    };
-    div()
-        .id(("right-dock-tab", tab as u32))
-        .role(Role::Tab)
-        .aria_label(label)
-        .aria_selected(selected)
-        .focusable()
-        .tab_stop(true)
-        .focus_visible(|style| {
-            style.shadow(crate::theme::elevation::focus_ring(
-                Colors::state_focus_ring(),
-            ))
-        })
-        .relative()
-        .h(px(RIGHT_DOCK_TAB_HEIGHT))
-        .px(px(crate::theme::space::SNUG))
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(crate::theme::space::TIGHT))
-        .rounded(px(crate::theme::radius::CONTROL_SM))
-        .text_size(px(crate::theme::typography::UI_XS))
-        .font_weight(if selected {
-            gpui::FontWeight::SEMIBOLD
-        } else {
-            gpui::FontWeight::MEDIUM
-        })
-        .text_color(text)
-        .cursor(gpui::CursorStyle::PointingHand)
-        .hover(move |style| style.text_color(hover_text))
-        .on_click(move |_, _, cx| {
-            let _ = owner.update(cx, |layout, cx| {
-                layout.panels.inspector = true;
-                layout.right_dock_tab = tab;
-                layout.set_active_panel(tab.active_panel(), cx);
-            });
-        })
-        .tooltip(components::fb_tooltip(label))
-        .child(
-            gpui::svg()
-                .path(icon)
-                .w(px(RIGHT_DOCK_TAB_ICON))
-                .h(px(RIGHT_DOCK_TAB_ICON))
-                .flex_shrink_0()
-                .text_color(text),
-        )
-        .children(selected.then(|| div().flex_shrink_0().child(label)))
-        // Indicator sits on the strip's bottom edge, flush with the divider, so
-        // selecting a tab never reflows the row.
-        .children(selected.then(|| {
-            div()
-                .absolute()
-                .left(px(crate::theme::space::SNUG))
-                .right(px(crate::theme::space::SNUG))
-                .bottom_0()
-                .h(px(2.0))
-                .rounded(px(crate::theme::radius::MICRO))
-                .bg(Colors::accent_primary())
-        }))
+    components::controls::fb_dock_tab_fill(
+        ("right-dock-tab", tab as u32),
+        label,
+        tab == active,
+        right_dock_planes(),
+        move |_, _, cx| on_select(tab, cx),
+    )
+    .aria_label(name)
+    .tooltip(components::fb_tooltip(name))
 }
 
 #[cfg(target_os = "windows")]

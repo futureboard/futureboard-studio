@@ -159,6 +159,98 @@ impl SourceParams {
     }
 }
 
+/// One of the six numbers that place a channel, as an automation lane or a
+/// control reads it: each maps to and from `0..=1`, so a lane's value is
+/// always in range and its default is the parameter's own default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SourceParam {
+    /// Left (`0`) to right (`1`); the centre line at `0.5`.
+    X,
+    /// Back wall (`0`) to front wall (`1`); the listener at `0.5`.
+    Y,
+    /// Ear level (`0`) to the ceiling (`1`).
+    Height,
+    Spread,
+    Width,
+    Lfe,
+}
+
+impl SourceParam {
+    pub const ALL: [SourceParam; 6] = [
+        Self::X,
+        Self::Y,
+        Self::Height,
+        Self::Spread,
+        Self::Width,
+        Self::Lfe,
+    ];
+
+    /// What the parameter is called on a lane or a control.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::X => "Left/Right",
+            Self::Y => "Front/Back",
+            Self::Height => "Height",
+            Self::Spread => "Spread",
+            Self::Width => "Width",
+            Self::Lfe => "LFE",
+        }
+    }
+
+    /// Position in [`Self::ALL`]: a stable index for compact storage.
+    pub fn index(self) -> usize {
+        match self {
+            Self::X => 0,
+            Self::Y => 1,
+            Self::Height => 2,
+            Self::Spread => 3,
+            Self::Width => 4,
+            Self::Lfe => 5,
+        }
+    }
+
+    pub fn from_index(index: usize) -> Option<Self> {
+        Self::ALL.get(index).copied()
+    }
+
+    /// `params`' value of this parameter, as `0..=1`.
+    pub fn normalized(self, params: &SourceParams) -> f32 {
+        let value = match self {
+            Self::X => (params.position.x + 1.0) * 0.5,
+            Self::Y => (params.position.y + 1.0) * 0.5,
+            Self::Height => params.position.z,
+            Self::Spread => params.spread,
+            Self::Width => params.width,
+            Self::Lfe => params.lfe,
+        };
+        if value.is_finite() {
+            value.clamp(0.0, 1.0)
+        } else {
+            self.normalized(&SourceParams::default())
+        }
+    }
+
+    /// `params` with this parameter set from a `0..=1` value. Realtime-safe:
+    /// arithmetic on a copy.
+    #[inline]
+    pub fn apply(self, mut params: SourceParams, normalized: f32) -> SourceParams {
+        let v = if normalized.is_finite() {
+            normalized.clamp(0.0, 1.0)
+        } else {
+            return params;
+        };
+        match self {
+            Self::X => params.position.x = v * 2.0 - 1.0,
+            Self::Y => params.position.y = v * 2.0 - 1.0,
+            Self::Height => params.position.z = v,
+            Self::Spread => params.spread = v,
+            Self::Width => params.width = v,
+            Self::Lfe => params.lfe = v,
+        }
+        params
+    }
+}
+
 /// The room a binaural mix is heard in.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct RoomSettings {
@@ -228,6 +320,32 @@ mod tests {
         let inside = RoomPosition::new(0.5, 0.0, 0.0).rotated(-FRAC_PI_2);
         assert!((inside.wall_radius() - 0.5).abs() < 1.0e-5);
         assert!(inside.y > 0.49);
+    }
+
+    #[test]
+    fn every_param_round_trips_through_its_normalized_value() {
+        let params = SourceParams {
+            position: RoomPosition::new(-0.5, 0.25, 0.75),
+            spread: 0.4,
+            width: 0.6,
+            lfe: 0.2,
+        };
+        for param in SourceParam::ALL {
+            let norm = param.normalized(&params);
+            assert!((0.0..=1.0).contains(&norm));
+            let back = param.apply(SourceParams::default(), norm);
+            assert!(
+                (param.normalized(&back) - norm).abs() < 1.0e-6,
+                "{param:?} did not round-trip"
+            );
+            assert_eq!(SourceParam::from_index(param.index()), Some(param));
+        }
+        assert!((SourceParam::X.normalized(&params) - 0.25).abs() < 1.0e-6);
+        assert!((SourceParam::Y.normalized(&params) - 0.625).abs() < 1.0e-6);
+        // The front-centre default is where a new lane starts.
+        let front = SourceParams::default();
+        assert_eq!(SourceParam::X.normalized(&front), 0.5);
+        assert_eq!(SourceParam::Width.normalized(&front), 1.0);
     }
 
     #[test]

@@ -84,6 +84,77 @@ impl TrackState {
         depth
     }
 
+    /// Each take's region and its place in it, in `takes` order.
+    ///
+    /// A region is a run of bars recorded over more than once: a take joins
+    /// the region of the first earlier take it overlaps (see
+    /// [`ranges_overlap`]), or starts a region of its own. Its place is how
+    /// many takes of that region came before it, so the first pass over a
+    /// region is `0` wherever on the track it sits — two regions recorded 3
+    /// and 4 times hold takes 1–3 and 1–4, not 1–7.
+    pub fn take_regions(&self) -> Vec<(usize, usize)> {
+        let bounds: Vec<Option<(f32, f32)>> = self
+            .takes
+            .iter()
+            .map(|take| self.take_bounds(take))
+            .collect();
+        let mut placed: Vec<(usize, usize)> = Vec::with_capacity(bounds.len());
+        let mut sizes: Vec<usize> = Vec::new();
+        for (index, own) in bounds.iter().enumerate() {
+            let joined = own.and_then(|own| {
+                (0..index)
+                    .find(|&earlier| bounds[earlier].is_some_and(|b| ranges_overlap(own, b)))
+                    .map(|earlier| placed[earlier].0)
+            });
+            let region = joined.unwrap_or_else(|| {
+                sizes.push(0);
+                sizes.len() - 1
+            });
+            placed.push((region, sizes[region]));
+            sizes[region] += 1;
+        }
+        placed
+    }
+
+    /// The take lanes, top to bottom: lane `n` holds every region's take
+    /// `n + 1`, each where its clip sits. A track recorded 3 times over one
+    /// part and 4 times over another shows four lanes, not seven.
+    pub fn take_lane_rows(&self) -> Vec<Vec<&TrackTake>> {
+        let mut rows: Vec<Vec<&TrackTake>> = Vec::new();
+        for (take, (_, rank)) in self.takes.iter().zip(self.take_regions()) {
+            if rows.len() <= rank {
+                rows.resize_with(rank + 1, Vec::new);
+            }
+            rows[rank].push(take);
+        }
+        rows
+    }
+
+    /// The name a take just pushed last gets: `Take N`, counted within its
+    /// region. Never reuses a number its region still shows, so deleting
+    /// Take 2 of three and recording again gives Take 4, not a second Take 3.
+    fn next_region_take_name(&self) -> String {
+        let regions = self.take_regions();
+        let Some(&(region, rank)) = regions.last() else {
+            return "Take 1".to_string();
+        };
+        let highest = self
+            .takes
+            .iter()
+            .zip(&regions)
+            .filter(|(_, (other, _))| *other == region)
+            .filter_map(|(take, _)| {
+                take.name
+                    .strip_prefix("Take ")?
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+            })
+            .max()
+            .unwrap_or(0);
+        format!("Take {}", (rank + 1).max(highest + 1))
+    }
+
     fn take_bounds(&self, take: &TrackTake) -> Option<(f32, f32)> {
         let clip = self.clips.iter().find(|clip| clip.id == take.clip_id)?;
         Some((
@@ -361,14 +432,20 @@ impl TimelineState {
         if !track.clips.iter().any(|clip| clip.id == clip_id) {
             return None;
         }
-        let name = format!("Take {}", track.takes.len() + 1);
+        // Numbered within the bars it was recorded over, not across the
+        // track: the third pass over the chorus is Take 3 even when the verse
+        // was recorded first.
         track.takes.push(TrackTake {
             id: take_id.clone(),
-            name,
+            name: String::new(),
             clip_id: clip_id.to_string(),
             active: true,
             recorded_at,
         });
+        let name = track.next_region_take_name();
+        if let Some(take) = track.takes.last_mut() {
+            take.name = name;
+        }
         // A track that has never been comped shows no take lane; the second
         // overlapping pass is what makes one worth opening.
         if track.take_stack_depth() > 1 {
@@ -749,6 +826,55 @@ mod tests {
 
     fn track_id(state: &TimelineState) -> String {
         state.tracks[0].id.clone()
+    }
+
+    /// Takes count per region: a part recorded three times and another
+    /// recorded four times, interleaved, hold Take 1–3 and Take 1–4, in four
+    /// lanes rather than seven.
+    #[test]
+    fn takes_are_numbered_and_laned_per_region() {
+        // Verse at bar 0, chorus at bar 16, recorded alternately.
+        let verse = (0.0, 8.0);
+        let chorus = (16.0, 8.0);
+        let order = [verse, chorus, verse, chorus, chorus, verse, chorus];
+        let mut state = track_with_clips(&order);
+        let id = track_id(&state);
+        for index in 0..order.len() {
+            state
+                .register_recorded_take(&id, &format!("clip-{index}"), String::new())
+                .expect("take");
+        }
+        let track = &state.tracks[0];
+        let names: Vec<&str> = track.takes.iter().map(|take| take.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["Take 1", "Take 1", "Take 2", "Take 2", "Take 3", "Take 3", "Take 4"]
+        );
+        let rows = track.take_lane_rows();
+        let sizes: Vec<usize> = rows.iter().map(Vec::len).collect();
+        assert_eq!(sizes, [2, 2, 2, 1], "lane n holds each region's take n");
+        assert_eq!(rows[3][0].clip_id, "clip-6");
+    }
+
+    /// A deleted take's number is not handed out again while its region
+    /// still shows a higher one.
+    #[test]
+    fn a_new_take_never_repeats_a_number_its_region_shows() {
+        let mut state = track_with_clips(&[(0.0, 8.0); 4]);
+        let id = track_id(&state);
+        let _first = state.register_recorded_take(&id, "clip-0", String::new());
+        let second = state
+            .register_recorded_take(&id, "clip-1", String::new())
+            .expect("take 2");
+        let _third = state.register_recorded_take(&id, "clip-2", String::new());
+        state.tracks[0].takes.retain(|take| take.id != second);
+        state.register_recorded_take(&id, "clip-3", String::new());
+        let names: Vec<&str> = state.tracks[0]
+            .takes
+            .iter()
+            .map(|take| take.name.as_str())
+            .collect();
+        assert_eq!(names, ["Take 1", "Take 3", "Take 4"]);
     }
 
     /// The second pass over the same bars is an alternate, not a layer. Playing

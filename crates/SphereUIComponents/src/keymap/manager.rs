@@ -603,6 +603,7 @@ fn build_action_catalog() -> HashMap<String, String> {
         ("audio:bounce-in-place",          "Audio › Render in Place"),
         ("audio:create-crossfade",         "Audio › Create Crossfade"),
         ("audio:find-tempo-key",           "Audio › Find Tempo & Key"),
+        ("audio:strip-silence",            "Audio › Strip Silence"),
         ("chords:open-generator",          "Chords › Chord Generator"),
         ("chords:open-track",              "Chords › Show Chord Track"),
         ("chords:hide-track",              "Chords › Hide Chord Track"),
@@ -610,6 +611,10 @@ fn build_action_catalog() -> HashMap<String, String> {
         ("chords:to-midi",                 "Chords › Create MIDI Clip from Chords"),
         ("audio:render-selection",         "Audio › Render Selection"),
         ("clip:consolidate",               "Clip › Consolidate"),
+        ("clip:nudge-left",                "Clip › Nudge Left"),
+        ("clip:nudge-right",               "Clip › Nudge Right"),
+        ("clip:nudge-bar-left",            "Clip › Nudge Left by a Bar"),
+        ("clip:nudge-bar-right",           "Clip › Nudge Right by a Bar"),
         ("clip:properties",                "Clip › Properties"),
         ("clip:rename",                    "Clip › Rename"),
         ("clip:split-at-playhead",         "Clip › Split at Playhead"),
@@ -714,14 +719,18 @@ pub fn format_keystroke_list(keys: &[String]) -> String {
     if keys.is_empty() {
         return "—".to_string();
     }
+    format_keystrokes(keys).join(", ")
+}
+
+/// Each keystroke as it is displayed, one entry per alternative key.
+pub fn format_keystrokes(keys: &[String]) -> Vec<String> {
     keys.iter()
         .map(|key| {
             canonical_accel(key)
                 .map(|token| format_accel_display(&token))
                 .unwrap_or_else(|| key.clone())
         })
-        .collect::<Vec<_>>()
-        .join(", ")
+        .collect()
 }
 
 pub fn profile_label(profile_id: &str) -> &'static str {

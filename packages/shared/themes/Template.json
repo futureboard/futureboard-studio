@@ -72,7 +72,8 @@
       "tick": "#FFFFFF14",
       "scaleText": "#8F949F",
       "groove": "#0E1015",
-      "thumbBorder": "#FFFFFF33"
+      "thumbBorder": "#FFFFFF33",
+      "sliderThumb": "#E6E8EC"
     },
     "knob": {
       "background": "#14161C",
@@ -205,6 +206,11 @@
       "blackKey": "#15171C",
       "keySeam": "#A3A8B2",
       "keyLabel": "#4A505C"
+    },
+    "harmony": {
+      "major": "#E9A86B",
+      "minor": "#7FA2F0",
+      "other": "#9AA0AC"
     },
     "track": {
       "audio": "#38C7B4",

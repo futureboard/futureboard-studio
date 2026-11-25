@@ -385,9 +385,10 @@ impl StudioLayout {
     /// the tree, undo, an import — the other surfaces follow: the selected
     /// track's strip and its arrangement row scroll into view if they are off
     /// screen, and the pop-out mixer repaints its highlight. When the change is
-    /// a just-created track (the Add Track dialog, a plug-in or preset drop, a
-    /// duplicate, stem extraction) the dock switches to the Mixer first, unless
-    /// the mixer is popped out or the preference is off.
+    /// a just-created track (the Add Track dialog, an audio file, plug-in or
+    /// preset drop, a duplicate, stem extraction) the dock switches to the
+    /// Mixer first only when the "Open the Mixer when a track is added"
+    /// preference is on (off by default) and the mixer is not popped out.
     ///
     /// Checked once per frame like [`Self::sync_track_name_surfaces`]; nothing
     /// is cloned unless something changed, and the work runs after the frame
@@ -429,7 +430,7 @@ impl StudioLayout {
                 .read(cx)
                 .current
                 .editing
-                .show_mixer_on_add_track;
+                .open_mixer_on_add_track;
         let this = cx.entity().downgrade();
         cx.defer(move |cx| {
             let _ = this.update(cx, |this, cx| {
@@ -1646,6 +1647,33 @@ impl StudioLayout {
                         reveal_enabled,
                     ));
                     entries.extend(self.ara_clip_menu_entries(clip_id, exists, cx));
+                    entries.push(menu_item_enabled(
+                        i18n.tr("menu.audio-strip_silence"),
+                        "audio:strip-silence",
+                        self.timeline
+                            .read(cx)
+                            .state
+                            .audio_clip_conversion_source(clip_id)
+                            .is_ok(),
+                    ));
+                    // Only where this build and license offer it.
+                    if self.audio_to_midi_available() {
+                        let convertible = self
+                            .timeline
+                            .read(cx)
+                            .state
+                            .audio_clip_conversion_source(clip_id)
+                            .is_ok();
+                        entries.push(ContextMenuEntry::Separator);
+                        entries.push(ContextMenuEntry::Header("Convert to MIDI".to_string()));
+                        for mode in crate::audio_to_midi::ConvertMode::ALL {
+                            entries.push(menu_item_enabled(
+                                mode.label(),
+                                mode.command(),
+                                convertible,
+                            ));
+                        }
+                    }
                 }
                 if is_midi {
                     // A MIDI clip is a voice synth's region on its track.
@@ -1677,6 +1705,16 @@ impl StudioLayout {
                     }
                 }
                 entries.push(ContextMenuEntry::Separator);
+                if selected_count >= 2 {
+                    let state = &self.timeline.read(cx).state;
+                    let mergeable = state
+                        .plan_clip_merge(&state.selection.selected_clip_ids)
+                        .is_ok();
+                    entries.push(
+                        menu_item_enabled("Merge Clips", "clip:merge", mergeable)
+                            .with_shortcut(crate::keymap::accel_display("J")),
+                    );
+                }
                 if is_audio && selected_count >= 2 {
                     entries.push(menu_item_enabled(
                         "Consolidate Clips",
@@ -2006,6 +2044,32 @@ impl StudioLayout {
                     ContextMenuEntry::item(i18n.tr("context.mixer.reset-pan"), "mixer:reset-pan"),
                 ];
                 entries.extend(channel_bypass);
+                // VCA groups: Professional mixing.
+                if crate::components::mixer_panel::pro_mixing() {
+                    let state = &self.timeline.read(cx).state;
+                    let current = state
+                        .find_track(track_id)
+                        .and_then(|track| track.vca_group.clone());
+                    entries.push(ContextMenuEntry::Separator);
+                    entries.push(ContextMenuEntry::Header("VCA".to_string()));
+                    entries.push(ContextMenuEntry::item(
+                        "New VCA from Selected Channels",
+                        "mixer:vca-new",
+                    ));
+                    for group in &state.master.vca_groups {
+                        entries.push(ContextMenuEntry::checked_item(
+                            group.name.clone(),
+                            format!("mixer:vca-assign|{track_id}|{}", group.id),
+                            current.as_deref() == Some(group.id.as_str()),
+                        ));
+                    }
+                    if current.is_some() {
+                        entries.push(ContextMenuEntry::item(
+                            "Remove from VCA",
+                            format!("mixer:vca-assign|{track_id}|none"),
+                        ));
+                    }
+                }
                 entries.extend([
                     ContextMenuEntry::Separator,
                     ContextMenuEntry::item(i18n.tr("context.track.mute"), "track:mute"),
@@ -2071,7 +2135,18 @@ impl StudioLayout {
             ContextTarget::SidechainPicker {
                 track_id,
                 insert_id,
-            } => self.sidechain_picker_entries(track_id, insert_id, cx),
+            } => {
+                // The mixer's insert menu: where it sits against the fader,
+                // then its sidechain. The plug-in window offers the sidechain
+                // rows alone.
+                let mut entries = self.insert_fader_position_entries(track_id, insert_id, cx);
+                if !entries.is_empty() {
+                    entries.push(ContextMenuEntry::Separator);
+                }
+                entries.extend(self.sidechain_picker_entries(track_id, insert_id, cx));
+                entries
+            }
+            ContextTarget::PanMode { track_id } => self.pan_mode_entries(track_id, cx),
             ContextTarget::OutputPicker { track_id } => {
                 use crate::components::timeline::timeline_state::TrackOutputRouting;
                 let state = &self.timeline.read(cx).state;
@@ -2211,13 +2286,16 @@ impl StudioLayout {
                     ],
                 );
 
-                let plugin_targets: Vec<AutomationTarget> = state
+                // The channel's placement, while it is placed in a spatial mix.
+                let spatial_targets: Vec<AutomationTarget> = state
                     .available_automation_targets(track_id)
                     .into_iter()
-                    .filter(|t| matches!(t, AutomationTarget::PluginParameter { .. }))
+                    .filter(|t| matches!(t, AutomationTarget::Spatial(_)))
                     .collect();
-                push_group(&mut entries, "Plugins", &plugin_targets);
+                push_group(&mut entries, "Spatial", &spatial_targets);
 
+                // Sends and bypasses before the plug-in parameters: an
+                // instrument can list hundreds, and they buried the sends.
                 let send_targets: Vec<AutomationTarget> = state
                     .available_automation_targets(track_id)
                     .into_iter()
@@ -2237,6 +2315,13 @@ impl StudioLayout {
                     .filter(|t| matches!(t, AutomationTarget::InsertBypass { .. }))
                     .collect();
                 push_group(&mut entries, "Inserts", &bypass_targets);
+
+                let plugin_targets: Vec<AutomationTarget> = state
+                    .available_automation_targets(track_id)
+                    .into_iter()
+                    .filter(|t| matches!(t, AutomationTarget::PluginParameter { .. }))
+                    .collect();
+                push_group(&mut entries, "Plugins", &plugin_targets);
 
                 if entries.len() == 1 {
                     entries.push(ContextMenuEntry::disabled_item(

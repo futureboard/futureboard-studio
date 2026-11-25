@@ -182,7 +182,11 @@ impl StudioLayout {
         }
     }
 
-    pub(crate) fn build_inspector_callbacks(&self, owner: Entity<Self>) -> InspectorCallbacks {
+    pub(crate) fn build_inspector_callbacks(
+        &self,
+        owner: Entity<Self>,
+        i18n: crate::i18n::I18n,
+    ) -> InspectorCallbacks {
         let audio_engine = self.audio_bridge.engine.clone();
         let timeline_vol = self.timeline.clone();
         let owner_vol = owner.clone();
@@ -484,6 +488,26 @@ impl StudioLayout {
             });
         });
 
+        // A bus keeping its channels' places changes where they are rendered:
+        // one undo step and a graph rebuild.
+        let timeline_keeps = self.timeline.clone();
+        let owner_keeps = owner.clone();
+        let on_spatial_keeps_inputs: Arc<dyn Fn(&(String, bool), &mut Window, &mut App) + 'static> =
+            Arc::new(move |(id, keep), _w, cx| {
+                let changed = timeline_keeps.update(cx, |timeline, cx| {
+                    timeline.set_track_keeps_inputs(id, *keep, cx)
+                });
+                if changed {
+                    StudioLayout::defer_update(&owner_keeps, cx, |this, cx| {
+                        this.mark_dirty();
+                        let _ = this.mixer_panel.update(cx, |_, cx| cx.notify());
+                        this.push_mixer_snapshot_to_window(cx);
+                        this.refresh_room_window(cx);
+                        cx.notify();
+                    });
+                }
+            });
+
         // Track colour is committed by `StudioLayout::apply_inspector_color`,
         // driven by the shared colour picker the Inspector renders — there is
         // no separate palette callback here any more.
@@ -501,6 +525,7 @@ impl StudioLayout {
             on_spatial_drag_start,
             on_spatial_drag_preview,
             on_spatial_drag_commit,
+            on_spatial_keeps_inputs,
             on_toggle_mute,
             on_toggle_solo,
             on_toggle_arm,
@@ -536,6 +561,69 @@ impl StudioLayout {
             on_open_clip_bottom_editor,
             on_open_clip_external_midi_editor,
             on_open_soundfont_player,
+            on_add_midi_fx: {
+                let owner = owner.clone();
+                Arc::new(
+                    move |(track_id, kind): &(String, sphere_midi_fx::DeviceKind), _w, cx| {
+                        let (track_id, kind) = (track_id.clone(), *kind);
+                        StudioLayout::defer_update(&owner, cx, move |this, cx| {
+                            this.add_midi_fx(&track_id, kind, cx);
+                        });
+                    },
+                )
+            },
+            on_remove_midi_fx: {
+                let owner = owner.clone();
+                Arc::new(move |(track_id, slot_id): &(String, String), _w, cx| {
+                    let (track_id, slot_id) = (track_id.clone(), slot_id.clone());
+                    StudioLayout::defer_update(&owner, cx, move |this, cx| {
+                        this.remove_midi_fx(&track_id, &slot_id, cx);
+                    });
+                })
+            },
+            on_toggle_midi_fx: {
+                let owner = owner.clone();
+                Arc::new(move |(track_id, slot_id): &(String, String), _w, cx| {
+                    let (track_id, slot_id) = (track_id.clone(), slot_id.clone());
+                    StudioLayout::defer_update(&owner, cx, move |this, cx| {
+                        this.toggle_midi_fx(&track_id, &slot_id, cx);
+                    });
+                })
+            },
+            on_open_midi_fx: {
+                let owner = owner.clone();
+                Arc::new(move |(track_id, slot_id): &(String, String), _w, cx| {
+                    let (track_id, slot_id) = (track_id.clone(), slot_id.clone());
+                    StudioLayout::defer_update(&owner, cx, move |this, cx| {
+                        this.open_midi_fx_slot(&track_id, &slot_id, cx);
+                    });
+                })
+            },
+            midi_fx_picker_open: self.midi_fx_picker_open.clone(),
+            midi_fx_plugin_choices: if self.midi_fx_picker_open.is_some() {
+                self.midi_fx_plugin_choices()
+            } else {
+                Vec::new()
+            },
+            on_add_midi_fx_plugin: {
+                let owner = owner.clone();
+                Arc::new(move |(track_id, registry_id): &(String, String), _w, cx| {
+                    let (track_id, registry_id) = (track_id.clone(), registry_id.clone());
+                    StudioLayout::defer_update(&owner, cx, move |this, cx| {
+                        this.add_midi_fx_plugin(&track_id, &registry_id, cx);
+                    });
+                })
+            },
+            on_toggle_midi_fx_picker: {
+                let owner = owner.clone();
+                Arc::new(move |track_id: &String, _w, cx| {
+                    let track_id = track_id.clone();
+                    StudioLayout::defer_update(&owner, cx, move |this, cx| {
+                        this.toggle_midi_fx_picker(&track_id, cx);
+                    });
+                })
+            },
+            i18n,
             open_routing_combo,
             on_toggle_routing_combo,
             folded_sections: Arc::new(self.inspector_folded.clone()),

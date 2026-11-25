@@ -117,6 +117,15 @@ pub fn set_edition_provider(provider: EditionProvider) {
     }
 }
 
+/// Remove the provider, so the process reads as Community again. Only the UI
+/// preview does this: it renders both editions' views in one run.
+#[cfg(feature = "ui-preview")]
+pub fn clear_edition_provider() {
+    if let Ok(mut guard) = slot().write() {
+        *guard = None;
+    }
+}
+
 /// Current edition/license info, or `None` on a build with no provider
 /// (Community Edition). The provider is invoked with no lock held so it can
 /// safely touch other shared state.
@@ -252,6 +261,30 @@ pub fn refresh_licensed_providers() {
     if let Some(handler) = handler {
         handler();
     }
+}
+
+// ── Licensed spatial mixing ──────────────────────────────────────────────────
+//
+// Surround and binaural mixing — the spatial formats, the room panner, the
+// 3D Room Preview, multichannel export and Virtual Speaker — come with an active
+// Professional license. The Professional app layer sets this from its verified
+// license each time it installs what the license grants; a Community build
+// never sets it. Projects keep their spatial settings either way: without the
+// license a spatial project plays, and exports, as a stereo mix.
+
+static SPATIAL_MIX_LICENSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Record whether this machine's license grants spatial mixing. Called by the
+/// Professional app layer alongside its other licensed providers.
+pub fn set_spatial_mix_licensed(licensed: bool) {
+    SPATIAL_MIX_LICENSED.store(licensed, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether spatial mixing is licensed here. A plain atomic load: cheap enough
+/// for a render, never a license check of its own.
+pub fn spatial_mix_licensed() -> bool {
+    SPATIAL_MIX_LICENSED.load(std::sync::atomic::Ordering::Acquire)
 }
 
 #[cfg(test)]

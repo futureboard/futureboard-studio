@@ -8,7 +8,7 @@ use cargo_metadata::MetadataCommand;
 
 use crate::cargo_build::{self, APP_PACKAGE};
 use crate::metadata::{BuildInfo, MetadataInputs};
-use crate::platform::{Edition, host_target, platform_folder};
+use crate::platform::{host_target, platform_folder};
 use crate::plugins;
 use crate::staging::{self, StagingPlan};
 use crate::validation::{self, ValidationInputs};
@@ -59,7 +59,6 @@ impl PluginSelection {
 pub struct PackageOptions {
     pub profile: String,
     pub target: Option<String>,
-    pub edition: Edition,
     /// Root of the distributable tree (default `out`).
     pub out_root: PathBuf,
     /// Also stage debug symbols into `symbols/`.
@@ -70,6 +69,9 @@ pub struct PackageOptions {
     pub stage_cef: bool,
     /// After a macOS package, wrap the staged tree into `Futureboard Studio.app`.
     pub bundle_macos: bool,
+    /// Build the Futureboard Visualizer app with CMake and stage it beside
+    /// the Studio (native Windows and Linux packages).
+    pub visualizer: bool,
 }
 
 /// Run the full package pipeline and return the published directory.
@@ -134,7 +136,6 @@ pub fn run(options: &PackageOptions) -> Result<PathBuf> {
     let build = cargo_build::build(
         &options.profile,
         options.target.as_deref(),
-        options.edition,
         cef_dist.as_deref(),
     )?;
     let executable = &build.app_executable;
@@ -143,12 +144,7 @@ pub fn run(options: &PackageOptions) -> Result<PathBuf> {
     let platform = platform_folder(&target_triple);
 
     // 2. Prepare staging (clean any stale directory first).
-    let plan = StagingPlan::new(
-        &options.out_root,
-        &options.profile,
-        options.edition,
-        &platform,
-    );
+    let plan = StagingPlan::new(&options.out_root, &options.profile, &platform);
     plan.prepare()?;
 
     // 3. Copy required runtime files into staging — the app binary, the sidecar
@@ -163,6 +159,31 @@ pub fn run(options: &PackageOptions) -> Result<PathBuf> {
         let name = staging::stage_executable(&plan.staging_dir, sidecar)?;
         eprintln!("[xtask] staged sidecar executable: {name}");
         sidecar_names.push(name);
+    }
+    // 3a. The 32-bit plug-in bridge, beside the 64-bit sidecars.
+    if crate::x86_bridge::applies_to(&target_triple) {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .context("xtask must live under the workspace root")?;
+        for (executable, name) in crate::x86_bridge::build(workspace, &options.profile)? {
+            staging::copy_into(&plan.staging_dir, name, &executable)?;
+            eprintln!("[xtask] staged 32-bit bridge executable: {name}");
+            sidecar_names.push(name.to_string());
+        }
+    }
+    // 3b. The Futureboard Visualizer app, beside the Studio.
+    if options.visualizer {
+        let host = host_target().context("could not determine host target triple")?;
+        if crate::visualizer::applies_to(&target_triple, &host) {
+            let executable =
+                crate::visualizer::build(&workspace, &options.profile, &target_triple)?;
+            let name = crate::visualizer::staged_name(&target_triple);
+            staging::copy_into(&plan.staging_dir, name, &executable)?;
+            eprintln!("[xtask] staged visualizer app: {name}");
+            sidecar_names.push(name.to_string());
+        } else {
+            eprintln!("[xtask] visualizer app not built for target `{target_triple}`");
+        }
     }
     if let Some(helper) = &build.cef_helper_executable {
         let name = staging::stage_executable(&plan.staging_dir, helper)?;
@@ -210,12 +231,7 @@ pub fn run(options: &PackageOptions) -> Result<PathBuf> {
     // 4b. Optionally build and stage Built-in Plugin dynamic libraries.
     if options.plugins.is_enabled() {
         let packages: Vec<String> = selected.iter().map(|p| p.name.clone()).collect();
-        let built = plugins::build_plugins(
-            &packages,
-            &options.profile,
-            options.target.as_deref(),
-            options.edition,
-        )?;
+        let built = plugins::build_plugins(&packages, &options.profile, options.target.as_deref())?;
         let staged = plugins::stage_plugins(&plan.staging_dir, &built, &target_triple)?;
         if staged.is_empty() {
             eprintln!("[xtask] plugin build requested but no plugin cdylibs were produced");
@@ -258,7 +274,7 @@ pub fn run(options: &PackageOptions) -> Result<PathBuf> {
     let info = BuildInfo::collect(&MetadataInputs {
         binary: &binary_name,
         sidecars: &sidecar_names,
-        edition: options.edition,
+        professional: build.professional,
         profile: &options.profile,
         target: &target_triple,
         platform: &platform,
@@ -473,12 +489,9 @@ mod tests {
 
     #[test]
     fn macos_app_bundle_is_a_sibling_not_nested_in_the_package() {
-        let package = PathBuf::from("/out/release/community/macos-arm64");
+        let package = PathBuf::from("/out/release/macos-arm64");
         let app_out = macos_app_bundle_out(&package);
-        assert_eq!(
-            app_out,
-            PathBuf::from("/out/release/community/macos-arm64-app")
-        );
+        assert_eq!(app_out, PathBuf::from("/out/release/macos-arm64-app"));
         assert!(
             !app_out.starts_with(&package),
             "bundle output must not live inside the staged runtime tree"

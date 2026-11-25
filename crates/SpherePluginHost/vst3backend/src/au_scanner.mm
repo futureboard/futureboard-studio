@@ -94,6 +94,10 @@ static std::string category_for_type(OSType type) {
       return "Panner";
     case kAudioUnitType_Mixer:
       return "Mixer";
+    // 'aumi': MIDI in, MIDI out, no audio. Rust reads this exact label as a
+    // MIDI effect (`registry::is_midi_effect`).
+    case kAudioUnitType_MIDIProcessor:
+      return "MIDI Processor";
     default:
       return "AudioUnit";
   }

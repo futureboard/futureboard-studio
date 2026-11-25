@@ -114,6 +114,8 @@ fn isolate_for_bounce(snapshot: &mut EngineProjectSnapshot, targets: &[BounceTar
     let fader_tags = [
         AutomationTarget::TrackVolume.to_tag(),
         AutomationTarget::TrackPan.to_tag(),
+        AutomationTarget::TrackPanLeft.to_tag(),
+        AutomationTarget::TrackPanRight.to_tag(),
         AutomationTarget::TrackMute.to_tag(),
     ];
     for track in &mut snapshot.tracks {
@@ -125,6 +127,7 @@ fn isolate_for_bounce(snapshot: &mut EngineProjectSnapshot, targets: &[BounceTar
         };
         track.volume = 1.0;
         track.pan = 0.0;
+        track.dual_pan = Default::default();
         track.muted = false;
         track
             .automation_lanes
@@ -253,6 +256,9 @@ fn add_bounced_track(
         track.parent_group_id = source.parent_group_id.clone();
         track.routing.output = source.routing.output.clone();
         track.spatial = source.spatial;
+        // The bounce is pre-fader, so the new channel pans it as the
+        // source did — Dual included.
+        track.dual_pan = source.dual_pan;
         track.timebase = source.timebase;
         if whole_channel {
             track.muted = source.muted;
@@ -930,11 +936,13 @@ mod tests {
 
     fn track(id: &str) -> EngineTrackSnapshot {
         EngineTrackSnapshot {
+            vca_gain: 1.0,
             midi_programs: Vec::new(),
             id: id.to_string(),
             track_type: "audio".to_string(),
             volume: 0.5,
             pan: -0.5,
+            dual_pan: Default::default(),
             muted: true,
             solo: true,
             armed: true,
@@ -955,6 +963,7 @@ mod tests {
             soundfont_mode: Default::default(),
             soundfont_channels: Default::default(),
             solfege_engine: None,
+            midi_fx: Vec::new(),
             inserts: vec![EngineInsertSnapshot {
                 id: format!("{id}-fx"),
                 kind: "fx".to_string(),

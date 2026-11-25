@@ -7,8 +7,8 @@
 //!
 //! `build.rs` stages that file when the private checkout is present and sets
 //! `professional_toolchain`. A public Community checkout compiles the stub
-//! below instead, so `cargo xtask build-all` / `package --edition professional`
-//! stop with an explanation rather than failing to compile.
+//! below instead; `cargo xtask package` / `build-all` then build the package
+//! without the Professional code and never call it.
 //!
 //! The bridge deliberately uses `include!` rather than a `#[path]` module, for
 //! the same reason `apps/native/studio/src/professional_edition.rs` does:
@@ -59,7 +59,8 @@ mod stub {
             "this checkout has no Professional Edition build toolchain.\n\
              Building with ASIO needs the authorized `crates/ExclusiveEdition` \
              source, which provisions the Steinberg ASIO SDK and libclang.\n\
-             Community builds do not use it: `cargo xtask package --edition community`."
+             Without it, `cargo xtask package` builds the package without the \
+             Professional code."
         )
     }
 }

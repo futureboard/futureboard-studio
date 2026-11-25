@@ -68,6 +68,12 @@ pub(crate) struct RecordingSessionState {
     /// The track this Record press armed because nothing was armed. Disarmed
     /// again if the take does not start; kept armed once it does.
     pub auto_armed: Option<String>,
+    /// The track the user agreed to arm when Arm on Record asked: Record may
+    /// arm it, and only it, on the press that follows the answer.
+    pub arm_confirmed_for: Option<String>,
+    /// The Arm on Record question, while it is open.
+    pub arm_dialog:
+        Option<gpui::WindowHandle<crate::components::message_box_dialog::MessageBoxWindow>>,
 }
 
 impl Default for RecordingSessionState {
@@ -86,6 +92,8 @@ impl Default for RecordingSessionState {
             record_loop: None,
             jam_offset_ms: None,
             auto_armed: None,
+            arm_confirmed_for: None,
+            arm_dialog: None,
         }
     }
 }
@@ -197,6 +205,16 @@ impl StudioLayout {
             self.recording.start_after_finalize = true;
             cx.notify();
             return;
+        }
+        // Arm on Record: Ask. Asked before the count-in, which arms the take.
+        let policy = self.settings.read(cx).current.recording.arm_on_record;
+        if policy == crate::settings::ArmOnRecord::Ask {
+            if let Some(target) = self.record_arm_target(cx) {
+                if self.recording.arm_confirmed_for.as_deref() != Some(target.as_str()) {
+                    self.ask_arm_and_record(target, cx);
+                    return;
+                }
+            }
         }
         let (count_in_enabled, count_in_bars, playing, bpm, beats_per_bar, target_beat) = {
             let timeline = self.timeline.read(cx);
@@ -471,66 +489,45 @@ impl StudioLayout {
         // check below and reports only into `last_error`. When nothing is armed,
         // arm the selected track (if it can record) so the ordinary "click a
         // track, press Record" flow just works instead of silently failing.
-        let already_armed = {
-            let timeline = self.timeline.read(cx);
-            timeline.state.tracks.iter().any(|t| {
-                t.armed
-                    && matches!(
-                        t.track_type,
-                        TrackType::Audio | TrackType::Midi | TrackType::Instrument
-                    )
-            })
-        };
-        if !already_armed {
-            let arm_target = {
-                let timeline = self.timeline.read(cx);
-                timeline
-                    .state
-                    .selection
-                    .selected_track_id
-                    .clone()
-                    .filter(|id| {
-                        timeline
-                            .state
-                            .find_track(id)
-                            .map(|t| {
-                                matches!(
-                                    t.track_type,
-                                    TrackType::Audio | TrackType::Midi | TrackType::Instrument
-                                )
-                            })
-                            .unwrap_or(false)
+        //
+        // Settings → Playback → Arm on Record decides whether it may: always
+        // (Selected), only the track the user just agreed to (Ask), or never
+        // (Off, and Record reports that nothing is armed).
+        let policy = self.settings.read(cx).current.recording.arm_on_record;
+        let confirmed = self.recording.arm_confirmed_for.take();
+        let arm_target = self.record_arm_target(cx).filter(|id| match policy {
+            crate::settings::ArmOnRecord::SelectedTrack => true,
+            crate::settings::ArmOnRecord::Ask => confirmed.as_deref() == Some(id.as_str()),
+            crate::settings::ArmOnRecord::Off => false,
+        });
+        if let Some(id) = arm_target {
+            // Armed the way the arm button arms it, engine included: the
+            // engine opens the track's input when it is armed, and a take
+            // started on a track the engine did not know was armed had to
+            // open its own capture stream between Record and the downbeat.
+            let armed = self.timeline.update(cx, |timeline, cx| {
+                let changed = timeline.state.set_track_armed(&id, true);
+                cx.notify();
+                changed
+            });
+            if armed {
+                self.recording.auto_armed = Some(id.clone());
+                let error = {
+                    let timeline = self.timeline.read(cx);
+                    timeline.state.find_track(&id).and_then(|track| {
+                        apply_engine_track_input_state(
+                            engine,
+                            track,
+                            &timeline.state.audio_connections,
+                        )
+                        .err()
                     })
-            };
-            if let Some(id) = arm_target {
-                // Armed the way the arm button arms it, engine included: the
-                // engine opens the track's input when it is armed, and a take
-                // started on a track the engine did not know was armed had to
-                // open its own capture stream between Record and the downbeat.
-                let armed = self.timeline.update(cx, |timeline, cx| {
-                    let changed = timeline.state.set_track_armed(&id, true);
-                    cx.notify();
-                    changed
-                });
-                if armed {
-                    self.recording.auto_armed = Some(id.clone());
-                    let error = {
-                        let timeline = self.timeline.read(cx);
-                        timeline.state.find_track(&id).and_then(|track| {
-                            apply_engine_track_input_state(
-                                engine,
-                                track,
-                                &timeline.state.audio_connections,
-                            )
-                            .err()
-                        })
-                    };
-                    if let Some(error) = error {
-                        self.fail_recording_start(&format!("could not arm the track: {error}"), cx);
-                        return;
-                    }
-                    self.mark_dirty_view_only();
+                };
+                if let Some(error) = error {
+                    self.fail_recording_start(&format!("could not arm the track: {error}"), cx);
+                    return;
                 }
+                self.mark_dirty_view_only();
             }
         }
 
@@ -888,6 +885,8 @@ impl StudioLayout {
             // moves it to Idle when the writer hands the files over.
             if !self.recording.awaiting_finalize {
                 self.recording.ui_state = RecordingUiState::Idle;
+                // A take with no audio files to close is kept now.
+                self.disarm_after_take(cx);
             }
             if midi_committed {
                 self.audio_bridge.project_dirty = true;
@@ -936,6 +935,7 @@ impl StudioLayout {
                 self.commit_recording_results(cx, results);
                 if !matches!(self.recording.ui_state, RecordingUiState::Failed { .. }) {
                     self.recording.ui_state = RecordingUiState::Idle;
+                    self.disarm_after_take(cx);
                 }
             }
             Err(error) => {
@@ -1264,7 +1264,7 @@ impl StudioLayout {
         };
         // Both move the take in real time; `place_recorded_take` turns that
         // into beats through the tempo map at the take.
-        let shift_seconds = (recording_offset_ms as f64 - jam_offset_ms.unwrap_or(0.0)) / 1000.0;
+        let shift_seconds = (recording_offset_ms - jam_offset_ms.unwrap_or(0.0)) / 1000.0;
         let mut import_paths: Vec<(PathBuf, String)> = Vec::new();
         let mut failed_tracks: Vec<String> = Vec::new();
         // One stamp for the whole pass, so every track's take from this Record
@@ -1689,6 +1689,146 @@ impl StudioLayout {
                 cx.notify();
             }
         });
+    }
+
+    /// The track Record would arm: the selected track, when it can record
+    /// and no track that can record is armed. `None` when something is armed
+    /// already, or the selection cannot record.
+    fn record_arm_target(&self, cx: &App) -> Option<String> {
+        let timeline = self.timeline.read(cx);
+        let records = |track: &TrackState| {
+            matches!(
+                track.track_type,
+                TrackType::Audio | TrackType::Midi | TrackType::Instrument
+            )
+        };
+        if timeline
+            .state
+            .tracks
+            .iter()
+            .any(|track| track.armed && records(track))
+        {
+            return None;
+        }
+        timeline
+            .state
+            .selection
+            .selected_track_id
+            .clone()
+            .filter(|id| timeline.state.find_track(id).is_some_and(records))
+    }
+
+    /// Arm on Record: Ask. Offer to arm `track_id` and record; Record runs
+    /// again on the answer, allowed to arm that track and no other.
+    fn ask_arm_and_record(&mut self, track_id: String, cx: &mut Context<Self>) {
+        use crate::components::message_box_dialog::{
+            open_message_box_window, MessageBoxKind, MessageBoxOptions, MessageBoxResult,
+        };
+        if let Some(handle) = self.recording.arm_dialog {
+            if handle
+                .update(cx, |_, window, _| window.activate_window())
+                .is_ok()
+            {
+                return;
+            }
+            self.recording.arm_dialog = None;
+        }
+        let name = self
+            .timeline
+            .read(cx)
+            .state
+            .find_track(&track_id)
+            .map(|track| track.name.clone())
+            .unwrap_or_else(|| "the selected track".to_string());
+        let options = MessageBoxOptions {
+            kind: MessageBoxKind::Question,
+            title: "Arm and record?".to_string(),
+            message: format!("No track is armed. Arm \"{name}\" and record?"),
+            detail: Some(
+                "Settings → Playback → Arm on Record sets what Record does when nothing is armed."
+                    .to_string(),
+            ),
+            buttons: vec!["Arm and Record".to_string(), "Cancel".to_string()],
+            default_id: 0,
+            cancel_id: Some(1),
+        };
+        let owner = cx.entity().clone();
+        let on_response: std::sync::Arc<
+            dyn Fn(MessageBoxResult, &mut gpui::Window, &mut App) + Send + Sync,
+        > = std::sync::Arc::new(move |result, _window, cx| {
+            let confirmed = result.response == 0;
+            let track_id = track_id.clone();
+            StudioLayout::defer_update(&owner, cx, move |this, cx| {
+                this.recording.arm_dialog = None;
+                if confirmed {
+                    this.recording.arm_confirmed_for = Some(track_id);
+                    this.start_native_recording(cx);
+                }
+            });
+        });
+        let owner_bounds = crate::window_position::resolve_owner_bounds_with_preferred(
+            None,
+            self.studio_window_bounds(cx),
+            cx,
+        );
+        match open_message_box_window(owner_bounds, options, on_response, cx) {
+            Ok(handle) => self.recording.arm_dialog = Some(handle),
+            Err(error) => {
+                self.fail_recording_start(&format!("could not ask to arm a track: {error}"), cx)
+            }
+        }
+    }
+
+    /// Disarm after recording: once a take is kept, disarm every armed
+    /// track, the engine's inputs included, so the next Record does not
+    /// record over them. Not when Record was pressed again while the take's
+    /// files were closing: that take wants the same tracks.
+    fn disarm_after_take(&mut self, cx: &mut Context<Self>) {
+        if !self
+            .settings
+            .read(cx)
+            .current
+            .recording
+            .disarm_after_recording
+            || self.recording.start_after_finalize
+        {
+            return;
+        }
+        let disarmed: Vec<String> = self.timeline.update(cx, |timeline, cx| {
+            let armed: Vec<String> = timeline
+                .state
+                .tracks
+                .iter()
+                .filter(|track| track.armed)
+                .map(|track| track.id.clone())
+                .collect();
+            let disarmed: Vec<String> = armed
+                .into_iter()
+                .filter(|id| timeline.state.set_track_armed(id, false))
+                .collect();
+            if !disarmed.is_empty() {
+                cx.notify();
+            }
+            disarmed
+        });
+        if disarmed.is_empty() {
+            return;
+        }
+        if let Some(engine) = self.audio_bridge.engine.clone() {
+            let timeline = self.timeline.read(cx);
+            for id in &disarmed {
+                if let Some(track) = timeline.state.find_track(id) {
+                    if let Err(error) = apply_engine_track_input_state(
+                        &engine,
+                        track,
+                        &timeline.state.audio_connections,
+                    ) {
+                        eprintln!("[recording] disarm after take failed for {id}: {error}");
+                    }
+                }
+            }
+        }
+        self.mark_dirty_view_only();
     }
 
     fn fail_recording_start(&mut self, message: &str, cx: &mut Context<Self>) {

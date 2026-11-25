@@ -43,6 +43,29 @@ pub(super) fn publish_track_to_jam(
     slot.write_planar(&track.block_l, &track.block_r, frames, runtime.sample_rate);
 }
 
+/// Feed one track's post-fader block to the visualizer track tap, when this
+/// is the track a visualizer asked for. One relaxed load per track per block
+/// otherwise; atomics into a preallocated ring when it is.
+#[inline]
+pub(super) fn publish_track_to_visualizer(
+    runtime: &RuntimeProject,
+    track_index: usize,
+    frames: usize,
+) {
+    let Some(track) = runtime.tracks.get(track_index) else {
+        return;
+    };
+    if !track.meter.visualizer_tap.load(Ordering::Relaxed) {
+        return;
+    }
+    let frames = frames.min(track.block_l.len()).min(track.block_r.len());
+    crate::visualizer_tap::track_tap().write_planar(
+        &track.block_l[..frames],
+        &track.block_r[..frames],
+        runtime.sample_rate,
+    );
+}
+
 /// Keep this track's post-fader block for a track that loops it back as input.
 ///
 /// Realtime-safe in the steady state: two `copy_from_slice`s into buffers that

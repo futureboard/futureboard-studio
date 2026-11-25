@@ -6,6 +6,15 @@
 //! own instrument says otherwise (the built-in Drum Sampler's pads, by their
 //! samples). Every row mapping the editor does in drum mode goes through here,
 //! so the lane list, the grid rows, the hits and hit-testing agree.
+//!
+//! A lane is only a note, so any instrument played by note — the Drum
+//! Sampler, a hosted VSTi drum kit — plays the steps: they are the clip's own
+//! notes at the lane's pitch, on the track's note channel (the channel the
+//! Piano Roll draws on, `TrackRoutingState::default_note_channel`), not
+//! forced to General MIDI's channel 10. Most VSTi kits listen on channel 1 or
+//! omni; set the track's MIDI channel to 10 for a GM module's drum part. A
+//! kit mapped off the GM notes is fitted with Lane Note, which keeps the
+//! track's lane list (`TrackState::step_lanes`).
 
 use std::collections::BTreeSet;
 
@@ -67,11 +76,60 @@ const GM_LAST: u8 = 81;
 /// What an empty clip shows in Used mode: a kit to start a beat on.
 const CORE_KIT: [u8; 6] = [36, 38, 42, 46, 49, 51];
 
+/// The General MIDI percussion map in the groups a kit is set up in, for
+/// the Lane Note picker. Every note from 35 to 81 is in exactly one group.
+pub(super) const GM_GROUPS: [(&str, &[u8]); 5] = [
+    ("Kick & Snare", &[35, 36, 37, 38, 39, 40]),
+    ("Hi-Hats", &[42, 44, 46]),
+    ("Toms", &[41, 43, 45, 47, 48, 50]),
+    ("Cymbals", &[49, 51, 52, 53, 55, 57, 59]),
+    (
+        "Percussion",
+        &[
+            54, 56, 58, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78,
+            79, 80, 81,
+        ],
+    ),
+];
+
 /// The General MIDI name of a percussion note, if it has one.
 pub(super) fn gm_drum_name(pitch: u8) -> Option<&'static str> {
     (GM_FIRST..=GM_LAST)
         .contains(&pitch)
         .then(|| GM_DRUMS[(pitch - GM_FIRST) as usize])
+}
+
+/// The track's drum lanes, ascending: every note the clip plays, plus the
+/// track's own lane list (`kit`, what Lane Note picked) — or, while it has
+/// none and the clip plays nothing, a starter kit. This is the Used view
+/// and what a Lane Note change rewrites.
+pub(super) fn track_lanes(kit: &[u8], used: &[u8]) -> Vec<u8> {
+    let mut lanes: BTreeSet<u8> = used.iter().copied().collect();
+    if !kit.is_empty() {
+        lanes.extend(kit.iter().map(|note| note & 0x7F));
+    } else if lanes.is_empty() {
+        lanes.extend(CORE_KIT);
+    }
+    lanes.into_iter().collect()
+}
+
+/// Whether `note` is already a lane or holds hits, so a lane cannot be set to
+/// it: two lanes on one note would be one row, and moving hits onto another
+/// lane's hits would merge them.
+pub(super) fn lane_note_taken(lanes: &[u8], hits: &[u8], note: u8) -> bool {
+    lanes.contains(&note) || hits.contains(&note)
+}
+
+/// `lanes` with lane `from` given note `to`, ascending: the track's new lane
+/// list. `None` when nothing changes or `to` is taken (see
+/// [`lane_note_taken`]); `hits` is every note the track's clips play.
+pub(super) fn relabeled_lanes(lanes: &[u8], hits: &[u8], from: u8, to: u8) -> Option<Vec<u8>> {
+    if from == to || to > 127 || lane_note_taken(lanes, hits, to) {
+        return None;
+    }
+    let mut next: BTreeSet<u8> = lanes.iter().copied().filter(|n| *n != from).collect();
+    next.insert(to);
+    Some(next.into_iter().collect())
 }
 
 /// Which lanes the drum editor lists.
@@ -105,12 +163,11 @@ impl DrumOrder {
 
 /// The lanes, top to bottom, in `order`. `used` is every note the clip
 /// plays; none of them is ever left without a lane, so no hit is hidden.
-pub(super) fn drum_rows(lanes: DrumLanes, order: DrumOrder, used: &[u8]) -> Vec<u8> {
-    let mut rows: BTreeSet<u8> = used.iter().copied().collect();
-    match lanes {
-        DrumLanes::Kit => rows.extend(GM_FIRST..=GM_LAST),
-        DrumLanes::Used if rows.is_empty() => rows.extend(CORE_KIT),
-        DrumLanes::Used => {}
+/// `kit` is the track's own lane list (see [`track_lanes`]).
+pub(super) fn drum_rows(lanes: DrumLanes, order: DrumOrder, used: &[u8], kit: &[u8]) -> Vec<u8> {
+    let mut rows: BTreeSet<u8> = track_lanes(kit, used).into_iter().collect();
+    if lanes == DrumLanes::Kit {
+        rows.extend(GM_FIRST..=GM_LAST);
     }
     match order {
         DrumOrder::LowFirst => rows.into_iter().collect(),
@@ -160,17 +217,17 @@ mod tests {
     /// empty clip in Used mode still has a kit to draw on.
     #[test]
     fn every_played_note_has_a_lane() {
-        let kit = drum_rows(DrumLanes::Kit, DrumOrder::LowFirst, &[20, 36, 100]);
+        let kit = drum_rows(DrumLanes::Kit, DrumOrder::LowFirst, &[20, 36, 100], &[]);
         assert_eq!(kit.first(), Some(&20));
         assert_eq!(kit.last(), Some(&100));
         assert_eq!(kit.len(), 47 + 2);
 
         assert_eq!(
-            drum_rows(DrumLanes::Used, DrumOrder::LowFirst, &[42, 36, 42]),
+            drum_rows(DrumLanes::Used, DrumOrder::LowFirst, &[42, 36, 42], &[]),
             vec![36, 42]
         );
         assert_eq!(
-            drum_rows(DrumLanes::Used, DrumOrder::LowFirst, &[]),
+            drum_rows(DrumLanes::Used, DrumOrder::LowFirst, &[], &[]),
             CORE_KIT.to_vec()
         );
     }
@@ -179,14 +236,94 @@ mod tests {
     /// to the lane drawn below.
     #[test]
     fn reversed_order_runs_high_notes_first() {
-        let rows = drum_rows(DrumLanes::Used, DrumOrder::HighFirst, &[36, 42, 38]);
+        let rows = drum_rows(DrumLanes::Used, DrumOrder::HighFirst, &[36, 42, 38], &[]);
         assert_eq!(rows, vec![42, 38, 36]);
         assert_eq!(drum_move(&rows, 42, 1), 38);
         assert_eq!(drum_row_at(&rows, 0.0, 0.0, 20.0), Some(42));
-        let kit = drum_rows(DrumLanes::Kit, DrumOrder::HighFirst, &[]);
+        let kit = drum_rows(DrumLanes::Kit, DrumOrder::HighFirst, &[], &[]);
         assert_eq!(kit.first(), Some(&GM_LAST));
         assert_eq!(kit.last(), Some(&GM_FIRST));
         assert_eq!(DrumOrder::HighFirst.reversed(), DrumOrder::LowFirst);
+    }
+
+    /// The picker's groups hold the whole percussion map once each, and the
+    /// kit pieces a VSTi drum kit is mapped by sit where GM puts them.
+    #[test]
+    fn gm_groups_cover_every_percussion_note_once() {
+        let mut seen: Vec<u8> = GM_GROUPS
+            .iter()
+            .flat_map(|(_, notes)| notes.iter().copied())
+            .collect();
+        seen.sort_unstable();
+        assert_eq!(seen, (GM_FIRST..=GM_LAST).collect::<Vec<_>>());
+        let group_of = |note: u8| {
+            GM_GROUPS
+                .iter()
+                .find(|(_, notes)| notes.contains(&note))
+                .map(|(name, _)| *name)
+        };
+        for kick_or_snare in [35, 36, 37, 38, 39, 40] {
+            assert_eq!(group_of(kick_or_snare), Some("Kick & Snare"));
+        }
+        for hat in [42, 44, 46] {
+            assert_eq!(group_of(hat), Some("Hi-Hats"));
+        }
+        for tom in [41, 43, 45, 47, 48, 50] {
+            assert_eq!(group_of(tom), Some("Toms"));
+        }
+        for cymbal in [49, 51, 57] {
+            assert_eq!(group_of(cymbal), Some("Cymbals"));
+        }
+        assert_eq!(gm_drum_name(35), Some("Acoustic Kick"));
+        assert_eq!(gm_drum_name(37), Some("Side Stick"));
+        assert_eq!(gm_drum_name(39), Some("Hand Clap"));
+        assert_eq!(gm_drum_name(44), Some("Pedal Hi-Hat"));
+        assert_eq!(gm_drum_name(46), Some("Open Hi-Hat"));
+        assert_eq!(gm_drum_name(49), Some("Crash 1"));
+        assert_eq!(gm_drum_name(51), Some("Ride 1"));
+        assert_eq!(gm_drum_name(57), Some("Crash 2"));
+    }
+
+    /// The track's own lane list replaces the starter kit and keeps its
+    /// lanes even with no hits on them; played notes always get a lane.
+    #[test]
+    fn a_tracks_lane_list_shows_its_empty_lanes() {
+        assert_eq!(track_lanes(&[], &[]), CORE_KIT.to_vec());
+        assert_eq!(track_lanes(&[], &[38, 36]), vec![36, 38]);
+        assert_eq!(track_lanes(&[24, 36, 44], &[]), vec![24, 36, 44]);
+        assert_eq!(track_lanes(&[24, 36], &[38]), vec![24, 36, 38]);
+        assert_eq!(
+            drum_rows(DrumLanes::Used, DrumOrder::LowFirst, &[], &[24, 44]),
+            vec![24, 44]
+        );
+        let kit = drum_rows(DrumLanes::Kit, DrumOrder::LowFirst, &[], &[24]);
+        assert_eq!(kit.first(), Some(&24), "a non-GM lane is listed in Kit too");
+        assert_eq!(kit.len(), 47 + 1);
+    }
+
+    /// Lane Note swaps one lane's note in the list; a note that is already a
+    /// lane, or holds hits anywhere on the track, is refused.
+    #[test]
+    fn a_lane_takes_a_free_note_only() {
+        let lanes = track_lanes(&[], &[]);
+        assert_eq!(
+            relabeled_lanes(&lanes, &[], 42, 44),
+            Some(vec![36, 38, 44, 46, 49, 51])
+        );
+        assert_eq!(relabeled_lanes(&lanes, &[], 42, 42), None, "no change");
+        assert_eq!(relabeled_lanes(&lanes, &[], 42, 46), None, "another lane");
+        assert_eq!(relabeled_lanes(&lanes, &[40], 42, 40), None, "hits there");
+        assert!(lane_note_taken(&lanes, &[40], 40));
+        assert!(!lane_note_taken(&lanes, &[40], 41));
+        // A Kit-view lane that is not on the track's list (an empty GM lane)
+        // is free to take.
+        assert_eq!(
+            relabeled_lanes(&[36, 38], &[36], 38, 40),
+            Some(vec![36, 40])
+        );
+        // Any MIDI note, not only GM ones: a kit mapped below the GM range.
+        assert_eq!(relabeled_lanes(&[36, 38], &[], 36, 24), Some(vec![24, 38]));
+        assert_eq!(relabeled_lanes(&[36], &[], 36, 128), None);
     }
 
     #[test]

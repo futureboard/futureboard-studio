@@ -170,6 +170,35 @@ impl StudioLayout {
             return;
         }
 
+        // A time range in the arrangement: Delete removes what it holds from
+        // the clips it covers and leaves the gap. With a range set nothing
+        // falls through to whole clips or the track, even when it covers
+        // nothing. Selected automation points still go first.
+        match self.timeline.update(cx, |timeline, cx| {
+            use crate::components::timeline::timeline_state::TrackLaneMode;
+            let automation_points = timeline
+                .state
+                .selection
+                .selected_track_id
+                .as_deref()
+                .is_some_and(|tid| {
+                    timeline.state.track_lane_mode(tid) == TrackLaneMode::Automation
+                        && timeline.state.selected_automation_point_count(tid) > 0
+                });
+            if automation_points {
+                None
+            } else {
+                timeline.delete_arrangement_range("Delete Range", cx)
+            }
+        }) {
+            Some(true) => {
+                self.mark_dirty();
+                return;
+            }
+            Some(false) => return,
+            None => {}
+        }
+
         // Decide up front whether this gesture resolves to a *track* delete, so
         // plugin cleanup (close editors, MIDI panic) runs before the model
         // mutation. Mirrors the branch order inside the update below: automation
@@ -266,6 +295,14 @@ impl StudioLayout {
     }
 
     pub(super) fn copy_selected_clips(&mut self, cx: &mut Context<Self>) {
+        // A time range copies the part of each clip inside it, without
+        // changing the project; a range over no clips leaves the clipboard.
+        if let Some(pieces) = self.timeline.read(cx).copy_arrangement_range() {
+            if !pieces.is_empty() {
+                self.clip_clipboard = pieces;
+            }
+            return;
+        }
         self.clip_clipboard = self
             .timeline
             .read(cx)
@@ -278,6 +315,21 @@ impl StudioLayout {
     }
 
     pub(super) fn cut_selected_clips(&mut self, cx: &mut Context<Self>) {
+        // A time range: copy the part inside it, then delete that part — one
+        // undo step, the delete; the copy changes nothing.
+        if let Some(pieces) = self.timeline.read(cx).copy_arrangement_range() {
+            if pieces.is_empty() {
+                return;
+            }
+            self.clip_clipboard = pieces;
+            let cut = self.timeline.update(cx, |timeline, cx| {
+                timeline.delete_arrangement_range("Cut Range", cx)
+            });
+            if cut == Some(true) {
+                self.mark_dirty();
+            }
+            return;
+        }
         self.copy_selected_clips(cx);
         if self.clip_clipboard.is_empty() {
             return;
@@ -558,6 +610,7 @@ impl StudioLayout {
                 self.menu_bar.submenu_path.clear();
                 self.project_switcher.is_open = false;
                 self.automation_picker_query.clear();
+                self.automation_picker_open_groups.clear();
                 self.automation_picker_search_input.set_value("");
                 self.request_track_insert_parameters(track_id, cx);
                 self.automation_picker_search_input
@@ -685,12 +738,7 @@ impl StudioLayout {
             if selected.is_empty() {
                 return;
             }
-            let mut clips = Vec::new();
-            for id in selected {
-                if let Some((track_id, clip)) = timeline.state.build_clip_duplicate_after(&id) {
-                    clips.push((track_id, clip));
-                }
-            }
+            let clips = timeline.state.build_clip_group_duplicate(&selected);
             if clips.is_empty() {
                 return;
             }

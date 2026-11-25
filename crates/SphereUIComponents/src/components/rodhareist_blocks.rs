@@ -415,6 +415,7 @@ fn rows(kind: StageKind) -> &'static [Row] {
         StageKind::Cab => &[
             ("cab_mic", "cab_mic", "Mic Position"),
             ("cab_dist", "cab_dist", "Distance"),
+            ("cab_axis", "cab_axis", "Off-Axis"),
         ],
         StageKind::Eq => &[
             ("eq_low_gain", "eq_low_gain", "Low"),
@@ -507,7 +508,7 @@ pub(crate) fn params(p: &Params, kind: StageKind) -> Vec<ParamSpec> {
     let inactive = |id: &str| match id {
         "wah_sens" => p.wah_model != WahModel::TouchWah,
         "reverb_shimmer" => p.reverb_model != ReverbModel::Shimmer,
-        "cab_mic" | "cab_dist" => p.cab_model == CabModel::Ir,
+        "cab_mic" | "cab_dist" | "cab_axis" => p.cab_model == CabModel::Ir,
         "delay_time_r" | "delay_fb_r" => !stereo_a,
         "delay2_time_r" | "delay2_fb_r" => !stereo_b,
         _ => false,
@@ -812,6 +813,7 @@ pub(crate) fn reverb_model_label(model: ReverbModel) -> &'static str {
         ReverbModel::Chamber => "Drum Chamber",
         ReverbModel::Ambience => "Ambience",
         ReverbModel::DarkHall => "Dark Hall",
+        ReverbModel::LiveRoom => "Live Room",
     }
 }
 

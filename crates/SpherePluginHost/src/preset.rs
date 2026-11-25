@@ -291,6 +291,8 @@ pub fn read_preset_file(preset_path: &Path) -> Result<RegistryPlugin, String> {
         // Presets predate ARA detection and store no ARA flag; the catalog row
         // from the scan is the authority, so this projection stays conservative.
         is_ara: false,
+        // Same for the VST3 event-output flag: the catalog row carries it.
+        midi_output: false,
         preset_path: preset_path.to_path_buf(),
         scanned_at_ms: parsed.created_at,
         status,
@@ -510,7 +512,7 @@ pub fn read_state_preset(path: &Path) -> Result<(String, Vec<u8>), String> {
 
 fn build_state_preset_binary(preset: &StatePreset) -> Vec<u8> {
     let metadata = PresetMetadata {
-        preset_format: "Mochi preset: Futureboard",
+        preset_format: "Futureboard preset",
         version: 1,
         created_at: now_millis(),
         plugin_metadata: PresetPluginMetadata {
@@ -565,7 +567,7 @@ fn now_millis() -> i64 {
 fn build_preset_binary(plugin: &RegistryPlugin) -> Vec<u8> {
     let kind = plugin.kind.as_str();
     let metadata = PresetMetadata {
-        preset_format: "Mochi preset: Futureboard",
+        preset_format: "Futureboard preset",
         version: 1,
         created_at: plugin.scanned_at_ms,
         plugin_metadata: PresetPluginMetadata {

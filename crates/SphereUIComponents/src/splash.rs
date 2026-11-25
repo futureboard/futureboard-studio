@@ -1,24 +1,34 @@
 //! Standalone boot splash window.
 //!
 //! Shown immediately at process launch, before Welcome or Studio windows exist.
-//! Displays only the splash artwork at logical 670×350 (source PNG is @2x).
+//! Displays the splash artwork at logical 402×525: the @1x copy on a 100%
+//! display, the @2x art above that, and the boot status under the artwork's
+//! text column.
 
 use gpui::{
-    div, img, px, rgb, rgba, App, AppContext, Context, IntoElement, ObjectFit, ParentElement,
-    Render, SharedString, Styled, StyledImage, Window, WindowBackgroundAppearance, WindowBounds,
+    div, img, px, rgb, App, AppContext, Context, IntoElement, ObjectFit, ParentElement, Render,
+    SharedString, Styled, StyledImage, Window, WindowBackgroundAppearance, WindowBounds,
     WindowHandle, WindowKind, WindowOptions,
 };
 
 use crate::edition::{self, EditionInfo, LicenseDisplayState};
 use crate::embedded_assets::{
-    splash_image_available, SPLASH_CE_IMAGE_PATH, SPLASH_IMAGE_PATH, SPLASH_PROFESSIONAL_IMAGE_PATH,
+    splash_image_available, splash_image_for_scale, SPLASH_CE_IMAGE_PATH, SPLASH_IMAGE_PATH,
+    SPLASH_PROFESSIONAL_IMAGE_PATH,
 };
 use crate::theme::{self, Colors};
 use crate::window_position::centered_window_bounds;
 
-/// Splash window size in logical pixels (source asset is 1340×700 @2x).
-pub const SPLASH_WIDTH: f32 = 670.0;
-pub const SPLASH_HEIGHT: f32 = 350.0;
+/// Splash window size in logical pixels: the artwork is 804×1050 @2x and
+/// 402×525 @1x.
+pub const SPLASH_WIDTH: f32 = 402.0;
+pub const SPLASH_HEIGHT: f32 = 525.0;
+/// The artwork's left text margin, which the status line lines up with.
+const ART_MARGIN_X: f32 = 26.0;
+const STATUS_BOTTOM: f32 = 24.0;
+/// Status text drawn over the artwork's own flat background, so it is
+/// matched to the art rather than to the theme.
+const STATUS_TEXT: u32 = 0x8d9099;
 
 pub struct SplashWindow {
     image_path: &'static str,
@@ -69,7 +79,7 @@ fn splash_image_path_for_edition(info: Option<&EditionInfo>) -> &'static str {
 }
 
 impl Render for SplashWindow {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let mut root = div()
             .size_full()
             .relative()
@@ -79,10 +89,13 @@ impl Render for SplashWindow {
 
         if self.image_available {
             root = root.child(
-                img(SharedString::from(self.image_path))
-                    .w(px(SPLASH_WIDTH))
-                    .h(px(SPLASH_HEIGHT))
-                    .object_fit(ObjectFit::Contain),
+                img(SharedString::from(splash_image_for_scale(
+                    self.image_path,
+                    window.scale_factor(),
+                )))
+                .w(px(SPLASH_WIDTH))
+                .h(px(SPLASH_HEIGHT))
+                .object_fit(ObjectFit::Contain),
             );
         } else {
             root = root.child(
@@ -103,25 +116,18 @@ impl Render for SplashWindow {
         }
 
         if !self.status.is_empty() {
-            // Bottom-centered status pill, legible over the artwork.
+            // The artwork leaves its lower part empty: the boot status sits
+            // there, on the same left edge as the title above it.
             root = root.child(
                 div()
                     .absolute()
-                    .bottom(px(10.0))
-                    .left_0()
-                    .right_0()
-                    .flex()
-                    .justify_center()
-                    .child(
-                        div()
-                            .px(px(10.0))
-                            .py(px(3.0))
-                            .rounded(px(crate::theme::radius::CONTROL))
-                            .bg(rgba(0x0b0f18cc))
-                            .text_size(px(11.0))
-                            .text_color(rgb(0xd7dbe6))
-                            .child(self.status.clone()),
-                    ),
+                    .bottom(px(STATUS_BOTTOM))
+                    .left(px(ART_MARGIN_X))
+                    .right(px(ART_MARGIN_X))
+                    .truncate()
+                    .text_size(px(crate::theme::typography::UI_XS))
+                    .text_color(rgb(STATUS_TEXT))
+                    .child(self.status.clone()),
             );
         }
 
@@ -212,6 +218,22 @@ mod tests {
             splash_image_path_for_edition(Some(&unlicensed)),
             SPLASH_CE_IMAGE_PATH
         );
+    }
+
+    #[test]
+    fn a_100_percent_display_gets_the_1x_artwork() {
+        for path in [
+            SPLASH_IMAGE_PATH,
+            SPLASH_CE_IMAGE_PATH,
+            SPLASH_PROFESSIONAL_IMAGE_PATH,
+        ] {
+            let one_x = splash_image_for_scale(path, 1.0);
+            assert_ne!(one_x, path);
+            assert!(one_x.ends_with("_1x.png"));
+            assert!(splash_image_available(one_x));
+            assert_eq!(splash_image_for_scale(path, 1.25), path);
+            assert_eq!(splash_image_for_scale(path, 2.0), path);
+        }
     }
 
     #[test]

@@ -1,7 +1,9 @@
 //! The Audio Repair module navigator.
 //!
-//! A labeled vertical list, not an abbreviation rail: the module name is the
-//! primary identifier and the glyph supports it. One registration table drives
+//! A labeled vertical list: each working module shows its name over a few
+//! words on what it fixes, and the modules not built yet sit under their own
+//! heading. Only a narrow window collapses it to an icon rail, whose tooltips
+//! carry the names. One registration table drives
 //! order, labels, icons and availability, so adding a repair module is a row in
 //! [`MODULES`] plus an SVG file — no layout code changes.
 //!
@@ -18,15 +20,23 @@ use sphere_audio_editor::AudioRepairModule;
 
 use crate::assets;
 use crate::components::controls::{fb_section_label, fb_tooltip};
-use crate::theme::{elevation, radius, size, space, typography, Colors};
+use crate::theme::{elevation, radius, space, typography, Colors};
 
 use super::window::AudioToolWindow;
 
-/// Navigator width. Sized so the longest label ("Noise Reduction") sits beside
-/// its glyph and the unavailable marker without truncating.
-pub(super) const MODULE_LIST_WIDTH: f32 = 164.0;
+/// Navigator width. Sized so the longest purpose line ("Hiss and background
+/// noise") sits beside its icon tile without truncating.
+pub(super) const MODULE_LIST_WIDTH: f32 = 212.0;
+/// The icon-only rail a narrow window collapses the navigator to.
+pub(super) const MODULE_RAIL_WIDTH: f32 = 52.0;
 /// Glyph box. The family is drawn on an 18 px grid and reads down to this size.
 const ICON_SIZE: f32 = 16.0;
+/// The rounded plate behind each glyph.
+const ICON_TILE: f32 = 28.0;
+/// A working module: its name over what it fixes.
+const ROW_H: f32 = 44.0;
+/// A module that is not built yet: one quiet line.
+const LATER_ROW_H: f32 = 26.0;
 /// Leading selected marker, matching the app's other sidebar rails.
 const MARKER_W: f32 = 2.0;
 
@@ -110,47 +120,81 @@ pub(super) fn step_selectable(from: usize, delta: i32) -> Option<usize> {
     }
 }
 
-/// The module navigator: a section label over one row per registered module.
+/// The module navigator: the working modules as two-line rows, then the ones
+/// not built yet under their own heading, so the list says plainly which half
+/// can be used. `compact` collapses it to an icon rail for narrow windows.
 pub(super) fn repair_module_list(
     active: AudioRepairModule,
     focus: &[FocusHandle],
+    compact: bool,
     cx: &mut Context<AudioToolWindow>,
 ) -> impl IntoElement {
+    let rows: Vec<_> = MODULES
+        .iter()
+        .zip(focus)
+        .enumerate()
+        .map(|(index, (meta, handle))| {
+            (
+                meta.available,
+                repair_module_item(*meta, index, meta.id == active, compact, handle, cx)
+                    .into_any_element(),
+            )
+        })
+        .collect();
+    let (ready, later): (Vec<_>, Vec<_>) = rows.into_iter().partition(|(available, _)| *available);
+    let heading = |label: &'static str| {
+        div()
+            .px(px(space::LOOSE))
+            .pt(px(space::SNUG))
+            .pb(px(space::TIGHT))
+            .child(fb_section_label(label))
+    };
+
     div()
         .id("repair-modules")
         .flex_none()
-        .w(px(MODULE_LIST_WIDTH))
+        .w(px(if compact {
+            MODULE_RAIL_WIDTH
+        } else {
+            MODULE_LIST_WIDTH
+        }))
         .h_full()
         .flex()
         .flex_col()
         .gap(px(space::HAIR))
-        .py(px(space::SNUG))
+        .pb(px(space::BASE))
+        .pt(px(if compact { space::BASE } else { 0.0 }))
         .bg(Colors::surface_sidebar())
         .border_r(px(1.0))
         .border_color(Colors::border_subtle())
         .overflow_y_scroll()
-        .child(
-            div()
-                .px(px(space::SNUG + space::TIGHT))
-                .pb(px(space::TIGHT))
-                .child(fb_section_label("MODULES")),
-        )
-        .children(
-            MODULES
-                .iter()
-                .zip(focus)
-                .enumerate()
-                .map(|(index, (meta, handle))| {
-                    repair_module_item(*meta, index, meta.id == active, handle, cx)
-                }),
-        )
+        .when(!compact, |list| list.child(heading("REPAIR")))
+        .children(ready.into_iter().map(|(_, row)| row))
+        .when(!later.is_empty(), |list| {
+            if compact {
+                // A hairline instead of a heading: the rail has no room for
+                // words, and the rows' tooltips say they are not built yet.
+                list.child(
+                    div()
+                        .mx(px(space::LOOSE))
+                        .my(px(space::SNUG))
+                        .h(px(1.0))
+                        .bg(Colors::border_subtle()),
+                )
+            } else {
+                list.child(heading("COMING LATER"))
+            }
+        })
+        .children(later.into_iter().map(|(_, row)| row))
 }
 
-/// One navigator row: `[icon] [label]`, plus the unavailable marker.
+/// One navigator row. A working module is `[icon tile] name / what it fixes`;
+/// one not built yet is a single dimmed line. In the rail, the icon alone.
 fn repair_module_item(
     meta: AudioRepairModuleMeta,
     index: usize,
     active: bool,
+    compact: bool,
     focus: &FocusHandle,
     cx: &mut Context<AudioToolWindow>,
 ) -> impl IntoElement {
@@ -172,11 +216,18 @@ fn repair_module_item(
     } else {
         (Colors::text_secondary(), Colors::text_muted())
     };
-    let tooltip = if meta.available {
-        meta.id.canvas_hint()
+    let tile_fill = if active {
+        Colors::with_alpha(Colors::accent_primary(), 0.16)
     } else {
-        "Not available in this build yet."
+        Colors::surface_raised()
     };
+    let tooltip: gpui::SharedString = match (meta.available, compact) {
+        (true, true) => format!("{} — {}", meta.label, meta.id.purpose()).into(),
+        (true, false) => meta.id.purpose().into(),
+        (false, true) => format!("{} — not available in this build yet", meta.label).into(),
+        (false, false) => "Not available in this build yet.".into(),
+    };
+    let tall = meta.available && !compact;
 
     div()
         .id(("repair-module", index))
@@ -188,41 +239,93 @@ fn repair_module_item(
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(space::SNUG))
-        .h(px(size::DEFAULT))
-        .mx(px(space::TIGHT))
-        .px(px(space::SNUG))
+        .when(compact, |row| row.justify_center())
+        .gap(px(space::BASE))
+        .h(px(if tall {
+            ROW_H
+        } else if compact {
+            ICON_TILE + space::TIGHT * 2.0
+        } else {
+            LATER_ROW_H
+        }))
+        .mx(px(space::SNUG))
+        .px(px(if compact { 0.0 } else { space::SNUG }))
         .rounded(px(radius::CONTROL))
         .bg(rest)
         .tooltip(fb_tooltip(tooltip))
-        .child(
-            svg()
-                .path(meta.icon)
-                .size(px(ICON_SIZE))
-                .flex_none()
-                .text_color(icon_tint),
-        )
-        .child(
+        .child(if tall || compact {
             div()
-                .flex_1()
-                .min_w(px(0.0))
-                .truncate()
-                .text_size(px(typography::UI_XS))
-                .font_weight(if active {
-                    gpui::FontWeight::SEMIBOLD
+                .size(px(ICON_TILE))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(radius::CONTROL))
+                .bg(if meta.available {
+                    tile_fill
                 } else {
-                    gpui::FontWeight::MEDIUM
+                    Colors::with_alpha(tile_fill, 0.0)
                 })
-                .text_color(label_tint)
-                .child(meta.label),
-        )
-        .when(!meta.available, |row| {
+                .child(
+                    svg()
+                        .path(meta.icon)
+                        .size(px(ICON_SIZE))
+                        .text_color(icon_tint),
+                )
+                .into_any_element()
+        } else {
+            // Not built yet: the glyph sits where the tile's would, so the
+            // labels of both groups start on one line.
+            div()
+                .w(px(ICON_TILE))
+                .flex_none()
+                .flex()
+                .justify_center()
+                .child(
+                    svg()
+                        .path(meta.icon)
+                        .size(px(ICON_SIZE - 2.0))
+                        .text_color(icon_tint),
+                )
+                .into_any_element()
+        })
+        .when(!compact, |row| {
             row.child(
                 div()
-                    .flex_none()
-                    .text_size(px(typography::DENSE_CAPTION))
-                    .text_color(Colors::text_faint())
-                    .child("Soon"),
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.0))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(if tall {
+                                typography::UI_SM
+                            } else {
+                                typography::UI_XS
+                            }))
+                            .font_weight(if active {
+                                gpui::FontWeight::SEMIBOLD
+                            } else {
+                                gpui::FontWeight::MEDIUM
+                            })
+                            .text_color(label_tint)
+                            .child(meta.label),
+                    )
+                    .when(tall, |text| {
+                        text.child(
+                            div()
+                                .truncate()
+                                .text_size(px(typography::DENSE_CAPTION))
+                                .text_color(if active {
+                                    Colors::text_secondary()
+                                } else {
+                                    Colors::text_muted()
+                                })
+                                .child(meta.id.purpose()),
+                        )
+                    }),
             )
         })
         .when(active, |row| {

@@ -364,6 +364,7 @@ enum BuiltinDsp {
     AirBoost(airboost::Dsp),
     DeEsser(deesser::Dsp),
     Duckstep(duckstep::Dsp),
+    Trigger(trigger::Dsp),
 }
 
 /// A built-in processor is created on the IPC thread and then owned exclusively
@@ -445,6 +446,7 @@ impl BuiltinHostProcessor {
             "airboost" => Some(Self::airboost(sample_rate, state_json)),
             "deesser" => Some(Self::deesser(sample_rate, state_json)),
             "duckstep" => Some(Self::duckstep(sample_rate, state_json)),
+            "trigger" => Some(Self::trigger(sample_rate, state_json)),
             _ => None,
         }
     }
@@ -1048,6 +1050,31 @@ impl BuiltinHostProcessor {
         }
     }
 
+    fn trigger(sample_rate: u32, state_json: Option<&str>) -> Self {
+        let sr = sample_rate.max(1) as f32;
+        let mut dsp = trigger::Dsp::new(sr);
+        // Same pre-publish window as above: the IPC thread still owns the DSP.
+        if let Some(json) = state_json {
+            match trigger::ipc::TriggerState::from_json(json) {
+                Ok(state) => dsp.set_params(state.params),
+                Err(error) => {
+                    eprintln!("[plugin-host-builtin] Trigger state rejected: {error}");
+                }
+            }
+        }
+        // Its one sample arrives like a Quick Sampler's, through slot 0.
+        let sample_loader = Some(dsp.sample_loader());
+        Self {
+            dsp: UnsafeCell::new(BuiltinDsp::Trigger(dsp)),
+            spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
+            nam_loader: None,
+            ir_loader: None,
+            drum_pad_loaders: None,
+            sample_loader,
+            sample_rate: sr,
+        }
+    }
+
     /// Stereo sidechain inputs of the cores that take a key: Duckstep's
     /// External source and EQ-Z8's per-band External detector. 0 for the rest.
     fn sidechain_input_channels(&self) -> u32 {
@@ -1216,6 +1243,9 @@ impl BuiltinHostProcessor {
                     interleaved[i * 2 + 1] = r;
                 }
             }
+            // Whole blocks: hits found ahead of the voices, which start each
+            // one on its own sample.
+            BuiltinDsp::Trigger(dsp) => dsp.process_block(in_l, in_r, interleaved, frames),
         }
     }
 
@@ -1287,6 +1317,7 @@ impl BuiltinHostProcessor {
         const _: () = assert!(airboost::telemetry::SLOTS == BUILTIN_PAD_SLOTS);
         const _: () = assert!(deesser::telemetry::SLOTS == BUILTIN_PAD_SLOTS);
         const _: () = assert!(duckstep::telemetry::SLOTS == BUILTIN_PAD_SLOTS);
+        const _: () = assert!(trigger::telemetry::SLOTS == BUILTIN_PAD_SLOTS);
         const _: () = assert!(burnlimit::telemetry::SLOTS == BUILTIN_PAD_SLOTS);
         const _: () = assert!(equz8::telemetry::SLOTS == BUILTIN_PAD_SLOTS);
         const _: () = assert!(equzx::telemetry::SLOTS == BUILTIN_PAD_SLOTS);
@@ -1309,6 +1340,8 @@ impl BuiltinHostProcessor {
             BuiltinDsp::AirBoost(dsp) => Some(dsp.telemetry()),
             BuiltinDsp::DeEsser(dsp) => Some(dsp.telemetry()),
             BuiltinDsp::Duckstep(dsp) => Some(dsp.telemetry()),
+            // The detector, the last hit and the sample (`trigger::telemetry`).
+            BuiltinDsp::Trigger(dsp) => Some(dsp.telemetry()),
             // Per-channel peaks and loudness (`burnlimit::telemetry`).
             BuiltinDsp::BurnLimit(dsp) => Some(dsp.telemetry()),
             // Output peaks and each band's detector and dynamic gain
@@ -1636,6 +1669,27 @@ impl BuiltinHostProcessor {
                     slot_out_peak: [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS],
                 })
             }
+            BuiltinDsp::Trigger(dsp) => {
+                let f = dsp.meter_frame();
+                // The detector's level rides slot 0's input peak and each
+                // hit lights slot 0's output for a moment: the editor's
+                // history draws the one and marks the other.
+                let mut slot_in_peak = [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS];
+                let mut slot_out_peak = [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS];
+                slot_in_peak[0] = f.detector_peak;
+                slot_out_peak[0] = if f.hit { 1.0 } else { 0.0 };
+                Some(SpherePluginHost::audio_bridge::BuiltinMeterFrame {
+                    in_peak: f.in_peak,
+                    in_rms: f.in_rms,
+                    out_peak: f.out_peak,
+                    out_rms: f.out_rms,
+                    gain_reduction_db: 0.0,
+                    in_clip: f.in_clip,
+                    out_clip: f.out_clip,
+                    slot_in_peak,
+                    slot_out_peak,
+                })
+            }
             BuiltinDsp::Equz8(_)
             | BuiltinDsp::Equzx(_)
             | BuiltinDsp::Verbspace(_)
@@ -1678,6 +1732,8 @@ impl BuiltinHostProcessor {
             BuiltinDsp::AirBoost(dsp) => dsp.latency_samples(),
             BuiltinDsp::DeEsser(dsp) => dsp.latency_samples(),
             BuiltinDsp::Duckstep(dsp) => dsp.latency_samples(),
+            // Its fixed lookahead: a hit's sample lands on the hit.
+            BuiltinDsp::Trigger(dsp) => dsp.latency_samples(),
         }
     }
 
@@ -1756,6 +1812,9 @@ impl BuiltinHostProcessor {
                 let _ = dsp.apply_wire_param(param_id, value);
             }
             BuiltinDsp::Duckstep(dsp) => {
+                let _ = dsp.apply_wire_param(param_id, value);
+            }
+            BuiltinDsp::Trigger(dsp) => {
                 let _ = dsp.apply_wire_param(param_id, value);
             }
         }
@@ -2806,6 +2865,68 @@ mod builtin_processor_tests {
         assert!(frame.slot_in_peak[0] > 0.1, "{}", frame.slot_in_peak[0]);
     }
 
+    /// Trigger restores its state, reports its lookahead, takes its sample
+    /// through the same slot-0 loader as Quick Sampler, and plays it on a hit
+    /// — replacing the track — with the hit in its telemetry and meter frame.
+    #[test]
+    fn trigger_replaces_a_hit_with_its_loaded_sample() {
+        let params = trigger::Params {
+            threshold_db: -12.0,
+            ..trigger::default_params()
+        };
+        let json = trigger::ipc::TriggerState::new(params)
+            .to_json()
+            .expect("state serializes");
+        let processor = BuiltinHostProcessor::trigger(48_000, Some(&json));
+        assert_eq!(processor.latency_samples(), 240);
+        let mut samples = vec![0.0f32; 4_800];
+        samples[0] = 1.0;
+        let sample =
+            quicksampler::SampleData::from_interleaved(&samples, 1, 48_000).expect("a sample");
+        processor
+            .sample_loader
+            .as_ref()
+            .expect("Trigger takes a sample")
+            .submit(Some(std::sync::Arc::new(sample)));
+
+        let mut output = [0.0f32; 256];
+        let mut left = Vec::new();
+        let mut published_hit = false;
+        for block in 0..40 {
+            // A loud burst in block 10, silence around it.
+            let input: [f32; 128] = std::array::from_fn(|i| {
+                if block == 10 && i < 64 {
+                    0.9 * (-(i as f32) / 16.0).exp()
+                } else {
+                    0.0
+                }
+            });
+            processor.process_block(&input, &input, &mut output, 128);
+            left.extend(output.chunks(2).map(|pair| pair[0]));
+            published_hit |= processor
+                .meter_frame()
+                .is_some_and(|frame| frame.slot_out_peak[0] >= 0.5);
+        }
+        let onset = left.iter().position(|v| v.abs() > 1.0e-3);
+        assert_eq!(onset, Some(10 * 128 + 240), "the sample lands on the hit");
+        assert!(published_hit, "the meter frame flags the hit");
+        let block = processor.pad_levels().expect("Trigger publishes telemetry");
+        assert_eq!(block[trigger::telemetry::HITS], 1.0);
+        assert_eq!(block[trigger::telemetry::LOADED], 1.0);
+
+        // The threshold, sent like any edit, decides what counts as a hit.
+        let threshold = trigger::ui_param_index("thresholdDb").expect("in the wire table");
+        processor.apply_param(threshold, -0.5);
+        let burst: [f32; 128] = std::array::from_fn(|i| if i < 64 { 0.5 } else { 0.0 });
+        processor.process_block(&burst, &burst, &mut output, 128);
+        let block = processor.pad_levels().expect("Trigger publishes telemetry");
+        assert_eq!(
+            block[trigger::telemetry::HITS],
+            1.0,
+            "under the new threshold"
+        );
+    }
+
     /// BurnLimit and both EQs publish their editor telemetry blocks:
     /// BurnLimit's per-channel peaks and loudness, the EQs' output peaks.
     #[test]
@@ -3604,12 +3725,42 @@ enum BlockRuntime<'a> {
     Au(&'a AuHostProcessor),
 }
 
+/// The block path's working buffers, allocated once per producer thread.
+///
+/// They used to be arrays declared inside [`service_audio_bridge`], each
+/// zero-filled on every call: ~290 KB of stores per instance per block, sized
+/// for the longest block and the widest plug-in whatever the device ran at.
+/// One producer serves every built-in in a host, so that fixed cost was paid
+/// once per insert in the session on every block. Each block now clears only
+/// what it uses.
+struct BlockScratch {
+    in_l: Box<[f32]>,
+    in_r: Box<[f32]>,
+    sc_l: Box<[f32]>,
+    sc_r: Box<[f32]>,
+    interleaved: Box<[f32]>,
+}
+
+impl BlockScratch {
+    fn new() -> Self {
+        let block = || vec![0.0f32; MAX_BLOCK_FRAMES].into_boxed_slice();
+        Self {
+            in_l: block(),
+            in_r: block(),
+            sc_l: block(),
+            sc_r: block(),
+            interleaved: vec![0.0f32; AUDIO_BUF_LEN].into_boxed_slice(),
+        }
+    }
+}
+
 fn service_audio_bridge(
     region: &SharedAudioRegion,
     dsp: &BridgeAudioShared,
     runtime: BlockRuntime<'_>,
     plugin_instance_id: &str,
     midi_out_event: Option<&BridgeKickEvent>,
+    scratch: &mut BlockScratch,
 ) {
     let bridge = region.bridge();
     let req = bridge.request_seq.load(Ordering::Acquire);
@@ -3679,8 +3830,14 @@ fn service_audio_bridge(
             "[plugin-host-param-consume] seq={req} instance={plugin_instance_id} params={param_count}"
         );
     }
-    let mut in_l = [0.0f32; MAX_BLOCK_FRAMES];
-    let mut in_r = [0.0f32; MAX_BLOCK_FRAMES];
+    let BlockScratch {
+        in_l,
+        in_r,
+        sc_l,
+        sc_r,
+        interleaved,
+    } = scratch;
+    // Every frame of the block is read into these below.
     // SAFETY: the engine owns `audio_in` until it bumps `request_seq`.
     unsafe {
         bridge
@@ -3689,8 +3846,6 @@ fn service_audio_bridge(
     }
     // The insert's sidechain key, when the engine wrote one with this block's
     // request: same ownership as `audio_in` above.
-    let mut sc_l = [0.0f32; MAX_BLOCK_FRAMES];
-    let mut sc_r = [0.0f32; MAX_BLOCK_FRAMES];
     let sidechain_frames = bridge.sidechain_frames.load(Ordering::Relaxed) as usize;
     let sidechain = if frames > 0 && sidechain_frames >= frames {
         // SAFETY: the engine owns `audio_in` until it bumps `request_seq`.
@@ -3735,8 +3890,10 @@ fn service_audio_bridge(
     bridge
         .sidechain_input_channels
         .store(sidechain_channels, Ordering::Relaxed);
-    let mut interleaved = [0.0f32; AUDIO_BUF_LEN];
     let len = (frames * output_channels).min(AUDIO_BUF_LEN);
+    // A plug-in may leave channels it does not produce untouched: they read
+    // as silence, never as another instance's last block.
+    interleaved[..len].fill(0.0);
     let produced_channels = match runtime {
         BlockRuntime::Builtin(builtin) if builtin.plays_midi_on_apply() => {
             midi_count += builtin.process_block_with_midi(
@@ -4262,11 +4419,12 @@ impl ProducerDiagnostics {
 /// it keeps shutdown responsive and sweeps any request whose signal raced the
 /// wait. Without a kick event (no `--parent-pid`, or creation failed) it falls
 /// back to the legacy 250 µs sleep poll.
-/// Stack for the audio producer thread. The block path's own fixed-size
-/// buffers are 272 KiB before any plugin DSP is inlined on top, and the
-/// platform default (2 MiB) left no usable margin — measured, the thread wanted
-/// between 2.0 and 2.5 MiB. 8 MiB costs nothing but address space (stack pages
-/// are committed on use) and takes the whole class of failure off the table.
+/// Stack for the audio producer thread. The block path's buffers used to sit
+/// on it (272 KiB, now [`BlockScratch`] on the heap), and with the plug-in DSP
+/// inlined on top the platform default (2 MiB) left no usable margin —
+/// measured, the thread wanted between 2.0 and 2.5 MiB. 8 MiB costs nothing
+/// but address space (stack pages are committed on use) and keeps the whole
+/// class of failure off the table.
 const AUDIO_PRODUCER_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 /// MIDI a plug-in may produce in one block. Its bridge keeps at most 256.
@@ -4311,6 +4469,7 @@ fn run_audio_producer(
 ) {
     boost_audio_producer_thread();
     let mut diagnostics = ProducerDiagnostics::default();
+    let mut scratch = BlockScratch::new();
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
@@ -4344,6 +4503,7 @@ fn run_audio_producer(
                 runtime,
                 &entry.instance_id,
                 midi_out_event.as_ref(),
+                &mut scratch,
             );
             if region.bridge().done_seq.load(Ordering::Relaxed) != before {
                 diagnostics.record(region.bridge());
@@ -4462,13 +4622,10 @@ fn run_ipc_loop(mut out: IpcOut, shutdown: Arc<AtomicBool>) {
         });
         std::thread::Builder::new()
             .name("plugin-host-audio".into())
-            // `service_audio_bridge` alone puts 272 KiB of fixed-size block
-            // buffers on this thread's stack (`in_l`/`in_r` at MAX_BLOCK_FRAMES
-            // plus `interleaved` at MAX_BLOCK_FRAMES * MAX_CHANNELS), and the
-            // rest of the inlined block path sat just under the 2 MiB default
-            // — close enough that adding DSP to the path overflowed it on
-            // thread entry, aborting the whole host process before any plugin
-            // was even loaded. Ask for a stack that is not a coincidence.
+            // The inlined block path sat just under the 2 MiB default — close
+            // enough that adding DSP to it overflowed the stack on thread
+            // entry, aborting the whole host process before any plugin was
+            // even loaded. Ask for a stack that is not a coincidence.
             .stack_size(AUDIO_PRODUCER_STACK_BYTES)
             .spawn(move || run_audio_producer(producer_plan, dsp, shutdown, kick, midi_out_event))
             .expect("spawn plugin-host audio producer");
@@ -6416,6 +6573,8 @@ fn dispatch(
                         automatable: parameter.automatable,
                         hidden: parameter.hidden,
                         read_only: parameter.read_only,
+                        value_normalized: None,
+                        value_text: String::new(),
                     })
                     .collect();
                 eprintln!(
@@ -6447,6 +6606,8 @@ fn dispatch(
                     automatable: p.automatable,
                     hidden: p.hidden,
                     read_only: p.read_only,
+                    value_normalized: Some(ipc::NormalizedValue(p.value_normalized)),
+                    value_text: p.value_text,
                 })
                 .collect();
             eprintln!(

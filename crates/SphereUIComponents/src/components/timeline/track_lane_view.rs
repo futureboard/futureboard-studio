@@ -66,6 +66,7 @@ pub struct LaneFrameContext {
     pub on_erase_start: Option<Arc<dyn Fn(&f32, &mut gpui::Window, &mut gpui::App) + 'static>>,
     pub on_erase_clip: Option<Arc<dyn Fn(&String, &mut gpui::Window, &mut gpui::App) + 'static>>,
     pub on_cut_clip: Option<AudioClipCutCb>,
+    pub on_clip_body_press: Option<crate::components::timeline::audio_clip::ClipBodyPressCb>,
     pub on_audio_clip_process_preview: AudioClipProcessPreviewCb,
     pub on_audio_clip_process_commit: AudioClipProcessCommitCb,
     pub on_crossfade: Option<crate::components::timeline::crossfade_overlay::CrossfadeGestureCb>,

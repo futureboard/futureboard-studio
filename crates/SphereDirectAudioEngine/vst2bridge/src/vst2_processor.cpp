@@ -799,12 +799,21 @@ SphereDauxVst2Processor *sphere_daux_vst2_create(const char *plugin_path,
 #if defined(_WIN32)
   const std::wstring wide_path = widen_utf8(plugin_path);
   unsigned short machine = 0;
-  if (read_pe_machine(wide_path, &machine) &&
-      machine != IMAGE_FILE_MACHINE_AMD64 &&
-      machine != IMAGE_FILE_MACHINE_ARM64) {
+  const bool machine_known = read_pe_machine(wide_path, &machine);
+#if defined(_WIN64)
+  // A 32-bit plug-in loads in the 32-bit plug-in bridge
+  // (FutureboardPluginHostX86.exe), which builds this same file as 32-bit.
+  const bool loadable_here = machine == IMAGE_FILE_MACHINE_AMD64 ||
+                             machine == IMAGE_FILE_MACHINE_ARM64;
+  const char *const host_word = "64-bit";
+#else
+  const bool loadable_here = machine == IMAGE_FILE_MACHINE_I386;
+  const char *const host_word = "32-bit";
+#endif
+  if (machine_known && !loadable_here) {
     std::ostringstream err;
-    err << "VST2 plug-in is not 64-bit (PE machine 0x" << std::hex << machine
-        << "). Futureboard hosts 64-bit VST2 only.";
+    err << "VST2 plug-in is not " << host_word << " (PE machine 0x" << std::hex
+        << machine << "), and this plug-in host is.";
     vst2_set_last_error(err.str());
     delete p;
     return nullptr;

@@ -33,6 +33,11 @@ pub(crate) struct PluginCatalogState {
     pub cache_present: bool,
     /// Catalog load phase (Loading / Ready / …) driving the picker skeleton/error UI.
     pub status: PluginCatalogStatus,
+    /// The database revision (`plugin_db::catalog_revision`) the lists were
+    /// last loaded at. A scan, a cache clear or a rebuild — from the Plug-in
+    /// Manager or the welcome scan, in their own windows — moves it on, and
+    /// the next poll reloads the lists. See [`StudioLayout::refresh_stale_plugin_catalog`].
+    pub revision_seen: u64,
 }
 
 impl Default for PluginCatalogState {
@@ -41,6 +46,7 @@ impl Default for PluginCatalogState {
             available: None,
             cache_present: false,
             status: PluginCatalogStatus::Loading,
+            revision_seen: SpherePluginHost::plugin_db::catalog_revision(),
         }
     }
 }
@@ -161,6 +167,12 @@ pub(crate) struct PluginEditorWindows {
     pub duckstep: std::collections::HashMap<
         String,
         gpui::WindowHandle<crate::components::duckstep_plate::DuckstepWindow>,
+    >,
+    /// Open native Trigger editors, keyed by insert id, like `quick_sampler`.
+    #[cfg(feature = "builtin-plugin-editor")]
+    pub trigger: std::collections::HashMap<
+        String,
+        gpui::WindowHandle<crate::components::trigger_plate::TriggerWindow>,
     >,
     /// Open native VerbSpace editors, keyed by insert id, like
     /// `quick_sampler`.
@@ -660,6 +672,103 @@ impl StudioLayout {
         cx.notify();
     }
 
+    /// Put an insert before or after its channel's fader. One undo step; the
+    /// running instance keeps playing, and the engine moves it with the
+    /// project resync.
+    pub(crate) fn set_insert_post_fader(
+        &mut self,
+        track_id: &str,
+        insert_id: &str,
+        post: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !crate::components::mixer_panel::pro_mixing() {
+            return;
+        }
+        let edit = self.begin_track_edit(
+            crate::components::timeline::timeline_state::TrackEditScope::channel(track_id),
+            cx,
+        );
+        let changed = self.timeline.update(cx, |timeline, _| {
+            timeline
+                .state
+                .set_insert_post_fader(track_id, insert_id, post)
+        });
+        if !changed {
+            return;
+        }
+        self.commit_track_edit(
+            if post {
+                "Insert Post-Fader"
+            } else {
+                "Insert Pre-Fader"
+            },
+            edit,
+            cx,
+        );
+        self.mark_dirty();
+        self.audio_bridge.project_dirty = true;
+        self.schedule_audio_project_sync(cx, false, "insert_post_fader");
+        self.push_mixer_snapshot_to_window(cx);
+        cx.notify();
+    }
+
+    /// The mixer insert menu's fader rows: Pre-Fader and Post-Fader, the
+    /// current one checked. Empty for an insert that cannot move after the
+    /// fader (an instrument, a wet/dry/wet insert) and is not there already.
+    pub(crate) fn insert_fader_position_entries(
+        &self,
+        track_id: &str,
+        insert_id: &str,
+        cx: &gpui::App,
+    ) -> Vec<crate::components::context_menu::ContextMenuEntry> {
+        use crate::components::context_menu::ContextMenuEntry;
+        let state = &self.timeline.read(cx).state;
+        // Moving an insert across the fader is Professional mixing.
+        if !crate::components::mixer_panel::pro_mixing() {
+            return Vec::new();
+        }
+        let Some(slot) = state.find_insert_slot(track_id, insert_id) else {
+            return Vec::new();
+        };
+        if !slot.post_fader && !slot.can_be_post_fader() {
+            return Vec::new();
+        }
+        vec![
+            ContextMenuEntry::Header(format!("Fader · {}", slot.display_name)),
+            ContextMenuEntry::checked_item(
+                "Pre-Fader".to_string(),
+                format!("{INSERT_FADER_COMMAND_PREFIX}{track_id}|{insert_id}|pre"),
+                !slot.post_fader,
+            ),
+            ContextMenuEntry::checked_item(
+                "Post-Fader".to_string(),
+                format!("{INSERT_FADER_COMMAND_PREFIX}{track_id}|{insert_id}|post"),
+                slot.post_fader,
+            ),
+        ]
+    }
+
+    /// Run one fader row of the insert menu. Returns `false` for a command
+    /// that is not one.
+    pub(crate) fn dispatch_insert_fader_position_command(
+        &mut self,
+        command_id: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(rest) = command_id.strip_prefix(INSERT_FADER_COMMAND_PREFIX) else {
+            return false;
+        };
+        let mut parts = rest.splitn(3, '|');
+        if let (Some(track_id), Some(insert_id), Some(position)) =
+            (parts.next(), parts.next(), parts.next())
+        {
+            let (track_id, insert_id) = (track_id.to_string(), insert_id.to_string());
+            self.set_insert_post_fader(&track_id, &insert_id, position == "post", cx);
+        }
+        true
+    }
+
     /// Route `sidechain` into an insert's sidechain input, or clear it. One
     /// undo step; the engine picks the route up with the project resync.
     pub(super) fn set_insert_sidechain(
@@ -762,6 +871,10 @@ pub(crate) fn sidechain_host_op(
 /// Command prefix of the sidechain picker's rows:
 /// `{prefix}{track}|{insert}|none`, `…|src|{source}`, `…|tap|pre` / `…|tap|post`.
 pub(crate) const SIDECHAIN_COMMAND_PREFIX: &str = "mixer:sidechain|";
+
+/// The mixer insert menu's Pre-Fader / Post-Fader rows:
+/// `mixer:insert-fader|{track}|{insert}|pre|post`.
+pub(crate) const INSERT_FADER_COMMAND_PREFIX: &str = "mixer:insert-fader|";
 
 impl StudioLayout {
     /// What an editor header's Sidechain control reads: `None` (no control)
@@ -1221,6 +1334,25 @@ impl StudioLayout {
                             cx.notify();
                         });
                     }
+                    #[cfg(feature = "builtin-plugin-editor")]
+                    if let Some(handle) = self
+                        .plugin_editors
+                        .trigger
+                        .get(&plugin_instance_id)
+                        .copied()
+                    {
+                        let _ = handle.update(cx, |window, _window, cx| {
+                            window.editor().clone().update(cx, |editor, cx| {
+                                crate::components::trigger_plate::notify_sample_result(
+                                    editor,
+                                    ok,
+                                    &name,
+                                    error.as_deref(),
+                                    cx,
+                                );
+                            });
+                        });
+                    }
                     for handle in self.plugin_editors.builtin.values() {
                         let _ = handle.update(cx, |editor, _window, _cx| {
                             editor.notify_drum_sample_result(
@@ -1478,12 +1610,29 @@ impl StudioLayout {
                     );
                     if loaded && owned {
                         self.note_plugin_state_edited(cx);
+                        // The mixer's EQ curve draws a Pro-Q from its reported
+                        // values: read them again. The host spaces these
+                        // reports (`state_touch::REPORT_INTERVAL`).
+                        if self.insert_feeds_mixer_eq(&plugin_instance_id, cx) {
+                            self.request_bridge_insert_parameters(&plugin_instance_id, cx);
+                        }
                         // Not pushed back by later edits: a plug-in that
                         // reports edits without pause still gets captured.
                         self.plugin_editors
                             .state_capture_due
                             .entry(plugin_instance_id)
                             .or_insert_with(|| Instant::now() + LIVE_STATE_CAPTURE_DELAY);
+                    }
+                }
+                // A saved state went into the plug-in after its parameter list
+                // was first read (project open, undo, a preset): the values
+                // the mixer's EQ curve draws from are now stale.
+                ClientEvent::Host(HostEvent::PluginStateSet {
+                    plugin_instance_id,
+                    ok: true,
+                }) => {
+                    if self.insert_feeds_mixer_eq(&plugin_instance_id, cx) {
+                        self.request_bridge_insert_parameters(&plugin_instance_id, cx);
                     }
                 }
                 // A state asked for by `request_due_state_captures` (or one a
@@ -2562,7 +2711,7 @@ impl StudioLayout {
     ///
     /// Called from a spawned task, never from inside a frame — see the note at
     /// its only call site.
-    fn open_bridged_editor_window(
+    pub(super) fn open_bridged_editor_window(
         &mut self,
         owner_bounds: gpui::Bounds<gpui::Pixels>,
         key: (String, String),
@@ -3748,6 +3897,13 @@ impl StudioLayout {
                 window,
                 cx,
             ),
+            Some(trigger::ui::UI_ORIGIN) => self.open_native_editor(
+                |windows| &mut windows.trigger,
+                crate::components::trigger_plate::open_trigger_editor,
+                (target, identity, host_ops),
+                window,
+                cx,
+            ),
             Some(clipper67::ui::UI_ORIGIN) => self.open_native_editor(
                 |windows| &mut windows.dynamics,
                 crate::components::dyn_plate::open_clipper67_editor,
@@ -3873,35 +4029,39 @@ impl StudioLayout {
     pub(super) fn sync_builtin_output_strips(&mut self, cx: &mut Context<Self>) {
         #[cfg(feature = "builtin-plugin-editor")]
         {
-            let changed = self.timeline.update(cx, |timeline, _cx| {
-                let inserts: Vec<(String, String, String)> = timeline
-                    .state
-                    .tracks
-                    .iter()
-                    .flat_map(|track| {
-                        track.inserts.iter().filter_map(move |slot| {
-                            let plugin_id = slot.plugin_id.clone()?;
-                            Some((track.id.clone(), slot.id.clone(), plugin_id))
-                        })
+            // This runs with the bridge poll, every 16 ms, over every insert in
+            // the project. Read in place and keep only the slots whose outputs
+            // moved, so a still project costs no allocation and no write.
+            let moved: Vec<(String, String, Vec<u8>)> = self
+                .timeline
+                .read(cx)
+                .state
+                .tracks
+                .iter()
+                .flat_map(|track| {
+                    track.inserts.iter().filter_map(move |slot| {
+                        let buses =
+                            crate::components::builtin_plugin_editor::builtin_output_buses_for(
+                                slot.plugin_id.as_deref()?,
+                                &slot.id,
+                            )?;
+                        (slot.active_output_buses.as_ref() != Some(&buses))
+                            .then(|| (track.id.clone(), slot.id.clone(), buses))
                     })
-                    .collect();
-                let mut changed = false;
-                for (track_id, insert_id, plugin_id) in inserts {
-                    let Some(buses) =
-                        crate::components::builtin_plugin_editor::builtin_output_buses_for(
-                            &plugin_id, &insert_id,
-                        )
-                    else {
-                        continue;
-                    };
-                    changed |= timeline.state.set_insert_active_output_buses(
-                        &track_id,
-                        &insert_id,
-                        Some(buses),
-                    );
-                }
-                changed
-            });
+                })
+                .collect();
+            let changed = !moved.is_empty()
+                && self.timeline.update(cx, |timeline, _cx| {
+                    let mut changed = false;
+                    for (track_id, insert_id, buses) in moved {
+                        changed |= timeline.state.set_insert_active_output_buses(
+                            &track_id,
+                            &insert_id,
+                            Some(buses),
+                        );
+                    }
+                    changed
+                });
             if changed {
                 self.schedule_audio_project_sync(cx, true, "builtin_output_strips");
                 cx.notify();
@@ -3973,6 +4133,10 @@ impl StudioLayout {
             }
             let duckers: Vec<_> = self.plugin_editors.duckstep.values().copied().collect();
             for handle in duckers {
+                let _ = handle.update(cx, |editor, _window, cx| editor.sync_from_mirror(cx));
+            }
+            let triggers: Vec<_> = self.plugin_editors.trigger.values().copied().collect();
+            for handle in triggers {
                 let _ = handle.update(cx, |editor, _window, cx| editor.sync_from_mirror(cx));
             }
             let reverbs: Vec<_> = self.plugin_editors.verbspace.values().copied().collect();
@@ -4352,12 +4516,117 @@ impl StudioLayout {
     /// A channel's plug-ins share one editor window, one tab each: only this
     /// slot's tab goes, and the window closes with its last tab. Closing the
     /// window releases the view before the window goes.
+    /// Takes every native built-in editor window (one map per plug-in type,
+    /// keyed by insert id) whose insert id `gone` accepts out of its map. A
+    /// map added for a new built-in editor belongs in this list too, or its
+    /// windows outlive their insert.
+    #[cfg(feature = "builtin-plugin-editor")]
+    fn take_native_builtin_editors(
+        &mut self,
+        mut gone: impl FnMut(&str) -> bool,
+    ) -> Vec<gpui::AnyWindowHandle> {
+        let mut taken: Vec<gpui::AnyWindowHandle> = Vec::new();
+        macro_rules! take_from {
+            ($($map:ident),* $(,)?) => {$(
+                let ids: Vec<String> = self
+                    .plugin_editors
+                    .$map
+                    .keys()
+                    .filter(|id| gone(id))
+                    .cloned()
+                    .collect();
+                for id in ids {
+                    if let Some(handle) = self.plugin_editors.$map.remove(&id) {
+                        taken.push(handle.into());
+                    }
+                }
+            )*};
+        }
+        take_from!(
+            quick_sampler,
+            drum_sampler,
+            slicer,
+            rodhareist,
+            wrap_synth,
+            equz8,
+            equzx,
+            burn_limit,
+            zapp,
+            imager,
+            airboost,
+            deesser,
+            duckstep,
+            trigger,
+            verbspace,
+            echospace,
+            white_sharp,
+            dynamics,
+            waygate,
+            bands,
+            mix_station,
+        );
+        taken
+    }
+
+    /// Whether any native built-in editor window is open.
+    fn any_native_builtin_editor_open(&self) -> bool {
+        #[cfg(feature = "builtin-plugin-editor")]
+        {
+            let editors = &self.plugin_editors;
+            [
+                editors.quick_sampler.is_empty(),
+                editors.drum_sampler.is_empty(),
+                editors.slicer.is_empty(),
+                editors.rodhareist.is_empty(),
+                editors.wrap_synth.is_empty(),
+                editors.equz8.is_empty(),
+                editors.equzx.is_empty(),
+                editors.burn_limit.is_empty(),
+                editors.zapp.is_empty(),
+                editors.imager.is_empty(),
+                editors.airboost.is_empty(),
+                editors.deesser.is_empty(),
+                editors.duckstep.is_empty(),
+                editors.trigger.is_empty(),
+                editors.verbspace.is_empty(),
+                editors.echospace.is_empty(),
+                editors.white_sharp.is_empty(),
+                editors.dynamics.is_empty(),
+                editors.waygate.is_empty(),
+                editors.bands.is_empty(),
+                editors.mix_station.is_empty(),
+            ]
+            .contains(&false)
+        }
+        #[cfg(not(feature = "builtin-plugin-editor"))]
+        false
+    }
+
+    /// Closes the native built-in editors whose insert id `gone` accepts.
+    /// They are not channel tabs: each is its own window bound to one insert,
+    /// and nothing else closes it when that insert is removed — it stayed on
+    /// screen showing default parameters for a plug-in that no longer exists.
+    fn close_native_builtin_editors(
+        &mut self,
+        gone: impl FnMut(&str) -> bool,
+        cx: &mut Context<Self>,
+    ) {
+        #[cfg(feature = "builtin-plugin-editor")]
+        for handle in self.take_native_builtin_editors(gone) {
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+        }
+        #[cfg(not(feature = "builtin-plugin-editor"))]
+        let _ = (gone, cx);
+    }
+
     pub(super) fn close_insert_editor(
         &mut self,
         track_id: &str,
         insert_id: &str,
         cx: &mut Context<Self>,
     ) {
+        // A native built-in editor (EQUZ8, Quick Sampler, …) is its own window.
+        self.close_native_builtin_editors(|id| id == insert_id, cx);
         // Native main-owned bridge editor (default path).
         self.close_bridge_editor(cx, track_id, insert_id);
         let key = (track_id.to_string(), insert_id.to_string());
@@ -5003,6 +5272,27 @@ impl StudioLayout {
         // (not existence) — a deleted track/insert must drop out of the
         // sidebar even if nothing ever called `close_insert_editor` for it.
         self.refresh_builtin_editor_sidebars(cx);
+        // Native built-in editors whose insert is gone from every channel —
+        // deleted with its track, by undo, or by any path that never called
+        // `close_insert_editor`. A moved insert keeps its id and its window.
+        if self.any_native_builtin_editor_open() {
+            let live_insert_ids: std::collections::HashSet<String> = {
+                let state = &self.timeline.read(cx).state;
+                state
+                    .tracks
+                    .iter()
+                    .flat_map(|track| {
+                        track.inserts.iter().map(|slot| slot.id.clone()).chain(
+                            track.midi_fx.iter().filter_map(|fx| {
+                                fx.plugin.as_ref().map(|plugin| plugin.id.clone())
+                            }),
+                        )
+                    })
+                    .chain(state.master.inserts.iter().map(|slot| slot.id.clone()))
+                    .collect()
+            };
+            self.close_native_builtin_editors(|id| !live_insert_ids.contains(id), cx);
+        }
         if self.plugin_editors.open.is_empty() && self.plugin_editors.bridge.is_empty() {
             return;
         }
@@ -5269,6 +5559,35 @@ impl StudioLayout {
         SpherePluginHost::native_editor::detach_all_embedded_editors();
     }
 
+    /// Reload the plug-in lists when the database changed since they were
+    /// read: the insert picker, the Add Track instrument list and the
+    /// Browser's Instruments tab, all through [`Self::arm_catalog_load`]. A
+    /// scan runs in the Plug-in Manager's own window and never told this one,
+    /// so the lists kept what they read at startup until the app was reopened.
+    /// Called on the poll tick; costs one atomic load when nothing changed.
+    pub(super) fn refresh_stale_plugin_catalog(&mut self, cx: &mut Context<Self>) {
+        let revision = SpherePluginHost::plugin_db::catalog_revision();
+        if revision == self.plugin_catalog.revision_seen {
+            return;
+        }
+        self.plugin_catalog.revision_seen = revision;
+        if self.plugin_catalog.available.is_some() {
+            // Reloads the picker, the Add Track list and the Browser tab.
+            self.plugin_catalog.available = None;
+            self.plugin_catalog.status = PluginCatalogStatus::Loading;
+            self.arm_catalog_load(cx);
+        } else if matches!(
+            self.file_browser.instruments_load,
+            crate::components::file_browser::InstrumentsLoad::Loaded
+                | crate::components::file_browser::InstrumentsLoad::Failed(_)
+        ) {
+            // The catalog was never loaded (it is lazy), but the Browser's
+            // Instruments tab read the database on its own.
+            self.spawn_browser_instruments_load(cx);
+        }
+        cx.notify();
+    }
+
     /// Start a background SQLite load of the plug-in catalog. The picker
     /// opens instantly with a skeleton; this task replaces the skeleton once
     /// the catalog is read. Re-entrant: a second call while a load is in
@@ -5294,6 +5613,9 @@ impl StudioLayout {
         let debug = std::env::var_os("FUTUREBOARD_PLUGIN_PICKER_DEBUG").is_some()
             || std::env::var_os("FUTUREBOARD_PLUGIN_DB_DEBUG").is_some();
         let shell_started = std::time::Instant::now();
+        // The database as this load will read it. A write landing while it
+        // runs moves the revision on, and the poll reloads once this is in.
+        let read_revision = SpherePluginHost::plugin_db::catalog_revision();
 
         cx.spawn(async move |this, cx| {
             let load = cx
@@ -5304,6 +5626,7 @@ impl StudioLayout {
                 if crate::shutdown::ShutdownState::global().is_shutting_down() {
                     return;
                 }
+                this.plugin_catalog.revision_seen = read_revision;
                 match load {
                     CatalogLoad::Loaded { catalog, sqlite_ms } => {
                         let count = catalog.plugins.len();
@@ -5761,6 +6084,7 @@ impl StudioLayout {
                     class_id: bridge_class_id.clone(),
                     display_name: log_display_name.clone(),
                     format: Some(plugin_format.label().to_string()),
+                    engine_reads_midi_out: false,
                 };
                 match super::plugin_bridge_runtime::PluginBridgeRuntime::ensure_shared(
                     &mut self.plugin_editors.bridge_runtime,
@@ -5953,6 +6277,11 @@ impl StudioLayout {
         }
         if changed {
             self.mark_dirty();
+            // The value's text was cleared with the change; a Pro-Q under the
+            // mixer's EQ curve needs the plug-in's own reading of it.
+            if self.insert_feeds_mixer_eq(&insert_id, cx) {
+                self.request_bridge_insert_parameters(&insert_id, cx);
+            }
         }
         cx.notify();
     }
@@ -6797,6 +7126,7 @@ impl StudioLayout {
                 track
                     .inserts
                     .iter()
+                    .chain(track.midi_fx.iter().filter_map(|fx| fx.plugin.as_ref()))
                     .filter(|slot| slot.is_bridge_hosted_external_module())
                     .map(|slot| (track.id.clone(), slot.id.clone()))
             })
@@ -7037,7 +7367,8 @@ impl StudioLayout {
                 }
             }
             for track in &mut timeline.state.tracks {
-                for slot in &mut track.inserts {
+                let midi_fx_plugins = track.midi_fx.iter_mut().filter_map(|fx| fx.plugin.as_mut());
+                for slot in track.inserts.iter_mut().chain(midi_fx_plugins) {
                     if let Some(packed) = states.get(&slot.id) {
                         slot.vst3_state = Some(std::sync::Arc::new(packed.clone()));
                     }
@@ -7137,20 +7468,31 @@ impl StudioLayout {
         let Ok(runtime) = runtime_arc.lock() else {
             return false;
         };
+        // Every project sync re-binds every bridged insert, almost always to
+        // the sink it already has; that routine pass logs only under the
+        // engine-sync debug switch. Restores and adds still log.
+        let verbose =
+            reason != "audio_project_sync_complete" || crate::perf::engine_sync_debug_enabled();
         let mut installed = false;
         for (track_id, insert_id) in &slots {
             let Some(sink) = runtime.audio_sink_for(insert_id) else {
-                eprintln!(
-                    "[PluginRestore] bridge sink deferred instance={insert_id} reason=no_shared_audio source={reason}"
-                );
+                if verbose {
+                    eprintln!(
+                        "[PluginRestore] bridge sink deferred instance={insert_id} reason=no_shared_audio source={reason}"
+                    );
+                }
                 continue;
             };
-            eprintln!("[PluginAdd] bridge_key={insert_id} track={track_id}");
+            if verbose {
+                eprintln!("[PluginAdd] bridge_key={insert_id} track={track_id}");
+            }
             match engine.set_plugin_bridge_sink(insert_id.clone(), Some(sink)) {
                 Ok(()) => {
-                    eprintln!(
-                        "[PluginRestore] bridge registered instance={insert_id} track={track_id} source={reason}"
-                    );
+                    if verbose {
+                        eprintln!(
+                            "[PluginRestore] bridge registered instance={insert_id} track={track_id} source={reason}"
+                        );
+                    }
                     installed = true;
                 }
                 Err(error) => {
@@ -7608,11 +7950,13 @@ impl StudioLayout {
         PluginParameterState {
             id: param.id,
             name,
-            value_normalized: 0.5,
+            // A host that reads no value (Audio Units) keeps the old middle.
+            value_normalized: param.value_normalized.map_or(0.5, |value| value.0 as f32),
             automatable: param.automatable,
             hidden: param.hidden,
             read_only: param.read_only,
             unit: param.unit.clone(),
+            value_text: param.value_text.clone(),
         }
     }
 
@@ -7673,6 +8017,7 @@ impl StudioLayout {
                     hidden: false,
                     read_only: false,
                     unit: spec.unit.clone(),
+                    value_text: String::new(),
                 }
             })
             .collect();
@@ -7689,6 +8034,21 @@ impl StudioLayout {
                     )
                 })
         })
+    }
+
+    /// Whether the mixer's EQ curve reads this insert's values from its host
+    /// ([`crate::components::mixer_panel::eq_curve_reads_host_values`]).
+    fn insert_feeds_mixer_eq(&self, plugin_instance_id: &str, cx: &Context<Self>) -> bool {
+        // Only the Professional Edition draws the curve.
+        if !crate::components::mixer_panel::pro_mixing() {
+            return false;
+        }
+        let state = &self.timeline.read(cx).state;
+        state
+            .insert_owner_ids_containing(plugin_instance_id)
+            .iter()
+            .filter_map(|track_id| state.find_insert_slot(track_id, plugin_instance_id))
+            .any(crate::components::mixer_panel::eq_curve_reads_host_values)
     }
 
     pub(super) fn request_track_insert_parameters(
@@ -7840,6 +8200,14 @@ impl StudioLayout {
             class_id: class_id.clone(),
             display_name: display_name.clone(),
             format: slot.plugin_format.map(|f| f.label().to_string()),
+            // A plug-in in the track's MIDI FX chain hands its MIDI to the
+            // engine, which feeds it on to the instrument.
+            engine_reads_midi_out: self
+                .timeline
+                .read(cx)
+                .state
+                .midi_fx_plugin(track_id, slot_id)
+                .is_some(),
         };
 
         match super::plugin_bridge_runtime::PluginBridgeRuntime::ensure_shared(

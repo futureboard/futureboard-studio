@@ -24,7 +24,6 @@
 #                    `all` builds both slices, then the universal merge, and
 #                    bundles all three — what a release produces.
 #   --profile <p>    cargo profile (default: release)
-#   --edition <e>    community (default) — see xtask --edition
 #   --plugin <spec>  all (default) | none | comma-separated crate names
 #   --version <v>    version string for the bundle (default: version.json)
 #   --out <dir>      where .app/.dmg go (default: packaging/native/out)
@@ -43,7 +42,6 @@ cd "$ROOT"
 
 ARCH="all"
 PROFILE="release"
-EDITION="community"
 PLUGIN="all"
 APP_VERSION=""
 OUT_DIR="$ROOT/packaging/native/out"
@@ -69,7 +67,6 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --arch) ARCH="${2:?--arch needs a value}"; shift 2 ;;
     --profile) PROFILE="${2:?--profile needs a value}"; shift 2 ;;
-    --edition) EDITION="${2:?--edition needs a value}"; shift 2 ;;
     --plugin|--plugins) PLUGIN="${2:?--plugin needs a value}"; shift 2 ;;
     --version) APP_VERSION="${2:?--version needs a value}"; shift 2 ;;
     --out) OUT_DIR="${2:?--out needs a value}"; shift 2 ;;
@@ -116,7 +113,7 @@ cef_dir_for() {
   esac
 }
 
-STAGE_ROOT="$ROOT/out/$PROFILE/$EDITION"
+STAGE_ROOT="$ROOT/out/$PROFILE"
 package_dir_for() { echo "$STAGE_ROOT/$(package_folder_for "$1")"; }
 
 # Which slices this run has to compile. `universal` is a merge of the two, so it
@@ -195,7 +192,7 @@ if [[ -z "$APP_VERSION" ]]; then
 fi
 [[ -n "$APP_VERSION" ]] || die "could not determine app version — pass --version"
 note "version $APP_VERSION"
-note "profile $PROFILE, edition $EDITION, plugins $PLUGIN"
+note "profile $PROFILE, plugins $PLUGIN"
 note "bundling: ${VARIANTS[*]}"
 
 if [[ "$WANT_CLEAN" -eq 1 ]]; then
@@ -234,7 +231,6 @@ if [[ "$WANT_BUILD" -eq 1 ]]; then
     # per-pass CEF_PATH is set here — same as the workflow.
     cargo run -p xtask -- package \
       --profile "$PROFILE" \
-      --edition "$EDITION" \
       --plugin "$PLUGIN" \
       --target "$triple"
   done

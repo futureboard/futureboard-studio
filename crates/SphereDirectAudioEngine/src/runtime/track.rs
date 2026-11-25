@@ -2,6 +2,78 @@
 
 use super::*;
 
+/// Mark the buses that keep their channels' places, from `snapshot`. Only in
+/// a spatial mix: in stereo nothing is placed, so nothing is kept. Control
+/// thread; runs before latency planning, which reads the flags through
+/// [`spatial_field_target`].
+pub fn apply_spatial_keeps_inputs(
+    tracks: &mut [RuntimeTrack],
+    snapshot: &crate::types::EngineSpatialSnapshot,
+) {
+    let spatial = snapshot.format.is_spatial();
+    for track in tracks.iter_mut() {
+        track.spatial_state.keeps_inputs = spatial
+            && crate::audio_graph::is_routing_track_type(&track.track_type)
+            && snapshot
+                .sources
+                .iter()
+                .any(|source| source.keeps_inputs && source.track_id == track.id);
+    }
+}
+
+/// The bus whose field `track_index` is placed into, when it is routed into a
+/// bus that keeps its channels' places and that bus sums into the master.
+/// Such a channel reaches the master directly — through the field, at the
+/// bus's fader — so the render path places it there and latency planning
+/// counts it as a direct path. Resolved indices only; cheap.
+#[inline]
+pub fn spatial_field_target(tracks: &[RuntimeTrack], track_index: usize) -> Option<usize> {
+    let track = tracks.get(track_index)?;
+    if crate::audio_graph::is_master_track_type(&track.track_type) {
+        return None;
+    }
+    let target = track.output_track_index.filter(|&t| t != track_index)?;
+    let bus = tracks.get(target)?;
+    (bus.spatial_state.keeps_inputs
+        && crate::audio_graph::is_routing_track_type(&bus.track_type)
+        && bus.output_track_index.is_none())
+    .then_some(target)
+}
+
+/// One channel's spatial state beyond its saved placement.
+#[derive(Debug, Clone)]
+pub struct RuntimeTrackSpatial {
+    /// Where the channel is heard this block: `spatial_params` with any
+    /// spatial automation lane applied. Set by the fader stage, read where the
+    /// channel is placed. A copy, so the render path never allocates for it.
+    pub heard: solfege_spatialaudio::SourceParams,
+    /// A bus or return set to keep its channels' places (snapshot flag). Only
+    /// acted on in a spatial mix, by a bus that sums into the master.
+    pub keeps_inputs: bool,
+    /// The field such a bus gathers: every channel routed into it rendered
+    /// where it sits in the room, in the mix's own channel layout. Added to the
+    /// master's spatial bus at the bus's fader. `None` everywhere else.
+    /// Preallocated by [`RuntimeProject::ensure_spatial`].
+    pub field: Option<solfege_spatialaudio::SpatialBus>,
+    /// The field gain the bus ended its last block on, so the next one ramps.
+    pub field_gain: f32,
+    /// This block's fader gain (volume × VCA, automation included), set by
+    /// the fader stage for the field to follow.
+    pub fader_gain: f32,
+}
+
+impl Default for RuntimeTrackSpatial {
+    fn default() -> Self {
+        Self {
+            heard: solfege_spatialaudio::SourceParams::default(),
+            keeps_inputs: false,
+            field: None,
+            field_gain: 1.0,
+            fader_gain: 1.0,
+        }
+    }
+}
+
 /// The spatial mix of a graph.
 ///
 /// In a stereo project this is inert (`format` stereo, a two-channel bus
@@ -22,6 +94,14 @@ pub struct RuntimeSpatial {
     /// mix, and a surround mix heard through the virtual speakers.
     pub tail: Option<solfege_spatialaudio::RoomTail>,
     pub sample_rate: u32,
+    /// Each speaker feed's peak (or the two ears of a binaural mix) since the
+    /// display last read it, after the master fader. Shared with the control
+    /// side's copy of the graph like the track meters.
+    pub meter: Arc<RuntimeSpeakerMeter>,
+    /// An offline render writing every speaker to its own channel of a
+    /// multichannel file: the surround bus goes out discretely whatever the
+    /// Control Room would do with a device (the exporter never runs it).
+    pub offline_discrete: bool,
 }
 
 impl Default for RuntimeSpatial {
@@ -34,7 +114,35 @@ impl Default for RuntimeSpatial {
             virtual_speakers: None,
             tail: None,
             sample_rate: 48_000,
+            meter: Arc::default(),
+            offline_discrete: false,
         }
+    }
+}
+
+/// Peak of every channel of the spatial bus, as the Room window meters it.
+#[derive(Debug, Default)]
+pub struct RuntimeSpeakerMeter {
+    peaks: [AtomicU32; solfege_spatialaudio::MAX_CHANNELS],
+}
+
+impl RuntimeSpeakerMeter {
+    /// Publish one block's peaks: a lock-free max per channel.
+    #[inline]
+    pub fn store(&self, channel: usize, peak: f32) {
+        if let Some(slot) = self.peaks.get(channel) {
+            slot.fetch_max(peak_bits(peak), Ordering::Relaxed);
+        }
+    }
+
+    /// The first `channels` peaks since the last take, and start the next
+    /// window. For the one display reader.
+    pub fn take(&self, channels: usize) -> Vec<f32> {
+        self.peaks
+            .iter()
+            .take(channels)
+            .map(|slot| f32_load(slot.swap(0, Ordering::Relaxed)))
+            .collect()
     }
 }
 
@@ -73,6 +181,8 @@ impl RuntimeSpatial {
             virtual_speakers,
             tail,
             sample_rate,
+            meter: Arc::default(),
+            offline_discrete: false,
         }
     }
 
@@ -80,6 +190,20 @@ impl RuntimeSpatial {
     #[inline]
     pub fn active(&self) -> bool {
         self.format.is_spatial()
+    }
+
+    /// Meter every channel of the bus at `gain` (the master fader). Realtime:
+    /// reads the preallocated bus, one atomic max per channel.
+    #[inline]
+    pub fn publish_meter(&self, frames: usize, gain: f32) {
+        for channel in 0..self.bus.channels() {
+            let peak = self
+                .bus
+                .channel(channel, frames)
+                .iter()
+                .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+            self.meter.store(channel, peak * gain.abs());
+        }
     }
 
     /// Channels a surround bus writes to the device directly, or `None` when it
@@ -95,9 +219,9 @@ impl RuntimeSpatial {
             return None;
         };
         let count = layout.channel_count();
-        let master_owns_first_pair = monitor.hardware_owner
-            == crate::monitor::HardwareOutputOwner::MasterDirect
-            && monitor.master_output == Some((0, 1));
+        let master_owns_first_pair = self.offline_discrete
+            || (monitor.hardware_owner == crate::monitor::HardwareOutputOwner::MasterDirect
+                && monitor.master_output == Some((0, 1)));
         (count > 2 && device_channels >= count && master_owns_first_pair).then_some(count)
     }
 }
@@ -186,6 +310,50 @@ impl RuntimeMonitor {
             self.source_l[i] = 0.0;
             self.source_r[i] = 0.0;
         }
+    }
+}
+
+/// A channel's Dual pan on the audio thread.
+///
+/// `settings` is what the mixer asked for (live-updated by
+/// `SetTrackDualPan`); `matrix` is the 2x2 gain, volume included, that the
+/// fader applied at the end of the last block that ran the matrix path, in
+/// [`crate::dsp::gain::dual_pan_matrix`]'s layout. `engaged` says whether the
+/// last block did run it: the fader uses it to ramp into and out of Dual from
+/// the balance gains instead of jumping. Plain `Copy` data, no allocation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RuntimeDualPan {
+    pub settings: crate::types::EngineDualPan,
+    pub matrix: [f32; 4],
+    pub engaged: bool,
+}
+
+impl Default for RuntimeDualPan {
+    fn default() -> Self {
+        Self::new(crate::types::EngineDualPan::default())
+    }
+}
+
+impl RuntimeDualPan {
+    pub fn new(settings: crate::types::EngineDualPan) -> Self {
+        Self {
+            settings: settings.sanitized(),
+            matrix: [1.0, 0.0, 0.0, 1.0],
+            engaged: false,
+        }
+    }
+
+    /// Built already at `settings`' matrix scaled by `gain` (the channel's
+    /// volume), so a Dual channel's first block plays at its level with no
+    /// ramp — the same seeding the balance smoother gets.
+    pub fn seeded(settings: crate::types::EngineDualPan, gain: f32) -> Self {
+        let mut dual = Self::new(settings);
+        if dual.settings.enabled {
+            let m = crate::dsp::gain::dual_pan_matrix(dual.settings.left, dual.settings.right);
+            dual.matrix = m.map(|g| g * gain);
+            dual.engaged = true;
+        }
+        dual
     }
 }
 
@@ -297,6 +465,10 @@ pub struct RuntimeTrack {
     /// `None` in a stereo mix and for channels routed into a bus (the bus is
     /// placed instead). Preallocated by [`RuntimeProject::ensure_spatial`].
     pub spatial: Option<solfege_spatialaudio::SpatialSource>,
+    /// The rest of the channel's spatial state: where automation puts it this
+    /// block, and — on a bus that keeps its channels' places — the multichannel
+    /// field those channels are rendered into.
+    pub spatial_state: RuntimeTrackSpatial,
     /// Per-block MIDI events for the instrument VST3 insert (Phase 2B).
     /// Cleared at the start of `schedule_midi_block`; no steady-path allocation.
     pub midi_block_events: Vec<Vst3MidiEvent>,
@@ -314,6 +486,16 @@ pub struct RuntimeTrack {
     ///
     /// `(sample_offset, note_id, voicebank articulation id)`.
     pub solfege_articulation_events: Vec<(u32, i32, u16)>,
+    /// MIDI FX between this track's MIDI and its instrument (see
+    /// [`RuntimeMidiFx`]). When set, every event for the instrument goes
+    /// through `midi_block_events`, never straight to a bridge ring.
+    pub midi_fx: Option<Arc<RuntimeMidiFx>>,
+    /// Events held over a block in which the MIDI FX chain was locked by an
+    /// edit. Reserved with `midi_block_events`.
+    pub midi_fx_hold: Vec<Vst3MidiEvent>,
+    /// The hosted plug-ins in `midi_fx`, in chain order, with their bridge
+    /// sinks (resolved like an insert's, without locking the chain).
+    pub midi_fx_plugins: RuntimeMidiFxPlugins,
     /// Index into `inserts` of the first instrument-capable native VST3 insert.
     pub midi_instrument_insert_ix: Option<usize>,
     /// Built-in RustySynth SoundFont instrument for Instrument tracks.
@@ -331,8 +513,14 @@ pub struct RuntimeTrack {
     /// each block so playback and offline export handle fader automation alike.
     /// Initialized to the build-time target to avoid a startup fade. When
     /// [`RuntimeProject::fader_smoothing`] is off, the target applies directly.
+    /// Linear gain the track's VCA group puts on its fader, automation
+    /// included; `1.0` outside a VCA. See [`crate::types::EngineTrackSnapshot::vca_gain`].
+    pub vca_gain: f32,
     pub smoothed_gain_l: f32,
     pub smoothed_gain_r: f32,
+    /// Dual pan: its settings and the matrix the fader last applied. Inert
+    /// (and the fader bit-identical to the balance path) while it is off.
+    pub dual_pan: RuntimeDualPan,
     /// The return this track's wet/dry/wet inserts
     /// ([`RuntimeInsert::signal_bus`] = [`SIGNAL_BUS_WDW`]) run on, or `None`
     /// while the split is not live: no enabled wet/dry/wet send, or its
@@ -499,8 +687,17 @@ impl RuntimeTrack {
                 RuntimeAutomationTarget::TrackPan => {
                     values.pan = Some((value * 2.0 - 1.0).clamp(-1.0, 1.0));
                 }
+                RuntimeAutomationTarget::TrackPanLeft => {
+                    values.pan_left = Some((value * 2.0 - 1.0).clamp(-1.0, 1.0));
+                }
+                RuntimeAutomationTarget::TrackPanRight => {
+                    values.pan_right = Some((value * 2.0 - 1.0).clamp(-1.0, 1.0));
+                }
                 RuntimeAutomationTarget::TrackMute => {
                     values.muted = Some(value >= 0.5);
+                }
+                RuntimeAutomationTarget::Spatial(param) => {
+                    values.spatial[param.index()] = Some(value);
                 }
                 _ => {}
             }
@@ -593,6 +790,11 @@ pub struct RuntimeTrackMeter {
     pub(super) peak_r: AtomicU32,
     pub(super) rms_l: AtomicU32,
     pub(super) rms_r: AtomicU32,
+    /// This track's post-fader block goes to the visualizer track tap
+    /// (`crate::visualizer_tap::track_tap`). Set by the control side; the
+    /// meter is shared with the graph the callback renders, so the flag
+    /// reaches it without a command. Read once per block.
+    pub(crate) visualizer_tap: AtomicBool,
 }
 
 #[derive(Debug, Clone)]

@@ -145,6 +145,9 @@ pub(crate) struct EngineSyncState {
     /// GPUI re-lay-out and repaint the entire window (timeline, docks, mixer)
     /// on every tick for a label that had not changed.
     pub displayed_bar_beat: (i64, u16),
+    /// Publishes meters, transport and audio to the native visualizer app
+    /// while one is reading (`crate::visualizer_link`).
+    pub visualizer_link: crate::visualizer_link::Publisher,
 }
 
 impl Default for EngineSyncState {
@@ -162,6 +165,7 @@ impl Default for EngineSyncState {
             bridge_reconciled_at: Instant::now() - Duration::from_secs(1),
             midi_devices_synced_at: Instant::now() - Duration::from_secs(1),
             displayed_bar_beat: (i64::MIN, u16::MAX),
+            visualizer_link: crate::visualizer_link::Publisher::default(),
         }
     }
 }
@@ -210,6 +214,16 @@ pub(crate) struct AudioBridgeState {
     /// the commit it held the drawn note off screen until it finished. The
     /// engine poll leaves a waiting edit alone for [`MIDI_EDIT_PAINT_GRACE`].
     pub midi_publish_waiting_since: Option<Instant>,
+    /// A MIDI edit is on its way to the engine on its own
+    /// (`AudioEngine::replace_midi_clips`), not inside a project sync.
+    pub midi_live_in_flight: bool,
+    /// Another MIDI edit arrived while one was in flight; it is pushed, from
+    /// the state then current, when that one lands.
+    pub midi_live_pending: bool,
+    /// A project sync asked for while a live MIDI push was in flight, run
+    /// when the push lands — `(force, reason)`. Run before then, its older
+    /// snapshot could be overtaken by the push's newer notes or overtake them.
+    pub sync_after_midi_live: Option<(bool, &'static str)>,
     /// Counter behind the synthetic fingerprint a known content change gets.
     pub content_change_serial: u64,
     /// Monotonic id of the in-flight sync. A `complete_audio_project_sync` whose
@@ -328,6 +342,9 @@ impl Default for AudioBridgeState {
             pending_force: false,
             known_content_change: false,
             midi_publish_waiting_since: None,
+            midi_live_in_flight: false,
+            midi_live_pending: false,
+            sync_after_midi_live: None,
             content_change_serial: 0,
             sync_generation: 0,
             sync_started_at: None,
@@ -915,6 +932,9 @@ impl StudioLayout {
             // ARA plug-ins post transport requests and model updates from their
             // own threads; this is where those land on the UI thread.
             self.poll_ara(cx);
+            // A scan or a cache clear in the Plug-in Manager's window: reload
+            // the plug-in lists here so they show it without a restart.
+            self.refresh_stale_plugin_catalog(cx);
             // The one place Space becomes play/pause when it was pressed
             // somewhere GPUI's key bindings could not see it.
             //
@@ -960,6 +980,17 @@ impl StudioLayout {
             }
         }
 
+        // A MIDI edit whose paint-first publish never came (no frame drawn):
+        // published live once the grace runs out.
+        if !self.audio_bridge.project_dirty
+            && !self.audio_bridge.media_dirty
+            && self
+                .audio_bridge
+                .midi_publish_waiting_since
+                .is_some_and(|since| since.elapsed() >= MIDI_EDIT_PAINT_GRACE)
+        {
+            self.publish_midi_edit(cx);
+        }
         if self.audio_bridge.project_dirty || self.audio_bridge.media_dirty {
             let held_for_paint = self
                 .audio_bridge
@@ -1276,6 +1307,10 @@ impl StudioLayout {
     /// `cx.notify` — repaints are driven by the audio poll when transport
     /// is active, or by user interaction when idle.
     pub(super) fn apply_engine_meters(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.audio_bridge.engine.is_none() {
+            return false;
+        }
+        self.follow_spatial_license(cx);
         let Some(engine) = self.audio_bridge.engine.as_ref() else {
             return false;
         };
@@ -1300,6 +1335,15 @@ impl StudioLayout {
         // `plugin_outputs.clone()` on this playback hot path. `master_peak_*` are
         // `f64` (Copy), so the forensic trace and the closure can both read them.
         let meters = engine.meters();
+        // The native visualizer app reads this tick's raw engine levels; with
+        // no visualizer running this is one atomic load.
+        self.engine_sync.visualizer_link.publish(
+            engine,
+            &meters,
+            &self.timeline.read(cx).state,
+            self.project_session.display_name(),
+        );
+        self.tick_room_window(&meters.speaker_peaks, cx);
         let meter_tracks = meters.tracks;
         let plugin_output_meters = meters.plugin_outputs;
         let master_peak_l = meters.master_peak_l;
@@ -1514,6 +1558,15 @@ impl StudioLayout {
             self.audio_bridge.last_error = Some("audio engine unavailable".to_string());
             return;
         };
+        if self.audio_bridge.midi_live_in_flight {
+            // Runs when the live MIDI push lands (`finish_midi_live_push`).
+            let (queued_force, _) = self
+                .audio_bridge
+                .sync_after_midi_live
+                .unwrap_or((false, reason));
+            self.audio_bridge.sync_after_midi_live = Some((force || queued_force, reason));
+            return;
+        }
         self.audio_bridge.sync_request_count =
             self.audio_bridge.sync_request_count.saturating_add(1);
         crate::perf::count("sync_request_count", self.audio_bridge.sync_request_count);
@@ -1819,6 +1872,13 @@ impl StudioLayout {
             if (now.pan - was.pan).abs() > 1.0e-6 {
                 let _ = engine.update_track_param(&track.id, "pan", f64::from(now.pan));
             }
+            if now.dual_pan != was.dual_pan {
+                let dual = now.dual_pan;
+                let _ = engine.update_track_param(&track.id, "panLeft", f64::from(dual.left));
+                let _ = engine.update_track_param(&track.id, "panRight", f64::from(dual.right));
+                let mode = if dual.enabled { 1.0 } else { 0.0 };
+                let _ = engine.update_track_param(&track.id, "panMode", mode);
+            }
             if (now.volume - was.volume).abs() > 1.0e-6 {
                 let _ = engine.update_track_param(&track.id, "volume", f64::from(now.volume));
             }
@@ -1867,15 +1927,19 @@ impl StudioLayout {
                     "sync_completed_count",
                     self.audio_bridge.sync_completed_count,
                 );
-                eprintln!(
-                    "[ROUTE GRAPH REBUILD]\nreason=audio_project_sync_complete\ngraph_version_before={}\ngraph_version_after={}\nnum_plugin_child_channels={}\nnum_routes_to_master={}\npublished_to_audio_thread=true",
-                    self.audio_bridge
-                        .route_graph_in_flight_version
-                        .saturating_sub(1),
-                    self.audio_bridge.route_graph_in_flight_version,
-                    self.audio_bridge.route_graph_in_flight_child_channels,
-                    self.audio_bridge.route_graph_in_flight_master_routes
-                );
+                // Every sync lands here, rebuilt routing or not; only the
+                // engine-sync debug switch wants it in the log.
+                if crate::perf::engine_sync_debug_enabled() {
+                    eprintln!(
+                        "[ROUTE GRAPH REBUILD]\nreason=audio_project_sync_complete\ngraph_version_before={}\ngraph_version_after={}\nnum_plugin_child_channels={}\nnum_routes_to_master={}\npublished_to_audio_thread=true",
+                        self.audio_bridge
+                            .route_graph_in_flight_version
+                            .saturating_sub(1),
+                        self.audio_bridge.route_graph_in_flight_version,
+                        self.audio_bridge.route_graph_in_flight_child_channels,
+                        self.audio_bridge.route_graph_in_flight_master_routes
+                    );
+                }
                 // Record the published graph's fingerprint so a later
                 // engine_dirty_poll for the identical graph is deduped in
                 // `schedule_audio_project_sync` (no second rebuild). A successful
@@ -1918,7 +1982,9 @@ impl StudioLayout {
 
         // Project load can finish plugin restore before the audio engine is
         // warm; re-bind bridge sinks whenever a graph swap completes.
-        if self.sync_plugin_bridge_sinks_to_engine(cx, "audio_project_sync_complete") {
+        if self.sync_plugin_bridge_sinks_to_engine(cx, "audio_project_sync_complete")
+            && crate::perf::engine_sync_debug_enabled()
+        {
             eprintln!("[PluginRestore] graph snapshot swapped generation=post_sync");
         }
 
@@ -2123,19 +2189,20 @@ impl StudioLayout {
     /// sync that publishes it skips the whole-project signature. Publishing
     /// itself waits for [`Self::publish_midi_edit`], after the edit paints.
     pub(super) fn mark_midi_edit_dirty(&mut self) {
-        self.mark_dirty();
-        self.audio_bridge.known_content_change = true;
+        // Unsaved, but the engine graph is not stale: the notes go to the
+        // engine on their own (`publish_midi_edit`), not in a project sync.
+        self.project_session.mark_dirty();
+        self.project_switcher.current_project.is_dirty = true;
+        self.project_switcher.current_project.subtitle = "Unsaved changes".to_string();
         self.audio_bridge
             .midi_publish_waiting_since
             .get_or_insert_with(Instant::now);
     }
 
-    /// A MIDI tool's live preview changed notes: the engine graph is stale
-    /// and the change is known to be real, but it is not an edit, so the
-    /// project is not marked unsaved. Published like an edit, after it paints.
+    /// A MIDI tool's live preview changed notes: heard like an edit, but it is
+    /// not one, so the project is not marked unsaved. Published like an edit,
+    /// after it paints.
     pub(super) fn mark_midi_preview_dirty(&mut self) {
-        self.mark_engine_project_dirty();
-        self.audio_bridge.known_content_change = true;
         self.audio_bridge
             .midi_publish_waiting_since
             .get_or_insert_with(Instant::now);
@@ -2153,6 +2220,82 @@ impl StudioLayout {
         {
             return;
         }
+        self.push_midi_edit_live(cx);
+    }
+
+    /// Sends the project's MIDI clips to the engine on their own: the edited
+    /// clip is rebuilt (the rest are memoized) and the engine swaps in a new
+    /// note schedule — no project snapshot, no graph or plug-in bookkeeping,
+    /// no background task, no log. One push at a time; edits made meanwhile
+    /// go in one push from the state current when it lands.
+    ///
+    /// Falls back to a project sync, which carries the same notes, whenever
+    /// the engine's loaded project may not be the one this edit applies to:
+    /// a sync running or waiting, or ARA (whose regions need their sessions
+    /// refreshed).
+    fn push_midi_edit_live(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.audio_bridge.engine.clone() else {
+            return;
+        };
+        if self.audio_bridge.midi_live_in_flight {
+            self.audio_bridge.midi_live_pending = true;
+            return;
+        }
+        let bridge = &self.audio_bridge;
+        if bridge.sync_in_flight
+            || bridge.project_dirty
+            || bridge.media_dirty
+            || self.ara.is_active()
+        {
+            self.fall_back_to_midi_sync(cx);
+            return;
+        }
+        use gpui::AppContext as _;
+        let clips = super::engine_snapshot::build_engine_midi_clips(&self.timeline.read(cx).state);
+        self.audio_bridge.midi_live_in_flight = true;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { engine.replace_midi_clips(clips) })
+                .await;
+            let _ = this.update(cx, |layout, cx| layout.finish_midi_live_push(result, cx));
+        })
+        .detach();
+    }
+
+    fn finish_midi_live_push(
+        &mut self,
+        result: Result<bool, DirectAudio::SphereAudioError>,
+        cx: &mut Context<Self>,
+    ) {
+        self.audio_bridge.midi_live_in_flight = false;
+        match result {
+            Ok(true) => {
+                // The engine now holds notes the published graph's fingerprint
+                // and signature do not describe: the next sync must not be
+                // skipped as unchanged (an undo back to them, say).
+                self.audio_bridge.graph_fingerprint = None;
+                self.audio_bridge.last_project_signature = None;
+            }
+            Ok(false) | Err(_) => {
+                // Nothing loaded to edit, or the swap failed: a sync carries
+                // the notes instead (and reports a real failure itself).
+                self.audio_bridge.midi_live_pending = false;
+                self.fall_back_to_midi_sync(cx);
+            }
+        }
+        if let Some((force, reason)) = self.audio_bridge.sync_after_midi_live.take() {
+            self.audio_bridge.midi_live_pending = false;
+            self.audio_bridge.known_content_change = true;
+            self.schedule_audio_project_sync(cx, force, reason);
+        } else if std::mem::take(&mut self.audio_bridge.midi_live_pending) {
+            self.push_midi_edit_live(cx);
+        }
+    }
+
+    /// The MIDI edit goes out in a project sync after all.
+    fn fall_back_to_midi_sync(&mut self, cx: &mut Context<Self>) {
+        self.mark_engine_project_dirty();
+        self.audio_bridge.known_content_change = true;
         self.schedule_audio_project_sync(cx, false, MIDI_EDIT_SYNC_REASON);
     }
 
@@ -4909,6 +5052,7 @@ struct SentControl {
     muted: bool,
     solo: bool,
     pan: f32,
+    dual_pan: DirectAudio::types::EngineDualPan,
     /// Linear gain, as the engine receives it.
     volume: f32,
 }
@@ -4924,6 +5068,7 @@ impl SentControl {
             muted: track.muted,
             solo: track.solo,
             pan: track.pan.clamp(-1.0, 1.0),
+            dual_pan: super::engine_snapshot::engine_dual_pan(track),
             volume: volume_norm_to_linear(state.display_track_volume(track)),
         }
     }
@@ -4942,6 +5087,7 @@ impl SentTrackControls {
                         muted: track.muted,
                         solo: track.solo,
                         pan: track.pan,
+                        dual_pan: track.dual_pan,
                         volume: track.volume,
                     },
                 )

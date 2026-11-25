@@ -382,7 +382,14 @@ fn fs_handle(in: HandleOut) -> @location(0) vec4<f32> {
 
     thread_local! {
         /// `None` = not tried yet; `Some(None)` = unavailable on this machine.
-        static LANE_GPU: RefCell<Option<Option<LaneGpu>>> = const { RefCell::new(None) };
+        ///
+        /// Never dropped, like the visualizer's context: Studio ends in
+        /// `ExitProcess`, which runs thread-local destructors after wgpu's
+        /// own state is gone, and dropping a device there aborted the process
+        /// on every quit after a controller lane had been drawn. The OS
+        /// reclaims it.
+        static LANE_GPU: std::mem::ManuallyDrop<RefCell<Option<Option<LaneGpu>>>> =
+            const { std::mem::ManuallyDrop::new(RefCell::new(None)) };
     }
 
     fn gpu_debug() -> bool {

@@ -594,6 +594,12 @@ pub(super) fn render_project_block_interleaved_core(
     // it is restored below. `audio_graph` is otherwise untouched here.
     if runtime.spatial.active() {
         runtime.spatial.bus.clear(frames);
+        // Buses that keep their channels' places gather a fresh field.
+        for track in runtime.tracks.iter_mut() {
+            if let Some(field) = track.spatial_state.field.as_mut() {
+                field.clear(frames);
+            }
+        }
     }
     // Each pass runs in batches: first the insert chains of every track in the
     // batch (in parallel when multi-core processing is on), then, in the fixed
@@ -716,6 +722,7 @@ pub(super) fn render_project_block_interleaved_core(
                 channels,
                 block_beat,
                 emit,
+                transport,
             );
             if let Some(tap) = track_taps
                 .as_deref_mut()
@@ -730,6 +737,7 @@ pub(super) fn render_project_block_interleaved_core(
             // an export would capture. Atomics into a preallocated ring, and one
             // `Option` check for every track that is not being shared.
             publish_track_to_jam(runtime, track_index, frames, jam);
+            publish_track_to_visualizer(runtime, track_index, frames);
             stage_track_to_render_capture(runtime, track_index, frames);
             // Track loopback tap: the same post-fader signal, kept for whichever
             // audio track reads this one as its input on the next callback. One
@@ -795,6 +803,7 @@ pub(super) fn render_project_block_interleaved_core(
                 channels,
                 block_beat,
                 emit,
+                transport,
             );
             if let Some(tap) = track_taps
                 .as_deref_mut()
@@ -809,6 +818,7 @@ pub(super) fn render_project_block_interleaved_core(
             // an export would capture. Atomics into a preallocated ring, and one
             // `Option` check for every track that is not being shared.
             publish_track_to_jam(runtime, track_index, frames, jam);
+            publish_track_to_visualizer(runtime, track_index, frames);
             stage_track_to_render_capture(runtime, track_index, frames);
             // Track loopback tap for routing tracks: a bus, group or return
             // (the WDW return included) is a loopback source like any other,
@@ -829,6 +839,9 @@ pub(super) fn render_project_block_interleaved_core(
 
     // ── Spatial bus → device ──
     let discrete_channels = mix_spatial_bus(runtime, frames, output, channels);
+    if runtime.spatial.active() {
+        runtime.spatial.publish_meter(frames, master_volume);
+    }
 
     // ── Master bus: apply master track inserts on the summed output ──
     // A discrete surround mix bypasses them: the master chain is stereo, and
@@ -906,6 +919,30 @@ pub(super) fn render_project_block_interleaved_core(
             let out = &mut output[i * channels..i * channels + channels];
             for sample in &mut out[..mix_width] {
                 *sample *= master_volume;
+            }
+        }
+    }
+    // Master post-fader inserts (a dither, a last limiter): after the master
+    // volume, on what leaves for the device. Stereo only, like the master
+    // chain, and not while the master is muted — its output is silence.
+    if let Some(m_idx) = master_index.filter(|_| discrete_channels.is_none()) {
+        let has_post = runtime.tracks[m_idx]
+            .inserts
+            .iter()
+            .any(|insert| insert.post_fader);
+        if has_post && !effective_track_muted(&runtime.tracks[m_idx], block_beat) {
+            let master = &mut runtime.tracks[m_idx];
+            let frames = frames.min(master.block_l.len()).min(master.block_r.len());
+            for i in 0..frames {
+                let frame = &output[i * channels..i * channels + channels];
+                master.block_l[i] = frame[0];
+                master.block_r[i] = frame[1];
+            }
+            apply_post_fader_inserts(master, frames, transport);
+            for i in 0..frames {
+                let out = &mut output[i * channels..i * channels + channels];
+                out[0] = master.block_l[i];
+                out[1] = master.block_r[i];
             }
         }
     }
@@ -996,7 +1033,11 @@ pub(super) fn stamp_automation_clocks(
             } else {
                 0
             };
-            (mix.saturating_add(latency_graph.master_plugin_latency), mix)
+            // The master volume comes before the master's post-fader inserts.
+            let before_fader = latency_graph
+                .master_plugin_latency
+                .saturating_sub(crate::latency_graph::post_fader_latency_samples(track));
+            (mix.saturating_add(before_fader), mix)
         } else {
             let output = latency_graph
                 .track_output_latency
@@ -1008,7 +1049,10 @@ pub(super) fn stamp_automation_clocks(
                 .get(idx)
                 .copied()
                 .unwrap_or(0);
-            (output, output.saturating_sub(block))
+            // The fader, sends and mute come before the post-fader inserts.
+            let fader =
+                output.saturating_sub(crate::latency_graph::post_fader_latency_samples(track));
+            (fader, output.saturating_sub(block))
         };
         track.automation_clock = crate::runtime::RuntimeAutomationClock {
             fader_lag_beats: lag_beats(fader_lag),

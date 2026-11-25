@@ -139,8 +139,15 @@ pub enum EngineCommand {
     /// on the control thread, so the callback neither searches by id nor frees
     /// a `String`; an index the graph does not have is ignored.
     SetTrackVolume { track_index: usize, value: f32 },
+    /// Set the linear gain a track's VCA group puts on its fader (0..4).
+    SetTrackVcaGain { track_index: usize, value: f32 },
     /// Set a track's pan (-1..1).
     SetTrackPan { track_index: usize, value: f32 },
+    /// Set a track's Dual pan: mode and both input positions at once.
+    SetTrackDualPan {
+        track_index: usize,
+        dual_pan: crate::types::EngineDualPan,
+    },
     /// Mute or unmute a track.
     SetTrackMute { track_index: usize, muted: bool },
     /// Solo or unsolo a track.

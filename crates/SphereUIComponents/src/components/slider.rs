@@ -29,26 +29,27 @@ type SliderCommitCb = Arc<dyn Fn(&mut Window, &mut App) + 'static>;
 
 // ── Geometry ────────────────────────────────────────────────────────────────
 // Fixed chrome, not data-driven: named here rather than repeated inline so the
-// rail, the detent, the glow and the thumb stay on one vertical rhythm.
+// rail, the detent and the thumb stay centred on one line.
 const TRACK_H: f32 = 20.0;
-const RAIL_TOP: f32 = 7.0;
-const RAIL_H: f32 = 6.0;
-const DETENT_TOP: f32 = 5.0;
-const DETENT_W: f32 = 1.0;
+const RAIL_H: f32 = 4.0;
+const RAIL_TOP: f32 = (TRACK_H - RAIL_H) / 2.0;
+const DETENT_W: f32 = 2.0;
 const DETENT_H: f32 = 10.0;
-const GLOW_TOP: f32 = 2.0;
-const GLOW_W: f32 = 12.0;
-const GLOW_H: f32 = 16.0;
-const THUMB_TOP: f32 = 3.0;
-const THUMB_W: f32 = 8.0;
-const THUMB_H: f32 = 14.0;
-const THUMB_NOTCH_TOP: f32 = 3.0;
-const THUMB_NOTCH_INSET: f32 = 2.0;
-const THUMB_NOTCH_H: f32 = 1.5;
+const DETENT_TOP: f32 = (TRACK_H - DETENT_H) / 2.0;
+/// A round thumb: the grab point reads as one, not as a bar on the rail.
+const THUMB_D: f32 = 14.0;
+const THUMB_TOP: f32 = (TRACK_H - THUMB_D) / 2.0;
+/// The ring in the slider's colour, so two sliders side by side are told
+/// apart by their thumbs as well as by their fills.
+const THUMB_RING: f32 = 2.0;
+/// Spread of the state ring that appears around the thumb under the pointer.
+const HOVER_RING: f32 = 4.0;
+const HOVER_RING_ALPHA: f32 = 0.22;
+const GROUP: &str = "fb-slider";
 
 const COMPACT_TRACK_H: f32 = 10.0;
-const COMPACT_RAIL_TOP: f32 = 3.5;
-const COMPACT_RAIL_H: f32 = 3.0;
+const COMPACT_RAIL_H: f32 = 4.0;
+const COMPACT_RAIL_TOP: f32 = (COMPACT_TRACK_H - COMPACT_RAIL_H) / 2.0;
 
 /// Half-width of the snap-to-neutral dead zone, in **window pixels**.
 ///
@@ -316,7 +317,7 @@ pub fn compact_slider_with_reset(
                 .right_0()
                 .top(px(COMPACT_RAIL_TOP))
                 .h(px(COMPACT_RAIL_H))
-                .bg(Colors::divider())
+                .bg(Colors::fader_groove())
                 .rounded(px(radius::PILL)),
         )
         .child(
@@ -452,13 +453,8 @@ fn drag_slider(
     let a11y_commit_decrement = on_drag_commit.clone();
 
     let focus = Colors::state_focus_ring();
-    let fill = {
-        let mut c = accent;
-        c.a = 0.95;
-        c
-    };
-    let mut accent_glow = accent;
-    accent_glow.a = 0.35;
+    let mut hover_ring = accent;
+    hover_ring.a = HOVER_RING_ALPHA;
 
     div()
         .id(gpui::ElementId::Name(id_str.clone()))
@@ -503,8 +499,9 @@ fn drag_slider(
         .flex_1()
         .min_w_0()
         .relative()
+        .group(GROUP)
         .cursor(gpui::CursorStyle::ResizeLeftRight)
-        // Recessed rail
+        // Recessed groove, the same token the faders sit in.
         .child(
             div()
                 .absolute()
@@ -512,9 +509,7 @@ fn drag_slider(
                 .right_0()
                 .top(px(RAIL_TOP))
                 .h(px(RAIL_H))
-                .bg(Colors::divider())
-                .border(px(1.0))
-                .border_color(Colors::with_alpha(Colors::surface_canvas(), 0.25))
+                .bg(Colors::fader_groove())
                 .rounded(px(radius::PILL)),
         )
         // Fill bar. Bipolar sliders grow it outward from the rail midpoint, so
@@ -529,7 +524,7 @@ fn drag_slider(
                     .top(px(RAIL_TOP))
                     .h(px(RAIL_H))
                     .w(gpui::relative(fill_width))
-                    .bg(fill)
+                    .bg(accent)
                     .rounded(px(radius::PILL)),
             )
         })
@@ -546,45 +541,33 @@ fn drag_slider(
                     .top(px(DETENT_TOP))
                     .w(px(DETENT_W))
                     .h(px(DETENT_H))
+                    .rounded(px(radius::PILL))
                     .bg(Colors::text_muted()),
             )
         })
-        // Soft glow halo behind the thumb so it reads as the active element.
-        .child(
-            div()
-                .absolute()
-                .top(px(GLOW_TOP))
-                .left(gpui::relative(pos))
-                .ml(px(-GLOW_W / 2.0))
-                .w(px(GLOW_W))
-                .h(px(GLOW_H))
-                .rounded(px(radius::PILL))
-                .bg(accent_glow),
-        )
-        // Handle thumb — bordered, brighter, and a hair taller than the rail.
+        // Round thumb: a light cap ringed in the slider's colour. Under
+        // the pointer it gains a soft ring in the same hue (a state layer, not
+        // a resting glow), so the grab target is obvious before the press.
         .child(
             div()
                 .absolute()
                 .top(px(THUMB_TOP))
                 .left(gpui::relative(pos))
-                .ml(px(-THUMB_W / 2.0))
-                .w(px(THUMB_W))
-                .h(px(THUMB_H))
-                .rounded(px(radius::MICRO))
-                .bg(Colors::text_primary())
-                .border(px(1.0))
-                .border_color(Colors::border_strong())
-                // Center accent notch inside the handle so the user can read
-                // which slider they're touching at a glance.
-                .child(
-                    div()
-                        .absolute()
-                        .top(px(THUMB_NOTCH_TOP))
-                        .left(px(THUMB_NOTCH_INSET))
-                        .right(px(THUMB_NOTCH_INSET))
-                        .h(px(THUMB_NOTCH_H))
-                        .bg(accent),
-                ),
+                .ml(px(-THUMB_D / 2.0))
+                .size(px(THUMB_D))
+                .rounded(px(radius::PILL))
+                .bg(Colors::slider_thumb())
+                .border(px(THUMB_RING))
+                .border_color(accent)
+                .group_hover(GROUP, move |style| {
+                    style.shadow(vec![gpui::BoxShadow {
+                        color: gpui::Hsla::from(hover_ring),
+                        offset: gpui::point(px(0.0), px(0.0)),
+                        blur_radius: px(0.0),
+                        spread_radius: px(HOVER_RING),
+                        inset: false,
+                    }])
+                }),
         )
         .on_drag(
             FaderDrag::new(id_string.clone()),

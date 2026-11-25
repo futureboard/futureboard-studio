@@ -251,6 +251,7 @@ impl RuntimeProject {
                     vst3,
                     cpu_us: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
                     guard: Default::default(),
+                    latency_bypassed: false,
                     callback_process_log_done: false,
                     silent_process_blocks: 0,
                     bridge_missed_blocks: 0,
@@ -262,6 +263,7 @@ impl RuntimeProject {
                     scratch_multi: Vec::new(),
                     chain_latency_samples: 0,
                     signal_bus: signal_bus_from_params(&insert.params),
+                    post_fader: post_fader_from_params(&insert.params),
                     // Resolved to a source index in `resolve_sidechains`.
                     sidechain: sidechain_from_params(&insert.params),
                 });
@@ -298,6 +300,7 @@ impl RuntimeProject {
             tracks.push(RuntimeTrack {
                 spatial: None,
                 spatial_params: Default::default(),
+                spatial_state: Default::default(),
                 listen: crate::monitor::ListenMode::Off,
                 id: t.id.clone(),
                 track_type: t.track_type.clone(),
@@ -379,6 +382,9 @@ impl RuntimeProject {
                 ara_silence: vec![0.0; DEFAULT_AUDIO_BLOCK_CAPACITY],
                 ara_latency_samples: 0,
                 midi_block_events: Vec::with_capacity(MIDI_BLOCK_EVENT_BASE_CAPACITY),
+                midi_fx: RuntimeMidiFx::build(&t.midi_fx, output_sample_rate),
+                midi_fx_hold: Vec::new(),
+                midi_fx_plugins: RuntimeMidiFxPlugins::from_specs(&t.midi_fx),
                 solfege_pitch_events: Vec::with_capacity(1024),
                 solfege_articulation_events: Vec::with_capacity(256),
                 midi_instrument_insert_ix,
@@ -388,8 +394,13 @@ impl RuntimeProject {
                 pdc_delay_l: Vec::new(),
                 pdc_delay_r: Vec::new(),
                 pdc_write_pos: 0,
-                smoothed_gain_l: init_volume * init_pan_l,
-                smoothed_gain_r: init_volume * init_pan_r,
+                vca_gain: t.vca_gain.clamp(0.0, 4.0),
+                smoothed_gain_l: init_volume * t.vca_gain.clamp(0.0, 4.0) * init_pan_l,
+                smoothed_gain_r: init_volume * t.vca_gain.clamp(0.0, 4.0) * init_pan_r,
+                dual_pan: RuntimeDualPan::seeded(
+                    t.dual_pan,
+                    init_volume * t.vca_gain.clamp(0.0, 4.0),
+                ),
                 wdw_return_index: None,
                 sidechain_tap: Default::default(),
             });
@@ -581,6 +592,10 @@ impl RuntimeProject {
             let _ = idx;
         }
 
+        // Which buses keep their channels' places decides where those
+        // channels' audio meets the master, so compensation is planned on it.
+        crate::runtime::apply_spatial_keeps_inputs(&mut tracks, &snapshot.spatial);
+
         let pdc_active = pdc_enabled
             && !std::env::var_os("FUTUREBOARD_PDC").is_some_and(|v| v == "0" || v == "false");
         let latency_graph = plan_runtime_latency_graph(&mut tracks, &audio_graph, pdc_active);
@@ -635,6 +650,8 @@ impl RuntimeProject {
             // instrument has nothing to reset.
             midi_sent_since_panic: false,
             latency_replan_count: 0,
+            pdc_rings_short: false,
+            low_latency_bypass_any: false,
             // Realtime default: smooth fader/pan drags. The offline exporter
             // overrides this to `false` right after `build()` for a deterministic,
             // byte-identical bounce.
