@@ -62,7 +62,8 @@ impl TimelineState {
                     audio_import: AudioImportState::Ready,
                     stretch: AudioClipStretchState::default(),
                 },
-            ],
+            ]
+            .into(),
             automation_lanes: vec![AutomationLaneState {
                 id: "lane-1".to_string(),
                 name: "Volume".to_string(),
@@ -139,7 +140,8 @@ impl TimelineState {
                 muted: false,
                 audio_import: AudioImportState::Ready,
                 stretch: AudioClipStretchState::default(),
-            }],
+            }]
+            .into(),
             automation_lanes: vec![],
             lane_mode: TrackLaneMode::Clips,
             selected_automation_target: None,
@@ -213,7 +215,8 @@ impl TimelineState {
                 muted: false,
                 audio_import: AudioImportState::default(),
                 stretch: AudioClipStretchState::default(),
-            }],
+            }]
+            .into(),
             automation_lanes: vec![],
             lane_mode: TrackLaneMode::Clips,
             selected_automation_target: None,

@@ -57,8 +57,9 @@ impl Render for Timeline {
             self.state.sync_time_warp();
         }
         let mut row_layout = self.state.track_row_layout();
+        let content_w = self.timeline_content_width();
         let (viewport_w, viewport_h, (scroll_max_x, scroll_max_y)) =
-            self.scroll_geometry_with_content_height(window, row_layout.total_height);
+            self.scroll_geometry_with_content_height(window, row_layout.total_height, content_w);
         self.state.update_viewport_size(viewport_w, viewport_h);
         // A reopened project's saved scroll (`pending_view_restore`) lands on
         // the first frame with a real viewport, before the clamp.
@@ -169,7 +170,8 @@ impl Render for Timeline {
         // The hovered or dragged clip's fade handles, resolved against this
         // frame's scroll and zoom.
         let fade_handle_overlay = self.fade_handle_overlay(cx);
-        self.refresh_fade_handle_frame(&row_layout);
+        let clip_frame = self.clip_lane_frame();
+        self.refresh_fade_handle_frame(&row_layout, &clip_frame);
 
         // Diagnostic only, and it walks every track: skip the sum entirely when
         // the perf collector is off.
@@ -1777,8 +1779,9 @@ impl Render for Timeline {
                 &self.state,
             ),
         );
-        self.frame_lane_ctx = Some(std::rc::Rc::new(
+        let frame_lane_ctx = std::rc::Rc::new(
             crate::components::timeline::track_lane_view::LaneFrameContext {
+                clips: clip_frame,
                 track_indices: self
                     .state
                     .tracks
@@ -1806,7 +1809,8 @@ impl Render for Timeline {
                 on_audio_clip_process_commit: on_audio_clip_process_commit.clone(),
                 on_crossfade: Some(on_crossfade.clone()),
             },
-        ));
+        );
+        self.frame_lane_ctx = Some(frame_lane_ctx.clone());
 
         let state = &self.state;
         let tempo_h = state.tempo_track_height();
@@ -1858,7 +1862,6 @@ impl Render for Timeline {
         // edges of the lane area. Clicking the track jumps the scroll
         // position to that point — gives a functional scrollbar without
         // needing a stateful drag.
-        let content_w = self.timeline_content_width();
         let content_h = row_layout.total_height.max(1.0);
         let lane_view_h = viewport_h.max(DEFAULT_TRACK_HEIGHT);
         let lane_view_w = viewport_w.max(1.0);
@@ -2927,7 +2930,7 @@ impl Render for Timeline {
                 Some(on_erase_start.clone()),
                 Some(on_erase_clip.clone()),
                 Some(on_cut_clip.clone()),
-                Some(&self.erase_preview_ids),
+                self.erase_clip_drag.as_ref(),
                 on_audio_clip_process_preview.clone(),
                 on_audio_clip_process_commit.clone(),
                 Some(on_crossfade.clone()),
@@ -2955,6 +2958,7 @@ impl Render for Timeline {
                     None => self.render_arrangement_surface(),
                 },
                 &lane_gesture,
+                &frame_lane_ctx.clips,
                 &self.track_lanes,
             )))
             .children(timeline_marker_region_overlay(state).map(|overlay| {
@@ -3792,12 +3796,12 @@ fn clip_move_hint_overlay(
     state: &TimelineState,
     row_layout: &crate::components::timeline::timeline_state::TrackRowLayout,
 ) -> Option<gpui::AnyElement> {
-    let source_index = state.tracks.iter().position(|track| {
-        track
-            .clips
-            .iter()
-            .any(|clip| clip.id == origin.anchor_clip_id)
-    })?;
+    let locations = origin.locations(state);
+    let anchor_index = origin
+        .clips
+        .iter()
+        .position(|item| item.clip.id == origin.anchor_clip_id)?;
+    let source_index = locations[anchor_index]?.track;
     let delta = target_index as isize - source_index as isize;
     if delta == 0 {
         return None;
@@ -3821,16 +3825,13 @@ fn clip_move_hint_overlay(
     let mut ghosts = Vec::new();
     let mut lanes = Vec::new();
     let count = origin.clips.len();
-    for snapshot in &origin.clips {
-        let Some((track_index, clip)) = state.tracks.iter().enumerate().find_map(|(i, track)| {
-            track
-                .clips
-                .iter()
-                .find(|clip| clip.id == snapshot.clip.id)
-                .map(|clip| (i, clip))
-        }) else {
+    let mut shaded = HashSet::new();
+    for (snapshot, slot) in origin.clips.iter().zip(locations.iter()) {
+        let Some(slot) = slot else {
             continue;
         };
+        let track_index = slot.track;
+        let clip = &state.tracks[track_index].clips[slot.index];
         let landing = (track_index as isize + delta).clamp(0, max_index) as usize;
         let (Some(from_row), Some(to_row)) = (
             row_layout.row_for_index(track_index),
@@ -3862,7 +3863,7 @@ fn clip_move_hint_overlay(
         }
 
         let lane_color = state.tracks.get(landing).map_or(color, |t| t.color);
-        if !lanes.contains(&landing) {
+        if shaded.insert(landing) {
             lanes.push(landing);
         }
         let anchor = snapshot.clip.id == origin.anchor_clip_id;

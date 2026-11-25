@@ -3046,7 +3046,7 @@ fn clone_track_for_mixer_detail(track: &TrackState, include_detail: bool) -> Tra
         meter_peak_hold_l: *meter_peak_hold_l,
         meter_peak_hold_r: *meter_peak_hold_r,
         meter_clip: *meter_clip,
-        clips: Vec::new(),
+        clips: Default::default(),
         takes: Vec::new(),
         takes_expanded: false,
         freeze: freeze.clone(),

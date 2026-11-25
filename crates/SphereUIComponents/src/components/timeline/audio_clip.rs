@@ -503,6 +503,7 @@ pub(crate) fn paint_fade_curves(
 /// do) is only equivalent while the tempo is constant: under a tempo map the
 /// seconds axis and the beat axis are different axes, and the clip drifted off
 /// its own grid position by the difference.
+#[cfg(test)]
 pub(crate) fn audio_clip_timeline_geometry(clip: &ClipState, state: &TimelineState) -> (f32, f32) {
     // The shared clip geometry; see [`TimelineState::clip_lane_rect`].
     state.clip_lane_x_span(clip)
@@ -1160,7 +1161,7 @@ fn ara_notes_canvas(
     .inset_0()
 }
 
-pub fn audio_clip(
+pub(crate) fn audio_clip(
     clip: &ClipState,
     track_id: &str,
     track_color: gpui::Rgba,
@@ -1178,6 +1179,8 @@ pub fn audio_clip(
     >,
     on_cut_clip: Option<AudioClipCutCb>,
     erase_target: bool,
+    selected: bool,
+    (left, width): (f32, f32),
     fades: EffectiveFades,
     time: &ClipTimeAxis<'_>,
     ara: bool,
@@ -1191,12 +1194,7 @@ pub fn audio_clip(
     let drag_track_id = track_id.to_string();
     let drag_name = clip.name.clone();
     let drag_start_beat = clip.start_beat;
-    let selected = state
-        .display_selection()
-        .selected_clip_ids
-        .contains(&clip.id);
     let stretch_badge = stretch_badge(clip, state);
-    let (left, width) = audio_clip_timeline_geometry(clip, state);
     let has_crossfade = fades.any();
     // Detail by width. Below each threshold the thing being dropped is already
     // illegible, so this is what the clip *should* look like — and it is also

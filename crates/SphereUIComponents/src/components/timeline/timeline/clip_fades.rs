@@ -40,6 +40,7 @@ pub(super) struct ClipProcessEffect {
 /// A fade handle being dragged.
 #[derive(Debug, Clone)]
 struct FadeGesture {
+    track_id: String,
     clip_id: String,
     edge: FadeEdge,
     /// Window px between the press and the fade's end, so the end follows the
@@ -68,11 +69,52 @@ pub(super) struct ClipFadeUi {
     cancelled: bool,
     /// The audio clip under the pointer, whose fade handles the overlay shows.
     hover: Option<String>,
+    process_tracks: HashSet<String>,
     frame: FadeHandleCell,
     overlay: Option<gpui::Entity<FadeHandleOverlay>>,
 }
 
 impl Timeline {
+    pub(super) fn clip_lane_frame(
+        &self,
+    ) -> crate::components::timeline::track_lane_view::ClipLaneFrame {
+        use crate::components::timeline::timeline_state::ArrangementTempo;
+        use crate::components::timeline::track_lane_view::ClipLaneFrame;
+
+        let mut live_tracks: HashSet<String> = self
+            .clip_resize_origin
+            .iter()
+            .chain(
+                self.clip_move_origin
+                    .iter()
+                    .flat_map(|origin| &origin.clips),
+            )
+            .map(|snapshot| snapshot.track_id.clone())
+            .collect();
+        if let Some(drag) = &self.clip_fades.crossfade {
+            live_tracks.insert(drag.left.track_id.clone());
+            live_tracks.insert(drag.right.track_id.clone());
+        }
+        if let Some(drag) = &self.clip_fades.fade {
+            live_tracks.insert(drag.track_id.clone());
+        }
+        if self.clip_process_origin.is_some() {
+            live_tracks.extend(self.clip_fades.process_tracks.iter().cloned());
+        }
+        ClipLaneFrame {
+            tempo: ArrangementTempo::new(&self.state),
+            selected: self
+                .state
+                .display_selection()
+                .selected_clip_ids
+                .iter()
+                .cloned()
+                .collect(),
+            live_tracks,
+            live_tempo: self.tempo_drag.is_some(),
+        }
+    }
+
     /// The fade handle overlay, built on first render like the razor line's.
     pub(super) fn fade_handle_overlay(
         &mut self,
@@ -99,7 +141,11 @@ impl Timeline {
     /// dragged, drawn active over the clip's own squares, else of the hovered
     /// one — unless it is selected (it draws its own) or off the visible
     /// track area.
-    fn fade_handle_frame(&self, rows: &TrackRowLayout) -> Option<FadeHandleFrame> {
+    fn fade_handle_frame(
+        &self,
+        rows: &TrackRowLayout,
+        frame: &crate::components::timeline::track_lane_view::ClipLaneFrame,
+    ) -> Option<FadeHandleFrame> {
         if self.state.active_tool != TimelineTool::Pointer {
             return None;
         }
@@ -108,46 +154,49 @@ impl Timeline {
             (None, Some(hover)) => (hover.as_str(), false),
             (None, None) => return None,
         };
-        if !active
-            && self
-                .state
-                .display_selection()
-                .selected_clip_ids
-                .iter()
-                .any(|id| id == clip_id)
-        {
+        if !active && frame.selected.contains(clip_id) {
             return None;
         }
-        let index = self
-            .state
-            .tracks
-            .iter()
-            .position(|track| track.clips.iter().any(|clip| clip.id == clip_id))?;
-        let track = &self.state.tracks[index];
-        let clip = track.clips.iter().find(|clip| clip.id == clip_id)?;
+        let (first, end, _, _) = crate::components::timeline::track_resize::visible_track_row_range(
+            rows,
+            self.state.viewport.scroll_y,
+            self.state.viewport.viewport_height,
+            0,
+        );
+        let (row, track, slot) = rows.rows[first..end].iter().find_map(|row| {
+            if row.height <= 0.0 || row.y + row.height <= self.state.viewport.scroll_y {
+                return None;
+            }
+            let track = self
+                .state
+                .tracks
+                .get(row.index)
+                .filter(|track| track.id == row.track_id)?;
+            let slot = track.clips.index_of(clip_id)?;
+            Some((row, track, slot))
+        })?;
+        let clip = &track.clips[slot];
         if !matches!(clip.clip_type, ClipType::Audio { .. }) {
             return None;
         }
-        let row = rows.row_for_index(index)?;
-        if row.height <= 0.0 {
-            return None;
-        }
-        let crossfades = self.state.audio_crossfades(track);
-        let fades = self.state.effective_clip_fades(clip, &crossfades);
-        let rect = self.state.clip_lane_rect(clip, row.height);
-        let handles = clip_fade_handle_layout(
-            &self.state.clip_time_axis(clip),
-            &fades,
-            rect.left,
-            rect.width,
-            rect.height,
-            false,
-        );
+        let live_edit = frame.live_tempo || frame.live_tracks.contains(&track.id);
+        let crossfades = self
+            .state
+            .arrangement_crossfades(track, &frame.tempo, live_edit);
+        let axis = self
+            .state
+            .clip_time_axis_in(frame.tempo.lookup(&self.state), clip);
+        let fades = crossfades.effective_fades(&self.state, track, slot, &axis);
+        let (left, width) = self
+            .state
+            .clip_lane_x_span_with_end(clip, self.state.clip_end_in(clip, &frame.tempo));
+        let (top, height) = crate::components::timeline::timeline_state::clip_lane_band(row.height);
+        let handles = clip_fade_handle_layout(&axis, &fades, left, width, height, false);
         // The clip's inner box in window coordinates: the rows' transform.
         let lane_left = self.state.lane_origin_x();
         let track_top = self.state.timeline_origin_y() + self.state.arrangement_content_top();
-        let origin_x = lane_left + rect.left + CLIP_BORDER;
-        let origin_y = track_top + row.y - self.state.viewport.scroll_y + rect.top + CLIP_BORDER;
+        let origin_x = lane_left + left + CLIP_BORDER;
+        let origin_y = track_top + row.y - self.state.viewport.scroll_y + top + CLIP_BORDER;
         let lane_right = lane_left + self.state.viewport.viewport_width;
         let track_bottom = track_top + self.state.viewport.viewport_height;
         let mark = |rect: crate::components::timeline::audio_clip::FadeHandleRect| {
@@ -172,17 +221,24 @@ impl Timeline {
     /// Bring the overlay's frame in line with the arrangement, laid out in
     /// this frame's `rows`. Called by `render`, which the overlay renders
     /// with, so no notify is needed there.
-    pub(super) fn refresh_fade_handle_frame(&self, rows: &TrackRowLayout) {
-        self.clip_fades.frame.set(self.fade_handle_frame(rows));
+    pub(super) fn refresh_fade_handle_frame(
+        &self,
+        rows: &TrackRowLayout,
+        frame: &crate::components::timeline::track_lane_view::ClipLaneFrame,
+    ) {
+        self.clip_fades
+            .frame
+            .set(self.fade_handle_frame(rows, frame));
     }
 
     /// Re-resolve the overlay's frame outside a render (a hover) and repaint
     /// the overlay alone if it moved. Placed in the rows the last frame drew,
     /// which are the ones under the pointer.
     fn publish_fade_handle_frame(&self, cx: &mut gpui::App) {
+        let frame = self.clip_lane_frame();
         let next = match self.frame_lane_ctx.as_ref() {
-            Some(ctx) => self.fade_handle_frame(&ctx.row_layout),
-            None => self.fade_handle_frame(&self.state.track_row_layout()),
+            Some(ctx) => self.fade_handle_frame(&ctx.row_layout, &frame),
+            None => self.fade_handle_frame(&self.state.track_row_layout(), &frame),
         };
         if self.clip_fades.frame.get() == next {
             return;
@@ -249,17 +305,26 @@ impl Timeline {
             .as_ref()
             .is_none_or(|origin| origin.id != clip_id)
         {
-            self.clip_process_origin = self.state.find_clip(clip_id).map(|(_, clip)| clip.clone());
-            self.clip_process_peers = self
-                .clip_drag_selection_ids(clip_id)
-                .into_iter()
-                .filter(|id| id != clip_id)
-                .filter_map(|id| {
-                    let (track, clip) = self.state.find_clip(&id)?;
-                    (track.ara.is_none() && matches!(clip.clip_type, ClipType::Audio { .. }))
-                        .then(|| clip.clone())
-                })
-                .collect();
+            let selected = &self.state.selection.selected_clip_ids;
+            let ids: Vec<_> = if selected.iter().any(|id| id == clip_id) {
+                selected.iter().map(String::as_str).collect()
+            } else {
+                vec![clip_id]
+            };
+            self.clip_fades.process_tracks.clear();
+            self.clip_process_peers.clear();
+            self.clip_process_origin = None;
+            for location in self.state.locate_clips(&ids).into_iter().flatten() {
+                let track = &self.state.tracks[location.track];
+                let clip = &track.clips[location.index];
+                if clip.id == clip_id {
+                    self.clip_fades.process_tracks.insert(track.id.clone());
+                    self.clip_process_origin = Some(clip.clone());
+                } else if track.ara.is_none() && matches!(clip.clip_type, ClipType::Audio { .. }) {
+                    self.clip_fades.process_tracks.insert(track.id.clone());
+                    self.clip_process_peers.push(clip.clone());
+                }
+            }
         }
     }
 
@@ -452,8 +517,10 @@ impl Timeline {
                 let Some(fade_x) = self.fade_end_window_x(clip_id, edge) else {
                     return effect;
                 };
+                let track_id = track.id.clone();
                 self.capture_clip_process_origin(clip_id);
                 self.clip_fades.fade = Some(FadeGesture {
+                    track_id,
                     clip_id: clip_id.to_string(),
                     edge,
                     grab_dx: window_x - fade_x,
@@ -884,7 +951,7 @@ mod tests {
             .iter_mut()
             .find(|track| track.id == track_id)
             .expect("track")
-            .clips = clips;
+            .clips = clips.into();
         timeline.state.reconcile_audio_clip_lengths();
         timeline.state.viewport.pixels_per_second = 100.0;
         timeline.state.sync_pixels_per_beat();

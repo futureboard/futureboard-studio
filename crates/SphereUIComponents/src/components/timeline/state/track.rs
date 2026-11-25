@@ -286,7 +286,7 @@ pub struct TrackState {
     /// Latched clip indicator — set when the engine peak reached/exceeded
     /// 0 dBFS, auto-cleared once the held peak falls back. UI-only.
     pub meter_clip: bool,
-    pub clips: Vec<ClipState>,
+    pub clips: TrackClips,
     pub automation_lanes: Vec<AutomationLaneState>,
     /// Per-track edit mode (Clip vs Automation). View state, saved in the
     /// project's view section (v54).
@@ -580,7 +580,7 @@ impl TimelineState {
             meter_peak_hold_l: 0.0,
             meter_peak_hold_r: 0.0,
             meter_clip: false,
-            clips: Vec::new(),
+            clips: Default::default(),
             automation_lanes: Vec::new(),
             lane_mode: TrackLaneMode::Clips,
             selected_automation_target: None,

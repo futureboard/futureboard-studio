@@ -1,4 +1,5 @@
 use super::*;
+use crate::components::BottomTab;
 
 impl Render for StudioLayout {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1681,6 +1682,12 @@ impl Render for StudioLayout {
             } else {
                 None
             })
+            // The editor measures the waveform lanes. Hosting the playhead
+            // here keeps its ticks out of the dock's cached view path.
+            .children(
+                (show_bottom_docked && self.active_bottom_tab() != BottomTab::Mixer)
+                    .then(|| self.audio_editor.read(cx).playhead_overlay()),
+            )
             // The docked mixer's meters, painted over the bottom panel from
             // outside it so a meter tick never rebuilds the panel.
             .children(

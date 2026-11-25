@@ -106,19 +106,24 @@ impl ClipSnapshot {
     pub fn capture(state: &TimelineState, clip_id: &str) -> Option<Self> {
         for track in &state.tracks {
             if let Some(index) = track.clips.iter().position(|c| c.id == clip_id) {
-                return Some(Self {
-                    track_id: track.id.clone(),
-                    clip: track.clips[index].clone(),
-                    index,
-                    take: track
-                        .takes
-                        .iter()
-                        .find(|take| take.clip_id == clip_id)
-                        .cloned(),
-                });
+                return Some(Self::at(track, index));
             }
         }
         None
+    }
+
+    pub(crate) fn at(track: &TrackState, index: usize) -> Self {
+        let clip = &track.clips[index];
+        Self {
+            track_id: track.id.clone(),
+            clip: clip.clone(),
+            index,
+            take: track
+                .takes
+                .iter()
+                .find(|take| take.clip_id == clip.id)
+                .cloned(),
+        }
     }
 }
 

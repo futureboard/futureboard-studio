@@ -25,7 +25,7 @@ const MIDI_LABEL_MIN_W: f32 = 40.0;
 /// handles would cover the body they sit on.
 const MIDI_RESIZE_HANDLE_MIN_W: f32 = 20.0;
 
-pub fn midi_clip(
+pub(crate) fn midi_clip(
     clip: &ClipState,
     track_id: &str,
     track_color: gpui::Rgba,
@@ -42,20 +42,16 @@ pub fn midi_clip(
         std::sync::Arc<dyn Fn(&String, &mut gpui::Window, &mut gpui::App) + 'static>,
     >,
     erase_target: bool,
+    selected: bool,
+    (left, width): (f32, f32),
 ) -> impl IntoElement {
     let clip_id = clip.id.clone();
     let drag_clip_id = clip.id.clone();
     let drag_track_id = track_id.to_string();
     let drag_name = clip.name.clone();
     let drag_start_beat = clip.start_beat;
-    let selected = state
-        .display_selection()
-        .selected_clip_ids
-        .contains(&clip.id);
     // The shared clip rectangle, the one the marquee hit-tests against.
-    let lane_rect = state.clip_lane_rect(clip, row_height);
-    let left = lane_rect.left;
-    let width = lane_rect.width;
+    let (pad, clip_h) = super::timeline_state::clip_lane_band(row_height);
 
     // Detail by width, for the same reason as an audio clip: the label bar is a
     // measured text node per clip, and a zoomed-out arrangement has the most
@@ -64,8 +60,6 @@ pub fn midi_clip(
     let show_resize_handles = width >= MIDI_RESIZE_HANDLE_MIN_W;
     let label_h = if show_label { LABEL_H } else { 0.0 };
 
-    let pad = lane_rect.top;
-    let clip_h = lane_rect.height;
     let note_h = clip_h - label_h; // height for notes preview
 
     // Draw notes and controller previews with canvases instead of one GPUI element

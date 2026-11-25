@@ -157,7 +157,9 @@ impl StudioLayout {
     /// On a transport tick: move the editor's playhead line and end a
     /// play-selection audition once it reaches its end.
     pub(super) fn tick_audio_editor(&mut self, playing: bool, cx: &mut Context<Self>) {
-        crate::components::AudioEditorHost::publish_playhead(&self.audio_editor, cx);
+        if self.bottom_panel_docked() && self.active_bottom_tab() != BottomTab::Mixer {
+            crate::components::AudioEditorHost::publish_playhead(&self.audio_editor, cx);
+        }
         let Some(end) = self.audio_editor_audition_end else {
             return;
         };

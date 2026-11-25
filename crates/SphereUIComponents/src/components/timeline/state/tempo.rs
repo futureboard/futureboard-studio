@@ -551,7 +551,13 @@ impl TimelineState {
     /// clip per frame, which is what made a project's frame cost scale with
     /// its tempo-marker count.
     pub fn resolved_tempo_map(&self) -> std::sync::Arc<DirectAudio::TempoMap> {
-        let key = self.tempo_cache_key();
+        self.resolved_tempo_map_for_key(self.tempo_cache_key())
+    }
+
+    pub(crate) fn resolved_tempo_map_for_key(
+        &self,
+        key: u64,
+    ) -> std::sync::Arc<DirectAudio::TempoMap> {
         let build = || {
             TEMPO_MAPS_BUILT.with(|built| built.set(built.get().saturating_add(1)));
             std::sync::Arc::new(self.tempo_map.to_engine_map(self.bpm.max(1.0) as f64))

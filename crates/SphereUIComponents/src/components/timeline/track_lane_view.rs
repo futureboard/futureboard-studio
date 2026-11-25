@@ -24,7 +24,9 @@ use gpui::{div, px, Context, Entity, IntoElement, Render, Styled, WeakEntity, Wi
 use crate::components::timeline::audio_clip::{
     AudioClipCutCb, AudioClipProcessCommitCb, AudioClipProcessPreviewCb,
 };
-use crate::components::timeline::timeline_state::{TimelineGestureContext, TrackRowLayout};
+use crate::components::timeline::timeline_state::{
+    ArrangementTempo, TimelineGestureContext, TrackRowLayout,
+};
 use crate::components::timeline::Timeline;
 
 /// Lane views keyed by track id. Built and pruned by `Timeline::render`
@@ -36,7 +38,15 @@ pub type TrackLaneViews = std::collections::HashMap<String, Entity<TrackLaneView
 /// Every field is something that render already produced for the inline path;
 /// publishing them costs one `Rc` and a handful of `Arc` clones, and lets a
 /// dirty lane rebuild itself without re-deriving the frame.
+pub(crate) struct ClipLaneFrame {
+    pub tempo: ArrangementTempo,
+    pub selected: std::collections::HashSet<String>,
+    pub live_tracks: std::collections::HashSet<String>,
+    pub live_tempo: bool,
+}
+
 pub struct LaneFrameContext {
+    pub(crate) clips: ClipLaneFrame,
     /// Built once with the frame; each lane resolves its track without an
     /// O(total_tracks) id scan. Entity ids survive track reordering.
     pub track_indices: std::collections::HashMap<gpui::EntityId, usize>,

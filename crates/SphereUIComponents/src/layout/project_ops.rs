@@ -1778,8 +1778,7 @@ impl StudioLayout {
     }
 
     pub(super) fn project_snapshot(&mut self, cx: &mut Context<Self>) -> FutureboardProject {
-        let tl_state = self.timeline.read(cx).state.clone();
-        let mut project = FutureboardProject::from(&tl_state);
+        let mut project = FutureboardProject::from(&self.timeline.read(cx).state);
         project.id = self.project_session.id.clone();
         project.name = self.project_session.name.clone();
         project.created_at = self.project_session.created_at;

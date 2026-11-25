@@ -2244,6 +2244,11 @@ impl gpui::Render for AudioClipsPreview {
                         None,
                         None,
                         false,
+                        state
+                            .display_selection()
+                            .selected_clip_ids
+                            .contains(&clip.id),
+                        state.clip_lane_x_span(clip),
                         state.effective_clip_fades(clip, &crossfades),
                         &state.clip_time_axis(clip),
                         false,

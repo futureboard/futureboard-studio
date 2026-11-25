@@ -555,6 +555,16 @@ impl TimelineState {
             map: (!self.tempo_map.points.is_empty()).then(|| self.resolved_tempo_map()),
         }
     }
+
+    pub(crate) fn tempo_lookup_in(
+        &self,
+        map: &std::sync::Arc<DirectAudio::TempoMap>,
+    ) -> TempoLookup<'_> {
+        TempoLookup {
+            state: self,
+            map: (!self.tempo_map.points.is_empty()).then(|| map.clone()),
+        }
+    }
 }
 
 /// [`TimelineState::seconds_at_beat`] and [`TimelineState::beat_at_seconds`]

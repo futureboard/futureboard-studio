@@ -563,13 +563,17 @@ impl TimelineState {
     /// and by the drawing, so a clip is never grabbable at one length and
     /// painted at another.
     pub fn audio_clip_end_beat(&self, clip: &ClipState) -> Option<f64> {
+        self.audio_clip_end_beat_in(clip, &self.resolved_tempo_map())
+    }
+
+    pub(crate) fn audio_clip_end_beat_in(
+        &self,
+        clip: &ClipState,
+        tempo: &DirectAudio::TempoMap,
+    ) -> Option<f64> {
         let project_bpm = self.bpm.max(1.0) as f64;
         let seconds = clip.stretch.played_seconds_for_project_bpm(project_bpm)?;
-        // The cached map: this runs once per audio clip per frame, and
-        // rebuilding it here made the arrangement's frame cost scale with the
-        // project's tempo-marker count.
-        let tempo = self.resolved_tempo_map();
-        let beats = audio_clip_beats_for_seconds(clip, seconds, &tempo, project_bpm);
+        let beats = audio_clip_beats_for_seconds(clip, seconds, tempo, project_bpm);
         Some(clip.start_beat as f64 + beats.max(MIN_AUDIO_CLIP_BEATS as f64))
     }
 
@@ -823,9 +827,10 @@ impl TimelineState {
     pub fn set_clip_gain(&mut self, clip_id: &str, gain: f32) -> bool {
         let gain = gain.clamp(0.0, 4.0);
         for track in &mut self.tracks {
-            if let Some(clip) = track.clips.iter_mut().find(|clip| clip.id == clip_id) {
+            if let Some(index) = track.clips.iter().position(|clip| clip.id == clip_id) {
+                let clip = &track.clips[index];
                 if (clip.gain - gain).abs() > 0.0001 {
-                    clip.gain = gain;
+                    track.clips[index].gain = gain;
                     return true;
                 }
                 return false;
@@ -909,9 +914,10 @@ impl TimelineState {
         let mut stretch = stretch;
         stretch.sanitize_in_place();
         for track in &mut self.tracks {
-            if let Some(clip) = track.clips.iter_mut().find(|clip| clip.id == clip_id) {
+            if let Some(index) = track.clips.iter().position(|clip| clip.id == clip_id) {
+                let clip = &track.clips[index];
                 if clip.stretch != stretch {
-                    clip.stretch = stretch;
+                    track.clips[index].stretch = stretch;
                     return true;
                 }
                 return false;
