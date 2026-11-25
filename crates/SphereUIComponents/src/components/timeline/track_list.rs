@@ -133,10 +133,7 @@ pub(crate) fn track_list(
     let active_tool = state.active_tool;
     let tail_marquee = on_range_start.clone();
     let tail_anchor_track_id = row_layout
-        .rows
-        .iter()
-        .rev()
-        .find(|row| row.height > 0.0)
+        .last_visible_track_row()
         .map(|row| row.track_id.clone());
     let (visible_start, visible_end, top_spacer_h, bottom_spacer_h) =
         visible_track_row_range(row_layout, scroll_y, viewport_height, OVERSCAN);

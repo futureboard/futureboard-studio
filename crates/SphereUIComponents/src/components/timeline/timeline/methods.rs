@@ -3937,22 +3937,14 @@ impl Timeline {
     }
 
     pub(super) fn scroll_geometry(&self, window: &Window) -> (f32, f32, (f32, f32)) {
-        self.scroll_geometry_with_content_height(
-            window,
-            self.state.total_track_rows_height(),
-            self.timeline_content_width(),
-        )
+        self.scroll_geometry_with_row_layout(window, &self.state.track_row_layout())
     }
 
-    /// Scroll geometry against an already-known arrangement content height.
-    ///
-    /// The repaint path passes the height from the frame's shared row layout so
-    /// the O(track_count) layout build does not run a second time per frame.
-    pub(super) fn scroll_geometry_with_content_height(
+    /// Use the frame's shared row layout to avoid rebuilding it during repaint.
+    pub(super) fn scroll_geometry_with_row_layout(
         &self,
         window: &Window,
-        content_h: f32,
-        content_w: f32,
+        row_layout: &crate::components::timeline::timeline_state::TrackRowLayout,
     ) -> (f32, f32, (f32, f32)) {
         let window_size = window.bounds().size;
         let window_w: f32 = window_size.width.into();
@@ -3988,7 +3980,7 @@ impl Timeline {
                 m.bottom_panel_height,
                 m.status_bar_height,
                 content_w,
-                content_h
+                row_layout.total_height
             );
         }
 
@@ -3997,7 +3989,7 @@ impl Timeline {
             track_view_h,
             (
                 (content_w - track_view_w).max(0.0),
-                (content_h - track_view_h).max(0.0),
+                row_layout.max_scroll_y(track_view_h),
             ),
         )
     }
