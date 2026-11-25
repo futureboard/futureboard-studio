@@ -20,6 +20,24 @@ pub struct MixerCallbacks {
         std::sync::Arc<dyn Fn(&(String, f32), &mut Window, &mut App) + 'static>,
     pub on_volume_drag_commit: std::sync::Arc<dyn Fn(&String, &mut Window, &mut App) + 'static>,
     pub on_pan_change: std::sync::Arc<dyn Fn(&(String, f32), &mut Window, &mut App) + 'static>,
+    /// Move one Dual pan position `(track_id, side, position)` on a channel in
+    /// Dual pan. Consecutive values of one drag fold into one undo step.
+    pub on_dual_pan_change: std::sync::Arc<
+        dyn Fn(
+                &(
+                    String,
+                    crate::components::timeline::timeline_state::DualPanSide,
+                    f32,
+                ),
+                &mut Window,
+                &mut App,
+            ) + 'static,
+    >,
+    /// Right-click on a strip's pan: open the pan mode menu (Balance / Dual
+    /// Pan) at `(x, y)`. `(track_id, x, y)`. `None` leaves the right-click to
+    /// the strip's own menu.
+    pub on_pan_mode_menu:
+        Option<std::sync::Arc<dyn Fn(&(String, f32, f32), &mut Window, &mut App) + 'static>>,
     /// Move a channel in the spatial mix's square room `(track_id, params)`.
     /// Consecutive moves of one drag fold into one undo step.
     pub on_spatial_change: std::sync::Arc<
@@ -30,6 +48,10 @@ pub struct MixerCallbacks {
     /// and which speakers the panner shows. Carried here because every mixer
     /// surface already receives this bundle.
     pub spatial_format: solfege_spatialaudio::SpatialFormat,
+    /// The channels placed in the room as the mix plays here — the rule the
+    /// engine places by. A strip not in it (a channel sent to an ordinary
+    /// bus) keeps its pan knob, which is what it is heard with.
+    pub spatial_placed: std::sync::Arc<std::collections::HashSet<String>>,
     pub on_toggle_mute: std::sync::Arc<dyn Fn(&String, &mut Window, &mut App) + 'static>,
     pub on_toggle_solo: std::sync::Arc<dyn Fn(&String, &mut Window, &mut App) + 'static>,
     pub on_toggle_arm: std::sync::Arc<dyn Fn(&String, &mut Window, &mut App) + 'static>,
@@ -140,6 +162,15 @@ pub struct MixerCallbacks {
     /// Set the send gain `(track_id, send_id, gain_db)`.
     pub on_send_gain_change:
         std::sync::Arc<dyn Fn(&(String, String, f32), &mut Window, &mut App) + 'static>,
+    /// Move a VCA's fader `(group_id, level)` (normalized, like a channel's).
+    pub on_vca_level: std::sync::Arc<dyn Fn(&(String, f32), &mut Window, &mut App) + 'static>,
+    /// Mute or unmute a VCA.
+    pub on_toggle_vca_mute: std::sync::Arc<dyn Fn(&String, &mut Window, &mut App) + 'static>,
+    /// Delete a VCA; its channels keep their own faders.
+    pub on_delete_vca: std::sync::Arc<dyn Fn(&String, &mut Window, &mut App) + 'static>,
+    /// Tap a send before or after the fader `(track_id, send_id, pre_fader)`.
+    pub on_set_send_pre_fader:
+        std::sync::Arc<dyn Fn(&(String, String, bool), &mut Window, &mut App) + 'static>,
     /// Drag-reorder commit for a send slot. `(track_id, dragged_send_id,
     /// anchor)`, the anchor naming the send it lands next to; the layout
     /// resolves it against the live send order.
@@ -186,10 +217,21 @@ pub fn noop_mixer_callbacks() -> MixerCallbacks {
         on_volume_drag_preview: noop_vol,
         on_volume_drag_commit: noop_vol_commit,
         on_pan_change: noop_pan,
+        on_dual_pan_change: Arc::new(
+            |_: &(
+                String,
+                crate::components::timeline::timeline_state::DualPanSide,
+                f32,
+            ),
+             _: &mut Window,
+             _: &mut App| {},
+        ),
+        on_pan_mode_menu: None,
         on_spatial_change: Arc::new(
             |_: &(String, solfege_spatialaudio::SourceParams), _: &mut Window, _: &mut App| {},
         ),
         spatial_format: solfege_spatialaudio::SpatialFormat::Stereo,
+        spatial_placed: Default::default(),
         on_toggle_mute: noop_track.clone(),
         on_toggle_solo: noop_track.clone(),
         on_toggle_arm: noop_track.clone(),
@@ -237,6 +279,12 @@ pub fn noop_mixer_callbacks() -> MixerCallbacks {
         on_open_output_picker: Arc::new(|_: &(String, f32, f32), _: &mut Window, _: &mut App| {}),
         on_remove_send: noop_insert_pair,
         on_send_gain_change: noop_send_gain,
+        on_set_send_pre_fader: Arc::new(
+            |_: &(String, String, bool), _: &mut Window, _: &mut App| {},
+        ),
+        on_vca_level: Arc::new(|_: &(String, f32), _: &mut Window, _: &mut App| {}),
+        on_toggle_vca_mute: Arc::new(|_: &String, _: &mut Window, _: &mut App| {}),
+        on_delete_vca: Arc::new(|_: &String, _: &mut Window, _: &mut App| {}),
         on_reorder_send: noop_send_reorder,
         on_clear_solos: None,
         on_add_track: None,

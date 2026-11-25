@@ -11,8 +11,6 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::platform::Edition;
-
 /// Directory names created inside every staged application.
 pub const PLUGINS_DIR: &str = "Plugins";
 pub const RESOURCES_DIR: &str = "Resources";
@@ -39,38 +37,26 @@ pub struct StagingPlan {
     pub final_dir: PathBuf,
 }
 
-/// Compute the final `out/` directory for this build.
-///
-/// * `dev` profile → `out/dev/<platform>` (edition omitted, matching the spec's
-///   development layout).
-/// * any other profile → `out/<profile>/<edition>/<platform>` (so `release`
-///   yields `out/release/community/windows-x64`).
-pub fn final_output_dir(
-    out_root: &Path,
-    profile: &str,
-    edition: Edition,
-    platform: &str,
-) -> PathBuf {
-    if profile == "dev" {
-        out_root.join("dev").join(platform)
-    } else {
-        out_root.join(profile).join(edition.as_str()).join(platform)
-    }
+/// Compute the final `out/` directory for this build: `out/<profile>/<platform>`,
+/// so `release` yields `out/release/windows-x64` and `dev` `out/dev/windows-x64`.
+/// There is one package, so nothing else qualifies the path.
+pub fn final_output_dir(out_root: &Path, profile: &str, platform: &str) -> PathBuf {
+    out_root.join(profile).join(platform)
 }
 
-/// Compute the temporary staging directory for this build. Always edition- and
-/// profile-qualified so concurrent/adjacent packages never collide.
-pub fn staging_dir(out_root: &Path, profile: &str, edition: Edition, platform: &str) -> PathBuf {
+/// Compute the temporary staging directory for this build. Always
+/// profile-qualified so adjacent packages never collide.
+pub fn staging_dir(out_root: &Path, profile: &str, platform: &str) -> PathBuf {
     out_root
         .join(".staging")
-        .join(format!("{platform}-{}-{profile}", edition.as_str()))
+        .join(format!("{platform}-{profile}"))
 }
 
 impl StagingPlan {
-    pub fn new(out_root: &Path, profile: &str, edition: Edition, platform: &str) -> Self {
+    pub fn new(out_root: &Path, profile: &str, platform: &str) -> Self {
         StagingPlan {
-            staging_dir: staging_dir(out_root, profile, edition, platform),
-            final_dir: final_output_dir(out_root, profile, edition, platform),
+            staging_dir: staging_dir(out_root, profile, platform),
+            final_dir: final_output_dir(out_root, profile, platform),
         }
     }
 
@@ -345,28 +331,17 @@ pub fn safe_join(root: &Path, relative: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::Edition;
 
     #[test]
-    fn dev_output_path_omits_edition() {
-        let out = Path::new("out");
-        let path = final_output_dir(out, "dev", Edition::Community, "windows-x64");
-        assert_eq!(path, Path::new("out/dev/windows-x64"));
-        // Edition does not change the dev path.
-        let path_ex = final_output_dir(out, "dev", Edition::Professional, "windows-x64");
-        assert_eq!(path_ex, path);
-    }
-
-    #[test]
-    fn release_output_path_splits_by_edition() {
+    fn output_path_is_profile_then_platform() {
         let out = Path::new("out");
         assert_eq!(
-            final_output_dir(out, "release", Edition::Community, "windows-x64"),
-            Path::new("out/release/community/windows-x64")
+            final_output_dir(out, "dev", "windows-x64"),
+            Path::new("out/dev/windows-x64")
         );
         assert_eq!(
-            final_output_dir(out, "release", Edition::Professional, "windows-x64"),
-            Path::new("out/release/professional/windows-x64")
+            final_output_dir(out, "release", "windows-x64"),
+            Path::new("out/release/windows-x64")
         );
     }
 
@@ -374,8 +349,8 @@ mod tests {
     fn staging_path_is_fully_qualified() {
         let out = Path::new("out");
         assert_eq!(
-            staging_dir(out, "release", Edition::Professional, "windows-x64"),
-            Path::new("out/.staging/windows-x64-professional-release")
+            staging_dir(out, "release", "windows-x64"),
+            Path::new("out/.staging/windows-x64-release")
         );
     }
 
@@ -484,8 +459,8 @@ mod tests {
     fn publish_replaces_previous_package() {
         let temp = tempfile::tempdir().unwrap();
         let out = temp.path();
-        let final_dir = out.join("release/community/windows-x64");
-        let staging = out.join(".staging/windows-x64-community-release");
+        let final_dir = out.join("release/windows-x64");
+        let staging = out.join(".staging/windows-x64-release");
 
         // Existing (stale) package.
         fs::create_dir_all(&final_dir).unwrap();
@@ -512,7 +487,7 @@ mod tests {
     #[test]
     fn prepare_removes_stale_staging_contents() {
         let temp = tempfile::tempdir().unwrap();
-        let plan = StagingPlan::new(temp.path(), "release", Edition::Community, "windows-x64");
+        let plan = StagingPlan::new(temp.path(), "release", "windows-x64");
 
         fs::create_dir_all(&plan.staging_dir).unwrap();
         fs::write(plan.staging_dir.join("junk.txt"), "junk").unwrap();

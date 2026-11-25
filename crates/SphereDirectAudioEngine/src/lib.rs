@@ -122,7 +122,7 @@ pub use crate::plugin_backend::PluginModuleFormat;
 /// Shared automation curve shaping — the UI lane renderer calls this so the drawn
 /// curve matches realtime playback and offline export exactly.
 pub use crate::runtime::automation_curve_factor;
-pub use crate::visualizer_tap::{visualizer_tap, TapRead, VisualizerTap};
+pub use crate::visualizer_tap::{track_tap, visualizer_tap, TapRead, VisualizerTap};
 // ARA renderers are built by the app (which owns the ARA document) and installed
 // with `AudioEngine::set_ara_renderers`, so the type has to be nameable outside
 // this crate.

@@ -225,6 +225,13 @@ impl AsioDuplexHandle {
         self.device.asio_open_control_panel()
     }
 
+    /// The driver, for opening its control panel without holding the engine's
+    /// stream lock: a driver whose panel is modal keeps the call until it
+    /// closes, and the meter poll must not wait behind it.
+    pub fn driver_device(&self) -> AsioDevice {
+        self.device.clone()
+    }
+
     /// Re-query driver latencies (e.g. after a `LatenciesChanged` message).
     pub fn refresh_latencies(&self) -> Option<(u32, u32)> {
         self.device
@@ -265,16 +272,28 @@ impl AsioDuplexHandle {
 /// Snap a requested buffer size into the driver's constraints: clamp to
 /// `[min, max]`, then honour granularity (`-1` = powers of two, `> 0` = steps
 /// from `min`). `None` picks the driver-preferred size.
+///
+/// Never above [`MAX_BRIDGE_BLOCK_FRAMES`](crate::plugin_bridge::MAX_BRIDGE_BLOCK_FRAMES)
+/// when the driver allows a size at or below it: a bridged plug-in is handed
+/// at most that many frames a block, and the rest of a longer block played
+/// dry. Every built-in runs bridged, so a 4096-frame ASIO buffer (or a driver
+/// preferring one) silently took every built-in effect out of the mix. The
+/// other backends are held to the same ceiling.
 pub(crate) fn snap_buffer_size(
     requested: Option<u32>,
     info: &cpal::platform::AsioBufferSizeInfo,
 ) -> u32 {
-    let preferred = info.preferred.max(1);
-    let Some(requested) = requested.filter(|&frames| frames > 0) else {
-        return preferred;
-    };
     let min = info.min.max(1);
-    let max = info.max.max(min);
+    let ceiling = (crate::plugin_bridge::MAX_BRIDGE_BLOCK_FRAMES as u32).max(min);
+    let preferred = info.preferred.max(1);
+    let requested = match requested.filter(|&frames| frames > 0) {
+        Some(requested) => requested,
+        None if preferred <= ceiling || info.granularity == 0 => return preferred,
+        // The driver's own choice is too long to bridge: the longest it
+        // allows that is not.
+        None => ceiling,
+    };
+    let max = info.max.max(min).min(ceiling);
     let clamped = requested.clamp(min, max);
     match info.granularity {
         0 => preferred,
@@ -297,7 +316,13 @@ pub(crate) fn snap_buffer_size(
             let step = granularity as u32;
             let offset = clamped.saturating_sub(min);
             let snapped = min + (offset + step / 2) / step * step;
-            snapped.clamp(min, max)
+            if snapped > max {
+                // The last step at or below the ceiling, not the ceiling
+                // itself, which may fall between two steps.
+                min + (max - min) / step * step
+            } else {
+                snapped.max(min)
+            }
         }
         _ => clamped,
     }
@@ -1187,6 +1212,24 @@ mod tests {
         // min=48, step=16 → valid sizes 48, 64, 80, ...
         assert_eq!(snap_buffer_size(Some(70), &info(48, 1024, 128, 16)), 64);
         assert_eq!(snap_buffer_size(Some(73), &info(48, 1024, 128, 16)), 80);
+    }
+
+    /// A bridged plug-in takes at most `MAX_BRIDGE_BLOCK_FRAMES` a block, so
+    /// a longer buffer is only chosen when the driver allows nothing shorter.
+    #[test]
+    fn never_longer_than_a_bridged_plugin_can_take() {
+        let most = crate::plugin_bridge::MAX_BRIDGE_BLOCK_FRAMES as u32;
+        assert_eq!(snap_buffer_size(Some(4096), &info(64, 8192, 512, -1)), most);
+        assert_eq!(snap_buffer_size(None, &info(64, 8192, 4096, -1)), most);
+        // Linear steps: the last step under the ceiling (48 + 125 × 16).
+        assert_eq!(snap_buffer_size(Some(4000), &info(48, 8192, 128, 16)), 2048);
+        assert_eq!(snap_buffer_size(Some(4000), &info(40, 8192, 128, 24)), 2032);
+        // Nothing shorter on offer: the driver's own sizes stand.
+        assert_eq!(
+            snap_buffer_size(Some(1024), &info(4096, 8192, 4096, -1)),
+            4096
+        );
+        assert_eq!(snap_buffer_size(None, &info(4096, 4096, 4096, 0)), 4096);
     }
 
     #[test]

@@ -153,18 +153,17 @@ impl VideoDecoder {
         }
         let backend = match hardware::HardwareDecoder::open(&path) {
             Ok(decoder) => Backend::Hardware(decoder),
-            Err(gpu_err) => match software::SoftwareDecoder::open(&path) {
-                Ok(decoder) => Backend::Software(decoder),
+            Err(gpu_err) => {
+                // Logged whether or not software takes the file: "why is this
+                // clip not on the GPU" is the first question when it is slow.
+                eprintln!(
+                    "[video-mkff] GPU path declined {}: {gpu_err}",
+                    path.display()
+                );
                 // The software path covers every container, so its error is
-                // the one that explains the file; the GPU reason goes to logs.
-                Err(sw_err) => {
-                    eprintln!(
-                        "[video-mkff] GPU path declined {}: {gpu_err}",
-                        path.display()
-                    );
-                    return Err(sw_err);
-                }
-            },
+                // the one that explains the file.
+                Backend::Software(software::SoftwareDecoder::open(&path)?)
+            }
         };
         Ok(Self { path, backend })
     }

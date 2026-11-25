@@ -57,6 +57,15 @@ impl CanvasView {
         }
     }
 
+    /// The full name, where the view switch has the room for it.
+    pub const fn long_label(self) -> &'static str {
+        match self {
+            Self::Waveform => "Waveform",
+            Self::Spectrogram => "Spectrogram",
+            Self::Overlay => "Both",
+        }
+    }
+
     pub const fn shows_waveform(self) -> bool {
         matches!(self, Self::Waveform | Self::Overlay)
     }
@@ -597,15 +606,20 @@ fn paint_waveform(
     }
     let columns = peaks.columns(transform);
     let center = plane_h * 0.5;
-    // Over the spectrogram the waveform is a reference layer, not the subject,
-    // so it drops to a weight that keeps spectral detail readable.
-    let alpha = if canvas.view == CanvasView::Overlay {
-        0.5
+    // Over the spectrogram the waveform is a reference layer, not the subject:
+    // its outline stays and its body all but goes, because a filled body over
+    // the spectrogram's colours turns both into grey.
+    let (body, edge) = if canvas.view == CanvasView::Overlay {
+        (
+            Colors::with_alpha(Colors::accent_primary(), 0.06),
+            Colors::with_alpha(Colors::accent_primary(), 0.75),
+        )
     } else {
-        0.9
+        (
+            Colors::with_alpha(Colors::accent_primary(), 0.40),
+            Colors::with_alpha(Colors::accent_primary(), 0.9),
+        )
     };
-    let body = Colors::with_alpha(Colors::accent_primary(), alpha * 0.45);
-    let edge = Colors::with_alpha(Colors::accent_primary(), alpha);
     quad(
         window,
         origin,
@@ -826,7 +840,7 @@ fn paint_diff(
             base_y - before_h,
             1.0,
             before_h,
-            Colors::with_alpha(Colors::text_muted(), 0.45 * dim),
+            Colors::with_alpha(Colors::text_muted(), 0.28 * dim),
         );
         // What the processor removes is the readable part of a before/after
         // comparison, so the difference gets the strong colour, not the result.
@@ -894,14 +908,16 @@ fn frequency_ruler(canvas: &ProcessingCanvas) -> impl IntoElement {
         .top_0()
         .w(px(FREQ_GUTTER))
         .h(px(transform.height))
-        .bg(Colors::with_alpha(Colors::surface_canvas(), 0.55))
+        .bg(Colors::with_alpha(Colors::surface_canvas(), 0.30))
+        .border_r(px(1.0))
+        .border_color(Colors::border_subtle())
         .children(entries.into_iter().map(|(y, label)| {
             div()
                 .absolute()
                 .left(px(space::TIGHT))
                 .top(px((y - 6.0).clamp(0.0, (transform.height - 12.0).max(0.0))))
                 .text_size(px(typography::DENSE_CAPTION))
-                .text_color(Colors::text_faint())
+                .text_color(Colors::text_muted())
                 .child(label)
         }))
 }

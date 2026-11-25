@@ -65,6 +65,7 @@ pub fn knob(
         false,
         label,
         min,
+        KnobGesture::default(),
         on_change,
     )
 }
@@ -93,6 +94,7 @@ pub fn knob_with_default(
         false,
         None,
         default_value,
+        KnobGesture::default(),
         on_change,
     )
 }
@@ -121,7 +123,52 @@ pub fn knob_bipolar(
         true,
         label,
         default_value,
+        KnobGesture::default(),
         on_change,
+    )
+}
+
+/// A drag's start and end, for a control whose owner records one undo step
+/// per gesture rather than one per value: the start runs when the drag
+/// begins, the end on release.
+#[derive(Clone, Default)]
+pub struct KnobGesture {
+    pub on_start: Option<std::rc::Rc<dyn Fn(&mut Window, &mut App)>>,
+    pub on_end: Option<std::rc::Rc<dyn Fn(&mut Window, &mut App)>>,
+}
+
+/// [`knob_bipolar`] that also reports the drag's start and end, so the owner
+/// can preview each value and commit once. `on_change` receives the previews;
+/// the reset gesture (double-click, Alt-click) goes to `on_reset`, which is
+/// a discrete change of its own.
+#[allow(clippy::too_many_arguments)]
+pub fn knob_bipolar_with_gesture(
+    id: impl Into<gpui::SharedString>,
+    value: f32,
+    min: f32,
+    max: f32,
+    size: f32,
+    accent: gpui::Rgba,
+    default_value: f32,
+    gesture: KnobGesture,
+    on_change: impl Fn(&f32, &mut Window, &mut App) + 'static,
+    on_reset: impl Fn(&f32, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let on_change = std::rc::Rc::new(on_change);
+    let on_reset = std::rc::Rc::new(on_reset);
+    render_knob_with_reset(
+        id.into(),
+        value,
+        min,
+        max,
+        size,
+        accent,
+        true,
+        None,
+        default_value,
+        gesture,
+        on_change,
+        on_reset,
     )
 }
 
@@ -156,7 +203,41 @@ fn render_knob(
     bipolar: bool,
     label: Option<gpui::SharedString>,
     default_value: f32,
+    gesture: KnobGesture,
     on_change: impl Fn(&f32, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let on_change = std::rc::Rc::new(on_change);
+    let on_reset = on_change.clone();
+    render_knob_with_reset(
+        id,
+        value,
+        min,
+        max,
+        size,
+        accent,
+        bipolar,
+        label,
+        default_value,
+        gesture,
+        on_change,
+        on_reset,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_knob_with_reset(
+    id: gpui::SharedString,
+    value: f32,
+    min: f32,
+    max: f32,
+    size: f32,
+    accent: gpui::Rgba,
+    bipolar: bool,
+    label: Option<gpui::SharedString>,
+    default_value: f32,
+    gesture: KnobGesture,
+    on_change: std::rc::Rc<dyn Fn(&f32, &mut Window, &mut App)>,
+    on_reset: std::rc::Rc<dyn Fn(&f32, &mut Window, &mut App)>,
 ) -> impl IntoElement {
     let range = (max - min).max(0.0001);
     let value = value.clamp(min, max);
@@ -170,8 +251,8 @@ fn render_knob(
     };
 
     let id_string = id.to_string();
-    let on_change = std::rc::Rc::new(on_change);
-    let on_reset = on_change.clone();
+    let KnobGesture { on_start, on_end } = gesture;
+    let on_end_out = on_end.clone();
     // The body disc and its rim, under the canvas: a rounded div draws a
     // crisper circle than a tessellated one, and it takes the hover rim.
     let inset = ARC_W + 2.5;
@@ -211,16 +292,25 @@ fn render_knob(
         // pressed, as on a fader.
         .on_drag(
             FaderDrag::new(id_string.clone()),
-            |drag, _offset, _window, cx| {
+            move |drag, _offset, window, cx| {
+                if let Some(start) = on_start.as_ref() {
+                    start(window, cx);
+                }
                 crate::components::drag_pointer::hide_for_drag();
                 cx.new(|_| FaderDrag::new(drag.id.clone()))
             },
         )
-        .on_mouse_up(gpui::MouseButton::Left, |_event, _window, _cx| {
+        .on_mouse_up(gpui::MouseButton::Left, move |_event, window, cx| {
             crate::components::drag_pointer::show_after_drag();
+            if let Some(end) = on_end.as_ref() {
+                end(window, cx);
+            }
         })
-        .on_mouse_up_out(gpui::MouseButton::Left, |_event, _window, _cx| {
+        .on_mouse_up_out(gpui::MouseButton::Left, move |_event, window, cx| {
             crate::components::drag_pointer::show_after_drag();
+            if let Some(end) = on_end_out.as_ref() {
+                end(window, cx);
+            }
         })
         .on_drag_move::<FaderDrag>(move |event, window, cx| {
             let drag = event.drag(cx);

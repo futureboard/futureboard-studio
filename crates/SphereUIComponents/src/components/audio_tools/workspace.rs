@@ -244,7 +244,7 @@ pub fn latch(
     let rest = if active {
         Colors::accent_soft()
     } else {
-        Colors::with_alpha(Colors::surface_input(), 0.0)
+        Colors::surface_input()
     };
     let hover = Colors::composite(rest, Colors::state_hover());
     div()
@@ -264,8 +264,11 @@ pub fn latch(
         .justify_center()
         .rounded(px(radius::CONTROL_SM))
         .bg(rest)
-        .when(active, |this| {
-            this.border(px(1.0)).border_color(Colors::border_accent())
+        .border(px(1.0))
+        .border_color(if active {
+            Colors::border_accent()
+        } else {
+            Colors::border_subtle()
         })
         .text_size(px(typography::DENSE_LABEL))
         .font_weight(if active {
@@ -276,7 +279,7 @@ pub fn latch(
         .text_color(if active {
             Colors::text_primary()
         } else {
-            Colors::text_muted()
+            Colors::text_secondary()
         })
         .opacity(if enabled { 1.0 } else { 0.4 })
         .when(enabled, |this| {

@@ -19,6 +19,7 @@ Wire-up into DAUx / `SphereAudioPlugins` happens in a later integration pass.
 | `airboost` | Air EQ: shelf or bell air band (2.5–40 kHz), presence bell, high-band exciter, built-in de-esser, mid/side, auto gain (native editor) | 2 medium | `biquad` (shelves, bells, exciter high-passes) |
 | `deesser` | De-esser: split-band or wideband, adjustable band and width, lookahead, listen, mid/side (native editor) | 2 medium | `biquad` (detector band-pass) |
 | `duckstep` | Ducker keyed by the track's own signal (soft knee, hold, tempo-synced release, lookahead) and a tempo-synced volume shaper with an editable curve; full / low / high band, delta monitor (native editor) | 2 medium | `biquad` (detector filters, crossover) |
+| `trigger` | Drum trigger and replacer: band-filtered hit detection with re-arm and retrigger hold, a fixed 5 ms lookahead (reported latency) so each sample lands on its hit, velocity from the hit's level, Replace or Blend, Quick Sampler's voices; built-in kick, snare, tom and clap rendered to WAV (native editor) | 2 medium | `biquad` (detector band) |
 | `imager` | Four-band stereo width with per-band stereoize (Haas / decorrelated) and Recover Sides (M/S, Linkwitz-Riley crossovers) (native editor) | 2 medium | `biquad` (crossovers, all-pass) |
 | `c1073` | 3-band channel EQ + drive | 3 hard | `biquad` |
 | `meowsyn` | Polyphonic soft-synth | 3 hard | [`fundsp`](https://crates.io/crates/fundsp) (MIT OR Apache-2.0) |

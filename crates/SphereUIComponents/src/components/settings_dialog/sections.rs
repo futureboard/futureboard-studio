@@ -172,25 +172,15 @@ pub(crate) fn midi_direction_label(i18n: &I18n, direction: MidiDeviceDirection) 
     }
 }
 
-pub(crate) fn midi_device_status_label(
-    i18n: &I18n,
-    device: &MidiDeviceSetting,
-) -> (String, BoxListBadgeTone) {
+/// A device's state, in words. The table carries it in monochrome: the word,
+/// plus a dot that is filled, hollow or crossed, never a hue alone.
+pub(crate) fn midi_device_status_label(i18n: &I18n, device: &MidiDeviceSetting) -> String {
     if !device.connected {
-        (
-            i18n.tr("settings.midi.status.missing"),
-            BoxListBadgeTone::Warning,
-        )
+        i18n.tr("settings.midi.status.missing")
     } else if !device.enabled {
-        (
-            i18n.tr("settings.midi.status.disabled"),
-            BoxListBadgeTone::Neutral,
-        )
+        i18n.tr("settings.midi.status.disabled")
     } else {
-        (
-            i18n.tr("settings.midi.status.connected"),
-            BoxListBadgeTone::Success,
-        )
+        i18n.tr("settings.midi.status.connected")
     }
 }
 
@@ -202,7 +192,60 @@ pub(crate) fn midi_device_icon(direction: MidiDeviceDirection) -> &'static str {
     }
 }
 
-pub(crate) fn midi_device_list_row(
+/// Column widths of the device table. The name takes what is left.
+const MIDI_TYPE_COL_W: f32 = 104.0;
+const MIDI_STATUS_COL_W: f32 = 104.0;
+const MIDI_ENABLED_COL_W: f32 = 64.0;
+const MIDI_ROW_H: f32 = 32.0;
+const MIDI_HEADER_H: f32 = 26.0;
+const MIDI_STATUS_DOT: f32 = 7.0;
+
+/// The status column's dot: filled while the device is in use, hollow while
+/// it is switched off, and a hollow one under a strike while it is unplugged.
+fn midi_status_dot(device: &MidiDeviceSetting) -> impl IntoElement {
+    let ink = Colors::text_secondary();
+    let dot = div()
+        .relative()
+        .flex_none()
+        .size(px(MIDI_STATUS_DOT))
+        .rounded(px(theme::radius::PILL));
+    if !device.connected {
+        dot.border(px(1.0))
+            .border_color(Colors::text_faint())
+            .child(
+                div()
+                    .absolute()
+                    .left(px(-1.0))
+                    .top(px(MIDI_STATUS_DOT / 2.0 - 0.5))
+                    .w(px(MIDI_STATUS_DOT + 2.0))
+                    .h(px(1.0))
+                    .bg(Colors::text_faint()),
+            )
+    } else if !device.enabled {
+        dot.border(px(1.0)).border_color(Colors::text_muted())
+    } else {
+        dot.bg(ink)
+    }
+}
+
+/// One cell of the header row.
+fn midi_header_cell(label: String, width: Option<f32>) -> impl IntoElement {
+    let cell = div()
+        .flex()
+        .items_center()
+        .text_size(px(theme::typography::DENSE_CAPTION))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(Colors::text_faint())
+        .child(label.to_uppercase());
+    match width {
+        Some(width) => cell.flex_none().w(px(width)),
+        None => cell.flex_1().min_w_0(),
+    }
+}
+
+/// One device as a table row: name with its direction glyph, type, status,
+/// and the switch. All text in the neutral ramp; a missing device dims.
+pub(crate) fn midi_device_table_row(
     row_index: usize,
     device: &MidiDeviceSetting,
     i18n: &I18n,
@@ -211,81 +254,108 @@ pub(crate) fn midi_device_list_row(
     let snapshot = device.clone();
     let enabled = device.enabled;
     let up = on_update.clone();
-    let (status_label, status_tone) = midi_device_status_label(i18n, device);
+    let status = midi_device_status_label(i18n, device);
     let type_label = midi_direction_label(i18n, device.direction);
+    let missing = !device.connected;
+    let (name_ink, cell_ink) = if missing {
+        (Colors::text_muted(), Colors::text_faint())
+    } else {
+        (Colors::text_primary(), Colors::text_secondary())
+    };
+    let hover = Colors::composite(Colors::surface_input(), Colors::state_hover());
 
-    box_list_item()
+    div()
         .id(("midi-device-row", row_index))
-        .child(box_list_item_leading_icon(midi_device_icon(
-            device.direction,
-        )))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(theme::space::LOOSE))
+        .h(px(MIDI_ROW_H))
+        .px(px(theme::space::LOOSE))
+        .when(row_index > 0, |row| {
+            row.border_t(px(1.0)).border_color(Colors::divider())
+        })
+        .hover(move |style| style.bg(hover))
         .child(
-            box_list_item_content()
-                .child(box_list_item_title(device.name.clone()))
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(theme::space::BASE))
+                .flex_1()
+                .min_w_0()
+                .child(icon(
+                    midi_device_icon(device.direction),
+                    13.0,
+                    Colors::text_muted(),
+                ))
                 .child(
                     div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(4.0))
-                        .flex_wrap()
-                        .child(box_list_item_badge(type_label, BoxListBadgeTone::Accent))
-                        .child(box_list_item_badge(status_label, status_tone)),
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(theme::typography::UI_SM))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(name_ink)
+                        .child(device.name.clone()),
                 ),
         )
-        .child(box_list_item_trailing().child(box_list_toggle(
-            ("midi-device-toggle", row_index),
-            enabled,
-            move |_, w, cx| {
-                let next = !enabled;
-                if midi_settings_debug_enabled() {
-                    eprintln!("[MIDI settings] toggle {} enabled={next}", snapshot.name);
-                }
-                let saved_for_update = snapshot.clone();
-                up(
-                    Arc::new(move |s| {
-                        let mut updated = saved_for_update.clone();
-                        updated.enabled = next;
-                        upsert_midi_device(&mut s.hardware.midi, updated);
-                    }),
-                    w,
-                    cx,
-                );
-            },
-        )))
+        .child(
+            div()
+                .flex_none()
+                .w(px(MIDI_TYPE_COL_W))
+                .truncate()
+                .text_size(px(theme::typography::UI_XS))
+                .text_color(cell_ink)
+                .child(type_label),
+        )
+        .child(
+            div()
+                .flex_none()
+                .w(px(MIDI_STATUS_COL_W))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(theme::space::SNUG))
+                .child(midi_status_dot(device))
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(theme::typography::UI_XS))
+                        .text_color(cell_ink)
+                        .child(status),
+                ),
+        )
+        .child(
+            div()
+                .flex_none()
+                .w(px(MIDI_ENABLED_COL_W))
+                .flex()
+                .justify_end()
+                .child(box_list_switch(
+                    ("midi-device-toggle", row_index),
+                    enabled,
+                    move |_, w, cx| {
+                        let next = !enabled;
+                        if midi_settings_debug_enabled() {
+                            eprintln!("[MIDI settings] toggle {} enabled={next}", snapshot.name);
+                        }
+                        let saved_for_update = snapshot.clone();
+                        up(
+                            Arc::new(move |s| {
+                                let mut updated = saved_for_update.clone();
+                                updated.enabled = next;
+                                upsert_midi_device(&mut s.hardware.midi, updated);
+                            }),
+                            w,
+                            cx,
+                        );
+                    },
+                )),
+        )
 }
 
-pub(crate) fn midi_device_group(
-    title: String,
-    devices: &[MidiDeviceSetting],
-    row_offset: &mut usize,
-    i18n: &I18n,
-    on_update: &Arc<dyn Fn(UpdateSettingFn, &mut Window, &mut App) + 'static>,
-) -> Option<gpui::AnyElement> {
-    if devices.is_empty() {
-        return None;
-    }
-    let rows: Vec<_> = devices
-        .iter()
-        .enumerate()
-        .map(|(idx, device)| {
-            let row_ix = *row_offset + idx;
-            midi_device_list_row(row_ix, device, i18n, on_update).into_any_element()
-        })
-        .collect();
-    *row_offset += devices.len();
-    Some(
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(4.0))
-            .child(box_list_group_label(title))
-            .child(box_list_view().children(rows))
-            .into_any_element(),
-    )
-}
-
-/// The MIDI device list: inputs and outputs, each switchable, with a rescan.
+/// The MIDI devices as one table: a header row, then the inputs (a two-way
+/// port once, with them) and the outputs, with a rescan under it.
 pub(crate) fn midi_devices_body(
     schema: &SettingsSchema,
     i18n: &I18n,
@@ -295,28 +365,25 @@ pub(crate) fn midi_devices_body(
     let detected = cached_midi_devices();
     let resolved = resolve_midi_devices(&schema.hardware.midi.devices, &detected);
 
-    let inputs: Vec<_> = resolved
+    // Inputs first, then outputs. A two-way port is listed once, with the
+    // inputs; its type says it is both. Listing it twice gave two switches
+    // for the one device.
+    let ordered: Vec<_> = resolved
         .iter()
-        .filter(|d| {
-            d.direction == MidiDeviceDirection::Input
-                || d.direction == MidiDeviceDirection::InputOutput
-        })
-        .cloned()
-        .collect();
-    // A two-way port is listed once, with the inputs; its badge says it is
-    // both. Listing it twice gave two switches for the one device.
-    let outputs: Vec<_> = resolved
-        .iter()
-        .filter(|d| d.direction == MidiDeviceDirection::Output)
+        .filter(|d| d.direction != MidiDeviceDirection::Output)
+        .chain(
+            resolved
+                .iter()
+                .filter(|d| d.direction == MidiDeviceDirection::Output),
+        )
         .cloned()
         .collect();
 
-    let mut row_offset = 0usize;
-    let mut body = div().flex().flex_col().gap(px(10.0));
+    let mut body = div().flex().flex_col().gap(px(theme::space::BASE));
 
-    if resolved.is_empty() {
+    if ordered.is_empty() {
         let refresh = on_refresh_midi.clone();
-        body = body.child(box_list_empty_state(
+        return body.child(box_list_empty_state(
             i18n.tr("settings.midi.empty"),
             i18n.tr("settings.midi.refresh"),
             move |_, w, cx| {
@@ -325,41 +392,70 @@ pub(crate) fn midi_devices_body(
                 }
             },
         ));
-    } else {
-        if let Some(group) = midi_device_group(
-            i18n.tr("settings.section.midi-inputs"),
-            &inputs,
-            &mut row_offset,
-            i18n,
-            &on_update,
-        ) {
-            body = body.child(group);
-        }
-        if let Some(group) = midi_device_group(
-            i18n.tr("settings.section.midi-outputs"),
-            &outputs,
-            &mut row_offset,
-            i18n,
-            &on_update,
-        ) {
-            body = body.child(group);
-        }
+    }
 
-        if let Some(refresh) = on_refresh_midi {
-            let refresh_cb = refresh.clone();
-            body = body.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .justify_end()
-                    .child(box_list_icon_button(
-                        "midi-devices-refresh",
-                        assets::ICON_REPEAT_PATH,
-                        "Refresh MIDI devices",
-                        move |_, w, cx| refresh_cb(w, cx),
-                    )),
-            );
-        }
+    let header = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(theme::space::LOOSE))
+        .h(px(MIDI_HEADER_H))
+        .px(px(theme::space::LOOSE))
+        .bg(Colors::surface_panel_alt())
+        .border_b(px(1.0))
+        .border_color(Colors::border_subtle())
+        .child(midi_header_cell(
+            i18n.tr_or("settings.midi.column.device", "Device"),
+            None,
+        ))
+        .child(midi_header_cell(
+            i18n.tr_or("settings.midi.column.type", "Type"),
+            Some(MIDI_TYPE_COL_W),
+        ))
+        .child(midi_header_cell(
+            i18n.tr_or("settings.midi.column.status", "Status"),
+            Some(MIDI_STATUS_COL_W),
+        ))
+        .child(
+            div()
+                .flex_none()
+                .w(px(MIDI_ENABLED_COL_W))
+                .flex()
+                .justify_end()
+                .child(midi_header_cell(
+                    i18n.tr_or("settings.midi.column.enabled", "Enabled"),
+                    None,
+                )),
+        );
+
+    body = body.child(
+        div()
+            .flex()
+            .flex_col()
+            .rounded(px(theme::radius::CONTROL))
+            .border(px(1.0))
+            .border_color(Colors::border_subtle())
+            .bg(Colors::surface_input())
+            .overflow_hidden()
+            .child(header)
+            .children(ordered.iter().enumerate().map(|(index, device)| {
+                midi_device_table_row(index, device, i18n, &on_update).into_any_element()
+            })),
+    );
+
+    if let Some(refresh) = on_refresh_midi {
+        body = body.child(
+            div()
+                .flex()
+                .flex_row()
+                .justify_end()
+                .child(box_list_icon_button(
+                    "midi-devices-refresh",
+                    assets::ICON_REPEAT_PATH,
+                    "Refresh MIDI devices",
+                    move |_, w, cx| refresh(w, cx),
+                )),
+        );
     }
 
     body

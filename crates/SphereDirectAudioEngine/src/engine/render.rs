@@ -85,6 +85,11 @@ mod soundfont_instrument_tests;
 
 #[cfg(test)]
 mod bridge_bypass_tests;
+#[cfg(test)]
+mod post_fader_tests;
+
+#[cfg(test)]
+mod dual_pan_tests;
 
 #[cfg(test)]
 mod fade_curve_tests;

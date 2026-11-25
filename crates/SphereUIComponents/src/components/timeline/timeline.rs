@@ -1,9 +1,13 @@
 mod automation_value_edit;
 mod clip_fades;
 mod clip_move_cancel;
+mod clip_range;
+mod dual_pan;
 mod methods;
 mod plugin_drop;
 mod render;
+#[cfg(test)]
+mod track_count_bench;
 mod track_rename;
 pub(crate) use automation_value_edit::{AutomationValueEdit, AUTOMATION_VALUE_FIELD_HEIGHT};
 pub use plugin_drop::{insert_index_below, resolve_plugin_drop, NewTrackKind, PluginDropTarget};
@@ -316,6 +320,12 @@ pub struct Timeline {
     /// keeps the existing selection; see `lane_press_intent`. Clips, rulers,
     /// toolbar controls and the other tools never start it.
     range_select_drag: Option<RangeSelectDrag>,
+    /// A Pointer press in a clip's body: a click selects the clip, a drag
+    /// draws a time range or moves the range's content. See `clip_range`.
+    clip_body_drag: Option<clip_range::ClipBodyDrag>,
+    /// The "before" of a range move in flight: the tracks its split cut. The
+    /// release records it with the move as one step; a cancel restores it.
+    range_move_edit: Option<crate::components::timeline::timeline_state::PendingTrackEdit>,
     /// Right-drag erase: clip ids already queued for deletion this gesture.
     erase_clip_drag: Option<HashSet<String>>,
     /// The notes each ARA clip sounds after its plug-in's edits, by clip id,
@@ -688,25 +698,8 @@ pub type TimelineClipGainLiveCb =
 /// A named Studio command requested from inside the timeline.
 pub type TimelineCommandCb = std::sync::Arc<dyn Fn(&'static str, &mut gpui::App) + 'static>;
 
-#[derive(Clone, Debug)]
-struct ScrollbarDrag {
-    axis: ScrollAxis,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum ScrollAxis {
-    Horizontal,
-    Vertical,
-}
-
-impl Render for ScrollbarDrag {
-    fn render(&mut self, _w: &mut Window, _cx: &mut gpui::Context<Self>) -> impl IntoElement {
-        Empty
-    }
-}
-
 // Clip edge-resize uses GPUI's drag system with no visible drag image, so the
-// payload renders as `Empty` (same as the scrollbar thumb drag).
+// payload renders as `Empty`.
 impl Render for ClipResizeDrag {
     fn render(&mut self, _w: &mut Window, _cx: &mut gpui::Context<Self>) -> impl IntoElement {
         Empty
@@ -724,16 +717,3 @@ impl Render for GlobalLaneResizeDrag {
         Empty
     }
 }
-
-// ── Timeline scrollbars ─────────────────────────────────────────────────
-//
-// Both scrollbars are rendered as absolute overlays on top of the
-// arrangement area. The thumb is sized by `viewport / content` and
-// positioned by `scroll / max_scroll`. Mouse-down on the track jumps
-// the scroll position so the click point becomes the new thumb top
-// (vertical) or thumb left (horizontal). The wheel handler on the
-// Timeline div continues to handle smooth scrolling and zoom; the
-// scrollbar is the visible indicator + a coarse jump target.
-
-const SCROLLBAR_THICKNESS: f32 = 8.0;
-const SCROLLBAR_MIN_THUMB: f32 = 24.0;

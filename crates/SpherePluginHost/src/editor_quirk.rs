@@ -71,6 +71,8 @@ const BUNDLE_SCAN_DIRS: &[&str] = &[
     "",
     "Contents/Resources",
     "Contents/x86_64-win",
+    // A 32-bit bundle, which the 32-bit plug-in bridge loads.
+    "Contents/x86-win",
     "Contents/Resources/WebView2",
     "Contents/Resources/CEF",
     "Contents/Resources/Chromium",

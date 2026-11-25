@@ -43,6 +43,9 @@ pub struct MasterBusState {
     /// Whether the arrangement shows the master's automation block — the
     /// master's counterpart of a track's Automation lane mode.
     pub automation_expanded: bool,
+    /// The mixer's VCA groups, in the order their strips show. Kept here so
+    /// the master's undo scope covers them (see [`super::vca`]).
+    pub vca_groups: Vec<VcaGroupState>,
 }
 
 /// Which signal the Control Room monitors. Mirrors the engine's
@@ -171,6 +174,31 @@ impl SpatialMix {
     pub fn is_spatial(&self) -> bool {
         self.format.is_spatial()
     }
+
+    /// The mix as it plays here: the saved one when spatial mixing is
+    /// `licensed`, otherwise the same room as a stereo mix. The project keeps
+    /// what was saved either way, so nothing is lost by opening it without a
+    /// license.
+    pub fn heard(self, licensed: bool) -> Self {
+        if licensed {
+            self
+        } else {
+            Self {
+                format: solfege_spatialaudio::SpatialFormat::Stereo,
+                ..self
+            }
+        }
+    }
+
+    /// [`Self::heard`] with this machine's license.
+    pub fn heard_here(self) -> Self {
+        self.heard(crate::edition::spatial_mix_licensed())
+    }
+
+    /// Saved as a spatial mix but playing as stereo for want of a license.
+    pub fn held_back(self, licensed: bool) -> bool {
+        self.is_spatial() && !licensed
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -212,6 +240,8 @@ pub struct TimelineState {
     /// The project's key: root and scale. `None` until someone sets one — a
     /// project has no key by default, and "C major" would be a guess.
     pub project_key: Option<MidiScale>,
+    /// Title, artist and the other tags exports carry (v72).
+    pub project_metadata: crate::project::ProjectMetadata,
     /// Timeline markers shown on the arrangement ruler.
     pub markers: Vec<TimelineMarkerState>,
     /// Named timeline regions spanning a beat range.
@@ -408,6 +438,7 @@ impl Default for TimelineState {
             spatial_mix: SpatialMix::default(),
             timecode_rate: TimecodeRate::default(),
             project_key: None,
+            project_metadata: Default::default(),
             markers: Vec::new(),
             regions: Vec::new(),
             song_text_events: Vec::new(),
@@ -449,6 +480,7 @@ impl Default for TimelineState {
             monitor_output_connection_id: None,
             output_routing_initialized: false,
             master: MasterBusState {
+                vca_groups: Vec::new(),
                 volume: volume::db_to_norm(0.0),
                 inserts: Vec::new(),
                 meter_level_l: 0.0,

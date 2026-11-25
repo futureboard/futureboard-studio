@@ -144,6 +144,10 @@ pub struct RegistryPlugin {
     /// The plug-in exposes an ARA main factory, so it can be attached to an
     /// audio clip through `SphereAraHost` instead of only as a track insert.
     pub is_ara: bool,
+    /// The VST3 component exposes an event output bus, read by instantiating
+    /// it once during the scan. Only meaningful for VST3; see
+    /// [`Self::is_midi_effect`].
+    pub midi_output: bool,
     pub preset_path: PathBuf,
     pub scanned_at_ms: i64,
     pub status: PluginStatus,
@@ -175,6 +179,23 @@ impl RegistryPlugin {
         self.is_ara && self.format == PluginFormat::Vst3 && self.class_id.is_some()
     }
 
+    /// Whether this plug-in can sit in a track's MIDI FX chain: it turns MIDI
+    /// into MIDI. See [`is_midi_effect`] for the per-format rules.
+    ///
+    /// This is independent of [`Self::kind`]: a VST3 chord tool still declares
+    /// itself `Instrument` or `Fx` and stays insertable on those paths too.
+    pub fn is_midi_effect(&self) -> bool {
+        if self.is_builtin() {
+            return false;
+        }
+        is_midi_effect(
+            self.format,
+            self.raw_category.as_deref().unwrap_or(&self.category),
+            self.sub_categories.as_deref(),
+            self.midi_output,
+        )
+    }
+
     /// Insert onto a track is supported for wired formats (or any built-in) once
     /// the preset is ready.
     pub fn supports_insert(&self) -> bool {
@@ -197,6 +218,41 @@ impl RegistryPlugin {
             self.format,
             PluginFormat::Vst3 | PluginFormat::Vst2 | PluginFormat::Clap
         ) && self.supports_insert()
+    }
+}
+
+/// Category label the AU scanner gives `kAudioUnitType_MIDIProcessor`
+/// (`'aumi'`) components — see `category_for_type` in `au_scanner.mm`.
+pub const AU_MIDI_PROCESSOR_CATEGORY: &str = "MIDI Processor";
+
+/// Whether a plug-in with this declared metadata turns MIDI into MIDI.
+///
+/// - VST3 has no MIDI-effect class category; chord tools and arpeggiators
+///   register as `Instrument` or `Fx`. The scan instantiates the component once
+///   and records whether it has an event *output* bus (`midi_output`).
+/// - CLAP declares the `note-effect` feature.
+/// - AU declares the `'aumi'` MIDI-processor component type, which the scanner
+///   folds into the [`AU_MIDI_PROCESSOR_CATEGORY`] category.
+/// - VST2 has no reliable signal, so it is never offered here.
+///
+/// `category` is the raw category the scanner reported (not the display label).
+pub fn is_midi_effect(
+    format: PluginFormat,
+    category: &str,
+    sub_categories: Option<&str>,
+    midi_output: bool,
+) -> bool {
+    match format {
+        PluginFormat::Vst3 => midi_output,
+        PluginFormat::Clap => sub_categories
+            .unwrap_or("")
+            .split('|')
+            .map(str::trim)
+            .any(|tag| {
+                tag.eq_ignore_ascii_case("note-effect") || tag.eq_ignore_ascii_case("note effect")
+            }),
+        PluginFormat::Au => category.eq_ignore_ascii_case(AU_MIDI_PROCESSOR_CATEGORY),
+        PluginFormat::Vst2 | PluginFormat::Lv2 | PluginFormat::Unknown => false,
     }
 }
 
@@ -402,6 +458,11 @@ pub fn default_scan_paths() -> Vec<PathBuf> {
             let pf86 = PathBuf::from(pf86);
             paths.push(pf86.join("Common Files").join("VST3"));
             paths.push(pf86.join("Common Files").join("CLAP"));
+            // 32-bit VST2 plug-ins, loaded through the 32-bit bridge
+            // (`FutureboardPluginHostX86.exe`).
+            paths.push(pf86.join("Common Files").join("VST2"));
+            paths.push(pf86.join("VSTPlugins"));
+            paths.push(pf86.join("Steinberg").join("VSTPlugins"));
         }
         if let Some(local) = std::env::var_os("LOCALAPPDATA") {
             let local = PathBuf::from(local);
@@ -625,6 +686,15 @@ fn kind_sort_rank(kind: PluginKind) -> u8 {
     }
 }
 
+/// Put the modules that need the 32-bit bridge after the rest, keeping each
+/// group's order. A plug-in installed in both word sizes is listed once, by
+/// the first build scanned ([`registry_display_key`]), and that should be the
+/// one that loads without the bridge, whatever the folders' names (by path
+/// alone `D:\VST32` sorts before `D:\VST64`).
+fn bridged_modules_last(bundles: &mut [PathBuf]) {
+    bundles.sort_by_cached_key(|bundle| crate::module_arch::module_arch(bundle).needs_x86_bridge());
+}
+
 fn registry_display_key(plugin: &RegistryPlugin) -> String {
     [
         plugin.vendor.as_str(),
@@ -698,6 +768,7 @@ pub fn registry_plugin_from_scan(info: &PluginInfo, scanned_at_ms: i64) -> Regis
         version: info.version.clone(),
         sdk_metadata_loaded: info.sdk_metadata_loaded,
         is_ara: info.is_ara,
+        midi_output: info.midi_output,
         preset_path,
         scanned_at_ms,
         status,
@@ -956,7 +1027,8 @@ impl PluginRegistry {
 
             let _ = ensure_preset_folders();
 
-            let bundles = discover_plugin_bundles(&scanned_paths);
+            let mut bundles = discover_plugin_bundles(&scanned_paths);
+            bridged_modules_last(&mut bundles);
             let bundle_total = bundles.len();
             on_progress(ScanProgress::Started { bundle_total });
 
@@ -1301,6 +1373,26 @@ mod tests {
         );
     }
 
+    /// With both builds of a plug-in installed, the 64-bit one is scanned
+    /// first and is the one listed.
+    #[test]
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    fn a_64_bit_build_is_scanned_before_its_32_bit_twin() {
+        let root = std::env::temp_dir().join(format!("fb-scan-order-{}", std::process::id()));
+        let x86 = root.join("VST32").join("Synth.vst3");
+        let x64 = root.join("VST64").join("Synth.vst3");
+        std::fs::create_dir_all(x86.join("Contents").join("x86-win")).unwrap();
+        std::fs::create_dir_all(x64.join("Contents").join("x86_64-win")).unwrap();
+        let other = root.join("VST32").join("Other.vst3");
+        std::fs::create_dir_all(other.join("Contents").join("x86_64-win")).unwrap();
+        let mut bundles = vec![other.clone(), x86.clone(), x64.clone()];
+        bundles.sort();
+        assert_eq!(bundles[1], x86, "by path the 32-bit build comes first");
+        super::bridged_modules_last(&mut bundles);
+        assert_eq!(bundles, vec![other, x64, x86]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn vst2_kind_comes_from_the_scanner_synth_flag() {
         // The VST2 scanner folds `effFlagsIsSynth` / `effGetPlugCategory` into
@@ -1435,5 +1527,102 @@ mod tests {
     fn bundle_with_no_cached_entries_is_not_reusable() {
         // A newly-appeared bundle (no cached rows) must be scanned.
         assert!(!bundle_is_reusable(std::iter::empty()));
+    }
+
+    fn scanned(format: &str, category: &str, sub: Option<&str>, midi_output: bool) -> PluginInfo {
+        PluginInfo {
+            id: format!("{}:test", format.to_ascii_lowercase()),
+            name: "Test".into(),
+            vendor: "Acme".into(),
+            category: category.into(),
+            sub_categories: sub.map(str::to_string),
+            format: format.into(),
+            path: "C:/does-not-exist/test".into(),
+            module_path: None,
+            class_id: Some("ABCD".into()),
+            version: None,
+            sdk_version: None,
+            is_shell_child: false,
+            is_ara: false,
+            midi_output,
+            sdk_metadata_loaded: true,
+            load_error: None,
+        }
+    }
+
+    /// A VST3 chord tool declares itself an instrument (or `Fx`); only the
+    /// event output bus the scan found marks it as a MIDI effect.
+    #[test]
+    fn vst3_midi_effect_follows_the_event_output_bus() {
+        let chords = registry_plugin_from_scan(
+            &scanned("VST3", "Audio Module Class", Some("Instrument"), true),
+            0,
+        );
+        assert!(chords.is_midi_effect());
+        // Still an instrument for the existing insert paths.
+        assert_eq!(chords.kind, PluginKind::Instrument);
+
+        let synth = registry_plugin_from_scan(
+            &scanned(
+                "VST3",
+                "Audio Module Class",
+                Some("Instrument|Synth"),
+                false,
+            ),
+            0,
+        );
+        assert!(!synth.is_midi_effect());
+
+        let arp_fx =
+            registry_plugin_from_scan(&scanned("VST3", "Audio Module Class", Some("Fx"), true), 0);
+        assert!(arp_fx.is_midi_effect());
+        assert_eq!(arp_fx.kind, PluginKind::Effect);
+    }
+
+    #[test]
+    fn clap_midi_effect_is_the_note_effect_feature() {
+        for sub in [
+            "note-effect",
+            "note-effect|utility",
+            "Note Effect",
+            " NOTE-EFFECT ",
+        ] {
+            let p = registry_plugin_from_scan(&scanned("CLAP", "", Some(sub), false), 0);
+            assert!(p.is_midi_effect(), "{sub:?}");
+        }
+        for sub in [
+            "audio-effect",
+            "audio-effect|delay",
+            "instrument|synthesizer",
+            "",
+        ] {
+            let p = registry_plugin_from_scan(&scanned("CLAP", "", Some(sub), false), 0);
+            assert!(!p.is_midi_effect(), "{sub:?}");
+        }
+        // The VST3 flag means nothing for CLAP.
+        let p = registry_plugin_from_scan(&scanned("CLAP", "", Some("audio-effect"), true), 0);
+        assert!(!p.is_midi_effect());
+    }
+
+    #[test]
+    fn au_midi_effect_is_the_midi_processor_type() {
+        let aumi = registry_plugin_from_scan(&scanned("AU", "MIDI Processor", None, false), 0);
+        assert!(aumi.is_midi_effect());
+        for category in ["Effect", "Music Effect", "Instrument", "Generator"] {
+            let p = registry_plugin_from_scan(&scanned("AU", category, None, false), 0);
+            assert!(!p.is_midi_effect(), "{category}");
+        }
+    }
+
+    #[test]
+    fn vst2_and_unknown_formats_are_never_midi_effects() {
+        let vst2 = registry_plugin_from_scan(&scanned("VST2", "", Some("Fx"), true), 0);
+        assert!(!vst2.is_midi_effect());
+        assert!(!is_midi_effect(
+            PluginFormat::Unknown,
+            "MIDI Processor",
+            Some("note-effect"),
+            true
+        ));
     }
 }

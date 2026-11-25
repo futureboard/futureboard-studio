@@ -192,6 +192,13 @@ export const APP_MENUS: AppMenuGroup[] = [
         action: "edit:duplicate",
       },
       {
+        id: "edit.merge_clips",
+        label: "Merge Clips",
+        accelerator: "J",
+        action: "clip:merge",
+        description: "Join the selected clips on each track into one clip",
+      },
+      {
         id: "edit.delete",
         label: "Delete",
         accelerator: "Delete",
@@ -607,6 +614,39 @@ export const APP_MENUS: AppMenuGroup[] = [
         description: "Detect the tempo and key of the selected audio clip",
       },
       {
+        id: "audio.audio_to_midi",
+        type: "submenu",
+        label: "Audio to MIDI",
+        icon: "keyboard-music",
+        children: [
+          {
+            id: "audio.audio_to_midi.melody",
+            label: "Melody",
+            action: "clip:to-midi-melody",
+            description: "Convert the selected audio clip's melody to MIDI on a new track",
+          },
+          {
+            id: "audio.audio_to_midi.drums",
+            label: "Drums",
+            action: "clip:to-midi-drums",
+            description: "Convert the selected audio clip's drum hits to MIDI on a new track",
+          },
+          {
+            id: "audio.audio_to_midi.chords",
+            label: "Chords",
+            action: "clip:to-midi-chords",
+            description: "Convert the selected audio clip's chords to MIDI on a new track",
+          },
+        ],
+      },
+      {
+        id: "audio.strip_silence",
+        label: "Strip Silence...",
+        icon: "audio-waveform",
+        action: "audio:strip-silence",
+        description: "Split the selected audio clips at their silences and remove the silent parts",
+      },
+      {
         type: "separator",
         id: "audio.sep.render",
       },
@@ -814,12 +854,28 @@ export const APP_MENUS: AppMenuGroup[] = [
           "Audio engine latency and PDC, plus every CPU core, memory and local drive",
       },
       {
+        id: "window.process_explorer",
+        label: "Process Explorer",
+        icon: "activity",
+        action: "window:process-explorer",
+        description:
+          "What each plug-in costs: DSP share, latency, and its host process's memory and CPU",
+      },
+      {
         id: "window.virtual_speaker",
         label: "Virtual Speaker",
         icon: "speaker",
         action: "window:virtual-speaker",
         description:
           "Hear the mix as it would play in a car, on a phone, through a PA or in other rooms (monitoring only)",
+      },
+      {
+        id: "window.room_preview",
+        label: "3D Room Preview",
+        icon: "audio-lines",
+        action: "window:room-preview",
+        description:
+          "Every channel's place in a surround or binaural mix in 3D, with the speakers' levels (Professional)",
       },
       {
         id: "window.visualizer",

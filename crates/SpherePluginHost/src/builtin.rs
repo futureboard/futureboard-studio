@@ -150,6 +150,14 @@ const CATALOG: &[BuiltinEntry] = &[
         editor: BuiltinEditorKind::Native,
     },
     BuiltinEntry {
+        stem: "trigger",
+        name: "Trigger",
+        category: "Dynamics",
+        kind: PluginKind::Effect,
+        // Native GPUI editor (`sphere_ui_components::components::trigger_plate`).
+        editor: BuiltinEditorKind::Native,
+    },
+    BuiltinEntry {
         stem: "clipper67",
         name: "67Clipper",
         category: "Dynamics",
@@ -291,6 +299,7 @@ pub const AUDIO_BRIDGE_STEMS: &[&str] = &[
     "airboost",
     "deesser",
     "duckstep",
+    "trigger",
 ];
 
 /// Whether this built-in currently has an out-of-process audio DSP runtime.
@@ -352,6 +361,7 @@ pub fn builtin_catalog(scanned_at_ms: i64) -> Vec<RegistryPlugin> {
             sdk_metadata_loaded: true,
             // Stock plug-ins are hosted directly; none of them is an ARA peer.
             is_ara: false,
+            midi_output: false,
             preset_path: std::path::PathBuf::new(),
             scanned_at_ms,
             status: PluginStatus::PresetReady,
@@ -429,6 +439,7 @@ mod tests {
             "airboost",
             "deesser",
             "duckstep",
+            "trigger",
         ] {
             assert_eq!(
                 builtin_editor_kind(&builtin_id(stem)),
@@ -541,6 +552,7 @@ mod tests {
             version: None,
             sdk_metadata_loaded: true,
             is_ara: false,
+            midi_output: false,
             preset_path: std::path::PathBuf::new(),
             scanned_at_ms: 1,
             status: PluginStatus::PresetReady,

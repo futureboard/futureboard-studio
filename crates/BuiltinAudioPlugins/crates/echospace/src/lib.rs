@@ -21,10 +21,10 @@
 use std::f32::consts::{FRAC_1_SQRT_2, FRAC_PI_2, TAU};
 
 use biquad::{Biquad, Coefficients, DirectForm1};
-use builtin_dsp_core::delay::{smoothing_step, Allpass, DelayRing, Smoothed};
+use builtin_dsp_core::delay::{Allpass, DelayRing, Smoothed, smoothing_step};
 use builtin_dsp_core::{
-    biquad_response_db, clamp, db_to_linear, flush_denormal, make_eq_coefficients, ParamDescriptor,
-    PluginCategory, PluginDescriptor, StereoEffect,
+    ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, biquad_response_db, clamp,
+    db_to_linear, flush_denormal, make_eq_coefficients,
 };
 use serde::{Deserialize, Serialize};
 
@@ -34,8 +34,8 @@ pub mod ui;
 
 /// Editor-facing parameter id table, re-exported at the crate root so the host
 /// resolves ids the same way for every built-in (`<plugin>::ui_param_index`).
-pub use ipc::{ui_param_id, ui_param_index, UI_PARAM_IDS};
-pub use presets::{factory_presets, FactoryPreset};
+pub use ipc::{UI_PARAM_IDS, ui_param_id, ui_param_index};
+pub use presets::{FactoryPreset, factory_presets};
 
 pub const PLUGIN_ID: &str = "futureboard.echospace";
 
@@ -602,7 +602,7 @@ pub fn echo_pattern(
     while let Some(index) = pending
         .iter()
         .enumerate()
-        .min_by(|a, b| (a.1 .1 + times[a.1 .0]).total_cmp(&(b.1 .1 + times[b.1 .0])))
+        .min_by(|a, b| (a.1.1 + times[a.1.0]).total_cmp(&(b.1.1 + times[b.1.0])))
         .map(|(i, _)| i)
     {
         if echoes.len() >= max_echoes {

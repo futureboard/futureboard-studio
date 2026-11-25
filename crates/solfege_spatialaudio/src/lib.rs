@@ -64,7 +64,7 @@ pub use listening::{
     ListeningDevice, ListeningGroup, ListeningProfile, ListeningSimulator, SimulationSettings,
 };
 pub use panner::SurroundPanner;
-pub use position::{RoomPosition, RoomSettings, SourceParams};
+pub use position::{RoomPosition, RoomSettings, SourceParam, SourceParams};
 pub use room_tail::RoomTail;
 pub use surround::SurroundSource;
 pub use virtual_speakers::{VirtualSpeakers, fold_down, fold_down_range, speaker_position};

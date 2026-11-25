@@ -34,8 +34,9 @@ fn windows_control_icon_font() -> &'static str {
     FONT.get_or_init(|| windows_control_icon_font_for_build(windows_build_number()))
 }
 
+/// The running Windows build, e.g. 22631.
 #[cfg(target_os = "windows")]
-fn windows_build_number() -> Option<u32> {
+pub(crate) fn windows_build_number() -> Option<u32> {
     let mut version: windows::Win32::System::SystemInformation::OSVERSIONINFOW =
         unsafe { std::mem::zeroed() };
     version.dwOSVersionInfoSize = std::mem::size_of_val(&version) as u32;

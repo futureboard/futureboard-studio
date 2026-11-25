@@ -1770,6 +1770,7 @@ mod fx_reorder_tests {
                 hidden: false,
                 read_only: false,
                 unit: String::new(),
+                value_text: String::new(),
             });
         }
 
@@ -1981,6 +1982,44 @@ mod midi_output_routing_tests {
         );
         assert_eq!(state.effective_instrument_track_id(&midi_id), None);
     }
+
+    /// The indexed form, used by passes over every track, resolves exactly
+    /// as the by-id form does: own instrument, routed, unrouted, stale, and a
+    /// target that stopped being an Instrument track.
+    #[test]
+    fn indexed_instrument_resolution_matches_the_by_id_form() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let inst_id = track(&mut state, TrackType::Instrument, "Synth");
+        let audio_id = track(&mut state, TrackType::Audio, "Vox");
+        let routed = track(&mut state, TrackType::Midi, "Routed");
+        let _unrouted = track(&mut state, TrackType::Midi, "Unrouted");
+        let stale = track(&mut state, TrackType::Midi, "Stale");
+        let to_audio = track(&mut state, TrackType::Midi, "To audio");
+        for (midi, target) in [
+            (&routed, &inst_id),
+            (&stale, &"gone".to_string()),
+            (&to_audio, &audio_id),
+        ] {
+            state.set_track_output_routing(
+                midi,
+                TrackOutputRouting::Instrument {
+                    track_id: target.clone(),
+                },
+            );
+        }
+        let index_by_id = state.track_index_by_id();
+        for track in &state.tracks {
+            assert_eq!(
+                state
+                    .effective_instrument_indexed(track, &index_by_id)
+                    .map(str::to_string),
+                state.effective_instrument_track_id(&track.id),
+                "{}",
+                track.name
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2120,6 +2159,82 @@ mod audio_clip_split_tests {
             original.name = duplicate.name;
         }
         assert_eq!(copy.unwrap().1.name, "Take Copy");
+    }
+
+    /// A project saved by the old Duplicate holds two clips under one id;
+    /// loading it renumbers the second so each clip selects on its own.
+    #[test]
+    fn clips_sharing_an_id_are_renumbered_apart() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let track = state.create_midi_track();
+        let clips = &mut state
+            .tracks
+            .iter_mut()
+            .find(|t| t.id == track)
+            .unwrap()
+            .clips;
+        clips.push(audio_clip("clip-1", 0.0, 8.0, 0.0));
+        clips.push(audio_clip("clip-3", 8.0, 8.0, 0.0));
+        clips.push(audio_clip("clip-3", 16.0, 8.0, 0.0));
+
+        assert_eq!(state.repair_duplicate_clip_ids(), 1);
+        let ids: Vec<&str> = state.tracks[0]
+            .clips
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect();
+        assert_eq!(ids, ["clip-1", "clip-3", "clip-4"]);
+        assert_eq!(
+            state.repair_duplicate_clip_ids(),
+            0,
+            "nothing left to repair"
+        );
+    }
+
+    /// The user's report: Ctrl+D on two adjacent MIDI clips gave both copies
+    /// the same id, and put the first copy on top of the second clip — the
+    /// same notes twice, cutting each other off in playback.
+    #[test]
+    fn duplicating_a_selection_keeps_its_layout_and_mints_distinct_ids() {
+        let mut state = TimelineState::default();
+        let track = state.create_track(CreateTrackOptions {
+            track_type: TrackType::Audio,
+            name: "Keys".to_string(),
+            color: gpui::rgba(0x336699ff),
+            volume: 1.0,
+            pan: 0.0,
+            armed: false,
+            input_monitor: InputMonitorMode::Off,
+        });
+        let clips = &mut state
+            .tracks
+            .iter_mut()
+            .find(|t| t.id == track)
+            .unwrap()
+            .clips;
+        clips.push(audio_clip("clip-1", 0.0, 8.0, 0.0));
+        clips.push(audio_clip("clip-2", 8.0, 8.0, 0.0));
+
+        let copies =
+            state.build_clip_group_duplicate(&["clip-1".to_string(), "clip-2".to_string()]);
+        let placed: Vec<(&str, f32)> = copies
+            .iter()
+            .map(|(_, clip)| (clip.id.as_str(), clip.start_beat))
+            .collect();
+        assert_eq!(placed, vec![("clip-3", 16.0), ("clip-4", 24.0)]);
+        assert!(copies.iter().all(|(track_id, _)| *track_id == track));
+
+        // One clip alone still lands right after itself.
+        let single = state.build_clip_group_duplicate(&["clip-2".to_string()]);
+        assert_eq!(single.len(), 1);
+        assert_eq!(
+            (single[0].1.id.as_str(), single[0].1.start_beat),
+            ("clip-3", 16.0)
+        );
+        assert!(state
+            .build_clip_group_duplicate(&["missing".to_string()])
+            .is_empty());
     }
 
     #[test]

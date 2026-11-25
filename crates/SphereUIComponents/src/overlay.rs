@@ -243,12 +243,15 @@ pub fn pointer_anchor(x: f32, y: f32) -> OverlayAnchor {
     }
 }
 
-/// Width of the Inspector value column (right-aligned panel).
+/// Inset of an Inspector row from the dock's edges: a section's padding,
+/// and the dock's 1 px left rule.
+const INSPECTOR_ROW_INSET: f32 = crate::theme::space::LOOSE;
+
+/// Width of the Inspector value column: its share of a row, as
+/// `inspector_kit::ins_form_row` lays it out at the dock's right edge.
 pub fn inspector_value_width(inspector_width: f32) -> f32 {
-    const PAD: f32 = 10.0;
-    const LABEL: f32 = 86.0;
-    const GAP: f32 = 10.0;
-    (inspector_width - PAD * 2.0 - LABEL - GAP).max(80.0)
+    let row = inspector_width - 1.0 - INSPECTOR_ROW_INSET * 2.0;
+    (row * crate::components::inspector_kit::PROP_VALUE_SHARE).max(80.0)
 }
 
 /// Build trigger bounds for an Inspector form-row ComboBox from a click on the
@@ -258,17 +261,15 @@ pub fn inspector_combo_trigger_bounds(
     inspector_width: f32,
     event: &MouseDownEvent,
 ) -> Bounds<Pixels> {
-    const PAD: f32 = 10.0;
-    const LABEL: f32 = 86.0;
-    const GAP: f32 = 10.0;
+    const TRIGGER_H: f32 = crate::components::inspector_kit::PROP_CONTROL_H;
     let value_w = inspector_value_width(inspector_width);
     let win_w: f32 = window.bounds().size.width.into();
-    let value_left = win_w - inspector_width + PAD + LABEL + GAP;
+    let value_left = win_w - INSPECTOR_ROW_INSET - value_w;
     let click_y: f32 = event.position.y.into();
-    let top = click_y - COMBO_TRIGGER_HEIGHT * 0.5;
+    let top = click_y - TRIGGER_H * 0.5;
     bounds(
         point(px(value_left), px(top)),
-        size(px(value_w), px(COMBO_TRIGGER_HEIGHT)),
+        size(px(value_w), px(TRIGGER_H)),
     )
 }
 

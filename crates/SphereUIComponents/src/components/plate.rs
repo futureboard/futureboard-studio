@@ -7,7 +7,7 @@
 //! size and multiplied by `s`.
 //!
 //! The designs carry their own look rather than Studio's tokens: their
-//! palette, Outfit for words and IBM Plex Mono for numbers — both embedded
+//! palette, Outfit for words and Barlow for numbers — both embedded
 //! and registered once ([`ensure_fonts`]) — and the knobs, pills, switches,
 //! cards and header they share. The editors are [`KitModel`]s: every edit is
 //! a wire param through [`KitEditor`], and the live displays are painted by
@@ -78,24 +78,20 @@ pub fn color_a(hex: u32, alpha: f32) -> Rgba {
 // ── Type ───────────────────────────────────────────────────────────────────
 
 const OUTFIT_FAMILY: &str = "Outfit";
-const PLEX_MONO_FAMILY: &str = "IBM Plex Mono";
 /// The Imager's face, Mona Sans, at its normal width (300–600), and the two
 /// wider cuts the design sets its name and its big readouts in.
 const MONA_SANS_FAMILY: &str = "Mona Sans";
 const MONA_SANS_EXPANDED_FAMILY: &str = "Mona Sans Expanded";
 const MONA_SANS_SEMI_EXPANDED_FAMILY: &str = "Mona Sans SemiExpanded";
-/// Rodhareist's number face, set with tabular figures so readouts hold
-/// still. See [`NumberFace`].
+/// The number face of every built-in editor, set with tabular figures so
+/// readouts hold still. See [`mono`].
 const BARLOW_FAMILY: &str = "Barlow";
-static FACES: [&[u8]; 17] = [
+static FACES: [&[u8]; 14] = [
     include_bytes!("../../assets/fonts/outfit/Outfit-Light.ttf"),
     include_bytes!("../../assets/fonts/outfit/Outfit-Regular.ttf"),
     include_bytes!("../../assets/fonts/outfit/Outfit-Medium.ttf"),
     include_bytes!("../../assets/fonts/outfit/Outfit-SemiBold.ttf"),
     include_bytes!("../../assets/fonts/outfit/Outfit-Bold.ttf"),
-    include_bytes!("../../assets/fonts/ibm-plex-mono/IBMPlexMono-Regular.ttf"),
-    include_bytes!("../../assets/fonts/ibm-plex-mono/IBMPlexMono-Medium.ttf"),
-    include_bytes!("../../assets/fonts/ibm-plex-mono/IBMPlexMono-SemiBold.ttf"),
     include_bytes!("../../assets/fonts/mona-sans/MonaSans-Light.ttf"),
     include_bytes!("../../assets/fonts/mona-sans/MonaSans-Regular.ttf"),
     include_bytes!("../../assets/fonts/mona-sans/MonaSans-Medium.ttf"),
@@ -108,15 +104,15 @@ static FACES: [&[u8]; 17] = [
 ];
 static REGISTERED: AtomicBool = AtomicBool::new(false);
 
-/// Adds the embedded Outfit (300–700), IBM Plex Mono (400–600) and Mona Sans
-/// faces to the text system, once per process.
+/// Adds the embedded Outfit (300–700), Mona Sans and Barlow (400–600) faces
+/// to the text system, once per process.
 pub fn ensure_fonts(cx: &App) {
     if REGISTERED.swap(true, Ordering::AcqRel) {
         return;
     }
     let faces = FACES.map(std::borrow::Cow::Borrowed).to_vec();
     if let Err(error) = cx.text_system().add_fonts(faces) {
-        eprintln!("[plate] Outfit / IBM Plex Mono could not be registered: {error}");
+        eprintln!("[plate] Outfit / Mona Sans / Barlow could not be registered: {error}");
         REGISTERED.store(false, Ordering::Release);
     }
 }
@@ -139,46 +135,14 @@ pub fn outfit(weight: FontWeight) -> Font {
     embedded(OUTFIT_FAMILY, weight)
 }
 
-/// Which face [`numbers`] (and so every knob and pill readout) sets digits
-/// in. The plates' designs use IBM Plex Mono; Rodhareist uses Barlow.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum NumberFace {
-    #[default]
-    PlexMono,
-    Barlow,
-}
-
-thread_local! {
-    static NUMBER_FACE: std::cell::Cell<NumberFace> = const { std::cell::Cell::new(NumberFace::PlexMono) };
-}
-
-/// Builds `f` with numbers set in `face`, then puts the previous face back.
-/// The font is fixed into each element when it is built, so an editor that
-/// wraps its render in this changes only its own readouts, not the other
-/// plates'.
-pub fn with_number_face<R>(face: NumberFace, f: impl FnOnce() -> R) -> R {
-    let previous = NUMBER_FACE.with(|cell| cell.replace(face));
-    struct Restore(NumberFace);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            NUMBER_FACE.with(|cell| cell.set(self.0));
-        }
-    }
-    let _restore = Restore(previous);
-    f()
-}
-
-/// The designs' number face: IBM Plex Mono, or Barlow with tabular figures
-/// inside [`with_number_face`].
+/// Every built-in editor's number face (every knob and pill readout, and the
+/// readouts the plates paint): Barlow with tabular figures, so digits hold
+/// still while a value changes. Barlow is proportional, so letters in a
+/// readout no longer line up in columns the way a monospace face's did.
 pub fn mono(weight: FontWeight) -> Font {
-    match NUMBER_FACE.with(|cell| cell.get()) {
-        NumberFace::PlexMono => embedded(PLEX_MONO_FAMILY, weight),
-        NumberFace::Barlow => {
-            let mut font = embedded(BARLOW_FAMILY, weight);
-            font.features = gpui::FontFeatures(std::sync::Arc::new(vec![("tnum".to_string(), 1)]));
-            font
-        }
-    }
+    let mut font = embedded(BARLOW_FAMILY, weight);
+    font.features = gpui::FontFeatures(std::sync::Arc::new(vec![("tnum".to_string(), 1)]));
+    font
 }
 
 /// The Imager's face, Mona Sans, 300–600.

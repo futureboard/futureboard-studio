@@ -42,12 +42,14 @@ impl PluginBridgeSink for WetEffectSink {
     }
 }
 
-fn bridge_effect_track(block: f32) -> RuntimeTrack {
+pub(super) fn bridge_effect_track(block: f32) -> RuntimeTrack {
     let mut params = HashMap::new();
     params.insert("role".to_string(), serde_json::json!("effect"));
     RuntimeTrack {
+        vca_gain: 1.0,
         spatial: None,
         spatial_params: Default::default(),
+        spatial_state: Default::default(),
         active_voices: 0,
         listen: crate::monitor::ListenMode::Off,
         id: "track-1".to_string(),
@@ -67,6 +69,9 @@ fn bridge_effect_track(block: f32) -> RuntimeTrack {
         preview_mode: RuntimePreviewMode::Stereo,
         output_track_id: None,
         output_track_index: None,
+        midi_fx: None,
+        midi_fx_hold: Vec::new(),
+        midi_fx_plugins: Default::default(),
         inserts: vec![RuntimeInsert {
             id: "insert-1".to_string(),
             kind: "external-bridge-plugin".to_string(),
@@ -83,6 +88,7 @@ fn bridge_effect_track(block: f32) -> RuntimeTrack {
             vst3: None,
             cpu_us: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             guard: Default::default(),
+            latency_bypassed: false,
             callback_process_log_done: false,
             silent_process_blocks: 0,
             bridge_missed_blocks: 0,
@@ -92,6 +98,7 @@ fn bridge_effect_track(block: f32) -> RuntimeTrack {
             scratch_multi: Vec::new(),
             chain_latency_samples: 0,
             signal_bus: 0,
+            post_fader: false,
             sidechain: None,
         }],
         sends: Vec::new(),
@@ -128,6 +135,7 @@ fn bridge_effect_track(block: f32) -> RuntimeTrack {
         pdc_write_pos: 0,
         smoothed_gain_l: 1.0,
         smoothed_gain_r: 1.0,
+        dual_pan: Default::default(),
         wdw_return_index: None,
         sidechain_tap: Default::default(),
     }
@@ -1003,6 +1011,7 @@ pub(super) fn bridge_effect_track_with_id(id: &str) -> RuntimeInsert {
         vst3: None,
         cpu_us: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         guard: Default::default(),
+        latency_bypassed: false,
         callback_process_log_done: false,
         silent_process_blocks: 0,
         bridge_missed_blocks: 0,
@@ -1012,6 +1021,7 @@ pub(super) fn bridge_effect_track_with_id(id: &str) -> RuntimeInsert {
         scratch_multi: Vec::new(),
         chain_latency_samples: 0,
         signal_bus: 0,
+        post_fader: false,
         sidechain: None,
     }
 }
@@ -1067,8 +1077,10 @@ fn serial_bridge_effect_chain_applies_both_gains() {
     }
 
     let mut track = RuntimeTrack {
+        vca_gain: 1.0,
         spatial: None,
         spatial_params: Default::default(),
+        spatial_state: Default::default(),
         active_voices: 0,
         listen: crate::monitor::ListenMode::Off,
         id: "track-1".to_string(),
@@ -1088,6 +1100,9 @@ fn serial_bridge_effect_chain_applies_both_gains() {
         preview_mode: RuntimePreviewMode::Stereo,
         output_track_id: None,
         output_track_index: None,
+        midi_fx: None,
+        midi_fx_hold: Vec::new(),
+        midi_fx_plugins: Default::default(),
         inserts: vec![
             bridge_effect_track_with_id("insert-a"),
             bridge_effect_track_with_id("insert-b"),
@@ -1126,6 +1141,7 @@ fn serial_bridge_effect_chain_applies_both_gains() {
         pdc_write_pos: 0,
         smoothed_gain_l: 1.0,
         smoothed_gain_r: 1.0,
+        dual_pan: Default::default(),
         wdw_return_index: None,
         sidechain_tap: Default::default(),
     };
@@ -1220,8 +1236,10 @@ fn serial_bridge_effect_chain_bypasses_only_missed_middle_insert() {
     }
 
     let mut track = RuntimeTrack {
+        vca_gain: 1.0,
         spatial: None,
         spatial_params: Default::default(),
+        spatial_state: Default::default(),
         active_voices: 0,
         listen: crate::monitor::ListenMode::Off,
         id: "track-1".to_string(),
@@ -1241,6 +1259,9 @@ fn serial_bridge_effect_chain_bypasses_only_missed_middle_insert() {
         preview_mode: RuntimePreviewMode::Stereo,
         output_track_id: None,
         output_track_index: None,
+        midi_fx: None,
+        midi_fx_hold: Vec::new(),
+        midi_fx_plugins: Default::default(),
         inserts: vec![
             bridge_effect_track_with_id("insert-a"),
             bridge_effect_track_with_id("insert-b"),
@@ -1280,6 +1301,7 @@ fn serial_bridge_effect_chain_bypasses_only_missed_middle_insert() {
         pdc_write_pos: 0,
         smoothed_gain_l: 1.0,
         smoothed_gain_r: 1.0,
+        dual_pan: Default::default(),
         wdw_return_index: None,
         sidechain_tap: Default::default(),
     };

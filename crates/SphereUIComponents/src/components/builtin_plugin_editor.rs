@@ -80,6 +80,7 @@ pub fn builtin_param_index(plugin_id: &str, param_id: &str) -> Option<u32> {
         airboost::ui::UI_ORIGIN => airboost::ui_param_index(param_id),
         deesser::ui::UI_ORIGIN => deesser::ui_param_index(param_id),
         duckstep::ui::UI_ORIGIN => duckstep::ui_param_index(param_id),
+        trigger::ui::UI_ORIGIN => trigger::ui_param_index(param_id),
         echospace::ui::UI_ORIGIN => echospace::ui_param_index(param_id),
         imager::ui::UI_ORIGIN => imager::ui_param_index(param_id),
         burnlimit::ui::UI_ORIGIN => burnlimit::ui_param_index(param_id),
@@ -161,6 +162,7 @@ pub fn builtin_param_specs(plugin_id: &str) -> Vec<BuiltinParamSpec> {
         Some(airboost::ui::UI_ORIGIN) => specs!(airboost),
         Some(deesser::ui::UI_ORIGIN) => specs!(deesser),
         Some(duckstep::ui::UI_ORIGIN) => specs!(duckstep),
+        Some(trigger::ui::UI_ORIGIN) => specs!(trigger),
         Some(echospace::ui::UI_ORIGIN) => specs!(echospace),
         Some(imager::ui::UI_ORIGIN) => specs!(imager),
         Some(burnlimit::ui::UI_ORIGIN) => specs!(burnlimit),
@@ -223,6 +225,7 @@ mod state_mirror {
         AirBoost(Box<airboost::Params>),
         DeEsser(Box<deesser::Params>),
         Duckstep(Box<duckstep::Params>),
+        Trigger(Box<trigger::Params>),
         Echospace(Box<echospace::Params>),
         Imager(Box<imager::Params>),
         BurnLimit(Box<burnlimit::Params>),
@@ -250,6 +253,7 @@ mod state_mirror {
                 Self::AirBoost(_) => airboost::ui::UI_ORIGIN,
                 Self::DeEsser(_) => deesser::ui::UI_ORIGIN,
                 Self::Duckstep(_) => duckstep::ui::UI_ORIGIN,
+                Self::Trigger(_) => trigger::ui::UI_ORIGIN,
                 Self::Echospace(_) => echospace::ui::UI_ORIGIN,
                 Self::Imager(_) => imager::ui::UI_ORIGIN,
                 Self::BurnLimit(_) => burnlimit::ui::UI_ORIGIN,
@@ -288,6 +292,7 @@ mod state_mirror {
                 duckstep::ui::UI_ORIGIN => {
                     Some(Self::Duckstep(Box::new(duckstep::default_params())))
                 }
+                trigger::ui::UI_ORIGIN => Some(Self::Trigger(Box::new(trigger::default_params()))),
                 echospace::ui::UI_ORIGIN => {
                     Some(Self::Echospace(Box::new(echospace::default_params())))
                 }
@@ -362,6 +367,7 @@ mod state_mirror {
             airboost::ui::UI_ORIGIN => airboost::ui_param_id(wire_index).is_some(),
             deesser::ui::UI_ORIGIN => deesser::ui_param_id(wire_index).is_some(),
             duckstep::ui::UI_ORIGIN => duckstep::ui_param_id(wire_index).is_some(),
+            trigger::ui::UI_ORIGIN => trigger::ui_param_id(wire_index).is_some(),
             echospace::ui::UI_ORIGIN => echospace::ui_param_id(wire_index).is_some(),
             imager::ui::UI_ORIGIN => imager::ui_param_id(wire_index).is_some(),
             burnlimit::ui::UI_ORIGIN => burnlimit::ui_param_id(wire_index).is_some(),
@@ -413,6 +419,9 @@ mod state_mirror {
             }
             Some(BuiltinParams::Duckstep(params)) => {
                 let _ = duckstep::ipc::apply_wire_param(params, wire_index, value);
+            }
+            Some(BuiltinParams::Trigger(params)) => {
+                let _ = trigger::ipc::apply_wire_param(params, wire_index, value);
             }
             Some(BuiltinParams::Echospace(params)) => {
                 let _ = echospace::ipc::apply_wire_param(params, wire_index, value);
@@ -527,6 +536,9 @@ mod state_mirror {
             duckstep::ui::UI_ORIGIN => duckstep::ipc::DuckstepState::from_json(text)
                 .ok()
                 .map(|state| BuiltinParams::Duckstep(Box::new(state.params))),
+            trigger::ui::UI_ORIGIN => trigger::ipc::TriggerState::from_json(text)
+                .ok()
+                .map(|state| BuiltinParams::Trigger(Box::new(state.params))),
             echospace::ui::UI_ORIGIN => echospace::ipc::EchospaceState::from_json(text)
                 .ok()
                 .map(|state| BuiltinParams::Echospace(Box::new(state.params))),
@@ -620,6 +632,11 @@ mod state_mirror {
             }
             BuiltinParams::Duckstep(params) if origin == duckstep::ui::UI_ORIGIN => {
                 duckstep::ipc::DuckstepState::new((**params).clone())
+                    .to_json()
+                    .ok()?
+            }
+            BuiltinParams::Trigger(params) if origin == trigger::ui::UI_ORIGIN => {
+                trigger::ipc::TriggerState::new((**params).clone())
                     .to_json()
                     .ok()?
             }
@@ -788,6 +805,12 @@ mod state_mirror {
                     .filter_map(|(id, value)| duckstep::ui_param_index(id).map(|i| (i, value)))
                     .collect()
             }
+            Some(BuiltinParams::Trigger(params)) if origin == trigger::ui::UI_ORIGIN => {
+                trigger::ipc::ui_values(params)
+                    .into_iter()
+                    .filter_map(|(id, value)| trigger::ui_param_index(id).map(|i| (i, value)))
+                    .collect()
+            }
             Some(BuiltinParams::Echospace(params)) if origin == echospace::ui::UI_ORIGIN => {
                 echospace::ipc::ui_values(params)
                     .into_iter()
@@ -895,6 +918,7 @@ mod state_mirror {
         if origin != drumsampler::ui::UI_ORIGIN
             && origin != quicksampler::ui::UI_ORIGIN
             && origin != slicer::ui::UI_ORIGIN
+            && origin != trigger::ui::UI_ORIGIN
         {
             return false;
         }
@@ -910,6 +934,7 @@ mod state_mirror {
                 Some(&mut params.sample_name)
             }
             Some(BuiltinParams::Slicer(params)) if pad_index == 0 => Some(&mut params.sample_name),
+            Some(BuiltinParams::Trigger(params)) if pad_index == 0 => Some(&mut params.sample_name),
             _ => None,
         };
         match slot {
@@ -954,6 +979,12 @@ mod state_mirror {
                     .collect()
             }
             Some(BuiltinParams::Slicer(params)) if origin == slicer::ui::UI_ORIGIN => params
+                .sample_name
+                .clone()
+                .map(|name| (0, name))
+                .into_iter()
+                .collect(),
+            Some(BuiltinParams::Trigger(params)) if origin == trigger::ui::UI_ORIGIN => params
                 .sample_name
                 .clone()
                 .map(|name| (0, name))
@@ -1179,6 +1210,16 @@ mod state_mirror {
         }
     }
 
+    /// A Trigger insert's mirrored params — its sample name with them — like
+    /// [`builtin_verbspace_params`].
+    pub fn builtin_trigger_params(insert_id: &str) -> Option<trigger::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::Trigger(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
     /// An EchoSpace insert's mirrored params, like
     /// [`builtin_verbspace_params`].
     pub fn builtin_echospace_params(insert_id: &str) -> Option<echospace::Params> {
@@ -1282,9 +1323,9 @@ pub use state_mirror::{
     builtin_slicer_params, builtin_state_apply, builtin_state_bytes, builtin_state_clear,
     builtin_state_parses, builtin_state_remove, builtin_state_replace, builtin_state_replay,
     builtin_state_seed, builtin_state_set_rodhareist_file, builtin_state_set_sample,
-    builtin_transient_params, builtin_used_output_buses, builtin_verbspace_params,
-    builtin_waygate_params, builtin_whitesharp_params, builtin_wrapsynth_params,
-    builtin_zapp_params, builtin_zcomp_params,
+    builtin_transient_params, builtin_trigger_params, builtin_used_output_buses,
+    builtin_verbspace_params, builtin_waygate_params, builtin_whitesharp_params,
+    builtin_wrapsynth_params, builtin_zapp_params, builtin_zcomp_params,
 };
 
 /// Featureless no-ops: without the editor there is no param wire, so there is

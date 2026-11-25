@@ -146,6 +146,11 @@ pub struct WavEncodeOptions {
     /// `RF64` with that chunk turned into `ds64`. Off by default: a file
     /// written without it keeps the classic 44-byte header.
     pub rf64: bool,
+    /// Which speaker each channel feeds, as a `WAVE_FORMAT_EXTENSIBLE`
+    /// `dwChannelMask` (bit 0 front left, 1 front right, 2 centre, 3 LFE, ...),
+    /// for a multichannel file whose channels are in that bit order. `None`
+    /// writes the plain format header, which names no speakers.
+    pub channel_mask: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -392,7 +397,13 @@ pub fn create_encoder(
     let path = path.as_ref();
     match options.format {
         AudioFileFormat::Wav => Ok(Box::new(
-            crate::wav::WavEncoder::create(path, spec, options.wav)?.with_dither(options.dither),
+            crate::wav::WavEncoder::create_with_metadata(
+                path,
+                spec,
+                options.wav,
+                &options.metadata,
+            )?
+            .with_dither(options.dither),
         )),
         AudioFileFormat::Rauf => Ok(Box::new(crate::rauf::RaufEncoder::create(path, spec)?)),
         AudioFileFormat::Flac => create_flac_encoder(path, spec, options),

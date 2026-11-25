@@ -8,7 +8,7 @@
  *   declaring `version.workspace = true`) and every first-party `Cargo.toml`
  *   with an explicit `[package] version` — apps/native/*, crates/* and the
  *   built-in plug-in crates. Vendored forks (crates/gpui, crates/Ara2Bridge,
- *   external/) keep their own upstream versions.
+ *   crates/mkff, external/) keep their own upstream versions.
  * - Cargo.lock: the `[[package]]` entries of those workspace members, so a
  *   `--locked` build after a bump does not fail on a stale lockfile.
  * - packages/shared/app/windows/app.rc: FILEVERSION / PRODUCTVERSION tuples
@@ -96,6 +96,11 @@ function replaceRequired(text, re, replacement, what, file) {
   return { text: text.replace(re, replacement), from: match[2] };
 }
 
+/** CRLF -> LF, so line-anchored patterns behave the same on every checkout. */
+function toLf(text) {
+  return text.replace(/\r\n/g, "\n");
+}
+
 /** Escape a string for use inside a RegExp. */
 function escapeRe(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -172,6 +177,9 @@ const SKIP_DIR_PATHS = [
   path.join("crates", "gpui"),
   path.join("crates", "Ara2Bridge"),
   path.join("crates", "collections"),
+  // MKFF (MediaKit Foundation) is vendored from its own repository and is a
+  // nested workspace with its own release line (0.1.0-dev, Cargo.lock).
+  path.join("crates", "mkff"),
   // Developer tooling and third-party extension scaffolds are not the product.
   "xtask",
   "extensions",
@@ -232,9 +240,22 @@ function cargoTargets() {
   const targets = [];
   const memberNames = new Set();
   const externalNames = new Set();
-  for (const manifest of walkCargoManifests(repoRoot)) {
+  const manifests = [...walkCargoManifests(repoRoot)].map((manifest) => ({
+    manifest,
+    text: toLf(fs.readFileSync(manifest, "utf8")),
+  }));
+  // Directories of nested workspaces (vstplugins/*, apps/mobile/*/rust):
+  // they keep their own Cargo.lock, so their crates must not touch the root
+  // one, even when a name collides (each plug-in has an `xtask`, as does the
+  // root workspace).
+  const nestedWorkspaceDirs = manifests
+    .filter(({ manifest, text }) =>
+      manifest !== path.join(repoRoot, "Cargo.toml") && /^\[workspace\]/m.test(text))
+    .map(({ manifest }) => path.dirname(manifest));
+  // First-party crates of each nested workspace, for its own Cargo.lock.
+  const nestedNames = new Map(nestedWorkspaceDirs.map((dir) => [dir, new Set()]));
+  for (const { manifest, text } of manifests) {
     const rel = path.relative(repoRoot, manifest).split(path.sep).join("/");
-    const text = fs.readFileSync(manifest, "utf8");
     const name = tomlPackageName(text);
     const isRoot = manifest === path.join(repoRoot, "Cargo.toml");
     const sections = isRoot ? ["workspace.package", "package"] : ["package"];
@@ -243,7 +264,11 @@ function cargoTargets() {
       externalNames.add(external);
     }
     if (name && (probe.from !== null || tomlInheritsWorkspaceVersion(text))) {
-      memberNames.add(name);
+      const nested = nestedWorkspaceDirs.find(
+        (dir) => manifest === path.join(dir, "Cargo.toml") || manifest.startsWith(dir + path.sep),
+      );
+      if (nested) nestedNames.get(nested).add(name);
+      else memberNames.add(name);
     }
     if (probe.from === null) continue; // inherits, or no version at all
     targets.push({
@@ -257,6 +282,17 @@ function cargoTargets() {
   }
   for (const external of externalNames) {
     memberNames.delete(external);
+  }
+  // A nested workspace's lockfile pins its own crates and the root-workspace
+  // crates it reaches by path (e.g. builtin_dsp_core), so both must follow.
+  for (const [dir, names] of nestedNames) {
+    const lockNames = new Set([...memberNames, ...names]);
+    targets.push({
+      name: `${path.relative(repoRoot, dir).split(path.sep).join("/")}/Cargo.lock`,
+      path: path.join(dir, "Cargo.lock"),
+      optional: true,
+      transform: cargoLockTransform(lockNames),
+    });
   }
   return { targets, memberNames };
 }
@@ -277,7 +313,8 @@ function cargoLockTransform(memberNames) {
         if (/^source = /m.test(block)) return block; // a registry crate of the same name
         const m = block.match(/^version = "([^"]*)"$/m);
         if (!m) return block;
-        from = from ?? m[1];
+        // Report the first stale entry, not the first member.
+        if (m[1] !== version) from = from ?? m[1];
         return block.replace(/^version = "([^"]*)"$/m, `version = "${version}"`);
       })
       .join("\n[[package]]\n");
@@ -466,7 +503,13 @@ for (const target of targets) {
     throw new Error(`Missing sync target: ${target.name}`);
   }
   const currentText = fs.readFileSync(target.path, "utf8");
-  const { text: nextText, from, to } = target.transform(currentText);
+  // Transforms match line-anchored patterns against LF text. A CRLF working
+  // copy (core.autocrlf on Windows) is converted for the transform and back
+  // afterwards, so a check run on Windows sees the same result as CI.
+  const crlf = currentText.includes("\r\n");
+  const result = target.transform(crlf ? toLf(currentText) : currentText);
+  const { from, to } = result;
+  const nextText = crlf ? result.text.replace(/\n/g, "\r\n") : result.text;
   if (nextText === currentText) {
     console.log(`[sync-version] ok: ${target.name}`);
     continue;

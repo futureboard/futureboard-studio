@@ -38,6 +38,15 @@ impl RuntimeProject {
             if events.capacity() < MIDI_BLOCK_EVENT_BASE_CAPACITY {
                 events.reserve(MIDI_BLOCK_EVENT_BASE_CAPACITY - events.len());
             }
+            // A MIDI FX chain can multiply a block's events (a chord, an
+            // arpeggio): its output and its hold list get its full capacity.
+            if track.midi_fx.is_some() {
+                for list in [&mut track.midi_block_events, &mut track.midi_fx_hold] {
+                    if list.capacity() < MIDI_FX_EVENT_CAPACITY {
+                        list.reserve(MIDI_FX_EVENT_CAPACITY - list.len());
+                    }
+                }
+            }
         }
         for midi_track in &self.midi_tracks {
             let Some(track) = midi_track

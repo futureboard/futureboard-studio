@@ -76,9 +76,73 @@ pub fn pan_gains(pan: f32) -> (f32, f32) {
     (l * SQRT_2, r * SQRT_2)
 }
 
+/// The 2×2 matrix of a Dual pan: where the left input and the right input
+/// each land, `[l→L, l→R, r→L, r→R]`, so
+///
+/// ```text
+/// out_l = in_l · m[0] + in_r · m[2]
+/// out_r = in_l · m[1] + in_r · m[3]
+/// ```
+///
+/// Each input follows [`pan_gains`]' sin/cos law scaled by `1/√2`: the same
+/// constant-power sweep, but unity at the *extremes* rather than at the
+/// centre. That is what makes the default placement (left input hard left,
+/// right input hard right) exactly the identity, so switching a channel from
+/// Balance to Dual changes nothing until a knob moves; a centred input sends
+/// −3 dB to each side, as a mono source panned on a console does.
+#[inline]
+pub fn dual_pan_matrix(left: f32, right: f32) -> [f32; 4] {
+    let (ll, lr) = dual_pan_input_gains(left);
+    let (rl, rr) = dual_pan_input_gains(right);
+    [ll, lr, rl, rr]
+}
+
+#[inline]
+fn dual_pan_input_gains(pan: f32) -> (f32, f32) {
+    use std::f32::consts::{FRAC_1_SQRT_2, FRAC_PI_4};
+    let pan = if pan.is_finite() {
+        pan.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+    // Exact end points and centre, as in `pan_gains`.
+    if pan <= -1.0 {
+        return (1.0, 0.0);
+    }
+    if pan >= 1.0 {
+        return (0.0, 1.0);
+    }
+    if pan == 0.0 {
+        return (FRAC_1_SQRT_2, FRAC_1_SQRT_2);
+    }
+    let angle = (pan + 1.0) * FRAC_PI_4; // 0..π/2
+    let (r, l) = angle.sin_cos();
+    (l, r)
+}
+
 #[cfg(test)]
 mod pan_tests {
-    use super::pan_gains;
+    use super::{dual_pan_matrix, pan_gains};
+
+    #[test]
+    fn dual_pan_default_is_identity_and_follows_the_pan_law() {
+        assert_eq!(dual_pan_matrix(-1.0, 1.0), [1.0, 0.0, 0.0, 1.0]);
+        // Both inputs hard left: everything on the left output.
+        assert_eq!(dual_pan_matrix(-1.0, -1.0), [1.0, 0.0, 1.0, 0.0]);
+        // Out-of-range clamps.
+        assert_eq!(dual_pan_matrix(-5.0, 5.0), dual_pan_matrix(-1.0, 1.0));
+        for step in -20..=20 {
+            let p = step as f32 / 20.0;
+            let m = dual_pan_matrix(p, p);
+            let (l, r) = pan_gains(p);
+            let inv = std::f32::consts::FRAC_1_SQRT_2;
+            assert!((m[0] - l * inv).abs() < 1.0e-6, "pan {p}");
+            assert!((m[1] - r * inv).abs() < 1.0e-6, "pan {p}");
+            assert_eq!((m[0], m[1]), (m[2], m[3]));
+            // Constant power per input.
+            assert!((m[0] * m[0] + m[1] * m[1] - 1.0).abs() < 1.0e-5);
+        }
+    }
 
     #[test]
     fn center_is_unity_and_extremes_isolate_a_channel() {

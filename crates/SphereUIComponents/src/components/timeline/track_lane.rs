@@ -73,6 +73,7 @@ pub(crate) fn track_lane(
         std::sync::Arc<dyn Fn(&String, &mut gpui::Window, &mut gpui::App) + 'static>,
     >,
     on_cut_clip: Option<crate::components::timeline::audio_clip::AudioClipCutCb>,
+    on_clip_body_press: Option<crate::components::timeline::audio_clip::ClipBodyPressCb>,
     erase_preview_ids: Option<&std::collections::HashSet<String>>,
     on_audio_clip_process_preview: AudioClipProcessPreviewCb,
     on_audio_clip_process_commit: AudioClipProcessCommitCb,
@@ -144,6 +145,7 @@ pub(crate) fn track_lane(
             let on_open = on_open_editor.clone();
             let on_del = on_erase_clip.clone();
             let on_cut = on_cut_clip.clone();
+            let on_body_press = on_clip_body_press.clone();
             let selected = frame.selected.contains(&clip.id);
             let erase_target = erase_preview_ids
                 .map(|s| s.contains(&clip.id))
@@ -166,6 +168,7 @@ pub(crate) fn track_lane(
                         on_clip_context,
                         on_del,
                         on_cut,
+                        on_body_press,
                         erase_target,
                         selected,
                         (left, width),
@@ -188,6 +191,7 @@ pub(crate) fn track_lane(
                     on_clip_context,
                     on_open,
                     on_del,
+                    on_body_press,
                     erase_target,
                     selected,
                     (left, width),
@@ -364,8 +368,11 @@ pub(crate) fn track_lane(
                             return;
                         }
                         let bypass_snap = event.modifiers.shift;
+                        // The clip goes in the cell clicked: its start, not
+                        // the nearest line, which past mid-bar is the next
+                        // bar — on top of whatever clip starts there.
                         let snapped_beat = state_ref
-                            .snap_beats_with_bypass(state_ref.x_to_beats(lane_x), bypass_snap);
+                            .cell_start_with_bypass(state_ref.x_to_beats(lane_x), bypass_snap);
                         on_add(
                             &(track_id_add.clone(), snapped_beat, click_count, bypass_snap),
                             window,

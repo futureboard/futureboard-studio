@@ -80,6 +80,10 @@ pub(crate) const IO_ROW_H: f32 = 17.0;
 pub(crate) const IO_ROW_GAP: f32 = 2.0;
 /// The I/O block: input over output.
 pub(crate) const IO_BLOCK_H: f32 = IO_ROW_H * 2.0 + IO_ROW_GAP;
+/// The EQ curve: what the channel's EQ inserts do, across 20 Hz–20 kHz.
+pub(crate) const EQ_H: f32 = 34.0;
+/// The level range the EQ curve shows, either side of 0 dB.
+pub(crate) const EQ_RANGE_DB: f32 = 15.0;
 /// The pan row: the knob and its readout under it.
 pub(crate) const PAN_H: f32 = PAN_KNOB_SIZE + 2.0 + 11.0;
 /// The pan knob's diameter.

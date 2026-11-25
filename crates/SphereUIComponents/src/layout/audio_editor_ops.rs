@@ -154,12 +154,27 @@ impl StudioLayout {
         self.audio_editor_audition_end = Some(end);
     }
 
+    /// The Audio Editor's playhead layer while the dock shows the clip
+    /// editor, for the studio root to render beside the cached bottom panel
+    /// rather than in it (see `audio_editor::EditorPlayhead`). The editor
+    /// itself turns the line off when the panel shows another editor.
+    pub(super) fn audio_editor_playhead_layer(
+        &self,
+        cx: &App,
+    ) -> Option<Entity<crate::components::audio_editor::EditorPlayhead>> {
+        // `EffectEditor` shows the clip editor too (see `render_active_tab`).
+        let editor_tab = matches!(
+            self.active_bottom_tab,
+            BottomTab::Editor | BottomTab::EffectEditor
+        );
+        (self.panels.bottom_docked && editor_tab)
+            .then(|| self.audio_editor.read(cx).playhead_layer())
+    }
+
     /// On a transport tick: move the editor's playhead line and end a
     /// play-selection audition once it reaches its end.
     pub(super) fn tick_audio_editor(&mut self, playing: bool, cx: &mut Context<Self>) {
-        if self.bottom_panel_docked() && self.active_bottom_tab() != BottomTab::Mixer {
-            crate::components::AudioEditorHost::publish_playhead(&self.audio_editor, cx);
-        }
+        crate::components::AudioEditorHost::publish_playhead(&self.audio_editor, cx);
         let Some(end) = self.audio_editor_audition_end else {
             return;
         };

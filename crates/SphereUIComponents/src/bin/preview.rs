@@ -152,6 +152,9 @@ fn main() {
                     // Opened and moved off the desktop in one update, so the
                     // message loop never gets to paint it where it opened.
                     let opened = cx.update(|cx| -> Result<AnyWindowHandle, String> {
+                        // Every scene starts as Community; one that shows the
+                        // Professional surface installs it for itself.
+                        sphere_ui_components::edition::clear_edition_provider();
                         let handle = scene.open(cx).map_err(|error| format!("{error:#}"))?;
                         handle
                             .update(cx, |_, window, _| preview::tuck_away(window))

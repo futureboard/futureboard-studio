@@ -11,6 +11,9 @@ pub struct PluginHostSpawnConfig {
     pub ipc_token: String,
     pub log_dir: PathBuf,
     pub plugin_path: Option<PathBuf>,
+    /// Spawn the 32-bit host (`FutureboardPluginHostX86.exe`) instead of the
+    /// 64-bit one, for plug-ins built for 32-bit Windows.
+    pub x86: bool,
 }
 
 impl Default for PluginHostSpawnConfig {
@@ -22,6 +25,7 @@ impl Default for PluginHostSpawnConfig {
             ipc_token: crate::ipc::PROTOCOL_VERSION.to_string(),
             log_dir: crate::plugin_host_logging::default_log_dir(),
             plugin_path: None,
+            x86: false,
         }
     }
 }

@@ -98,6 +98,9 @@ fn native_au_to_descriptor(entry: NativePluginInfo) -> Result<PluginDescriptor, 
         category,
         // ARA hosting is VST3-only in Futureboard; an AU row never claims it.
         is_ara: false,
+        // VST3-only bus flag; an AU MIDI effect is told apart by its
+        // `MIDI Processor` category instead.
+        midi_output: false,
         is_instrument,
         is_effect: !is_instrument,
         scan_status: if entry.sdk_metadata_loaded {

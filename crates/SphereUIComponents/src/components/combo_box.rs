@@ -49,12 +49,41 @@ pub fn combo_box_trigger(
     open: bool,
     on_mouse_down: impl Fn(&gpui::MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
+    combo_trigger(id, label, open, false, on_mouse_down)
+}
+
+/// [`combo_box_trigger`] at the Inspector's property-row height, so a
+/// routing menu sits in its row like every other value control there.
+pub fn combo_box_trigger_dense(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<String>,
+    open: bool,
+    on_mouse_down: impl Fn(&gpui::MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    combo_trigger(id, label, open, true, on_mouse_down)
+}
+
+fn combo_trigger(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<String>,
+    open: bool,
+    dense: bool,
+    on_mouse_down: impl Fn(&gpui::MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
     div()
         .id(id)
-        .h(px(30.0))
+        .h(px(if dense {
+            crate::components::inspector_kit::PROP_CONTROL_H
+        } else {
+            30.0
+        }))
         .w_full()
         .min_w(px(0.0))
-        .rounded(px(crate::theme::radius::CONTROL))
+        .rounded(px(if dense {
+            crate::theme::radius::CONTROL_SM
+        } else {
+            crate::theme::radius::CONTROL
+        }))
         .border(px(1.0))
         .border_color(if open {
             Colors::border_focus()
@@ -66,12 +95,20 @@ pub fn combo_box_trigger(
         } else {
             Colors::surface_input()
         })
-        .px(px(9.0))
+        .px(px(if dense {
+            crate::theme::space::SNUG
+        } else {
+            9.0
+        }))
         .flex()
         .flex_row()
         .items_center()
         .justify_between()
-        .gap(px(8.0))
+        .gap(px(if dense {
+            crate::theme::space::TIGHT
+        } else {
+            8.0
+        }))
         .cursor(gpui::CursorStyle::PointingHand)
         .hover(|s| {
             s.bg(Colors::surface_control_hover())
@@ -86,7 +123,11 @@ pub fn combo_box_trigger(
                 .flex()
                 .items_center()
                 .truncate()
-                .text_size(px(11.0))
+                .text_size(px(if dense {
+                    crate::theme::typography::UI_XS
+                } else {
+                    11.0
+                }))
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(Colors::text_primary())
                 .child(label.into()),
@@ -94,8 +135,8 @@ pub fn combo_box_trigger(
         .child(
             svg()
                 .path(assets::ICON_CHEVRON_DOWN_PATH)
-                .w(px(11.0))
-                .h(px(11.0))
+                .w(px(if dense { 10.0 } else { 11.0 }))
+                .h(px(if dense { 10.0 } else { 11.0 }))
                 .flex_shrink_0()
                 .text_color(Colors::text_faint()),
         )

@@ -40,6 +40,7 @@ zapp.workspace = true
 airboost.workspace = true
 deesser.workspace = true
 duckstep.workspace = true
+trigger.workspace = true
 echospace.workspace = true
 imager.workspace = true
 burnlimit.workspace = true

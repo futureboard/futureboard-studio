@@ -25,10 +25,10 @@
 //! overshoot the anti-alias filter puts back), and the dry/wet mix blends in
 //! the latency-aligned input.
 
-use builtin_dsp_core::delay::{smoothing_step, Smoothed};
+use builtin_dsp_core::delay::{Smoothed, smoothing_step};
 use builtin_dsp_core::{
-    clamp, db_to_linear, linear_to_db, mix, time_constant, ParamDescriptor, PluginCategory,
-    PluginDescriptor, StereoEffect,
+    ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, clamp, db_to_linear,
+    linear_to_db, mix, time_constant,
 };
 use serde::{Deserialize, Serialize};
 
@@ -37,11 +37,11 @@ mod oversample;
 pub mod presets;
 pub mod ui;
 
-pub use ipc::{ui_param_id, ui_param_index, UI_PARAM_IDS};
+pub use ipc::{UI_PARAM_IDS, ui_param_id, ui_param_index};
 pub use oversample::TAPS_PER_PHASE;
-pub use presets::{factory_presets, FactoryPreset};
+pub use presets::{FactoryPreset, factory_presets};
 
-use oversample::{AntiAlias, Lookahead, Ring, MAX_FACTOR};
+use oversample::{AntiAlias, Lookahead, MAX_FACTOR, Ring};
 
 pub const PLUGIN_ID: &str = "futureboard.clipper67";
 
@@ -809,11 +809,7 @@ impl Path {
     /// The gain a peak of `peak` needs to sit at `target`.
     #[inline]
     fn needed(peak: f32, target: f32) -> f32 {
-        if peak > target {
-            target / peak
-        } else {
-            1.0
-        }
+        if peak > target { target / peak } else { 1.0 }
     }
 
     /// One (oversampled) sample pair through the mode's shaper. Returns the

@@ -1,11 +1,10 @@
-//! Studio reverb — a Freeverb-style bank of parallel comb filters into series
-//! all-pass diffusers (the classic Schroeder/Moorer topology popularised by
-//! Jezar's public-domain Freeverb), fronted by a fractional predelay and, for
-//! the Shimmer voicing, an octave-up granular pitch shifter folded into the
-//! comb feedback. Four voicings — Plate, Room, Hall, Shimmer — share one
-//! preallocated buffer set; a model change only re-targets smoothed voicing
-//! parameters (damping, loop gain, predelay tap, shimmer amount), never
-//! reallocates, so it is safe from the audio-producer thread.
+//! Studio reverb. Plate, Room, Hall, Shimmer, Spring, Chamber, Ambience and
+//! Dark Hall share one Freeverb-style bank of parallel combs into series
+//! allpasses, fronted by a fractional predelay and, for Shimmer, an octave-up
+//! grain folded into the comb feedback. A model change among those only
+//! re-targets smoothed voicing parameters. Live Room does not: it is a
+//! separate modulated figure-8 tank ([`super::live_room`]) crossfaded against
+//! this bank. Neither path reallocates from `process`.
 //!
 //! All buffers are allocated in [`PlateReverb::new`] / `rebuild` (control
 //! thread). [`PlateReverb::process`] performs no allocation or locking.
@@ -13,7 +12,11 @@
 use builtin_dsp_core::mix;
 
 use super::ReverbModel;
+use super::live_room::LiveRoom;
 use super::smooth::Smoothed;
+
+/// Crossfade between the comb bank and the Live Room tank.
+const ALGORITHM_FADE_SECONDS: f32 = 0.045;
 
 /// Glide time for decay/mix/voicing edits (see `smooth.rs`).
 const SMOOTH_SECONDS: f32 = 0.010;
@@ -149,6 +152,18 @@ impl Voicing {
                 crossfeed: 0.50,
                 diffusion: 0.46,
                 early_gain: 0.10,
+            },
+            // Not heard: Live Room runs the figure-8 tank. Kept so this match
+            // stays exhaustive if a crossfade ever asks the comb bank for it.
+            ReverbModel::LiveRoom => Self {
+                predelay_s: 0.012,
+                size: 0.60,
+                fb_offset: 0.60,
+                fb_scale: 0.18,
+                damp: 0.50,
+                crossfeed: 0.18,
+                diffusion: 0.50,
+                early_gain: 0.28,
             },
         }
     }
@@ -359,6 +374,15 @@ pub(super) struct PlateReverb {
     /// transposed voice regenerates. Bounded to keep the shimmer loop stable.
     shimmer_fb_l: f32,
     shimmer_fb_r: f32,
+    /// Figure-8 tank used only while the model is Live Room (and during the
+    /// short crossfade into or out of it).
+    live: LiveRoom,
+    live_blend: Smoothed,
+    /// Set once the comb bank has been silenced after a fade to Live Room,
+    /// so the clear does not run on every sample.
+    plate_cleared: bool,
+    /// Set while the tank is in the mix, so leaving Live Room clears it once.
+    live_running: bool,
 }
 
 impl PlateReverb {
@@ -388,6 +412,10 @@ impl PlateReverb {
             predelay_samples: Smoothed::new(sr, PREDELAY_SMOOTH_SECONDS, 1.0),
             shimmer_fb_l: 0.0,
             shimmer_fb_r: 0.0,
+            live: LiveRoom::new(sr),
+            live_blend: Smoothed::new(sr, ALGORITHM_FADE_SECONDS, 0.0),
+            plate_cleared: false,
+            live_running: false,
         };
         reverb.rebuild();
         reverb
@@ -405,12 +433,32 @@ impl PlateReverb {
         self.shimmer.set_time(self.sample_rate, SMOOTH_SECONDS);
         self.predelay_samples
             .set_time(self.sample_rate, PREDELAY_SMOOTH_SECONDS);
+        self.live_blend
+            .set_time(self.sample_rate, ALGORITHM_FADE_SECONDS);
         self.shimmer_l = OctaveUp::new(self.sample_rate);
         self.shimmer_r = OctaveUp::new(self.sample_rate);
+        self.live.set_sample_rate(self.sample_rate);
         self.rebuild();
     }
 
     pub(super) fn reset(&mut self) {
+        self.clear_plate();
+        self.live.reset_audio();
+        self.plate_cleared = false;
+        self.live_running = false;
+        self.feedback.snap();
+        self.mix.snap();
+        self.damp.snap();
+        self.size.snap();
+        self.crossfeed.snap();
+        self.diffusion.snap();
+        self.early_gain.snap();
+        self.shimmer.snap();
+        self.predelay_samples.snap();
+        self.live_blend.snap();
+    }
+
+    fn clear_plate(&mut self) {
         for c in self.combs_l.iter_mut().chain(self.combs_r.iter_mut()) {
             c.clear();
         }
@@ -423,15 +471,6 @@ impl PlateReverb {
         self.shimmer_r.clear();
         self.shimmer_fb_l = 0.0;
         self.shimmer_fb_r = 0.0;
-        self.feedback.snap();
-        self.mix.snap();
-        self.damp.snap();
-        self.size.snap();
-        self.crossfeed.snap();
-        self.diffusion.snap();
-        self.early_gain.snap();
-        self.shimmer.snap();
-        self.predelay_samples.snap();
     }
 
     /// Allocate all buffers at the largest voicing size for the current sample
@@ -469,11 +508,21 @@ impl PlateReverb {
     /// `model` selects the voicing; `decay_s` is 0.5..15 and the percentage
     /// controls are 0..100. `shimmer` is ignored by non-Shimmer models.
     pub(super) fn configure(&mut self, model: ReverbModel, decay_s: f32, mix: f32, shimmer: f32) {
+        self.mix.set_target((mix / 100.0).clamp(0.0, 1.0));
+        self.live.configure(decay_s);
+        // Leave the comb bank on the voicing it already has while it fades
+        // out. Retuning it to a dummy Live Room curve would be audible for
+        // the length of the crossfade.
+        if model == ReverbModel::LiveRoom {
+            self.live_blend.set_target(1.0);
+            self.shimmer.set_target(0.0);
+            return;
+        }
+        self.live_blend.set_target(0.0);
         let v = Voicing::for_model(model);
         let amount = ((decay_s - 0.5) / 14.5).clamp(0.0, 1.0);
         self.feedback
             .set_target((v.fb_offset + amount * v.fb_scale).clamp(0.0, 0.985));
-        self.mix.set_target((mix / 100.0).clamp(0.0, 1.0));
         self.damp.set_target(v.damp);
         self.size.set_target(v.size);
         self.crossfeed.set_target(v.crossfeed);
@@ -490,8 +539,38 @@ impl PlateReverb {
 
     #[inline]
     pub(super) fn process(&mut self, left: f32, right: f32) -> (f32, f32) {
-        let feedback = self.feedback.tick();
+        let blend = self.live_blend.tick().clamp(0.0, 1.0);
         let mix_amount = self.mix.tick();
+        let wet = if blend <= 1.0e-3 {
+            if self.live_running {
+                self.live.reset_audio();
+                self.live_running = false;
+            }
+            self.process_plate_wet(left, right)
+        } else if blend >= 1.0 - 1.0e-3 {
+            if !self.plate_cleared {
+                self.clear_plate();
+                self.plate_cleared = true;
+            }
+            self.live_running = true;
+            self.live.process(left, right)
+        } else {
+            self.plate_cleared = false;
+            self.live_running = true;
+            let plate = self.process_plate_wet(left, right);
+            let live = self.live.process(left, right);
+            (
+                plate.0 + (live.0 - plate.0) * blend,
+                plate.1 + (live.1 - plate.1) * blend,
+            )
+        };
+        (mix(left, wet.0, mix_amount), mix(right, wet.1, mix_amount))
+    }
+
+    /// Comb-bank wet signal, without the shared dry/wet mix.
+    #[inline]
+    fn process_plate_wet(&mut self, left: f32, right: f32) -> (f32, f32) {
+        let feedback = self.feedback.tick();
         let damp = self.damp.tick();
         let size = self.size.tick().clamp(0.2, 1.0);
         let crossfeed = self.crossfeed.tick().clamp(0.0, 0.5);
@@ -584,7 +663,7 @@ impl PlateReverb {
             self.shimmer_fb_r = 0.0;
         }
 
-        (mix(left, wet_l, mix_amount), mix(right, wet_r, mix_amount))
+        (wet_l, wet_r)
     }
 }
 

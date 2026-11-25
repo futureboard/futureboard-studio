@@ -33,12 +33,16 @@
 )]
 
 pub mod account;
+/// Settings → Experimental → API server: loudness and visualizer data over
+/// loopback HTTP + WebSocket, and the web page that shows it.
+pub mod api_server;
 pub mod app_state;
 pub mod assets;
 pub mod audio_connections;
 pub mod audio_edit;
 pub mod audio_routing;
 pub mod audio_routing_compile;
+pub mod audio_to_midi;
 pub mod auth;
 pub mod auth_dialog;
 pub mod boot;
@@ -88,6 +92,7 @@ pub mod soundfont_player;
 pub mod system_load;
 pub mod tap_tempo;
 pub mod update_service;
+pub mod visualizer_link;
 pub mod window_lifecycle;
 pub mod window_position;
 pub mod workspace_layout;

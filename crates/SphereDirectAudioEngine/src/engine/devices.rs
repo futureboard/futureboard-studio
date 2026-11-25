@@ -726,6 +726,32 @@ impl EngineInner {
     ///   input that lagged the output by whatever the panel had just added.
     ///   The session is reopened with the same config, which re-snaps the
     ///   buffer size to the driver's new constraints.
+    /// Opens the running ASIO driver's own control panel (buffer size, clock
+    /// source, routing — whatever the driver offers). `Ok(false)` when the
+    /// engine is not running an ASIO device. A buffer-size change made there
+    /// comes back as the driver's `resetRequest`, which
+    /// [`Self::service_asio_driver_events`] answers by reopening the session.
+    #[cfg(all(target_os = "windows", feature = "asio"))]
+    pub(crate) fn open_asio_control_panel(&self) -> Result<bool, SphereAudioError> {
+        let device = {
+            let stream_guard = self.active_stream.lock();
+            let Some(handle) = stream_guard.as_ref().and_then(|s| s.as_asio_duplex()) else {
+                return Ok(false);
+            };
+            handle.driver_device()
+        };
+        device
+            .asio_open_control_panel()
+            .map(|()| true)
+            .map_err(SphereAudioError::NativeError)
+    }
+
+    /// No ASIO in this build: there is no driver panel to open.
+    #[cfg(not(all(target_os = "windows", feature = "asio")))]
+    pub(crate) fn open_asio_control_panel(&self) -> Result<bool, SphereAudioError> {
+        Ok(false)
+    }
+
     #[cfg(all(target_os = "windows", feature = "asio"))]
     pub(super) fn service_asio_driver_events(&self) {
         let (latencies_changed, reset_requested, refreshed) = {
@@ -795,6 +821,7 @@ impl EngineInner {
         // The status poll is the control thread's regular visit, so it is where
         // the driver's pending notifications get acted on.
         self.service_asio_driver_events();
+        self.service_short_pdc_rings();
         let st = self.status.lock().clone();
         let daux_cfg = self.daux_config.lock().clone();
         let glitch_count = self.glitch_counter.load(Ordering::Relaxed) as f64;

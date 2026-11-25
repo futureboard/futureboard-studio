@@ -314,7 +314,7 @@ pub fn open_raw_pcm_import_dialog(
     options.window_background = WindowBackgroundAppearance::Transparent;
     crate::window_position::apply_owner_display(&mut options, owner_bounds, cx);
 
-    cx.open_window(options, move |_window, cx| {
+    crate::dialog_frame::open_dialog_window(cx, options, move |_window, cx| {
         cx.new(|_cx| RawPcmImportDialog::new(setup, on_import, on_close))
     })
     .map_err(|e| e.to_string())

@@ -39,7 +39,7 @@ impl RuntimeProject {
         let pitch = pitch.min(127);
         let velocity = velocity.clamp(1, 127);
         self.midi_sent_since_panic = true;
-        let bridged = self.plugin_bridge_sinks.contains_key(plugin_instance_id);
+        let bridged = self.preview_goes_to_bridge(track_id, plugin_instance_id);
         if bridged {
             // Shared-memory path: always write into the realtime MIDI ring on the
             // audio thread. Do not rely on midi_block_events / runtime inserts.
@@ -79,7 +79,7 @@ impl RuntimeProject {
                 track_id, plugin_instance_id, channel, pitch
             );
         }
-        let bridged = self.plugin_bridge_sinks.contains_key(plugin_instance_id);
+        let bridged = self.preview_goes_to_bridge(track_id, plugin_instance_id);
         if bridged {
             self.push_bridge_preview_midi(plugin_instance_id, 0x80 | channel, pitch, 0, "note_off");
             self.set_preview_active(track_id, channel, pitch, false);
@@ -117,7 +117,7 @@ impl RuntimeProject {
             return;
         }
         let controller = controller.min(128);
-        if self.plugin_bridge_sinks.contains_key(plugin_instance_id) {
+        if self.preview_goes_to_bridge(track_id, plugin_instance_id) {
             if controller == 128 {
                 self.push_bridge_preview_midi(
                     plugin_instance_id,
@@ -159,7 +159,7 @@ impl RuntimeProject {
         let channel = channel.min(15);
         let value = value.min(16_383);
         self.midi_sent_since_panic = true;
-        if self.plugin_bridge_sinks.contains_key(plugin_instance_id) {
+        if self.preview_goes_to_bridge(track_id, plugin_instance_id) {
             self.push_bridge_preview_midi(
                 plugin_instance_id,
                 0xE0 | channel,
@@ -197,6 +197,13 @@ impl RuntimeProject {
             );
         }
         push_all_notes_off_for_track(self, track_index, &active, 0, true);
+        // An arpeggio or a generator keeps playing on its own: end it too.
+        if let Some(fx) = track_index
+            .and_then(|ti| self.tracks.get(ti))
+            .and_then(|track| track.midi_fx.as_ref())
+        {
+            fx.request_release();
+        }
         if self.plugin_bridge_sinks.contains_key(plugin_instance_id) {
             if let Some(sink) = self.plugin_bridge_sinks.get(plugin_instance_id) {
                 for &(channel, pitch) in &active {
@@ -216,6 +223,18 @@ impl RuntimeProject {
         {
             mt.preview_active.clear();
         }
+    }
+
+    /// Whether a preview event for `track_id` is written straight into the
+    /// instrument's bridge ring. Not when the track has MIDI FX: the event
+    /// must go through the chain, so it is queued in `midi_block_events` like
+    /// clip notes and reaches the instrument at render time.
+    fn preview_goes_to_bridge(&self, track_id: &str, plugin_instance_id: &str) -> bool {
+        self.plugin_bridge_sinks.contains_key(plugin_instance_id)
+            && !self
+                .tracks
+                .iter()
+                .any(|track| track.id == track_id && track.midi_fx.is_some())
     }
 
     pub(super) fn push_bridge_preview_midi(

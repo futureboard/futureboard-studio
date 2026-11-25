@@ -2,12 +2,17 @@ use crate::assets;
 use gpui::{AssetSource, Result, SharedString};
 use std::borrow::Cow;
 
-/// Asset path for the boot splash image, resolvable via `gpui::img(...)`.
-pub const SPLASH_IMAGE_PATH: &str = "images/splash.png";
+/// Boot splash shown when an edition's own artwork is missing ("Starting
+/// Up…"), resolvable via `gpui::img(...)`. Every splash path names the @2x
+/// artwork; [`splash_image_for_scale`] swaps in its @1x copy on a 100% display.
+pub const SPLASH_IMAGE_PATH: &str = "images/splash_new_2x.png";
 /// Community Edition boot splash image.
-pub const SPLASH_CE_IMAGE_PATH: &str = "images/Splash_CE.png";
+pub const SPLASH_CE_IMAGE_PATH: &str = "images/Splash_CE_new_2x.png";
 /// Licensed Professional Edition boot splash image.
-pub const SPLASH_PROFESSIONAL_IMAGE_PATH: &str = "images/Splash_Professional.png";
+pub const SPLASH_PROFESSIONAL_IMAGE_PATH: &str = "images/Splash_Professional_new_2x.png";
+const SPLASH_IMAGE_1X_PATH: &str = "images/splash_new_1x.png";
+const SPLASH_CE_IMAGE_1X_PATH: &str = "images/Splash_CE_new_1x.png";
+const SPLASH_PROFESSIONAL_IMAGE_1X_PATH: &str = "images/Splash_Professional_new_1x.png";
 /// Futureboard application icon/logo from packages/assets, resolvable via `gpui::img(...)`.
 pub const APP_LOGO_PATH: &str = "images/app.png";
 /// Futureboard horizontal wordmark from packages/assets, embedded for app chrome.
@@ -15,22 +20,55 @@ pub const LOGO_TEXT_PATH: &str = "images/logo-text.png";
 
 /// Splash PNG, embedded at compile time so it ships inside the binary (no
 /// runtime file dependency on the source tree / install layout).
-static SPLASH_PNG: &[u8] = include_bytes!("../../../packages/shared/images/splash.png");
-static SPLASH_CE_PNG: &[u8] = include_bytes!("../../../packages/shared/images/Splash_CE.png");
+static SPLASH_PNG: &[u8] = include_bytes!("../../../packages/shared/images/splash_new_2x.png");
+static SPLASH_CE_PNG: &[u8] =
+    include_bytes!("../../../packages/shared/images/Splash_CE_new_2x.png");
 static SPLASH_PROFESSIONAL_PNG: &[u8] =
-    include_bytes!("../../../packages/shared/images/Splash_Professional.png");
-static APP_LOGO_PNG: &[u8] = include_bytes!("../../../packages/assets/app.png");
+    include_bytes!("../../../packages/shared/images/Splash_Professional_new_2x.png");
+// Downscaled copies for 100% displays, so the window does not minify the @2x
+// art at runtime (which softens the type).
+static SPLASH_1X_PNG: &[u8] = include_bytes!("../../../packages/shared/images/splash_new_1x.png");
+static SPLASH_CE_1X_PNG: &[u8] =
+    include_bytes!("../../../packages/shared/images/Splash_CE_new_1x.png");
+static SPLASH_PROFESSIONAL_1X_PNG: &[u8] =
+    include_bytes!("../../../packages/shared/images/Splash_Professional_new_1x.png");
+// The app icon, as the About window draws it: a 144 px (2x) copy of
+// packages/shared/app/icons/app.png, so the renderer never minifies the
+// 1024 px master at 100% DPI.
+static APP_LOGO_PNG: &[u8] = include_bytes!("../../../packages/shared/app/icons/app.UI@2x.png");
 // UI-sized 2x derivative (398x36) avoids asking the renderer to minify the
 // 3487x315 source at runtime, which produced visibly jagged text at 100% DPI.
 static LOGO_TEXT_PNG: &[u8] = include_bytes!("../../../packages/assets/LogoText.UI@2x.png");
 
 pub fn splash_image_available(path: &str) -> bool {
-    match path {
-        SPLASH_IMAGE_PATH => !SPLASH_PNG.is_empty(),
-        SPLASH_CE_IMAGE_PATH => !SPLASH_CE_PNG.is_empty(),
-        SPLASH_PROFESSIONAL_IMAGE_PATH => !SPLASH_PROFESSIONAL_PNG.is_empty(),
-        _ => false,
+    splash_png(path).is_some_and(|bytes| !bytes.is_empty())
+}
+
+/// The splash artwork to draw at `scale` (device pixels per logical pixel).
+/// A 100% display gets the @1x copy; anything above it gets the @2x art,
+/// which minifies cleanly where @1x would have to be enlarged and blur.
+pub fn splash_image_for_scale(path: &'static str, scale: f32) -> &'static str {
+    if scale > 1.0 {
+        return path;
     }
+    match path {
+        SPLASH_IMAGE_PATH => SPLASH_IMAGE_1X_PATH,
+        SPLASH_CE_IMAGE_PATH => SPLASH_CE_IMAGE_1X_PATH,
+        SPLASH_PROFESSIONAL_IMAGE_PATH => SPLASH_PROFESSIONAL_IMAGE_1X_PATH,
+        other => other,
+    }
+}
+
+fn splash_png(path: &str) -> Option<&'static [u8]> {
+    Some(match path {
+        SPLASH_IMAGE_PATH => SPLASH_PNG,
+        SPLASH_CE_IMAGE_PATH => SPLASH_CE_PNG,
+        SPLASH_PROFESSIONAL_IMAGE_PATH => SPLASH_PROFESSIONAL_PNG,
+        SPLASH_IMAGE_1X_PATH => SPLASH_1X_PNG,
+        SPLASH_CE_IMAGE_1X_PATH => SPLASH_CE_1X_PNG,
+        SPLASH_PROFESSIONAL_IMAGE_1X_PATH => SPLASH_PROFESSIONAL_1X_PNG,
+        _ => return None,
+    })
 }
 
 pub struct EmbeddedAssets;
@@ -49,20 +87,17 @@ impl Default for EmbeddedAssets {
 
 impl AssetSource for EmbeddedAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
-        if path == SPLASH_IMAGE_PATH {
-            return Ok(Some(Cow::Borrowed(SPLASH_PNG)));
-        }
-        if path == SPLASH_CE_IMAGE_PATH {
-            return Ok(Some(Cow::Borrowed(SPLASH_CE_PNG)));
-        }
-        if path == SPLASH_PROFESSIONAL_IMAGE_PATH {
-            return Ok(Some(Cow::Borrowed(SPLASH_PROFESSIONAL_PNG)));
+        if let Some(bytes) = splash_png(path) {
+            return Ok(Some(Cow::Borrowed(bytes)));
         }
         if path == APP_LOGO_PATH {
             return Ok(Some(Cow::Borrowed(APP_LOGO_PNG)));
         }
         if path == LOGO_TEXT_PATH {
             return Ok(Some(Cow::Borrowed(LOGO_TEXT_PNG)));
+        }
+        if let Some(svg) = crate::components::command_icons::svg(path) {
+            return Ok(Some(Cow::Borrowed(svg.as_bytes())));
         }
         if let Some(svg) = crate::components::voxtune::icons::svg(path) {
             return Ok(Some(Cow::Borrowed(svg.as_bytes())));
@@ -136,6 +171,10 @@ impl AssetSource for EmbeddedAssets {
             assets::ICON_CHEVRON_RIGHT_PATH => Some(assets::icons::CHEVRON_RIGHT.as_bytes()),
             assets::ICON_CHEVRON_DOWN_PATH => Some(assets::icons::CHEVRON_DOWN.as_bytes()),
             assets::ICON_CHECK_PATH => Some(assets::icons::CHECK.as_bytes()),
+            assets::ICON_CIRCLE_CHECK_PATH => Some(assets::icons::CIRCLE_CHECK.as_bytes()),
+            assets::ICON_TRIANGLE_ALERT_PATH => Some(assets::icons::TRIANGLE_ALERT.as_bytes()),
+            assets::ICON_DOWNLOAD_PATH => Some(assets::icons::DOWNLOAD.as_bytes()),
+            assets::ICON_GUITAR_PATH => Some(assets::icons::GUITAR.as_bytes()),
             assets::ICON_STAR_PATH => Some(assets::icons::STAR.as_bytes()),
             assets::ICON_NEWSPAPER_PATH => Some(assets::icons::NEWSPAPER.as_bytes()),
             assets::ICON_PLAYHEAD_HANDLE_PATH => Some(assets::icons::PLAYHEAD_HANDLE.as_bytes()),
@@ -155,6 +194,9 @@ impl AssetSource for EmbeddedAssets {
             SPLASH_IMAGE_PATH,
             SPLASH_CE_IMAGE_PATH,
             SPLASH_PROFESSIONAL_IMAGE_PATH,
+            SPLASH_IMAGE_1X_PATH,
+            SPLASH_CE_IMAGE_1X_PATH,
+            SPLASH_PROFESSIONAL_IMAGE_1X_PATH,
             assets::ICON_PLAY_PATH,
             assets::ICON_PAUSE_PATH,
             assets::ICON_SQUARE_PATH,
@@ -229,6 +271,10 @@ impl AssetSource for EmbeddedAssets {
             assets::ICON_CHEVRON_RIGHT_PATH,
             assets::ICON_CHEVRON_DOWN_PATH,
             assets::ICON_CHECK_PATH,
+            assets::ICON_CIRCLE_CHECK_PATH,
+            assets::ICON_TRIANGLE_ALERT_PATH,
+            assets::ICON_DOWNLOAD_PATH,
+            assets::ICON_GUITAR_PATH,
             assets::ICON_STAR_PATH,
             assets::ICON_NEWSPAPER_PATH,
             assets::ICON_PLAYHEAD_HANDLE_PATH,

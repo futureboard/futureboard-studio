@@ -584,6 +584,38 @@ impl TimelineState {
     /// Deterministic id one past `id`, used when a single operation inserts two
     /// fresh clips (e.g. a split) before either is committed, so [`next_clip_id`]
     /// alone would hand back the same number twice.
+    /// Give every clip that shares its id with an earlier clip a fresh id.
+    ///
+    /// Clip ids are the identity selection, edits, the engine and ARA all go
+    /// by. Projects saved while the multi-clip Duplicate minted one id for all
+    /// of its copies hold several clips under one id, which behave as one: a
+    /// click selects all of them, a move or clone acts on whichever comes
+    /// first. The first clip keeps the id (a take or an ARA edit pointing at
+    /// it still finds it); the others are renumbered after the highest
+    /// `clip-N`. Returns how many were renumbered.
+    pub fn repair_duplicate_clip_ids(&mut self) -> usize {
+        let mut seen = std::collections::HashSet::new();
+        let mut next = next_clip_id_number(&self.tracks);
+        let mut repaired = 0;
+        for track in &mut self.tracks {
+            for clip in &mut track.clips {
+                if seen.insert(clip.id.clone()) {
+                    continue;
+                }
+                let fresh = format!("clip-{next}");
+                next += 1;
+                eprintln!(
+                    "[ProjectLoad] clip id {} was used twice; the second is now {fresh}",
+                    clip.id
+                );
+                clip.id = fresh.clone();
+                seen.insert(fresh);
+                repaired += 1;
+            }
+        }
+        repaired
+    }
+
     pub fn next_clip_id_after(&self, id: &str) -> String {
         id.strip_prefix("clip-")
             .and_then(|rest| rest.parse::<u32>().ok())
@@ -607,14 +639,24 @@ impl TimelineState {
         clip: &ClipState,
         split_beat: f32,
     ) -> Option<(ClipState, ClipState)> {
+        self.plan_audio_clip_split_keeping(clip, split_beat, Self::MIN_CLIP_SPLIT_BEATS)
+    }
+
+    /// [`Self::plan_audio_clip_split`] with `min_beats` kept either side of
+    /// the cut instead of [`Self::MIN_CLIP_SPLIT_BEATS`]: for a caller that
+    /// throws one side away (Strip Silence), where a sliver is not kept.
+    pub fn plan_audio_clip_split_keeping(
+        &self,
+        clip: &ClipState,
+        split_beat: f32,
+        min_beats: f32,
+    ) -> Option<(ClipState, ClipState)> {
         if !matches!(clip.clip_type, ClipType::Audio { .. }) {
             return None;
         }
         let clip_start = clip.start_beat;
         let clip_end = clip.start_beat + clip.duration_beats;
-        if split_beat <= clip_start + Self::MIN_CLIP_SPLIT_BEATS
-            || split_beat >= clip_end - Self::MIN_CLIP_SPLIT_BEATS
-        {
+        if split_beat <= clip_start + min_beats || split_beat >= clip_end - min_beats {
             return None;
         }
 
@@ -987,6 +1029,51 @@ impl TimelineState {
             }
         }
         None
+    }
+
+    /// Duplicates of `clip_ids` as one group, placed right after the group.
+    ///
+    /// The group moves by one offset: its earliest start lands where its
+    /// latest end was (snapped), so the copies keep their layout and land on
+    /// nothing the selection covers. Duplicating each clip after itself put
+    /// the copy of one clip on top of the next one, the same notes twice.
+    ///
+    /// Ids are reserved up front: none of the copies is on a track yet, so
+    /// [`Self::next_clip_id`] would hand every one of them the same id.
+    pub fn build_clip_group_duplicate(&self, clip_ids: &[String]) -> Vec<(String, ClipState)> {
+        let sources: Vec<(&str, &ClipState)> = clip_ids
+            .iter()
+            .filter_map(|id| {
+                self.find_clip(id)
+                    .map(|(track, clip)| (track.id.as_str(), clip))
+            })
+            .collect();
+        let Some(group_start) = sources
+            .iter()
+            .map(|(_, clip)| clip.start_beat)
+            .reduce(f32::min)
+        else {
+            return Vec::new();
+        };
+        let group_end = sources
+            .iter()
+            .map(|(_, clip)| clip.start_beat + clip.duration_beats)
+            .fold(group_start, f32::max);
+        let offset = self.snap_beats(group_end).max(0.0) - group_start;
+        let first_id = next_clip_id_number(&self.tracks);
+        sources
+            .into_iter()
+            .zip(first_id..)
+            .map(|((track_id, clip), n)| {
+                let duplicate = self.clone_clip_for_insert(
+                    clip,
+                    format!("clip-{n}"),
+                    derived_clip_name(&clip.name, "Copy"),
+                    clip.start_beat + offset,
+                );
+                (track_id.to_string(), duplicate)
+            })
+            .collect()
     }
 
     pub fn clone_clip_for_insert(

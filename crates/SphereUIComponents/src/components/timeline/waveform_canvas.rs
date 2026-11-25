@@ -950,6 +950,7 @@ fn paint_waveform_bars(
         scale: window.scale_factor(),
     };
     let overload_color = Colors::meter_high();
+    let corners = ClipCorners::of(bounds);
     // One scene layer for the clip's bars. Outside a layer every quad claims
     // its own draw order from the scene's bounds tree — a tree insert per
     // pixel column. The bars never overlap one another, so they can share the
@@ -967,6 +968,9 @@ fn paint_waveform_bars(
                 // for data that the next zoom/record tick will replace.
                 for &(x, min, max) in &tile[range.clone()] {
                     let (top, height, clipped) = style.column(min, max);
+                    let Some((top, height)) = corners.clamp(x, top, height) else {
+                        continue;
+                    };
                     window.paint_quad(fill(
                         Bounds::new(
                             bounds.origin + point(px(x), px(top)),
@@ -987,6 +991,25 @@ fn paint_waveform_bars(
                 }
                 let first = run.columns.start.max(range.start);
                 let end = run.columns.end.min(range.end);
+                // A run reaching into a rounded corner is drawn column by
+                // column there, each one cut to the corner's curve.
+                if corners.touches(tile[first].0, tile[end - 1].0) {
+                    let ink = if run.clipped { overload_color } else { color };
+                    for &(x, _, _) in &tile[first..end] {
+                        let Some((top, height)) = corners.clamp(x, run.top, run.height) else {
+                            continue;
+                        };
+                        window.paint_quad(fill(
+                            Bounds::new(
+                                bounds.origin + point(px(x), px(top)),
+                                size(px(1.0), px(height)),
+                            ),
+                            ink,
+                        ));
+                        rectangles += 1;
+                    }
+                    continue;
+                }
                 // Derive the two ends independently, just like individual
                 // columns. In particular, do not add a large clip-local width
                 // to a far-offscreen origin and lose subpixel precision.
@@ -1003,6 +1026,63 @@ fn paint_waveform_bars(
         crate::perf::count("waveform_paint_columns", columns as u64);
         crate::perf::count("waveform_paint_rectangles", rectangles);
     });
+}
+
+/// The audio clip's rounded corners, as the waveform canvas sees them.
+///
+/// The clip masks its children with `overflow_hidden`, but a content mask is
+/// a plain rectangle: the bars in the first and last few columns drew over
+/// the rounded corners and past the clip's outline. The canvas fills the
+/// clip inside its border, so the corners here are the clip's radius less
+/// that border, and a column within the radius of either end is cut to the
+/// curve.
+#[derive(Clone, Copy)]
+struct ClipCorners {
+    width: f32,
+    height: f32,
+    radius: f32,
+}
+
+impl ClipCorners {
+    fn of(bounds: Bounds<Pixels>) -> Self {
+        let width: f32 = bounds.size.width.into();
+        let height: f32 = bounds.size.height.into();
+        let border = super::audio_clip::CLIP_BORDER;
+        let outer = crate::theme::radius::clamped(
+            crate::theme::radius::CONTROL,
+            width + 2.0 * border,
+            height + 2.0 * border,
+        );
+        Self {
+            width,
+            height,
+            radius: (outer - border).max(0.0),
+        }
+    }
+
+    /// Whether columns `first_x ..= last_x` reach into a corner.
+    fn touches(self, first_x: f32, last_x: f32) -> bool {
+        self.radius > 0.0 && (first_x < self.radius || last_x + 1.0 > self.width - self.radius)
+    }
+
+    /// The column at `x` spanning `top .. top + height`, cut to the corners;
+    /// `None` when nothing of it is inside the clip.
+    fn clamp(self, x: f32, top: f32, height: f32) -> Option<(f32, f32)> {
+        let r = self.radius;
+        if r <= 0.0 {
+            return Some((top, height));
+        }
+        // Distance of the column's centre from the nearer side edge.
+        let d = (x + 0.5).min(self.width - x - 0.5).max(0.0);
+        if d >= r {
+            return Some((top, height));
+        }
+        let dy = r - d;
+        let inset = r - (r * r - dy * dy).max(0.0).sqrt();
+        let clipped_top = top.max(inset);
+        let clipped_bottom = (top + height).min(self.height - inset);
+        (clipped_bottom > clipped_top).then(|| (clipped_top, clipped_bottom - clipped_top))
+    }
 }
 
 fn aggregate_slice(peaks: &[waveform_cache::WaveformPeak]) -> waveform_cache::WaveformPeak {

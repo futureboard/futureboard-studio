@@ -457,8 +457,10 @@ mod tests {
 
     fn track(id: &str, ty: &str, sends: Vec<RuntimeSend>, output: Option<&str>) -> RuntimeTrack {
         RuntimeTrack {
+            vca_gain: 1.0,
             spatial: None,
             spatial_params: Default::default(),
+            spatial_state: Default::default(),
             active_voices: 0,
             ara_renderers: Vec::new(),
             ara_l: Vec::new(),
@@ -483,6 +485,9 @@ mod tests {
             preview_mode: crate::runtime::RuntimePreviewMode::Stereo,
             output_track_id: output.map(str::to_string),
             output_track_index: None,
+            midi_fx: None,
+            midi_fx_hold: Vec::new(),
+            midi_fx_plugins: Default::default(),
             inserts: Vec::new(),
             sends,
             automation_lanes: Vec::new(),
@@ -513,6 +518,7 @@ mod tests {
             pdc_write_pos: 0,
             smoothed_gain_l: 1.0,
             smoothed_gain_r: 1.0,
+            dual_pan: Default::default(),
             wdw_return_index: None,
             sidechain_tap: Default::default(),
         }

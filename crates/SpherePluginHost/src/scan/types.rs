@@ -195,6 +195,10 @@ pub struct PluginDescriptor {
     /// The plug-in exposes an ARA main factory. Only the VST3 scanner sets it.
     #[serde(default)]
     pub is_ara: bool,
+    /// The VST3 component exposes an event output bus. Only the VST3 scanner
+    /// sets it (by instantiating the component once to read its buses).
+    #[serde(default)]
+    pub midi_output: bool,
     #[serde(default)]
     pub sdk_metadata_loaded: bool,
 }

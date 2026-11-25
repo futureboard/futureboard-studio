@@ -32,11 +32,13 @@ const A4_PLUS_100_CENTS_HZ: f32 = 466.163_76;
 
 fn track(id: &str, track_type: &str, solfege: bool) -> EngineTrackSnapshot {
     EngineTrackSnapshot {
+        vca_gain: 1.0,
         midi_programs: Vec::new(),
         id: id.to_string(),
         track_type: track_type.to_string(),
         volume: 1.0,
         pan: 0.0,
+        dual_pan: Default::default(),
         muted: false,
         solo: false,
         armed: false,
@@ -47,6 +49,7 @@ fn track(id: &str, track_type: &str, solfege: bool) -> EngineTrackSnapshot {
         },
         preview_mode: "stereo".to_string(),
         output_track_id: None,
+        midi_fx: Vec::new(),
         inserts: Vec::new(),
         sends: Vec::new(),
         automation_lanes: Vec::new(),

@@ -1,7 +1,7 @@
 //! The MIDI editor's tools column, on the left of the keys.
 //!
 //! Three pages instead of a stack of collapsible sections: **Timing**
-//! (quantize, length), **Pitch** (transpose, scale, chords) and
+//! (quantize, swing, length), **Pitch** (transpose, scale, chords) and
 //! **Perform** (articulation, note expression). A page shows its controls
 //! flat, settings are picked from segmented choices rather than stepped, and
 //! each group ends in the button that applies it.
@@ -20,7 +20,7 @@ use super::*;
 use crate::components::controls::FbSegment;
 use crate::components::timeline::timeline_state::{
     conform_to_chords, delete_overlaps, invert_pitches, legato_notes, quantize_notes,
-    quantize_notes_on_grid, retrograde_notes, scale_note_lengths, set_note_lengths,
+    quantize_notes_on_grid, retrograde_notes, scale_note_lengths, set_note_lengths, swing_notes,
     transpose_in_scale, voice_chords, ChordVoicing, MidiScale, QuantizeSpec, QuantizeTarget,
 };
 use sphere_midi_service::{ExpressionCurve, ExpressionPoint};
@@ -59,6 +59,10 @@ const GRID_CHOICES: [(GridRes, &str); 4] = [
     (GridRes::Sixteenth, "1/16"),
     (GridRes::ThirtySecond, "1/32"),
 ];
+
+/// Grid choices for Swing: the off-beats it delays.
+const SWING_GRID_CHOICES: [(GridRes, &str); 2] =
+    [(GridRes::Eighth, "1/8"), (GridRes::Sixteenth, "1/16")];
 
 /// A grid split into its straight value and whether it is the triplet of it.
 fn split_grid(grid: GridRes) -> (GridRes, bool) {
@@ -141,6 +145,10 @@ pub(super) struct ToolsPanelState {
     pub(super) quantize_strength: u8,
     /// Off-beat swing, percent (100 = triplet feel).
     pub(super) quantize_swing: u8,
+    /// The Swing tool's grid: the off-beat of this value is delayed.
+    swing_res: GridRes,
+    /// The Swing tool's amount, percent (100 = triplet feel).
+    swing_amount: u8,
     /// ±1 moves by scale degrees instead of semitones (when a scale is set).
     pub(super) transpose_in_scale: bool,
     pub(super) length_res: GridRes,
@@ -156,6 +164,8 @@ impl Default for ToolsPanelState {
             show_chord_strip: false,
             quantize_strength: 100,
             quantize_swing: 0,
+            swing_res: GridRes::Sixteenth,
+            swing_amount: 50,
             transpose_in_scale: false,
             length_res: GridRes::Eighth,
             expression_lane: NoteExpressionLane::Pressure,
@@ -322,6 +332,15 @@ impl PianoRoll {
         self.run_note_tool(label, cx, move |notes, ids| {
             let bars = bars.as_ref().map(|(meter, origin)| (meter, *origin));
             quantize_in(notes, ids, spec, target, bars)
+        });
+    }
+
+    /// Swing the target notes on the Swing grid, without quantizing them.
+    fn tool_swing(&mut self, cx: &mut Context<Self>) {
+        let step = self.tools.swing_res.beats().max(MIN_NOTE_BEATS);
+        let amount = self.tools.swing_amount as f32 / 100.0;
+        self.run_note_tool("Swing", cx, move |notes, ids| {
+            swing_notes(notes, ids, step, amount)
         });
     }
 
@@ -620,6 +639,33 @@ impl PianoRoll {
                 .into_any_element(),
             ]),
             tool_caption("Q quantizes with these settings too. Hover Quantize to preview."),
+            insp_section("SWING").into_any_element(),
+            choice_track(
+                "pr-tools-swing-grid",
+                &SWING_GRID_CHOICES,
+                t.swing_res,
+                cx,
+                |this, value| this.tools.swing_res = value,
+            ),
+            labeled(
+                "Amount",
+                choice_track(
+                    "pr-tools-swing-amount",
+                    &[(25u8, "25"), (50, "50"), (75, "75"), (100, "100")],
+                    t.swing_amount,
+                    cx,
+                    |this, value| this.tools.swing_amount = value,
+                ),
+            ),
+            tool_row(vec![tool_button(
+                "pr-tools-swing-apply",
+                "Swing",
+                Emphasis::Normal,
+                enabled,
+                cx.listener(|this, _, _w, cx| this.tool_swing(cx)),
+            )
+            .into_any_element()]),
+            tool_caption("Delays every second note of the grid without snapping. 100 is a triplet feel."),
             insp_section("LENGTH").into_any_element(),
             choice_track(
                 "pr-tools-len-grid",

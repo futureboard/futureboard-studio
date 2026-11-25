@@ -452,6 +452,11 @@ pub enum AutomationTarget {
     TrackVolume,
     TrackPan,
     TrackMute,
+    /// Dual pan's left-input position (tag 7). Heard while the channel is in
+    /// Dual pan; a lane kept on a Balance channel is saved and plays nothing.
+    TrackPanLeft,
+    /// Dual pan's right-input position (tag 8).
+    TrackPanRight,
     PluginParameter {
         insert_id: String,
         parameter_id: String,
@@ -468,6 +473,99 @@ pub enum AutomationTarget {
     InsertBypass {
         insert_id: String,
     },
+    /// One of the channel's placement parameters in a spatial mix (tags
+    /// 9-14). Heard while the channel is placed in the room; a lane kept in a
+    /// stereo mix is saved and plays nothing.
+    Spatial(solfege_spatialaudio::SourceParam),
+}
+
+/// Readout of a spatial lane's `0..=1` value in the parameter's own terms.
+fn format_spatial_value(param: solfege_spatialaudio::SourceParam, norm: f32) -> String {
+    use solfege_spatialaudio::SourceParam as P;
+    let side = |v: f32, low: &str, high: &str, middle: &str| {
+        let percent = (v.abs() * 100.0).round() as i32;
+        if percent == 0 {
+            middle.to_string()
+        } else if v < 0.0 {
+            format!("{low} {percent}%")
+        } else {
+            format!("{high} {percent}%")
+        }
+    };
+    match param {
+        P::X => side(norm * 2.0 - 1.0, "Left", "Right", "Centre"),
+        P::Y => side(norm * 2.0 - 1.0, "Back", "Front", "Middle"),
+        P::Height | P::Spread => format!("{}%", (norm * 100.0).round() as i32),
+        P::Width => format!("\u{b1}{}\u{b0}", (norm * 30.0).round() as i32),
+        P::Lfe => {
+            if norm < 0.001 {
+                "Off".to_string()
+            } else {
+                format!("{:.1} dB", 20.0 * norm.log10())
+            }
+        }
+    }
+}
+
+/// The `0..=1` value a typed spatial value stands for: the inverse of
+/// [`format_spatial_value`], unit optional.
+fn parse_spatial_value(param: solfege_spatialaudio::SourceParam, lower: &str) -> Option<f32> {
+    use solfege_spatialaudio::SourceParam as P;
+    let number = |text: &str, unit: &str| -> Option<f32> {
+        text.trim()
+            .strip_suffix(unit)
+            .unwrap_or(text.trim())
+            .trim()
+            .replace('\u{2212}', "-")
+            .parse::<f32>()
+            .ok()
+            .filter(|v| v.is_finite())
+    };
+    // `Left 40`, `l40`, `40 left`, or a signed percent; the same for front
+    // and back. The middle word, or 0, is the centre line.
+    let sided = |low: &[&str], high: &[&str], middle: &[&str]| -> Option<f32> {
+        if middle.contains(&lower) || lower == "0" {
+            return Some(0.5);
+        }
+        let percent = |rest: &str| number(rest, "%");
+        let signed = low
+            .iter()
+            .find_map(|word| {
+                lower
+                    .strip_prefix(word)
+                    .or_else(|| lower.strip_suffix(word))
+                    .and_then(percent)
+                    .map(|v| -v.abs())
+            })
+            .or_else(|| {
+                high.iter().find_map(|word| {
+                    lower
+                        .strip_prefix(word)
+                        .or_else(|| lower.strip_suffix(word))
+                        .and_then(percent)
+                        .map(f32::abs)
+                })
+            })
+            .or_else(|| percent(lower))?;
+        Some(((signed / 100.0).clamp(-1.0, 1.0) + 1.0) * 0.5)
+    };
+    match param {
+        P::X => sided(&["left", "l"], &["right", "r"], &["c", "centre", "center"]),
+        P::Y => sided(
+            &["back", "b"],
+            &["front", "f"],
+            &["m", "middle", "c", "centre"],
+        ),
+        P::Height | P::Spread => number(lower, "%").map(|v| (v / 100.0).clamp(0.0, 1.0)),
+        P::Width => number(lower.trim_start_matches('\u{b1}'), "\u{b0}")
+            .map(|deg| (deg.abs() / 30.0).clamp(0.0, 1.0)),
+        P::Lfe => {
+            if matches!(lower, "off" | "-inf" | "-\u{221e}") {
+                return Some(0.0);
+            }
+            number(lower, "db").map(|db| 10f32.powf(db.min(0.0) / 20.0).clamp(0.0, 1.0))
+        }
+    }
 }
 
 impl AutomationTarget {
@@ -477,10 +575,13 @@ impl AutomationTarget {
             AutomationTarget::TrackVolume => "Volume".to_string(),
             AutomationTarget::TrackPan => "Pan".to_string(),
             AutomationTarget::TrackMute => "Mute".to_string(),
+            AutomationTarget::TrackPanLeft => "Pan Left".to_string(),
+            AutomationTarget::TrackPanRight => "Pan Right".to_string(),
             AutomationTarget::PluginParameter { parameter_name, .. } => parameter_name.clone(),
             AutomationTarget::SendLevel { .. } => "Send Level".to_string(),
             AutomationTarget::SendEnabled { .. } => "Send On/Off".to_string(),
             AutomationTarget::InsertBypass { .. } => "Bypass".to_string(),
+            AutomationTarget::Spatial(param) => format!("Spatial {}", param.name()),
         }
     }
 
@@ -491,11 +592,18 @@ impl AutomationTarget {
             AutomationTarget::TrackVolume => volume::db_to_norm(0.0),
             AutomationTarget::TrackPan => 0.5,
             AutomationTarget::TrackMute => 0.0,
+            // Dual pan's defaults: left input hard left, right input hard right.
+            AutomationTarget::TrackPanLeft => 0.0,
+            AutomationTarget::TrackPanRight => 1.0,
             AutomationTarget::PluginParameter { .. } => 0.5,
             // The send's own unity, on the same fader law as the track's.
             AutomationTarget::SendLevel { .. } => volume::db_to_norm(0.0),
             AutomationTarget::SendEnabled { .. } => 1.0,
             AutomationTarget::InsertBypass { .. } => 0.0,
+            // Front and centre, at a stereo pair's own width.
+            AutomationTarget::Spatial(param) => {
+                param.normalized(&solfege_spatialaudio::SourceParams::default())
+            }
         }
     }
 
@@ -507,7 +615,9 @@ impl AutomationTarget {
         let norm = norm.clamp(0.0, 1.0);
         match self {
             AutomationTarget::TrackVolume => format!("{} dB", volume::format_db(norm)),
-            AutomationTarget::TrackPan => {
+            AutomationTarget::TrackPan
+            | AutomationTarget::TrackPanLeft
+            | AutomationTarget::TrackPanRight => {
                 crate::components::knob::format_pan_label(norm * 2.0 - 1.0)
             }
             AutomationTarget::TrackMute => if norm >= 0.5 { "Muted" } else { "Open" }.to_string(),
@@ -520,6 +630,7 @@ impl AutomationTarget {
                 if norm >= 0.5 { "Bypassed" } else { "Active" }.to_string()
             }
             AutomationTarget::PluginParameter { .. } => format!("{:.0}%", norm * 100.0),
+            AutomationTarget::Spatial(param) => format_spatial_value(*param, norm),
         }
     }
 
@@ -537,6 +648,15 @@ impl AutomationTarget {
                     format!("{percent:.0}")
                 } else {
                     format!("{percent:.1}")
+                }
+            }
+            AutomationTarget::Spatial(param) => {
+                use solfege_spatialaudio::SourceParam as P;
+                match param {
+                    P::Height | P::Spread => format!("{}", (norm * 100.0).round() as i32),
+                    P::Width => format!("{}", (norm * 30.0).round() as i32),
+                    P::Lfe if norm >= 0.001 => format!("{:.1}", 20.0 * norm.log10()),
+                    _ => self.format_value(norm),
                 }
             }
             _ => self.format_value(norm),
@@ -590,7 +710,9 @@ impl AutomationTarget {
                 }
                 number("db").map(volume::db_to_norm)
             }
-            AutomationTarget::TrackPan => {
+            AutomationTarget::TrackPan
+            | AutomationTarget::TrackPanLeft
+            | AutomationTarget::TrackPanRight => {
                 if matches!(lower.as_str(), "c" | "center" | "centre" | "0") {
                     return Some(0.5);
                 }
@@ -622,6 +744,7 @@ impl AutomationTarget {
             AutomationTarget::TrackMute => switch(&["muted", "mute"], &["open", "unmuted"]),
             AutomationTarget::SendEnabled { .. } => switch(&[], &[]),
             AutomationTarget::InsertBypass { .. } => switch(&["bypassed", "bypass"], &["active"]),
+            AutomationTarget::Spatial(param) => parse_spatial_value(*param, lower.as_str()),
         }
     }
 
@@ -635,6 +758,9 @@ impl AutomationTarget {
             AutomationTarget::SendLevel { .. } => 4,
             AutomationTarget::SendEnabled { .. } => 5,
             AutomationTarget::InsertBypass { .. } => 6,
+            AutomationTarget::TrackPanLeft => 7,
+            AutomationTarget::TrackPanRight => 8,
+            AutomationTarget::Spatial(param) => 9 + param.index() as u8,
         }
     }
 
@@ -1034,6 +1160,18 @@ impl TimelineState {
             AutomationTarget::TrackPan,
             AutomationTarget::TrackMute,
         ];
+        // Dual pan's positions while the channel is in Dual — and whenever a
+        // lane for one already exists, so a lane kept from Dual stays
+        // reachable after switching back to Balance.
+        for target in [
+            AutomationTarget::TrackPanLeft,
+            AutomationTarget::TrackPanRight,
+        ] {
+            if track.dual_pan_active() || track.automation_lanes.iter().any(|l| l.target == target)
+            {
+                out.push(target);
+            }
+        }
         for send in &track.sends {
             out.push(AutomationTarget::SendLevel {
                 send_id: send.id.clone(),
@@ -1080,6 +1218,29 @@ impl TimelineState {
             }
             other => other.display_name(),
         }
+    }
+
+    /// [`Self::mixer_automation_targets`] plus the channel's placement
+    /// parameters while it is placed in the room as the mix plays here — and
+    /// any spatial lane it already carries, so a lane kept from a spatial mix
+    /// stays reachable.
+    pub fn mixer_automation_targets_for(&self, track: &TrackState) -> Vec<AutomationTarget> {
+        let mut out = Self::mixer_automation_targets(track);
+        let format = self.spatial_mix.heard_here().format;
+        let placed = self.spatially_placed(track);
+        for param in solfege_spatialaudio::SourceParam::ALL {
+            use solfege_spatialaudio::SourceParam as P;
+            let heard = match param {
+                P::Height => format.has_height(),
+                P::Lfe => format.has_lfe(),
+                _ => true,
+            };
+            let target = AutomationTarget::Spatial(param);
+            if (placed && heard) || track.automation_lanes.iter().any(|l| l.target == target) {
+                out.push(target);
+            }
+        }
+        out
     }
 
     /// [`Self::automation_target_label_for`] by track id.
@@ -1134,7 +1295,7 @@ impl TimelineState {
         }
         let mut out = self
             .find_track(track_id)
-            .map(Self::mixer_automation_targets)
+            .map(|track| self.mixer_automation_targets_for(track))
             .unwrap_or_else(|| {
                 vec![
                     AutomationTarget::TrackVolume,
@@ -1243,7 +1404,8 @@ impl TimelineState {
             .iter()
             .map(|lane| lane.target.clone())
             .collect();
-        let track_targets = Self::mixer_automation_targets(track)
+        let track_targets = self
+            .mixer_automation_targets_for(track)
             .into_iter()
             .map(|target| {
                 let label = Self::automation_target_label_for(track, &target);
@@ -2227,10 +2389,16 @@ impl TimelineState {
 
 /// Build a context-menu command id that selects `target` on `track_id`.
 pub fn automation_target_menu_command(track_id: &str, target: &AutomationTarget) -> String {
+    // The decoder splits the track id off at the first `:`, and a VSTi
+    // multi-out bus is `vsti-out:{insert}:bus:{n}`: its commands decoded to a
+    // track called `vsti-out`, so none of its lanes could ever be added.
+    let track_id = escape_command_track_id(track_id);
     match target {
         AutomationTarget::TrackVolume => format!("automation:add-target:{track_id}:volume"),
         AutomationTarget::TrackPan => format!("automation:add-target:{track_id}:pan"),
         AutomationTarget::TrackMute => format!("automation:add-target:{track_id}:mute"),
+        AutomationTarget::TrackPanLeft => format!("automation:add-target:{track_id}:pan-left"),
+        AutomationTarget::TrackPanRight => format!("automation:add-target:{track_id}:pan-right"),
         AutomationTarget::PluginParameter {
             insert_id,
             parameter_id,
@@ -2245,17 +2413,34 @@ pub fn automation_target_menu_command(track_id: &str, target: &AutomationTarget)
         AutomationTarget::InsertBypass { insert_id } => {
             format!("automation:add-target:{track_id}:bypass:{insert_id}")
         }
+        AutomationTarget::Spatial(param) => {
+            format!("automation:add-target:{track_id}:spatial:{}", param.index())
+        }
     }
+}
+
+/// A track id as one `:`-free field of a menu command. Ids without `:` or `%`
+/// come out unchanged, so commands spelled out by hand elsewhere still parse.
+fn escape_command_track_id(track_id: &str) -> String {
+    track_id.replace('%', "%25").replace(':', "%3A")
+}
+
+fn unescape_command_track_id(field: &str) -> String {
+    field.replace("%3A", ":").replace("%25", "%")
 }
 
 /// Decode [`automation_target_menu_command`].
 pub fn parse_automation_target_menu_command(command: &str) -> Option<(String, AutomationTarget)> {
     let rest = command.strip_prefix("automation:add-target:")?;
     let (track_id, kind) = rest.split_once(':')?;
+    let track_id = unescape_command_track_id(track_id);
+    let track_id = track_id.as_str();
     match kind {
         "volume" => Some((track_id.to_string(), AutomationTarget::TrackVolume)),
         "pan" => Some((track_id.to_string(), AutomationTarget::TrackPan)),
         "mute" => Some((track_id.to_string(), AutomationTarget::TrackMute)),
+        "pan-left" => Some((track_id.to_string(), AutomationTarget::TrackPanLeft)),
+        "pan-right" => Some((track_id.to_string(), AutomationTarget::TrackPanRight)),
         _ if kind.starts_with("plugin:") => {
             let parts = kind.strip_prefix("plugin:")?;
             let (insert_id, parameter_id) = parts.split_once(':')?;
@@ -2281,6 +2466,13 @@ pub fn parse_automation_target_menu_command(command: &str) -> Option<(String, Au
                 insert_id: kind.strip_prefix("bypass:")?.to_string(),
             },
         )),
+        _ if kind.starts_with("spatial:") => {
+            let index = kind.strip_prefix("spatial:")?.parse::<usize>().ok()?;
+            Some((
+                track_id.to_string(),
+                AutomationTarget::Spatial(solfege_spatialaudio::SourceParam::from_index(index)?),
+            ))
+        }
         _ if kind.starts_with("send:") => {
             let send_id = kind.strip_prefix("send:")?;
             Some((
@@ -2291,6 +2483,113 @@ pub fn parse_automation_target_menu_command(command: &str) -> Option<(String, Au
             ))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod spatial_target_tests {
+    use super::*;
+    use solfege_spatialaudio::{SourceParam, SourceParams};
+
+    #[test]
+    fn spatial_targets_take_tags_nine_to_fourteen_and_round_trip_their_menu_commands() {
+        for (offset, param) in SourceParam::ALL.into_iter().enumerate() {
+            let target = AutomationTarget::Spatial(param);
+            assert_eq!(target.to_tag(), 9 + offset as u8);
+            let command = automation_target_menu_command("track:1", &target);
+            assert_eq!(
+                parse_automation_target_menu_command(&command),
+                Some(("track:1".to_string(), target.clone()))
+            );
+            // A new lane starts where an unplaced channel sits.
+            assert_eq!(
+                target.default_value(),
+                param.normalized(&SourceParams::default())
+            );
+        }
+    }
+
+    #[test]
+    fn spatial_values_read_in_their_own_terms_and_parse_back() {
+        let near = |target: &AutomationTarget, text: &str, want: f32| {
+            let got = target
+                .parse_value(text)
+                .unwrap_or_else(|| panic!("{text} parses"));
+            assert!((got - want).abs() < 1.0e-4, "{text}: {got} != {want}");
+        };
+        let x = AutomationTarget::Spatial(SourceParam::X);
+        assert_eq!(x.format_value(0.5), "Centre");
+        assert_eq!(x.format_value(0.2), "Left 60%");
+        near(&x, "Left 60", 0.2);
+        near(&x, "r25", 0.625);
+        near(&x, "c", 0.5);
+
+        let y = AutomationTarget::Spatial(SourceParam::Y);
+        assert_eq!(y.format_value(1.0), "Front 100%");
+        assert_eq!(y.format_value(0.25), "Back 50%");
+        near(&y, "back 50", 0.25);
+
+        let height = AutomationTarget::Spatial(SourceParam::Height);
+        assert_eq!(height.format_value(0.4), "40%");
+        near(&height, "40", 0.4);
+
+        let width = AutomationTarget::Spatial(SourceParam::Width);
+        assert_eq!(width.format_value(1.0), "\u{b1}30\u{b0}");
+        near(&width, "15", 0.5);
+
+        let lfe = AutomationTarget::Spatial(SourceParam::Lfe);
+        assert_eq!(lfe.format_value(0.0), "Off");
+        assert_eq!(lfe.format_value(1.0), "0.0 dB");
+        near(&lfe, "off", 0.0);
+        near(&lfe, "-6.0206", 0.5);
+    }
+
+    /// A channel routed into a bus is placed only when the bus keeps its
+    /// channels' places and sums into the master; nothing is placed in a mix
+    /// heard as stereo.
+    #[test]
+    fn placement_follows_the_bus_that_keeps_its_channels_places() {
+        let mut state = TimelineState::default();
+        let track_id = state.create_audio_track();
+        // Creating the bus from the track routes the track into it.
+        let bus_id = state.create_bus_track(std::slice::from_ref(&track_id));
+        assert_eq!(
+            state.find_track(&track_id).expect("track").routing.output,
+            TrackOutputRouting::Bus {
+                bus_id: bus_id.clone()
+            }
+        );
+        let placed = |state: &TimelineState, id: &str, spatial: bool| {
+            state.spatially_placed_when(state.find_track(id).expect("track"), spatial)
+        };
+        assert!(!placed(&state, &track_id, true));
+        assert!(placed(&state, &bus_id, true));
+        state
+            .tracks
+            .iter_mut()
+            .find(|t| t.id == bus_id)
+            .expect("bus")
+            .spatial_keeps_inputs = true;
+        assert!(placed(&state, &track_id, true));
+        assert!(!placed(&state, &track_id, false));
+        assert!(!placed(&state, &bus_id, false));
+    }
+
+    /// Without the license a spatial project is heard as stereo, and keeps
+    /// what it saved.
+    #[test]
+    fn an_unlicensed_mix_is_heard_as_stereo_and_keeps_its_settings() {
+        let mix = SpatialMix {
+            format: solfege_spatialaudio::SpatialFormat::Binaural,
+            ..SpatialMix::default()
+        };
+        assert_eq!(mix.heard(true), mix);
+        let heard = mix.heard(false);
+        assert_eq!(heard.format, solfege_spatialaudio::SpatialFormat::Stereo);
+        assert_eq!(heard.room, mix.room);
+        assert!(mix.held_back(false));
+        assert!(!mix.held_back(true));
+        assert!(!SpatialMix::default().held_back(false));
     }
 }
 
@@ -2706,6 +3005,43 @@ mod mixer_target_tests {
                 Some(("track-1".to_string(), target))
             );
         }
+    }
+
+    /// A VSTi multi-out bus id has colons of its own; its commands used to
+    /// decode to a track called `vsti-out`.
+    #[test]
+    fn a_multi_out_bus_keeps_its_id_through_a_menu_command() {
+        let bus = "vsti-out:insert-track-2-1:bus:3";
+        for target in [
+            AutomationTarget::TrackVolume,
+            AutomationTarget::SendLevel {
+                send_id: "send-1".to_string(),
+            },
+            AutomationTarget::PluginParameter {
+                insert_id: "insert-9".to_string(),
+                parameter_id: "42".to_string(),
+                parameter_name: "42".to_string(),
+            },
+        ] {
+            let command = automation_target_menu_command(bus, &target);
+            assert_eq!(
+                parse_automation_target_menu_command(&command),
+                Some((bus.to_string(), target))
+            );
+        }
+        // A plain id is written as it always was.
+        assert_eq!(
+            automation_target_menu_command("track-1", &AutomationTarget::TrackPan),
+            "automation:add-target:track-1:pan"
+        );
+        let odd = "a%3Ab:c";
+        assert_eq!(
+            parse_automation_target_menu_command(&automation_target_menu_command(
+                odd,
+                &AutomationTarget::TrackMute
+            )),
+            Some((odd.to_string(), AutomationTarget::TrackMute))
+        );
     }
 
     /// A Bus or Return shows in the arrangement only while it carries a shown

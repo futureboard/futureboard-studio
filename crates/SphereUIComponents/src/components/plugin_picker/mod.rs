@@ -7,10 +7,10 @@ mod category;
 mod filter;
 mod insert;
 mod list_view;
+mod body;
 mod overlay;
 mod prefs;
 mod search_index;
-mod sidebar;
 mod state;
 
 pub use category::{normalize_category, normalized_category_label, NormalizedCategory};
@@ -23,8 +23,8 @@ pub use overlay::{
 pub use prefs::PluginPickerPrefs;
 pub use search_index::PluginSearchIndex;
 pub use state::{
-    CatalogStatus, KindTab, PickerFilter, PluginFilterState, PluginPickerLoadState,
-    PluginPickerScrollHandles, PluginPickerState,
+    CatalogStatus, KindTab, PickerFacet, PickerFilter, PluginFilterState, PluginPickerLoadState,
+    PluginPickerScrollHandles, PluginPickerState, PluginSource,
 };
 
 use std::sync::Arc;
@@ -44,8 +44,8 @@ pub struct PluginPickerCallbacks {
     pub on_pick: Arc<dyn Fn(&String, &mut Window, &mut App) + 'static>,
     pub on_select_filter: Arc<dyn Fn(&PickerFilter, &mut Window, &mut App) + 'static>,
     pub on_select_kind: Arc<dyn Fn(&KindTab, &mut Window, &mut App) + 'static>,
-    /// Folds or unfolds the rail's vendor list.
-    pub on_toggle_vendors: Arc<dyn Fn(&(), &mut Window, &mut App) + 'static>,
+    /// A source or category chip above the list.
+    pub on_select_facet: Arc<dyn Fn(&PickerFacet, &mut Window, &mut App) + 'static>,
     pub on_toggle_favorite: Arc<dyn Fn(&String, &mut Window, &mut App) + 'static>,
     pub on_retry_load: Arc<dyn Fn(&(), &mut Window, &mut App) + 'static>,
     pub on_open_plugin_manager: Arc<dyn Fn(&(), &mut Window, &mut App) + 'static>,

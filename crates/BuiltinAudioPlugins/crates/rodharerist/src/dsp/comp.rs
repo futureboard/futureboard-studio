@@ -143,8 +143,8 @@ impl CompStage {
         makeup_db: f32,
     ) {
         let voice = CompProfile::for_model(model);
-        self.attack_sec = (attack_ms.clamp(0.1, 100.0) * voice.attack_scale).clamp(0.1, 100.0)
-            * 0.001;
+        self.attack_sec =
+            (attack_ms.clamp(0.1, 100.0) * voice.attack_scale).clamp(0.1, 100.0) * 0.001;
         self.release_sec =
             (release_ms.clamp(10.0, 1_000.0) * voice.release_scale).clamp(10.0, 1_000.0) * 0.001;
         self.comp.set_timing(self.attack_sec, self.release_sec);

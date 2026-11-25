@@ -31,10 +31,10 @@
 //! dip rather than clicking.
 
 use biquad::{Biquad, Coefficients, DirectForm1};
-use builtin_dsp_core::delay::{smoothing_step, Smoothed};
+use builtin_dsp_core::delay::{Smoothed, smoothing_step};
 use builtin_dsp_core::{
-    clamp, db_to_linear, flush_denormal, linear_to_db, make_eq_coefficients, time_constant,
-    ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect,
+    ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, clamp, db_to_linear,
+    flush_denormal, linear_to_db, make_eq_coefficients, time_constant,
 };
 use serde::{Deserialize, Serialize};
 
@@ -42,8 +42,8 @@ pub mod ipc;
 pub mod presets;
 pub mod ui;
 
-pub use ipc::{ui_param_id, ui_param_index, UI_PARAM_IDS};
-pub use presets::{factory_presets, FactoryPreset};
+pub use ipc::{UI_PARAM_IDS, ui_param_id, ui_param_index};
+pub use presets::{FactoryPreset, factory_presets};
 
 pub const PLUGIN_ID: &str = "futureboard.airboost";
 
@@ -883,11 +883,7 @@ impl Dsp {
         }
         let gain = 1.0 + (self.cut - 1.0) * self.deess_amount.value;
         let db = linear_to_db(gain);
-        if db > -0.01 {
-            0.0
-        } else {
-            db
-        }
+        if db > -0.01 { 0.0 } else { db }
     }
 
     /// What the exciter adds, relative to the input, in dB.

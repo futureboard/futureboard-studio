@@ -14,6 +14,10 @@ struct SpherePluginHostString {
 };
 
 SPHERE_PLUGIN_HOST_API SpherePluginHostString sphere_vst3_scan_path_json(const char* path);
+/// True once a VST3 scan left a bus probe running inside a plug-in past its
+/// deadline. The process must then end without normal teardown (its module is
+/// still in use), right after its result is written.
+SPHERE_PLUGIN_HOST_API bool sphere_vst3_scan_left_work_running(void);
 SPHERE_PLUGIN_HOST_API SpherePluginHostString sphere_clap_scan_path_json(const char* path);
 /// Scan a folder (or a single module) for 64-bit VST2 plug-ins. Windows
 /// candidates are `.dll` files probed for a VST2 entry point; macOS candidates

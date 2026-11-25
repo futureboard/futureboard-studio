@@ -54,6 +54,10 @@ impl ExportSampleRateChoice {
 pub enum ExportChannelMode {
     Stereo,
     Mono,
+    /// A surround mix as one multichannel WAV, a speaker per channel in the
+    /// project's layout (WAV order, with the speaker mask). Professional:
+    /// offered only while the mix plays in surround here.
+    Surround,
 }
 
 /// How a render is produced.
@@ -101,10 +105,13 @@ pub struct ExportTrackTarget {
 }
 
 impl ExportChannelMode {
-    pub fn channels(self) -> u16 {
+    /// Channels in the file, `surround` being the project's layout as it
+    /// plays here (none in a stereo or binaural mix).
+    pub fn channels(self, surround: Option<solfege_spatialaudio::SpeakerLayout>) -> u16 {
         match self {
             Self::Stereo => 2,
             Self::Mono => 1,
+            Self::Surround => surround.map_or(2, |layout| layout.channel_count() as u16),
         }
     }
 }
@@ -171,6 +178,12 @@ pub struct ExportProjectDefaults {
     /// The running audio device's sample rate, which a realtime render is
     /// recorded at. `0` when no device is running: realtime is unavailable.
     pub live_sample_rate: u32,
+    /// The project's tags, written into every exported file (the mixdown
+    /// and each stem alike).
+    pub metadata: sphere_encoder::AudioMetadata,
+    /// The speaker layout of a surround mix as it plays here (licensed), for
+    /// a multichannel export. `None` in a stereo or binaural mix.
+    pub surround_layout: Option<solfege_spatialaudio::SpeakerLayout>,
 }
 
 #[derive(Debug, Clone)]
@@ -239,6 +252,11 @@ pub enum ExportSettingsError {
     /// Realtime chosen with a normalized mixdown: one pass cannot know the
     /// peak it normalizes to.
     RealtimeNormalize,
+    /// Surround chosen while the mix does not play in surround here.
+    SurroundUnavailable,
+    /// Surround with something only a stereo render can give: a format other
+    /// than WAV, channel files, or a realtime render.
+    SurroundMixdownOnly,
 }
 
 impl ExportSettingsError {
@@ -258,6 +276,8 @@ impl ExportSettingsError {
             Self::NothingToRender => "export.error.nothing-to-render",
             Self::RealtimeUnavailable => "export.error.realtime-unavailable",
             Self::RealtimeNormalize => "export.error.realtime-normalize",
+            Self::SurroundUnavailable => "export.error.surround-unavailable",
+            Self::SurroundMixdownOnly => "export.error.surround-mixdown-only",
         }
     }
 
@@ -283,6 +303,14 @@ impl ExportSettingsError {
             }
             Self::RealtimeNormalize => {
                 "A realtime render is recorded in one pass and cannot be normalized.".to_string()
+            }
+            Self::SurroundUnavailable => {
+                "Surround export needs a surround mix and a Professional license.".to_string()
+            }
+            Self::SurroundMixdownOnly => {
+                "A surround file is an offline WAV of the mixdown alone: channel files and \
+                 realtime renders are stereo."
+                    .to_string()
             }
         }
     }
@@ -509,6 +537,20 @@ impl ExportSettings {
         if realtime && self.include_mixdown && self.normalize != ExportNormalizeChoice::Off {
             return Err(ExportSettingsError::RealtimeNormalize);
         }
+        if self.channels == ExportChannelMode::Surround {
+            if defaults.surround_layout.is_none() {
+                return Err(ExportSettingsError::SurroundUnavailable);
+            }
+            // One render shares its channel count across every file, a stem
+            // tap is stereo, and the live path records the device's pair.
+            if self.format != AudioFileFormat::Wav
+                || realtime
+                || !self.include_mixdown
+                || self.batch_target_count(defaults) > 0
+            {
+                return Err(ExportSettingsError::SurroundMixdownOnly);
+            }
+        }
         Ok(())
     }
 
@@ -530,6 +572,12 @@ impl ExportSettings {
                 .saturating_mul(request.render.channels as u64)
                 .saturating_mul(request.sample_format.bytes_per_sample() as u64)
                 .saturating_add(WAV_HEADER_BYTES)
+                // A speaker mask makes the format header 24 bytes longer.
+                .saturating_add(if request.encode_options.wav.channel_mask.is_some() {
+                    24
+                } else {
+                    0
+                })
         });
         Ok(ExportEstimate {
             sample_rate,
@@ -627,6 +675,7 @@ impl ExportSettings {
             // TPDF unless turned off (#322, #362). Float and 32-bit output is
             // never dithered whatever this says.
             dither: self.dither,
+            metadata: defaults.metadata.clone(),
             ..Default::default()
         };
         encode_options.flac = FlacEncodeOptions {
@@ -637,6 +686,11 @@ impl ExportSettings {
             bitrate: self.opus_bitrate(),
             ..Default::default()
         };
+        // A surround file names its speakers, in the layout's (WAV) order.
+        let surround = defaults.surround_layout;
+        if self.channels == ExportChannelMode::Surround {
+            encode_options.wav.channel_mask = surround.map(|layout| layout.wav_channel_mask());
+        }
 
         Ok(ArrangementExportRequest {
             output_path,
@@ -644,7 +698,7 @@ impl ExportSettings {
             sample_format: self.sample_format(),
             render: OfflineRenderRequest {
                 sample_rate,
-                channels: self.channels.channels(),
+                channels: self.channels.channels(surround),
                 start_sample,
                 end_sample,
                 master_volume: defaults.master_volume,

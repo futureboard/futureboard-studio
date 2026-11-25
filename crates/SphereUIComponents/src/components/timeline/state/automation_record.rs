@@ -163,6 +163,12 @@ impl TimelineState {
             AutomationTarget::TrackVolume => Some(track.volume.clamp(0.0, 1.0)),
             AutomationTarget::TrackPan => Some(((track.pan + 1.0) * 0.5).clamp(0.0, 1.0)),
             AutomationTarget::TrackMute => Some(switch(track.muted)),
+            AutomationTarget::TrackPanLeft => {
+                Some(((track.dual_pan.left + 1.0) * 0.5).clamp(0.0, 1.0))
+            }
+            AutomationTarget::TrackPanRight => {
+                Some(((track.dual_pan.right + 1.0) * 0.5).clamp(0.0, 1.0))
+            }
             AutomationTarget::SendLevel { send_id } => track
                 .sends
                 .iter()
@@ -176,6 +182,7 @@ impl TimelineState {
             AutomationTarget::InsertBypass { .. } | AutomationTarget::PluginParameter { .. } => {
                 insert_control_value(&track.inserts, target)
             }
+            AutomationTarget::Spatial(param) => Some(param.normalized(&track.spatial)),
         }
     }
 

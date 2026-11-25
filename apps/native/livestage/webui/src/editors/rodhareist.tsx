@@ -288,6 +288,7 @@ const REVERB_MODELS = [
   'Drum Chamber',
   'Ambience',
   'Dark Hall',
+  'Live Room',
 ]
 const REVERB_SHIMMER = 3
 const EQ_MODELS = [
@@ -387,6 +388,7 @@ const STAGES: StageInfo[] = [
     rows: [
       ['cab_mic', 'cab_mic', 'Mic Position'],
       ['cab_dist', 'cab_dist', 'Distance'],
+      ['cab_axis', 'cab_axis', 'Off-Axis'],
     ],
   },
   { name: 'Comp A', enable: 'comp_on', models: { wire: 'comp_model', labels: COMP_MODELS }, rows: compRows('comp') },
@@ -505,6 +507,7 @@ function params(editor: Editor, kind: number): ParamSpec[] {
         return modelIndex(editor.value('reverb_model'), REVERB_MODELS.length) !== REVERB_SHIMMER
       case 'cab_mic':
       case 'cab_dist':
+      case 'cab_axis':
         return modelIndex(editor.value('cab_model'), CAB_MODELS.length) === CAB_IR
       default:
         return false

@@ -876,7 +876,8 @@ fn paint_history(
     // The labels go over the traces, each on a patch of the box's ground.
     let tag =
         |window: &mut Window, cx: &mut App, text: &str, ink: Rgba, x: f32, y: f32, align: Align| {
-            // IBM Plex Mono advances 0.6 em.
+            // 0.6 em a character: wider than Barlow's tabular digits and most
+            // of its letters, so the patch always covers the label.
             let w = text.chars().count() as f32 * 6.0 + 6.0;
             let left = match align {
                 Align::Left => x - 3.0,

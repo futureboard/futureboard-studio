@@ -132,6 +132,7 @@ impl Render for Timeline {
                 // A clip gain / fade / crossfade drag puts its clips back.
                 this.cancel_clip_handle_gesture(Some(window), cx);
                 if this.range_select_drag.is_some()
+                    || this.clip_body_drag.is_some()
                     || this.pen_clip_draw.is_some()
                     || this.erase_clip_drag.is_some()
                     || this.automation_drag.is_some()
@@ -204,7 +205,18 @@ impl Render for Timeline {
         );
 
         let on_select_clip = cx.listener(
-            |this, (clip_id, additive, clone_drag): &(String, bool, bool), _window, cx| {
+            |this, (clip_id, additive, clone_drag): &(String, bool, bool), window, cx| {
+                // The drag that may follow measures from here. GPUI starts a
+                // drag only once the pointer has travelled past its threshold,
+                // and its first move event is already some way from the press;
+                // measuring from that left the clip trailing the pointer (and
+                // its drag ghost) by that distance for the whole move.
+                this.clip_drag_origin = Some(window.mouse_position());
+                // Glue tool: a click joins the clip to the one after it.
+                if this.state.active_tool == TimelineTool::Glue {
+                    this.glue_clip_with_next(clip_id, cx);
+                    return;
+                }
                 if this.state.active_tool == TimelineTool::Pen {
                     let is_audio = this
                         .state
@@ -222,6 +234,10 @@ impl Render for Timeline {
                 }
                 this.clip_clone_drag_id = clone_drag.then(|| clip_id.clone());
                 this.clip_clone_hint = None;
+                // A press that moves or clones whole clips (the top band, an
+                // Option press) ends the time range; the body's own presses
+                // come through `begin_clip_body_press` instead.
+                this.state.arrangement_range = None;
                 // A press on a clip that is already selected keeps the
                 // selection until the release, so a drag moves everything
                 // selected (a whole marquee selection). The click still makes
@@ -564,6 +580,11 @@ impl Render for Timeline {
                 this.begin_marquee(press, cx);
             },
         );
+        let on_clip_body_press = cx.listener(
+            |this, press: &crate::components::timeline::audio_clip::ClipBodyPress, _window, cx| {
+                this.begin_clip_body_press(press, cx);
+            },
+        );
 
         let on_erase_start = cx.listener(|this, _beat: &f32, _window, cx| {
             this.begin_erase_at(None, cx);
@@ -634,6 +655,7 @@ impl Render for Timeline {
             if event.pressed_button.is_none()
                 && (this.pen_clip_draw.is_some()
                     || this.range_select_drag.is_some()
+                    || this.clip_body_drag.is_some()
                     || this.erase_clip_drag.is_some()
                     || this.automation_drag.is_some()
                     || this.automation_curve_drag.is_some()
@@ -644,7 +666,9 @@ impl Render for Timeline {
                     || this.marker_drag.is_some()
                     || this.pan_last_position.is_some())
             {
-                this.reset_input_state();
+                // The release went somewhere else: end what was in flight,
+                // keeping any time range it drew.
+                this.end_pointer_gestures();
                 cx.notify();
                 return;
             }
@@ -699,6 +723,17 @@ impl Render for Timeline {
                     cx,
                 );
             } else if event.pressed_button == Some(gpui::MouseButton::Left)
+                && this.clip_body_drag.is_some()
+            {
+                // As for the marquee: the window-wide tracker takes the moves
+                // from the frame after the press.
+                this.update_clip_body_drag(
+                    (event.position.x.into(), event.position.y.into()),
+                    event.modifiers.shift,
+                    window,
+                    cx,
+                );
+            } else if event.pressed_button == Some(gpui::MouseButton::Left)
                 && this.pen_clip_draw.is_some()
             {
                 // Live MIDI clip draw: track the snapped cursor beat so the ghost
@@ -731,6 +766,13 @@ impl Render for Timeline {
             this.log_input_state("mouse-up-left");
             // A clip gain / fade / crossfade drag ends here: one undo step.
             this.finish_clip_handle_gestures(cx);
+            // A clip body press: its range stays, its range move commits.
+            this.finish_clip_body_drag(
+                Some((event.position.x.into(), event.position.y.into())),
+                event.modifiers.shift,
+                window,
+                cx,
+            );
             // A press on a selected clip released without a drag: the click
             // applies the selection change the press held back.
             this.apply_pending_clip_click();
@@ -755,7 +797,8 @@ impl Render for Timeline {
                     this.finish_erase_clip_drag(cx);
                 }
             }
-            this.reset_input_state();
+            // A release keeps the time range a gesture drew.
+            this.end_pointer_gestures();
             debug_assert!(this.range_select_drag.is_none());
             cx.notify();
         });
@@ -768,6 +811,14 @@ impl Render for Timeline {
             // A clip gain / fade / crossfade drag released outside the
             // timeline ends here too: one undo step.
             this.finish_clip_handle_gestures(cx);
+            // Before the clip move's own commit below: a range move commits
+            // its split with it.
+            this.finish_clip_body_drag(
+                Some((event.position.x.into(), event.position.y.into())),
+                event.modifiers.shift,
+                window,
+                cx,
+            );
             // A clip move released outside the timeline gets no drop. Commit
             // what the lanes show before the reset below forgets the origin.
             if let Some(anchor) = this
@@ -798,7 +849,8 @@ impl Render for Timeline {
                     this.finish_erase_clip_drag(cx);
                 }
             }
-            this.reset_input_state();
+            // A release keeps the time range a gesture drew.
+            this.end_pointer_gestures();
             debug_assert!(this.range_select_drag.is_none());
             cx.notify();
         });
@@ -1165,6 +1217,8 @@ impl Render for Timeline {
         > = std::sync::Arc::new(on_erase_clip);
         let on_cut_clip: crate::components::timeline::audio_clip::AudioClipCutCb =
             std::sync::Arc::new(on_cut_clip);
+        let on_clip_body_press: crate::components::timeline::audio_clip::ClipBodyPressCb =
+            std::sync::Arc::new(on_clip_body_press);
         let on_zoom_in: std::sync::Arc<dyn Fn(&(), &mut gpui::Window, &mut gpui::App) + 'static> =
             std::sync::Arc::new(on_zoom_in);
         let on_zoom_out: std::sync::Arc<dyn Fn(&(), &mut gpui::Window, &mut gpui::App) + 'static> =
@@ -1805,6 +1859,7 @@ impl Render for Timeline {
                 on_erase_start: Some(on_erase_start.clone()),
                 on_erase_clip: Some(on_erase_clip.clone()),
                 on_cut_clip: Some(on_cut_clip.clone()),
+                on_clip_body_press: Some(on_clip_body_press.clone()),
                 on_audio_clip_process_preview: on_audio_clip_process_preview.clone(),
                 on_audio_clip_process_commit: on_audio_clip_process_commit.clone(),
                 on_crossfade: Some(on_crossfade.clone()),
@@ -1857,11 +1912,8 @@ impl Render for Timeline {
         let on_zoom_out_btn = on_zoom_out.clone();
 
         // ── Scrollbar geometry ──────────────────────────────────────────
-        // Computed once per render against the live window size. Both
-        // tracks (visible bar) are 8 px wide and sit at the right/bottom
-        // edges of the lane area. Clicking the track jumps the scroll
-        // position to that point — gives a functional scrollbar without
-        // needing a stateful drag.
+        // Computed once per render against the live window size (the content
+        // width at the top of `render`); see `lane_scrollbars`.
         let content_h = row_layout.total_height.max(1.0);
         let lane_view_h = viewport_h.max(DEFAULT_TRACK_HEIGHT);
         let lane_view_w = viewport_w.max(1.0);
@@ -2631,45 +2683,50 @@ impl Render for Timeline {
         // root's own hover-gated mouse-move ever sees. Deliberately not a GPUI
         // drag payload: an active drag makes GPUI refresh the whole window on
         // every move, which would rebuild every cached lane per pointer event.
-        let marquee_tracker = self.range_select_drag.is_some().then(|| {
-            let on_move = cx.weak_entity();
-            let on_up = on_move.clone();
-            gpui::canvas(
-                |_, _, _| {},
-                move |_, _, window, _| {
-                    window.on_mouse_event(
-                        move |event: &gpui::MouseMoveEvent, phase, window, cx| {
-                            if phase != gpui::DispatchPhase::Capture {
-                                return;
-                            }
-                            let position = (event.position.x.into(), event.position.y.into());
-                            let _ = on_move.update(cx, |this, cx| match event.pressed_button {
-                                Some(gpui::MouseButton::Left) => {
-                                    this.update_marquee(position, window, cx)
+        let marquee_tracker = (self.range_select_drag.is_some() || self.clip_body_drag.is_some())
+            .then(|| {
+                let on_move = cx.weak_entity();
+                let on_up = on_move.clone();
+                gpui::canvas(
+                    |_, _, _| {},
+                    move |_, _, window, _| {
+                        window.on_mouse_event(
+                            move |event: &gpui::MouseMoveEvent, phase, window, cx| {
+                                if phase != gpui::DispatchPhase::Capture {
+                                    return;
                                 }
-                                // The release reached somebody else: end the
-                                // marquee where the rectangle is.
-                                None => this.finish_marquee(None, window, cx),
-                                Some(_) => {}
-                            });
-                        },
-                    );
-                    window.on_mouse_event(move |event: &gpui::MouseUpEvent, phase, window, cx| {
-                        if phase != gpui::DispatchPhase::Capture
-                            || event.button != gpui::MouseButton::Left
-                        {
-                            return;
-                        }
-                        let position = (event.position.x.into(), event.position.y.into());
-                        let _ = on_up.update(cx, |this, cx| {
-                            this.finish_marquee(Some(position), window, cx)
-                        });
-                    });
-                },
-            )
-            .absolute()
-            .inset_0()
-        });
+                                let position = (event.position.x.into(), event.position.y.into());
+                                let shift = event.modifiers.shift;
+                                let _ = on_move.update(cx, |this, cx| match event.pressed_button {
+                                    Some(gpui::MouseButton::Left) => {
+                                        this.track_pointer_drag(position, shift, window, cx)
+                                    }
+                                    // The release reached somebody else: end the
+                                    // marquee (or the clip body drag) where it is.
+                                    None => this.release_pointer_drag(None, shift, window, cx),
+                                    Some(_) => {}
+                                });
+                            },
+                        );
+                        window.on_mouse_event(
+                            move |event: &gpui::MouseUpEvent, phase, window, cx| {
+                                if phase != gpui::DispatchPhase::Capture
+                                    || event.button != gpui::MouseButton::Left
+                                {
+                                    return;
+                                }
+                                let position = (event.position.x.into(), event.position.y.into());
+                                let shift = event.modifiers.shift;
+                                let _ = on_up.update(cx, |this, cx| {
+                                    this.release_pointer_drag(Some(position), shift, window, cx)
+                                });
+                            },
+                        );
+                    },
+                )
+                .absolute()
+                .inset_0()
+            });
         let marquee_overlay = self
             .range_select_drag
             .is_some()
@@ -2728,6 +2785,7 @@ impl Render for Timeline {
                 cx.listener(|this, event: &gpui::KeyDownEvent, _window, cx| {
                     if event.keystroke.key.as_str() == "escape"
                         && (this.range_select_drag.is_some()
+                            || this.clip_body_drag.is_some()
                             || this.marker_drag.is_some()
                             || this.pen_clip_draw.is_some()
                             || this.erase_clip_drag.is_some()
@@ -2784,7 +2842,8 @@ impl Render for Timeline {
                     if this.erase_clip_drag.is_some() {
                         this.finish_erase_clip_drag(cx);
                     }
-                    this.reset_input_state();
+                    // A right click (a context menu) keeps the time range.
+                    this.end_pointer_gestures();
                     cx.notify();
                 }),
             )
@@ -2795,7 +2854,8 @@ impl Render for Timeline {
                     if this.erase_clip_drag.is_some() {
                         this.finish_erase_clip_drag(cx);
                     }
-                    this.reset_input_state();
+                    // A right click (a context menu) keeps the time range.
+                    this.end_pointer_gestures();
                     cx.notify();
                 }),
             )
@@ -2930,6 +2990,7 @@ impl Render for Timeline {
                 Some(on_erase_start.clone()),
                 Some(on_erase_clip.clone()),
                 Some(on_cut_clip.clone()),
+                Some(on_clip_body_press.clone()),
                 self.erase_clip_drag.as_ref(),
                 on_audio_clip_process_preview.clone(),
                 on_audio_clip_process_commit.clone(),
@@ -3110,22 +3171,14 @@ impl Render for Timeline {
                         },
                     )),
             ))
-            // 5. Vertical scrollbar (right edge, over the lane area)
-            .child(vertical_scrollbar(
+            // 5-6. Scrollbars (right and bottom edges, over the lane area)
+            .children(lane_scrollbars(
                 cx,
-                state.viewport.scroll_y,
-                content_h,
-                lane_view_h,
-                scroll_max_y,
+                (state.viewport.scroll_x, state.viewport.scroll_y),
+                (content_w, content_h),
+                (lane_view_w, lane_view_h),
+                (scroll_max_x, scroll_max_y),
                 content_top,
-            ))
-            // 6. Horizontal scrollbar (bottom edge, over the lane area)
-            .child(horizontal_scrollbar(
-                cx,
-                state.viewport.scroll_x,
-                content_w,
-                lane_view_w,
-                scroll_max_x,
             ))
             // 7. Zoom Controls
             .child(
@@ -3217,164 +3270,101 @@ impl Render for Timeline {
     }
 }
 
-pub(crate) fn vertical_scrollbar(
+/// The lane area's scrollbars: the shared draggable bar, on the right edge
+/// below the ruler and along the bottom edge right of the track headers.
+/// Drag the thumb or click the track. Where both show, each stops short of the
+/// corner the other runs into. Arguments are `(x, y)` pairs.
+pub(crate) fn lane_scrollbars(
     cx: &mut Context<Timeline>,
-    scroll_y: f32,
-    content_h: f32,
-    view_h: f32,
-    max_scroll: f32,
+    scroll: (f32, f32),
+    content: (f32, f32),
+    view: (f32, f32),
+    max_scroll: (f32, f32),
     content_top: f32,
-) -> gpui::AnyElement {
-    if max_scroll <= 0.5 || view_h <= 0.0 {
-        return Empty.into_any_element();
-    }
-    let track_h = view_h;
-    let thumb_h = ((view_h / content_h) * track_h).max(SCROLLBAR_MIN_THUMB);
-    let progress = (scroll_y / max_scroll).clamp(0.0, 1.0);
-    let thumb_top = progress * (track_h - thumb_h).max(0.0);
+) -> Vec<gpui::AnyElement> {
+    use crate::components::scrollbar::{scrollbar, Axis, THICKNESS};
+    let has_x = max_scroll.0 > 0.5 && view.0 > 0.0;
+    let has_y = max_scroll.1 > 0.5 && view.1 > 0.0;
+    let corner = |other: bool| if other { THICKNESS } else { 0.0 };
+    let entity = cx.entity().downgrade();
+    let mut bars = Vec::new();
 
-    let on_track_click = cx.listener(move |this, event: &gpui::MouseDownEvent, _w, cx| {
-        // Position is in window space; convert to a fraction of the
-        // scrollbar track. We approximate the track top as the click
-        // y minus the thumb half-height when clicking above the thumb,
-        // and snap the thumb center to the click otherwise.
-        let click_y: f32 = event.position.y.into();
-        // The track starts `content_top` below the timeline's own top, which
-        // is where the measured origin puts it in the window. (A fixed 36px
-        // guess here missed the chrome's real height by 40px.)
-        let local = (click_y - this.state.timeline_origin_y() - content_top).max(0.0);
-        let frac = (local / track_h.max(1.0)).clamp(0.0, 1.0);
-        this.state.set_scroll_immediate(
-            this.state.viewport.scroll_x,
-            (frac * max_scroll).clamp(0.0, max_scroll),
-            f32::MAX,
-            max_scroll,
-        );
-        cx.notify();
-    });
-
-    let on_thumb_drag = cx.listener(
-        move |this, event: &gpui::DragMoveEvent<ScrollbarDrag>, _w, cx| {
-            if event.drag(cx).axis != ScrollAxis::Vertical {
-                return;
-            }
-            let y: f32 = event.event.position.y.into();
-            let oy: f32 = event.bounds.origin.y.into();
-            let track_range = (track_h - thumb_h).max(1.0);
-            let local = (y - oy - thumb_h * 0.5).clamp(0.0, track_range);
-            let frac = local / track_range;
-            this.state.set_scroll_immediate(
-                this.state.viewport.scroll_x,
-                frac * max_scroll,
-                f32::MAX,
-                max_scroll,
+    if has_y {
+        let entity = entity.clone();
+        let max_y = max_scroll.1;
+        let on_scroll = std::sync::Arc::new(move |y: f32, _: &mut Window, cx: &mut gpui::App| {
+            let _ = entity.update(cx, |this, cx| {
+                this.state.set_scroll_immediate(
+                    this.state.viewport.scroll_x,
+                    y.clamp(0.0, max_y),
+                    f32::MAX,
+                    max_y,
+                );
+                cx.notify();
+            });
+        });
+        let track_len = (view.1 - corner(has_x)).max(1.0);
+        if let Some(bar) = scrollbar(
+            "timeline-vscroll",
+            Axis::Vertical,
+            scroll.1,
+            content.1,
+            view.1,
+            max_y,
+            track_len,
+            on_scroll,
+        ) {
+            bars.push(
+                div()
+                    .absolute()
+                    .top(px(content_top))
+                    .right_0()
+                    .h(px(track_len))
+                    .w(px(THICKNESS))
+                    .child(bar)
+                    .into_any_element(),
             );
-            cx.notify();
-        },
-    );
-
-    div()
-        .absolute()
-        .top(px(content_top))
-        .right(px(0.0))
-        .bottom(px(0.0))
-        .w(px(SCROLLBAR_THICKNESS))
-        .id("timeline-vscroll")
-        .on_mouse_down(gpui::MouseButton::Left, on_track_click)
-        .on_drag(
-            ScrollbarDrag {
-                axis: ScrollAxis::Vertical,
-            },
-            |drag, _offset, _window, cx| cx.new(|_| drag.clone()),
-        )
-        .on_drag_move::<ScrollbarDrag>(on_thumb_drag)
-        .child(
-            div()
-                .absolute()
-                .top(px(thumb_top))
-                .left(px(2.0))
-                .right(px(2.0))
-                .h(px(thumb_h))
-                .rounded(px(crate::theme::radius::PILL))
-                .bg(Colors::with_alpha(Colors::text_primary(), 0.2)),
-        )
-        .into_any_element()
-}
-
-pub(crate) fn horizontal_scrollbar(
-    cx: &mut Context<Timeline>,
-    scroll_x: f32,
-    content_w: f32,
-    view_w: f32,
-    max_scroll: f32,
-) -> gpui::AnyElement {
-    if max_scroll <= 0.5 || view_w <= 0.0 {
-        return Empty.into_any_element();
+        }
     }
-    let track_w = view_w;
-    let thumb_w = ((view_w / content_w) * track_w).max(SCROLLBAR_MIN_THUMB);
-    let progress = (scroll_x / max_scroll).clamp(0.0, 1.0);
-    let thumb_left = progress * (track_w - thumb_w).max(0.0);
 
-    let on_track_click = cx.listener(move |this, event: &gpui::MouseDownEvent, _w, cx| {
-        let click_x: f32 = event.position.x.into();
-        let local = this.state.lane_x_from_window_x(click_x).max(0.0);
-        let frac = (local / track_w.max(1.0)).clamp(0.0, 1.0);
-        this.state.set_scroll_immediate(
-            (frac * max_scroll).clamp(0.0, max_scroll),
-            this.state.viewport.scroll_y,
-            max_scroll,
-            f32::MAX,
-        );
-        cx.notify();
-    });
-
-    let on_thumb_drag = cx.listener(
-        move |this, event: &gpui::DragMoveEvent<ScrollbarDrag>, _w, cx| {
-            if event.drag(cx).axis != ScrollAxis::Horizontal {
-                return;
-            }
-            let x: f32 = event.event.position.x.into();
-            let ox: f32 = event.bounds.origin.x.into();
-            let track_range = (track_w - thumb_w).max(1.0);
-            let local = (x - ox - thumb_w * 0.5).clamp(0.0, track_range);
-            let frac = local / track_range;
-            this.state.set_scroll_immediate(
-                frac * max_scroll,
-                this.state.viewport.scroll_y,
-                max_scroll,
-                f32::MAX,
+    if has_x {
+        let max_x = max_scroll.0;
+        let on_scroll = std::sync::Arc::new(move |x: f32, _: &mut Window, cx: &mut gpui::App| {
+            let _ = entity.update(cx, |this, cx| {
+                this.state.set_scroll_immediate(
+                    x.clamp(0.0, max_x),
+                    this.state.viewport.scroll_y,
+                    max_x,
+                    f32::MAX,
+                );
+                cx.notify();
+            });
+        });
+        let track_len = (view.0 - corner(has_y)).max(1.0);
+        if let Some(bar) = scrollbar(
+            "timeline-hscroll",
+            Axis::Horizontal,
+            scroll.0,
+            content.0,
+            view.0,
+            max_x,
+            track_len,
+            on_scroll,
+        ) {
+            bars.push(
+                div()
+                    .absolute()
+                    .bottom_0()
+                    .left(px(HEADER_WIDTH))
+                    .w(px(track_len))
+                    .h(px(THICKNESS))
+                    .child(bar)
+                    .into_any_element(),
             );
-            cx.notify();
-        },
-    );
+        }
+    }
 
-    div()
-        .absolute()
-        .bottom(px(0.0))
-        .left(px(HEADER_WIDTH))
-        .right(px(SCROLLBAR_THICKNESS))
-        .h(px(SCROLLBAR_THICKNESS))
-        .id("timeline-hscroll")
-        .on_mouse_down(gpui::MouseButton::Left, on_track_click)
-        .on_drag(
-            ScrollbarDrag {
-                axis: ScrollAxis::Horizontal,
-            },
-            |drag, _offset, _window, cx| cx.new(|_| drag.clone()),
-        )
-        .on_drag_move::<ScrollbarDrag>(on_thumb_drag)
-        .child(
-            div()
-                .absolute()
-                .left(px(thumb_left))
-                .top(px(2.0))
-                .bottom(px(2.0))
-                .w(px(thumb_w))
-                .rounded(px(crate::theme::radius::PILL))
-                .bg(Colors::with_alpha(Colors::text_primary(), 0.2)),
-        )
-        .into_any_element()
+    bars
 }
 
 /// Translucent arrangement range-selection rectangle. Pure render of
@@ -3484,7 +3474,7 @@ pub(crate) fn pinch_zoom_factor(delta: f32) -> f32 {
 /// this helper only normalizes direction and enforces positive duration. Shared
 /// by the live ghost preview and the commit so they can never disagree.
 pub(crate) fn compute_pen_clip_span(
-    _state: &TimelineState,
+    state: &TimelineState,
     start_beat: f32,
     end_beat: f32,
 ) -> (f32, f32) {
@@ -3494,7 +3484,16 @@ pub(crate) fn compute_pen_clip_span(
     let (lo, hi) = normalize_range(start_beat, end_beat);
     let dragged_length = hi - lo;
     let length = if dragged_length <= f32::EPSILON {
-        DEFAULT_MIDI_CLIP_BEATS
+        // A click makes one bar of the meter it lands in (4 beats in 4/4,
+        // 3 in 3/4), not a fixed 4 beats that spill into the next bar.
+        let bar = state
+            .time_signature_map
+            .beats_per_bar_at_beat(f64::from(lo)) as f32;
+        if bar > f32::EPSILON {
+            bar
+        } else {
+            DEFAULT_MIDI_CLIP_BEATS
+        }
     } else {
         dragged_length.max(MIN_MIDI_CLIP_BEATS)
     };
@@ -4293,6 +4292,136 @@ mod midi_clip_draw_tests {
     #[gpui::test]
     fn a_double_click_on_the_tempo_lane_adds_a_marker(cx: &mut gpui::TestAppContext) {
         assert!(!click_down_the_tempo_lane(cx, TimelineTool::Pointer, 2).is_empty());
+    }
+
+    /// Press an audio clip, drag it eight beats right and let go: the clip
+    /// moves the whole eight beats, the same as the pointer and its drag ghost,
+    /// and the drop keeps it there with one undo step. It used to measure from
+    /// the drag's first move event rather than the press, and trailed the
+    /// pointer by the distance GPUI needs before it starts a drag.
+    #[gpui::test]
+    fn a_dragged_audio_clip_stays_where_it_is_dropped(cx: &mut gpui::TestAppContext) {
+        use crate::components::timeline::timeline_state::{
+            AudioClipStretchState, AudioImportState, ClipState, ClipType,
+        };
+        let window = cx.open_window(gpui::size(px(1600.0), px(900.0)), |_, _| {
+            let mut timeline = Timeline::new();
+            timeline.state.tracks.clear();
+            let track_id = timeline.state.create_audio_track();
+            let clip = ClipState {
+                id: "clip-a".to_string(),
+                name: "Take".to_string(),
+                start_beat: 4.0,
+                duration_beats: 8.0,
+                source_duration_seconds: Some(4.0),
+                offset_beats: 0.0,
+                gain: 1.0,
+                clip_type: ClipType::Audio {
+                    file_id: "asset-a".to_string(),
+                    source_path: None,
+                },
+                muted: false,
+                audio_import: AudioImportState::Ready,
+                stretch: AudioClipStretchState::default(),
+            };
+            timeline
+                .state
+                .tracks
+                .iter_mut()
+                .find(|track| track.id == track_id)
+                .expect("track")
+                .clips
+                .push(clip);
+            timeline
+        });
+        cx.run_until_parked();
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        let x = window
+            .update(&mut vcx, |t, _, _| {
+                t.state.lane_origin_x() + t.state.beats_to_x(6.0)
+            })
+            .expect("window is open");
+        let mut grab_y = None;
+        for y in (60..600).step_by(4) {
+            let position = gpui::point(px(x), px(y as f32));
+            vcx.simulate_event(gpui::MouseDownEvent {
+                button: gpui::MouseButton::Left,
+                position,
+                modifiers: gpui::Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            });
+            vcx.simulate_event(gpui::MouseUpEvent {
+                button: gpui::MouseButton::Left,
+                position,
+                modifiers: gpui::Modifiers::default(),
+                click_count: 1,
+            });
+            vcx.run_until_parked();
+            let hit = window
+                .update(&mut vcx, |t, _, _| {
+                    t.state
+                        .selection
+                        .selected_clip_ids
+                        .iter()
+                        .any(|id| id == "clip-a")
+                })
+                .expect("window is open");
+            if hit {
+                grab_y = Some(y as f32);
+                break;
+            }
+        }
+        let y = grab_y.expect("a press somewhere down the lane selects the clip");
+        let ppb = window
+            .update(&mut vcx, |t, _, _| {
+                t.state.beats_to_x(5.0) - t.state.beats_to_x(4.0)
+            })
+            .expect("window is open");
+        let press = gpui::point(px(x), px(y));
+        vcx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Left,
+            position: press,
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        for step in 1..=8 {
+            let position = gpui::point(px(x + ppb * step as f32), px(y));
+            vcx.simulate_event(gpui::MouseMoveEvent {
+                position,
+                pressed_button: Some(gpui::MouseButton::Left),
+                modifiers: gpui::Modifiers::default(),
+            });
+            vcx.run_until_parked();
+        }
+        let mid_drag = window
+            .update(&mut vcx, |t, _, _| {
+                t.state.find_clip("clip-a").map(|(_, c)| c.start_beat)
+            })
+            .expect("window is open");
+        let release = gpui::point(px(x + ppb * 8.0), px(y));
+        vcx.simulate_event(gpui::MouseUpEvent {
+            button: gpui::MouseButton::Left,
+            position: release,
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+        });
+        vcx.run_until_parked();
+        let (after, can_undo) = window
+            .update(&mut vcx, |t, _, _| {
+                (
+                    t.state.find_clip("clip-a").map(|(_, c)| c.start_beat),
+                    t.edit_history.can_undo(),
+                )
+            })
+            .expect("window is open");
+        assert_eq!(
+            after, mid_drag,
+            "the drop keeps the clip where it was let go"
+        );
+        assert_eq!(mid_drag, Some(12.0), "the preview follows the pointer");
+        assert!(can_undo, "the move is an undo step");
     }
 
     #[gpui::test]

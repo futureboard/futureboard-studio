@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Bundle the Community Edition FutureboardNative into a portable Linux AppImage.
+# Bundle the xtask-staged FutureboardNative package into a portable Linux AppImage.
 #
 # Usage: bundle-appimage.sh [PACKAGE_DIR] [OUT_DIR] [APP_VERSION]
 #   PACKAGE_DIR Complete runtime tree produced by `xtask package`.
-#               Default: out/release/community/linux-x64
+#               Default: out/release/linux-x64
 #   OUT_DIR     Directory the finished .AppImage is written to.
 #               Default: target/appimage
 #   APP_VERSION Version string embedded in the AppImage filename.
@@ -12,7 +12,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
-PACKAGE_DIR="${1:-$ROOT/out/release/community/linux-x64}"
+PACKAGE_DIR="${1:-$ROOT/out/release/linux-x64}"
 OUT_DIR="${2:-$ROOT/target/appimage}"
 APP_VERSION="${3:-}"
 BIN="$PACKAGE_DIR/FutureboardNative"
@@ -37,7 +37,7 @@ APPDIR="$OUT_DIR/AppDir"
 
 if [[ ! -f "$BIN" ]]; then
   echo "error: xtask runtime package not found: $BIN" >&2
-  echo "run: cargo xtask package --profile release --edition community --plugin all" >&2
+  echo "run: cargo xtask package --profile release --plugin all" >&2
   exit 1
 fi
 if [[ ! -f "$PACKAGE_DIR/build-info.json" ]]; then

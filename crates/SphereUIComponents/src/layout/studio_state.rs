@@ -183,6 +183,11 @@ pub enum ContextTarget {
         track_id: String,
         insert_id: String,
     },
+    /// Pan mode menu (Balance / Dual Pan) opened from a mixer strip's pan
+    /// right-click; wired to `set_track_pan_mode`.
+    PanMode {
+        track_id: String,
+    },
     /// Master Output picker opened from the Master strip. Lists Output Audio
     /// Connections only; selecting one stores nothing but its stable id.
     MasterOutputPicker,

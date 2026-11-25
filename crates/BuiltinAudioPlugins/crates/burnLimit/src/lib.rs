@@ -3,10 +3,10 @@
 //! Lookahead peak limiting with style curves and a 4× cubic inter-sample peak
 //! detector. The audio path remains allocation-free and bounded.
 
-use builtin_dsp_core::delay::{smoothing_step, Smoothed};
+use builtin_dsp_core::delay::{Smoothed, smoothing_step};
 use builtin_dsp_core::{
-    clamp, db_to_linear, flush_denormal, linear_to_db, mix, time_constant, ParamDescriptor,
-    PluginCategory, PluginDescriptor, StereoEffect,
+    ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, clamp, db_to_linear,
+    flush_denormal, linear_to_db, mix, time_constant,
 };
 use serde::{Deserialize, Serialize};
 
@@ -17,8 +17,8 @@ pub mod presets;
 pub mod telemetry;
 pub mod ui;
 
-pub use ipc::{ui_param_id, ui_param_index, UI_PARAM_IDS};
-pub use presets::{factory_presets, FactoryPreset};
+pub use ipc::{UI_PARAM_IDS, ui_param_id, ui_param_index};
+pub use presets::{FactoryPreset, factory_presets};
 
 use loudness::Loudness;
 use oversample::{AntiAlias, Ring, TAPS_PER_PHASE};
@@ -2234,10 +2234,11 @@ mod tests {
                 .map(|n| dsp.process_stereo(if n == 0 { 0.5 } else { 0.0 }, 0.0))
                 .collect();
             assert_eq!(out[latency], (0.5, 0.0), "{os:?}");
-            assert!(out
-                .iter()
-                .enumerate()
-                .all(|(i, s)| i == latency || s.0 == 0.0));
+            assert!(
+                out.iter()
+                    .enumerate()
+                    .all(|(i, s)| i == latency || s.0 == 0.0)
+            );
 
             // Driven 18 dB into a -1 dB ceiling: bounded, finite, held.
             assert!(dsp.apply_ui_param("gainDb", 18.0));

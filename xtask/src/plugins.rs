@@ -16,7 +16,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, anyhow, bail};
 use cargo_metadata::{Artifact, Message};
 
-use crate::platform::{Edition, dynamic_library_extension, dynamic_library_file_name};
+use crate::platform::{TARGET_DIR, dynamic_library_extension, dynamic_library_file_name};
 use crate::staging::{PLUGINS_DIR, copy_into};
 
 /// Directory (relative to the workspace root) that holds the plugin crates.
@@ -43,6 +43,7 @@ pub const BUILTIN_PLUGIN_CRATES: &[&str] = &[
     "airboost",
     "deesser",
     "duckstep",
+    "trigger",
 ];
 
 /// The platform-correct dynamic-library file names every built-in plugin is
@@ -106,7 +107,6 @@ pub fn build_plugins(
     packages: &[String],
     profile: &str,
     target: Option<&str>,
-    edition: Edition,
 ) -> Result<Vec<PluginArtifact>> {
     if packages.is_empty() {
         return Ok(Vec::new());
@@ -117,7 +117,7 @@ pub fn build_plugins(
         .arg("build")
         .arg("--message-format=json-render-diagnostics")
         .args(["--profile", profile])
-        .args(["--target-dir", edition.target_dir()]);
+        .args(["--target-dir", TARGET_DIR]);
     crate::jobs::apply(&mut command, Some(profile), &[]);
     for package in packages {
         command.args(["--package", package]);

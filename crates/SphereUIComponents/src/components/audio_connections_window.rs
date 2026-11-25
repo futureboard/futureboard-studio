@@ -1511,6 +1511,7 @@ impl AudioConnectionsWindow {
                 shortcut: None,
                 checked: false,
                 enabled: true,
+                icon: None,
             })
             .collect();
         let on_edit = self.on_edit.clone();

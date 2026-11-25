@@ -718,11 +718,13 @@ fn automation_track_snapshot(
     automation_lanes: Vec<EngineAutomationLaneSnapshot>,
 ) -> crate::types::EngineTrackSnapshot {
     crate::types::EngineTrackSnapshot {
+        vca_gain: 1.0,
         midi_programs: Vec::new(),
         id: "track-1".to_string(),
         track_type: "audio".to_string(),
         volume: 1.0,
         pan: 0.0,
+        dual_pan: Default::default(),
         muted: false,
         solo: false,
         armed: false,
@@ -730,6 +732,7 @@ fn automation_track_snapshot(
         input_source: Default::default(),
         preview_mode: "stereo".to_string(),
         output_track_id: None,
+        midi_fx: Vec::new(),
         inserts: Vec::new(),
         sends: Vec::new(),
         automation_lanes,
@@ -1132,8 +1135,10 @@ impl crate::plugin_bridge::PluginBridgeSink for RecordingSink {
 
 fn bridged_instrument_track(id: &str) -> RuntimeTrack {
     RuntimeTrack {
+        vca_gain: 1.0,
         spatial: None,
         spatial_params: Default::default(),
+        spatial_state: Default::default(),
         active_voices: 0,
         listen: crate::monitor::ListenMode::Off,
         id: id.to_string(),
@@ -1153,6 +1158,9 @@ fn bridged_instrument_track(id: &str) -> RuntimeTrack {
         preview_mode: RuntimePreviewMode::Stereo,
         output_track_id: None,
         output_track_index: None,
+        midi_fx: None,
+        midi_fx_hold: Vec::new(),
+        midi_fx_plugins: Default::default(),
         inserts: vec![RuntimeInsert {
             id: "insert-1".to_string(),
             kind: "external-bridge-plugin".to_string(),
@@ -1169,6 +1177,7 @@ fn bridged_instrument_track(id: &str) -> RuntimeTrack {
             vst3: None,
             cpu_us: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             guard: Default::default(),
+            latency_bypassed: false,
             callback_process_log_done: false,
             silent_process_blocks: 0,
             bridge_missed_blocks: 0,
@@ -1178,6 +1187,7 @@ fn bridged_instrument_track(id: &str) -> RuntimeTrack {
             scratch_multi: Vec::new(),
             chain_latency_samples: 0,
             signal_bus: 0,
+            post_fader: false,
             sidechain: None,
         }],
         sends: Vec::new(),
@@ -1214,6 +1224,7 @@ fn bridged_instrument_track(id: &str) -> RuntimeTrack {
         pdc_write_pos: 0,
         smoothed_gain_l: 1.0,
         smoothed_gain_r: 1.0,
+        dual_pan: Default::default(),
         wdw_return_index: None,
         sidechain_tap: Default::default(),
     }
@@ -1370,6 +1381,77 @@ fn scheduled_bridge_events_carry_offset_velocity_and_channel() {
     // NoteOff at 120_000 inside block 119_900..120_412.
     p.schedule_midi_block(119_900, 512);
     assert_eq!(sink.take(), vec![(0x80, 60, 0, 100)]);
+}
+
+/// `bridged_project` with a Transpose +12 MIDI FX on its instrument track.
+fn bridged_project_with_midi_fx() -> (RuntimeProject, Arc<RecordingSink>) {
+    let (mut p, sink) = bridged_project();
+    p.tracks[0].midi_fx = RuntimeMidiFx::build(
+        &[crate::types::EngineMidiFxSnapshot {
+            id: "fx-1".into(),
+            device: "transpose".into(),
+            plugin_instance_id: None,
+            enabled: true,
+            params: vec![("semitones".into(), 12.0)],
+        }],
+        48_000,
+    );
+    p.reserve_midi_block_events();
+    (p, sink)
+}
+
+/// One render block of the track's chain, then the end-of-block clear every
+/// render path does (`backend/render.rs`, `stream.rs`, the offline renderer).
+fn render_chain_block(p: &mut RuntimeProject, at_ppq: f64) {
+    crate::engine::apply_track_chain_block(&mut p.tracks[0], 64, playing_at(at_ppq));
+    p.tracks[0].midi_block_events.clear();
+}
+
+fn playing_at(ppq: f64) -> crate::vst3_processor::RuntimeTransportContext {
+    crate::vst3_processor::RuntimeTransportContext {
+        tempo_bpm: 120.0,
+        ppq_position: ppq,
+        playing: true,
+        ..Default::default()
+    }
+}
+
+/// With MIDI FX on the track, a clip note never goes straight to the bridged
+/// instrument: it waits in `midi_block_events`, the chain runs at render,
+/// and the instrument receives the result in the same block.
+#[test]
+fn a_track_with_midi_fx_feeds_its_bridged_instrument_through_the_chain() {
+    let (mut p, sink) = bridged_project_with_midi_fx();
+    p.reset_midi_playback(95_990);
+    sink.take(); // the seek's panic CCs
+                 // NoteOn at 96_000: offset 10 in the 64-frame block from 95_990.
+    p.schedule_midi_block(95_990, 64);
+    assert!(
+        sink.take().is_empty(),
+        "nothing reaches the ring unprocessed"
+    );
+    render_chain_block(&mut p, 4.0);
+    assert_eq!(sink.take(), vec![(0x90, 72, 100, 10)]);
+}
+
+/// Live notes (preview / MIDI input) on a MIDI FX track go through the chain
+/// too, and a panic ends what the chain was playing.
+#[test]
+fn preview_notes_on_a_midi_fx_track_go_through_the_chain() {
+    let (mut p, sink) = bridged_project_with_midi_fx();
+    p.bridge_preview_note_on("track-1", "insert-1", 0, 60, 90);
+    assert!(sink.take().is_empty(), "queued, not written to the ring");
+    render_chain_block(&mut p, 0.0);
+    assert_eq!(sink.take(), vec![(0x90, 72, 90, 0)]);
+
+    p.bridge_preview_all_notes_off("track-1", "insert-1");
+    sink.take(); // the instrument's own panic CCs, sent directly
+    render_chain_block(&mut p, 0.0);
+    assert_eq!(
+        sink.take(),
+        vec![(0x80, 72, 0, 0)],
+        "the chain releases its note"
+    );
 }
 
 #[test]

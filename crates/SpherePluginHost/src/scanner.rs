@@ -16,6 +16,16 @@ extern "C" {
     fn sphere_clap_scan_path_json(path: *const c_char) -> SpherePluginHostString;
     fn sphere_vst2_scan_path_json(path: *const c_char) -> SpherePluginHostString;
     fn sphere_plugin_host_free_string(value: SpherePluginHostString);
+    fn sphere_vst3_scan_left_work_running() -> bool;
+}
+
+/// Whether a VST3 scan in this process left a bus probe running inside a
+/// plug-in past its deadline (a plug-in that does its whole start-up in
+/// `initialize()`, like ZENOLOGY). Its rows were still reported, without a bus
+/// layout. The process has to end without normal teardown once its result is
+/// out: the abandoned thread is still inside the plug-in's module.
+pub fn scan_left_work_running() -> bool {
+    unsafe { sphere_vst3_scan_left_work_running() }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -42,6 +52,11 @@ pub struct NativePluginInfo {
     /// VST2 backends, which never emit it.
     #[serde(default)]
     pub is_ara: bool,
+    /// The VST3 component exposes an event output bus — read by instantiating
+    /// it once during the scan. Absent (false) for older scanners and for the
+    /// CLAP and VST2 backends, which classify MIDI effects by other means.
+    #[serde(default)]
+    pub midi_output: bool,
     pub sdk_metadata_loaded: bool,
     #[serde(default)]
     pub load_error: Option<String>,
@@ -186,6 +201,7 @@ fn scan_native_root(path: &str, format: PluginFormat) -> Result<Vec<PluginInfo>,
                 sdk_version: plugin.sdk_version,
                 is_shell_child: plugin.is_shell_child.unwrap_or(false),
                 is_ara: plugin.is_ara,
+                midi_output: plugin.midi_output,
                 sdk_metadata_loaded: plugin.sdk_metadata_loaded,
                 load_error: plugin.load_error,
             }
@@ -336,6 +352,7 @@ fn plugin_from_path(path: &Path, format: PluginFormat) -> PluginInfo {
         sdk_version: None,
         is_shell_child: false,
         is_ara: false,
+        midi_output: false,
         sdk_metadata_loaded: false,
         load_error: Some("Plug-in metadata was not read".to_string()),
     }
@@ -378,6 +395,37 @@ mod tests {
         assert!(!legacy.is_ara);
     }
 
+    /// The C++ VST3 scanner emits `midiOutput` from the bus probe; CLAP, VST2,
+    /// and payloads from scanners that predate the probe omit it.
+    #[test]
+    fn native_json_carries_midi_output_and_defaults_to_false() {
+        let with_midi: NativePluginInfo = serde_json::from_str(
+            r#"{"name":"Chords","vendor":"Acme","category":"Audio Module Class",
+                "subCategories":"Instrument","format":"VST3","path":"C:/s.vst3",
+                "classId":"ABCD","isShellChild":false,"isAra":false,
+                "midiInput":true,"midiOutput":true,"audioOutputs":1,
+                "sdkMetadataLoaded":true}"#,
+        )
+        .expect("VST3 payload with midiOutput must parse");
+        assert!(with_midi.midi_output);
+
+        let no_midi: NativePluginInfo = serde_json::from_str(
+            r#"{"name":"Comp","vendor":"Acme","category":"Audio Module Class",
+                "format":"VST3","path":"C:/c.vst3","classId":"EF01",
+                "midiInput":false,"midiOutput":false,"audioOutputs":1,
+                "sdkMetadataLoaded":true}"#,
+        )
+        .expect("VST3 payload with midiOutput:false must parse");
+        assert!(!no_midi.midi_output);
+
+        let legacy: NativePluginInfo = serde_json::from_str(
+            r#"{"name":"Comp","vendor":"Acme","category":"Audio Module Class",
+                "format":"VST3","path":"C:/c.vst3","sdkMetadataLoaded":true}"#,
+        )
+        .expect("payload without midiOutput must still parse");
+        assert!(!legacy.midi_output);
+    }
+
     fn plugin(id: &str, name: &str) -> PluginInfo {
         PluginInfo {
             id: id.to_string(),
@@ -390,6 +438,7 @@ mod tests {
             module_path: None,
             class_id: None,
             is_ara: false,
+            midi_output: false,
             version: None,
             sdk_version: None,
             is_shell_child: false,

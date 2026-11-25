@@ -183,6 +183,55 @@ impl BrowserTab {
     }
 }
 
+/// The type chips under the browser's search field. They hide files of other
+/// types and never folders, so a filtered tree can still be browsed into.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BrowserKindFilter {
+    #[default]
+    All,
+    Audio,
+    Midi,
+    Presets,
+}
+
+impl BrowserKindFilter {
+    pub const ALL: [BrowserKindFilter; 4] = [
+        BrowserKindFilter::All,
+        BrowserKindFilter::Audio,
+        BrowserKindFilter::Midi,
+        BrowserKindFilter::Presets,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BrowserKindFilter::All => "All",
+            BrowserKindFilter::Audio => "Audio",
+            BrowserKindFilter::Midi => "MIDI",
+            BrowserKindFilter::Presets => "Presets",
+        }
+    }
+
+    /// Whether a row survives the chip. Only files are ever hidden.
+    pub fn keeps(self, node: &BrowserVisibleNode) -> bool {
+        if node.kind != BrowserNodeKind::File {
+            return true;
+        }
+        match self {
+            BrowserKindFilter::All => true,
+            BrowserKindFilter::Audio => node.is_audio(),
+            BrowserKindFilter::Midi => node.is_midi(),
+            BrowserKindFilter::Presets => node.is_plugin_preset(),
+        }
+    }
+}
+
+impl BrowserTab {
+    /// Tabs that list folders of mixed files, where the type chips apply.
+    pub fn has_kind_filter(self) -> bool {
+        matches!(self, BrowserTab::Samples | BrowserTab::Files)
+    }
+}
+
 /// One instrument the Instruments tab lists, read from the plug-in database.
 /// `preset_path` is the `.pst` the database points at — the file a drag
 /// carries and a double-click loads.
@@ -363,6 +412,8 @@ pub struct FileBrowserState {
     pub project_folder: Option<PathBuf>,
     /// Current search filter query.
     pub filter: String,
+    /// The type chip. Applies only on tabs where [`BrowserTab::has_kind_filter`].
+    pub kind_filter: BrowserKindFilter,
     /// Whether selecting an audio file immediately auditions it through the
     /// engine. This is session-only and defaults on for DAW-style browsing.
     pub preview_enabled: bool,
@@ -416,6 +467,7 @@ impl Default for FileBrowserState {
             index: IndexCache::default(),
             project_folder: None,
             filter: String::new(),
+            kind_filter: BrowserKindFilter::All,
             preview_enabled: true,
             waveform_inflight: HashSet::new(),
             waveform_failed: HashSet::new(),
@@ -580,6 +632,23 @@ impl FileBrowserState {
     pub fn set_filter(&mut self, filter: &str) {
         self.filter = filter.to_string();
         self.update_visible_nodes();
+    }
+
+    /// Set the type chip.
+    pub fn set_kind_filter(&mut self, kind: BrowserKindFilter) {
+        if self.kind_filter != kind {
+            self.kind_filter = kind;
+            self.update_visible_nodes();
+        }
+    }
+
+    /// The type chip in force on the shown tab.
+    pub fn active_kind_filter(&self) -> BrowserKindFilter {
+        if self.tab.has_kind_filter() {
+            self.kind_filter
+        } else {
+            BrowserKindFilter::All
+        }
     }
 
     /// Flip the auto-preview toggle. Returns the new state.
@@ -895,6 +964,10 @@ impl FileBrowserState {
             }
         }
 
+        let kind = self.active_kind_filter();
+        if kind != BrowserKindFilter::All {
+            nodes.retain(|node| kind.keeps(node));
+        }
         // Apply the active search filter across the tab's flattened rows.
         if !self.filter.is_empty() {
             nodes = self.filter_flattened_nodes(nodes);
@@ -2115,6 +2188,58 @@ mod tests {
 
     fn ids(state: &FileBrowserState) -> Vec<String> {
         state.visible_nodes.iter().map(|n| n.id.clone()).collect()
+    }
+
+    /// A type chip hides files of other types, never folders, and only on the
+    /// tabs that show the chips.
+    #[test]
+    fn the_type_chip_hides_other_files_but_keeps_folders() {
+        let mut state = FileBrowserState::default();
+        let root = std::env::temp_dir().join("futureboard-browser-kind-test");
+        state.roots.samples = Some(root.clone());
+        state.roots.audio_files = None;
+        state.roots.user_library = None;
+        state.set_tab(BrowserTab::Samples);
+        state.expanded_paths.insert(root.clone());
+        let file = |name: &str, ext: &str| FileBrowserEntry {
+            name: name.to_string(),
+            path: root.join(name),
+            kind: FileEntryKind::File,
+            extension: ext.to_string(),
+            size_bytes: Some(1),
+        };
+        state.apply_loaded(
+            root.clone(),
+            vec![
+                FileBrowserEntry {
+                    name: "Kits".to_string(),
+                    path: root.join("Kits"),
+                    kind: FileEntryKind::Folder,
+                    extension: String::new(),
+                    size_bytes: None,
+                },
+                file("Loop.wav", "wav"),
+                file("Fill.mid", "mid"),
+                file("Bass.pst", "pst"),
+            ],
+        );
+        let labels = |state: &FileBrowserState| -> Vec<String> {
+            state
+                .visible_nodes
+                .iter()
+                .filter(|n| n.depth == 2)
+                .map(|n| n.label.clone())
+                .collect()
+        };
+        assert_eq!(labels(&state).len(), 4);
+        state.set_kind_filter(BrowserKindFilter::Midi);
+        assert_eq!(labels(&state), vec!["Kits", "Fill.mid"]);
+        state.set_kind_filter(BrowserKindFilter::Audio);
+        assert_eq!(labels(&state), vec!["Kits", "Loop.wav"]);
+        // The Plug-ins tab has no chips, so a chip left on elsewhere hides
+        // nothing there.
+        state.set_tab(BrowserTab::Plugins);
+        assert_eq!(state.active_kind_filter(), BrowserKindFilter::All);
     }
 
     /// The tree may show one folder in two places, but it may never show two

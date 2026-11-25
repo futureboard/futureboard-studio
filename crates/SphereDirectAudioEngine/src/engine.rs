@@ -223,6 +223,7 @@ mod jam;
 mod lifecycle;
 mod live_input;
 mod meters;
+mod midi_fx;
 mod mixer;
 mod preview;
 mod project;
@@ -782,6 +783,7 @@ pub(crate) fn prime_audio_thread_resources() {
     crate::graveyard::prime();
     let _ = crate::analysis_tap::analysis_tap();
     let _ = crate::visualizer_tap::visualizer_tap();
+    let _ = crate::visualizer_tap::track_tap();
     let _ = command_debug_enabled();
     let _ = input_debug_enabled();
     let _ = callback_debug_enabled();
@@ -872,6 +874,24 @@ impl EngineInner {
     pub fn set_record_pdc_bypass_enabled(&self, enabled: bool) {
         self.shared
             .record_pdc_bypass_enabled
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    /// Settings → Playback → Low-Latency Monitoring. `0` is off; otherwise
+    /// effects reporting more latency than `limit_samples` leave the paths of
+    /// armed and monitoring tracks while they are live. Takes effect on the
+    /// next callback.
+    pub fn set_low_latency_monitoring(&self, limit_samples: u32) {
+        self.shared
+            .low_latency_limit_samples
+            .store(limit_samples, Ordering::Relaxed);
+    }
+
+    /// Settings → Playback → Correct Takes for Interface Latency. Read when a
+    /// take is placed.
+    pub fn set_record_interface_latency_correction(&self, enabled: bool) {
+        self.shared
+            .record_interface_latency_correction
             .store(enabled, Ordering::Relaxed);
     }
 

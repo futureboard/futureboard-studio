@@ -120,6 +120,20 @@ pub fn snap_beat(beat: f64, snap: MusicalSnap, bypass: bool) -> f64 {
     (beat / step).round() * step
 }
 
+/// The start of the grid cell `beat` falls in: what a click that places
+/// something *in* a bar or step means. [`snap_beat`] rounds, which puts a
+/// click in the second half of bar 3 at bar 4.
+pub fn floor_beat(beat: f64, snap: MusicalSnap, bypass: bool) -> f64 {
+    if bypass {
+        return beat;
+    }
+    let Some(step) = snap.step_beats() else {
+        return beat;
+    };
+    // A click exactly on a line belongs to the cell after it, not before.
+    ((beat / step) + 1e-6).floor() * step
+}
+
 /// Snap while preserving the grab offset between the pointer and the object's
 /// origin. `raw_beat` is the pointer musical position; `grab_offset` is
 /// `object_origin - pointer_at_press` (usually ≤ 0 for a grab inside the object).

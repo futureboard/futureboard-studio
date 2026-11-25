@@ -9,10 +9,9 @@ use std::process::Command;
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use crate::platform::Edition;
-
-/// Bump when the on-disk shape of `build-info.json` changes.
-const SCHEMA_VERSION: u32 = 1;
+/// Bump when the on-disk shape of `build-info.json` changes. 2: one package,
+/// so `edition` became `professional`.
+const SCHEMA_VERSION: u32 = 2;
 
 /// Serializable contents of `build-info.json`. `camelCase` to match the shape
 /// requested by the packaging spec and the wider JS tooling.
@@ -24,7 +23,10 @@ pub struct BuildInfo {
     pub binary: String,
     /// Runtime sidecar executables shipped beside `binary`.
     pub sidecars: Vec<String>,
-    pub edition: String,
+    /// Whether the Professional code is compiled in. It is unlocked at runtime
+    /// by a licence, so this says what the package *can* do, not what a user
+    /// gets.
+    pub professional: bool,
     pub profile: String,
     pub target: String,
     pub platform: String,
@@ -41,7 +43,7 @@ pub struct BuildInfo {
 pub struct MetadataInputs<'a> {
     pub binary: &'a str,
     pub sidecars: &'a [String],
-    pub edition: Edition,
+    pub professional: bool,
     pub profile: &'a str,
     pub target: &'a str,
     pub platform: &'a str,
@@ -56,7 +58,7 @@ impl BuildInfo {
             application: "Futureboard Studio".to_string(),
             binary: inputs.binary.to_string(),
             sidecars: inputs.sidecars.to_vec(),
-            edition: inputs.edition.as_str().to_string(),
+            professional: inputs.professional,
             profile: inputs.profile.to_string(),
             target: inputs.target.to_string(),
             platform: inputs.platform.to_string(),
@@ -129,7 +131,7 @@ mod tests {
                 "FutureboardPluginHostX64.exe".to_string(),
                 "FutureboardPluginScanner.exe".to_string(),
             ],
-            edition: "community".to_string(),
+            professional: true,
             profile: "release".to_string(),
             target: "x86_64-pc-windows-msvc".to_string(),
             platform: "windows-x64".to_string(),
@@ -147,12 +149,13 @@ mod tests {
         let json = sample().to_json().unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(value["schemaVersion"], 1);
+        assert_eq!(value["schemaVersion"], 2);
         assert_eq!(value["application"], "Futureboard Studio");
         assert_eq!(value["binary"], "FutureboardNative.exe");
         assert_eq!(value["sidecars"][0], "FutureboardPluginHostX64.exe");
         assert_eq!(value["sidecars"][1], "FutureboardPluginScanner.exe");
-        assert_eq!(value["edition"], "community");
+        assert_eq!(value["professional"], true);
+        assert!(value.get("edition").is_none());
         assert_eq!(value["platform"], "windows-x64");
         assert_eq!(value["gitCommit"], "abc123");
         assert_eq!(value["gitDirty"], false);

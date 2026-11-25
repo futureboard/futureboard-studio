@@ -151,12 +151,14 @@ impl StudioLayout {
             let state = &self.timeline.read(cx).state;
             match state.selection.selected_clip_ids.first() {
                 Some(clip_id) => {
-                    let is_audio = state
-                        .find_clip(clip_id)
-                        .is_some_and(|(_, clip)| matches!(clip.clip_type, ClipType::Audio { .. }));
+                    // Before the clip search: that walks every track's clips,
+                    // and the unchanged selection is the common case.
                     if self.dock_followed_clip.as_ref() == Some(clip_id) {
                         return;
                     }
+                    let is_audio = state
+                        .find_clip(clip_id)
+                        .is_some_and(|(_, clip)| matches!(clip.clip_type, ClipType::Audio { .. }));
                     (Some(clip_id.clone()), is_audio)
                 }
                 None if self.dock_followed_clip.is_none() => return,

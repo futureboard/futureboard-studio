@@ -1,8 +1,8 @@
 name: CI
 
 # Quality gates for the maintained desktop surface (Rust/GPUI native + audio
-# engine + plugin host), built as the Community Edition via the *-ce cargo
-# aliases in .cargo/config.toml (target/community). Build/packaging of release
+# engine + plugin host), built via the *-studio cargo aliases in
+# .cargo/config.toml (target/studio). Build/packaging of release
 # artifacts lives in build-desktop.yml / daily-build.yml — this workflow only
 # checks correctness, on all three desktop targets (Windows / macOS / Linux).
 
@@ -267,14 +267,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cache_dir="$(cargo run -q -p xtask -- crashpad-prebuilt --target-dir target/community)"
+          cache_dir="$(cargo run -q -p xtask -- crashpad-prebuilt --target-dir target/studio)"
           echo "CRASHPAD_CACHE_DIR=$cache_dir" >> "$GITHUB_ENV"
 
-      - name: cargo clippy (Community Edition)
-        run: cargo clippy-ce --all-targets -- -D warnings
+      - name: cargo clippy
+        run: cargo clippy-studio --all-targets -- -D warnings
 
-      - name: cargo test (Community Edition)
-        run: cargo test-ce
+      - name: cargo test
+        run: cargo test-studio
 
   # The macOS runner is arm64, so the Intel half of the universal build is
   # cross-compiled and never exercised by the job above. Without this gate an

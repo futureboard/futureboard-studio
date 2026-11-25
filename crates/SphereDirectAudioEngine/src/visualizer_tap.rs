@@ -78,6 +78,17 @@ impl VisualizerTap {
         }
     }
 
+    /// Producer: append a planar stereo block. Realtime-safe (atomics only).
+    #[inline]
+    pub fn write_planar(&self, left: &[f32], right: &[f32], sample_rate: u32) {
+        if self.sample_rate.load(Ordering::Relaxed) != sample_rate {
+            self.sample_rate.store(sample_rate, Ordering::Relaxed);
+        }
+        for (l, r) in left.iter().zip(right) {
+            self.ring.write_stereo(*l, *r);
+        }
+    }
+
     /// Register a listener; the callback starts copying on the next block.
     /// Returns the cursor a new reader should start from (the current head,
     /// so it never reads frames from before it opened).
@@ -136,6 +147,15 @@ pub fn visualizer_tap() -> &'static VisualizerTap {
     TAP.get_or_init(VisualizerTap::default)
 }
 
+/// The process-wide tap for one track's post-fader signal: the track whose
+/// meter carries the tap flag (`AudioEngine::set_visualizer_track_tap`)
+/// writes its block here as the block renderer finishes it. Read like
+/// [`visualizer_tap`].
+pub fn track_tap() -> &'static VisualizerTap {
+    static TAP: OnceLock<VisualizerTap> = OnceLock::new();
+    TAP.get_or_init(VisualizerTap::default)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +201,19 @@ mod tests {
         assert!(read.skipped > 0);
         assert_eq!(read.next, 40 * 1_024);
         assert!(read.frames as u64 <= tap.ring.capacity_frames() - OVERWRITE_MARGIN);
+    }
+
+    #[test]
+    fn a_planar_block_arrives_as_frames() {
+        let tap = VisualizerTap::default();
+        let cursor = tap.listen();
+        tap.write_planar(&[0.1, 0.2, 0.3], &[-0.1, -0.2, -0.3], 44_100);
+        let (mut l, mut r) = ([0.0; 4], [0.0; 4]);
+        let read = tap.read(cursor, &mut l, &mut r);
+        assert_eq!(read.frames, 3);
+        assert_eq!(&l[..3], &[0.1, 0.2, 0.3]);
+        assert_eq!(&r[..3], &[-0.1, -0.2, -0.3]);
+        assert_eq!(tap.sample_rate(), 44_100);
     }
 
     #[test]

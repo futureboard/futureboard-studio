@@ -110,6 +110,8 @@ pub struct MixerSnapshot {
     /// on each strip. Carried here because the window's callbacks are built
     /// once, when it opens.
     pub spatial_format: solfege_spatialaudio::SpatialFormat,
+    /// The channels placed in the room (see `MixerCallbacks::spatial_placed`).
+    pub spatial_placed: std::sync::Arc<std::collections::HashSet<String>>,
     /// A context menu opened *from this window*: its position in this window's
     /// coordinates, and the entries to draw.
     ///
@@ -271,6 +273,7 @@ impl Render for MixerWindowBody {
         let i18n = I18n::from_app(cx);
         let mut callbacks = self.callbacks.clone();
         callbacks.spatial_format = snapshot.spatial_format;
+        callbacks.spatial_placed = snapshot.spatial_placed.clone();
 
         div()
             .flex()

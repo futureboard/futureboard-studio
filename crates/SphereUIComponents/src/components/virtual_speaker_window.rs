@@ -44,6 +44,9 @@ pub struct VirtualSpeakerSnapshot {
     pub control_room_in_path: bool,
     /// Whether an audio engine is open to hear anything with.
     pub engine_ready: bool,
+    /// Whether this machine's license grants spatial mixing, which Virtual
+    /// Speaker is part of. Without it the simulation stays off.
+    pub licensed: bool,
 }
 
 /// A new choice, for the Studio to apply.
@@ -77,7 +80,9 @@ impl VirtualSpeakerWindow {
     }
 
     /// Show `settings` at once and hand them to the Studio.
-    fn choose(&mut self, settings: SimulationSettings, cx: &mut Context<Self>) {
+    fn choose(&mut self, mut settings: SimulationSettings, cx: &mut Context<Self>) {
+        // A system can still be picked without the license; it is not heard.
+        settings.enabled &= self.snapshot.licensed;
         self.snapshot.settings = settings;
         (self.on_change)(settings, cx);
         cx.notify();
@@ -98,7 +103,7 @@ impl Render for VirtualSpeakerWindow {
             .flex_col()
             .gap(px(space::LOOSE))
             .p(px(space::SECTION))
-            .child(control_card(settings, cx));
+            .child(control_card(settings, snapshot.licensed, cx));
 
         for group in ListeningGroup::ALL {
             let profiles: Vec<ListeningProfile> = ListeningProfile::ALL
@@ -161,9 +166,12 @@ impl Render for VirtualSpeakerWindow {
 /// On/off, what is playing, and what the listener is wearing.
 fn control_card(
     settings: SimulationSettings,
+    licensed: bool,
     cx: &mut Context<VirtualSpeakerWindow>,
 ) -> impl IntoElement {
-    let status = if settings.enabled {
+    let status = if !licensed {
+        "Part of Futureboard Professional — activate a license to hear it".to_string()
+    } else if settings.enabled {
         format!(
             "{} — heard on {}",
             settings.profile.name(),
@@ -172,18 +180,23 @@ fn control_card(
     } else {
         "Off — you hear the mix as it is".to_string()
     };
-    let toggle = fb_toggle(
-        "virtual-speaker-power",
-        if settings.enabled { "On" } else { "Off" },
-        FbLatch::Monitor,
-        settings.enabled,
-        theme::size::DEFAULT,
-        cx.listener(move |this, _event, _window, cx| {
-            let mut next = this.snapshot.settings;
-            next.enabled = !next.enabled;
-            this.choose(next, cx);
-        }),
-    );
+    let toggle = if licensed {
+        fb_toggle(
+            "virtual-speaker-power",
+            if settings.enabled { "On" } else { "Off" },
+            FbLatch::Monitor,
+            settings.enabled,
+            theme::size::DEFAULT,
+            cx.listener(move |this, _event, _window, cx| {
+                let mut next = this.snapshot.settings;
+                next.enabled = !next.enabled;
+                this.choose(next, cx);
+            }),
+        )
+        .into_any_element()
+    } else {
+        fb_badge("Professional", Colors::text_muted()).into_any_element()
+    };
 
     let mut devices = fb_segmented_track();
     for (index, device) in ListeningDevice::ALL.into_iter().enumerate() {
@@ -396,7 +409,7 @@ pub fn open_virtual_speaker_window(
     options.window_min_size = Some(size(px(WINDOW_MIN_WIDTH), px(WINDOW_MIN_HEIGHT)));
     apply_owner_display(&mut options, owner_bounds, cx);
 
-    cx.open_window(options, move |_window, cx| {
+    crate::dialog_frame::open_dialog_window(cx, options, move |_window, cx| {
         cx.new(|cx| VirtualSpeakerWindow::new(snapshot, on_change, cx))
     })
     .map_err(|error| error.to_string())

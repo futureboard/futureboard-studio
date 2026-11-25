@@ -192,7 +192,7 @@ jobs:
 
       - name: Package native runtime with xtask
         if: matrix.os != 'macos-latest'
-        run: cargo run -p xtask -- package --profile release --edition community --plugin all
+        run: cargo run -p xtask -- package --profile release --plugin all
 
       # One package per architecture, then a lipo merge. xtask passes the
       # target-matched CEF distribution to Cargo itself, so no per-pass CEF_PATH
@@ -204,22 +204,22 @@ jobs:
         run: |
           set -euo pipefail
           for triple in x86_64-apple-darwin aarch64-apple-darwin; do
-            cargo run -p xtask -- package --profile release --edition community \
+            cargo run -p xtask -- package --profile release \
               --plugin all --target "$triple"
           done
           bash packaging/native/merge-universal-macos.sh \
-            out/release/community/macos-x64 \
-            out/release/community/macos-arm64 \
-            out/release/community/macos-universal
+            out/release/macos-x64 \
+            out/release/macos-arm64 \
+            out/release/macos-universal
 
       - name: Resolve xtask package directory
         shell: bash
         run: |
           set -euo pipefail
-          if [ -d out/release/community/macos-universal ]; then
-            package_dir="out/release/community/macos-universal"
+          if [ -d out/release/macos-universal ]; then
+            package_dir="out/release/macos-universal"
           else
-            package_dir="$(find out/release/community -mindepth 1 -maxdepth 1 -type d -print -quit)"
+            package_dir="$(find out/release -mindepth 1 -maxdepth 1 -type d -print -quit)"
           fi
           test -n "$package_dir" || { echo "xtask package directory not found"; exit 1; }
           test -f "$package_dir/build-info.json" || { echo "missing $package_dir/build-info.json"; exit 1; }
@@ -234,8 +234,8 @@ jobs:
       - name: Scan packaged files for the TONE3000 key canary
         shell: pwsh
         run: |
-          $files = @(Get-ChildItem -LiteralPath out/release/community -Recurse -File | ForEach-Object FullName)
-          if ($files.Count -eq 0) { Write-Error 'no packaged files under out/release/community'; exit 1 }
+          $files = @(Get-ChildItem -LiteralPath out/release -Recurse -File | ForEach-Object FullName)
+          if ($files.Count -eq 0) { Write-Error 'no packaged files under out/release'; exit 1 }
           Write-Output "Scanning $($files.Count) packaged files"
           & ./scripts/check-release-secret.ps1 -Canary $env:FUTUREBOARD_TONE3000_API_KEY -Path $files
           exit $LASTEXITCODE
@@ -251,7 +251,7 @@ jobs:
           key="$(printf '%s' "$FUTUREBOARD_UPDATE_PUBLIC_KEY" | tr -d '[:space:]')"
           test -n "$key" || { echo "::error::FUTUREBOARD_UPDATE_PUBLIC_KEY is empty"; exit 1; }
           fail=0
-          for package in out/release/community/*/; do
+          for package in out/release/*/; do
             if grep -rqF -- "$key" "$package"; then
               echo "update public key baked in: $package"
             else
@@ -279,9 +279,9 @@ jobs:
             FUTUREBOARD_REQUIRE_UNIVERSAL="$require_universal" bash packaging/native/bundle-macos.sh "$package_dir" "$app_out" "$VERSION"
             bash packaging/native/bundle-macos-dmg.sh "$app" packaging/native/out "$VERSION"
           }
-          bundle out/release/community/macos-arm64     arm64     0
-          bundle out/release/community/macos-x64       x64       0
-          bundle out/release/community/macos-universal universal 1
+          bundle out/release/macos-arm64     arm64     0
+          bundle out/release/macos-x64       x64       0
+          bundle out/release/macos-universal universal 1
           for expected in macos-arm64 macos-x86_64 macos-universal; do
             ls packaging/native/out/*-${expected}.dmg >/dev/null \
               || { echo "error: missing ${expected} DMG"; exit 1; }

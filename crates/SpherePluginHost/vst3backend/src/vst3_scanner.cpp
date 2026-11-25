@@ -1,8 +1,11 @@
 #include "sphere_plugin_host_vst3.h"
 
+#include "pluginterfaces/base/ipluginbase.h"
+#include "pluginterfaces/vst/ivstcomponent.h"
 #include "public.sdk/source/vst/hosting/hostclasses.h"
 #include "public.sdk/source/vst/hosting/module.h"
 #include "public.sdk/source/vst/utility/stringconvert.h"
+#include "public.sdk/source/vst/utility/uid.h"
 
 // Only for `kARAMainFactoryClass`. An ARA-capable VST3 registers a second
 // factory class in this category alongside its audio-module class, so ARA
@@ -29,13 +32,19 @@
 // SphereDirectAudioEngine so scanner and host can never drift.
 #include "sphere_vst2_abi.h"
 
+#include <atomic>
 #include <cctype>
+#include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <future>
+#include <memory>
 #include <new>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifdef _WIN32
@@ -121,7 +130,147 @@ struct ClassEntry {
   /// audio-module class, so the plug-in can be driven through ARA. See the
   /// pairing rules in `ARAVST3.h`.
   bool is_ara = false;
+  /// Bus layout read from one instantiated component (see
+  /// `probe_vst3_buses`). All false / zero when the probe failed.
+  bool midi_input = false;
+  bool midi_output = false;
+  int audio_outputs = 0;
 };
+
+/// Modules with more audio-module classes than this are not bus-probed. Shells
+/// that large (WaveShell: hundreds of classes) take minutes to instantiate
+/// class by class, and no known MIDI effect ships inside one.
+constexpr std::size_t kMaxBusProbeClasses = 16;
+
+/// Wall-clock budget for all bus probes of one module, well inside the 30 s
+/// per-bundle scan timeout (`DEFAULT_BUNDLE_SCAN_TIMEOUT_SECS`) so a slow
+/// module still reports its rows instead of timing out.
+constexpr std::chrono::seconds kBusProbeBudget{10};
+
+/// Instantiate the component of one audio-module class just long enough to
+/// read its bus layout, then tear it down. No processing, no editor, no
+/// controller — `initialize()` / bus counts / `terminate()` only.
+///
+/// VST3 has no MIDI-effect class category: chord tools and arpeggiators
+/// register as `Instrument` or `Fx` and are told apart only by an event
+/// *output* bus, which factory class info does not carry.
+///
+/// Any failure leaves the entry at "unknown" (false / zero). A plug-in that
+/// hangs or crashes here is contained by the per-bundle scan child process and
+/// its timeout (`src/scan/isolation.rs`).
+void probe_vst3_buses(const VST3::Hosting::PluginFactory& factory,
+                      Steinberg::Vst::HostApplication& host_context,
+                      ClassEntry& entry, bool debug) {
+  try {
+    const auto uid = VST3::UID::fromString(entry.class_id);
+    if (!uid) {
+      return;
+    }
+    auto component = factory.createInstance<Steinberg::Vst::IComponent>(*uid);
+    if (!component) {
+      if (debug) {
+        std::fprintf(stderr,
+                     "[SpherePluginHost]     bus probe: createInstance failed\n");
+      }
+      return;
+    }
+    if (component->initialize(&host_context) != Steinberg::kResultOk) {
+      if (debug) {
+        std::fprintf(stderr,
+                     "[SpherePluginHost]     bus probe: initialize failed\n");
+      }
+      return;
+    }
+    const auto event_in =
+        component->getBusCount(Steinberg::Vst::kEvent, Steinberg::Vst::kInput);
+    const auto event_out =
+        component->getBusCount(Steinberg::Vst::kEvent, Steinberg::Vst::kOutput);
+    const auto audio_out =
+        component->getBusCount(Steinberg::Vst::kAudio, Steinberg::Vst::kOutput);
+    component->terminate();
+
+    entry.midi_input = event_in > 0;
+    entry.midi_output = event_out > 0;
+    entry.audio_outputs = audio_out > 0 ? static_cast<int>(audio_out) : 0;
+    if (debug) {
+      std::fprintf(stderr,
+                   "[SpherePluginHost]     bus probe: event in=%d out=%d, "
+                   "audio out=%d\n",
+                   static_cast<int>(event_in), static_cast<int>(event_out),
+                   static_cast<int>(audio_out));
+    }
+  } catch (...) {
+    entry.midi_input = false;
+    entry.midi_output = false;
+    entry.audio_outputs = 0;
+    if (debug) {
+      std::fprintf(stderr, "[SpherePluginHost]     bus probe: exception\n");
+    }
+  }
+}
+
+/// Set once a bus probe was still inside a plug-in when its deadline passed.
+/// That thread is left running — a thread cannot be stopped safely inside
+/// vendor code — with its module kept loaded, so the scanner process has to
+/// end without the normal teardown (`sphere_vst3_scan_left_work_running`).
+std::atomic<bool> g_scan_left_work_running{false};
+
+/// [`probe_vst3_buses`] with a real deadline.
+///
+/// The probe instantiates and initializes the component, and some plug-ins do
+/// their whole start-up there: ZENOLOGY loads its sound engine in
+/// `initialize()` and takes ~50 s. The budget used to be checked only between
+/// classes, so one slow `initialize()` ran the bundle past the 30 s per-bundle
+/// timeout and every row of it was dropped — the plug-in vanished from the
+/// list although its class info had been read in under a second.
+///
+/// The probe runs on its own thread; `entry` gets its bus layout when the
+/// probe finishes by `deadline`. Otherwise the entry keeps the "unknown" bus
+/// layout, the thread is detached with everything it uses kept alive (the
+/// module stays loaded, `host_context` is never freed), and `false` is
+/// returned so no further class is probed.
+bool probe_vst3_buses_bounded(const VST3::Hosting::Module::Ptr& module,
+                              const VST3::Hosting::PluginFactory& factory,
+                              Steinberg::Vst::HostApplication* host_context,
+                              ClassEntry& entry, bool debug,
+                              std::chrono::steady_clock::time_point deadline) {
+  struct Job {
+    VST3::Hosting::Module::Ptr module;
+    VST3::Hosting::PluginFactory factory;
+    Steinberg::Vst::HostApplication* host;
+    ClassEntry entry;
+    bool debug;
+    std::promise<void> done;
+  };
+  auto job = std::make_shared<Job>(
+      Job{module, factory, host_context, entry, debug, std::promise<void>()});
+  auto finished = job->done.get_future();
+  std::thread worker;
+  try {
+    worker = std::thread([job] {
+      probe_vst3_buses(job->factory, *job->host, job->entry, job->debug);
+      job->done.set_value();
+    });
+  } catch (...) {
+    // No thread, no probe: the entry stays "unknown", as on a failed probe.
+    return true;
+  }
+  if (finished.wait_until(deadline) == std::future_status::ready) {
+    worker.join();
+    entry.midi_input = job->entry.midi_input;
+    entry.midi_output = job->entry.midi_output;
+    entry.audio_outputs = job->entry.audio_outputs;
+    return true;
+  }
+  worker.detach();
+  g_scan_left_work_running.store(true);
+  if (debug) {
+    std::fprintf(stderr,
+                 "[SpherePluginHost]     bus probe still running at its "
+                 "deadline; listed without a bus layout\n");
+  }
+  return false;
+}
 
 /// Emit an entry for a module whose metadata could not be read.
 ///
@@ -369,10 +518,22 @@ std::string vst2_arch_mismatch_reason(const std::filesystem::path& module_path) 
           static_cast<unsigned>(pe[4]) | (static_cast<unsigned>(pe[5]) << 8);
       constexpr unsigned kAmd64 = 0x8664;
       constexpr unsigned kArm64 = 0xAA64;
+      constexpr unsigned kI386 = 0x014C;
+#if defined(_WIN64)
+      // A 32-bit module is scanned by the 32-bit scanner
+      // (FutureboardPluginScannerX86.exe), never by this one.
       if (machine != kAmd64 && machine != kArm64) {
-        reason =
-            "Plug-in is a 32-bit VST2 build; Futureboard hosts 64-bit VST2 only";
+        reason = machine == kI386
+                     ? "Plug-in is a 32-bit VST2 build; it is scanned and "
+                       "loaded through the 32-bit plug-in bridge"
+                     : "Plug-in is not built for this processor";
       }
+#else
+      // The 32-bit scanner of the plug-in bridge loads 32-bit modules only.
+      if (machine != kI386) {
+        reason = "Plug-in is not a 32-bit build; the 64-bit scanner reads it";
+      }
+#endif
     }
   }
   std::fclose(file);
@@ -579,6 +740,10 @@ void append_vst2_entry(std::string& json, bool& first,
 
 } // namespace
 
+extern "C" bool sphere_vst3_scan_left_work_running() {
+  return g_scan_left_work_running.load();
+}
+
 extern "C" SpherePluginHostString sphere_vst3_scan_path_json(const char* path) {
   if (!path) {
     return make_string("[]");
@@ -586,8 +751,10 @@ extern "C" SpherePluginHostString sphere_vst3_scan_path_json(const char* path) {
 
   const bool debug = std::getenv("SPHERE_PLUGIN_HOST_DEBUG") != nullptr;
 
-  // Phase 1 host scanner: load VST3 factory metadata. Does not instantiate
-  // processors, open editors, or touch realtime audio.
+  // Phase 1 host scanner: load VST3 factory metadata, then instantiate each
+  // audio-module component once to read its bus layout (`probe_vst3_buses`;
+  // skipped for large shells and capped by `kBusProbeBudget`). No processing,
+  // no editor, no controller, no realtime audio.
   std::filesystem::path root(path);
   if (!std::filesystem::exists(root)) {
     return make_string("[]");
@@ -624,8 +791,11 @@ extern "C" SpherePluginHostString sphere_vst3_scan_path_json(const char* path) {
     }
 
     const auto factory = module->getFactory();
-    Steinberg::Vst::HostApplication host_context;
-    factory.setHostContext(&host_context);
+    // On the heap: a bus probe left running past its deadline still uses it
+    // (and the plug-in may keep the pointer), so it is freed only when no
+    // probe was abandoned. See `probe_vst3_buses_bounded`.
+    auto* host_context = new Steinberg::Vst::HostApplication();
+    factory.setHostContext(host_context);
     const auto factory_info = factory.info();
     const auto& raw_factory = factory.get();
     const auto raw_count = raw_factory ? raw_factory->countClasses() : 0;
@@ -769,7 +939,38 @@ extern "C" SpherePluginHostString sphere_vst3_scan_path_json(const char* path) {
     const bool is_shell = (audio_classes.size() > 1);
     const std::string module_path = plugin_path.string();
 
-    for (const auto& entry : audio_classes) {
+    // The bus probe instantiates a component per class, which costs orders of
+    // magnitude more than reading class info: a 718-class WaveShell reads in
+    // ~1 s but did not finish probing in 240 s, far past the 30 s per-bundle
+    // timeout, which would have dropped every row of the bundle. Large shells
+    // are therefore not probed, and probing stops once the budget is spent;
+    // classes left unprobed report `midiOutput:false` exactly as before.
+    const bool probe_buses = audio_classes.size() <= kMaxBusProbeClasses;
+    if (debug && !probe_buses) {
+      std::fprintf(stderr,
+                   "[SpherePluginHost]   Bus probe skipped: %zu classes > %zu\n",
+                   audio_classes.size(), kMaxBusProbeClasses);
+    }
+    const auto probe_deadline = std::chrono::steady_clock::now() + kBusProbeBudget;
+    bool probe_abandoned = false;
+
+    for (auto& entry : audio_classes) {
+      if (probe_buses && !probe_abandoned) {
+        if (std::chrono::steady_clock::now() < probe_deadline) {
+          if (debug) {
+            std::fprintf(stderr, "[SpherePluginHost]   Probing buses: %s\n",
+                         entry.name.c_str());
+          }
+          probe_abandoned = !probe_vst3_buses_bounded(
+              module, factory, host_context, entry, debug, probe_deadline);
+        } else if (debug) {
+          std::fprintf(stderr,
+                       "[SpherePluginHost]   Bus probe budget spent, not "
+                       "probing: %s\n",
+                       entry.name.c_str());
+        }
+      }
+
       if (!first) {
         json += ",";
       }
@@ -787,7 +988,15 @@ extern "C" SpherePluginHostString sphere_vst3_scan_path_json(const char* path) {
       json += "\"isShellChild\":" +
               std::string(is_shell ? "true" : "false") + ",";
       json += "\"isAra\":" + std::string(entry.is_ara ? "true" : "false") + ",";
+      json += "\"midiInput\":" +
+              std::string(entry.midi_input ? "true" : "false") + ",";
+      json += "\"midiOutput\":" +
+              std::string(entry.midi_output ? "true" : "false") + ",";
+      json += "\"audioOutputs\":" + std::to_string(entry.audio_outputs) + ",";
       json += "\"sdkMetadataLoaded\":true}";
+    }
+    if (!probe_abandoned) {
+      delete host_context;
     }
   };
 

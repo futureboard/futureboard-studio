@@ -294,6 +294,36 @@ fn audio(cx: &PageCtx) -> Vec<PrefGroup> {
             cx.state,
             cx.callbacks,
         ));
+    // The driver's own panel: buffer size, clock source, its routing. Only
+    // while the engine runs the ASIO device, since the panel belongs to the
+    // loaded driver.
+    if is_asio {
+        let running = latency.engine_open;
+        let open_panel = cx.callbacks.on_open_asio_control_panel.clone();
+        device = device.row(PrefRow::described(
+            "ASIO Control Panel",
+            if running {
+                "Opens the driver's own settings. A buffer-size change made there \
+                 reopens the device."
+                    .to_string()
+            } else {
+                "Available while the ASIO device is running.".to_string()
+            },
+            &["asio", "control panel", "driver", "buffer", "clock"],
+            fb_button(
+                "settings-asio-control-panel",
+                "Open Control Panel",
+                FbButtonKind::Default,
+                running && open_panel.is_some(),
+                move |_, window, cx| {
+                    if let Some(open) = open_panel.as_ref() {
+                        open(window, cx);
+                    }
+                },
+            )
+            .into_any_element(),
+        ));
+    }
     // Only the WASAPI Shared stream feeds Windows' shared-mode mixer, and only
     // that stream applies the setting (`OutputStage::for_backend`), so it is
     // shown for that backend alone. Live: no reopen.
@@ -387,7 +417,106 @@ fn audio(cx: &PageCtx) -> Vec<PrefGroup> {
         ))
         .note(cx.tr("settings.buffer.hint"));
 
-    vec![device, format, latency_group(cx)]
+    vec![device, format, recording_delay_group(cx), latency_group(cx)]
+}
+
+/// How far either way the Recording Delay reaches, in samples.
+const RECORDING_DELAY_RANGE: f64 = 2_000.0;
+
+/// Recording Delay: moves every recorded take by a fixed amount on top of the
+/// round trip the engine measures for it, for a rig whose interface reports
+/// its latency wrong. Set in samples at the running rate and kept as time
+/// (`recording_offset_ms`), so it still holds after a sample-rate change.
+fn recording_delay_group(cx: &PageCtx) -> PrefGroup {
+    let s = cx.schema;
+    let latency = cx.latency;
+    let rate = if latency.engine_open && latency.active_sample_rate > 0 {
+        latency.active_sample_rate
+    } else {
+        s.general.project_defaults.sample_rate.max(1)
+    } as f64;
+    let ms = s.recording.audio.recording_offset_ms;
+    let samples = (ms * rate / 1000.0).round();
+    let keywords: &[&str] = &[
+        "recording",
+        "delay",
+        "offset",
+        "latency",
+        "compensation",
+        "samples",
+        "record",
+    ];
+    // The change that sets the delay to `samples` at the running rate.
+    let set = move |samples: f64| -> UpdateSettingFn {
+        let ms = samples.clamp(-RECORDING_DELAY_RANGE, RECORDING_DELAY_RANGE) / rate * 1000.0;
+        Arc::new(move |s: &mut SettingsSchema| s.recording.audio.recording_offset_ms = ms)
+    };
+    let up = cx.up();
+    let slider = pref_slider(
+        "rec-delay-slider",
+        ((samples + RECORDING_DELAY_RANGE) / (2.0 * RECORDING_DELAY_RANGE)) as f32,
+        format!("{samples:+.0} smp"),
+        {
+            let up = up.clone();
+            move |fraction, w, cx| {
+                let samples = (f64::from(*fraction) * 2.0 - 1.0) * RECORDING_DELAY_RANGE;
+                up(set(samples.round()), w, cx);
+            }
+        },
+    );
+    // Double-click the value to type it; drag it to scrub.
+    let typed = div()
+        .w(px(96.0))
+        .child(crate::components::inspector::inspector_numeric_stepper(
+            "rec-delay-value",
+            samples,
+            format!("{samples:+.0} smp"),
+            -RECORDING_DELAY_RANGE,
+            RECORDING_DELAY_RANGE,
+            1.0,
+            false,
+            {
+                let up = up.clone();
+                move |value, w, cx| up(set(value.round()), w, cx)
+            },
+        ))
+        .into_any_element();
+    let fine = pref_stepper_around(
+        "rec-delay-fine",
+        typed,
+        {
+            let up = up.clone();
+            move |_, w, cx| up(set(samples - 1.0), w, cx)
+        },
+        {
+            let up = up.clone();
+            move |_, w, cx| up(set(samples + 1.0), w, cx)
+        },
+    );
+    let description = if samples == 0.0 {
+        "Off: takes land where the measured round trip places them.".to_string()
+    } else {
+        format!(
+            "{:+.2} ms at {} Hz: every take moves {}.",
+            ms,
+            rate as u32,
+            if samples > 0.0 { "later" } else { "earlier" }
+        )
+    };
+    PrefGroup::new("Recording Delay")
+        .row(PrefRow::described(
+            "Recording Delay",
+            description,
+            keywords,
+            slider,
+        ))
+        .row(PrefRow::field("Fine Adjust", keywords, fine))
+        .note(
+            "Applied on top of the round trip the engine measures for each take. \
+             Positive moves takes later, negative earlier. To find the value, \
+             record a click through a cable from an output back into an input \
+             and move the take onto the click.",
+        )
 }
 
 /// What the engine reports about latency right now.
@@ -556,23 +685,8 @@ fn recording(cx: &PageCtx) -> Vec<PrefGroup> {
                     }),
                 ),
             ))
-            .row(PrefRow::described(
-                "Recording Offset",
-                "Shifts where recorded clips start, to cancel measured latency.",
-                &["offset", "latency", "compensation", "record"],
-                pref_stepper(
-                    "rec-offset",
-                    format!("{} ms", s.recording.audio.recording_offset_ms),
-                    apply(&up, |s| {
-                        s.recording.audio.recording_offset_ms =
-                            (s.recording.audio.recording_offset_ms - 1).clamp(-2000, 2000)
-                    }),
-                    apply(&up, |s| {
-                        s.recording.audio.recording_offset_ms =
-                            (s.recording.audio.recording_offset_ms + 1).clamp(-2000, 2000)
-                    }),
-                ),
-            ))
+            // The manual Recording Delay lives on the Audio page, beside the
+            // latency the engine reports.
             .row(PrefRow::described(
                 "Auto Offset from JAM Session",
                 match crate::jam::recording_offset_ms() {
@@ -766,7 +880,106 @@ fn playback(cx: &PageCtx) -> Vec<PrefGroup> {
                     }),
                 ),
             )),
+        recording_playback_group(cx),
     ]
+}
+
+/// Arming and the latency a performer hears and records with, beside the
+/// playback latency settings they interact with.
+fn recording_playback_group(cx: &PageCtx) -> PrefGroup {
+    use crate::settings::{ArmOnRecord, LOW_LATENCY_LIMITS};
+    let s = cx.schema;
+    let up = cx.up();
+    PrefGroup::new("Playback > Recording")
+        .row(PrefRow::described(
+            "Arm on Record",
+            "What Record does when no track is armed: arm the selected track, \
+             ask first, or arm nothing.",
+            &["arm", "record", "selected", "track", "auto"],
+            choice(
+                "rec-arm-on-record",
+                vec![
+                    (ArmOnRecord::SelectedTrack, "Selected".to_string()),
+                    (ArmOnRecord::Ask, "Ask".to_string()),
+                    (ArmOnRecord::Off, "Off".to_string()),
+                ],
+                s.recording.arm_on_record,
+                &up,
+                |s, v| s.recording.arm_on_record = v,
+            ),
+        ))
+        .row(PrefRow::described(
+            "Disarm After Recording",
+            "Each kept take disarms its tracks, so the next Record does not \
+             record over them.",
+            &["disarm", "arm", "record", "stop"],
+            pref_switch(
+                "rec-disarm-after",
+                s.recording.disarm_after_recording,
+                apply(&up, |s| {
+                    s.recording.disarm_after_recording = !s.recording.disarm_after_recording
+                }),
+            ),
+        ))
+        .row(PrefRow::described(
+            "Low-Latency Monitoring",
+            "While a track is armed or monitoring, effects on its way to the \
+             master reporting more latency than this (samples) are bypassed \
+             until it stops. Other tracks stay compensated.",
+            &[
+                "latency",
+                "monitor",
+                "monitoring",
+                "bypass",
+                "low",
+                "plugin",
+                "record",
+            ],
+            choice(
+                "rec-low-latency",
+                LOW_LATENCY_LIMITS
+                    .iter()
+                    .map(|&limit| {
+                        let label = if limit == 0 {
+                            "Off".to_string()
+                        } else {
+                            limit.to_string()
+                        };
+                        (limit, label)
+                    })
+                    .collect(),
+                if LOW_LATENCY_LIMITS.contains(&s.recording.low_latency_limit_samples) {
+                    s.recording.low_latency_limit_samples
+                } else {
+                    0
+                },
+                &up,
+                |s, v| s.recording.low_latency_limit_samples = v,
+            ),
+        ))
+        .row(PrefRow::described(
+            "Correct takes for interface latency",
+            "Moves each take earlier by the round trip through the interface, as \
+             measured or as the driver reports it. Off, takes are placed by the \
+             Recording Delay on the Audio page alone.",
+            &[
+                "latency",
+                "interface",
+                "driver",
+                "asio",
+                "offset",
+                "record",
+                "compensation",
+            ],
+            pref_switch(
+                "rec-correct-interface-latency",
+                s.recording.audio.correct_interface_latency,
+                apply(&up, |s| {
+                    s.recording.audio.correct_interface_latency =
+                        !s.recording.audio.correct_interface_latency
+                }),
+            ),
+        ))
 }
 
 // ── Editing ─────────────────────────────────────────────────────────────────
@@ -837,14 +1050,14 @@ fn editing(cx: &PageCtx) -> Vec<PrefGroup> {
             ),
         )),
         PrefGroup::new("Tracks").row(PrefRow::described(
-            "Show the Mixer when a track is added",
-            "Switches the dock to the Mixer and scrolls to the new track's strip.",
-            &["mixer", "track", "add", "new", "panel", "tab", "dock"],
+            "Open the Mixer when a track is added",
+            "Also when an audio file is dropped. Switches the dock to the Mixer and scrolls to the new track's strip.",
+            &["mixer", "track", "add", "new", "panel", "tab", "dock", "drop"],
             pref_switch(
-                "editing-show-mixer-on-add-track",
-                s.editing.show_mixer_on_add_track,
+                "editing-open-mixer-on-add-track",
+                s.editing.open_mixer_on_add_track,
                 apply(&up, |s| {
-                    s.editing.show_mixer_on_add_track = !s.editing.show_mixer_on_add_track
+                    s.editing.open_mixer_on_add_track = !s.editing.open_mixer_on_add_track
                 }),
             ),
         )),
@@ -1116,7 +1329,47 @@ fn experimental(cx: &PageCtx) -> Vec<PrefGroup> {
                 apply(&up, |s| s.experimental.voxtune = !s.experimental.voxtune),
             ),
         ))
+        .row(PrefRow::described(
+            "API server",
+            "Loudness and visualizer data over HTTP and WebSocket on this computer only, \
+             with a web page that shows it. Open the address below in a browser.",
+            &[
+                "api",
+                "server",
+                "websocket",
+                "loudness",
+                "lufs",
+                "visualizer",
+                "web",
+                "experimental",
+            ],
+            pref_switch(
+                "experimental-api-server",
+                s.experimental.api_server,
+                apply(&up, |s| {
+                    s.experimental.api_server = !s.experimental.api_server
+                }),
+            ),
+        ))
+        .row(PrefRow::field(
+            "API address",
+            &["api", "server", "address", "port", "url"],
+            pref_value(api_server_status_text(s.experimental.api_server_port)),
+        ))
         .note("Experimental features can change or be removed between versions.")]
+}
+
+/// What the API server row reports: where to open it, or why it is not there.
+fn api_server_status_text(port: u16) -> String {
+    use crate::api_server::{status, ApiServerStatus, DEFAULT_PORT};
+    match status() {
+        ApiServerStatus::Running(addr) => format!("http://{addr}"),
+        ApiServerStatus::Failed(error) => format!("Could not start — {error}"),
+        ApiServerStatus::Off => {
+            let port = if port == 0 { DEFAULT_PORT } else { port };
+            format!("Off (http://127.0.0.1:{port} when on)")
+        }
+    }
 }
 
 // ── About ───────────────────────────────────────────────────────────────────

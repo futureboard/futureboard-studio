@@ -521,6 +521,14 @@ pub enum EditCommand {
         prev: f32,
         next: f32,
     },
+    /// A channel's Dual pan: switching Balance / Dual, or one gesture on a
+    /// Dual position. Carries the whole setting so undo restores mode and
+    /// both positions together. Never reloads the project/graph.
+    SetTrackDualPan {
+        track_id: String,
+        prev: crate::components::timeline::timeline_state::DualPan,
+        next: crate::components::timeline::timeline_state::DualPan,
+    },
     SetTrackVolumeAutomationRead {
         track_id: String,
         prev: bool,
@@ -608,6 +616,12 @@ pub enum EditCommand {
         prev: Option<crate::components::timeline::timeline_state::MidiScale>,
         next: Option<crate::components::timeline::timeline_state::MidiScale>,
     },
+    /// Edit the project metadata (title, artist, …) exports carry. Saved with
+    /// the project; nothing plays differently.
+    SetProjectMetadata {
+        prev: Box<crate::project::ProjectMetadata>,
+        next: Box<crate::project::ProjectMetadata>,
+    },
     /// One global-lane height gesture (drag or reset-to-default). Persisted
     /// with the project since v40, but view state all the same, so it never
     /// invalidates the audio graph.
@@ -615,6 +629,13 @@ pub enum EditCommand {
         prev: GlobalLaneHeights,
         next: GlobalLaneHeights,
     },
+}
+
+fn is_midi_clip(clip: &ClipState) -> bool {
+    matches!(
+        clip.clip_type,
+        crate::components::timeline::timeline_state::ClipType::Midi { .. }
+    )
 }
 
 impl EditCommand {
@@ -637,18 +658,31 @@ impl EditCommand {
             | EditCommand::SetMidiArticulations { .. }
             | EditCommand::SetClipSysEx { .. }
             | EditCommand::SplitMidiNote { .. } => EditImpact::Midi,
+            // A new MIDI clip (a duplicate, a clone, a paste) changes what
+            // plays, not the graph that plays it: the engine keeps MIDI clips
+            // out of its structure key and swaps the schedule in. Through the
+            // MIDI path it is published right after the frame that draws it,
+            // instead of waiting on the gesture throttle and a whole-project
+            // serialize on the UI thread.
+            EditCommand::CreateClip { clip, .. } if is_midi_clip(clip) => EditImpact::Midi,
+            EditCommand::BatchCreateClips { clips }
+                if !clips.is_empty() && clips.iter().all(|(_, clip)| is_midi_clip(clip)) =>
+            {
+                EditImpact::Midi
+            }
             EditCommand::SetSongTextEvents { .. } => EditImpact::Metadata,
             EditCommand::SetChordEvents { .. } => EditImpact::Metadata,
             EditCommand::SetGlobalLaneHeights { .. } => EditImpact::Metadata,
+            EditCommand::SetProjectMetadata { .. } => EditImpact::Metadata,
             // Saved with the project, but the instance and the graph around
             // it are unchanged: the studio hands the plug-in its state.
             EditCommand::SetInsertState { .. } => EditImpact::Metadata,
             // Nothing the engine plays differently, but ARA plug-ins read the
             // key from the musical context, including on undo and redo.
             EditCommand::SetProjectKey { .. } => EditImpact::MusicalContext,
-            EditCommand::SetTrackVolume { .. } | EditCommand::SetTrackPan { .. } => {
-                EditImpact::MixerControl
-            }
+            EditCommand::SetTrackVolume { .. }
+            | EditCommand::SetTrackPan { .. }
+            | EditCommand::SetTrackDualPan { .. } => EditImpact::MixerControl,
             EditCommand::SetTempoState { .. } => EditImpact::TempoMap,
             EditCommand::SetTimeSignatureState { .. } => EditImpact::TimeSignatureMap,
             _ => EditImpact::Project,
@@ -670,10 +704,19 @@ impl EditCommand {
     /// mutate `TimelineState`. Since these commands no longer dirty the engine
     /// graph, undo/redo have to make that push instead of leaning on the next
     /// project sync to carry the value across.
+    /// [`Self::mixer_control_target`]'s param for [`EditCommand::SetTrackDualPan`]:
+    /// stands for `panMode`, `panLeft` and `panRight` together.
+    pub const DUAL_PAN_TARGET: &'static str = "dualPan";
+
     pub fn mixer_control_target(&self) -> Option<(&str, &'static str)> {
         match self {
             EditCommand::SetTrackVolume { track_id, .. } => Some((track_id.as_str(), "volume")),
             EditCommand::SetTrackPan { track_id, .. } => Some((track_id.as_str(), "pan")),
+            // Not one engine param but three (`panMode`, `panLeft`,
+            // `panRight`); the owner pushes them together.
+            EditCommand::SetTrackDualPan { track_id, .. } => {
+                Some((track_id.as_str(), Self::DUAL_PAN_TARGET))
+            }
             _ => None,
         }
     }
@@ -730,10 +773,16 @@ impl EditCommand {
                 .collect::<Vec<_>>()
         };
         let track = |snapshot: &TrackSnapshot| {
+            let midi_fx = snapshot
+                .track
+                .midi_fx
+                .iter()
+                .filter_map(|fx| fx.plugin.as_ref());
             snapshot
                 .track
                 .inserts
                 .iter()
+                .chain(midi_fx)
                 .filter(|slot| !slot.is_empty())
                 .map(|slot| (snapshot.track.id.clone(), slot.id.clone()))
                 .collect::<Vec<_>>()
@@ -781,6 +830,16 @@ impl EditCommand {
             EditCommand::DuplicateTrack { snapshot, .. }
             | EditCommand::DeleteTrack { snapshot } => {
                 refresh(&mut snapshot.track.inserts);
+                for plugin in snapshot
+                    .track
+                    .midi_fx
+                    .iter_mut()
+                    .filter_map(|fx| fx.plugin.as_mut())
+                {
+                    if let Some(state) = states.get(&plugin.id) {
+                        plugin.vst3_state = Some(state.clone());
+                    }
+                }
             }
             EditCommand::SetTracks { prev, next, .. } => {
                 for slot in prev.slots_mut().chain(next.slots_mut()) {
@@ -913,6 +972,10 @@ impl EditCommand {
             EditCommand::SetTrackHeights { .. } => "Resize Track Height",
             EditCommand::SetTrackVolume { .. } => "Set Volume",
             EditCommand::SetTrackPan { .. } => "Set Pan",
+            EditCommand::SetTrackDualPan { prev, next, .. } if prev.mode != next.mode => {
+                "Set Pan Mode"
+            }
+            EditCommand::SetTrackDualPan { .. } => "Set Dual Pan",
             EditCommand::SetTrackVolumeAutomationRead { .. } => "Set Volume Automation Read",
             EditCommand::SetTrackMpeConfiguration { .. } => "Set MPE Configuration",
             EditCommand::SetTrackProgramSelection { .. } => "Set Program",
@@ -925,6 +988,7 @@ impl EditCommand {
             EditCommand::SetChordEvents { label, .. } => label,
             EditCommand::SetGlobalLaneHeights { .. } => "Resize Lane",
             EditCommand::SetProjectKey { .. } => "Set Project Key",
+            EditCommand::SetProjectMetadata { .. } => "Edit Project Metadata",
             EditCommand::MapTempo { label, .. } => label,
         }
     }
@@ -1197,6 +1261,9 @@ impl EditCommand {
             EditCommand::SetTrackPan { track_id, next, .. } => {
                 state.set_track_pan(track_id, *next);
             }
+            EditCommand::SetTrackDualPan { track_id, next, .. } => {
+                state.set_track_dual_pan(track_id, *next);
+            }
             EditCommand::SetTrackVolumeAutomationRead { track_id, next, .. } => {
                 let beat = state.transport.playhead_beats;
                 state.set_track_volume_automation_read(track_id, *next);
@@ -1231,6 +1298,9 @@ impl EditCommand {
             }
             EditCommand::SetProjectKey { next, .. } => {
                 state.project_key = *next;
+            }
+            EditCommand::SetProjectMetadata { next, .. } => {
+                state.project_metadata = (**next).clone();
             }
             EditCommand::MapTempo {
                 tempo_next,
@@ -1438,6 +1508,9 @@ impl EditCommand {
             EditCommand::SetTrackPan { track_id, prev, .. } => {
                 state.set_track_pan(track_id, *prev);
             }
+            EditCommand::SetTrackDualPan { track_id, prev, .. } => {
+                state.set_track_dual_pan(track_id, *prev);
+            }
             EditCommand::SetTrackVolumeAutomationRead { track_id, prev, .. } => {
                 let beat = state.transport.playhead_beats;
                 state.set_track_volume_automation_read(track_id, *prev);
@@ -1472,6 +1545,9 @@ impl EditCommand {
             }
             EditCommand::SetProjectKey { prev, .. } => {
                 state.project_key = *prev;
+            }
+            EditCommand::SetProjectMetadata { prev, .. } => {
+                state.project_metadata = (**prev).clone();
             }
             EditCommand::MapTempo {
                 tempo_prev,
@@ -1828,6 +1904,87 @@ mod inspector_gesture_command_tests {
         assert!(!history.undo(&mut state), "one drag must create one entry");
         assert!(history.redo(&mut state));
         assert!((state.find_track(&track_id).unwrap().pan - 0.6).abs() < 1.0e-6);
+    }
+
+    /// Dual pan: a mode switch is its own undo step, a drag on a position
+    /// folds into one, undo restores mode and positions together, and none
+    /// of it dirties the audio graph.
+    #[test]
+    fn dual_pan_undoes_mode_and_positions_together() {
+        use crate::components::timeline::timeline_state::{DualPan, PanMode};
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let track_id = state.create_audio_track();
+        let start = state.find_track(&track_id).unwrap().dual_pan;
+        assert_eq!(start, DualPan::default());
+
+        let mut history = EditHistory::new(8);
+        let dual = DualPan {
+            mode: PanMode::Dual,
+            ..start
+        };
+        let switch = EditCommand::SetTrackDualPan {
+            track_id: track_id.clone(),
+            prev: start,
+            next: dual,
+        };
+        assert_eq!(switch.impact(), EditImpact::MixerControl);
+        assert_eq!(
+            switch.mixer_control_target(),
+            Some((track_id.as_str(), EditCommand::DUAL_PAN_TARGET))
+        );
+        assert_eq!(switch.label(), "Set Pan Mode");
+        switch.execute(&mut state);
+        history.push(switch);
+        assert!(state.find_track(&track_id).unwrap().dual_pan_active());
+
+        // One drag on the right position: three samples, one step.
+        let mut prev = dual;
+        for right in [0.8, 0.6, 0.4] {
+            let next = DualPan { right, ..prev };
+            assert!(state.set_track_dual_pan(&track_id, next));
+            history.push_mixer_value(EditCommand::SetTrackDualPan {
+                track_id: track_id.clone(),
+                prev,
+                next,
+            });
+            prev = next;
+        }
+        assert_eq!(state.find_track(&track_id).unwrap().dual_pan.right, 0.4);
+
+        assert!(history.undo(&mut state));
+        assert_eq!(state.find_track(&track_id).unwrap().dual_pan, dual);
+        assert!(history.undo(&mut state), "the mode switch is its own step");
+        assert_eq!(state.find_track(&track_id).unwrap().dual_pan, start);
+        assert!(!history.undo(&mut state));
+        assert!(history.redo(&mut state));
+        assert!(history.redo(&mut state));
+        let restored = state.find_track(&track_id).unwrap().dual_pan;
+        assert_eq!(restored.mode, PanMode::Dual);
+        assert_eq!(restored.right, 0.4);
+    }
+
+    /// A mono channel never plays Dual, whatever its stored mode.
+    #[test]
+    fn dual_pan_is_inactive_on_a_mono_channel() {
+        use crate::components::timeline::timeline_state::{DualPan, PanMode, TrackAudioFormat};
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let track_id = state.create_audio_track();
+        state.set_track_dual_pan(
+            &track_id,
+            DualPan {
+                mode: PanMode::Dual,
+                left: 0.0,
+                right: 0.0,
+            },
+        );
+        assert!(state.find_track(&track_id).unwrap().dual_pan_active());
+        let track = state.tracks.iter_mut().find(|t| t.id == track_id).unwrap();
+        track.routing.audio_format = TrackAudioFormat::Mono;
+        let track = state.find_track(&track_id).unwrap();
+        assert!(!track.dual_pan_active());
+        assert!(!crate::layout::engine_snapshot::engine_dual_pan(track).enabled);
     }
 
     /// Set up a track with one volume automation lane holding `beats` points.
@@ -2743,6 +2900,27 @@ impl EditHistory {
                     ..
                 }),
             ) if track_id == top_track => {
+                *top_next = *next;
+                self.redo_stack.clear();
+            }
+            // A Dual position folds the same way; a mode switch never folds
+            // into, or absorbs, a position gesture.
+            (
+                EditCommand::SetTrackDualPan {
+                    track_id,
+                    prev,
+                    next,
+                },
+                Some(EditCommand::SetTrackDualPan {
+                    track_id: top_track,
+                    prev: top_prev,
+                    next: top_next,
+                }),
+            ) if track_id == top_track
+                && prev.mode == next.mode
+                && top_prev.mode == top_next.mode
+                && top_next.mode == next.mode =>
+            {
                 *top_next = *next;
                 self.redo_stack.clear();
             }

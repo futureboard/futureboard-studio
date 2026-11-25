@@ -62,7 +62,8 @@ Other build-time configuration:
 - `FUTUREBOARD_AUTH_API_URL` defaults to `https://futureboard.studio`, the same
   public origin CI bakes (override: `authApiUrl`).
 - The TONE3000 API key and the Discord client id are not baked (no `.env`,
-  as in a fresh clone); Professional Edition is not built.
+  as in a fresh clone); the Professional code is not compiled in
+  (`build-info.json` reports `"professional": false`).
 
 ## Runtime
 

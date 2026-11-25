@@ -39,10 +39,14 @@ fn lane_tooltip(text: &'static str) -> impl Fn(&mut Window, &mut App) -> AnyView
 /// the track header so the block reads as part of the track.
 pub(crate) const AUTOMATION_TRACK_STRIP_W: f32 = 3.0;
 
+/// The track header's number tab, continued down the track's automation
+/// rows as a column in its colour: the lanes read as the track's own.
+pub(crate) const AUTOMATION_TAB_W: f32 = crate::components::timeline::track_header::TRACK_TAB_W;
+
 /// Where the automation section's content starts in the header column: the
-/// track header's own content inset, so the section's glyph sits in the same
-/// column as the track's handle.
-pub(crate) const AUTOMATION_CONTENT_X: f32 = AUTOMATION_TRACK_STRIP_W + space::BASE;
+/// track header's own content inset past the tab, so the section's glyph sits
+/// where the track's toggles start.
+pub(crate) const AUTOMATION_CONTENT_X: f32 = AUTOMATION_TAB_W + space::BASE;
 
 /// X-position of the section's vertical guide: the centre of the 14 px glyph
 /// on its control row, so the guide hangs from it.
@@ -142,10 +146,13 @@ fn target_category(target: &AutomationTarget) -> &'static str {
     match target {
         AutomationTarget::TrackVolume
         | AutomationTarget::TrackPan
+        | AutomationTarget::TrackPanLeft
+        | AutomationTarget::TrackPanRight
         | AutomationTarget::TrackMute => "Track",
         AutomationTarget::PluginParameter { .. } => "Plugin Parameter",
         AutomationTarget::SendLevel { .. } | AutomationTarget::SendEnabled { .. } => "Send",
         AutomationTarget::InsertBypass { .. } => "Insert",
+        AutomationTarget::Spatial(_) => "Spatial",
     }
 }
 
@@ -153,13 +160,16 @@ fn target_category(target: &AutomationTarget) -> &'static str {
 fn target_icon(target: &AutomationTarget) -> &'static str {
     match target {
         AutomationTarget::TrackVolume => assets::ICON_SLIDERS_HORIZONTAL_PATH,
-        AutomationTarget::TrackPan => assets::ICON_ARROW_LEFT_RIGHT_PATH,
+        AutomationTarget::TrackPan
+        | AutomationTarget::TrackPanLeft
+        | AutomationTarget::TrackPanRight => assets::ICON_ARROW_LEFT_RIGHT_PATH,
         AutomationTarget::TrackMute => assets::ICON_VOLUME_X_PATH,
         AutomationTarget::SendLevel { .. } | AutomationTarget::SendEnabled { .. } => {
             assets::ICON_ROUTE_PATH
         }
         AutomationTarget::InsertBypass { .. } => assets::ICON_POWER_PATH,
         AutomationTarget::PluginParameter { .. } => assets::ICON_PLUG_PATH,
+        AutomationTarget::Spatial(_) => assets::ICON_AUDIO_LINES_PATH,
     }
 }
 
@@ -248,18 +258,10 @@ pub fn automation_lane(
             gpui::MouseButton::Left,
             lane_action(AutomationLaneAction::Activate),
         )
-        // The track's colour strip, continued from its header. The master's
+        // The track's tab column, continued from its header. The master's
         // block has no track to belong to.
         .when(track_id != MASTER_TRACK_ID, |header| {
-            header.child(
-                div()
-                    .absolute()
-                    .left_0()
-                    .top_0()
-                    .bottom_0()
-                    .w(px(AUTOMATION_TRACK_STRIP_W))
-                    .bg(Colors::with_alpha(track_color, 0.6)),
-            )
+            header.child(automation_tab_column(track_color))
         })
         // The section's nesting guide, continued from the control row; lit on
         // the lane being edited.
@@ -367,136 +369,120 @@ pub fn automation_lane(
         })
         .child(lane.target.format_value(readout_value));
 
+    // The lane's switch: one latch, the way the track's own toggles are, in
+    // the automation hue — or the record hue while the Automation Arm writes
+    // the lane. A lane overridden by hand keeps its latch lit in grey until it
+    // is re-enabled. Fill and glyph carry the state together.
+    let switch_hue = if lane.recording {
+        Colors::state_arm()
+    } else {
+        Colors::state_automation()
+    };
+    let (switch_fill, switch_border) = if lane.enabled && !lane.overridden {
+        Colors::latched(header_bg, switch_hue)
+    } else if lane.enabled {
+        (
+            Colors::composite(header_bg, Colors::state_selected()),
+            border_subtle,
+        )
+    } else {
+        (Colors::button_bg(), border_subtle)
+    };
+    let switch_glyph = if lane.enabled && !lane.overridden {
+        switch_hue
+    } else {
+        text_muted
+    };
+    let switch_hover = Colors::composite(switch_fill, state_hover);
+    let lane_switch = div()
+        .py(px(crate::theme::size::hit_target(
+            crate::theme::size::DENSE,
+        )))
+        .flex_none()
+        .child(
+            div()
+                .id(("automation-lane-switch", id_num))
+                .relative()
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(crate::theme::size::DENSE))
+                .rounded(px(radius::CONTROL_SM))
+                .bg(switch_fill)
+                .border(px(1.0))
+                .border_color(switch_border)
+                .cursor(gpui::CursorStyle::PointingHand)
+                .hover(move |s| s.bg(switch_hover))
+                .tooltip(crate::components::fb_tooltip(if lane.enabled {
+                    "On \u{2014} the lane plays the parameter. Click to bypass it"
+                } else {
+                    "Off \u{2014} the lane is bypassed. Click to play it"
+                }))
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    lane_action(AutomationLaneAction::SetEnabled(!lane.enabled)),
+                )
+                .child(
+                    svg()
+                        .path(assets::ICON_POWER_PATH)
+                        .size(px(11.0))
+                        .text_color(switch_glyph),
+                )
+                // A lane being written right now shows a dot.
+                .when(lane.recording && lane.enabled, |switch| {
+                    switch.child(
+                        div()
+                            .absolute()
+                            .top(px(2.0))
+                            .right(px(2.0))
+                            .size(px(4.0))
+                            .rounded(px(radius::PILL))
+                            .bg(switch_hue),
+                    )
+                }),
+        );
+
     let name_row = div()
         .flex()
         .flex_row()
         .items_center()
-        .justify_between()
         .gap(px(space::SNUG))
         .min_w(px(0.0))
+        .child(lane_switch)
         .child(div().flex_1().min_w(px(0.0)).child(name_button))
         .child(readout);
 
-    // ── Row 2: the lane's switch, as one flush segmented control, then the
-    // lane's own controls ─────────────────────────────────────────────────────
-    //
-    // Off or On — each one click. On takes the automation hue, or the record
-    // hue while the Automation Arm is writing the lane. A lane overridden by
-    // hand adds a grey Re-enable segment: the control's own value is playing
-    // until it is clicked (or the transport's Re-Enable Automation is). Fill
-    // and border carry the state together, never hue alone.
-    let mut segments = div()
-        .flex()
-        .flex_row()
-        .flex_none()
-        .items_center()
-        .h(px(18.0))
-        .rounded(px(radius::CONTROL_SM))
-        .border(px(1.0))
-        .border_color(border_subtle)
-        .bg(Colors::surface_input());
-    let choices: [(bool, &'static str, &'static str); 2] = [
-        (false, "Off", "Off \u{2014} the lane is bypassed"),
-        (
-            true,
-            "On",
-            "On \u{2014} the lane plays the parameter; with the Automation Arm on, moving the control while playing writes it",
-        ),
-    ];
-    for (index, (enabled, label, tip)) in choices.into_iter().enumerate() {
-        let on = lane.enabled == enabled;
-        let hue = if !enabled {
-            text_muted
-        } else if lane.recording {
-            Colors::state_arm()
-        } else {
-            Colors::state_automation()
-        };
-        let (fill, border) = if on && enabled && !lane.overridden {
-            Colors::latched(header_bg, hue)
-        } else if on {
-            (
-                Colors::composite(header_bg, Colors::state_selected()),
-                border_subtle,
-            )
-        } else {
-            (
-                Colors::with_alpha(header_bg, 0.0),
-                Colors::with_alpha(border_subtle, 0.0),
-            )
-        };
-        let hover = Colors::composite(fill, state_hover);
-        let recording = on && enabled && lane.recording;
-        segments = segments.child(
-            div()
-                .id((
-                    "automation-lane-mode",
-                    id_num.wrapping_mul(8).wrapping_add(index),
-                ))
-                .flex()
-                .items_center()
-                .justify_center()
-                .gap(px(space::HAIR))
-                .h_full()
-                .min_w(px(26.0))
-                .px(px(space::TIGHT))
-                .bg(fill)
-                .border(px(1.0))
-                .border_color(border)
-                .text_size(px(typography::UI_XS))
-                .font_weight(if on {
-                    gpui::FontWeight::BOLD
-                } else {
-                    gpui::FontWeight::MEDIUM
-                })
-                .text_color(if on && !lane.overridden {
-                    hue
-                } else {
-                    text_muted
-                })
-                .cursor(gpui::CursorStyle::PointingHand)
-                .hover(move |s| s.bg(hover))
-                .tooltip(crate::components::fb_tooltip(tip))
-                .on_mouse_down(
-                    gpui::MouseButton::Left,
-                    lane_action(AutomationLaneAction::SetEnabled(enabled)),
-                )
-                // A lane being written right now shows a dot.
-                .when(recording, |segment| {
-                    segment.child(div().size(px(4.0)).rounded(px(radius::PILL)).bg(hue))
-                })
-                .child(label),
-        );
-    }
-    if lane.enabled && lane.overridden {
+    // ── Row 2: what the lane holds, the way back from a hand override, and
+    // the lane's own controls ────────────────────────────────────────────────
+    let reenable = (lane.enabled && lane.overridden).then(|| {
         let fill = Colors::composite(header_bg, Colors::state_hover());
         let hover = Colors::composite(fill, state_hover);
-        segments = segments.child(
-            div()
-                .id(("automation-lane-reenable", id_num))
-                .flex()
-                .items_center()
-                .justify_center()
-                .h_full()
-                .px(px(space::TIGHT))
-                .bg(fill)
-                .border(px(1.0))
-                .border_color(border_subtle)
-                .text_size(px(typography::UI_XS))
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(text_muted)
-                .cursor(gpui::CursorStyle::PointingHand)
-                .hover(move |s| s.bg(hover))
-                .tooltip(crate::components::fb_tooltip(
-                    "Overridden \u{2014} the control was moved by hand. Click to play the lane again",
-                ))
-                .on_mouse_down(
-                    gpui::MouseButton::Left,
-                    lane_action(AutomationLaneAction::ReEnable),
-                )
-                .child("Re-enable"),
-        );
-    }
+        div()
+            .id(("automation-lane-reenable", id_num))
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .h(px(18.0))
+            .px(px(space::SNUG))
+            .rounded(px(radius::CONTROL_SM))
+            .bg(fill)
+            .border(px(1.0))
+            .border_color(border_subtle)
+            .text_size(px(typography::UI_XS))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(Colors::text_secondary())
+            .cursor(gpui::CursorStyle::PointingHand)
+            .hover(move |s| s.bg(hover))
+            .tooltip(crate::components::fb_tooltip(
+                "Overridden \u{2014} the control was moved by hand. Click to play the lane again",
+            ))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                lane_action(AutomationLaneAction::ReEnable),
+            )
+            .child("Re-enable")
+    });
     let point_count = lane.points.len();
     let mode_row = div()
         .flex()
@@ -512,8 +498,9 @@ pub fn automation_lane(
                 .items_center()
                 .gap(px(space::SNUG))
                 .min_w(px(0.0))
-                .pl(px(space::TIGHT))
-                .child(segments)
+                // Under the name, past the switch.
+                .pl(px(crate::theme::size::DENSE + space::SNUG + space::TIGHT))
+                .children(reenable)
                 .child(
                     div()
                         .min_w(px(0.0))
@@ -850,6 +837,29 @@ fn tabular_numerals() -> gpui::FontFeatures {
     static TNUM: std::sync::OnceLock<gpui::FontFeatures> = std::sync::OnceLock::new();
     TNUM.get_or_init(|| gpui::FontFeatures(std::sync::Arc::new(vec![("tnum".to_string(), 1)])))
         .clone()
+}
+
+/// The track header's tab column, continued down an automation row: the
+/// track's colour as a wash, with its solid edge.
+pub(crate) fn automation_tab_column(track_color: gpui::Rgba) -> impl IntoElement {
+    div()
+        .absolute()
+        .left_0()
+        .top_0()
+        .bottom_0()
+        .w(px(AUTOMATION_TAB_W))
+        .bg(Colors::with_alpha(track_color, 0.10))
+        .border_r(px(1.0))
+        .border_color(Colors::border_subtle())
+        .child(
+            div()
+                .absolute()
+                .left_0()
+                .top_0()
+                .bottom_0()
+                .w(px(AUTOMATION_TRACK_STRIP_W))
+                .bg(track_color),
+        )
 }
 
 /// A 20 px icon button of the lane header. `hover` is the `(fill, glyph)` pair

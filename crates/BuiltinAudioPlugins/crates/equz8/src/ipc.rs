@@ -564,7 +564,10 @@ mod tests {
         // The sidechain block is appended after the 108 that came before it.
         assert_eq!(SC_BASE_INDEX, 108);
         assert_eq!(ui_param_index("band1_scExternal"), Some(108));
-        assert_eq!(ui_param_index("band8_scExternal"), Some(sc_wire_index(BAND_COUNT - 1)));
+        assert_eq!(
+            ui_param_index("band8_scExternal"),
+            Some(sc_wire_index(BAND_COUNT - 1))
+        );
         assert_eq!(PARAM_COUNT, 116);
         for index in 0..PARAM_COUNT as u32 {
             let decoded = [
@@ -588,7 +591,9 @@ mod tests {
         let json = Equz8State::new(params.clone()).to_json().unwrap();
         let back = Equz8State::from_json(&json).unwrap();
         assert!(back.params.bands[2].sc_external);
-        let legacy = json.replace(",\"scExternal\":true", "").replace(",\"scExternal\":false", "");
+        let legacy = json
+            .replace(",\"scExternal\":true", "")
+            .replace(",\"scExternal\":false", "");
         assert!(!legacy.contains("scExternal"));
         let old = Equz8State::from_json(&legacy).unwrap();
         assert!(old.params.bands.iter().all(|band| !band.sc_external));

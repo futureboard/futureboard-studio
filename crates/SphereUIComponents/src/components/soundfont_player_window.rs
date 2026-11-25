@@ -214,8 +214,22 @@ pub fn soundfont_program_parts(
     {
         return parts;
     }
+    if instrument.track_type != TrackType::Instrument {
+        return parts;
+    }
     for track in &state.tracks {
-        if state.effective_instrument_track_id(&track.id).as_deref() != Some(instrument_id) {
+        // `effective_instrument_track_id(track) == instrument`, decided from the
+        // instrument in hand: resolving it per track scanned the project per
+        // track, which the engine sync paid on every edit.
+        let plays_here = match track.track_type {
+            TrackType::Instrument => track.id == instrument.id,
+            TrackType::Midi => matches!(
+                &track.routing.output,
+                TrackOutputRouting::Instrument { track_id } if *track_id == instrument.id
+            ),
+            _ => false,
+        };
+        if !plays_here {
             continue;
         }
         // The channel its selection goes out on, as for any instrument.
@@ -238,6 +252,11 @@ pub fn effective_soundfont_channels(
     track: &TrackState,
 ) -> SoundfontChannels {
     let mut channels = track.soundfont_channels;
+    // Only a Soundfont Multi has parts a program can set. Asked for every
+    // track by the engine sync, so the rest must not search the project.
+    if !track.builtin_soundfont_player || track.soundfont_mode != SoundfontPlayerMode::Multi {
+        return channels;
+    }
     for (part, program) in channels
         .iter_mut()
         .zip(soundfont_program_parts(state, &track.id))
@@ -1204,7 +1223,7 @@ pub fn open_soundfont_player_window(
     ));
     crate::window_position::apply_owner_display(&mut options, owner_bounds, cx);
 
-    cx.open_window(options, move |_window, cx| {
+    crate::dialog_frame::open_dialog_window(cx, options, move |_window, cx| {
         cx.new(|cx| {
             SoundfontPlayerWindow::new(
                 track_id,

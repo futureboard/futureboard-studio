@@ -311,28 +311,44 @@ pub(crate) fn pref_stepper(
     on_up: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> gpui::AnyElement {
     use crate::theme::{radius, size, space, typography};
+    pref_stepper_around(
+        id,
+        div()
+            .min_w(px(72.0))
+            .h(px(size::COMFORTABLE))
+            .px(px(space::BASE))
+            .rounded(px(radius::CONTROL))
+            .border(px(1.0))
+            .border_color(Colors::border_subtle())
+            .bg(Colors::surface_input())
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(typography::UI_XS))
+            .text_color(Colors::text_primary())
+            .child(value)
+            .into_any_element(),
+        on_down,
+        on_up,
+    )
+}
+
+/// − / + around a value of the caller's own: a field that can be typed into
+/// (double-click), scrubbed, or stepped.
+pub(crate) fn pref_stepper_around(
+    id: &'static str,
+    value: gpui::AnyElement,
+    on_down: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    on_up: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui::AnyElement {
+    use crate::theme::space;
     div()
         .flex()
         .flex_row()
         .items_center()
         .gap(px(space::TIGHT))
         .child(fb_stepper_button((id, 0usize), "−", on_down))
-        .child(
-            div()
-                .min_w(px(72.0))
-                .h(px(size::COMFORTABLE))
-                .px(px(space::BASE))
-                .rounded(px(radius::CONTROL))
-                .border(px(1.0))
-                .border_color(Colors::border_subtle())
-                .bg(Colors::surface_input())
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_size(px(typography::UI_XS))
-                .text_color(Colors::text_primary())
-                .child(value),
-        )
+        .child(value)
         .child(fb_stepper_button((id, 1usize), "+", on_up))
         .into_any_element()
 }

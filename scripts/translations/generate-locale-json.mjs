@@ -660,12 +660,6 @@ const TRIPLES = [
     "Futureboard Studio",
   ],
   [
-    "Futureboard Studio / Mochi DAW v0.1.0",
-    "Futureboard Studio / Mochi DAW v0.1.0",
-    "Futureboard Studio / Mochi DAW v0.1.0",
-    "Futureboard Studio / Mochi DAW v0.1.0",
-  ],
-  [
     "GPU Acceleration",
     "GPU 加速",
     "GPU アクセラレーション",

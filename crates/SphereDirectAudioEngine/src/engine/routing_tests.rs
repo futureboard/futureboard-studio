@@ -11,8 +11,10 @@ use std::sync::Arc;
 fn track(id: &str, ty: &str, sends: Vec<RuntimeSend>) -> RuntimeTrack {
     let cap = 8;
     RuntimeTrack {
+        vca_gain: 1.0,
         spatial: None,
         spatial_params: Default::default(),
+        spatial_state: Default::default(),
         active_voices: 0,
         listen: crate::monitor::ListenMode::Off,
         id: id.to_string(),
@@ -32,6 +34,9 @@ fn track(id: &str, ty: &str, sends: Vec<RuntimeSend>) -> RuntimeTrack {
         preview_mode: RuntimePreviewMode::Stereo,
         output_track_id: None,
         output_track_index: None,
+        midi_fx: None,
+        midi_fx_hold: Vec::new(),
+        midi_fx_plugins: Default::default(),
         inserts: Vec::new(),
         sends,
         automation_lanes: Vec::new(),
@@ -67,6 +72,7 @@ fn track(id: &str, ty: &str, sends: Vec<RuntimeSend>) -> RuntimeTrack {
         pdc_write_pos: 0,
         smoothed_gain_l: 1.0,
         smoothed_gain_r: 1.0,
+        dual_pan: Default::default(),
         wdw_return_index: None,
         sidechain_tap: Default::default(),
     }
@@ -313,6 +319,125 @@ fn block_render_wraps_clip_material_inside_callback() {
     assert_eq!(rendered, frames as u64);
     let left: Vec<f32> = output.chunks(channels).map(|frame| frame[0]).collect();
     assert_eq!(left, vec![0.3, 0.4, 0.2, 0.3, 0.4]);
+}
+
+/// The visualizer track tap: the tapped track's post-fader block reaches
+/// `track_tap()` as the block renderer finishes it, and an untapped one does
+/// not.
+#[test]
+fn a_tapped_track_feeds_the_visualizer_track_tap() {
+    let frames = 6usize;
+    let channels = 2usize;
+    let tracks = vec![track("tapped-audio", "audio", vec![])];
+    let audio_graph = crate::audio_graph::plan_runtime_audio_graph(&tracks).unwrap();
+    let samples: Vec<f32> = (0..16).flat_map(|i| [i as f32 / 20.0; 2]).collect();
+    let source = Arc::new(ClipAudioSource::InMemory(Arc::new(AudioFileBuffer {
+        sample_rate: 48_000,
+        channels: 2,
+        frames: 16,
+        samples,
+    })));
+    let mut clip = clip_for_tap_test(source);
+    clip.track_id = "tapped-audio".to_string();
+    let mut p = RuntimeProject {
+        spatial: Default::default(),
+        sample_rate: 48_000,
+        tracks,
+        clips: vec![clip],
+        audio_graph,
+        ..Default::default()
+    };
+    p.resolve_indices();
+    let tap = crate::visualizer_tap::track_tap();
+    let cursor = tap.listen();
+    let mut output = vec![0.0f32; frames * channels];
+
+    // Untapped: nothing arrives.
+    render_project_block_interleaved(&mut p, 0, 1.0, &mut output, channels, true, 0, 4, None);
+    let (mut l, mut r) = (vec![0.0f32; 64], vec![0.0f32; 64]);
+    let quiet = tap.read(cursor, &mut l, &mut r);
+    assert_eq!(quiet.frames, 0);
+
+    // Tapped: the block the track played, as it left its fader.
+    p.tracks[0]
+        .meter
+        .visualizer_tap
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    render_project_block_interleaved(&mut p, 0, 1.0, &mut output, channels, true, 0, 4, None);
+    let heard = tap.read(quiet.next, &mut l, &mut r);
+    tap.unlisten();
+    p.tracks[0]
+        .meter
+        .visualizer_tap
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(heard.frames, frames);
+    let left: Vec<f32> = output.chunks(channels).map(|frame| frame[0]).collect();
+    assert_eq!(
+        &l[..frames],
+        &left[..],
+        "the tap carries the track's post-fader block"
+    );
+    assert_eq!(tap.sample_rate(), 48_000);
+}
+
+fn clip_for_tap_test(source: Arc<ClipAudioSource>) -> RuntimeClip {
+    RuntimeClip {
+        id: "clip-tap".to_string(),
+        track_id: String::new(),
+        track_index: None,
+        start_beat: 0.0,
+        duration_beats: 16.0,
+        start_sample: 0,
+        duration_samples: 16,
+        offset_seconds: 0.0,
+        gain: 1.0,
+        gain_target: 1.0,
+        gain_step: 1.0,
+        stretch: SphereAudioProcessor::StretchParams::default(),
+        speed_ratio: 1.0,
+        source_read_rate: 1.0,
+        effective_time_ratio: 1.0,
+        pitch_ratio: 1.0,
+        stretch_backend: SphereAudioProcessor::StretchBackend::InternalRePitch,
+        source_start_samples: 0,
+        source_end_samples: 16,
+        warp_markers: Vec::new(),
+        warp_segments: Vec::new(),
+        processor: ClipDspProcessor::Resample,
+        reverse: false,
+        denoise: SphereAudioProcessor::DenoiseProcessor::new(48_000, 0.0),
+        id_hash: 7,
+        channel_transform: SphereAudioProcessor::ChannelTransform::Stereo,
+        dc_remove: false,
+        dc_left: 0.0,
+        dc_right: 0.0,
+        extra_gain: 1.0,
+        dehum: SphereAudioProcessor::DehumProcessor::new(
+            48_000,
+            SphereAudioProcessor::DehumParams {
+                base_hz: 0.0,
+                harmonics: 0,
+                reduction_db: 0.0,
+            },
+        ),
+        envelope_points: Vec::new(),
+        preview_bypass: false,
+        muted: false,
+        ara_rendered: false,
+        fade_in_samples: 0,
+        fade_out_samples: 0,
+        fade_in_curve: crate::runtime::FadeCurve::EqualPower,
+        fade_out_curve: crate::runtime::FadeCurve::EqualPower,
+        source,
+        stretch_processor: None,
+        stretch_input_l: Vec::new(),
+        stretch_input_r: Vec::new(),
+        stretch_output_l: Vec::new(),
+        stretch_output_r: Vec::new(),
+        stretch_prime_l: Vec::new(),
+        stretch_prime_r: Vec::new(),
+        stretch_next_project_sample: None,
+    }
 }
 
 /// #379: a device switch hands the backend the cached graph, which

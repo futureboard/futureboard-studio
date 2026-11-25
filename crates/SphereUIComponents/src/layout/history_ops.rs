@@ -276,6 +276,12 @@ impl StudioLayout {
                     }
                 }
             }
+            // Plug-ins in the track's MIDI FX chain.
+            for (id, state) in &states {
+                if let Some(plugin) = timeline.state.midi_fx_plugin_mut(track_id, id) {
+                    plugin.vst3_state = Some(state.clone());
+                }
+            }
         });
     }
 
@@ -436,6 +442,17 @@ impl StudioLayout {
             .iter()
             .map(|track| track.id.clone())
             .collect()
+    }
+
+    /// Every command item the menu bar enables or annotates at run time.
+    pub(super) fn menu_command_states(
+        &self,
+        cx: &gpui::App,
+    ) -> Vec<crate::menu::CommandMenuState<'static>> {
+        let mut states = self.history_menu_states(cx);
+        states.extend(self.audio_to_midi_menu_states(cx));
+        states.extend(self.strip_silence_menu_states(cx));
+        states
     }
 
     /// Undo and Redo as the Edit menu shows them: available only when there

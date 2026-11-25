@@ -557,6 +557,10 @@ pub struct Vst3ParameterDescriptor {
     pub read_only: bool,
     #[serde(default)]
     pub value_normalized: f64,
+    /// The plug-in's own text for the current value (`getParamStringByValue`),
+    /// empty when it gives none.
+    #[serde(default)]
+    pub value_text: String,
 }
 
 impl Vst3ParameterDescriptor {

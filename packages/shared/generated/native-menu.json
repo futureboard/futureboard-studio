@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generatedAt": "2026-10-24T05:22:12.141Z",
+  "generatedAt": "2026-11-23T18:07:27.432Z",
   "menus": [
     {
       "id": "file",
@@ -316,6 +316,21 @@
           "checked": false,
           "danger": false,
           "description": null,
+          "children": []
+        },
+        {
+          "id": "edit.merge_clips",
+          "kind": "normal",
+          "label": "Merge Clips",
+          "icon": null,
+          "shortcut": "J",
+          "command": "clip:merge",
+          "role": null,
+          "enabled": true,
+          "visible": true,
+          "checked": false,
+          "danger": false,
+          "description": "Join the selected clips on each track into one clip",
           "children": []
         },
         {
@@ -1099,6 +1114,78 @@
           "children": []
         },
         {
+          "id": "audio.audio_to_midi",
+          "kind": "submenu",
+          "label": "Audio to MIDI",
+          "icon": "keyboard-music",
+          "shortcut": null,
+          "command": null,
+          "enabled": true,
+          "visible": true,
+          "children": [
+            {
+              "id": "audio.audio_to_midi.melody",
+              "kind": "normal",
+              "label": "Melody",
+              "icon": null,
+              "shortcut": null,
+              "command": "clip:to-midi-melody",
+              "role": null,
+              "enabled": true,
+              "visible": true,
+              "checked": false,
+              "danger": false,
+              "description": "Convert the selected audio clip's melody to MIDI on a new track",
+              "children": []
+            },
+            {
+              "id": "audio.audio_to_midi.drums",
+              "kind": "normal",
+              "label": "Drums",
+              "icon": null,
+              "shortcut": null,
+              "command": "clip:to-midi-drums",
+              "role": null,
+              "enabled": true,
+              "visible": true,
+              "checked": false,
+              "danger": false,
+              "description": "Convert the selected audio clip's drum hits to MIDI on a new track",
+              "children": []
+            },
+            {
+              "id": "audio.audio_to_midi.chords",
+              "kind": "normal",
+              "label": "Chords",
+              "icon": null,
+              "shortcut": null,
+              "command": "clip:to-midi-chords",
+              "role": null,
+              "enabled": true,
+              "visible": true,
+              "checked": false,
+              "danger": false,
+              "description": "Convert the selected audio clip's chords to MIDI on a new track",
+              "children": []
+            }
+          ]
+        },
+        {
+          "id": "audio.strip_silence",
+          "kind": "normal",
+          "label": "Strip Silence...",
+          "icon": "audio-waveform",
+          "shortcut": null,
+          "command": "audio:strip-silence",
+          "role": null,
+          "enabled": true,
+          "visible": true,
+          "checked": false,
+          "danger": false,
+          "description": "Split the selected audio clips at their silences and remove the silent parts",
+          "children": []
+        },
+        {
           "id": "audio.sep.render",
           "kind": "separator",
           "enabled": true,
@@ -1507,6 +1594,21 @@
           "checked": false,
           "danger": false,
           "description": "Hear the mix as it would play in a car, on a phone, through a PA or in other rooms (monitoring only)",
+          "children": []
+        },
+        {
+          "id": "window.room_preview",
+          "kind": "normal",
+          "label": "3D Room Preview",
+          "icon": "audio-lines",
+          "shortcut": null,
+          "command": "window:room-preview",
+          "role": null,
+          "enabled": true,
+          "visible": true,
+          "checked": false,
+          "danger": false,
+          "description": "Every channel's place in a surround or binaural mix in 3D, with the speakers' levels (Professional)",
           "children": []
         },
         {
@@ -2072,7 +2174,8 @@
           "danger": false,
           "description": null,
           "children": []
-        },        {
+        },
+        {
           "id": "help.welcome_tour",
           "kind": "normal",
           "label": "Welcome Tour",

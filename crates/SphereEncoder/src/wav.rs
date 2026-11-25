@@ -7,6 +7,7 @@ use crate::format::{
     AudioSampleFormat, EncodeError, Quantizer, WavEncodeOptions, check_interleaved_len, f32_to_i32,
     i32_to_f32,
 };
+use crate::metadata::AudioMetadata;
 use crate::rauf::{RAUF_FLAG_FINALIZED, RaufError, RaufReader, RaufSampleFormat};
 
 pub type Result<T> = std::result::Result<T, WavError>;
@@ -202,6 +203,20 @@ fn copy_exact_bytes(input: &mut File, output: &mut File, bytes: u64) -> Result<(
 
 const WAVE_FORMAT_PCM: u16 = 1;
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
+const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
+/// What `WAVE_FORMAT_EXTENSIBLE` adds to the 16-byte `fmt ` payload: `cbSize`,
+/// valid bits, the channel mask and the sub-format GUID.
+const EXTENSIBLE_EXTRA_BYTES: u64 = 24;
+
+/// `KSDATAFORMAT_SUBTYPE_PCM` / `_IEEE_FLOAT` as stored: the format tag in
+/// the first four bytes, then the fixed `-0000-0010-8000-00AA00389B71` tail.
+fn subformat_guid(format_tag: u16) -> [u8; 16] {
+    let mut guid = [
+        0, 0, 0, 0, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
+    ];
+    guid[..2].copy_from_slice(&format_tag.to_le_bytes());
+    guid
+}
 
 /// Size of the `JUNK` chunk an RF64-ready header reserves ahead of `fmt `:
 /// the 8-byte chunk header plus the 28-byte `ds64` payload it becomes.
@@ -221,12 +236,18 @@ const PLAIN_DATA_OFFSET: u64 = 44;
 ///
 /// With [`WavEncodeOptions::rf64`] the file may grow past 4 GiB: the sizes
 /// are then written as RF64 (see [`patch_sizes`]).
+///
+/// Metadata, when there is any, is a `LIST`/`INFO` chunk between `fmt ` and
+/// `data`, so readers that stop at `data` still see it.
 pub struct WavEncoder {
     writer: BufWriter<File>,
     spec: AudioEncodeSpec,
     data_bytes: u64,
     /// Whether the header reserves room for `ds64`.
     rf64: bool,
+    /// Where the samples start: after the header, the RF64 reserve and the
+    /// `LIST`/`INFO` chunk, whichever are present.
+    data_offset: u64,
     finalized: bool,
     scratch: Vec<u8>,
     /// 16/24-bit conversion; [`AudioDither::Off`] unless set by
@@ -240,16 +261,35 @@ impl WavEncoder {
         spec: AudioEncodeSpec,
         options: WavEncodeOptions,
     ) -> std::result::Result<Self, EncodeError> {
+        Self::create_with_metadata(path, spec, options, &AudioMetadata::default())
+    }
+
+    /// [`create`](Self::create), writing `metadata` as a RIFF `LIST`/`INFO`
+    /// chunk. Nothing extra is written when it has no INFO field set.
+    pub fn create_with_metadata(
+        path: impl AsRef<Path>,
+        spec: AudioEncodeSpec,
+        options: WavEncodeOptions,
+        metadata: &AudioMetadata,
+    ) -> std::result::Result<Self, EncodeError> {
         spec.validate()?;
         let quantizer = Quantizer::for_file(path.as_ref());
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
-        write_stream_header_placeholder(&mut writer, &spec, options.rf64)?;
+        let info = metadata.riff_info_chunk();
+        let data_offset = write_stream_header_placeholder(
+            &mut writer,
+            &spec,
+            options.rf64,
+            options.channel_mask,
+            info.as_deref(),
+        )?;
         Ok(Self {
             writer,
             spec,
             data_bytes: 0,
             rf64: options.rf64,
+            data_offset,
             finalized: false,
             scratch: Vec::new(),
             quantizer,
@@ -274,9 +314,9 @@ impl WavEncoder {
     fn flush_and_patch(&mut self) -> std::result::Result<(), EncodeError> {
         self.writer.flush()?;
         let frames = self.frames_written();
-        let (data_bytes, rf64) = (self.data_bytes, self.rf64);
+        let (data_bytes, rf64, data_offset) = (self.data_bytes, self.rf64, self.data_offset);
         let file = self.writer.get_mut();
-        patch_sizes(file, data_bytes, frames, rf64)?;
+        patch_sizes(file, data_bytes, frames, rf64, data_offset)?;
         file.seek(SeekFrom::End(0))?;
         Ok(())
     }
@@ -299,11 +339,16 @@ impl WavEncoder {
     }
 }
 
+/// Write the header with placeholder sizes, `info` (a complete, even-length
+/// `LIST` chunk) between `fmt ` and `data` when given, and return where the
+/// samples start.
 fn write_stream_header_placeholder(
     writer: &mut BufWriter<File>,
     spec: &AudioEncodeSpec,
     rf64: bool,
-) -> std::result::Result<(), EncodeError> {
+    channel_mask: Option<u32>,
+    info: Option<&[u8]>,
+) -> std::result::Result<u64, EncodeError> {
     let audio_format = if spec.sample_format.is_float() {
         WAVE_FORMAT_IEEE_FLOAT
     } else {
@@ -323,21 +368,48 @@ fn write_stream_header_placeholder(
         writer.write_all(&[0u8; 28])?;
     }
     writer.write_all(b"fmt ")?;
-    writer.write_all(&16u32.to_le_bytes())?;
-    writer.write_all(&audio_format.to_le_bytes())?;
+    // A speaker mask needs the extensible form: the same 16 bytes under the
+    // extensible tag, then the mask and the real format as a GUID.
+    let extensible = channel_mask.is_some();
+    let fmt_size = if extensible {
+        16 + EXTENSIBLE_EXTRA_BYTES as u32
+    } else {
+        16
+    };
+    writer.write_all(&fmt_size.to_le_bytes())?;
+    let tag = if extensible {
+        WAVE_FORMAT_EXTENSIBLE
+    } else {
+        audio_format
+    };
+    writer.write_all(&tag.to_le_bytes())?;
     writer.write_all(&spec.channels.to_le_bytes())?;
     writer.write_all(&spec.sample_rate.to_le_bytes())?;
     writer.write_all(&byte_rate.to_le_bytes())?;
     writer.write_all(&block_align.to_le_bytes())?;
     writer.write_all(&bits.to_le_bytes())?;
+    if let Some(mask) = channel_mask {
+        writer.write_all(&22u16.to_le_bytes())?; // cbSize
+        writer.write_all(&bits.to_le_bytes())?; // every container bit is valid
+        writer.write_all(&mask.to_le_bytes())?;
+        writer.write_all(&subformat_guid(audio_format))?;
+    }
+    let info = info.unwrap_or_default();
+    writer.write_all(info)?;
     writer.write_all(b"data")?;
     writer.write_all(&0u32.to_le_bytes())?; // patched at finalize
-    Ok(())
+    let reserve = if rf64 { RF64_RESERVE_BYTES } else { 0 };
+    let extra = if extensible {
+        EXTENSIBLE_EXTRA_BYTES
+    } else {
+        0
+    };
+    Ok(PLAIN_DATA_OFFSET + reserve + extra + info.len() as u64)
 }
 
 /// Write the sizes of a stream header made by
 /// [`write_stream_header_placeholder`] for `data_bytes` of samples
-/// (`frames` frames).
+/// (`frames` frames) starting at `data_offset`.
 ///
 /// While the file fits RIFF (a RIFF size of at most `u32::MAX`) it is a plain
 /// RIFF/WAVE. Past that, an RF64-ready header becomes RF64: `RF64` with
@@ -348,12 +420,8 @@ fn patch_sizes(
     data_bytes: u64,
     frames: u64,
     rf64: bool,
+    data_offset: u64,
 ) -> std::result::Result<(), EncodeError> {
-    let data_offset = if rf64 {
-        PLAIN_DATA_OFFSET + RF64_RESERVE_BYTES
-    } else {
-        PLAIN_DATA_OFFSET
-    };
     // Everything after the 8-byte RIFF chunk header.
     let riff_size = (data_offset - 8)
         .checked_add(data_bytes)
@@ -686,6 +754,40 @@ mod encoder_tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// A speaker mask makes the header extensible: tag 0xFFFE, a 40-byte
+    /// `fmt `, the mask, the real format as a GUID, and the samples after it,
+    /// with the sizes patched in the right places.
+    #[test]
+    fn a_channel_mask_writes_an_extensible_header() {
+        let path = temp_path("extensible");
+        let mut enc = WavEncoder::create(
+            &path,
+            spec(6, AudioSampleFormat::F32),
+            WavEncodeOptions {
+                channel_mask: Some(0x3F),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        enc.write_interleaved_f32(&[0.5; 12]).unwrap();
+        enc.finalize().unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[12..16], b"fmt ");
+        assert_eq!(u32_at(&bytes, 16), 40);
+        assert_eq!(u16::from_le_bytes([bytes[20], bytes[21]]), 0xFFFE);
+        assert_eq!(u16::from_le_bytes([bytes[22], bytes[23]]), 6);
+        assert_eq!(u16::from_le_bytes([bytes[36], bytes[37]]), 22);
+        assert_eq!(u16::from_le_bytes([bytes[38], bytes[39]]), 32);
+        assert_eq!(u32_at(&bytes, 40), 0x3F);
+        assert_eq!(&bytes[44..60], &subformat_guid(WAVE_FORMAT_IEEE_FLOAT));
+        assert_eq!(&bytes[60..64], b"data");
+        assert_eq!(u32_at(&bytes, 64), 12 * 4);
+        assert_eq!(u32_at(&bytes, 4), (bytes.len() - 8) as u32);
+        assert_eq!(bytes.len(), 68 + 12 * 4);
+        assert_eq!(f32::from_le_bytes(bytes[68..72].try_into().unwrap()), 0.5);
+        let _ = std::fs::remove_file(path);
+    }
+
     fn spec(channels: u16, sample_format: AudioSampleFormat) -> AudioEncodeSpec {
         AudioEncodeSpec {
             sample_rate: 48_000,
@@ -741,7 +843,10 @@ mod encoder_tests {
         let mut enc = WavEncoder::create(
             &path,
             spec(1, AudioSampleFormat::F32),
-            WavEncodeOptions { rf64: true },
+            WavEncodeOptions {
+                rf64: true,
+                ..Default::default()
+            },
         )
         .unwrap();
         enc.write_interleaved_f32(&[0.5, -0.5, 0.25]).unwrap();
@@ -775,14 +880,24 @@ mod encoder_tests {
         let mut enc = WavEncoder::create(
             &path,
             spec(2, AudioSampleFormat::F32),
-            WavEncodeOptions { rf64: true },
+            WavEncodeOptions {
+                rf64: true,
+                ..Default::default()
+            },
         )
         .unwrap();
         enc.write_interleaved_f32(&[0.0; 4]).unwrap();
         enc.writer.flush().unwrap();
         let data_bytes = 5_000_000_000u64;
         let frames = data_bytes / 8;
-        patch_sizes(enc.writer.get_mut(), data_bytes, frames, true).unwrap();
+        patch_sizes(
+            enc.writer.get_mut(),
+            data_bytes,
+            frames,
+            true,
+            enc.data_offset,
+        )
+        .unwrap();
 
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(&bytes[0..4], b"RF64");
@@ -814,11 +929,142 @@ mod encoder_tests {
         .unwrap();
         enc.writer.flush().unwrap();
         assert!(matches!(
-            patch_sizes(enc.writer.get_mut(), u64::from(u32::MAX), 1, false),
+            patch_sizes(
+                enc.writer.get_mut(),
+                u64::from(u32::MAX),
+                1,
+                false,
+                enc.data_offset
+            ),
             Err(EncodeError::FinalizeFailed(_))
         ));
         drop(enc);
         let _ = std::fs::remove_file(path);
+    }
+
+    /// Walk a RIFF/WAVE file's top-level chunks: `(id, payload offset, size)`.
+    fn riff_chunks(bytes: &[u8]) -> Vec<([u8; 4], usize, usize)> {
+        let mut chunks = Vec::new();
+        let mut at = 12;
+        while at + 8 <= bytes.len() {
+            let id: [u8; 4] = bytes[at..at + 4].try_into().unwrap();
+            let size = u32_at(bytes, at + 4) as usize;
+            chunks.push((id, at + 8, size));
+            at += 8 + size + size % 2;
+        }
+        chunks
+    }
+
+    /// Export metadata is a `LIST`/`INFO` chunk between `fmt ` and `data`:
+    /// a reader walking the chunks finds `fmt `, the tags and `data` (sized
+    /// right, holding the samples), and the RIFF size covers all of it —
+    /// through the factory, as the export uses it, and with the RF64 reserve.
+    #[test]
+    fn metadata_is_a_list_info_chunk_before_data() {
+        let metadata = AudioMetadata {
+            title: Some("Song".into()),
+            artist: Some("Band".into()),
+            album: Some("Record".into()),
+            genre: Some("Ambient".into()),
+            date: Some("2026".into()),
+            comment: Some("Mixed late".into()),
+            copyright: Some("(c) 2026".into()),
+            track_number: Some("3".into()),
+            isrc: Some("USRC17607839".into()),
+            composer: Some("  ".into()),
+            ..AudioMetadata::default()
+        };
+        for rf64 in [false, true] {
+            let path = temp_path("info");
+            let mut enc = crate::format::create_encoder(
+                &path,
+                spec(2, AudioSampleFormat::I16),
+                crate::format::AudioEncodeOptions {
+                    wav: WavEncodeOptions {
+                        rf64,
+                        ..Default::default()
+                    },
+                    metadata: metadata.clone(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            enc.write_interleaved_i32(&[i32::MAX, 0, 0, i32::MIN])
+                .unwrap();
+            let summary = enc.finalize().unwrap();
+            assert_eq!(summary.bytes_written, 8);
+            let bytes = std::fs::read(&path).unwrap();
+            let _ = std::fs::remove_file(&path);
+
+            assert_eq!(&bytes[0..4], b"RIFF");
+            assert_eq!(u32_at(&bytes, 4) as usize, bytes.len() - 8);
+            assert_eq!(&bytes[8..12], b"WAVE");
+            let chunks = riff_chunks(&bytes);
+            let ids: Vec<&[u8; 4]> = chunks.iter().map(|(id, _, _)| id).collect();
+            let expected: Vec<&[u8; 4]> = if rf64 {
+                vec![b"JUNK", b"fmt ", b"LIST", b"data"]
+            } else {
+                vec![b"fmt ", b"LIST", b"data"]
+            };
+            assert_eq!(ids, expected);
+
+            let (_, at, size) = chunks[chunks.len() - 2];
+            let list = &bytes[at..at + size];
+            assert_eq!(&list[0..4], b"INFO");
+            let mut fields = Vec::new();
+            let mut cursor = 4;
+            while cursor < list.len() {
+                let id = std::str::from_utf8(&list[cursor..cursor + 4]).unwrap();
+                let len = u32_at(list, cursor + 4) as usize;
+                let value = &list[cursor + 8..cursor + 8 + len];
+                assert_eq!(value.last(), Some(&0), "{id} is NUL-terminated");
+                let value = std::str::from_utf8(&value[..len - 1]).unwrap();
+                fields.push(format!("{id}={value}"));
+                cursor += 8 + len + len % 2;
+            }
+            assert_eq!(cursor, list.len());
+            assert_eq!(
+                fields,
+                [
+                    "INAM=Song",
+                    "IART=Band",
+                    "IPRD=Record",
+                    "IGNR=Ambient",
+                    "ICRD=2026",
+                    "ITRK=3",
+                    "ICMT=Mixed late",
+                    "ICOP=(c) 2026",
+                ]
+            );
+
+            let (_, at, size) = chunks[chunks.len() - 1];
+            assert_eq!(size, 8);
+            assert_eq!(at + size, bytes.len());
+            assert_eq!(i16::from_le_bytes([bytes[at], bytes[at + 1]]), i16::MAX);
+        }
+    }
+
+    /// Empty metadata writes the plain 44-byte header, as before.
+    #[test]
+    fn empty_metadata_writes_no_list_chunk() {
+        let path = temp_path("no-info");
+        let mut enc = WavEncoder::create_with_metadata(
+            &path,
+            spec(1, AudioSampleFormat::I16),
+            WavEncodeOptions::default(),
+            &AudioMetadata {
+                title: Some(" ".into()),
+                isrc: Some("USRC17607839".into()),
+                ..AudioMetadata::default()
+            },
+        )
+        .unwrap();
+        enc.write_interleaved_f32(&[0.0]).unwrap();
+        enc.finalize().unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(bytes.len(), 44 + 2);
+        assert_eq!(&bytes[36..40], b"data");
     }
 
     #[test]

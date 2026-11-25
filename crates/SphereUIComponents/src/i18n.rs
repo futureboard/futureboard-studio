@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -121,11 +120,11 @@ impl I18n {
         locale_messages(self.locale)
             .get(key)
             .or_else(|| locale_messages(Locale::EnUs).get(key))
-            .map(|value| value.as_ref())
+            .copied()
     }
 }
 
-type Messages = HashMap<&'static str, Cow<'static, str>>;
+type Messages = HashMap<&'static str, &'static str>;
 
 fn locale_messages(locale: Locale) -> &'static Messages {
     static MESSAGES: [OnceLock<Messages>; Locale::ALL.len()] =
@@ -142,36 +141,9 @@ fn parse_messages(source: &'static str) -> Messages {
                 return None;
             }
             let (key, value) = line.split_once('=')?;
-            Some((key.trim(), unescape_properties(value.trim())))
+            Some((key.trim(), value.trim()))
         })
         .collect()
-}
-
-/// Crowdin round-trips these catalogs as Java `.properties` (`crowdin.yml`),
-/// and its exports escape the properties separator and comment characters as
-/// `\:`, `\=`, `\#` and `\!`. Undo exactly those; an escaped backslash (`\\`)
-/// and every other sequence (`\n` …) is kept as written.
-fn unescape_properties(value: &'static str) -> Cow<'static, str> {
-    if !value.contains('\\') {
-        return Cow::Borrowed(value);
-    }
-    let mut out = String::with_capacity(value.len());
-    let mut chars = value.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some(escaped @ (':' | '=' | '#' | '!')) => out.push(escaped),
-            Some(other) => {
-                out.push('\\');
-                out.push(other);
-            }
-            None => out.push('\\'),
-        }
-    }
-    Cow::Owned(out)
 }
 
 #[cfg(test)]
@@ -370,10 +342,11 @@ mod tests {
         );
     }
 
-    /// #214: Crowdin exports the catalogs as Java `.properties`, escaping
-    /// `:`/`=`/`#`/`!`. No resolved string may show those escapes.
+    /// Catalog values are read as written, so a `.properties`-style escape
+    /// (`\:`, `\=`, `\#`, `\!`, as the old translation service exported them,
+    /// #214) would reach the screen verbatim.
     #[test]
-    fn no_translated_value_shows_a_properties_escape() {
+    fn no_translated_value_carries_a_properties_escape() {
         let catalogs = shipped_catalogs();
         let mut stray = Vec::new();
         for locale in Locale::ALL {
@@ -392,21 +365,13 @@ mod tests {
     }
 
     #[test]
-    fn properties_escapes_unescape_and_other_sequences_stay() {
+    fn values_keep_colons_and_literal_line_breaks() {
         assert_eq!(
-            unescape_properties("最終スキャン\\: { $when }"),
-            "最終スキャン: { $when }"
+            I18n::new("en-US").tr("plugin-manager.footer.last-scan"),
+            "Last scan: { $when }"
         );
-        assert_eq!(unescape_properties("a \\= b \\# c \\! d"), "a = b # c ! d");
-        assert_eq!(unescape_properties("line\\nnext"), "line\\nnext");
-        assert_eq!(unescape_properties("path\\\\: x"), "path\\\\: x");
-        assert!(matches!(
-            unescape_properties("plain: text"),
-            Cow::Borrowed(_)
-        ));
-        assert_eq!(
-            I18n::new("ja-JP").tr("plugin-manager.footer.last-scan"),
-            "最終スキャン: { $when }"
-        );
+        assert!(I18n::new("en-US")
+            .tr("dialog.old-version-project.detail")
+            .contains("\\n"));
     }
 }

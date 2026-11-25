@@ -1403,6 +1403,7 @@ impl StudioLayout {
         match save_project_with_report_from(&mut project, path, records_root.as_deref()) {
             Ok(report) => {
                 remove_autosaves_without_waiting(obsolete_autosaves, cx);
+                self.write_project_thumbnail(&project, path.clone(), cx);
                 self.finish_project_save(project, path.clone(), saved_generation, cx);
                 self.warn_offline_media_once(&report, cx);
                 true
@@ -1412,6 +1413,77 @@ impl StudioLayout {
                 false
             }
         }
+    }
+
+    /// Write the saved project's thumbnail, `{project}/Preview/Thumb.png`,
+    /// when its folder keeps one (projects made since thumbnails exist; see
+    /// `project::thumbnail`).
+    ///
+    /// The picture is the arrangement view as it is on screen: once this
+    /// update ends, the studio window's last frame is drawn again by its own
+    /// renderer and read back — never a capture of the screen, so nothing
+    /// over the window ends up in it. The arrangement's rectangle is cut from
+    /// it and scaled down off the UI thread. Where the renderer cannot read a
+    /// frame back (only Windows can today), or the arrangement has not been
+    /// laid out yet (a project being created), the overview drawn from the
+    /// project data is written instead.
+    pub(super) fn write_project_thumbnail(
+        &mut self,
+        project: &crate::project::FutureboardProject,
+        project_file: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::project::thumbnail::{
+            render_thumbnail, thumbnail_from_frame, write_thumbnail_image_if_enabled,
+        };
+        let rect = self.timeline.read(cx).arrangement_window_rect();
+        let window = self.window_hooks.self_window;
+        let can_capture = cfg!(target_os = "windows") && rect.is_some() && window.is_some();
+        // Drawn now, while the project is at hand, only where it is needed.
+        let drawn = (!can_capture).then(|| render_thumbnail(project));
+        cx.spawn(async move |_this, cx| {
+            let captured = match (rect, window) {
+                (Some(_), Some(window)) if can_capture => cx
+                    .update(|app| {
+                        window
+                            .update(app, |_, window, _| {
+                                let scale = window.scale_factor();
+                                window.render_to_image().map(|frame| (frame, scale))
+                            })
+                            .ok()
+                    })
+                    .and_then(|frame| {
+                        frame
+                            .map_err(|error| {
+                                eprintln!("[ProjectThumb] could not read the frame: {error}")
+                            })
+                            .ok()
+                    }),
+                _ => None,
+            };
+            cx.background_executor()
+                .spawn(async move {
+                    let image = match captured {
+                        Some((frame, scale)) => {
+                            let px = |value: gpui::Pixels| (f32::from(value) * scale).round();
+                            thumbnail_from_frame(
+                                &frame,
+                                (
+                                    px(rect?.origin.x).max(0.0) as u32,
+                                    px(rect?.origin.y).max(0.0) as u32,
+                                    px(rect?.size.width) as u32,
+                                    px(rect?.size.height) as u32,
+                                ),
+                            )
+                        }
+                        None => drawn,
+                    }?;
+                    write_thumbnail_image_if_enabled(&image, &project_file);
+                    Some(())
+                })
+                .await;
+        })
+        .detach();
     }
 
     pub(super) fn save_project_in_background(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -1633,6 +1705,7 @@ impl StudioLayout {
                         "save completed for superseded session — skipping rebind/after-save"
                     );
                 } else {
+                    self.write_project_thumbnail(&project, request.path.clone(), cx);
                     let clean = self.finish_project_save(
                         project,
                         request.path.clone(),

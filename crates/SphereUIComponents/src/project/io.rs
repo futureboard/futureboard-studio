@@ -124,6 +124,8 @@ pub fn create_project_folder(base_dir: &Path, project_name: &str) -> Result<Path
 
     let layout = ProjectFolderLayout::from_root(root.clone());
     layout.ensure_dirs()?;
+    // A new project keeps a thumbnail; see `thumbnail`.
+    super::thumbnail::enable_thumbnails(&root)?;
 
     Ok(root)
 }
@@ -2109,11 +2111,13 @@ mod tests {
             color_hex: "#56C7C9".to_string(),
             volume_norm: 1.0,
             pan: 0.0,
+            dual_pan: Default::default(),
             muted: false,
             solo: false,
             record_arm: false,
             input_monitor: crate::project::InputMonitorMode::Off,
             routing: TrackRouting::default(),
+            midi_fx: Vec::new(),
             inserts: Vec::new(),
             automation_lanes: Vec::new(),
             clips: vec![ProjectClip {
@@ -2138,6 +2142,7 @@ mod tests {
             takes_expanded: false,
             freeze: None,
             drum_step: false,
+            step_lanes: Vec::new(),
         });
 
         let project_file = root.join("Portable.fbproj");
@@ -2205,11 +2210,13 @@ mod tests {
             color_hex: "#56C7C9".to_string(),
             volume_norm: 1.0,
             pan: 0.0,
+            dual_pan: Default::default(),
             muted: false,
             solo: false,
             record_arm: false,
             input_monitor: crate::project::InputMonitorMode::Off,
             routing: TrackRouting::default(),
+            midi_fx: Vec::new(),
             inserts: Vec::new(),
             automation_lanes: Vec::new(),
             clips,
@@ -2221,6 +2228,7 @@ mod tests {
             takes_expanded: false,
             freeze: None,
             drum_step: false,
+            step_lanes: Vec::new(),
         }
     }
 
@@ -3885,11 +3893,13 @@ mod tests {
             color_hex: "#56C7C9".to_string(),
             volume_norm: 1.0,
             pan: 0.0,
+            dual_pan: Default::default(),
             muted: false,
             solo: false,
             record_arm: false,
             input_monitor: crate::project::InputMonitorMode::Off,
             routing: TrackRouting::default(),
+            midi_fx: Vec::new(),
             inserts: Vec::new(),
             automation_lanes: Vec::new(),
             clips: vec![ProjectClip {
@@ -3914,6 +3924,7 @@ mod tests {
             takes_expanded: false,
             freeze: None,
             drum_step: false,
+            step_lanes: Vec::new(),
         });
 
         let archive = root.join("My Song.zip");
@@ -3982,11 +3993,13 @@ mod tests {
             color_hex: "#B280FF".to_string(),
             volume_norm: 1.0,
             pan: 0.0,
+            dual_pan: Default::default(),
             muted: false,
             solo: false,
             record_arm: false,
             input_monitor: crate::project::InputMonitorMode::Off,
             routing: TrackRouting::default(),
+            midi_fx: Vec::new(),
             inserts: Vec::new(),
             automation_lanes: Vec::new(),
             clips: vec![ProjectClip {
@@ -4011,6 +4024,7 @@ mod tests {
             takes_expanded: false,
             freeze: None,
             drum_step: false,
+            step_lanes: Vec::new(),
         });
 
         let archive = root.join("FilmScore.zip");
@@ -4095,11 +4109,13 @@ mod tests {
             color_hex: "#B280FF".to_string(),
             volume_norm: 1.0,
             pan: 0.0,
+            dual_pan: Default::default(),
             muted: false,
             solo: false,
             record_arm: false,
             input_monitor: crate::project::InputMonitorMode::Off,
             routing: TrackRouting::default(),
+            midi_fx: Vec::new(),
             inserts: Vec::new(),
             automation_lanes: Vec::new(),
             clips: vec![ProjectClip {
@@ -4124,6 +4140,7 @@ mod tests {
             takes_expanded: false,
             freeze: None,
             drum_step: false,
+            step_lanes: Vec::new(),
         });
 
         let file_a = root_a.join("ProjectA.fbproj");
@@ -4178,11 +4195,13 @@ mod tests {
             color_hex: "#B280FF".to_string(),
             volume_norm: 1.0,
             pan: 0.0,
+            dual_pan: Default::default(),
             muted: false,
             solo: false,
             record_arm: false,
             input_monitor: crate::project::InputMonitorMode::Off,
             routing: TrackRouting::default(),
+            midi_fx: Vec::new(),
             inserts: Vec::new(),
             automation_lanes: Vec::new(),
             clips: vec![ProjectClip {
@@ -4207,6 +4226,7 @@ mod tests {
             takes_expanded: false,
             freeze: None,
             drum_step: false,
+            step_lanes: Vec::new(),
         });
 
         let archive = root.join("MissingVid.zip");
@@ -4242,11 +4262,13 @@ mod tests {
             color_hex: "#B280FF".to_string(),
             volume_norm: 1.0,
             pan: 0.0,
+            dual_pan: Default::default(),
             muted: false,
             solo: false,
             record_arm: false,
             input_monitor: crate::project::InputMonitorMode::Off,
             routing: TrackRouting::default(),
+            midi_fx: Vec::new(),
             inserts: Vec::new(),
             automation_lanes: Vec::new(),
             clips: vec![ProjectClip {
@@ -4271,6 +4293,7 @@ mod tests {
             takes_expanded: false,
             freeze: None,
             drum_step: false,
+            step_lanes: Vec::new(),
         });
 
         let project_file = project_dir.join("MyProject.fbproj");

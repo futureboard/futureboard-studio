@@ -43,6 +43,7 @@ pub(crate) mod ara_ops;
 mod ara_restore_plan;
 mod ara_studio;
 mod audio_editor_ops;
+mod audio_to_midi_ops;
 mod audio_tool_ops;
 mod audio_transport;
 mod bottom_panel_ops;
@@ -62,6 +63,7 @@ mod history_ops;
 mod input_ops;
 mod inspector_ops;
 mod midi_export_ops;
+mod midi_fx_ops;
 mod midi_import_ops;
 mod midi_input_router;
 mod missing_media_ops;
@@ -89,7 +91,10 @@ mod sampler_rack_ops;
 mod session_load;
 mod shell_regions;
 mod stretch_tempo_ops;
+mod strip_silence_ops;
 mod studio_render;
+#[cfg(feature = "ui-preview")]
+pub(crate) use studio_render::preview_right_dock_tab_strip;
 mod studio_state;
 mod tempo_key_ops;
 mod tempo_map_ops;
@@ -419,6 +424,9 @@ pub(crate) fn build_and_warm_audio_engine(
 
     engine.set_pdc_enabled(schema.playback.latency_compensation);
     engine.set_record_pdc_bypass_enabled(schema.recording.audio.bypass_pdc_while_recording);
+    engine.set_low_latency_monitoring(schema.recording.low_latency_limit_samples);
+    engine
+        .set_record_interface_latency_correction(schema.recording.audio.correct_interface_latency);
     engine.set_dropout_protection_mode(engine_audioguard_level(schema.playback.audioguard));
     engine.set_shared_headroom(schema.hardware.audio.shared_headroom);
     apply_audio_processing_settings(&schema.performance.audio_processing);
@@ -641,10 +649,20 @@ pub struct StudioLayout {
     /// Automation target picker search query + input state.
     automation_picker_query: String,
     automation_picker_search_input: TextInputState,
+    /// Groups of the picker's tree folded or unfolded away from their default
+    /// since it opened.
+    automation_picker_open_groups: std::collections::HashSet<String>,
     /// Detached / external window handles (settings, mixer, add-track,
     /// plugin-manager, export) + deferred external-mixer open bounds. Grouped
     /// into [`window_ops::ExternalWindows`] (decomposition slice).
     external_windows: window_ops::ExternalWindows,
+    /// The track whose "Add MIDI FX" device list is open in the Inspector.
+    midi_fx_picker_open: Option<String>,
+    /// Open MIDI FX editors by `(track id, slot id)`.
+    midi_fx_editors: std::collections::HashMap<
+        (String, String),
+        gpui::WindowHandle<crate::components::midi_fx_editor::MidiFxEditor>,
+    >,
     /// The layout the last raw PCM import used: the next one starts from it,
     /// since raw files usually come in batches from the same source.
     last_raw_pcm_settings: Option<crate::components::timeline::raw_pcm_import::RawPcmSettings>,
@@ -652,6 +670,10 @@ pub struct StudioLayout {
     /// session; `None` until first changed, when it reads as off on the
     /// remembered profile (see `listening_simulation`).
     listening_simulation: Option<solfege_spatialaudio::SimulationSettings>,
+    /// The spatial-mix license as the engine graph and the open surfaces last
+    /// saw it. A renewal or lapse while Studio runs is noticed on the meter
+    /// tick and rebuilds them (see `follow_spatial_license`).
+    spatial_licensed_seen: bool,
     /// Plugin catalog / registry-scan state backing the insert picker (cached
     /// scan result, preset-cache presence, catalog load phase). Grouped into
     /// [`plugin_ops::PluginCatalogState`] (decomposition slice).
@@ -1331,21 +1353,13 @@ impl StudioLayout {
                 timeline.set_midi_changed_callback(Some(Arc::new(move |cx| {
                     let target = target.clone();
                     cx.defer(move |cx| {
-                        // Dirty now (the project is unsaved and the graph
-                        // stale from this moment) but published after the
-                        // frame that paints the edit.
-                        //
-                        // Publishing builds a full engine snapshot on the UI
-                        // thread. Run here, in the same pass as the commit, it
-                        // sat between the mouse-up and the frame that draws
-                        // the new note, so every drawn note appeared late by
-                        // the cost of a whole-project snapshot. A frame
-                        // callback runs at the start of the next frame, before
-                        // that frame draws, so the publish is queued two
-                        // frames out and the frame holding the edit is
-                        // presented first. The engine hears the note a frame
-                        // later instead. The throttle and the engine poll
-                        // still coalesce a burst exactly as before.
+                        // Unsaved now, published after the frame that paints
+                        // the edit: a frame callback runs at the start of the
+                        // next frame, before it draws, so the publish is
+                        // queued two frames out and the frame holding the
+                        // edit is presented first. Publishing sends only the
+                        // MIDI clips (`push_midi_edit_live`), not a project
+                        // sync, so the engine hears the note a frame later.
                         let _ = target.update(cx, |this, _cx| this.mark_midi_edit_dirty());
                         publish_midi_after_paint(target, cx);
                     });
@@ -1646,14 +1660,18 @@ impl StudioLayout {
             plugin_picker_au_error: load_au_cache_state().last_error,
             plugin_picker_window: None,
             automation_picker_query: String::new(),
+            automation_picker_open_groups: std::collections::HashSet::new(),
             automation_picker_search_input: TextInputState::new(
                 "automation-picker-search-input",
                 cx.focus_handle(),
             )
             .with_placeholder("Search parameters…"),
             external_windows: window_ops::ExternalWindows::default(),
+            midi_fx_picker_open: None,
+            midi_fx_editors: std::collections::HashMap::new(),
             last_raw_pcm_settings: None,
             listening_simulation: None,
+            spatial_licensed_seen: crate::edition::spatial_mix_licensed(),
             plugin_catalog: plugin_ops::PluginCatalogState::default(),
             plugin_editors: plugin_ops::PluginEditorWindows::default(),
             ara: ara_ops::AraState::default(),
@@ -2132,7 +2150,8 @@ impl StudioLayout {
         })
     }
 
-    fn context_clip_id_or_selected(&self, cx: &Context<Self>) -> Option<String> {
+    /// The clip an open context menu was opened on, if one is open on a clip.
+    fn context_menu_clip_id(&self) -> Option<String> {
         match &self.overlay.open_popover {
             Some(OpenPopover::Context { request }) => match &request.target {
                 ContextMenuTarget::Clip(clip_id) => Some(clip_id.clone()),
@@ -2141,7 +2160,10 @@ impl StudioLayout {
             },
             _ => None,
         }
-        .or_else(|| {
+    }
+
+    fn context_clip_id_or_selected(&self, cx: &Context<Self>) -> Option<String> {
+        self.context_menu_clip_id().or_else(|| {
             self.timeline
                 .read(cx)
                 .state
@@ -2378,7 +2400,33 @@ impl StudioLayout {
             }
             return;
         }
+        if command_id == "mixer:vca-new" {
+            self.overlay.open_popover = None;
+            self.create_vca_from_selection(cx);
+            cx.notify();
+            return;
+        }
+        if let Some(rest) = command_id.strip_prefix("mixer:vca-assign|") {
+            self.overlay.open_popover = None;
+            if let Some((track_id, group)) = rest.split_once('|') {
+                let (track_id, group) = (track_id.to_string(), group.to_string());
+                let group = (group != "none").then_some(group);
+                self.set_track_vca(&track_id, group.as_deref(), cx);
+            }
+            cx.notify();
+            return;
+        }
+        if self.dispatch_insert_fader_position_command(command_id, cx) {
+            self.overlay.open_popover = None;
+            cx.notify();
+            return;
+        }
         if self.dispatch_sidechain_command(command_id, cx) {
+            self.overlay.open_popover = None;
+            cx.notify();
+            return;
+        }
+        if self.dispatch_pan_mode_command(command_id, cx) {
             self.overlay.open_popover = None;
             cx.notify();
             return;
@@ -3076,6 +3124,7 @@ impl StudioLayout {
             }
             "window:process-explorer" => self.open_process_explorer_window(owner_bounds, cx),
             "window:virtual-speaker" => self.open_virtual_speaker_window(owner_bounds, cx),
+            "window:room-preview" => self.open_room_window(owner_bounds, cx),
             #[cfg(feature = "gpu-renderer")]
             command
                 if crate::components::visualizer::VisualizerKind::from_command(command)
@@ -3193,6 +3242,12 @@ impl StudioLayout {
             "audio:bounce-in-place" => self.render_selected_tracks_in_place(cx),
             "audio:render-selection" => self.render_arrangement_selection(cx),
             "clip:consolidate" => self.consolidate_selected_clips(cx),
+            "clip:to-midi-melody" | "clip:to-midi-drums" | "clip:to-midi-chords" => {
+                if let Some(mode) = crate::audio_to_midi::ConvertMode::from_command(command_id) {
+                    self.convert_clip_to_midi(mode, cx);
+                }
+            }
+            "audio:strip-silence" => self.open_strip_silence(cx),
             "track:duplicate" => self.duplicate_context_track(true, cx),
             "track:group-selected" => self.group_selected_tracks(cx),
             "track:remove-from-folder" => self.remove_context_track_from_folder(cx),
@@ -3352,6 +3407,31 @@ impl StudioLayout {
                 }
             }
             "clip:split-at-playhead" => self.split_selected_audio_clip_at_playhead(cx),
+            // ← / →: the selected clips one grid step; Shift: one bar.
+            "clip:nudge-left"
+            | "clip:nudge-right"
+            | "clip:nudge-bar-left"
+            | "clip:nudge-bar-right" => {
+                let direction = if command_id.ends_with("right") {
+                    1.0
+                } else {
+                    -1.0
+                };
+                let by_bar = command_id.contains("-bar-");
+                self.timeline.update(cx, |timeline, cx| {
+                    timeline.nudge_selected_clips(direction, by_bar, cx);
+                });
+            }
+            // J: the selected clips on each track as one clip, one undo step.
+            // Nothing that can be merged says why in the status bar.
+            "clip:merge" => {
+                let result = self
+                    .timeline
+                    .update(cx, |timeline, cx| timeline.merge_selected_clips(cx));
+                if let Err(message) = result {
+                    self.show_edit_notice(message.to_string(), cx);
+                }
+            }
             "audio:find-tempo-key" => self.open_tempo_key_finder(cx),
             "chords:open-track" => self.set_chord_track_visible(true, cx),
             "chords:hide-track" => self.set_chord_track_visible(false, cx),
@@ -3630,6 +3710,12 @@ impl StudioLayout {
             engine.set_shared_headroom(schema.hardware.audio.shared_headroom);
 
             engine.set_record_pdc_bypass_enabled(schema.recording.audio.bypass_pdc_while_recording);
+            // Both live: one atomic the callback reads, and one read when a
+            // take is placed.
+            engine.set_low_latency_monitoring(schema.recording.low_latency_limit_samples);
+            engine.set_record_interface_latency_correction(
+                schema.recording.audio.correct_interface_latency,
+            );
             let desired_pdc = schema.playback.latency_compensation;
             if engine.pdc_enabled() != desired_pdc {
                 engine.set_pdc_enabled(desired_pdc);

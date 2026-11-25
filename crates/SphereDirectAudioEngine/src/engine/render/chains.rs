@@ -181,6 +181,18 @@ pub fn apply_track_chain_at_beat(
     }
     let automation = track.automation_values_at_beat(beat);
     let volume = automation.volume.unwrap_or(track.volume);
+    if track.dual_pan.settings.enabled && track.spatial.is_none() {
+        // Dual pan: each input placed on its own (see `dual_pan_matrix`).
+        let settings = track.dual_pan.settings;
+        let m = crate::dsp::gain::dual_pan_matrix(
+            automation.pan_left.unwrap_or(settings.left),
+            automation.pan_right.unwrap_or(settings.right),
+        );
+        return (
+            (l * m[0] + r * m[2]) * volume,
+            (l * m[1] + r * m[3]) * volume,
+        );
+    }
     let pan = automation.pan.unwrap_or(track.pan);
     let (pan_l, pan_r) = pan_gains(pan);
     (l * volume * pan_l, r * volume * pan_r)
@@ -317,6 +329,18 @@ pub fn apply_track_chain_block(
     apply_insert_bypass_automation(track, transport.playing.then_some(chain_beat));
 
     render_ara_block(track, frames, transport);
+    // MIDI FX run on everything bound for the instrument this block -- clip
+    // notes, live input, previews -- before any instrument hears it. Hosted
+    // MIDI-effect plug-ins in the chain exchange with their bridge here too.
+    if let Some(fx) = &track.midi_fx {
+        fx.process_block(
+            &mut track.midi_block_events,
+            &mut track.midi_fx_hold,
+            frames,
+            &transport,
+            &track.midi_fx_plugins,
+        );
+    }
     render_soundfont_instrument_block(track, frames);
     render_solfege_instrument_block(track, frames);
 
@@ -332,6 +356,10 @@ pub fn apply_track_chain_block(
         // they stay in this chain: a plug-in left on the W bus keeps playing
         // instead of going silent.
         if wdw_live && insert.signal_bus == crate::runtime::SIGNAL_BUS_WDW {
+            continue;
+        }
+        // Post-fader inserts run after the fader, in `apply_post_fader_inserts`.
+        if insert.post_fader {
             continue;
         }
         let midi = instrument_ix
@@ -386,6 +414,42 @@ pub(super) fn process_chain_insert(
     if insert.active() && crate::audioguard::process_level().protects() {
         insert.guard.check_output(block_l, block_r);
     }
+}
+
+/// Run `track`'s post-fader inserts, in chain order, on its block — which by
+/// now holds the signal after the fader and pan. The chain skipped them
+/// ([`apply_track_chain_block`]); their automation was applied there with the
+/// rest. On the audio thread, after the chain batch: no allocation, no lookup,
+/// one flag check per insert for a track that has none.
+pub(super) fn apply_post_fader_inserts(
+    track: &mut RuntimeTrack,
+    frames: usize,
+    transport: RuntimeTransportContext,
+) {
+    let frames = frames.min(track.block_l.len()).min(track.block_r.len());
+    if frames == 0 || !track.inserts.iter().any(|insert| insert.post_fader) {
+        return;
+    }
+    let crate::runtime::RuntimeTrack {
+        inserts,
+        block_l,
+        block_r,
+        ..
+    } = track;
+    for (ix, insert) in inserts.iter_mut().enumerate() {
+        if !insert.post_fader {
+            continue;
+        }
+        process_chain_insert(
+            &mut block_l[..frames],
+            &mut block_r[..frames],
+            insert,
+            ix,
+            None,
+            transport,
+        );
+    }
+    silence_nonfinite_block(&mut block_l[..frames], &mut block_r[..frames]);
 }
 
 /// The track whose wet/dry/wet inserts run on `return_index`. A scan of a

@@ -501,6 +501,21 @@ impl StepDrag {
     }
 }
 
+/// The hits of lane `from` moved to lane `to`: the same notes (ids, timing,
+/// velocity, channel, mute) at the new pitch, for overwriting by id. Empty
+/// when the lane has none.
+pub(crate) fn retargeted(notes: &[MidiNoteState], from: u8, to: u8) -> Vec<MidiNoteState> {
+    notes
+        .iter()
+        .filter(|note| note.pitch == from)
+        .map(|note| {
+            let mut moved = note.clone();
+            moved.pitch = to;
+            moved
+        })
+        .collect()
+}
+
 /// The empty steps among `indices` on lane `pitch`, filled: the notes to add.
 pub(crate) fn paint_steps(
     notes: &[MidiNoteState],
@@ -1098,6 +1113,111 @@ mod tests {
         assert_eq!(repeat_after(2, -5), 1);
         // An uneven roll of five counts from ×6.
         assert_eq!(repeat_after(5, 0), 6);
+    }
+
+    /// A painted step is a plain MIDI note on the lane's pitch, on the
+    /// channel the editor hands in (the track's note channel), so whatever
+    /// instrument the track plays — a hosted VSTi drum kit too — gets it
+    /// exactly as a Piano Roll note.
+    #[test]
+    fn painted_steps_are_real_notes_on_the_lane_pitch_and_channel() {
+        let channel = MidiChannel::from_ui(10);
+        // A four-on-the-floor kick and an off-beat closed hat over one bar.
+        let mut notes = paint_steps(
+            &[],
+            36,
+            &[0, 4, 8, 12],
+            16,
+            SIXTEENTH,
+            1,
+            RepeatCurve::Flat,
+            channel,
+        );
+        notes.extend(paint_steps(
+            &notes,
+            42,
+            &[2, 6, 10, 14],
+            16,
+            SIXTEENTH,
+            1,
+            RepeatCurve::Flat,
+            channel,
+        ));
+        assert_eq!(notes.len(), 8);
+        for note in &notes {
+            assert!(note.pitch == 36 || note.pitch == 42);
+            assert_eq!(note.channel, channel);
+            assert_eq!(note.velocity, STEP_VELOCITY);
+            assert!((note.duration - SIXTEENTH).abs() < 1e-6);
+        }
+        let kick_starts: Vec<f32> = notes
+            .iter()
+            .filter(|n| n.pitch == 36)
+            .map(|n| n.start)
+            .collect();
+        assert_eq!(kick_starts, vec![0.0, 1.0, 2.0, 3.0]);
+        let hat_starts: Vec<f32> = notes
+            .iter()
+            .filter(|n| n.pitch == 42)
+            .map(|n| n.start)
+            .collect();
+        assert_eq!(hat_starts, vec![0.5, 1.5, 2.5, 3.5]);
+        // Painting a filled step again adds nothing; steps past the clip none.
+        assert!(paint_steps(
+            &notes,
+            36,
+            &[0, 16],
+            16,
+            SIXTEENTH,
+            1,
+            RepeatCurve::Flat,
+            channel
+        )
+        .is_empty());
+        // A ×3 roll is three real notes in the step.
+        let roll = paint_steps(&[], 38, &[3], 16, SIXTEENTH, 3, RepeatCurve::Flat, channel);
+        assert_eq!(roll.len(), 3);
+        assert!(roll.iter().all(|n| n.pitch == 38 && n.channel == channel));
+    }
+
+    /// Lane Note moves a lane's hits to the new note as the same notes: ids,
+    /// timing, velocity, channel and mute kept, other lanes untouched.
+    #[test]
+    fn a_lane_retargeted_keeps_its_hits() {
+        let mut notes = step_notes(
+            42,
+            2,
+            SIXTEENTH,
+            2,
+            90,
+            RepeatCurve::Decay,
+            MidiChannel::from_ui(10),
+        );
+        notes[0].muted = true;
+        notes.push(note(36, 0.0, SIXTEENTH));
+        let moved = retargeted(&notes, 42, 44);
+        assert_eq!(moved.len(), 2);
+        for (before, after) in notes.iter().zip(&moved) {
+            assert_eq!(after.id, before.id);
+            assert_eq!(after.pitch, 44);
+            assert_eq!(
+                (
+                    after.start,
+                    after.duration,
+                    after.velocity,
+                    after.channel,
+                    after.muted
+                ),
+                (
+                    before.start,
+                    before.duration,
+                    before.velocity,
+                    before.channel,
+                    before.muted
+                )
+            );
+        }
+        assert!(retargeted(&notes, 40, 41).is_empty());
     }
 
     /// Rewriting keeps a step where it plays (nudge), muted, and as loud;

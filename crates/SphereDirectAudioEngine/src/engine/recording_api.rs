@@ -640,6 +640,10 @@ impl EngineInner {
         } else {
             crate::backend::render::metronome_compensation_delay_samples(&runtime)
         };
+        let correct_interface_latency = self
+            .shared
+            .record_interface_latency_correction
+            .load(Ordering::Relaxed);
         for result in &mut results {
             if !runtime
                 .tracks
@@ -653,6 +657,10 @@ impl EngineInner {
             // recorded from the graph itself.
             let round_trip = if placement.loopback_tap {
                 result.latency_seconds = 0.0;
+                0
+            } else if !correct_interface_latency {
+                // Placed by hand: the Recording Delay alone stands for the
+                // interface (the caller adds it).
                 0
             } else if measured_round_trip > 0 {
                 measured_round_trip

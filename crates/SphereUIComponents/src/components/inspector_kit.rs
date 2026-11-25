@@ -35,8 +35,8 @@
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, svg, App, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement,
-    Styled, Window,
+    div, px, svg, App, AppContext, InteractiveElement, IntoElement, ParentElement,
+    StatefulInteractiveElement, Styled, Window,
 };
 
 use crate::theme::{radius, size, space, typography, Colors};
@@ -430,7 +430,7 @@ pub fn ins_value(text: impl Into<String>) -> impl IntoElement {
         .w_full()
         .min_w_0()
         .truncate()
-        .text_size(px(typography::UI_SM))
+        .text_size(px(typography::UI_XS))
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(Colors::text_primary())
         .child(text.into())
@@ -516,10 +516,10 @@ pub fn ins_control_surface() -> gpui::Div {
         .flex()
         .flex_row()
         .items_center()
-        .h(px(size::COMFORTABLE))
-        .px(px(space::BASE))
-        .gap(px(space::SNUG))
-        .rounded(px(radius::CONTROL))
+        .h(px(PROP_CONTROL_H))
+        .px(px(space::SNUG))
+        .gap(px(space::TIGHT))
+        .rounded(px(radius::CONTROL_SM))
         .bg(Colors::surface_input())
         .border(px(1.0))
         .border_color(Colors::border_normal())
@@ -556,7 +556,7 @@ pub fn ins_select(
                 .flex_1()
                 .min_w_0()
                 .truncate()
-                .text_size(px(typography::UI_SM))
+                .text_size(px(typography::UI_XS))
                 .text_color(if enabled {
                     Colors::text_primary()
                 } else {
@@ -619,41 +619,53 @@ pub fn ins_empty(
         )
 }
 
-// ── Fold layout (the Inspector) ──────────────────────────────────────────────
+// ── Property sheet (the Inspector) ───────────────────────────────────────────
 //
-// The Inspector is a flat stack rather than a column of cards: an identity
-// block, then one fold section per concern, each separated from the next by a
-// single hairline. A section folds to its header, and a folded header carries
-// a one-line summary, so a long instrument track still reads top to bottom
-// without scrolling past the parts not being worked on.
+// The Inspector is a property sheet: what is selected sits in a bar at the
+// top, and its properties follow as dense label | value rows, grouped under
+// thin section bands that fold. Every value control sits in the same right
+// column at the same height, so a long track reads as one table rather than
+// a stack of cards.
 //
 // ```txt
 // ┌───────────────────────────────────────────┐
-// │ ▣  Instrument Track 3                     │  ← identity block
-// │    Instrument · WrapSynth                 │
-// │ [M Mute] [S Solo] [I Input] [R Rec]       │
+// │▌3  Instrument Track 3          M S I R    │  ← object bar
 // ├───────────────────────────────────────────┤
-// │ ▾ ◫ Track                                 │  ← open fold
-// │   Volume                         −3.0 dB  │
-// │   ─────────────●──────────────            │
-// ├───────────────────────────────────────────┤
-// │ ▸ ⇄ Routing        All inputs · Master    │  ← folded, with summary
+// │ ▾ Track                                   │  ← section band
+// │   Volume        ────────●──     −3.0 dB   │
+// │   Pan           ─────●─────        L 20   │
+// │ ▸ Routing             All inputs · Master │  ← folded, with summary
+// ├═══════════════ splitter ══════════════════┤
+// │▌  Chorus Sketch                     ♪     │  ← the selected clip's bar
+// │ ▾ Clip                                    │
+// │   Start                       [ 16.00 bt ]│
 // └───────────────────────────────────────────┘
 // ```
 
-/// Height of a fold section's header row.
-pub const FOLD_HEADER_H: f32 = size::PROMINENT + space::BASE;
-/// Label column of a form row inside a fold section.
+/// Height of a section band.
+pub const FOLD_HEADER_H: f32 = size::DEFAULT;
+/// Height of a property row. Controls inside are `size::DENSE`.
+pub const PROP_ROW_H: f32 = size::DEFAULT;
+/// Height of a value control in a property row.
+pub const PROP_CONTROL_H: f32 = size::DENSE;
+/// Share of a row's width the value column takes.
+pub const PROP_VALUE_SHARE: f32 = 0.56;
+/// Label column of a form row inside a fold section, for the rows that still
+/// size their label.
 pub const FOLD_LABEL_COL: f32 = LABEL_COL + space::SNUG;
 /// Chevron glyph in a fold header.
 pub const FOLD_CHEVRON: f32 = 10.0;
 /// Edge of the identity block's colour swatch.
 pub const IDENTITY_SWATCH: f32 = size::COMFORTABLE;
+/// Height of the bar naming the inspected object.
+pub const OBJECT_BAR_H: f32 = size::PROMINENT;
+/// Edge of the object bar's colour swatch.
+pub const OBJECT_SWATCH: f32 = size::DENSE;
 
-/// The Inspector's scroll body: the panel's only vertical scroller and its
+/// The Inspector's scroll body: the pane's only vertical scroller and its
 /// only horizontal clip. Unlike [`ins_body`] it adds no padding or gap — the
-/// blocks inside own their insets and separate by hairlines.
-pub fn ins_flat_body(id: &'static str) -> gpui::Stateful<gpui::Div> {
+/// blocks inside own their insets and separate by their bands.
+pub fn ins_flat_body(id: impl Into<gpui::ElementId>) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .flex_1()
@@ -676,10 +688,133 @@ pub fn ins_identity_block() -> gpui::Div {
         .border_color(Colors::border_subtle())
 }
 
-/// One fold section: a header that opens and closes it, and its body.
+/// The bar naming what a pane inspects. It draws the colour strip; the caller
+/// adds the rest (a swatch, a number, the name, state toggles, a kind glyph).
 ///
-/// `summary` is shown on the header only while the section is folded, so the
-/// value the body would have shown is still readable at a glance.
+/// The colour is a solid strip down the leading edge — the object's own hue,
+/// the one its track header or clip wears — so the two panes of a split
+/// Inspector say whose they are before a word is read.
+pub fn ins_object_bar(accent: gpui::Rgba) -> gpui::Div {
+    div()
+        .relative()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(space::BASE))
+        .h(px(OBJECT_BAR_H))
+        .flex_shrink_0()
+        .pl(px(space::LOOSE))
+        .pr(px(space::BASE))
+        .bg(Colors::surface_panel_raised())
+        .border_b(px(1.0))
+        .border_color(Colors::border_subtle())
+        .child(
+            div()
+                .absolute()
+                .left_0()
+                .top_0()
+                .bottom_0()
+                .w(px(space::TIGHT))
+                .bg(accent),
+        )
+}
+
+/// A track's number in its [`ins_object_bar`], as its header shows it.
+pub fn ins_object_number(number: usize) -> impl IntoElement {
+    div()
+        .flex_shrink_0()
+        .text_size(px(typography::UI_XS))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .font_features(tabular_features())
+        .text_color(Colors::text_muted())
+        .child(number.to_string())
+}
+
+/// Tabular figures, so a track number keeps its width as it changes.
+fn tabular_features() -> gpui::FontFeatures {
+    static FEATURES: std::sync::OnceLock<gpui::FontFeatures> = std::sync::OnceLock::new();
+    FEATURES
+        .get_or_init(|| gpui::FontFeatures(std::sync::Arc::new(vec![("tnum".to_string(), 1)])))
+        .clone()
+}
+
+/// The name in an [`ins_object_bar`].
+pub fn ins_object_name(name: impl Into<String>) -> gpui::Div {
+    div()
+        .w_full()
+        .min_w_0()
+        .truncate()
+        .text_size(px(typography::UI_SM))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(Colors::text_primary())
+        .child(name.into())
+}
+
+/// One of a track's switches (M / S / I / R) in its object bar: a square
+/// carrying the letter, lit in the switch's own semantic hue — the colours the
+/// mixer and the track header use — and outlined in it, so a lit switch is
+/// told apart by fill and edge rather than by hue alone.
+pub fn ins_bar_toggle(
+    id: impl Into<gpui::ElementId>,
+    letter: &'static str,
+    name: impl Into<gpui::SharedString>,
+    on: bool,
+    semantic: gpui::Rgba,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let fill = if on {
+        semantic
+    } else {
+        Colors::surface_input()
+    };
+    let hover = Colors::composite(fill, Colors::state_hover());
+    let pressed = Colors::composite(fill, Colors::state_recessed());
+    let focus = Colors::state_focus_ring();
+    let name = name.into();
+    div()
+        .id(id)
+        .role(gpui::Role::Button)
+        .aria_label(name.clone())
+        .aria_toggled(if on {
+            gpui::Toggled::True
+        } else {
+            gpui::Toggled::False
+        })
+        .focusable()
+        .tab_stop(true)
+        .focus_visible(move |style| style.shadow(crate::theme::elevation::focus_ring(focus)))
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(px(size::DENSE))
+        .rounded(px(radius::CONTROL_SM))
+        .bg(fill)
+        .border(px(1.0))
+        .border_color(if on {
+            semantic
+        } else {
+            Colors::border_normal()
+        })
+        .text_size(px(typography::UI_XS))
+        .font_weight(gpui::FontWeight::BOLD)
+        .text_color(if on {
+            Colors::on_color(semantic)
+        } else {
+            Colors::text_secondary()
+        })
+        .cursor(gpui::CursorStyle::PointingHand)
+        .hover(move |style| style.bg(hover))
+        .active(move |style| style.bg(pressed))
+        .tooltip(crate::components::controls::fb_tooltip(name))
+        .on_click(on_click)
+        .child(letter)
+}
+
+/// One fold section: a band that opens and closes it, and its rows.
+///
+/// `summary` is shown on the band only while the section is folded, so the
+/// value the rows would have shown is still readable at a glance.
 #[allow(clippy::too_many_arguments)]
 pub fn ins_fold(
     id: impl Into<gpui::ElementId>,
@@ -691,17 +826,21 @@ pub fn ins_fold(
     body: impl IntoElement,
 ) -> gpui::AnyElement {
     let summary = summary.into();
-    let hover = Colors::composite(Colors::surface_panel(), Colors::state_hover());
-    let pressed = Colors::composite(Colors::surface_panel(), Colors::state_recessed());
+    let band = Colors::surface_panel_alt();
+    let hover = Colors::composite(band, Colors::state_hover());
+    let pressed = Colors::composite(band, Colors::state_recessed());
     let header = div()
         .id(id)
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(space::BASE))
+        .gap(px(space::SNUG))
         .h(px(FOLD_HEADER_H))
         .flex_shrink_0()
-        .px(px(space::LOOSE))
+        .px(px(space::BASE))
+        .bg(band)
+        .border_b(px(1.0))
+        .border_color(Colors::border_subtle())
         .cursor(gpui::CursorStyle::PointingHand)
         .hover(move |style| style.bg(hover))
         .active(move |style| style.bg(pressed))
@@ -721,17 +860,17 @@ pub fn ins_fold(
         .children(icon.map(|icon| {
             svg()
                 .path(icon)
-                .w(px(ICON))
-                .h(px(ICON))
+                .w(px(ICON - 1.0))
+                .h(px(ICON - 1.0))
                 .flex_shrink_0()
                 .text_color(Colors::text_muted())
         }))
         .child(
             div()
                 .flex_shrink_0()
-                .text_size(px(typography::UI_MD))
+                .text_size(px(typography::UI_XS))
                 .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(Colors::text_primary())
+                .text_color(Colors::text_secondary())
                 .child(title.into()),
         )
         .child(
@@ -746,7 +885,7 @@ pub fn ins_fold(
                         div()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(typography::UI_XS))
+                            .text_size(px(typography::DENSE_LABEL))
                             .text_color(Colors::text_muted())
                             .child(summary),
                     )
@@ -756,42 +895,267 @@ pub fn ins_fold(
         .flex()
         .flex_col()
         .flex_shrink_0()
-        .border_b(px(1.0))
-        .border_color(Colors::border_subtle())
         .child(header)
         .when(open, |section| {
             section.child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(space::BASE))
+                    .gap(px(space::HAIR))
                     .px(px(space::LOOSE))
-                    .pt(px(space::HAIR))
-                    .pb(px(space::LOOSE))
+                    .pt(px(space::TIGHT))
+                    .pb(px(space::BASE))
                     .child(body),
             )
         })
         .into_any_element()
 }
 
-/// Label column, then the control — the row shape of every fold section.
+/// Label, then the value control in the right column — the row shape of
+/// every section.
+///
+/// The value column is a fixed share of the row, so every select, field and
+/// checkbox down the pane starts on the same edge; the label takes what is
+/// left and truncates rather than wrapping into it.
 pub fn ins_form_row(label: impl Into<String>, child: impl IntoElement) -> impl IntoElement {
     div()
         .flex()
         .flex_row()
         .items_center()
         .gap(px(space::BASE))
-        .min_h(px(ROW_MIN_HEIGHT))
+        .min_h(px(PROP_ROW_H))
         .child(
             div()
-                .w(px(FOLD_LABEL_COL))
-                .min_w(px(LABEL_COL_MIN))
+                .flex_1()
+                .min_w_0()
                 .truncate()
-                .text_size(px(typography::UI_SM))
-                .text_color(Colors::text_muted())
+                .text_size(px(typography::UI_XS))
+                .text_color(Colors::text_secondary())
+                .child(label.into()),
+        )
+        .child(
+            div()
+                .w(gpui::relative(PROP_VALUE_SHARE))
+                .flex_shrink_0()
+                .min_w_0()
+                .child(child),
+        )
+}
+
+/// A row whose control takes everything after a short label — a slider with
+/// its readout, which needs the width more than the label needs the room.
+pub fn ins_wide_row(label: impl Into<String>, child: impl IntoElement) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(space::BASE))
+        .min_h(px(PROP_ROW_H))
+        .child(
+            div()
+                .w(px(LABEL_COL_MIN + space::BASE))
+                .flex_shrink_0()
+                .truncate()
+                .text_size(px(typography::UI_XS))
+                .text_color(Colors::text_secondary())
                 .child(label.into()),
         )
         .child(div().flex_1().min_w_0().child(child))
+}
+
+/// A checkbox in the value column: the box alone, at the column's end, the
+/// row's label saying what it is.
+pub fn ins_check(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<gpui::SharedString>,
+    checked: bool,
+    enabled: bool,
+    on_toggle: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let fill = if checked {
+        Colors::accent_primary()
+    } else {
+        Colors::surface_input()
+    };
+    let hover = Colors::composite(fill, Colors::state_hover());
+    let focus = Colors::state_focus_ring();
+    div().flex().flex_row().justify_end().child(
+        div()
+            .id(id)
+            .role(gpui::Role::CheckBox)
+            .aria_label(label.into())
+            .aria_disabled(!enabled)
+            .aria_toggled(if checked {
+                gpui::Toggled::True
+            } else {
+                gpui::Toggled::False
+            })
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(PROP_CONTROL_H - space::TIGHT))
+            .rounded(px(radius::CONTROL_SM))
+            .bg(fill)
+            .border(px(1.0))
+            .border_color(if checked {
+                Colors::accent_primary()
+            } else {
+                Colors::border_strong()
+            })
+            .when(checked, |b| {
+                b.child(
+                    svg()
+                        .path(crate::assets::ICON_CHECK_PATH)
+                        .size(px(10.0))
+                        .text_color(Colors::on_accent()),
+                )
+            })
+            .when(!enabled, |b| {
+                b.opacity(crate::theme::state::DISABLED_CONTENT)
+            })
+            .when(enabled, |b| {
+                b.focusable()
+                    .tab_stop(true)
+                    .focus_visible(move |style| {
+                        style.shadow(crate::theme::elevation::focus_ring(focus))
+                    })
+                    .cursor(gpui::CursorStyle::PointingHand)
+                    .hover(move |style| style.bg(hover))
+                    .on_click(on_toggle)
+            }),
+    )
+}
+
+/// The Inspector's two panes, the track over the selected clip, with a bar
+/// between them that drags to share the height.
+///
+/// Where the bar sits is view state — how the user likes the dock — kept per
+/// window under `id`, so it holds as the selection moves from clip to clip.
+#[derive(IntoElement)]
+pub struct InsSplit {
+    pub id: gpui::ElementId,
+    pub top: gpui::AnyElement,
+    pub bottom: gpui::AnyElement,
+}
+
+/// Share of the height the top pane starts with.
+pub const SPLIT_DEFAULT: f32 = 0.5;
+/// Neither pane goes below this share.
+pub const SPLIT_MIN: f32 = 0.18;
+/// Height of the bar between the panes.
+pub const SPLIT_BAR_H: f32 = space::BASE;
+
+/// Where the split's bar sits, as the top pane's share of the height.
+pub struct InsSplitState {
+    pub top_share: f32,
+}
+
+/// Drag payload of the split's bar.
+#[derive(Clone)]
+pub struct InsSplitDrag(gpui::ElementId);
+
+impl gpui::Render for InsSplitDrag {
+    fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
+/// The top pane's share for a pointer at `y` within a split `height` tall,
+/// held clear of either end.
+pub fn split_share(y: f32, height: f32) -> f32 {
+    if !(height > 0.0) || !y.is_finite() {
+        return SPLIT_DEFAULT;
+    }
+    (y / height).clamp(SPLIT_MIN, 1.0 - SPLIT_MIN)
+}
+
+impl gpui::RenderOnce for InsSplit {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let state = window.use_keyed_state(self.id.clone(), cx, |_, _| InsSplitState {
+            top_share: SPLIT_DEFAULT,
+        });
+        let share = state.read(cx).top_share;
+        let drag_id = self.id.clone();
+        let move_id = self.id.clone();
+        let move_state = state.clone();
+        let reset_state = state.clone();
+        let grip = Colors::border_strong();
+        let bar_hover = Colors::composite(Colors::surface_panel_alt(), Colors::state_hover());
+        div()
+            .id(self.id.clone())
+            .size_full()
+            .flex()
+            .flex_col()
+            .on_drag_move::<InsSplitDrag>(move |event, _window, cx| {
+                if event.drag(cx).0 != move_id {
+                    return;
+                }
+                let top: f32 = event.bounds.origin.y.into();
+                let height: f32 = event.bounds.size.height.into();
+                let y: f32 = event.event.position.y.into();
+                let next = split_share(y - top, height);
+                move_state.update(cx, |state, cx| {
+                    if (state.top_share - next).abs() > f32::EPSILON {
+                        state.top_share = next;
+                        cx.notify();
+                    }
+                });
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .h(gpui::relative(share))
+                    .child(self.top),
+            )
+            .child(
+                div()
+                    .id("inspector-split-bar")
+                    .flex_shrink_0()
+                    .h(px(SPLIT_BAR_H))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(Colors::surface_panel_alt())
+                    .border_t(px(1.0))
+                    .border_b(px(1.0))
+                    .border_color(Colors::border_subtle())
+                    .cursor(gpui::CursorStyle::ResizeUpDown)
+                    .hover(move |style| style.bg(bar_hover))
+                    .tooltip(crate::components::controls::fb_tooltip(
+                        "Drag to share the height. Double-click to even it.",
+                    ))
+                    .on_drag(InsSplitDrag(drag_id), |drag, _, _, cx| {
+                        cx.new(|_| drag.clone())
+                    })
+                    .on_click(move |event, _, cx| {
+                        if event.click_count() == 2 {
+                            reset_state.update(cx, |state, cx| {
+                                state.top_share = SPLIT_DEFAULT;
+                                cx.notify();
+                            });
+                        }
+                    })
+                    .child(
+                        div()
+                            .w(px(size::COMFORTABLE))
+                            .h(px(space::HAIR))
+                            .rounded(px(radius::PILL))
+                            .bg(grip),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(self.bottom),
+            )
+    }
 }
 
 /// A wide slider with its name and value on the line above it, and an
@@ -964,6 +1328,18 @@ mod tests {
         // `INSPECTOR_WIDTH` minus the section card's padding.
         let card_inner = crate::components::panel::INSPECTOR_WIDTH - 4.0 * SECTION_PAD;
         assert!(160.0 + LABEL_COL_MIN < card_inner);
+    }
+
+    /// Dragging the split bar never lets either pane close, and a split with no
+    /// height yet (first layout) falls back to an even share.
+    #[test]
+    fn the_split_keeps_both_panes_open() {
+        assert_eq!(split_share(250.0, 500.0), 0.5);
+        assert_eq!(split_share(0.0, 500.0), SPLIT_MIN);
+        assert_eq!(split_share(-40.0, 500.0), SPLIT_MIN);
+        assert_eq!(split_share(500.0, 500.0), 1.0 - SPLIT_MIN);
+        assert_eq!(split_share(100.0, 0.0), SPLIT_DEFAULT);
+        assert_eq!(split_share(f32::NAN, 500.0), SPLIT_DEFAULT);
     }
 
     /// Density contract: rows and their controls come off the shared ladder,

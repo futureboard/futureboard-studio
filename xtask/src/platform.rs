@@ -1,77 +1,51 @@
-//! Platform / edition vocabulary for packaging.
+//! Platform vocabulary for packaging.
 //!
 //! Keeps every piece of platform-specific string mapping in one module so the
 //! rest of the packager stays OS-agnostic. Adding a new target triple only
-//! requires a row in [`platform_folder`]; nothing here shells out or touches
-//! the filesystem.
+//! requires a row in [`platform_folder`]; nothing here shells out.
 
-use std::fmt;
+use std::path::Path;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 
-/// Which edition of Futureboard Studio to build and stage.
+/// The one Cargo target directory the package, the workspace aliases
+/// (`build-studio`, `check-studio`, ...) and the jam client share.
+pub const TARGET_DIR: &str = "target/studio";
+
+/// Features that compile the Professional code (licensing, ASIO, Score view)
+/// into the package. They grant nothing by themselves: Studio installs the
+/// Professional providers only for a verified licence, so an unlicensed
+/// machine running this package gets the Community feature set.
+pub const PROFESSIONAL_FEATURES: &str =
+    "futureboard_native/professional,sphere_directaudioengine/asio";
+
+/// Where the private Professional sources live. A public checkout does not
+/// have them and builds the same package without the Professional code.
+const PROFESSIONAL_SOURCES: &str = "crates/ExclusiveEdition/src";
+
+/// Whether this package compiles the Professional code in.
 ///
-/// The build arguments come straight from the existing `.cargo/config.toml`
-/// aliases — this enum only decides which feature set and target directory to
-/// use, it does not invent a new feature model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Edition {
-    /// Default public build (the `build-ce` / `check-ce` aliases).
-    Community,
-    /// Windows Professional Edition with ASIO (the `*-professional-win` aliases).
-    Professional,
+/// There is one package, not two editions: the licence decides at runtime.
+/// The code is included for Windows and Linux whenever this checkout carries
+/// the private sources. Windows also compiles the ASIO host (`asio-sys`);
+/// that toolchain is applied only for Windows targets. The licence client,
+/// Score view, EULA, and licensed updater are the same code on both.
+pub fn includes_professional(workspace: &Path, target_triple: &str) -> bool {
+    professional_target(target_triple)
+        && cfg!(professional_toolchain)
+        && workspace.join(PROFESSIONAL_SOURCES).is_dir()
 }
 
-impl Edition {
-    /// Lower-case identifier used in output paths and `build-info.json`.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Edition::Community => "community",
-            Edition::Professional => "professional",
-        }
-    }
-
-    /// Cargo `--features` argument for this edition, or `None` for the default
-    /// Community configuration. Mirrors `build-professional-win` in
-    /// `.cargo/config.toml`.
-    pub fn cargo_features(self) -> Option<&'static str> {
-        match self {
-            Edition::Community => None,
-            Edition::Professional => {
-                Some("futureboard_native/professional,sphere_directaudioengine/asio")
-            }
-        }
-    }
-
-    /// Per-edition Cargo target directory. Cargo unifies features within one
-    /// build graph, so the editions must not share a directory — this matches
-    /// the `--target-dir target/<edition>` split the aliases already use.
-    pub fn target_dir(self) -> &'static str {
-        match self {
-            Edition::Community => "target/community",
-            Edition::Professional => "target/professional",
-        }
-    }
+/// Targets that ship the Professional client. Linux matches the packaged
+/// gnu/musl triples (`*-unknown-linux-*`), which keeps Android triples out.
+fn professional_target(target_triple: &str) -> bool {
+    target_triple.contains("windows") || target_triple.contains("unknown-linux")
 }
 
-impl fmt::Display for Edition {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for Edition {
-    type Err = anyhow::Error;
-
-    fn from_str(value: &str) -> Result<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "community" | "ce" => Ok(Edition::Community),
-            // `exclusive` / `ee` are the edition's former name, still accepted so
-            // existing scripts and muscle memory keep working after the rename.
-            "professional" | "pro" | "exclusive" | "ee" => Ok(Edition::Professional),
-            other => bail!("unknown edition `{other}` (expected `community` or `professional`)"),
-        }
-    }
+/// `asio-sys` needs the Steinberg SDK and libclang. Linux compiles the same
+/// Professional feature set; the ASIO host itself stays behind `cfg(windows)`.
+pub fn requires_asio_toolchain(target_triple: &str) -> bool {
+    target_triple.contains("windows")
 }
 
 /// Map a Cargo target triple to a short, readable output folder name.
@@ -203,23 +177,40 @@ mod tests {
     }
 
     #[test]
-    fn edition_parsing_is_case_insensitive() {
-        assert_eq!("Community".parse::<Edition>().unwrap(), Edition::Community);
+    fn professional_code_follows_the_private_checkout_on_windows_and_linux() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let compiled_in =
+            cfg!(professional_toolchain) && workspace.join(PROFESSIONAL_SOURCES).is_dir();
+
         assert_eq!(
-            "PROFESSIONAL".parse::<Edition>().unwrap(),
-            Edition::Professional
+            includes_professional(&workspace, "x86_64-pc-windows-msvc"),
+            compiled_in
         );
-        assert_eq!("ce".parse::<Edition>().unwrap(), Edition::Community);
-        assert!("enterprise".parse::<Edition>().is_err());
+        assert_eq!(
+            includes_professional(&workspace, "x86_64-unknown-linux-gnu"),
+            compiled_in
+        );
+        assert_eq!(
+            includes_professional(&workspace, "aarch64-unknown-linux-musl"),
+            compiled_in
+        );
+        assert!(!includes_professional(&workspace, "aarch64-apple-darwin"));
+        assert!(!includes_professional(&workspace, "aarch64-linux-android"));
+        assert!(requires_asio_toolchain("x86_64-pc-windows-msvc"));
+        assert!(!requires_asio_toolchain("x86_64-unknown-linux-gnu"));
     }
 
     #[test]
-    fn professional_carries_feature_flags_community_does_not() {
-        assert_eq!(Edition::Community.cargo_features(), None);
-        assert_eq!(
-            Edition::Professional.cargo_features(),
-            Some("futureboard_native/professional,sphere_directaudioengine/asio")
-        );
+    fn a_checkout_without_the_private_sources_builds_without_professional_code() {
+        let empty = tempfile::tempdir().unwrap();
+        assert!(!includes_professional(
+            empty.path(),
+            "x86_64-pc-windows-msvc"
+        ));
+        assert!(!includes_professional(
+            empty.path(),
+            "x86_64-unknown-linux-gnu"
+        ));
     }
 }
 

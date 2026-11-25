@@ -203,6 +203,28 @@ pub trait PluginBridgeSink: Send + Sync + std::fmt::Debug {
     /// Wait-free (plain atomic stores). Default no-op for sinks that do not
     /// carry transport (e.g. test stubs).
     fn set_transport(&self, _ctx: &crate::vst3_processor::RuntimeTransportContext) {}
+
+    /// Pop the MIDI the hosted plug-in produced into `out`, oldest first, and
+    /// return how many were written. Called right after a fresh
+    /// [`Self::read_output`], so the events are the ones that block produced
+    /// (the host publishes them before the block). Only for an instance whose
+    /// MIDI output the engine consumes (a plug-in in a MIDI FX chain): the
+    /// ring has one consumer, and for every other instance that is the
+    /// Studio's control thread. Wait-free. Default: a sink without a host
+    /// produces no MIDI.
+    fn pop_output_midi(&self, _out: &mut [BridgeMidiOut]) -> usize {
+        0
+    }
+}
+
+/// One raw MIDI message a bridged plug-in produced; `sample_offset` is the
+/// frame within the block that produced it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BridgeMidiOut {
+    pub sample_offset: u32,
+    pub status: u8,
+    pub data1: u8,
+    pub data2: u8,
 }
 
 /// Shared handle to a realtime plugin-bridge sink.

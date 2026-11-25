@@ -249,6 +249,12 @@ impl Dsp {
         self.sampler.active_voice_count()
     }
 
+    /// Whether a sample is loaded — as of the last block, which adopts one
+    /// submitted since.
+    pub fn has_sample(&self) -> bool {
+        self.sampler.sample().is_some()
+    }
+
     /// The newest sounding voices: see [`QuickSampler::sounding`].
     pub fn sounding(&self, out: &mut [(u8, u64, f32)]) -> usize {
         self.sampler.sounding(out)

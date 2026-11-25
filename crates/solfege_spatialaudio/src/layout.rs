@@ -156,6 +156,36 @@ impl SpeakerLayout {
             .any(|speaker| speaker.elevation_deg >= 20.0)
     }
 
+    /// Which speaker each channel feeds, as a WAV `dwChannelMask`: the
+    /// channels are already in the mask's bit order. 7.1.2's top-middle pair
+    /// has no bit of its own and is written as the top-front pair, as is
+    /// usual for that layout in a WAV file.
+    pub fn wav_channel_mask(self) -> u32 {
+        const FL: u32 = 0x1;
+        const FR: u32 = 0x2;
+        const FC: u32 = 0x4;
+        const LFE: u32 = 0x8;
+        const BL: u32 = 0x10;
+        const BR: u32 = 0x20;
+        const SL: u32 = 0x200;
+        const SR: u32 = 0x400;
+        const TFL: u32 = 0x1000;
+        const TFR: u32 = 0x4000;
+        const TBL: u32 = 0x8000;
+        const TBR: u32 = 0x20000;
+        match self {
+            Self::Stereo => FL | FR,
+            Self::Lcr => FL | FR | FC,
+            Self::Quad => FL | FR | BL | BR,
+            Self::Surround50 => FL | FR | FC | BL | BR,
+            Self::Surround51 => FL | FR | FC | LFE | BL | BR,
+            Self::Surround70 => FL | FR | FC | BL | BR | SL | SR,
+            Self::Surround71 => FL | FR | FC | LFE | BL | BR | SL | SR,
+            Self::Surround712 => FL | FR | FC | LFE | BL | BR | SL | SR | TFL | TFR,
+            Self::Surround714 => FL | FR | FC | LFE | BL | BR | SL | SR | TFL | TFR | TBL | TBR,
+        }
+    }
+
     /// The conventional name: `5.1`, `7.1.4`.
     pub fn name(self) -> &'static str {
         match self {
@@ -201,6 +231,20 @@ mod tests {
                 .iter()
                 .all(|layout| layout.channel_count() <= MAX_CHANNELS)
         );
+    }
+
+    #[test]
+    fn each_layout_names_one_speaker_bit_per_channel() {
+        for layout in SpeakerLayout::ALL {
+            assert_eq!(
+                layout.wav_channel_mask().count_ones() as usize,
+                layout.channel_count(),
+                "{}",
+                layout.name()
+            );
+        }
+        assert_eq!(SpeakerLayout::Surround51.wav_channel_mask(), 0x3F);
+        assert_eq!(SpeakerLayout::Surround71.wav_channel_mask(), 0x63F);
     }
 
     #[test]

@@ -727,6 +727,115 @@ pub fn fb_segment(
         .child(div().min_w_0().truncate().child(label))
 }
 
+/// A [`fb_segment`] that names its choice with a glyph above the label — for a
+/// picker whose choices are kinds of object (track types), where the glyph is
+/// what the eye finds first and the label confirms it.
+///
+/// Same track, corners, state layers and focus ring as [`fb_segment`]; the
+/// selected glyph takes the accent as a second channel beside the fill. A
+/// disabled segment keeps its place in the group so the row never reflows,
+/// but drops its state layers, focus stop and click.
+pub fn fb_icon_segment(
+    id: impl Into<gpui::ElementId>,
+    icon: &'static str,
+    label: impl Into<String>,
+    active: bool,
+    enabled: bool,
+    position: FbSegment,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    /// Glyph edge: the 12 px menu glyph one step up, so it leads the label.
+    const GLYPH: f32 = 14.0;
+    let label: String = label.into();
+    let track = Colors::surface_input();
+    let rest = if active {
+        Colors::composite(track, Colors::state_selected())
+    } else {
+        Colors::with_alpha(track, 0.0)
+    };
+    let hover = Colors::composite(if active { rest } else { track }, Colors::state_hover());
+    let pressed = Colors::composite(if active { rest } else { track }, Colors::state_recessed());
+    let focus = Colors::state_focus_ring();
+    let r = radius::inner(radius::SURFACE, space::TIGHT);
+    let (tl, tr, bl, br) = match position {
+        FbSegment::Only => (r, r, r, r),
+        FbSegment::First => (r, radius::NONE, r, radius::NONE),
+        FbSegment::Middle => (radius::NONE, radius::NONE, radius::NONE, radius::NONE),
+        FbSegment::Last => (radius::NONE, r, radius::NONE, r),
+    };
+    let content = if !enabled {
+        Colors::text_disabled()
+    } else if active {
+        Colors::text_primary()
+    } else {
+        Colors::text_muted()
+    };
+
+    div()
+        .id(id)
+        .role(Role::Button)
+        .aria_label(label.clone())
+        .aria_disabled(!enabled)
+        .aria_toggled(if active {
+            Toggled::True
+        } else {
+            Toggled::False
+        })
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(px(space::TIGHT))
+        .flex_1()
+        .min_w(px(0.0))
+        .py(px(space::SNUG))
+        // Labels sit under the glyph, centred: the side inset only has to keep
+        // text off the neighbouring tile, so it is the hairline, not a pad.
+        .px(px(space::HAIR))
+        .rounded_tl(px(tl))
+        .rounded_tr(px(tr))
+        .rounded_bl(px(bl))
+        .rounded_br(px(br))
+        .bg(rest)
+        .overflow_hidden()
+        .child(
+            svg()
+                .path(icon)
+                .flex_shrink_0()
+                .w(px(GLYPH))
+                .h(px(GLYPH))
+                .text_color(if active && enabled {
+                    Colors::accent_primary()
+                } else {
+                    content
+                }),
+        )
+        .child(
+            div()
+                .max_w_full()
+                .min_w_0()
+                .truncate()
+                .text_size(px(typography::DENSE_LABEL))
+                .font_weight(if active {
+                    gpui::FontWeight::SEMIBOLD
+                } else {
+                    gpui::FontWeight::MEDIUM
+                })
+                .text_color(content)
+                .child(label),
+        )
+        .when(enabled, |this| {
+            this.focusable()
+                .tab_stop(true)
+                .focus_visible(move |style| style.shadow(elevation::focus_ring(focus)))
+                .cursor(gpui::CursorStyle::PointingHand)
+                .hover(move |s| s.bg(hover))
+                .active(move |s| s.bg(pressed))
+                .on_click(on_click)
+        })
+        .when(!enabled, |this| this.opacity(state::DISABLED_CONTENT + 0.2))
+}
+
 /// Inset track that holds [`fb_segment`] children. Its padding is what makes
 /// the nested-radius arithmetic land.
 pub fn fb_segmented_track() -> gpui::Div {
@@ -827,6 +936,60 @@ pub fn fb_dock_tab(
     shortcut: Option<String>,
 ) -> impl IntoElement {
     let label: String = label.into();
+    let text = dock_tab_text(active);
+    dock_tab_shape(id, &label, active, planes)
+        .px(px(space::LOOSE))
+        .children(icon_path.map(|path| svg().path(path).w(px(14.0)).h(px(14.0)).text_color(text)))
+        .child(label)
+        .children(shortcut.as_deref().map(fb_shortcut_hint))
+        .on_click(on_click)
+}
+
+/// A [`fb_dock_tab`] that takes an equal share of its strip, for a narrow
+/// dock whose views all have to stay one click away: every tab keeps its
+/// name, centred, and truncates before it would push a neighbour out.
+///
+/// Returned unfinished so the caller can add a tooltip with the full name.
+pub fn fb_dock_tab_fill(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<String>,
+    active: bool,
+    planes: FbDockPlanes,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    let label: String = label.into();
+    dock_tab_shape(id, &label, active, planes)
+        .flex_1()
+        .min_w_0()
+        .justify_center()
+        .px(px(space::TIGHT))
+        .child(
+            div()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .child(label),
+        )
+        .on_click(on_click)
+}
+
+fn dock_tab_text(active: bool) -> Rgba {
+    if active {
+        Colors::tab_text_active()
+    } else {
+        Colors::tab_text_muted()
+    }
+}
+
+/// Everything a dock tab is but its padding and content.
+fn dock_tab_shape(
+    id: impl Into<gpui::ElementId>,
+    label: &str,
+    active: bool,
+    planes: FbDockPlanes,
+) -> gpui::Stateful<gpui::Div> {
+    let label = label.to_string();
     let r = radius::CONTROL;
     let rest = if active {
         planes.body
@@ -835,11 +998,7 @@ pub fn fb_dock_tab(
     };
     let hover = Colors::composite(planes.strip, Colors::state_hover());
     let pressed = Colors::composite(planes.strip, Colors::state_recessed());
-    let text = if active {
-        Colors::tab_text_active()
-    } else {
-        Colors::tab_text_muted()
-    };
+    let text = dock_tab_text(active);
     let text_hover = Colors::tab_text();
     let focus = Colors::state_focus_ring();
 
@@ -857,7 +1016,6 @@ pub fn fb_dock_tab(
         .items_center()
         .gap(px(space::SNUG))
         .h(px(size::DEFAULT))
-        .px(px(space::LOOSE))
         .rounded_tl(px(r))
         .rounded_tr(px(r))
         .rounded_bl(px(radius::NONE))
@@ -877,10 +1035,6 @@ pub fn fb_dock_tab(
             el.hover(move |s| s.bg(hover).text_color(text_hover))
                 .active(move |s| s.bg(pressed))
         })
-        .children(icon_path.map(|path| svg().path(path).w(px(14.0)).h(px(14.0)).text_color(text)))
-        .child(label)
-        .children(shortcut.as_deref().map(fb_shortcut_hint))
-        .on_click(on_click)
 }
 
 /// Determinate progress bar. The track is a capsule; the fill is square so the

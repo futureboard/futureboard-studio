@@ -69,15 +69,17 @@ impl ArrangementOverlayLayout {
         tracks: &[crate::components::timeline::timeline_state::TrackState],
     ) -> u64 {
         let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0) as u32;
+        let children = multi_out_levels(tracks);
         let mut sig = self.meter_slots.len() as u64;
         for (id, (index, _)) in &self.meter_slots {
             let Some(track) = track_at(tracks, id, *index) else {
                 continue;
             };
+            let (level_l, level_r) = header_levels(track, &children);
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             id.hash(&mut hasher);
-            q(track.meter_level_l).hash(&mut hasher);
-            q(track.meter_level_r).hash(&mut hasher);
+            q(level_l).hash(&mut hasher);
+            q(level_r).hash(&mut hasher);
             // Order-independent: the slots are a map.
             sig = sig.wrapping_add(hasher.finish());
         }
@@ -86,6 +88,44 @@ impl ArrangementOverlayLayout {
 }
 
 pub type SharedArrangementOverlay = Rc<RefCell<ArrangementOverlayLayout>>;
+
+/// The loudest level among each multi-out instrument's output channels
+/// (`vsti-out:{insert}:bus:{n}`), keyed by the instrument insert's id. Empty —
+/// and no allocation — when no track has multi-out channels.
+fn multi_out_levels(
+    tracks: &[crate::components::timeline::timeline_state::TrackState],
+) -> HashMap<&str, (f32, f32)> {
+    use crate::components::timeline::timeline_state::vsti_output_child_insert_id;
+    let mut levels: HashMap<&str, (f32, f32)> = HashMap::new();
+    for track in tracks {
+        let Some(insert) = vsti_output_child_insert_id(&track.id) else {
+            continue;
+        };
+        let level = levels.entry(insert).or_insert((0.0, 0.0));
+        level.0 = level.0.max(track.meter_level_l);
+        level.1 = level.1.max(track.meter_level_r);
+    }
+    levels
+}
+
+/// What a header meter shows: the track's own level, or for an instrument
+/// whose plug-in plays through multi-out channels, the loudest of those and
+/// its own. A multi-out instrument's audio leaves through its child channels
+/// and its own track can be silent, so the header would read nothing while
+/// the instrument plays. The mixer keeps one strip per output.
+fn header_levels(
+    track: &crate::components::timeline::timeline_state::TrackState,
+    children: &HashMap<&str, (f32, f32)>,
+) -> (f32, f32) {
+    let own = (track.meter_level_l, track.meter_level_r);
+    if children.is_empty() {
+        return own;
+    }
+    track
+        .instrument_insert()
+        .and_then(|insert| children.get(insert.id.as_str()))
+        .map_or(own, |&(l, r)| (own.0.max(l), own.1.max(r)))
+}
 
 /// The track at `index` if it is still `id`, else a search: a reordered track
 /// list must not paint another track's level.
@@ -209,13 +249,15 @@ impl Render for ArrangementMeterOverlay {
                     return;
                 };
                 let tracks = &timeline.read(cx).state.tracks;
+                let children = multi_out_levels(tracks);
                 let meters: Vec<(Bounds<Pixels>, f32, f32)> = layout
                     .meter_slots
                     .iter()
                     .filter(|(_, (_, bounds))| bounds.intersects(&clip))
                     .filter_map(|(id, (index, bounds))| {
                         let track = track_at(tracks, id, *index)?;
-                        Some((*bounds, track.meter_level_l, track.meter_level_r))
+                        let (level_l, level_r) = header_levels(track, &children);
+                        Some((*bounds, level_l, level_r))
                     })
                     .collect();
                 window.with_content_mask(Some(ContentMask { bounds: clip }), |window| {

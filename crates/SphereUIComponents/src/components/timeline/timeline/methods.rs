@@ -175,6 +175,22 @@ impl Timeline {
         }
     }
 
+    /// The arrangement view's rectangle in window coordinates at the last
+    /// layout: the track headers, the ruler and conductor lanes, and the
+    /// visible lanes. `None` before the arrangement has been laid out.
+    pub(crate) fn arrangement_window_rect(&self) -> Option<gpui::Bounds<gpui::Pixels>> {
+        let context = self.arrangement_coordinate_context();
+        let width = HEADER_WIDTH + self.state.viewport.viewport_width;
+        let height = self.state.arrangement_content_top() + self.state.viewport.viewport_height;
+        if self.state.viewport.viewport_width < 1.0 || self.state.viewport.viewport_height < 1.0 {
+            return None;
+        }
+        Some(gpui::Bounds::new(
+            context.panel_origin_px,
+            gpui::size(px(width), px(height)),
+        ))
+    }
+
     pub(super) fn arrangement_coordinate_context(&self) -> ArrangementCoordinateContext {
         // Both origins come off the one measured lane edge. Deriving the panel
         // origin from the chrome estimate while the viewport used the measured
@@ -273,7 +289,17 @@ impl Timeline {
         }
     }
 
+    /// End every pointer gesture ([`Self::end_pointer_gestures`]) and clear
+    /// the arrangement's time range: Escape, a tool change, a project load.
     pub fn reset_input_state(&mut self) {
+        self.end_pointer_gestures();
+        self.state.arrangement_range = None;
+    }
+
+    /// End every pointer gesture in flight, as a release does. The time
+    /// range a gesture drew stays: it is a selection, which the edit
+    /// commands act on after the release.
+    pub(super) fn end_pointer_gestures(&mut self) {
         self.log_input_state("reset-before");
         self.file_drop_hint = None;
         self.clip_clone_hint = None;
@@ -293,7 +319,9 @@ impl Timeline {
         self.end_marquee(true);
         self.marquee_autoscroll = None;
         self.marquee_frame.set(None);
-        self.state.arrangement_range = None;
+        if self.clip_body_drag.take().is_some() {
+            self.state.follow_playhead_suspended = false;
+        }
         // A clip move that ends here was never committed — Escape, a tool
         // change, a cancelled gesture — so its clips go back where the gesture
         // found them rather than stay moved with no undo step.
@@ -377,6 +405,8 @@ impl Timeline {
             clip_clone_drag_id: None,
             pen_clip_draw: None,
             range_select_drag: None,
+            clip_body_drag: None,
+            range_move_edit: None,
             erase_clip_drag: None,
             ara_notes: Default::default(),
             automation_drag: None,
@@ -488,6 +518,8 @@ impl Timeline {
             clip_clone_drag_id: None,
             pen_clip_draw: None,
             range_select_drag: None,
+            clip_body_drag: None,
+            range_move_edit: None,
             erase_clip_drag: None,
             ara_notes: Default::default(),
             automation_drag: None,
@@ -609,6 +641,7 @@ impl Timeline {
         let moved = match &cmd {
             EditCommand::SetTrackVolume { prev, next, .. }
             | EditCommand::SetTrackPan { prev, next, .. } => (prev - next).abs() > 1.0e-5,
+            EditCommand::SetTrackDualPan { prev, next, .. } => prev != next,
             _ => true,
         };
         if !moved {
@@ -850,9 +883,12 @@ impl Timeline {
         cx: &mut gpui::Context<Self>,
     ) -> Option<solfege_spatialaudio::SourceParams> {
         let params = params.sanitized();
-        if self.state.find_track(track_id)?.spatial == params {
+        let prev = self.state.find_track(track_id)?.spatial;
+        if prev == params {
             return Some(params);
         }
+        self.state
+            .override_spatial_automation(track_id, prev, params);
         let edit = self.begin_track_edit(
             crate::components::timeline::timeline_state::TrackEditScope::tracks(vec![
                 track_id.to_string()
@@ -864,6 +900,42 @@ impl Timeline {
         self.commit_track_edit("Move in Room", edit, true, cx);
         cx.notify();
         Some(params)
+    }
+
+    /// Make a bus or return keep its channels' places in a spatial mix, or
+    /// stop. One undo step; returns whether anything changed.
+    pub(crate) fn set_track_keeps_inputs(
+        &mut self,
+        track_id: &str,
+        keep: bool,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        let Some(track) = self.state.find_track(track_id) else {
+            return false;
+        };
+        if track.spatial_keeps_inputs == keep || !track.track_type.is_routing() {
+            return false;
+        }
+        let edit = self.begin_track_edit(
+            crate::components::timeline::timeline_state::TrackEditScope::tracks(vec![
+                track_id.to_string()
+            ]),
+        );
+        if let Some(track) = self.state.tracks.iter_mut().find(|t| t.id == track_id) {
+            track.spatial_keeps_inputs = keep;
+        }
+        self.commit_track_edit(
+            if keep {
+                "Keep Channels' Places"
+            } else {
+                "Place Bus as One Source"
+            },
+            edit,
+            true,
+            cx,
+        );
+        cx.notify();
+        true
     }
 
     /// Start an Inspector gesture on a channel's placement. See
@@ -889,8 +961,11 @@ impl Timeline {
         if self.room_edit.is_none() {
             self.begin_room_edit(track_id);
         }
-        let track = self.state.tracks.iter_mut().find(|t| t.id == track_id)?;
-        if track.spatial != params {
+        let prev = self.state.find_track(track_id)?.spatial;
+        if prev != params {
+            self.state
+                .override_spatial_automation(track_id, prev, params);
+            let track = self.state.tracks.iter_mut().find(|t| t.id == track_id)?;
             track.spatial = params;
             cx.notify();
         }
@@ -1273,6 +1348,54 @@ impl Timeline {
         true
     }
 
+    /// Nudge: moves the selected clips one grid step later (`direction > 0`)
+    /// or earlier, or one bar with `by_bar`, as one undo step. The clips
+    /// keep their spacing, so a nudge that would push the earliest one before
+    /// the song start moves them all only as far as it.
+    pub(crate) fn nudge_selected_clips(
+        &mut self,
+        direction: f32,
+        by_bar: bool,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        let ids = self.state.selection.selected_clip_ids.clone();
+        let Some(first) = ids.first().cloned() else {
+            return false;
+        };
+        let step = if by_bar {
+            self.state.beats_per_bar()
+        } else {
+            self.state.midi_snap_step_beats()
+        };
+        let earliest = ids
+            .iter()
+            .filter_map(|id| self.state.find_clip(id).map(|(_, clip)| clip.start_beat))
+            .fold(f32::INFINITY, f32::min);
+        if !earliest.is_finite() {
+            return false;
+        }
+        let delta = (direction.signum() * step).max(-earliest);
+        if delta.abs() <= f32::EPSILON {
+            return false;
+        }
+        self.edit_clip_selection(
+            &first,
+            |state, id| {
+                let Some(clip) = state
+                    .tracks
+                    .iter_mut()
+                    .flat_map(|track| track.clips.iter_mut())
+                    .find(|clip| clip.id == id)
+                else {
+                    return false;
+                };
+                clip.start_beat = (clip.start_beat + delta).max(0.0);
+                true
+            },
+            cx,
+        )
+    }
+
     pub fn begin_inspector_clip_gesture(&mut self, clip_id: &str) {
         self.inspector_clip_gesture_origin = ClipSnapshot::capture(&self.state, clip_id);
     }
@@ -1361,6 +1484,14 @@ impl Timeline {
         let Some(track) = self.state.tracks.iter().find(|t| t.id == track_id) else {
             return;
         };
+        if param_id == EditCommand::DUAL_PAN_TARGET {
+            let dual = crate::layout::engine_snapshot::engine_dual_pan(track);
+            callback(track_id.to_string(), "panLeft".to_string(), dual.left);
+            callback(track_id.to_string(), "panRight".to_string(), dual.right);
+            let mode = if dual.enabled { 1.0 } else { 0.0 };
+            callback(track_id.to_string(), "panMode".to_string(), mode);
+            return;
+        }
         let value = match param_id {
             "volume" => track.display_volume(),
             "pan" => track.pan,
@@ -1484,6 +1615,59 @@ impl Timeline {
                 true
             }
         }
+    }
+
+    /// Merge Clips: the selected clips on each track as one clip, every
+    /// track one undo step together. `Err` says why nothing merged.
+    pub fn merge_selected_clips(
+        &mut self,
+        cx: &mut gpui::Context<Self>,
+    ) -> Result<(), &'static str> {
+        let plans = self
+            .state
+            .plan_clip_merge(&self.state.selection.selected_clip_ids.clone())?;
+        self.apply_clip_merges("Merge Clips", plans, cx);
+        Ok(())
+    }
+
+    /// The Glue tool's click: `clip_id` and the clip after it as one. What
+    /// cannot be glued says why in the status bar.
+    pub fn glue_clip_with_next(&mut self, clip_id: &str, cx: &mut gpui::Context<Self>) -> bool {
+        match self.state.plan_glue_with_next(clip_id) {
+            Ok(plan) => {
+                self.apply_clip_merges("Glue Clips", vec![plan], cx);
+                true
+            }
+            Err(reason) => {
+                self.report_edit_notice(reason, cx);
+                false
+            }
+        }
+    }
+
+    fn apply_clip_merges(
+        &mut self,
+        label: &'static str,
+        plans: Vec<crate::components::timeline::timeline_state::PlannedClipMerge>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        use crate::components::timeline::timeline_state::{ClipType, TrackEditScope};
+        let tracks: Vec<String> = plans.iter().map(|plan| plan.track_id.clone()).collect();
+        let audio = plans
+            .iter()
+            .any(|plan| matches!(plan.merged.clip_type, ClipType::Audio { .. }));
+        let edit = self.begin_track_edit(TrackEditScope::tracks(tracks));
+        for plan in &plans {
+            self.state.apply_clip_merge(plan);
+        }
+        self.state.selection.selected_clip_ids =
+            plans.iter().map(|plan| plan.merged.id.clone()).collect();
+        self.commit_track_edit(label, edit, false, cx);
+        self.mark_project_changed(cx);
+        if audio {
+            self.mark_media_changed(cx);
+        }
+        cx.notify();
     }
 
     pub fn split_audio_clip_at_beat(
@@ -1946,6 +2130,7 @@ impl Timeline {
                 ctx.on_erase_start.clone(),
                 ctx.on_erase_clip.clone(),
                 ctx.on_cut_clip.clone(),
+                ctx.on_clip_body_press.clone(),
                 self.erase_clip_drag.as_ref(),
                 ctx.on_audio_clip_process_preview.clone(),
                 ctx.on_audio_clip_process_commit.clone(),
@@ -2096,7 +2281,7 @@ impl Timeline {
     /// The Pen's release: one MIDI clip, default length for a plain click or
     /// the dragged span. Only the Pen draws clips here.
     pub(super) fn finish_pen_midi_clip(&mut self, end_beat: f32, cx: &mut gpui::Context<Self>) {
-        use crate::components::timeline::timeline_state::{TrackType, MIN_MIDI_CLIP_BEATS};
+        use crate::components::timeline::timeline_state::TrackType;
         let Some(preview) = self.pen_clip_draw.take() else {
             return;
         };
@@ -2111,15 +2296,11 @@ impl Timeline {
             return;
         }
 
-        let (clip_start, length) = if let Some(range) = self.state.arrangement_range.as_ref() {
-            let (range_start, range_end) = range.as_f32_range();
-            let (lo, hi) = normalize_range(range_start, range_end);
-            (lo, (hi - lo).max(MIN_MIDI_CLIP_BEATS))
-        } else {
-            // Commit exactly what the ghost preview showed: same start + snapped
-            // length helper, fed the live end beat from release.
-            compute_pen_clip_span(&self.state, preview.start_beat, end_beat)
-        };
+        // Commit exactly what the ghost preview showed: same start + snapped
+        // length helper, fed the live end beat from release. A time range
+        // selected elsewhere does not move it: the clip goes where it was
+        // drawn.
+        let (clip_start, length) = compute_pen_clip_span(&self.state, preview.start_beat, end_beat);
 
         if let Some(clip) = self.state.build_midi_clip(&track_id, clip_start, length) {
             let clip_id = clip.id.clone();
@@ -2346,7 +2527,10 @@ impl Timeline {
                 );
             }
             if drag.create_clip_on_click {
-                let start = self.snap_beat_with_bypass(drag.anchor_beat, drag.bypass_snap);
+                // In the bar clicked, wherever in it the click was.
+                let start = self
+                    .state
+                    .cell_start_with_bypass(drag.anchor_beat, drag.bypass_snap);
                 self.create_default_midi_clip(&drag.start_track_id, start, cx);
             }
         }
@@ -4166,7 +4350,10 @@ impl Timeline {
                 || before.index != after.index
                 || before.clip != after.clip
         });
-        if changed {
+        if let Some(edit) = self.range_move_edit.take() {
+            // A range move: its split and this move are one step.
+            self.record_range_move_edit(edit, cx);
+        } else if changed {
             self.record_executed_command(EditCommand::UpdateClips { previous, next }, cx);
         }
     }
@@ -4803,6 +4990,12 @@ impl Timeline {
             eprintln!("[MidiImport] nothing imported from {}", path.display());
         }
         imported
+    }
+
+    /// Bumped whenever the project is replaced: work started on one project
+    /// compares it before landing, so it never lands in the next.
+    pub fn project_generation(&self) -> u64 {
+        self.project_generation
     }
 
     /// Import a dropped MIDI file with the options the import dialog

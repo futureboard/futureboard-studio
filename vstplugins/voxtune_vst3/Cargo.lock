@@ -5727,7 +5727,7 @@ dependencies = [
 
 [[package]]
 name = "sphere_voxtune"
-version = "2026.11.1-beta2.0.0"
+version = "2026.11.13-beta2.0.1"
 dependencies = [
  "biquad",
  "serde",
@@ -6820,7 +6820,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voxtune_vst3"
-version = "2026.11.1-beta2.0.0"
+version = "2026.11.13-beta2.0.1"
 dependencies = [
  "ara2-bridge-sys",
  "dirs 5.0.1",
@@ -7988,7 +7988,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "2026.11.1-beta2.0.0"
+version = "2026.11.13-beta2.0.1"
 dependencies = [
  "nih_plug_xtask",
 ]

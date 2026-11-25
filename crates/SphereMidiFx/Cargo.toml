@@ -1,0 +1,14 @@
+[package]
+name = "sphere-midi-fx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "sphere_midi_fx"
+path = "src/lib.rs"
+
+# MIDI FX and MIDI generators that run on the engine's audio thread, between a
+# track's MIDI (clips, live input) and its instrument. No dependencies: every
+# device works on fixed-capacity buffers so `process` never allocates.
+[dependencies]

@@ -1,0 +1,20 @@
+[package]
+name = "rodhareist_engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "RodhareistEngine — a C ABI over the Rodhareist guitar multi-effect core, for C and C++ hosts"
+
+[lib]
+name = "rodhareist_engine"
+# `cdylib` (rodhareist_engine.dll / .so / .dylib) and `staticlib` (.lib / .a)
+# for C and C++ hosts; `rlib` so the crate's own tests call the ABI from Rust.
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+builtin-dsp-core.workspace = true
+rodharerist.workspace = true
+
+[lints]
+workspace = true

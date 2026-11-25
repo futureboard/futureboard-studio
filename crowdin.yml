@@ -1,8 +1,0 @@
-preserve_hierarchy: 1
-files:
-  - source: /packages/shared/locales/en-US/*.ftl
-    dest: /packages/shared/locales/en-US/%file_name%.properties
-    translation: /packages/shared/locales/%locale%/%file_name%.ftl
-    type: properties
-    escape_quotes: 0
-    escape_special_characters: 0

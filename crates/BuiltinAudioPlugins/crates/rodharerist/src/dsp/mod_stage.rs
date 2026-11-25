@@ -86,12 +86,10 @@ impl ModStage {
                 self.chorus
                     .configure_voice(rate, depth, mix, super::chorus::ChorusVoice::tri())
             }
-            ModModel::RazorChorus => self.chorus.configure_voice(
-                rate,
-                depth,
-                mix,
-                super::chorus::ChorusVoice::razor(),
-            ),
+            ModModel::RazorChorus => {
+                self.chorus
+                    .configure_voice(rate, depth, mix, super::chorus::ChorusVoice::razor())
+            }
             ModModel::Flanger => self.flanger.configure(rate, depth, mix),
             ModModel::ThruZero => self.flanger.configure_voice(
                 rate,
@@ -109,12 +107,10 @@ impl ModStage {
                 mix,
                 super::flanger::FlangerVoice::metal(),
             ),
-            ModModel::StabFlange => self.flanger.configure_voice(
-                rate,
-                depth,
-                mix,
-                super::flanger::FlangerVoice::stab(),
-            ),
+            ModModel::StabFlange => {
+                self.flanger
+                    .configure_voice(rate, depth, mix, super::flanger::FlangerVoice::stab())
+            }
             ModModel::Tremolo => self.tremolo.configure(rate, depth, mix),
             ModModel::HarmonicTrem => {
                 self.tremolo

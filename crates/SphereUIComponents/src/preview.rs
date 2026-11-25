@@ -11,6 +11,8 @@
 //! music-shaped analyser frame. That data exists only here, so a preview
 //! shows the analyser without a running host.
 
+mod redesign;
+
 use std::sync::Arc;
 
 use gpui::{
@@ -18,6 +20,7 @@ use gpui::{
     WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions,
 };
 
+use crate::components::add_track_dialog::AddTrackKind;
 use crate::components::band_model::BandKind;
 use crate::components::builtin_plugin_editor::builtin_state_seed;
 use crate::components::builtin_plugin_editor_window::{BuiltinEditorHostOps, PluginInstanceKey};
@@ -271,6 +274,24 @@ pub fn scenes() -> Vec<Scene> {
             open: duckstep_shaper_scene,
         },
         Scene {
+            name: "trigger",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: trigger_scene,
+        },
+        Scene {
+            name: "trigger-blend",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: trigger_blend_scene,
+        },
+        Scene {
+            name: "trigger-empty",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: trigger_empty_scene,
+        },
+        Scene {
             name: "airboost",
             width: plate::WINDOW_SIZE.0,
             height: plate::WINDOW_SIZE.1,
@@ -293,6 +314,12 @@ pub fn scenes() -> Vec<Scene> {
             width: crate::components::missing_media_window::MISSING_MEDIA_WINDOW_WIDTH,
             height: crate::components::missing_media_window::MISSING_MEDIA_WINDOW_HEIGHT,
             open: missing_media_scene,
+        },
+        Scene {
+            name: "missing-media-long",
+            width: crate::components::missing_media_window::MISSING_MEDIA_WINDOW_WIDTH,
+            height: crate::components::missing_media_window::MISSING_MEDIA_WINDOW_HEIGHT,
+            open: missing_media_long_scene,
         },
         Scene {
             name: "raw-pcm-import",
@@ -559,9 +586,29 @@ pub fn scenes() -> Vec<Scene> {
             open: settings_experimental,
         },
         Scene {
+            name: "context-menu-icons",
+            width: 640.0,
+            height: 520.0,
+            open: context_menu_icons_scene,
+        },
+        Scene {
+            name: "settings-midi",
+            width: crate::components::settings_layout::SETTINGS_WINDOW_WIDTH,
+            height: crate::components::settings_layout::SETTINGS_WINDOW_HEIGHT,
+            open: settings_midi,
+        },
+        Scene {
             name: "settings-audio-shared",
             width: crate::components::settings_layout::SETTINGS_WINDOW_WIDTH,
             height: crate::components::settings_layout::SETTINGS_WINDOW_HEIGHT,
+            open: settings_audio_shared,
+        },
+        // The same page tall enough to show what sits under the fold: the
+        // Recording Delay and the latency report.
+        Scene {
+            name: "settings-audio-full",
+            width: crate::components::settings_layout::SETTINGS_WINDOW_WIDTH,
+            height: 1_180.0,
             open: settings_audio_shared,
         },
         Scene {
@@ -801,10 +848,64 @@ pub fn scenes() -> Vec<Scene> {
             open: inspector_scene,
         },
         Scene {
+            name: "inspector-split",
+            width: crate::components::panel::INSPECTOR_WIDTH,
+            height: 900.0,
+            open: inspector_split_scene,
+        },
+        Scene {
+            name: "inspector-number-entry",
+            width: crate::components::panel::INSPECTOR_WIDTH,
+            height: 900.0,
+            open: inspector_number_entry_scene,
+        },
+        Scene {
+            name: "right-dock-tabs",
+            width: crate::components::panel::INSPECTOR_WIDTH,
+            height: 360.0,
+            open: right_dock_tabs_scene,
+        },
+        Scene {
+            name: "right-dock-tabs-chords",
+            width: crate::components::panel::INSPECTOR_WIDTH,
+            height: 360.0,
+            open: right_dock_tabs_chords_scene,
+        },
+        Scene {
             name: "inspector-folded",
             width: crate::components::panel::INSPECTOR_WIDTH,
             height: 560.0,
             open: inspector_folded_scene,
+        },
+        Scene {
+            name: "inspector-midi-fx",
+            width: crate::components::panel::INSPECTOR_WIDTH,
+            height: 1_320.0,
+            open: inspector_midi_fx_scene,
+        },
+        Scene {
+            name: "inspector-midi-fx-th",
+            width: crate::components::panel::INSPECTOR_WIDTH,
+            height: 1_320.0,
+            open: inspector_midi_fx_th_scene,
+        },
+        Scene {
+            name: "midi-fx-arpeggiator",
+            width: crate::components::midi_fx_editor::MIDI_FX_EDITOR_WIDTH,
+            height: crate::components::midi_fx_editor::MIDI_FX_EDITOR_HEIGHT,
+            open: |o, cx| midi_fx_editor_scene(o, cx, sphere_midi_fx::DeviceKind::Arpeggiator),
+        },
+        Scene {
+            name: "midi-fx-pattern",
+            width: crate::components::midi_fx_editor::MIDI_FX_EDITOR_WIDTH,
+            height: crate::components::midi_fx_editor::MIDI_FX_EDITOR_HEIGHT,
+            open: |o, cx| midi_fx_editor_scene(o, cx, sphere_midi_fx::DeviceKind::PatternGenerator),
+        },
+        Scene {
+            name: "midi-fx-chord",
+            width: crate::components::midi_fx_editor::MIDI_FX_EDITOR_WIDTH,
+            height: crate::components::midi_fx_editor::MIDI_FX_EDITOR_HEIGHT,
+            open: |o, cx| midi_fx_editor_scene(o, cx, sphere_midi_fx::DeviceKind::Chord),
         },
         Scene {
             name: "arrangement-meters",
@@ -813,10 +914,46 @@ pub fn scenes() -> Vec<Scene> {
             open: arrangement_meters_scene,
         },
         Scene {
+            name: "arrangement-thumbnail",
+            width: 1_100.0,
+            height: 520.0,
+            open: arrangement_thumbnail_scene,
+        },
+        Scene {
+            name: "track-headers",
+            width: 1_100.0,
+            height: 760.0,
+            open: track_headers_scene,
+        },
+        Scene {
             name: "ara-notes",
             width: 1_100.0,
             height: 520.0,
             open: ara_notes_scene,
+        },
+        Scene {
+            name: "stem-extractor",
+            width: crate::components::stem_extractor_dialog::STEM_EXTRACTOR_WINDOW_WIDTH,
+            height: 640.0,
+            open: stem_extractor_scene,
+        },
+        Scene {
+            name: "stem-extractor-empty",
+            width: crate::components::stem_extractor_dialog::STEM_EXTRACTOR_WINDOW_WIDTH,
+            height: 640.0,
+            open: stem_extractor_empty_scene,
+        },
+        Scene {
+            name: "stem-extractor-running",
+            width: crate::components::stem_extractor_dialog::STEM_EXTRACTOR_WINDOW_WIDTH,
+            height: 640.0,
+            open: stem_extractor_running_scene,
+        },
+        Scene {
+            name: "stem-extractor-done",
+            width: crate::components::stem_extractor_dialog::STEM_EXTRACTOR_WINDOW_WIDTH,
+            height: 640.0,
+            open: stem_extractor_done_scene,
         },
         Scene {
             name: "system-overloaded",
@@ -873,10 +1010,100 @@ pub fn scenes() -> Vec<Scene> {
             open: audio_connections_scene,
         },
         Scene {
+            name: "splash",
+            width: crate::splash::SPLASH_WIDTH,
+            height: crate::splash::SPLASH_HEIGHT,
+            open: splash_scene,
+        },
+        Scene {
+            name: "keymap",
+            width: crate::components::keymap_window::KEYMAP_WINDOW_WIDTH,
+            height: crate::components::keymap_window::KEYMAP_WINDOW_HEIGHT,
+            open: keymap_scene,
+        },
+        Scene {
+            name: "keymap-narrow",
+            width: crate::components::keymap_window::KEYMAP_WINDOW_MIN_WIDTH,
+            height: crate::components::keymap_window::KEYMAP_WINDOW_MIN_HEIGHT,
+            open: keymap_scene,
+        },
+        Scene {
+            name: "keymap-search",
+            width: crate::components::keymap_window::KEYMAP_WINDOW_WIDTH,
+            height: 420.0,
+            open: keymap_search_scene,
+        },
+        Scene {
+            name: "keymap-no-match",
+            width: crate::components::keymap_window::KEYMAP_WINDOW_WIDTH,
+            height: 420.0,
+            open: keymap_no_match_scene,
+        },
+        Scene {
+            name: "about",
+            width: crate::components::about_window::ABOUT_WINDOW_WIDTH,
+            height: crate::components::about_window::ABOUT_WINDOW_HEIGHT,
+            open: about_scene,
+        },
+        Scene {
+            name: "about-built-with",
+            width: crate::components::about_window::ABOUT_WINDOW_WIDTH,
+            height: crate::components::about_window::ABOUT_WINDOW_HEIGHT,
+            open: about_built_with_scene,
+        },
+        Scene {
+            name: "about-professional",
+            width: crate::components::about_window::ABOUT_WINDOW_WIDTH,
+            height: crate::components::about_window::ABOUT_WINDOW_HEIGHT,
+            open: about_professional_scene,
+        },
+        Scene {
+            name: "audio-repair",
+            width: 1_232.0,
+            height: 660.0,
+            open: audio_repair_noise_scene,
+        },
+        Scene {
+            name: "audio-repair-declick",
+            width: 1_232.0,
+            height: 660.0,
+            open: audio_repair_declick_scene,
+        },
+        Scene {
+            name: "audio-repair-dehum",
+            width: 1_232.0,
+            height: 660.0,
+            open: audio_repair_dehum_scene,
+        },
+        Scene {
+            name: "audio-repair-spectral",
+            width: 1_232.0,
+            height: 660.0,
+            open: audio_repair_spectral_scene,
+        },
+        Scene {
+            name: "audio-repair-narrow",
+            width: 760.0,
+            height: 480.0,
+            open: audio_repair_noise_scene,
+        },
+        Scene {
             name: "welcome",
             width: 1_180.0,
             height: 760.0,
             open: welcome_scene,
+        },
+        Scene {
+            name: "welcome-recent-grid",
+            width: 1_180.0,
+            height: 760.0,
+            open: welcome_recent_grid_scene,
+        },
+        Scene {
+            name: "welcome-recent-search",
+            width: 1_180.0,
+            height: 760.0,
+            open: welcome_recent_search_scene,
         },
         Scene {
             name: "process-explorer",
@@ -889,6 +1116,67 @@ pub fn scenes() -> Vec<Scene> {
             width: 520.0,
             height: 520.0,
             open: background_tasks_scene,
+        },
+        Scene {
+            name: "plugin-picker",
+            width: 960.0,
+            height: 680.0,
+            open: redesign::picker_scene,
+        },
+        Scene {
+            // The Add Insert window's minimum size.
+            name: "plugin-picker-min",
+            width: 820.0,
+            height: 560.0,
+            open: redesign::picker_scene,
+        },
+        Scene {
+            name: "browser-sidebar",
+            width: 272.0,
+            height: 760.0,
+            open: redesign::browser_scene,
+        },
+        Scene {
+            name: "room-preview",
+            width: 860.0,
+            height: 620.0,
+            open: |o, cx| redesign::room_scene(o, cx, true),
+        },
+        Scene {
+            name: "room-preview-unlicensed",
+            width: 860.0,
+            height: 620.0,
+            open: |o, cx| redesign::room_scene(o, cx, false),
+        },
+        Scene {
+            name: "automation-picker",
+            width: 420.0,
+            height: 600.0,
+            open: |o, cx| automation_picker_scene(o, cx, false),
+        },
+        Scene {
+            name: "automation-picker-open",
+            width: 420.0,
+            height: 600.0,
+            open: |o, cx| automation_picker_scene(o, cx, true),
+        },
+        Scene {
+            name: "chord-generator",
+            width: crate::components::chord_generator::CHORD_GENERATOR_WIDTH,
+            height: crate::components::chord_generator::CHORD_GENERATOR_HEIGHT,
+            open: chord_generator_scene,
+        },
+        Scene {
+            name: "chord-generator-browsing",
+            width: crate::components::chord_generator::CHORD_GENERATOR_WIDTH,
+            height: crate::components::chord_generator::CHORD_GENERATOR_HEIGHT,
+            open: chord_generator_browsing_scene,
+        },
+        Scene {
+            name: "chord-generator-min",
+            width: crate::components::chord_generator::MIN_WIDTH,
+            height: crate::components::chord_generator::MIN_HEIGHT,
+            open: chord_generator_scene,
         },
         Scene {
             name: "virtual-keyboard",
@@ -919,6 +1207,12 @@ pub fn scenes() -> Vec<Scene> {
             width: 1_100.0,
             height: 560.0,
             open: mixer::mixer_compact,
+        },
+        Scene {
+            name: "mixer-community",
+            width: 1_680.0,
+            height: 760.0,
+            open: mixer::mixer_community,
         },
         Scene {
             name: "mixer-short",
@@ -955,6 +1249,90 @@ pub fn scenes() -> Vec<Scene> {
             width: crate::components::add_track_dialog::ADD_TRACK_WINDOW_WIDTH,
             height: 640.0,
             open: add_track_drumstep,
+        },
+        // The dialog as it opens, one scene per track type, at its own size.
+        Scene {
+            name: "add-track-audio",
+            width: crate::components::add_track_dialog::ADD_TRACK_WINDOW_WIDTH,
+            height: crate::components::add_track_dialog::ADD_TRACK_WINDOW_HEIGHT,
+            open: |o, cx| add_track_kind(o, cx, AddTrackKind::Audio, 1, true, |_| {}),
+        },
+        Scene {
+            name: "add-track-audio-many",
+            width: crate::components::add_track_dialog::ADD_TRACK_WINDOW_WIDTH,
+            height: crate::components::add_track_dialog::ADD_TRACK_WINDOW_HEIGHT,
+            open: |o, cx| add_track_kind(o, cx, AddTrackKind::Audio, 4, true, |_| {}),
+        },
+        Scene {
+            name: "add-track-instrument",
+            width: crate::components::add_track_dialog::ADD_TRACK_WINDOW_WIDTH,
+            height: crate::components::add_track_dialog::ADD_TRACK_WINDOW_HEIGHT,
+            open: |o, cx| add_track_kind(o, cx, AddTrackKind::Instrument, 1, true, |_| {}),
+        },
+        Scene {
+            name: "add-track-step",
+            width: crate::components::add_track_dialog::ADD_TRACK_WINDOW_WIDTH,
+            height: crate::components::add_track_dialog::ADD_TRACK_WINDOW_HEIGHT,
+            open: |o, cx| add_track_kind(o, cx, AddTrackKind::DrumStep, 1, true, |_| {}),
+        },
+        Scene {
+            name: "add-track-midi",
+            width: crate::components::add_track_dialog::ADD_TRACK_WINDOW_WIDTH,
+            height: crate::components::add_track_dialog::ADD_TRACK_WINDOW_HEIGHT,
+            open: |o, cx| add_track_kind(o, cx, AddTrackKind::Midi, 1, true, |_| {}),
+        },
+        Scene {
+            name: "add-track-bus",
+            width: crate::components::add_track_dialog::ADD_TRACK_WINDOW_WIDTH,
+            height: crate::components::add_track_dialog::ADD_TRACK_WINDOW_HEIGHT,
+            open: |o, cx| add_track_kind(o, cx, AddTrackKind::Bus, 1, true, |_| {}),
+        },
+        Scene {
+            name: "add-track-automation",
+            width: crate::components::add_track_dialog::ADD_TRACK_WINDOW_WIDTH,
+            height: crate::components::add_track_dialog::ADD_TRACK_WINDOW_HEIGHT,
+            open: |o, cx| add_track_kind(o, cx, AddTrackKind::Automation, 1, true, |_| {}),
+        },
+        Scene {
+            name: "add-track-automation-empty",
+            width: crate::components::add_track_dialog::ADD_TRACK_WINDOW_WIDTH,
+            height: crate::components::add_track_dialog::ADD_TRACK_WINDOW_HEIGHT,
+            open: |o, cx| add_track_kind(o, cx, AddTrackKind::Automation, 1, false, |_| {}),
+        },
+        Scene {
+            name: "add-track-folder",
+            width: crate::components::add_track_dialog::ADD_TRACK_WINDOW_WIDTH,
+            height: crate::components::add_track_dialog::ADD_TRACK_WINDOW_HEIGHT,
+            open: |o, cx| add_track_kind(o, cx, AddTrackKind::Folder, 1, true, |_| {}),
+        },
+        Scene {
+            name: "add-track-instrument-solfege",
+            width: crate::components::add_track_dialog::ADD_TRACK_WINDOW_WIDTH,
+            height: crate::components::add_track_dialog::ADD_TRACK_WINDOW_HEIGHT,
+            open: |o, cx| {
+                add_track_with(o, cx, AddTrackKind::Instrument, |view| {
+                    view.preview_instrument_mode(
+                        crate::components::add_track_dialog::InstrumentMode::SolfegeEngine,
+                    )
+                })
+            },
+        },
+        Scene {
+            name: "add-track-color-open",
+            width: crate::components::add_track_dialog::ADD_TRACK_WINDOW_WIDTH,
+            height: crate::components::add_track_dialog::ADD_TRACK_WINDOW_HEIGHT,
+            open: |o, cx| {
+                add_track_with(o, cx, AddTrackKind::Audio, |view| {
+                    view.preview_open_color_picker()
+                })
+            },
+        },
+        // The tallest form at the smallest window the dialog allows.
+        Scene {
+            name: "add-track-audio-min",
+            width: crate::components::add_track_dialog::ADD_TRACK_WINDOW_MIN_WIDTH,
+            height: crate::components::add_track_dialog::ADD_TRACK_WINDOW_MIN_HEIGHT,
+            open: |o, cx| add_track_kind(o, cx, AddTrackKind::Audio, 4, true, |_| {}),
         },
         Scene {
             name: "visualizer-spectrum",
@@ -1129,6 +1507,7 @@ fn preview_instrument_library() -> Vec<SpherePluginHost::RegistryPlugin> {
             version: None,
             sdk_metadata_loaded: true,
             is_ara: false,
+            midi_output: false,
             preset_path: std::path::PathBuf::new(),
             scanned_at_ms: 0,
             status: PluginStatus::PresetReady,
@@ -1167,7 +1546,98 @@ fn add_track_instruments(
     Ok(handle.into())
 }
 
-/// Add Track on its DrumStep tab: the instrument fixed to the Drum Sampler.
+/// Add Track opened on `kind` the way Studio opens it: three tracks in the
+/// project (one of them a bus), a mono and a stereo input connection, and —
+/// for the Automation tab — those tracks' parameters. `count` > 1 shows the
+/// fields that only apply to several tracks at once.
+fn add_track_kind(
+    options: WindowOptions,
+    cx: &mut App,
+    kind: crate::components::add_track_dialog::AddTrackKind,
+    count: u32,
+    with_tracks: bool,
+    configure: fn(&mut crate::components::add_track_dialog::AddTrackWindow),
+) -> Result<AnyWindowHandle> {
+    use crate::components::add_track_dialog::{
+        AddTrackDialogState, AddTrackInputChoice, AddTrackWindow, AutomationTrackChoice,
+    };
+    let handle = cx.open_window(options, move |_, cx| {
+        cx.new(|cx| {
+            let i18n = crate::i18n::I18n::new("en-US");
+            let mut state = AddTrackDialogState::open_for(3, true);
+            state.set_kind(kind);
+            state.track_name = format!("{} {}", i18n.tr(kind.label_key()), state.next_number);
+            state.count = count;
+            state.audio_output_targets = vec![("bus-1".to_string(), "Drum Bus".to_string())];
+            state.audio_input_choices = vec![
+                AddTrackInputChoice {
+                    label: "Input 1 (Mono)".to_string(),
+                    connection_id: crate::audio_connections::AudioConnectionId::from_stored(
+                        "ac-in-1",
+                    ),
+                    channels: 1,
+                },
+                AddTrackInputChoice {
+                    label: "Input 1+2 (Stereo)".to_string(),
+                    connection_id: crate::audio_connections::AudioConnectionId::from_stored(
+                        "ac-in-12",
+                    ),
+                    channels: 2,
+                },
+            ];
+            let mut view = AddTrackWindow::new(
+                state,
+                "en-US",
+                preview_instrument_library(),
+                vec!["Keystation 49 MK3".to_string()],
+                Arc::new(|_, _, _| {}),
+                cx,
+            );
+            if with_tracks {
+                let target = |track: &str, id: &str, label: &str, shown: bool| {
+                    (
+                        format!("automation:add-target:{track}:{id}"),
+                        label.to_string(),
+                        shown,
+                    )
+                };
+                view.set_automation_choices(
+                    vec![
+                        AutomationTrackChoice {
+                            track_id: "t1".to_string(),
+                            name: "Lead Vocal".to_string(),
+                            targets: vec![
+                                target("t1", "volume", "Volume", true),
+                                target("t1", "pan", "Pan", false),
+                            ],
+                        },
+                        AutomationTrackChoice {
+                            track_id: "t2".to_string(),
+                            name: "Drums".to_string(),
+                            targets: vec![target("t2", "volume", "Volume", false)],
+                        },
+                    ],
+                    Some("t1"),
+                );
+            }
+            configure(&mut view);
+            view
+        })
+    })?;
+    Ok(handle.into())
+}
+
+/// [`add_track_kind`] for one track, then `configure` (a popover open, a mode).
+fn add_track_with(
+    options: WindowOptions,
+    cx: &mut App,
+    kind: AddTrackKind,
+    configure: fn(&mut crate::components::add_track_dialog::AddTrackWindow),
+) -> Result<AnyWindowHandle> {
+    add_track_kind(options, cx, kind, 1, true, configure)
+}
+
+/// Add Track on its DrumStep tab: the Drum Sampler until a VSTi is picked.
 fn add_track_drumstep(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
     use crate::components::add_track_dialog::{AddTrackDialogState, AddTrackKind, AddTrackWindow};
     let handle = cx.open_window(options, move |_, cx| {
@@ -1259,6 +1729,21 @@ fn seed(plugin: &str, insert: &str, json: String) {
 /// folder, takes on a drive that is not there, one take already relinked,
 /// and a plug-in that is there but would not load.
 fn missing_media_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_missing_media(options, 1, cx)
+}
+
+/// More rows than the window holds, so the list shows its scrollbar.
+fn missing_media_long_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_missing_media(options, 4, cx)
+}
+
+/// The Missing Media window with its five sample rows repeated `copies`
+/// times.
+fn open_missing_media(
+    options: WindowOptions,
+    copies: usize,
+    cx: &mut App,
+) -> Result<AnyWindowHandle> {
     use crate::components::missing_media_window::{
         MissingKind, MissingMediaCallbacks, MissingMediaWindow, MissingRow, MissingStatus,
     };
@@ -1273,7 +1758,7 @@ fn missing_media_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindow
             status,
             installed_at: None,
         };
-    let rows = vec![
+    let rows = [
         MissingRow {
             installed_at: Some(
                 r"C:\Program Files\Common Files\CLAP\FabFilter Saturn 2.clap".to_string(),
@@ -1325,6 +1810,18 @@ fn missing_media_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindow
             MissingStatus::Found,
         ),
     ];
+    let rows: Vec<MissingRow> = (0..copies.max(1))
+        .flat_map(|copy| {
+            rows.iter().cloned().map(move |row| MissingRow {
+                id: if copy == 0 {
+                    row.id.clone()
+                } else {
+                    format!("{}#{copy}", row.id)
+                },
+                ..row
+            })
+        })
+        .collect();
     let collect_rows = rows.clone();
     let callbacks = MissingMediaCallbacks {
         collect: Arc::new(move |_cx: &mut App| collect_rows.clone()),
@@ -1337,6 +1834,185 @@ fn missing_media_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindow
         cx.new(|cx| MissingMediaWindow::new(rows, callbacks, notes, cx))
     })?;
     Ok(handle.into())
+}
+
+/// The boot splash of a Community copy, with a status line.
+fn splash_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    let handle = cx.open_window(options, |_, cx| {
+        cx.new(|_| {
+            let mut splash = crate::splash::SplashWindow::new();
+            splash.set_status("Scanning plug-ins…");
+            splash
+        })
+    })?;
+    Ok(handle.into())
+}
+
+fn keymap_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    let handle =
+        crate::components::keymap_window::open_preview_keymap_window(options, true, "", cx)?;
+    Ok(handle.into())
+}
+
+/// A search that matches a few rows, and one that matches none.
+fn keymap_search_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    let handle =
+        crate::components::keymap_window::open_preview_keymap_window(options, false, "undo", cx)?;
+    Ok(handle.into())
+}
+
+fn keymap_no_match_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    let handle =
+        crate::components::keymap_window::open_preview_keymap_window(options, false, "zzz", cx)?;
+    Ok(handle.into())
+}
+
+fn about_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    let handle =
+        crate::components::about_window::open_preview_about_window(options, None, false, cx)?;
+    Ok(handle.into())
+}
+
+fn about_built_with_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    let handle =
+        crate::components::about_window::open_preview_about_window(options, None, true, cx)?;
+    Ok(handle.into())
+}
+
+/// A licensed Professional copy: an active perpetual license with a licensee,
+/// and the ASIO engine named without its logo (the logo is a private asset).
+fn about_professional_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    use crate::edition::{AudioEngineBadge, EditionInfo, LicenseDisplay, LicenseDisplayState};
+    let edition = EditionInfo {
+        edition: "Professional",
+        app_version: crate::edition::app_version(),
+        license: Some(LicenseDisplay {
+            state: LicenseDisplayState::Active,
+            licensee: Some("Studio Seven".to_string()),
+            entitlements: vec!["asio".to_string()],
+            expires_at: None,
+        }),
+        audio_engine: Some(AudioEngineBadge {
+            name: "ASIO Audio Engine",
+            notice: "ASIO is a trademark and software of Steinberg Media Technologies GmbH.",
+            logo: None,
+        }),
+    };
+    let handle = crate::components::about_window::open_preview_about_window(
+        options,
+        Some(edition),
+        false,
+        cx,
+    )?;
+    Ok(handle.into())
+}
+
+/// Eight seconds of 48 kHz stereo with something to repair in it: a sung,
+/// harmonic phrase over a hiss floor, 50 Hz mains hum with its harmonics, and
+/// a click every 0.7 s. Written once per run to the temp folder, because the
+/// tool window reads its source from a file like it does in a project.
+fn audio_repair_source() -> Result<std::path::PathBuf> {
+    use std::f32::consts::TAU;
+    const SR: u32 = 48_000;
+    const FRAMES: usize = SR as usize * 8;
+    let dir = std::env::temp_dir().join("futureboard-ui-preview");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("audio-repair-source.wav");
+    if path.exists() {
+        return Ok(path);
+    }
+    let mut seed: u32 = 0x1234_5678;
+    let mut noise = move || {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (seed >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0
+    };
+    let notes = [
+        220.0_f32, 246.94, 261.63, 293.66, 329.63, 293.66, 261.63, 246.94,
+    ];
+    let mut samples = Vec::with_capacity(FRAMES * 2);
+    let mut phase = 0.0_f32;
+    for frame in 0..FRAMES {
+        let t = frame as f32 / SR as f32;
+        // One note per second, sung for 0.8 s of it.
+        let note = notes[(t as usize).min(notes.len() - 1)];
+        let within = t.fract();
+        let env = if within < 0.8 {
+            (within / 0.05).min(1.0) * ((0.8 - within) / 0.1).min(1.0)
+        } else {
+            0.0
+        };
+        phase += TAU * note * (1.0 + 0.006 * (TAU * 5.5 * t).sin()) / SR as f32;
+        let voice: f32 = (1..=8)
+            .map(|h| (phase * h as f32).sin() / (h * h) as f32)
+            .sum::<f32>()
+            * 0.42
+            * env;
+        let hum: f32 = (1..=4)
+            .map(|h| (TAU * 50.0 * h as f32 * t).sin() * 0.03 / h as f32)
+            .sum();
+        let hiss = noise() * 0.018;
+        let click_at = (t / 0.7).fract() * 0.7;
+        let click = if click_at < 0.0004 {
+            0.7 * (1.0 - click_at / 0.0004)
+        } else {
+            0.0
+        };
+        let mono = voice + hum + hiss;
+        samples.push(mono + click);
+        samples.push(mono * 0.96 + noise() * 0.004 + click * 0.8);
+    }
+    SphereAudioProcessor::write_wav_f32(&path, &samples, 2, SR)
+        .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+    Ok(path)
+}
+
+fn open_audio_repair(
+    options: WindowOptions,
+    module: sphere_audio_editor::AudioRepairModule,
+    cx: &mut App,
+) -> Result<AnyWindowHandle> {
+    use sphere_audio_editor::{AudioToolKind, AudioToolTarget};
+    let path = audio_repair_source()?;
+    let target = AudioToolTarget {
+        clip_id: "clip-vocal".to_string(),
+        source_id: "source-vocal".to_string(),
+        clip_name: "Lead Vocal Take 3".to_string(),
+        file_label: "Lead Vocal Take 3.wav".to_string(),
+        source_path: Some(path.to_string_lossy().into_owned()),
+        sample_rate: 48_000,
+        channels: 2,
+        source_frames: 48_000 * 8,
+        time_selection: None,
+        spectral_selection: None,
+    };
+    let handle = crate::components::open_preview_audio_tool_window(
+        AudioToolKind::AudioRepair,
+        target,
+        module,
+        options,
+        cx,
+    )?;
+    Ok(handle.into())
+}
+
+fn audio_repair_noise_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_audio_repair(options, sphere_audio_editor::AudioRepairModule::Denoise, cx)
+}
+
+fn audio_repair_declick_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_audio_repair(options, sphere_audio_editor::AudioRepairModule::DeClick, cx)
+}
+
+fn audio_repair_dehum_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_audio_repair(options, sphere_audio_editor::AudioRepairModule::DeHum, cx)
+}
+
+fn audio_repair_spectral_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_audio_repair(
+        options,
+        sphere_audio_editor::AudioRepairModule::SpectralRepair,
+        cx,
+    )
 }
 
 fn open_raw_pcm_import(
@@ -2243,6 +2919,7 @@ impl gpui::Render for AudioClipsPreview {
                         None,
                         None,
                         None,
+                        None,
                         false,
                         state
                             .display_selection()
@@ -2803,9 +3480,58 @@ struct InspectorPreview {
     clip_name_input: crate::components::text_input::TextInputState,
     color: crate::components::ColorPickerState,
     folded: &'static [&'static str],
+    /// The "Add MIDI FX" device list is open.
+    midi_fx_picker: bool,
+    locale: &'static str,
+    /// Draw the right dock's tab strip above the panel, with this tab active.
+    dock_tab: Option<crate::layout::RightDockTab>,
+    /// An audio clip on the track is selected, so the clip pane opens under
+    /// the track's.
+    clip_selected: bool,
 }
 
 impl InspectorPreview {
+    /// A MIDI FX chain on the track (generator first, the scale bypassed),
+    /// with the device list open and the other sections folded.
+    fn with_midi_fx(cx: &mut Context<Self>) -> Self {
+        use sphere_midi_fx::DeviceKind;
+        let mut preview = Self::new(&["routing", "program", "mpe", "instrument"], cx);
+        let track = preview
+            .tracks
+            .iter_mut()
+            .find(|t| t.id == preview.track_id)
+            .expect("preview track");
+        for (n, kind) in [
+            DeviceKind::PatternGenerator,
+            DeviceKind::Arpeggiator,
+            DeviceKind::Scale,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut slot = crate::components::timeline::timeline_state::MidiFxSlotState::new(
+                format!("mfx-{}", n + 1),
+                kind,
+            );
+            slot.enabled = kind != DeviceKind::Scale;
+            track.midi_fx.push(slot);
+        }
+        // A hosted plug-in its host is still loading.
+        let mut plugin = crate::components::timeline::timeline_state::InsertSlotState::empty(
+            "insert-preview-plug",
+        );
+        plugin.display_name = "Chord Tool".to_string();
+        plugin.load_status = crate::components::timeline::timeline_state::InsertLoadStatus::Loading;
+        track.midi_fx.push(
+            crate::components::timeline::timeline_state::MidiFxSlotState::hosting(
+                "mfx-4".to_string(),
+                plugin,
+            ),
+        );
+        preview.midi_fx_picker = true;
+        preview
+    }
+
     fn new(folded: &'static [&'static str], cx: &mut Context<Self>) -> Self {
         use crate::components::timeline::timeline_state::{
             volume, CreateTrackOptions, InputMonitorMode, InsertLoadStatus, TimelineState,
@@ -2854,6 +3580,10 @@ impl InspectorPreview {
             clip_name_input,
             color,
             folded,
+            midi_fx_picker: false,
+            locale: "en-US",
+            dock_tab: None,
+            clip_selected: false,
         }
     }
 }
@@ -2862,7 +3592,16 @@ impl gpui::Render for InspectorPreview {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
         use crate::components::panel::{inspector_panel, InspectorCallbacks, InspectorColorPicker};
         use crate::components::text_input::TextInputCallbacks;
-        let callbacks = InspectorCallbacks::preview_noop(self.folded);
+        use gpui::{ParentElement, Styled};
+        let mut callbacks = InspectorCallbacks::preview_noop(self.folded);
+        callbacks.i18n = crate::i18n::I18n::new(self.locale);
+        if self.midi_fx_picker {
+            callbacks.midi_fx_picker_open = Some(self.track_id.clone());
+            callbacks.midi_fx_plugin_choices = vec![
+                ("a".to_string(), "Chord Tool".to_string()),
+                ("b".to_string(), "Step Arp".to_string()),
+            ];
+        }
         let noop = || Arc::new(|_: &mut Window, _: &mut App| {});
         let picker = InspectorColorPicker {
             state: &self.color,
@@ -2877,12 +3616,39 @@ impl gpui::Render for InspectorPreview {
                 on_auto: Arc::new(|_, _, _| {}),
             },
         };
-        inspector_panel(
+        let stretch = crate::components::timeline::timeline_state::AudioClipStretchState::default();
+        let clip = self
+            .clip_selected
+            .then(|| crate::components::panel::SelectedClipSummary {
+                clip_id: "preview-clip",
+                track_id: &self.track_id,
+                name: "Chorus Take 2",
+                start_beat: 16.0,
+                duration_beats: 8.0,
+                muted: false,
+                gain: 1.0,
+                source_duration_seconds: Some(4.0),
+                source_path: Some("D:/Audio/Chorus Take 2.wav"),
+                note_count: None,
+                kind: "Audio",
+                track_name: "Instrument Track 3",
+                stretch: &stretch,
+                project_bpm: 120.0,
+                selection_duration_beats: None,
+                fades: None,
+                beats_per_bar: 4.0,
+            });
+        let tracks = crate::components::panel::InspectorTracks::of(
             &self.tracks,
+            Some(&self.track_id),
+            Clone::clone,
+        );
+        let panel = inspector_panel(
+            &tracks,
             &crate::audio_connections::AudioConnectionRegistry::default(),
             Some(&self.track_id),
-            None,
-            None,
+            self.clip_selected.then_some("preview-clip"),
+            clip,
             None,
             &self.name_input,
             false,
@@ -2892,11 +3658,66 @@ impl gpui::Render for InspectorPreview {
             TextInputCallbacks::default(),
             picker,
             true,
-            solfege_spatialaudio::SpatialFormat::Stereo,
+            crate::components::panel::InspectorSpatial::default(),
             &callbacks,
-            crate::i18n::I18n::new("en-US"),
-        )
+            crate::i18n::I18n::new(self.locale),
+        );
+        gpui::div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .children(
+                self.dock_tab
+                    .map(crate::layout::preview_right_dock_tab_strip),
+            )
+            .child(
+                gpui::div()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(panel),
+            )
     }
+}
+
+/// The right dock's tab strip over the Inspector, then over Chords (which
+/// adds the pop-out button).
+fn right_dock_tabs_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    let handle = cx.open_window(options, |_, cx| {
+        cx.new(|cx| InspectorPreview {
+            dock_tab: Some(crate::layout::RightDockTab::Inspector),
+            ..InspectorPreview::new(&["routing", "program", "mpe", "instrument"], cx)
+        })
+    })?;
+    Ok(handle.into())
+}
+
+/// A clip selected: the track's pane over the clip's, split.
+fn inspector_split_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    let handle = cx.open_window(options, |_, cx| {
+        cx.new(|cx| InspectorPreview {
+            dock_tab: Some(crate::layout::RightDockTab::Inspector),
+            clip_selected: true,
+            ..InspectorPreview::new(&[], cx)
+        })
+    })?;
+    Ok(handle.into())
+}
+
+/// A clip's Start opened for typing, as a double-click leaves it.
+fn inspector_number_entry_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    crate::components::inspector::preview_edit_number("clip-start");
+    inspector_split_scene(options, cx)
+}
+
+fn right_dock_tabs_chords_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    let handle = cx.open_window(options, |_, cx| {
+        cx.new(|cx| InspectorPreview {
+            dock_tab: Some(crate::layout::RightDockTab::ChordDisplay),
+            ..InspectorPreview::new(&["routing", "program", "mpe", "instrument"], cx)
+        })
+    })?;
+    Ok(handle.into())
 }
 
 fn inspector_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
@@ -2907,6 +3728,59 @@ fn inspector_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHand
 fn inspector_folded_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
     let handle = cx.open_window(options, |_, cx| {
         cx.new(|cx| InspectorPreview::new(&["routing", "program", "mpe", "instrument"], cx))
+    })?;
+    Ok(handle.into())
+}
+
+fn inspector_midi_fx_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    let handle = cx.open_window(options, |_, cx| cx.new(InspectorPreview::with_midi_fx))?;
+    Ok(handle.into())
+}
+
+/// An empty chain with the list open, in Thai: marks above and below the
+/// line must not be cut off.
+fn inspector_midi_fx_th_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    let handle = cx.open_window(options, |_, cx| {
+        cx.new(|cx| {
+            let mut preview = InspectorPreview {
+                locale: "th-TH",
+                ..InspectorPreview::with_midi_fx(cx)
+            };
+            for track in &mut preview.tracks {
+                track.midi_fx.clear();
+            }
+            // Room for the whole list, plug-ins included.
+            preview.folded = &["track", "routing", "program", "mpe", "instrument"];
+            preview
+        })
+    })?;
+    Ok(handle.into())
+}
+
+/// A MIDI FX device editor on its default settings, as a fresh slot opens.
+fn midi_fx_editor_scene(
+    options: WindowOptions,
+    cx: &mut App,
+    kind: sphere_midi_fx::DeviceKind,
+) -> Result<AnyWindowHandle> {
+    use crate::components::midi_fx_editor::MidiFxEditor;
+    let i18n = crate::i18n::I18n::new("en-US");
+    let slot = crate::components::timeline::timeline_state::MidiFxSlotState::new(
+        "mfx-1".to_string(),
+        kind,
+    );
+    let title = format!("{} — Instrument Track 3", i18n.tr(kind.label()));
+    let handle = cx.open_window(options, move |_, cx| {
+        cx.new(|_| {
+            MidiFxEditor::new(
+                title,
+                kind,
+                i18n,
+                Arc::new(move |_: &App| Some(slot.clone())),
+                Arc::new(|_: &str, _: f32, _: &mut Window, _: &mut App| {}),
+                Arc::new(|_: &mut Window, _: &mut App| {}),
+            )
+        })
     })?;
     Ok(handle.into())
 }
@@ -2938,6 +3812,100 @@ impl gpui::Render for ArrangementMetersPreview {
     }
 }
 
+/// Track headers in every state: a folder with two members (one muted, one
+/// soloed, the soloed one a short 48 px row), an armed and monitored track,
+/// the selected track, and a tall 120 px row.
+fn track_headers_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    use crate::components::timeline::timeline_state::TrackType;
+    use crate::project::InputMonitorMode;
+    let handle = cx.open_window(options, |_, cx| {
+        let timeline = cx.new(|_| {
+            let mut timeline = crate::components::timeline::Timeline::with_demo_content();
+            let state = &mut timeline.state;
+            let mut folder = state.tracks[1].clone();
+            folder.id = "folder-drums".to_string();
+            folder.name = "Drums".to_string();
+            folder.track_type = TrackType::Group;
+            folder.color = crate::theme::Colors::track_color_for_index(5);
+            folder.clips.clear();
+            let member = |id: &str, name: &str| {
+                let mut track = state.tracks[1].clone();
+                track.id = id.to_string();
+                track.name = name.to_string();
+                track.parent_group_id = Some("folder-drums".to_string());
+                track.clips.clear();
+                track
+            };
+            let mut kick = member("track-kick", "Kick");
+            kick.muted = true;
+            let mut snare = member("track-snare", "Snare Top");
+            snare.solo = true;
+            snare.pan = -0.35;
+            state.tracks[0].armed = true;
+            state.tracks[0].input_monitor = InputMonitorMode::WhenRecordArmed;
+            state.tracks.insert(0, snare);
+            state.tracks.insert(0, kick);
+            state.tracks.insert(0, folder);
+            state.set_track_row_height("track-snare", 48.0);
+            state.set_track_row_height("track-3", 120.0);
+            for (index, track) in state.tracks.iter_mut().enumerate() {
+                track.meter_level_l = 0.2 + 0.12 * (index % 5) as f32;
+                track.meter_level_r = track.meter_level_l * 0.9;
+            }
+            timeline
+        });
+        cx.new(|_| ArrangementMetersPreview { timeline })
+    })?;
+    Ok(handle.into())
+}
+
+/// The arrangement, and its project thumbnail made from this window's frame
+/// the way a save makes it: the frame drawn again and read back, the
+/// arrangement cut out and scaled. The thumbnail is written to
+/// `<temp>/futureboard-ui-preview/arrangement-thumb.png`.
+fn arrangement_thumbnail_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    let handle = cx.open_window(options, |_, cx| {
+        let timeline = cx.new(|_| crate::components::timeline::Timeline::with_demo_content());
+        cx.new(|_| ArrangementMetersPreview { timeline })
+    })?;
+    cx.spawn(async move |cx| {
+        cx.background_executor()
+            .timer(std::time::Duration::from_millis(1_200))
+            .await;
+        let _ = handle.update(cx, |view, window, cx| {
+            let rect = view.timeline.read(cx).arrangement_window_rect();
+            let scale = window.scale_factor();
+            let (Some(rect), Ok(frame)) = (rect, window.render_to_image()) else {
+                eprintln!("[preview] arrangement-thumbnail: no rect or no frame");
+                return;
+            };
+            let px = |value: gpui::Pixels| (f32::from(value) * scale).round() as u32;
+            let Some(thumb) = crate::project::thumbnail::thumbnail_from_frame(
+                &frame,
+                (
+                    px(rect.origin.x),
+                    px(rect.origin.y),
+                    px(rect.size.width),
+                    px(rect.size.height),
+                ),
+            ) else {
+                eprintln!("[preview] arrangement-thumbnail: rect outside the frame");
+                return;
+            };
+            let path = std::env::temp_dir()
+                .join("futureboard-ui-preview")
+                .join("arrangement-thumb.png");
+            let _ = std::fs::create_dir_all(path.parent().unwrap_or(&path));
+            match thumb.save(&path) {
+                Ok(()) => eprintln!("[preview] arrangement thumbnail -> {}", path.display()),
+                Err(error) => eprintln!("[preview] arrangement thumbnail failed: {error}"),
+            }
+        });
+    })
+    .detach();
+    Ok(handle.into())
+}
+
 fn arrangement_meters_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
     let handle = cx.open_window(options, |_, cx| {
         let timeline = cx.new(|_| {
@@ -2958,6 +3926,116 @@ fn arrangement_meters_scene(options: WindowOptions, cx: &mut App) -> Result<AnyW
         cx.new(|_| ArrangementMetersPreview { timeline })
     })?;
     Ok(handle.into())
+}
+
+/// The Stem Extractor through the app's own dialog path, with two audio clips
+/// on tracks and the default model not downloaded (an empty models folder).
+fn open_stem_extractor_preview(
+    clips: bool,
+    state: Option<crate::components::stem_extractor_dialog::StemExtractJobState>,
+    cx: &mut App,
+) -> Result<AnyWindowHandle> {
+    use crate::components::stem_extractor_dialog::{
+        open_stem_extractor_window, StemExtractorDialogDefaults, StemSourceClip,
+    };
+    let audio_clips = if clips {
+        vec![
+            StemSourceClip {
+                clip_id: "clip-full-mix".into(),
+                track_id: "track-1".into(),
+                track_name: "Audio 1".into(),
+                clip_name: "Full Mix".into(),
+                source_path: "C:/Projects/Demo/Audio/full_mix.wav".into(),
+                start_beat: 0.0,
+                duration_beats: 128.0,
+                source_duration_seconds: Some(204.0),
+            },
+            StemSourceClip {
+                clip_id: "clip-chorus".into(),
+                track_id: "track-2".into(),
+                track_name: "Audio 2".into(),
+                clip_name: "Chorus Take".into(),
+                source_path: "C:/Projects/Demo/Audio/chorus_take.wav".into(),
+                start_beat: 32.0,
+                duration_beats: 16.0,
+                source_duration_seconds: Some(24.0),
+            },
+        ]
+    } else {
+        Vec::new()
+    };
+    let defaults = StemExtractorDialogDefaults {
+        project_name: "Demo".into(),
+        selected_clip_id: audio_clips.first().map(|clip| clip.clip_id.clone()),
+        audio_clips,
+        project_root: None,
+        models_dir: Some(std::env::temp_dir().join("fb-preview-empty-stem-models")),
+    };
+    let handle = open_stem_extractor_window(None, defaults, Arc::new(|_, _| {}), cx)
+        .map_err(gpui::private::anyhow::Error::msg)?;
+    if let Some(state) = state {
+        handle.update(cx, |this, _window, cx| {
+            this.show_state_for_preview(state, cx)
+        })?;
+    }
+    Ok(handle.into())
+}
+
+fn stem_extractor_scene(_options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_stem_extractor_preview(true, None, cx)
+}
+
+fn stem_extractor_empty_scene(_options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_stem_extractor_preview(false, None, cx)
+}
+
+fn stem_extractor_running_scene(_options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    use crate::components::stem_extractor_dialog::StemExtractJobState;
+    let progress = SphereAudioProcessor::StemExtractProgress::new(
+        SphereAudioProcessor::StemExtractStage::Separating,
+        46.0,
+        "Separating chunk 12 of 26",
+    );
+    open_stem_extractor_preview(true, Some(StemExtractJobState::Running(progress)), cx)
+}
+
+fn stem_extractor_done_scene(_options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    use crate::components::stem_extractor_dialog::{
+        StemExtractApplyRequest, StemExtractJobState, StemExtractJobSummary, StemExtractResultStem,
+    };
+    use SphereAudioProcessor::StemKind;
+    let stems = [
+        StemKind::Vocals,
+        StemKind::Drums,
+        StemKind::Bass,
+        StemKind::Other,
+    ]
+    .into_iter()
+    .map(|kind| StemExtractResultStem {
+        kind,
+        path: format!(
+            "C:/Projects/Demo/Rendered/Stems/Full Mix_{}.wav",
+            kind.as_str()
+        )
+        .into(),
+    })
+    .collect();
+    let summary = StemExtractJobSummary {
+        model: SphereAudioProcessor::StemModel::MdxNet,
+        device: SphereAudioProcessor::InferDevice::Cpu,
+        runtime: SphereAudioProcessor::StemPlatformRuntime::OnnxCpu,
+        backend: SphereAudioProcessor::InferBackendKind::SpectralStub,
+        apply: StemExtractApplyRequest {
+            source_track_id: "track-1".into(),
+            source_clip_id: "clip-full-mix".into(),
+            source_clip_name: "Full Mix".into(),
+            start_beat: 0.0,
+            duration_beats: 128.0,
+            source_duration_seconds: Some(204.0),
+            stems,
+        },
+    };
+    open_stem_extractor_preview(true, Some(StemExtractJobState::Complete(summary)), cx)
 }
 
 /// The System Overloaded dialog as a busy session raises it: four blocks
@@ -3874,19 +4952,47 @@ fn open_plate<M: KitModel>(
     block: PreviewBlock,
     then: impl FnOnce(&mut crate::components::plugin_kit::KitEditor<M>) + 'static,
 ) -> Result<AnyWindowHandle> {
+    open_plate_with(
+        options,
+        cx,
+        model,
+        (plugin, insert),
+        json,
+        (frames, block),
+        |ops| ops,
+        then,
+    )
+}
+
+/// [`open_plate`], with the host ops passed through `ops` first: for an
+/// editor whose controls need a host op the preview stands in for.
+#[allow(clippy::too_many_arguments)]
+fn open_plate_with<M: KitModel>(
+    options: WindowOptions,
+    cx: &mut App,
+    model: M,
+    (plugin, insert): (&'static str, &'static str),
+    json: std::result::Result<String, serde_json::Error>,
+    (frames, block): (
+        Vec<SpherePluginHost::audio_bridge::BuiltinMeterFrame>,
+        PreviewBlock,
+    ),
+    ops: impl FnOnce(BuiltinEditorHostOps) -> BuiltinEditorHostOps,
+    then: impl FnOnce(&mut crate::components::plugin_kit::KitEditor<M>) + 'static,
+) -> Result<AnyWindowHandle> {
     if let Ok(json) = json {
         seed(plugin, insert, json);
     }
     plate::ensure_fonts(cx);
     let last = frames.last().copied();
-    let host_ops = BuiltinEditorHostOps {
+    let host_ops = ops(BuiltinEditorHostOps {
         meter_source: last.map(|frame| {
             Arc::new(move |_: &PluginInstanceKey| Some(frame))
                 as crate::components::builtin_plugin_editor_window::BuiltinMeterSource
         }),
         pad_level_source: Some(Arc::new(move |_| Some((1, block)))),
         ..preview_host_ops()
-    };
+    });
     let handle = cx.open_window(options, move |_, cx| {
         cx.new(|cx| {
             let window = KitWindow::new(
@@ -4050,6 +5156,142 @@ fn duckstep_shaper_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWind
     params.depth = 80.0;
     params.offset = 10.0;
     duckstep_with(options, cx, "duckstep-shaper", params)
+}
+
+// ── Trigger ────────────────────────────────────────────────────────────────
+
+/// Trigger over [`preview_signal`] replacing its kicks with the built-in
+/// kick, the way the host drives it: whole blocks, then the meter frame (the
+/// detector in slot 0's input, each hit lighting slot 0's output).
+fn trigger_telemetry(
+    params: &trigger::Params,
+    sound: Option<trigger::synth::Sound>,
+) -> (
+    Vec<SpherePluginHost::audio_bridge::BuiltinMeterFrame>,
+    PreviewBlock,
+) {
+    const BLOCK: usize = 160;
+    let mut dsp = trigger::Dsp::new(48_000.0);
+    dsp.set_params(params.clone());
+    if let Some(sample) = sound
+        .and_then(|sound| quicksampler::SampleData::from_interleaved(&sound.render(), 1, 48_000))
+    {
+        dsp.sample_loader().submit(Some(Arc::new(sample)));
+    }
+    let mut noise = 0x2545_f491u32;
+    let mut frames = Vec::with_capacity(PREVIEW_BLOCKS);
+    let (mut left, mut right) = (vec![0.0; BLOCK], vec![0.0; BLOCK]);
+    let mut out = vec![0.0; BLOCK * 2];
+    for block in 0..PREVIEW_BLOCKS {
+        // A meter frame every 1 600 samples, as the other scenes take.
+        for sub in 0..PREVIEW_BLOCK / BLOCK {
+            let start = block * PREVIEW_BLOCK + sub * BLOCK;
+            for i in 0..BLOCK {
+                let (l, r) = preview_signal(start + i, &mut noise);
+                left[i] = l;
+                right[i] = r;
+            }
+            dsp.process_block(&left, &right, &mut out, BLOCK);
+        }
+        let f = dsp.meter_frame();
+        let mut slot_in_peak = [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS];
+        let mut slot_out_peak = [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS];
+        slot_in_peak[0] = f.detector_peak;
+        slot_out_peak[0] = if f.hit { 1.0 } else { 0.0 };
+        frames.push(SpherePluginHost::audio_bridge::BuiltinMeterFrame {
+            in_peak: f.in_peak,
+            in_rms: f.in_rms,
+            out_peak: f.out_peak,
+            out_rms: f.out_rms,
+            in_clip: f.in_clip,
+            out_clip: f.out_clip,
+            slot_in_peak,
+            slot_out_peak,
+            ..Default::default()
+        });
+    }
+    (frames, dsp.telemetry())
+}
+
+fn trigger_with(
+    options: WindowOptions,
+    cx: &mut App,
+    insert: &'static str,
+    params: trigger::Params,
+    sound: Option<trigger::synth::Sound>,
+) -> Result<AnyWindowHandle> {
+    use crate::components::trigger_plate::{show_sample_for_preview, TriggerPlate};
+    let (frames, block) = trigger_telemetry(&params, sound);
+    let json = trigger::ipc::TriggerState::new(params).to_json();
+    open_plate_with(
+        options,
+        cx,
+        TriggerPlate,
+        ("trigger", insert),
+        json,
+        (frames, block),
+        // The sample buttons act on the host: here, a stand-in that takes
+        // the load and drops it.
+        |ops| BuiltinEditorHostOps {
+            load_pad_sample: Some(Arc::new(|_, _| {})),
+            ..ops
+        },
+        move |editor| {
+            if let Some(sound) = sound {
+                show_sample_for_preview(editor, sound);
+            }
+        },
+    )
+}
+
+fn trigger_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    let params = trigger::factory_presets()
+        .into_iter()
+        .find(|preset| preset.name == "Kick Replace")
+        .map_or_else(trigger::default_params, |preset| preset.params);
+    let params = trigger::Params {
+        sample_name: Some(trigger::synth::Sound::Kick.file_name().to_string()),
+        ..params
+    };
+    trigger_with(
+        options,
+        cx,
+        "trigger",
+        params,
+        Some(trigger::synth::Sound::Kick),
+    )
+}
+
+fn trigger_blend_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    let params = trigger::Params {
+        mode: trigger::Mode::Blend,
+        dry_db: -3.0,
+        sample_db: -6.0,
+        length_ms: 260.0,
+        voices: 1,
+        threshold_db: -30.0,
+        hpf_hz: 150.0,
+        lpf_hz: 8_000.0,
+        sample_name: Some(trigger::synth::Sound::Snare.file_name().to_string()),
+        ..trigger::default_params()
+    };
+    trigger_with(
+        options,
+        cx,
+        "trigger-blend",
+        params,
+        Some(trigger::synth::Sound::Snare),
+    )
+}
+
+fn trigger_empty_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    trigger_with(
+        options,
+        cx,
+        "trigger-empty",
+        trigger::default_params(),
+        None,
+    )
 }
 
 // ── AirBoost ───────────────────────────────────────────────────────────────
@@ -4645,6 +5887,109 @@ fn settings_experimental(options: WindowOptions, cx: &mut App) -> Result<AnyWind
     )
 }
 
+/// A clip's and a track's context menus as drawn, with the command icon set.
+struct ContextMenuIconsPreview;
+
+impl gpui::Render for ContextMenuIconsPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+        use crate::components::context_menu::{preview_drawn_context_menu, ContextMenuEntry as E};
+        use gpui::{div, ParentElement, Styled};
+        let clip = vec![
+            E::item("Cut", "edit:cut").with_shortcut("Ctrl+X"),
+            E::item("Copy", "edit:copy").with_shortcut("Ctrl+C"),
+            E::item("Paste", "edit:paste").with_shortcut("Ctrl+V"),
+            E::item("Duplicate", "clip:duplicate").with_shortcut("Ctrl+D"),
+            E::Separator,
+            E::item("Split at Playhead", "clip:split-at-playhead").with_shortcut("S"),
+            E::item("Consolidate", "clip:consolidate"),
+            E::item("Bounce in Place", "audio:bounce-in-place"),
+            E::item("Export MIDI…", "midi:export-clip"),
+            E::Separator,
+            E::item("Rename…", "clip:rename"),
+            E::item("Properties", "clip:properties"),
+            E::danger_item("Delete", "clip:delete").with_shortcut("Del"),
+        ];
+        let track = vec![
+            E::item("Rename", "track:rename"),
+            E::item("Track Color", "track:color"),
+            E::Separator,
+            E::checked_item("Mute", "track:mute", true),
+            E::item("Solo", "track:solo"),
+            E::item("Freeze Track", "track:freeze"),
+            E::Separator,
+            E::Header("Track Height".into()),
+            E::checked_item("Small", "track:height-small", false),
+            E::checked_item("Normal", "track:height-normal", true),
+            E::item("Reset All Heights", "track:height-reset-all"),
+            E::Separator,
+            E::item("Group Selected Tracks", "track:group-selected"),
+            E::item("Remove from Folder", "track:remove-from-folder"),
+            E::item("Add Marker Here", "ruler:add-marker"),
+            E::danger_item("Delete Track", "track:delete"),
+        ];
+        div()
+            .size_full()
+            .relative()
+            .bg(crate::theme::Colors::surface_base())
+            .font(crate::theme::ui_font())
+            .child(preview_drawn_context_menu(clip, 24.0, 24.0, (640.0, 520.0)))
+            .child(preview_drawn_context_menu(
+                track,
+                330.0,
+                24.0,
+                (640.0, 520.0),
+            ))
+    }
+}
+
+fn context_menu_icons_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    let handle = cx.open_window(options, |_, cx| cx.new(|_| ContextMenuIconsPreview))?;
+    Ok(handle.into())
+}
+
+/// The MIDI page: two connected inputs (one switched off), a two-way port,
+/// an output, and a saved device that is unplugged.
+fn settings_midi(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    use crate::components::settings_dialog::SettingsTab;
+    use sphere_midi_service::{DetectedMidiDevice, MidiDeviceDirection, MidiDeviceSetting};
+    let detected = |id: &str, name: &str, direction| DetectedMidiDevice {
+        id: id.to_string(),
+        name: name.to_string(),
+        direction,
+    };
+    crate::device_registry::preview_set_midi_devices(vec![
+        detected("in-keys", "USB MIDI Keyboard", MidiDeviceDirection::Input),
+        detected("in-pads", "Pad Controller", MidiDeviceDirection::Input),
+        detected("io-loop", "Loopback Port", MidiDeviceDirection::InputOutput),
+        detected("out-synth", "Hardware Synth", MidiDeviceDirection::Output),
+    ]);
+    let mut schema = crate::settings::SettingsSchema::default();
+    let saved = |id: &str, name: &str, direction, enabled| MidiDeviceSetting {
+        id: id.to_string(),
+        name: name.to_string(),
+        direction,
+        enabled,
+        connected: false,
+        clock_enabled: false,
+    };
+    schema.hardware.midi.devices = vec![
+        saved(
+            "in-keys",
+            "USB MIDI Keyboard",
+            MidiDeviceDirection::Input,
+            true,
+        ),
+        saved(
+            "in-pads",
+            "Pad Controller",
+            MidiDeviceDirection::Input,
+            false,
+        ),
+        saved("in-old", "Old Controller", MidiDeviceDirection::Input, true),
+    ];
+    settings_on(SettingsTab::Midi, schema, options, cx)
+}
+
 /// The Audio page with WASAPI Shared selected and Shared Headroom on, so the
 /// backend-specific switch is drawn.
 fn settings_audio_shared(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
@@ -5137,6 +6482,118 @@ mod tests {
     }
 }
 
+/// The Add Automation picker of a sampler track with two sends: its own
+/// controls and sends open, the sampler folded under its name — or, with
+/// `sampler_open`, unfolded.
+fn automation_picker_scene(
+    options: WindowOptions,
+    cx: &mut App,
+    sampler_open: bool,
+) -> Result<AnyWindowHandle> {
+    use crate::components::text_input::{TextInputCallbacks, TextInputState};
+    use crate::components::timeline::automation_target_picker::{
+        automation_target_picker_overlay, plugin_group_key,
+    };
+    use crate::components::timeline::timeline_state::{
+        AutomationPickerModel, AutomationPickerParameter, AutomationPickerPluginGroup,
+        AutomationTarget,
+    };
+    use crate::theme::Colors;
+    use gpui::{div, IntoElement, ParentElement, Render, Styled};
+    struct AutomationPickerPreview {
+        model: AutomationPickerModel,
+        search: TextInputState,
+        open_groups: std::collections::HashSet<String>,
+    }
+    impl Render for AutomationPickerPreview {
+        fn render(&mut self, _w: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .relative()
+                .size_full()
+                .font(crate::theme::ui_font())
+                .bg(Colors::surface_window())
+                .child(automation_target_picker_overlay(
+                    &self.model,
+                    "track-1",
+                    "",
+                    &self.search,
+                    false,
+                    30.0,
+                    40.0,
+                    420.0,
+                    600.0,
+                    Arc::new(|_, _, _| {}),
+                    Arc::new(|_, _, _| {}),
+                    TextInputCallbacks::default(),
+                    &self.open_groups,
+                    Arc::new(|_, _, _| {}),
+                ))
+        }
+    }
+    let send = |id: &str| AutomationTarget::SendLevel {
+        send_id: id.to_string(),
+    };
+    let send_on = |id: &str| AutomationTarget::SendEnabled {
+        send_id: id.to_string(),
+    };
+    let model = AutomationPickerModel {
+        last_touched: None,
+        instrument: Some(AutomationPickerPluginGroup {
+            insert_id: "insert-1".to_string(),
+            plugin_name: "Kontakt 8".to_string(),
+            parameters: (1..=64)
+                .map(|n| AutomationPickerParameter {
+                    target: AutomationTarget::PluginParameter {
+                        insert_id: "insert-1".to_string(),
+                        parameter_id: n.to_string(),
+                        parameter_name: format!("Kontakt 8: #{n:02}"),
+                    },
+                    param_title: format!("#{n:02}"),
+                    already_added: false,
+                })
+                .collect(),
+        }),
+        effects: Vec::new(),
+        track_targets: vec![
+            (AutomationTarget::TrackVolume, "Volume".to_string(), true),
+            (AutomationTarget::TrackPan, "Pan".to_string(), false),
+            (AutomationTarget::TrackMute, "Mute".to_string(), false),
+            (send("send-1"), "Send \u{2192} Reverb".to_string(), false),
+            (
+                send_on("send-1"),
+                "Send \u{2192} Reverb On/Off".to_string(),
+                false,
+            ),
+            (send("send-2"), "Send \u{2192} Delay".to_string(), false),
+            (
+                send_on("send-2"),
+                "Send \u{2192} Delay On/Off".to_string(),
+                false,
+            ),
+            (
+                AutomationTarget::InsertBypass {
+                    insert_id: "insert-2".to_string(),
+                },
+                "EQUZ8 Bypass".to_string(),
+                false,
+            ),
+        ],
+    };
+    cx.open_window(options, move |_, cx| {
+        cx.new(|cx| AutomationPickerPreview {
+            model,
+            search: TextInputState::new("automation-picker-search", cx.focus_handle())
+                .with_placeholder("Search parameters..."),
+            open_groups: if sampler_open {
+                [plugin_group_key("insert-1")].into_iter().collect()
+            } else {
+                Default::default()
+            },
+        })
+    })
+    .map(Into::into)
+}
+
 /// The Process Explorer with a session's worth of plug-ins.
 /// The Background Tasks popup over the status bar's corner, with a job in
 /// each state.
@@ -5277,6 +6734,25 @@ fn background_tasks_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWin
     store.panel_open = true;
     let handle = cx.open_window(options, |_, cx| {
         cx.new(|_| BackgroundTasksPreview { store })
+    })?;
+    Ok(handle.into())
+}
+
+/// The Chord Generator window on a fixed opening progression.
+fn chord_generator_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    use crate::components::chord_generator::ChordGeneratorWindow;
+    let handle = cx.open_window(options, |_, cx| {
+        cx.new(|cx| ChordGeneratorWindow::for_preview(0x5eed_c40d, cx))
+    })?;
+    Ok(handle.into())
+}
+
+/// The Chord Generator with its palette a fifth from the song key and a
+/// section selected.
+fn chord_generator_browsing_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    use crate::components::chord_generator::ChordGeneratorWindow;
+    let handle = cx.open_window(options, |_, cx| {
+        cx.new(|cx| ChordGeneratorWindow::for_preview_browsing(0x5eed_c40d, cx))
     })?;
     Ok(handle.into())
 }
@@ -5423,6 +6899,102 @@ fn process_explorer_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWin
 }
 
 /// The start screen, with this machine's own recent list and settings.
+/// The Start pane's recent grid: two projects with thumbnails drawn by the
+/// real thumbnail renderer, one made before thumbnails, and one missing.
+fn welcome_recent_grid_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    welcome_recent_grid_with(options, cx, "")
+}
+
+/// The Recent grid narrowed by a search.
+fn welcome_recent_search_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    welcome_recent_grid_with(options, cx, "sketch")
+}
+
+fn welcome_recent_grid_with(
+    options: WindowOptions,
+    cx: &mut App,
+    query: &'static str,
+) -> Result<AnyWindowHandle> {
+    use crate::project::recent::RecentProject;
+    use crate::project::thumbnail::render_thumbnail;
+    use crate::project::FutureboardProject;
+    use crate::welcome::{WelcomeCallbacks, WelcomeWindow};
+
+    let thumb = |project: &FutureboardProject| {
+        let mut bytes = Vec::new();
+        render_thumbnail(project)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .ok()?;
+        Some(Arc::new(gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            bytes,
+        )))
+    };
+    let demo = crate::components::timeline::timeline_state::TimelineState::demo_project();
+    let first = FutureboardProject::from(&demo);
+    // The same song with its parts doubled further along, so the two
+    // pictures differ.
+    let mut second = first.clone();
+    for track in &mut second.tracks {
+        let more: Vec<_> = track
+            .clips
+            .iter()
+            .map(|clip| {
+                let mut clip = clip.clone();
+                clip.start_beat += 16.0;
+                clip
+            })
+            .collect();
+        track.clips.extend(more);
+    }
+    let now = crate::project::now_secs();
+    let entry = |name: &str, hours_ago: u64, missing: bool| RecentProject {
+        name: name.to_string(),
+        folder_path: Some(format!("D:/Music/Projects/{name}").into()),
+        path: format!("D:/Music/Projects/{name}/{name}.fbproj").into(),
+        last_opened_at: now - hours_ago * 3_600,
+        missing,
+    };
+    let entries = vec![
+        entry("Night Drive", 2, false),
+        entry("Chorus Sketch", 26, false),
+        entry("Old Session 2025", 24 * 40, false),
+        entry("Lost Demo", 24 * 9, true),
+    ];
+    // The first card shows a thumbnail made from the arrangement view, when
+    // the `arrangement-thumbnail` scene has written one this run or before.
+    let captured = std::fs::read(
+        std::env::temp_dir()
+            .join("futureboard-ui-preview")
+            .join("arrangement-thumb.png"),
+    )
+    .ok()
+    .map(|bytes| Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes)));
+    let thumbs = vec![
+        captured.or_else(|| thumb(&first)),
+        thumb(&second),
+        None,
+        None,
+    ];
+    let callbacks = WelcomeCallbacks {
+        on_action: std::sync::Arc::new(|_, _, _| {}),
+        footer_action: None,
+    };
+    let handle = cx.open_window(options, |_, cx| {
+        cx.new(|cx| {
+            let mut welcome = WelcomeWindow::new(callbacks, cx);
+            welcome.preview_recents(entries, thumbs);
+            welcome.preview_backdrop(false);
+            welcome.preview_search(query);
+            welcome
+        })
+    })?;
+    Ok(handle.into())
+}
+
 fn welcome_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
     use crate::welcome::{WelcomeCallbacks, WelcomeWindow};
     let callbacks = WelcomeCallbacks {
@@ -5430,7 +7002,11 @@ fn welcome_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle
         footer_action: None,
     };
     let handle = cx.open_window(options, |_, cx| {
-        cx.new(|cx| WelcomeWindow::new(callbacks, cx.focus_handle()))
+        cx.new(|cx| {
+            let mut welcome = WelcomeWindow::new(callbacks, cx);
+            welcome.preview_backdrop(false);
+            welcome
+        })
     })?;
     Ok(handle.into())
 }

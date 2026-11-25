@@ -8,27 +8,35 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, size, App, AppContext, Bounds, Context, FocusHandle, InteractiveElement, IntoElement,
-    KeyDownEvent, ParentElement, Render, SharedString, Styled, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowHandle, WindowKind,
+    div, px, size, svg, App, AppContext, Bounds, Context, FocusHandle, InteractiveElement,
+    IntoElement, KeyDownEvent, ParentElement, Render, Role, SharedString,
+    StatefulInteractiveElement, Styled, Toggled, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowHandle, WindowKind,
 };
 use sphere_encoder::{
     create_encoder, AudioEncodeOptions, AudioEncodeSpec, AudioFileFormat, AudioSampleFormat,
 };
 
-use crate::components::controls::{fb_button, fb_checkbox, FbButtonKind};
+use crate::assets;
+use crate::components::controls::{
+    fb_button, fb_segment, fb_segmented_track, FbButtonKind, FbSegment,
+};
 use crate::components::form::select::{select, SelectOption};
 use crate::components::progress_dialog::{progress_bar, ProgressBarValue};
 use crate::components::title_bar::{external_window_titlebar_compact, TITLEBAR_HEIGHT};
-use crate::theme::{self, Colors};
+use crate::theme::{self, elevation, radius, space, state, typography, Colors};
 use crate::window_position::{apply_owner_display, centered_window_bounds};
 
 pub const STEM_EXTRACTOR_WINDOW_WIDTH: f32 = 520.0;
-const STEM_EXTRACTOR_WINDOW_HEIGHT: f32 = 560.0;
-const BODY_PAD: f32 = 14.0;
-const ROW_GAP: f32 = 9.0;
-const LABEL_W: f32 = 96.0;
+const STEM_EXTRACTOR_WINDOW_HEIGHT: f32 = 610.0;
+const BODY_PAD: f32 = space::SECTION + space::TIGHT;
+/// Width of the label column in step 3 (Model, Quality).
+const FIELD_LABEL_W: f32 = 52.0;
+/// The number disc in front of each step title.
+const STEP_DISC: f32 = 20.0;
+const STEM_TILE_H: f32 = 66.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SelectField {
@@ -260,7 +268,8 @@ impl StemExtractorWindow {
                 true
             }
             "enter"
-                if matches!(self.state, StemExtractJobState::Editing) && !self.is_downloading() =>
+                if matches!(self.state, StemExtractJobState::Editing)
+                    && self.extract_blocker().is_none() =>
             {
                 self.start_extract(cx);
                 true
@@ -281,15 +290,6 @@ impl StemExtractorWindow {
             download.cancel.cancel();
         }
         cx.notify();
-    }
-
-    fn can_extract(&self) -> bool {
-        !self.is_downloading()
-            && self.selected_clip().is_some()
-            && self.source_path.is_some()
-            && self.params.validate().is_ok()
-            && !self.params.stems.is_empty()
-            && SphereAudioProcessor::resolve_current_platform_runtime().is_ok()
     }
 
     fn start_download(&mut self, cx: &mut Context<Self>) {
@@ -682,11 +682,7 @@ impl Render for StemExtractorWindow {
             StemExtractJobState::Complete(summary) => {
                 self.render_complete(summary.clone(), target.clone())
             }
-            StemExtractJobState::Cancelled => self.render_terminal(
-                "Extraction cancelled.",
-                Colors::text_secondary(),
-                target.clone(),
-            ),
+            StemExtractJobState::Cancelled => self.render_cancelled(target.clone()),
         };
 
         div()
@@ -713,122 +709,216 @@ impl Render for StemExtractorWindow {
                     }
                 },
             ))
-            .child(
-                div()
-                    .px(px(BODY_PAD))
-                    .pt(px(6.0))
-                    .text_size(px(11.0))
-                    .text_color(Colors::text_muted())
-                    .truncate()
-                    .child(self.subtitle()),
-            )
             .child(body)
     }
 }
 
 impl StemExtractorWindow {
-    fn subtitle(&self) -> String {
-        if let Some(clip) = self.selected_clip() {
-            format!("Source clip · {}", clip.label())
-        } else if self.defaults.audio_clips.is_empty() {
-            "MDX-NET · select an audio clip on a track".to_string()
-        } else {
-            format!("MDX-NET stem separation · {}", platform_runtime_label())
+    /// Why Extract is unavailable right now, in words the footer can show.
+    /// `None` when the job can start.
+    fn extract_blocker(&self) -> Option<String> {
+        if self.is_downloading() {
+            return Some("Wait for the download to finish.".into());
         }
+        if self.defaults.audio_clips.is_empty() {
+            return Some("Add an audio clip to a track first.".into());
+        }
+        if let Err(error) = SphereAudioProcessor::resolve_current_platform_runtime() {
+            return Some(error.user_message());
+        }
+        if self.selected_clip().is_none() || self.source_path.is_none() {
+            return Some("Pick a clip to split.".into());
+        }
+        if self.params.stems.is_empty() {
+            return Some("Pick at least one stem.".into());
+        }
+        if let Err(error) = self.params.validate() {
+            return Some(error.user_message());
+        }
+        None
+    }
+
+    /// Puts the dialog straight onto a later screen, for a preview.
+    #[cfg(feature = "ui-preview")]
+    pub fn show_state_for_preview(&mut self, state: StemExtractJobState, cx: &mut Context<Self>) {
+        self.state = state;
+        cx.notify();
+    }
+
+    fn back_to_editing(&mut self, cx: &mut Context<Self>) {
+        self.state = StemExtractJobState::Editing;
+        cx.notify();
     }
 
     fn render_editing(&self, target: gpui::Entity<Self>) -> gpui::AnyElement {
-        let mut col = div()
+        let stem_count = self.params.stems.len();
+        let stems_total = self.params.model.default_stems().len();
+        let mut body = div()
+            .id("stem-extractor-body")
             .flex()
             .flex_col()
             .flex_1()
+            .min_h(px(0.0))
+            .overflow_y_scroll()
             .px(px(BODY_PAD))
-            .py(px(BODY_PAD))
-            .gap(px(ROW_GAP))
-            .child(section_label("SOURCE"))
-            .child(self.clip_row(target.clone()))
+            .pt(px(space::LOOSE))
+            .pb(px(BODY_PAD))
+            .gap(px(space::SECTION))
             .child(
                 div()
-                    .text_size(px(10.0))
-                    .text_color(Colors::text_faint())
-                    .child(
-                        "Stems render to new tracks. The original source track is muted."
-                            .to_string(),
-                    ),
+                    .text_size(px(typography::UI_SM))
+                    .text_color(Colors::text_secondary())
+                    .child("Split a clip into separate parts. Each part lands on its own track."),
             )
-            .child(section_label("MODEL"))
-            .child(self.model_row(target.clone()))
-            .child(self.model_status_row(target.clone()))
-            .child(self.runtime_row())
-            .child(self.quality_row(target.clone()))
-            .child(section_label("STEMS"))
-            .child(self.stems_row(target.clone()))
-            .child(
+            .child(step(
+                1,
+                "Choose a clip",
+                None,
+                self.render_source(target.clone()),
+            ))
+            .child(step(
+                2,
+                "Pick the stems",
+                Some(
+                    div()
+                        .text_size(px(typography::UI_XS))
+                        .text_color(Colors::text_muted())
+                        .child(format!("{stem_count} of {stems_total}"))
+                        .into_any_element(),
+                ),
                 div()
-                    .text_size(px(10.0))
-                    .text_color(Colors::text_faint())
-                    .child(model_hint(
-                        &self.params,
-                        self.model_installed,
-                        &self.models_dir,
-                    )),
-            )
-            .child(div().flex_1());
-
-        if let ModelDownloadUi::Failed(message) = &self.download_ui {
-            col = col.child(error_banner(message.clone()));
-        } else if let ModelDownloadUi::Running(progress) = &self.download_ui {
-            col = col.child(self.render_download_progress(progress.clone(), target.clone()));
-        }
+                    .flex()
+                    .flex_col()
+                    .gap(px(space::BASE))
+                    .child(self.render_stem_tiles(target.clone()))
+                    .child(caption(
+                        "Each stem becomes a new track. The original track is muted.",
+                    ))
+                    .into_any_element(),
+            ))
+            .child(step(
+                3,
+                "Model and quality",
+                None,
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(space::BASE))
+                    .child(self.model_select(target.clone()))
+                    .child(self.render_model_status(target.clone()))
+                    .child(self.render_quality(target.clone()))
+                    .into_any_element(),
+            ));
 
         if let StemExtractJobState::Failed(message) = &self.state {
-            col = col.child(error_banner(message.clone()));
-        } else if self.defaults.audio_clips.is_empty() {
-            col = col.child(hint_banner(
-                "No audio clips on tracks. Import or record audio first.".into(),
-            ));
-        } else if let Err(error) = SphereAudioProcessor::resolve_current_platform_runtime() {
-            col = col.child(hint_banner(error.user_message()));
-        } else if !self.can_extract() && !self.is_downloading() {
-            col = col.child(hint_banner(
-                "Select an audio clip and at least one stem.".into(),
+            body = body.child(notice(
+                assets::ICON_TRIANGLE_ALERT_PATH,
+                Colors::status_error(),
+                "Extraction failed",
+                message.clone(),
             ));
         }
 
-        col = col.child(self.footer(self.can_extract(), target));
-        col.into_any_element()
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .child(body)
+            .child(self.footer(target))
+            .into_any_element()
     }
 
-    fn clip_row(&self, target: gpui::Entity<Self>) -> impl IntoElement {
-        let empty = self.defaults.audio_clips.is_empty();
-        let options = if empty {
-            vec![SelectOption::new("__none__", "No audio clips on tracks").disabled(true)]
-        } else {
-            self.defaults
-                .audio_clips
-                .iter()
-                .map(|clip| {
-                    let file_name = clip
-                        .source_path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| clip.source_path.display().to_string());
-                    SelectOption::new(clip.clip_id.clone(), clip.label()).description(file_name)
-                })
-                .collect()
-        };
-        let selected = self.selected_clip_id.clone().unwrap_or_else(|| {
-            if empty {
-                "__none__".to_string()
-            } else {
-                String::new()
-            }
-        });
+    fn render_source(&self, target: gpui::Entity<Self>) -> gpui::AnyElement {
+        if self.defaults.audio_clips.is_empty() {
+            return div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(space::LOOSE))
+                .px(px(space::LOOSE))
+                .py(px(space::LOOSE))
+                .rounded(px(radius::CONTROL))
+                .border(px(1.0))
+                .border_dashed()
+                .border_color(Colors::border_normal())
+                .child(
+                    svg()
+                        .path(assets::ICON_AUDIO_LINES_PATH)
+                        .size(px(20.0))
+                        .flex_none()
+                        .text_color(Colors::text_faint()),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(space::HAIR))
+                        .min_w(px(0.0))
+                        .child(
+                            div()
+                                .text_size(px(typography::UI_SM))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(Colors::text_secondary())
+                                .child("No audio clips in this project yet"),
+                        )
+                        .child(caption(
+                            "Import or record audio on a track, then open Stem Extractor again.",
+                        )),
+                )
+                .into_any_element();
+        }
+
+        let options = self
+            .defaults
+            .audio_clips
+            .iter()
+            .map(|clip| {
+                SelectOption::new(clip.clip_id.clone(), clip.label())
+                    .description(clip_file_name(clip))
+            })
+            .collect();
+        let selected = self.selected_clip_id.clone().unwrap_or_default();
         let control = self.dropdown(SelectField::Clip, "stem-clip", selected, options, target);
-        self.labeled("Clip", control)
+        let meta = self.selected_clip().map(|clip| {
+            let mut parts = vec![clip_file_name(clip)];
+            if let Some(seconds) = clip.source_duration_seconds {
+                parts.push(format_duration(seconds));
+            }
+            parts.join(" · ")
+        });
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(space::SNUG))
+            .child(control)
+            .children(meta.map(caption))
+            .into_any_element()
     }
 
-    fn model_row(&self, target: gpui::Entity<Self>) -> impl IntoElement {
+    fn render_stem_tiles(&self, target: gpui::Entity<Self>) -> impl IntoElement {
+        let stems = self.params.model.default_stems();
+        div()
+            .flex()
+            .flex_row()
+            .gap(px(space::BASE))
+            .children(stems.iter().copied().map(|stem| {
+                let checked = self.params.stems.contains(stem);
+                let target = target.clone();
+                stem_tile(stem, checked, move |_, _window, cx| {
+                    let _ = target.update(cx, |this, cx| {
+                        this.params
+                            .set_stem(stem, !this.params.stems.contains(stem));
+                        if matches!(this.state, StemExtractJobState::Failed(_)) {
+                            this.state = StemExtractJobState::Editing;
+                        }
+                        cx.notify();
+                    });
+                })
+            }))
+    }
+
+    fn model_select(&self, target: gpui::Entity<Self>) -> impl IntoElement {
         let models_dir = self.models_dir.clone();
         let options = SphereAudioProcessor::STEM_MODELS
             .iter()
@@ -836,9 +926,9 @@ impl StemExtractorWindow {
                 let package = info.model.package();
                 let installed = SphereAudioProcessor::model_installed(info.model, &models_dir);
                 let status = if installed {
-                    "Installed"
+                    "Downloaded"
                 } else {
-                    "Not installed"
+                    "Not downloaded"
                 };
                 SelectOption::new(info.id, info.label).description(format!(
                     "{} · {} · {status}",
@@ -854,185 +944,135 @@ impl StemExtractorWindow {
             options,
             target,
         );
-        self.labeled("Model", control)
+        field_row("Model", control)
     }
 
-    fn model_status_row(&self, target: gpui::Entity<Self>) -> impl IntoElement {
+    /// One card that says whether the chosen model is ready and, when it is
+    /// not, offers the download right there — progress, cancel and retry
+    /// included.
+    fn render_model_status(&self, target: gpui::Entity<Self>) -> impl IntoElement {
         let package = self.params.model.package();
-        let downloading = self.is_downloading();
-        let status = if let ModelDownloadUi::Running(progress) = &self.download_ui {
-            format!(
-                "Downloading… {:.0}% · {}",
-                progress.percent, progress.file_name
-            )
-        } else if self.model_installed {
-            format!(
-                "Installed · {} file(s) · {}",
-                package.file_count(),
-                package.approx_size_label()
-            )
-        } else {
-            format!(
-                "Not installed · {} · {}",
-                package.source_label,
-                package.approx_size_label()
-            )
-        };
-        let can_download = !self.model_installed
-            && !downloading
-            && !matches!(self.state, StemExtractJobState::Running(_));
-        let control = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(8.0))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .text_size(px(11.0))
-                    .text_color(if downloading {
-                        Colors::accent_primary()
-                    } else if self.model_installed {
-                        Colors::text_secondary()
-                    } else {
-                        Colors::text_muted()
-                    })
-                    .truncate()
-                    .child(status),
-            )
-            .child(fb_button(
-                "stem-model-download",
-                if downloading {
-                    "Downloading…"
-                } else {
-                    "Download"
-                },
-                FbButtonKind::Default,
-                can_download,
-                {
-                    let target = target.clone();
-                    move |_, _window, cx| {
-                        let _ = target.update(cx, |this, cx| this.start_download(cx));
-                    }
-                },
-            ));
-        self.labeled("Weights", control)
-    }
+        let size = package.approx_size_label();
+        let running_job = matches!(self.state, StemExtractJobState::Running(_));
 
-    fn render_download_progress(
-        &self,
-        progress: SphereAudioProcessor::StemModelDownloadProgress,
-        target: gpui::Entity<Self>,
-    ) -> impl IntoElement {
-        let percent = format!("{:.0}%", progress.percent);
-        let detail = if progress.file_count > 1 {
-            format!(
-                "{} ({}/{}) · {}",
-                progress.detail,
-                progress.file_index + 1,
-                progress.file_count,
-                progress.file_name
-            )
-        } else {
-            format!("{} · {}", progress.detail, progress.file_name)
-        };
-        div()
+        let card = div()
             .flex()
             .flex_col()
-            .gap(px(6.0))
-            .px(px(10.0))
-            .py(px(8.0))
-            .rounded(px(crate::theme::radius::CONTROL))
-            .bg(Colors::surface_panel_alt())
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(Colors::text_primary())
-                            .child(format!("Downloading {}", progress.model.label())),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .text_color(Colors::accent_primary())
-                            .child(percent),
+            .gap(px(space::BASE))
+            .px(px(space::LOOSE))
+            .py(px(space::BASE + space::HAIR))
+            .rounded(px(radius::CONTROL))
+            .bg(Colors::surface_panel())
+            .border(px(1.0))
+            .border_color(Colors::border_subtle());
+
+        if let ModelDownloadUi::Running(progress) = &self.download_ui {
+            let detail = if progress.file_count > 1 {
+                format!(
+                    "{} ({}/{})",
+                    progress.file_name,
+                    progress.file_index + 1,
+                    progress.file_count
+                )
+            } else {
+                progress.file_name.clone()
+            };
+            return card
+                .child(status_line(
+                    assets::ICON_DOWNLOAD_PATH,
+                    Colors::accent_primary(),
+                    format!(
+                        "Downloading {} · {:.0}%",
+                        progress.model.label(),
+                        progress.percent
                     ),
-            )
-            .child(progress_bar(ProgressBarValue::value(
-                progress.percent / 100.0,
-            )))
-            .child(
-                div()
-                    .text_size(px(10.0))
-                    .text_color(Colors::text_muted())
-                    .child(detail),
-            )
-            .child(div().flex().flex_row().justify_end().child(fb_button(
-                "stem-download-cancel",
-                "Cancel Download",
+                    detail,
+                    Some(
+                        fb_button(
+                            "stem-download-cancel",
+                            "Cancel",
+                            FbButtonKind::Default,
+                            true,
+                            {
+                                let target = target.clone();
+                                move |_, _window, cx| {
+                                    let _ = target
+                                        .update(cx, |this, cx| this.request_cancel_download(cx));
+                                }
+                            },
+                        )
+                        .into_any_element(),
+                    ),
+                ))
+                .child(progress_bar(ProgressBarValue::value(
+                    progress.percent / 100.0,
+                )));
+        }
+
+        if self.model_installed {
+            return card.child(status_line(
+                assets::ICON_CIRCLE_CHECK_PATH,
+                Colors::status_success(),
+                "Ready to use".to_string(),
+                format!("Downloaded · {size} · runs on {}", platform_runtime_label()),
+                None,
+            ));
+        }
+
+        let download_target = target.clone();
+        let download = move |label: &'static str| {
+            let target = download_target.clone();
+            fb_button(
+                "stem-model-download",
+                label,
                 FbButtonKind::Default,
-                true,
-                {
-                    let target = target.clone();
-                    move |_, _window, cx| {
-                        let _ = target.update(cx, |this, cx| this.request_cancel_download(cx));
-                    }
+                !running_job,
+                move |_, _window, cx| {
+                    let _ = target.update(cx, |this, cx| this.start_download(cx));
                 },
-            )))
+            )
+            .into_any_element()
+        };
+
+        if let ModelDownloadUi::Failed(message) = &self.download_ui {
+            return card.child(status_line(
+                assets::ICON_TRIANGLE_ALERT_PATH,
+                Colors::status_error(),
+                "Download failed".to_string(),
+                message.clone(),
+                Some(download("Try Again")),
+            ));
+        }
+
+        card.child(status_line(
+            assets::ICON_DOWNLOAD_PATH,
+            Colors::text_secondary(),
+            format!("Download the model · {size}"),
+            "One-time download. Until then a basic spectral split is used.".to_string(),
+            Some(download("Download")),
+        ))
     }
 
-    fn runtime_row(&self) -> impl IntoElement {
-        self.labeled(
-            "Runtime",
-            div()
-                .text_size(px(11.0))
-                .text_color(Colors::text_secondary())
-                .child(platform_runtime_label()),
-        )
-    }
-
-    fn quality_row(&self, target: gpui::Entity<Self>) -> impl IntoElement {
-        let options = vec![
-            SelectOption::new("draft", "Draft"),
-            SelectOption::new("balanced", "Balanced"),
-            SelectOption::new("high", "High"),
+    fn render_quality(&self, target: gpui::Entity<Self>) -> impl IntoElement {
+        use SphereAudioProcessor::StemExtractQuality as Quality;
+        let current = self.params.quality;
+        let choices = [
+            (Quality::Draft, "Fast", FbSegment::First),
+            (Quality::Balanced, "Balanced", FbSegment::Middle),
+            (Quality::High, "Best", FbSegment::Last),
         ];
-        let control = self.dropdown(
-            SelectField::Quality,
-            "stem-quality",
-            self.params.quality.as_str().to_string(),
-            options,
-            target,
-        );
-        self.labeled("Quality", control)
-    }
-
-    fn stems_row(&self, target: gpui::Entity<Self>) -> impl IntoElement {
-        let stems = self.params.model.default_stems();
-        div()
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .gap(px(10.0))
-            .children(stems.iter().copied().map(|stem| {
-                let checked = self.params.stems.contains(stem);
+        let track = fb_segmented_track()
+            .flex_1()
+            .children(choices.into_iter().map(|(quality, label, position)| {
                 let target = target.clone();
-                fb_checkbox(
-                    format!("stem-toggle-{}", stem.as_str()),
-                    stem.label(),
-                    checked,
-                    true,
+                fb_segment(
+                    SharedString::from(format!("stem-quality-{}", quality.as_str())),
+                    label,
+                    current == quality,
+                    position,
                     move |_, _window, cx| {
                         let _ = target.update(cx, |this, cx| {
-                            this.params
-                                .set_stem(stem, !this.params.stems.contains(stem));
+                            this.apply_select(SelectField::Quality, quality.as_str());
                             if matches!(this.state, StemExtractJobState::Failed(_)) {
                                 this.state = StemExtractJobState::Editing;
                             }
@@ -1040,7 +1080,22 @@ impl StemExtractorWindow {
                         });
                     },
                 )
-            }))
+            }));
+        let explanation = match current {
+            Quality::Draft => "Quickest. Good for a first listen.",
+            Quality::Balanced => "Clean stems at a moderate speed. Recommended.",
+            Quality::High => "Cleanest stems. Takes the longest.",
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(space::SNUG))
+            .child(field_row("Quality", track))
+            .child(
+                div()
+                    .pl(px(FIELD_LABEL_W + space::BASE))
+                    .child(caption(explanation)),
+            )
     }
 
     fn dropdown(
@@ -1086,39 +1141,36 @@ impl StemExtractorWindow {
         )
     }
 
-    fn labeled<E: IntoElement>(&self, label: &str, control: E) -> gpui::Stateful<gpui::Div> {
-        div()
-            .id(SharedString::from(format!("stem-row-{label}")))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(10.0))
-            .child(
-                div()
-                    .w(px(LABEL_W))
-                    .flex_none()
-                    .text_size(px(11.0))
-                    .text_color(Colors::text_secondary())
-                    .child(label.to_string()),
-            )
+    /// The action bar: what Extract will do (or why it can't yet) on the
+    /// left, Cancel and Extract on the right.
+    fn footer(&self, target: gpui::Entity<Self>) -> impl IntoElement {
+        let blocker = self.extract_blocker();
+        let count = self.params.stems.len();
+        let (hint, hint_color) = match &blocker {
+            Some(reason) => (reason.clone(), Colors::text_muted()),
+            None => (
+                format!(
+                    "Adds {count} new track{}",
+                    if count == 1 { "" } else { "s" }
+                ),
+                Colors::text_secondary(),
+            ),
+        };
+        let extract_label = match count {
+            0 => "Extract".to_string(),
+            1 => "Extract 1 Stem".to_string(),
+            n => format!("Extract {n} Stems"),
+        };
+        footer_bar()
             .child(
                 div()
                     .flex_1()
                     .min_w(px(0.0))
-                    .child(control.into_any_element()),
+                    .text_size(px(typography::UI_XS))
+                    .text_color(hint_color)
+                    .truncate()
+                    .child(hint),
             )
-    }
-
-    fn footer(&self, can_extract: bool, target: gpui::Entity<Self>) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_end()
-            .gap(px(8.0))
-            .pt(px(8.0))
-            .border_t(px(1.0))
-            .border_color(Colors::border_subtle())
             .child(fb_button(
                 "stem-cancel",
                 "Cancel",
@@ -1133,9 +1185,9 @@ impl StemExtractorWindow {
             ))
             .child(fb_button(
                 "stem-extract",
-                "Extract",
+                extract_label,
                 FbButtonKind::Primary,
-                can_extract,
+                blocker.is_none(),
                 {
                     let target = target.clone();
                     move |_, _window, cx| {
@@ -1150,61 +1202,109 @@ impl StemExtractorWindow {
         progress: SphereAudioProcessor::StemExtractProgress,
         target: gpui::Entity<Self>,
     ) -> gpui::AnyElement {
-        let percent = format!("{:.0}%", progress.percent);
+        use SphereAudioProcessor::StemExtractStage as Stage;
+        let stages = [
+            (Stage::Preparing, "Read audio"),
+            (Stage::LoadingModel, "Load model"),
+            (Stage::Separating, "Separate"),
+            (Stage::Writing, "Write tracks"),
+        ];
+        let current = stages
+            .iter()
+            .position(|(stage, _)| *stage == progress.stage)
+            .unwrap_or(stages.len());
         let detail = if let Some(stem) = progress.current_stem {
             format!("{} · {}", progress.detail, stem.label())
         } else {
             progress.detail.clone()
         };
-        div()
+        let clip = self
+            .selected_clip()
+            .map(StemSourceClip::label)
+            .unwrap_or_default();
+
+        let body = div()
             .flex()
             .flex_col()
             .flex_1()
             .px(px(BODY_PAD))
-            .py(px(BODY_PAD))
-            .gap(px(10.0))
+            .py(px(BODY_PAD + space::BASE))
+            .gap(px(space::SECTION))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(space::HAIR))
+                    .child(
+                        div()
+                            .text_size(px(typography::UI_LG))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(Colors::text_primary())
+                            .child("Extracting stems…"),
+                    )
+                    .child(caption(clip)),
+            )
+            .child(
+                div().flex().flex_row().gap(px(space::BASE)).children(
+                    stages
+                        .iter()
+                        .enumerate()
+                        .map(|(index, (_, label))| stage_chip(label, index.cmp(&current))),
+                ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(space::SNUG))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(space::BASE))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .text_size(px(typography::UI_XS))
+                                    .text_color(Colors::text_secondary())
+                                    .truncate()
+                                    .child(detail),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(typography::UI_XS))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(Colors::accent_primary())
+                                    .child(format!("{:.0}%", progress.percent)),
+                            ),
+                    )
+                    .child(progress_bar(ProgressBarValue::value(
+                        progress.percent / 100.0,
+                    ))),
+            )
             .child(
                 div()
                     .flex()
                     .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(Colors::text_primary())
-                            .child(progress.stage.as_str().to_string()),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(Colors::accent_primary())
-                            .child(percent),
-                    ),
+                    .flex_wrap()
+                    .gap(px(space::BASE))
+                    .children(self.params.stems.iter().map(stem_badge)),
             )
-            .child(progress_bar(ProgressBarValue::value(
-                progress.percent / 100.0,
-            )))
-            .child(
-                div()
-                    .text_size(px(10.0))
-                    .text_color(Colors::text_muted())
-                    .child(detail),
-            )
-            .child(
-                div()
-                    .text_size(px(10.0))
-                    .text_color(Colors::text_faint())
-                    .child(format!(
-                        "{} · {}",
-                        self.params.model.label(),
-                        self.params.device.label()
-                    )),
-            )
-            .child(div().flex_1())
-            .child(div().flex().flex_row().justify_end().child(fb_button(
+            .child(caption(format!(
+                "{} · {} · {} quality",
+                self.params.model.label(),
+                self.params.device.label(),
+                self.params.quality.label()
+            )));
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .child(body)
+            .child(footer_bar().child(div().flex_1()).child(fb_button(
                 "stem-cancel-run",
                 "Cancel",
                 FbButtonKind::Default,
@@ -1225,121 +1325,104 @@ impl StemExtractorWindow {
         target: gpui::Entity<Self>,
     ) -> gpui::AnyElement {
         let count = summary.apply.stems.len();
-        let stem_names = summary
-            .apply
-            .stems
-            .iter()
-            .map(|stem| stem.kind.label())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let stub = summary.backend == SphereAudioProcessor::InferBackendKind::SpectralStub;
+        let mut body = result_header(
+            assets::ICON_CIRCLE_CHECK_PATH,
+            Colors::status_success(),
+            "Your stems are ready",
+            format!(
+                "{count} new track{} added from {}. The original track is muted.",
+                if count == 1 { " was" } else { "s were" },
+                summary.apply.source_clip_name
+            ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap(px(space::BASE))
+                .children(summary.apply.stems.iter().map(|stem| stem_badge(stem.kind))),
+        );
+        if stub {
+            body = body.child(notice(
+                assets::ICON_TRIANGLE_ALERT_PATH,
+                Colors::status_warning(),
+                "Made with the basic spectral split",
+                format!(
+                    "The {} model wasn't available. Download it for cleaner stems.",
+                    summary.model.label()
+                ),
+            ));
+        } else {
+            body = body.child(caption(format!(
+                "{} · {}",
+                summary.backend.label(),
+                summary.device.label()
+            )));
+        }
+
         div()
             .flex()
             .flex_col()
             .flex_1()
-            .px(px(BODY_PAD))
-            .py(px(BODY_PAD))
-            .gap(px(10.0))
+            .child(body)
+            .child(footer_bar().child(div().flex_1()).child(fb_button(
+                "stem-close",
+                "Done",
+                FbButtonKind::Primary,
+                true,
+                {
+                    let target = target.clone();
+                    move |_, window, cx| {
+                        let _ = target.update(cx, |this, cx| this.close(window, cx));
+                    }
+                },
+            )))
+            .into_any_element()
+    }
+
+    fn render_cancelled(&self, target: gpui::Entity<Self>) -> gpui::AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .child(result_header(
+                assets::ICON_CLOSE_SMALL_PATH,
+                Colors::text_muted(),
+                "Extraction cancelled",
+                "Nothing was added to the project.".to_string(),
+            ))
             .child(
-                div()
-                    .text_size(px(12.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(Colors::accent_primary())
-                    .child("Extraction complete"),
-            )
-            .child(
-                div()
-                    .text_size(px(11.0))
-                    .text_color(Colors::text_primary())
-                    .child(format!(
-                        "{count} stem track(s) created · {} · {}",
-                        summary.model.label(),
-                        summary.device.label()
+                footer_bar()
+                    .child(div().flex_1())
+                    .child(fb_button(
+                        "stem-start-over",
+                        "Start Over",
+                        FbButtonKind::Default,
+                        true,
+                        {
+                            let target = target.clone();
+                            move |_, _window, cx| {
+                                let _ = target.update(cx, |this, cx| this.back_to_editing(cx));
+                            }
+                        },
+                    ))
+                    .child(fb_button(
+                        "stem-close-term",
+                        "Close",
+                        FbButtonKind::Primary,
+                        true,
+                        {
+                            let target = target.clone();
+                            move |_, window, cx| {
+                                let _ = target.update(cx, |this, cx| this.close(window, cx));
+                            }
+                        },
                     )),
             )
-            .child(
-                div()
-                    .text_size(px(10.0))
-                    .text_color(Colors::text_muted())
-                    .child(if stem_names.is_empty() {
-                        "Original source track muted.".to_string()
-                    } else {
-                        format!("{stem_names} · original source track muted")
-                    }),
-            )
-            .child(
-                div()
-                    .text_size(px(10.0))
-                    .text_color(Colors::text_faint())
-                    .child(format!("Backend · {}", summary.backend.label())),
-            )
-            .child(div().flex_1())
-            .child(div().flex().flex_row().justify_end().child(fb_button(
-                "stem-close",
-                "Close",
-                FbButtonKind::Primary,
-                true,
-                {
-                    let target = target.clone();
-                    move |_, window, cx| {
-                        let _ = target.update(cx, |this, cx| this.close(window, cx));
-                    }
-                },
-            )))
             .into_any_element()
     }
-
-    fn render_terminal(
-        &self,
-        message: &str,
-        color: gpui::Rgba,
-        target: gpui::Entity<Self>,
-    ) -> gpui::AnyElement {
-        div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .px(px(BODY_PAD))
-            .py(px(BODY_PAD))
-            .gap(px(10.0))
-            .child(
-                div()
-                    .text_size(px(12.0))
-                    .text_color(color)
-                    .child(message.to_string()),
-            )
-            .child(div().flex_1())
-            .child(div().flex().flex_row().justify_end().child(fb_button(
-                "stem-close-term",
-                "Close",
-                FbButtonKind::Primary,
-                true,
-                {
-                    let target = target.clone();
-                    move |_, window, cx| {
-                        let _ = target.update(cx, |this, cx| this.close(window, cx));
-                    }
-                },
-            )))
-            .into_any_element()
-    }
-}
-
-fn model_hint(
-    params: &SphereAudioProcessor::StemExtractParams,
-    installed: bool,
-    models_dir: &std::path::Path,
-) -> String {
-    let runtime = platform_runtime_label();
-    let weights = if installed {
-        format!("weights in {}", models_dir.display())
-    } else {
-        "weights not installed — Download saves to Utilities/Models".to_string()
-    };
-    format!(
-        "{} · {runtime} · {} · {weights}",
-        params.model.description(),
-        params.quality.label()
-    )
 }
 
 fn platform_runtime_label() -> String {
@@ -1348,35 +1431,425 @@ fn platform_runtime_label() -> String {
         .unwrap_or_else(|error| error.user_message())
 }
 
-fn section_label(label: &'static str) -> impl IntoElement {
+fn clip_file_name(clip: &StemSourceClip) -> String {
+    clip.source_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| clip.source_path.display().to_string())
+}
+
+/// `m:ss`, or `h:mm:ss` past an hour.
+fn format_duration(seconds: f64) -> String {
+    let total = seconds.max(0.0).round() as u64;
+    let (h, m, s) = (total / 3600, (total / 60) % 60, total % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+fn stem_icon(kind: SphereAudioProcessor::StemKind) -> &'static str {
+    use SphereAudioProcessor::StemKind as Kind;
+    match kind {
+        Kind::Vocals => assets::ICON_MIC_PATH,
+        Kind::Drums => assets::ICON_DRUM_PATH,
+        Kind::Bass => assets::ICON_GUITAR_PATH,
+        Kind::Other => assets::ICON_KEYBOARD_PATH,
+        Kind::Instrumental => assets::ICON_AUDIO_LINES_PATH,
+    }
+}
+
+fn caption(text: impl Into<SharedString>) -> impl IntoElement {
     div()
-        .mt(px(2.0))
-        .pb(px(2.0))
-        .border_b(px(1.0))
+        .text_size(px(typography::UI_XS))
+        .text_color(Colors::text_muted())
+        .child(text.into())
+}
+
+/// A numbered step: a small number disc and title, an optional note on the
+/// right, and the step's controls indented under the title.
+fn step(
+    number: u8,
+    title: &'static str,
+    aside: Option<gpui::AnyElement>,
+    content: gpui::AnyElement,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(space::BASE))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(space::BASE))
+                .child(
+                    div()
+                        .size(px(STEP_DISC))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(radius::PILL))
+                        .bg(Colors::surface_raised())
+                        .text_size(px(typography::DENSE_LABEL))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(Colors::text_secondary())
+                        .child(number.to_string()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .text_size(px(typography::UI_MD))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(Colors::text_primary())
+                        .child(title),
+                )
+                .children(aside),
+        )
+        .child(div().pl(px(STEP_DISC + space::BASE)).child(content))
+}
+
+fn field_row(label: &'static str, control: impl IntoElement) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(space::BASE))
+        .child(
+            div()
+                .w(px(FIELD_LABEL_W))
+                .flex_none()
+                .text_size(px(typography::UI_XS))
+                .text_color(Colors::text_secondary())
+                .child(label),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_1()
+                .min_w(px(0.0))
+                .child(control.into_any_element()),
+        )
+}
+
+/// A stem as a toggle tile: its icon and name, filled and outlined in the
+/// accent with a check when it will be extracted.
+fn stem_tile(
+    stem: SphereAudioProcessor::StemKind,
+    checked: bool,
+    on_toggle: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let rest = if checked {
+        Colors::composite(Colors::surface_panel(), Colors::accent_muted())
+    } else {
+        Colors::surface_panel()
+    };
+    let hover = Colors::composite(rest, Colors::state_hover());
+    let pressed = Colors::composite(rest, Colors::state_recessed());
+    let focus = Colors::state_focus_ring();
+    let label = stem.label();
+    div()
+        .id(SharedString::from(format!("stem-toggle-{}", stem.as_str())))
+        .role(Role::CheckBox)
+        .aria_label(label)
+        .aria_toggled(if checked {
+            Toggled::True
+        } else {
+            Toggled::False
+        })
+        .focusable()
+        .tab_stop(true)
+        .focus_visible(move |style| style.shadow(elevation::focus_ring(focus)))
+        .relative()
+        .flex_1()
+        .min_w(px(0.0))
+        .h(px(STEM_TILE_H))
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(px(space::SNUG))
+        .rounded(px(radius::CONTROL))
+        .border(px(1.0))
+        .border_color(if checked {
+            Colors::with_alpha(Colors::accent_primary(), state::ARMED_BORDER)
+        } else {
+            Colors::border_subtle()
+        })
+        .bg(rest)
+        .cursor(gpui::CursorStyle::PointingHand)
+        .hover(move |s| s.bg(hover))
+        .active(move |s| s.bg(pressed))
+        .on_click(on_toggle)
+        .child(
+            svg()
+                .path(stem_icon(stem))
+                .size(px(20.0))
+                .text_color(if checked {
+                    Colors::accent_primary()
+                } else {
+                    Colors::text_muted()
+                }),
+        )
+        .child(
+            div()
+                .max_w_full()
+                .px(px(space::TIGHT))
+                .truncate()
+                .text_size(px(typography::UI_SM))
+                .font_weight(if checked {
+                    gpui::FontWeight::SEMIBOLD
+                } else {
+                    gpui::FontWeight::NORMAL
+                })
+                .text_color(if checked {
+                    Colors::text_primary()
+                } else {
+                    Colors::text_secondary()
+                })
+                .child(label),
+        )
+        .child(
+            div()
+                .absolute()
+                .top(px(space::SNUG))
+                .right(px(space::SNUG))
+                .size(px(14.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(radius::PILL))
+                .border(px(1.0))
+                .border_color(if checked {
+                    Colors::accent_primary()
+                } else {
+                    Colors::border_strong()
+                })
+                .bg(if checked {
+                    Colors::accent_primary()
+                } else {
+                    Colors::surface_input()
+                })
+                .when(checked, |this| {
+                    this.child(
+                        svg()
+                            .path(assets::ICON_CHECK_PATH)
+                            .size(px(10.0))
+                            .text_color(Colors::on_accent()),
+                    )
+                }),
+        )
+}
+
+/// A finished stem, as listed on the result screen.
+fn stem_badge(kind: SphereAudioProcessor::StemKind) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(space::SNUG))
+        .h(px(theme::size::DEFAULT + space::TIGHT))
+        .px(px(space::LOOSE))
+        .rounded(px(radius::PILL))
+        .bg(Colors::surface_panel())
+        .border(px(1.0))
         .border_color(Colors::border_subtle())
-        .text_size(px(9.0))
-        .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_color(Colors::text_faint())
-        .child(label)
+        .child(
+            svg()
+                .path(stem_icon(kind))
+                .size(px(14.0))
+                .text_color(Colors::accent_primary()),
+        )
+        .child(
+            div()
+                .text_size(px(typography::UI_SM))
+                .text_color(Colors::text_primary())
+                .child(kind.label()),
+        )
 }
 
-fn error_banner(message: String) -> impl IntoElement {
-    banner(message, Colors::status_error())
-}
-
-fn hint_banner(message: String) -> impl IntoElement {
-    banner(message, Colors::text_muted())
-}
-
-fn banner(message: String, color: gpui::Rgba) -> impl IntoElement {
+/// Icon, title and detail, with an optional action on the right.
+fn status_line(
+    icon: &'static str,
+    tone: gpui::Rgba,
+    title: String,
+    detail: String,
+    action: Option<gpui::AnyElement>,
+) -> impl IntoElement {
     div()
-        .px(px(10.0))
-        .py(px(6.0))
-        .rounded(px(crate::theme::radius::CONTROL))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(space::BASE + space::HAIR))
+        .child(svg().path(icon).size(px(16.0)).flex_none().text_color(tone))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w(px(0.0))
+                .gap(px(space::HAIR))
+                .child(
+                    div()
+                        .text_size(px(typography::UI_SM))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(Colors::text_primary())
+                        .truncate()
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .text_size(px(typography::UI_XS))
+                        .text_color(Colors::text_muted())
+                        .child(detail),
+                ),
+        )
+        .children(action)
+}
+
+/// A tinted message with an icon — an error or a warning the user should read.
+fn notice(icon: &'static str, tone: gpui::Rgba, title: &'static str, detail: String) -> gpui::Div {
+    div()
+        .px(px(space::LOOSE))
+        .py(px(space::BASE + space::HAIR))
+        .rounded(px(radius::CONTROL))
+        .bg(Colors::composite(
+            Colors::surface_panel(),
+            Colors::with_alpha(tone, 0.10),
+        ))
+        .border(px(1.0))
+        .border_color(Colors::with_alpha(tone, 0.35))
+        .child(status_line(icon, tone, title.to_string(), detail, None))
+}
+
+/// The large icon and message that open the done and cancelled screens.
+fn result_header(
+    icon: &'static str,
+    tone: gpui::Rgba,
+    title: &'static str,
+    detail: String,
+) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .px(px(BODY_PAD))
+        .py(px(BODY_PAD + space::BASE))
+        .gap(px(space::SECTION))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(space::LOOSE))
+                .child(
+                    div()
+                        .size(px(40.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(radius::PILL))
+                        .bg(Colors::with_alpha(tone, 0.14))
+                        .child(svg().path(icon).size(px(20.0)).text_color(tone)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .gap(px(space::HAIR))
+                        .child(
+                            div()
+                                .text_size(px(typography::UI_LG))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(Colors::text_primary())
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(typography::UI_SM))
+                                .text_color(Colors::text_secondary())
+                                .child(detail),
+                        ),
+                ),
+        )
+}
+
+/// A progress step: done ones carry a check, the current one is lit.
+fn stage_chip(label: &'static str, order: std::cmp::Ordering) -> impl IntoElement {
+    use std::cmp::Ordering;
+    let (bg, border, text) = match order {
+        Ordering::Less => (
+            Colors::surface_panel(),
+            Colors::border_subtle(),
+            Colors::text_secondary(),
+        ),
+        Ordering::Equal => (
+            Colors::composite(Colors::surface_panel(), Colors::accent_muted()),
+            Colors::with_alpha(Colors::accent_primary(), state::ARMED_BORDER),
+            Colors::text_primary(),
+        ),
+        Ordering::Greater => (
+            Colors::surface_base(),
+            Colors::border_subtle(),
+            Colors::text_faint(),
+        ),
+    };
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .gap(px(space::TIGHT))
+        .flex_1()
+        .min_w(px(0.0))
+        .h(px(theme::size::DEFAULT + space::TIGHT))
+        .px(px(space::SNUG))
+        .rounded(px(radius::PILL))
+        .bg(bg)
+        .border(px(1.0))
+        .border_color(border)
+        .when(order == Ordering::Less, |this| {
+            this.child(
+                svg()
+                    .path(assets::ICON_CHECK_PATH)
+                    .size(px(12.0))
+                    .flex_none()
+                    .text_color(Colors::status_success()),
+            )
+        })
+        .child(
+            div()
+                .min_w(px(0.0))
+                .truncate()
+                .text_size(px(typography::UI_XS))
+                .font_weight(if order == Ordering::Equal {
+                    gpui::FontWeight::SEMIBOLD
+                } else {
+                    gpui::FontWeight::NORMAL
+                })
+                .text_color(text)
+                .child(label),
+        )
+}
+
+fn footer_bar() -> gpui::Div {
+    div()
+        .flex()
+        .flex_row()
+        .flex_none()
+        .items_center()
+        .gap(px(space::BASE))
+        .px(px(BODY_PAD))
+        .py(px(space::LOOSE))
+        .border_t(px(1.0))
+        .border_color(Colors::border_subtle())
         .bg(Colors::surface_panel_alt())
-        .text_size(px(10.0))
-        .text_color(color)
-        .child(message)
 }
 
 fn write_stem_wav(

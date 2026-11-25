@@ -76,6 +76,7 @@ pub(crate) fn track_list(
         std::sync::Arc<dyn Fn(&String, &mut gpui::Window, &mut gpui::App) + 'static>,
     >,
     on_cut_clip: Option<crate::components::timeline::audio_clip::AudioClipCutCb>,
+    on_clip_body_press: Option<crate::components::timeline::audio_clip::ClipBodyPressCb>,
     erase_preview_ids: Option<&std::collections::HashSet<String>>,
     on_audio_clip_process_preview: AudioClipProcessPreviewCb,
     on_audio_clip_process_commit: AudioClipProcessCommitCb,
@@ -287,6 +288,7 @@ pub(crate) fn track_list(
                                     on_erase_start.clone(),
                                     on_erase_clip.clone(),
                                     on_cut_clip.clone(),
+                                    on_clip_body_press.clone(),
                                     erase_preview_ids,
                                     on_audio_clip_process_preview.clone(),
                                     on_audio_clip_process_commit.clone(),
@@ -306,19 +308,22 @@ pub(crate) fn track_list(
             )
             .children(sub_lanes)
             .children((row_entry.take_height > 0.0).then(|| {
-                div()
-                    .flex()
-                    .flex_col()
-                    .w_full()
-                    .children(track.takes.iter().map(|take| {
-                        take_lane(
-                            track,
-                            take,
-                            state,
-                            header_callbacks.on_select_take.clone(),
-                            header_callbacks.on_delete_take.clone(),
-                        )
-                    }))
+                div().flex().flex_col().w_full().children(
+                    track
+                        .take_lane_rows()
+                        .into_iter()
+                        .enumerate()
+                        .map(|(rank, takes)| {
+                            take_lane(
+                                track,
+                                rank,
+                                &takes,
+                                state,
+                                header_callbacks.on_select_take.clone(),
+                                header_callbacks.on_delete_take.clone(),
+                            )
+                        }),
+                )
             }));
         rows.push(row.into_any_element());
     }

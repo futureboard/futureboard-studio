@@ -1,7 +1,16 @@
 //! Browser sidebar — left dock of the studio shell.
 //!
 //! A dense, grouped DAW asset browser. The navigation model lives in
-//! `file_browser.rs`; this module is pure presentation.
+//! `file_browser.rs`; this module is pure presentation. Top to bottom:
+//!
+//! ```txt
+//! title + preview / collapse / rescan
+//! six named tabs, three to a row
+//! search + type chips              (tabs of mixed files)
+//! folder path with a parent button
+//! tree: roots as captions, size or tag on the right
+//! preview card: play, name, facts, waveform, Add
+//! ```
 //!
 //! Region contract:
 //!
@@ -35,12 +44,13 @@ use gpui::{
 };
 
 use crate::assets;
-use crate::components::controls::{fb_shortcut_hint, fb_tooltip};
+use crate::components::controls::{fb_button, fb_tooltip, FbButtonKind};
+pub use crate::components::file_browser::BrowserKindFilter;
 use crate::components::file_browser::{
     format_size, BrowserCrumb, BrowserIcon, BrowserNodeKind, BrowserTab, BrowserVisibleNode,
     FileBrowserState, MAX_VISUAL_DEPTH,
 };
-use crate::components::scroll_thumb::vertical_scrollbar_thumb;
+use crate::components::scrollbar::scroll_handle_scrollbar;
 use crate::components::text_input::{
     text_field_with_callbacks, TextInputCallbacks, TextInputState,
 };
@@ -74,7 +84,7 @@ const GLYPH: f32 = typography::UI_XS;
 const CHEVRON: f32 = typography::DENSE_CAPTION;
 /// Preview waveform height. The arrangement's minimum audio lane height is the
 /// smallest height this system treats a waveform as readable at.
-const WAVEFORM_H: f32 = size::TRACK_ROW_MIN;
+const WAVEFORM_H: f32 = size::TRACK_ROW_MIN + space::BASE;
 
 pub type ActivateFileCb = Arc<dyn Fn(&PathBuf, &mut Window, &mut App) + 'static>;
 pub type SelectEntryCb = Arc<dyn Fn(&PathBuf, &mut Window, &mut App) + 'static>;
@@ -85,6 +95,8 @@ pub type BrowserContextCb =
 pub type BrowserActionCb = Arc<dyn Fn(&mut Window, &mut App) + 'static>;
 /// Tab strip: show a tab.
 pub type BrowserTabCb = Arc<dyn Fn(&BrowserTab, &mut Window, &mut App) + 'static>;
+/// Type chips: show one type of file.
+pub type BrowserKindCb = Arc<dyn Fn(&BrowserKindFilter, &mut Window, &mut App) + 'static>;
 
 /// Everything the sidebar can ask the layout to do.
 ///
@@ -94,11 +106,14 @@ pub type BrowserTabCb = Arc<dyn Fn(&BrowserTab, &mut Window, &mut App) + 'static
 #[derive(Clone)]
 pub struct BrowserCallbacks {
     pub on_select_tab: BrowserTabCb,
+    pub on_select_kind: BrowserKindCb,
     pub on_toggle: ToggleNodeCb,
     pub on_select: SelectEntryCb,
-    /// Breadcrumb jump: expand the ancestors of a path and select it.
+    /// Path jump: expand the ancestors of a path and select it.
     pub on_reveal: SelectEntryCb,
     pub on_activate_file: ActivateFileCb,
+    /// Play an audio file now, whether or not auto-preview is on.
+    pub on_audition: SelectEntryCb,
     pub on_context_menu: BrowserContextCb,
     pub on_collapse_all: BrowserActionCb,
     pub on_rescan: BrowserActionCb,
@@ -153,8 +168,8 @@ impl Render for BrowserDragPreview {
     }
 }
 
-/// Tabular figures for the details pane's numeric readouts, so digits keep a
-/// fixed advance while arrowing through a folder.
+/// Tabular figures for numeric readouts, so digits keep a fixed advance while
+/// arrowing through a folder.
 fn tabular_figures() -> gpui::FontFeatures {
     gpui::FontFeatures(Arc::new(vec![
         ("tnum".to_string(), 1),
@@ -171,6 +186,24 @@ fn node_label(label: &str, label_key: Option<&'static str>, i18n: I18n) -> Strin
     }
 }
 
+/// The depth at which rows are drawn as captions. A tab with group headers
+/// captions the headers (depth 0); one without captions its roots (depth 1),
+/// so on either the first level of real content sits at the left edge.
+fn caption_depth(nodes: &[BrowserVisibleNode]) -> usize {
+    if nodes.iter().any(|n| n.kind == BrowserNodeKind::GroupHeader) {
+        0
+    } else {
+        1
+    }
+}
+
+/// Indent steps for a row below the caption level.
+fn indent_steps(depth: usize, caption_depth: usize) -> f32 {
+    depth
+        .saturating_sub(caption_depth + 1)
+        .min(MAX_VISUAL_DEPTH) as f32
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn sidebar(
     state: &FileBrowserState,
@@ -184,13 +217,10 @@ pub fn sidebar(
     i18n: I18n,
     rigs_panel: Option<gpui::AnyView>,
 ) -> impl IntoElement {
-    // Which panel has the keyboard is no longer painted: an accent title and
-    // an accent rule down the column's edge were loud for what they said.
     let panel_border = Colors::border_subtle();
 
     // ── Header ──────────────────────────────────────────────────────
-    // Mirrors the Inspector dock header (32 px, DENSE_LABEL, bold) so the two
-    // docks read as one system.
+    // Mirrors the Inspector dock header so the two docks read as one system.
     let chrome_base = Colors::surface_panel_alt();
     let collapse_cb = callbacks.on_collapse_all.clone();
     let rescan_cb = callbacks.on_rescan.clone();
@@ -204,30 +234,19 @@ pub fn sidebar(
         .items_center()
         .gap(px(space::SNUG))
         .h(px(size::PROMINENT))
-        .pl(px(space::BASE))
+        .pl(px(space::LOOSE))
         .pr(px(space::TIGHT))
-        .border_b(px(1.0))
-        .border_color(panel_border)
         .bg(chrome_base)
-        .child(
-            svg()
-                .path(assets::ICON_FOLDER_PATH)
-                .w(px(typography::UI_MD))
-                .h(px(typography::UI_MD))
-                .text_color(Colors::text_muted()),
-        )
         .child(
             div()
                 .flex_1()
                 .min_w(px(0.0))
-                .overflow_hidden()
                 .truncate()
-                .text_size(px(typography::DENSE_LABEL))
-                .font_weight(gpui::FontWeight::BOLD)
-                .text_color(Colors::tab_text())
+                .text_size(px(typography::UI_MD))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(Colors::text_primary())
                 .child(i18n.tr("browser.panel.title")),
         )
-        .child(fb_shortcut_hint(crate::keymap::accel_display("Ctrl+1")))
         .child(
             crate::components::title_bar::chrome_cluster()
                 .flex_shrink_0()
@@ -255,7 +274,7 @@ pub fn sidebar(
                 ))
                 .child(browser_icon_button(
                     "browser-rescan",
-                    assets::ICON_REPEAT_PATH,
+                    assets::ICON_REFRESH_CW_PATH,
                     i18n.tr_or("browser.action.rescan", "Rescan folders"),
                     chrome_base,
                     None,
@@ -264,63 +283,44 @@ pub fn sidebar(
                 )),
         );
 
-    // ── Search ──────────────────────────────────────────────────────
-    let search_container = div()
+    // ── Tabs, search, type chips ────────────────────────────────────
+    let controls = div()
         .flex_shrink_0()
         .flex()
         .flex_col()
-        .gap(px(space::SNUG))
+        .gap(px(space::BASE))
         .px(px(space::BASE))
-        .pt(px(space::SNUG))
         .pb(px(space::BASE))
         .border_b(px(1.0))
-        .border_color(Colors::border_subtle())
+        .border_color(panel_border)
         .bg(chrome_base)
+        .child(tab_grid(state.tab, callbacks.on_select_tab.clone(), i18n))
         // The tree's filter means nothing to the Rigs page, which has its own
         // search; a field that filters nothing would be a control that lies.
-        .when(state.tab != BrowserTab::Rigs, |container| {
-            container.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(space::SNUG))
-                    .child(
-                        svg()
-                            .path(assets::ICON_SEARCH_PATH)
-                            .w(px(GLYPH))
-                            .h(px(GLYPH))
-                            .text_color(Colors::text_muted()),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .child(text_field_with_callbacks(
-                                search_input,
-                                search_focused,
-                                search_callbacks,
-                            )),
-                    ),
-            )
+        .when(state.tab != BrowserTab::Rigs, |col| {
+            col.child(text_field_with_callbacks(
+                search_input,
+                search_focused,
+                search_callbacks,
+            ))
         })
-        .child(tab_strip(state.tab, callbacks.on_select_tab.clone(), i18n));
+        .when(state.tab.has_kind_filter(), |col| {
+            col.child(kind_chips(
+                state.kind_filter,
+                callbacks.on_select_kind.clone(),
+            ))
+        });
 
-    // ── Breadcrumb ──────────────────────────────────────────────────
-    // Rendered only when there is a trail to show, so the panel never reserves
-    // a permanently empty row.
-    let crumbs = if state.tab == BrowserTab::Instruments {
-        Vec::new()
-    } else {
-        state.breadcrumb()
-    };
-    let breadcrumb =
-        (!crumbs.is_empty()).then(|| breadcrumb_bar(&crumbs, callbacks.on_reveal.clone(), i18n));
+    // ── Folder path ─────────────────────────────────────────────────
+    let trail = (state.tab != BrowserTab::Instruments)
+        .then(|| folder_trail(state, callbacks.on_reveal.clone(), i18n))
+        .flatten();
 
     // ── Row virtualization ──────────────────────────────────────────
     let nodes = state.visible_nodes();
     let count = nodes.len();
     crate::perf::count("browser_rows", count as u64);
+    let captions = caption_depth(&nodes);
     let scroll_for_thumb = scroll.0.borrow().base_handle.clone();
     let nodes_for_list = nodes.clone();
     let callbacks_for_list = callbacks.clone();
@@ -337,8 +337,11 @@ pub fn sidebar(
                     BrowserNodeKind::GroupHeader => {
                         group_header_row(i, node, &cbs, i18n).into_any_element()
                     }
-                    BrowserNodeKind::Info => info_row(node, i18n).into_any_element(),
-                    _ => tree_row(i, node, count, &cbs, &focus, i18n).into_any_element(),
+                    BrowserNodeKind::Info => info_row(node, captions, i18n).into_any_element(),
+                    _ if node.depth == captions && node.kind == BrowserNodeKind::Folder => {
+                        root_caption_row(i, node, &cbs, &focus, i18n).into_any_element()
+                    }
+                    _ => tree_row(i, node, count, captions, &cbs, &focus, i18n).into_any_element(),
                 }
             })
             .collect::<Vec<_>>()
@@ -379,12 +382,15 @@ pub fn sidebar(
         .relative()
         .child(list)
         .children(empty_hint)
-        .child(vertical_scrollbar_thumb(scroll_for_thumb));
+        .children(scroll_handle_scrollbar(
+            "browser-tree-scrollbar",
+            &scroll_for_thumb,
+        ));
 
-    // ── Details for the current selection ───────────────────────────
-    let details = state
+    // ── The current selection ───────────────────────────────────────
+    let card = state
         .selected_node()
-        .map(|node| details_pane(state, node, &callbacks, i18n));
+        .map(|node| preview_card(state, node, &callbacks, i18n));
 
     let column = div()
         .flex()
@@ -395,14 +401,14 @@ pub fn sidebar(
         .border_r(px(1.0))
         .border_color(panel_border)
         .child(header)
-        .child(search_container);
-    // The Rigs tab is a web page: it takes the whole body below the tab strip
-    // in place of the tree, its trail and its details.
+        .child(controls);
+    // The Rigs tab is a web page: it takes the whole body below the tabs in
+    // place of the tree, its path and its card.
     match rigs_panel {
         Some(panel) if state.tab == BrowserTab::Rigs => {
             column.child(div().flex_1().min_h_0().child(panel))
         }
-        _ => column.children(breadcrumb).child(listing).children(details),
+        _ => column.children(trail).child(listing).children(card),
     }
 }
 
@@ -410,80 +416,148 @@ pub fn sidebar(
 // Chrome primitives
 // ---------------------------------------------------------------------------
 
-/// The tab strip: what the list below shows. The shown tab carries its name;
-/// the others are their glyph, named in a tooltip — five names do not fit the
-/// dock, and the one you are on is the one worth reading.
-fn tab_strip(active: BrowserTab, on_select: BrowserTabCb, i18n: I18n) -> impl IntoElement {
+/// Every tab named, three to a row: six names do not fit one row of the dock,
+/// and a glyph alone made five of them guesswork.
+fn tab_grid(active: BrowserTab, on_select: BrowserTabCb, i18n: I18n) -> impl IntoElement {
     let track = Colors::surface_input();
+    let cell = |index: usize, tab: BrowserTab| {
+        let is_active = tab == active;
+        let label = i18n.tr_or(tab.label_key(), tab.label());
+        let rest = if is_active {
+            Colors::composite(track, Colors::state_selected())
+        } else {
+            Colors::with_alpha(track, 0.0)
+        };
+        let hover = Colors::composite(if is_active { rest } else { track }, Colors::state_hover());
+        let pressed = Colors::composite(
+            if is_active { rest } else { track },
+            Colors::state_recessed(),
+        );
+        let select = on_select.clone();
+        div()
+            .id(("browser-tab", index))
+            .role(Role::Tab)
+            .aria_label(label.clone())
+            .aria_selected(is_active)
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_center()
+            .gap(px(space::TIGHT))
+            .flex_1()
+            .min_w(px(0.0))
+            .h(px(size::DEFAULT))
+            .px(px(space::HAIR))
+            .rounded(px(radius::inner(radius::CONTROL, space::HAIR)))
+            .bg(rest)
+            .cursor(gpui::CursorStyle::PointingHand)
+            .hover(move |s| s.bg(hover))
+            .active(move |s| s.bg(pressed))
+            .on_click(move |_e, w, cx| select(&tab, w, cx))
+            .child(
+                svg()
+                    .path(browser_icon_path(tab.icon(), false))
+                    .flex_shrink_0()
+                    .w(px(GLYPH))
+                    .h(px(GLYPH))
+                    .text_color(if is_active {
+                        Colors::accent_primary()
+                    } else {
+                        Colors::text_muted()
+                    }),
+            )
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_size(px(typography::UI_XS))
+                    .font_weight(if is_active {
+                        gpui::FontWeight::SEMIBOLD
+                    } else {
+                        gpui::FontWeight::NORMAL
+                    })
+                    .text_color(if is_active {
+                        Colors::text_primary()
+                    } else {
+                        Colors::text_secondary()
+                    })
+                    .child(label),
+            )
+    };
+    let (first, second) = BrowserTab::ALL.split_at(3);
     div()
         .flex()
-        .flex_row()
-        .items_center()
+        .flex_col()
         .gap(px(space::HAIR))
         .p(px(space::HAIR))
         .rounded(px(radius::CONTROL))
         .bg(track)
         .border(px(1.0))
         .border_color(Colors::border_subtle())
-        .children(BrowserTab::ALL.iter().enumerate().map(|(index, tab)| {
-            let tab = *tab;
-            let is_active = tab == active;
-            let label = i18n.tr_or(tab.label_key(), tab.label());
-            let rest = if is_active {
-                Colors::composite(track, Colors::state_selected())
-            } else {
-                Colors::with_alpha(track, 0.0)
-            };
-            let hover =
-                Colors::composite(if is_active { rest } else { track }, Colors::state_hover());
-            let pressed = Colors::composite(
-                if is_active { rest } else { track },
-                Colors::state_recessed(),
-            );
-            let select = on_select.clone();
+        .child(
             div()
-                .id(("browser-tab", index))
-                .role(Role::Tab)
-                .aria_label(label.clone())
-                .aria_selected(is_active)
                 .flex()
                 .flex_row()
+                .gap(px(space::HAIR))
+                .children(first.iter().enumerate().map(|(i, t)| cell(i, *t))),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap(px(space::HAIR))
+                .children(second.iter().enumerate().map(|(i, t)| cell(i + 3, *t))),
+        )
+}
+
+/// One chip per file type. The active chip carries a fill and a bold label.
+fn kind_chips(active: BrowserKindFilter, on_select: BrowserKindCb) -> impl IntoElement {
+    let base = Colors::surface_panel_alt();
+    div().flex().flex_row().gap(px(space::TIGHT)).children(
+        BrowserKindFilter::ALL.iter().enumerate().map(|(i, kind)| {
+            let kind = *kind;
+            let on = kind == active;
+            let rest = if on {
+                Colors::composite(base, Colors::state_selected())
+            } else {
+                base
+            };
+            let hover = Colors::composite(rest, Colors::state_hover());
+            let select = on_select.clone();
+            div()
+                .id(("browser-kind", i))
+                .role(Role::Button)
+                .aria_label(kind.label())
+                .aria_toggled(if on { Toggled::True } else { Toggled::False })
+                .flex()
                 .items_center()
-                .justify_center()
-                .gap(px(space::SNUG))
-                .h(px(size::DENSE))
+                .h(px(size::MICRO + space::TIGHT))
                 .px(px(space::BASE))
-                .when(!is_active, |segment| segment.flex_1())
-                .rounded(px(radius::inner(radius::CONTROL, space::HAIR)))
+                .rounded(px(radius::PILL))
                 .bg(rest)
+                .border(px(1.0))
+                .border_color(if on {
+                    Colors::with_alpha(Colors::accent_primary(), 0.55)
+                } else {
+                    Colors::border_subtle()
+                })
                 .cursor(gpui::CursorStyle::PointingHand)
                 .hover(move |s| s.bg(hover))
-                .active(move |s| s.bg(pressed))
-                .tooltip(fb_tooltip(label.clone()))
-                .on_click(move |_e, w, cx| select(&tab, w, cx))
-                .child(
-                    svg()
-                        .path(browser_icon_path(tab.icon(), false))
-                        .flex_shrink_0()
-                        .w(px(GLYPH))
-                        .h(px(GLYPH))
-                        .text_color(if is_active {
-                            Colors::text_primary()
-                        } else {
-                            Colors::text_muted()
-                        }),
-                )
-                .when(is_active, |segment| {
-                    segment.child(
-                        div()
-                            .truncate()
-                            .text_size(px(typography::UI_XS))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(Colors::text_primary())
-                            .child(label),
-                    )
+                .on_click(move |_e, w, cx| select(&kind, w, cx))
+                .text_size(px(typography::DENSE_LABEL))
+                .font_weight(if on {
+                    gpui::FontWeight::SEMIBOLD
+                } else {
+                    gpui::FontWeight::NORMAL
                 })
-        }))
+                .text_color(if on {
+                    Colors::text_primary()
+                } else {
+                    Colors::text_muted()
+                })
+                .child(kind.label())
+        }),
+    )
 }
 
 /// Square icon button for the browser header.
@@ -557,112 +631,129 @@ fn browser_icon_button(
         )
 }
 
-/// Path trail from the mounted root down to the selection.
+/// The folders from the mounted root down to the one being browsed, with a
+/// button up to its parent. A selected file is in the card below, so it is
+/// not repeated here. `None` when nothing is selected.
 ///
-/// Truncation is predictable and never head-elides the leaf: when the trail is
-/// too long it keeps the root, one non-interactive ellipsis, and the last two
-/// crumbs.
-fn breadcrumb_bar(
-    crumbs: &[BrowserCrumb],
+/// Truncation keeps the last three folders: the deepest is where you are and
+/// the ones above it are where the parent button goes.
+fn folder_trail(
+    state: &FileBrowserState,
     on_reveal: SelectEntryCb,
     i18n: I18n,
-) -> impl IntoElement {
-    let mut shown: Vec<Option<&BrowserCrumb>> = Vec::new();
-    if crumbs.len() <= 3 {
-        shown.extend(crumbs.iter().map(Some));
-    } else {
-        shown.push(Some(&crumbs[0]));
-        shown.push(None);
-        shown.push(Some(&crumbs[crumbs.len() - 2]));
-        shown.push(Some(&crumbs[crumbs.len() - 1]));
+) -> Option<impl IntoElement> {
+    let mut crumbs: Vec<BrowserCrumb> = state.breadcrumb();
+    let selected_is_file = state
+        .selected_node()
+        .is_some_and(|n| n.kind == BrowserNodeKind::File);
+    if selected_is_file {
+        crumbs.pop();
     }
-    let last = shown.len().saturating_sub(1);
+    if crumbs.is_empty() {
+        return None;
+    }
+    let parent = (crumbs.len() >= 2).then(|| crumbs[crumbs.len() - 2].path.clone());
+    let shown = &crumbs[crumbs.len().saturating_sub(3)..];
+    let last = shown.len() - 1;
+
+    let base = Colors::surface_panel();
+    let hover = Colors::composite(base, Colors::state_hover());
+    let pressed = Colors::composite(base, Colors::state_recessed());
+    let focus = Colors::state_focus_ring();
+    let up_label = i18n.tr_or("browser.path.parent", "Parent folder");
+    let up_reveal = on_reveal.clone();
+    let up_enabled = parent.is_some();
+    let up = div()
+        .id("browser-path-parent")
+        .role(Role::Button)
+        .aria_label(up_label.clone())
+        .aria_disabled(!up_enabled)
+        .flex()
+        .items_center()
+        .justify_center()
+        .flex_shrink_0()
+        .w(px(size::DENSE))
+        .h(px(size::DENSE))
+        .rounded(px(radius::CONTROL_SM))
+        .bg(Colors::surface_raised())
+        .tooltip(fb_tooltip(up_label))
+        .when_some(parent, |b, parent| {
+            b.focusable()
+                .tab_stop(true)
+                .focus_visible(move |style| style.shadow(elevation::focus_ring(focus)))
+                .cursor(gpui::CursorStyle::PointingHand)
+                .hover(move |s| {
+                    s.bg(Colors::composite(
+                        Colors::surface_raised(),
+                        Colors::state_hover(),
+                    ))
+                })
+                .on_click(move |_e, w, cx| up_reveal(&parent, w, cx))
+        })
+        .child(
+            svg()
+                .path(assets::ICON_CHEVRON_LEFT_PATH)
+                .w(px(GLYPH))
+                .h(px(GLYPH))
+                .text_color(if up_enabled {
+                    Colors::text_secondary()
+                } else {
+                    Colors::text_disabled()
+                }),
+        );
 
     let mut bar = div()
         .flex_shrink_0()
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(space::HAIR))
-        .h(px(ROW_H))
+        .gap(px(space::TIGHT))
+        .h(px(size::COMFORTABLE))
         .px(px(space::SNUG))
         .overflow_hidden()
         .border_b(px(1.0))
         .border_color(Colors::border_subtle())
-        .bg(Colors::surface_panel_alt());
-
+        .child(up);
     for (i, crumb) in shown.iter().enumerate() {
         if i > 0 {
             bar = bar.child(
-                svg()
-                    .path(assets::ICON_CHEVRON_RIGHT_PATH)
+                div()
                     .flex_shrink_0()
-                    .w(px(CHEVRON))
-                    .h(px(CHEVRON))
-                    .text_color(Colors::text_faint()),
+                    .text_size(px(typography::DENSE_LABEL))
+                    .text_color(Colors::text_faint())
+                    .child("/"),
             );
         }
-        match crumb {
-            None => {
-                bar = bar.child(
-                    div()
-                        .flex_shrink_0()
-                        .px(px(space::HAIR))
-                        .text_size(px(typography::DENSE_CAPTION))
-                        .text_color(Colors::text_faint())
-                        .child("…"),
-                );
-            }
-            Some(crumb) => {
-                let label = node_label(&crumb.label, crumb.label_key, i18n);
-                let is_leaf = i == last;
-                if is_leaf {
-                    // The leaf *is* the selection; it is a readout, not a jump.
-                    bar = bar.child(
-                        div()
-                            .flex_shrink_0()
-                            .min_w(px(0.0))
-                            .overflow_hidden()
-                            .truncate()
-                            .px(px(space::HAIR))
-                            .text_size(px(typography::DENSE_CAPTION))
-                            .text_color(Colors::text_primary())
-                            .child(label),
-                    );
-                } else {
-                    let base = Colors::surface_panel_alt();
-                    let hover = Colors::composite(base, Colors::state_hover());
-                    let pressed = Colors::composite(base, Colors::state_recessed());
-                    let focus = Colors::state_focus_ring();
-                    let target = crumb.path.clone();
-                    let reveal = on_reveal.clone();
-                    bar = bar.child(
-                        div()
-                            .id(("browser-crumb", i))
-                            .role(Role::Button)
-                            .aria_label(label.clone())
-                            .focusable()
-                            .tab_stop(true)
-                            .focus_visible(move |style| style.shadow(elevation::focus_ring(focus)))
-                            .flex_shrink_0()
-                            .min_w(px(0.0))
-                            .overflow_hidden()
-                            .truncate()
-                            .px(px(space::HAIR))
-                            .rounded(px(radius::MICRO))
-                            .text_size(px(typography::DENSE_CAPTION))
-                            .text_color(Colors::text_muted())
-                            .cursor(gpui::CursorStyle::PointingHand)
-                            .hover(move |s| s.bg(hover))
-                            .active(move |s| s.bg(pressed))
-                            .on_click(move |_e, w, cx| reveal(&target, w, cx))
-                            .child(label),
-                    );
-                }
-            }
-        }
+        let label = node_label(&crumb.label, crumb.label_key, i18n);
+        let crumb_el = div()
+            .id(("browser-crumb", i))
+            .min_w(px(0.0))
+            .truncate()
+            .px(px(space::HAIR))
+            .rounded(px(radius::MICRO))
+            .text_size(px(typography::UI_XS));
+        bar = bar.child(if i == last {
+            // Where you are: a readout, not a jump.
+            crumb_el
+                .flex_shrink_0()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(Colors::text_primary())
+                .child(label)
+        } else {
+            let target = crumb.path.clone();
+            let reveal = on_reveal.clone();
+            crumb_el
+                .role(Role::Button)
+                .aria_label(label.clone())
+                .text_color(Colors::text_muted())
+                .cursor(gpui::CursorStyle::PointingHand)
+                .hover(move |s| s.bg(hover))
+                .active(move |s| s.bg(pressed))
+                .on_click(move |_e, w, cx| reveal(&target, w, cx))
+                .child(label)
+        });
     }
-    bar
+    Some(bar)
 }
 
 // ---------------------------------------------------------------------------
@@ -697,11 +788,63 @@ fn row_frame() -> Div {
         .h(px(ROW_H))
         .w_full()
         .flex_shrink_0()
-        .px(px(PLATE_INSET_X))
+        .pl(px(PLATE_INSET_X))
+        // The scrollbar overlays the list's right edge; keep the row's
+        // trailing size clear of it.
+        .pr(px(crate::components::scrollbar::THICKNESS))
         .py(px(PLATE_INSET_Y))
 }
 
-/// Subtle, collapsible section header (COLLECTIONS / LIBRARY / PLACES).
+/// A quiet uppercase caption with a chevron: group headers (Places, Drives, a
+/// vendor) and, on tabs without groups, the tab's root folders.
+#[allow(clippy::too_many_arguments)]
+fn caption_plate(
+    id: (&'static str, usize),
+    label: String,
+    expandable: bool,
+    expanded: bool,
+    selected: bool,
+    on_click: Option<Box<dyn Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static>>,
+) -> Stateful<Div> {
+    let base = Colors::surface_panel();
+    let hover = Colors::composite(base, Colors::state_hover());
+    let pressed = Colors::composite(base, Colors::state_recessed());
+    row_shell(id)
+        .px(px(PLATE_PAD_X))
+        .gap(px(space::TIGHT))
+        .when_some(on_click, |b, on_click| {
+            b.cursor(gpui::CursorStyle::PointingHand)
+                .hover(move |s| s.bg(hover))
+                .active(move |s| s.bg(pressed))
+                .on_click(on_click)
+        })
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .flex_shrink_0()
+                .w(px(DISCLOSURE_W))
+                .child(disclosure_icon(expandable, expanded)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .truncate()
+                .text_size(px(typography::DENSE_CAPTION))
+                .font_weight(gpui::FontWeight::BOLD)
+                .text_color(if selected {
+                    Colors::text_primary()
+                } else {
+                    Colors::text_faint()
+                })
+                .child(label.to_uppercase()),
+        )
+}
+
+/// Collapsible section header (Places / Drives / a vendor).
 ///
 /// While a search filter is active every group is forced open, so the header
 /// drops its chevron and click target rather than offering a control that
@@ -713,54 +856,19 @@ fn group_header_row(
     i18n: I18n,
 ) -> impl IntoElement {
     let id = node.id.clone();
-    let expandable = node.expandable;
-    let expanded = node.expanded;
-    let label = node_label(&node.label, node.label_key, i18n);
     let on_toggle = callbacks.on_toggle.clone();
-
-    let base = Colors::surface_panel();
-    let hover = Colors::composite(base, Colors::state_hover());
-    let pressed = Colors::composite(base, Colors::state_recessed());
-
-    let plate = row_shell(("browser-group", index))
-        .px(px(PLATE_PAD_X))
-        .gap(px(space::TIGHT))
-        .when(expandable, |b| {
-            b.cursor(gpui::CursorStyle::PointingHand)
-                .hover(move |s| s.bg(hover))
-                .active(move |s| s.bg(pressed))
-                .on_click(move |_e, w, cx| on_toggle(&(id.clone(), None), w, cx))
-        })
-        .child(if expandable {
-            svg()
-                .path(if expanded {
-                    assets::ICON_CHEVRON_DOWN_PATH
-                } else {
-                    assets::ICON_CHEVRON_RIGHT_PATH
-                })
-                .flex_shrink_0()
-                .w(px(CHEVRON))
-                .h(px(CHEVRON))
-                .text_color(Colors::text_faint())
-                .into_any_element()
-        } else {
-            div()
-                .flex_shrink_0()
-                .w(px(CHEVRON))
-                .h(px(CHEVRON))
-                .into_any_element()
-        })
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.0))
-                .overflow_hidden()
-                .truncate()
-                .text_size(px(typography::DENSE_LABEL))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(Colors::text_muted())
-                .child(label),
-        );
+    let plate = caption_plate(
+        ("browser-group", index),
+        node_label(&node.label, node.label_key, i18n),
+        node.expandable,
+        node.expanded,
+        false,
+        node.expandable.then(|| {
+            Box::new(move |_e: &gpui::ClickEvent, w: &mut Window, cx: &mut App| {
+                on_toggle(&(id.clone(), None), w, cx)
+            }) as Box<dyn Fn(&gpui::ClickEvent, &mut Window, &mut App)>
+        }),
+    );
 
     row_frame()
         .relative()
@@ -781,11 +889,57 @@ fn group_header_row(
         .child(plate)
 }
 
+/// A tab's root folder drawn as a caption, on tabs without group headers. It
+/// still opens, selects and takes the context menu like any folder row.
+fn root_caption_row(
+    index: usize,
+    node: &BrowserVisibleNode,
+    callbacks: &BrowserCallbacks,
+    tree_focus: &FocusHandle,
+    i18n: I18n,
+) -> impl IntoElement {
+    let label = node_label(&node.label, node.label_key, i18n);
+    let node_id = node.id.clone();
+    let path = node.path.clone();
+    let context_path = node.path.clone();
+    let on_select = callbacks.on_select.clone();
+    let on_toggle = callbacks.on_toggle.clone();
+    let on_context = callbacks.on_context_menu.clone();
+    let focus = tree_focus.clone();
+    let plate = caption_plate(
+        ("browser-root", index),
+        label.clone(),
+        node.expandable,
+        node.expanded,
+        node.selected,
+        Some(Box::new(move |_e, window, cx| {
+            focus.focus(window, cx);
+            if let Some(p) = path.as_ref() {
+                on_select(p, window, cx);
+            }
+            on_toggle(&(node_id.clone(), path.clone()), window, cx);
+        })),
+    )
+    .role(Role::TreeItem)
+    .aria_label(label)
+    .aria_selected(node.selected)
+    .aria_expanded(node.expanded)
+    .on_mouse_down(
+        gpui::MouseButton::Right,
+        move |event: &gpui::MouseDownEvent, window, cx| {
+            let x: f32 = event.position.x.into();
+            let y: f32 = event.position.y.into();
+            on_context(&(context_path.clone(), x, y), window, cx);
+        },
+    );
+    row_frame().child(plate)
+}
+
 /// Non-interactive hint row — an honest empty state, a pending listing, or a
 /// directory that could not be read.
-fn info_row(node: &BrowserVisibleNode, i18n: I18n) -> impl IntoElement {
+fn info_row(node: &BrowserVisibleNode, caption_depth: usize, i18n: I18n) -> impl IntoElement {
     let is_error = node.error.is_some();
-    let depth = node.depth.min(MAX_VISUAL_DEPTH) as f32;
+    let depth = indent_steps(node.depth, caption_depth);
     let label = node_label(&node.label, node.label_key, i18n);
     row_frame().child(
         div()
@@ -825,10 +979,27 @@ fn info_row(node: &BrowserVisibleNode, i18n: I18n) -> impl IntoElement {
     )
 }
 
+/// What a row shows at its end: an instrument's format, "MIDI" for a MIDI
+/// file, otherwise the file's size.
+fn row_meta(node: &BrowserVisibleNode) -> Option<String> {
+    if let Some(detail) = node.detail.clone() {
+        return Some(detail);
+    }
+    if node.kind != BrowserNodeKind::File {
+        return None;
+    }
+    if node.is_midi() {
+        return Some("MIDI".to_string());
+    }
+    node.size_bytes.map(format_size)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn tree_row(
     index: usize,
     node: &BrowserVisibleNode,
     total: usize,
+    caption_depth: usize,
     callbacks: &BrowserCallbacks,
     tree_focus: &FocusHandle,
     i18n: I18n,
@@ -841,8 +1012,7 @@ fn tree_row(
     let selected = node.selected;
     let is_folder = node.kind == BrowserNodeKind::Folder;
     let is_file = node.kind == BrowserNodeKind::File;
-    let is_root_item = node.depth == 1;
-    let depth = node.depth.min(MAX_VISUAL_DEPTH) as f32;
+    let depth = indent_steps(node.depth, caption_depth);
 
     // One background per div, so every state fill is resolved here and handed
     // to the closure — `.hover(|s| s.bg(token))` would replace the plate's fill
@@ -860,28 +1030,35 @@ fn tree_row(
     };
     let pressed = Colors::composite(if selected { rest } else { base }, Colors::state_recessed());
 
-    let text_color = if selected {
+    let text_color = if selected || is_folder {
         Colors::text_primary()
-    } else if is_folder || node.icon == BrowserIcon::Instruments {
+    } else if node.icon == BrowserIcon::Instruments
+        || node.is_audio()
+        || node.is_midi()
+        || node.is_plugin_preset()
+        || node.is_video()
+    {
         Colors::text_secondary()
-    } else if node.is_audio() || node.is_midi() || node.is_plugin_preset() || node.is_video() {
-        Colors::text_muted()
     } else {
         Colors::text_faint()
     };
-    let label_weight = if is_root_item {
-        gpui::FontWeight::SEMIBOLD
-    } else if is_folder {
+    let label_weight = if is_folder || selected {
         gpui::FontWeight::MEDIUM
     } else {
         gpui::FontWeight::NORMAL
     };
 
-    let icon_path = browser_icon_path(node.icon, expanded);
-    let icon_color = if selected {
-        Colors::text_primary()
+    let icon_path = if node.is_audio() {
+        assets::ICON_AUDIO_LINES_PATH
     } else {
+        browser_icon_path(node.icon, expanded)
+    };
+    let icon_color = if selected {
+        Colors::accent_primary()
+    } else if is_folder {
         Colors::text_muted()
+    } else {
+        Colors::text_faint()
     };
 
     let on_select = callbacks.on_select.clone();
@@ -920,7 +1097,8 @@ fn tree_row(
                 .left(px(0.0))
                 .top(px(space::TIGHT))
                 .bottom(px(space::TIGHT))
-                .w(px(space::HAIR))
+                .w(px(2.0))
+                .rounded(px(radius::PILL))
                 .bg(Colors::accent_primary())
                 .into_any_element()
         } else {
@@ -954,17 +1132,17 @@ fn tree_row(
                 .text_color(text_color)
                 .child(label.clone()),
         )
-        .children(node.detail.clone().map(|detail| {
+        .children(row_meta(node).map(|meta| {
             div()
                 .flex_shrink_0()
+                .font_features(tabular_figures())
                 .text_size(px(typography::DENSE_CAPTION))
-                .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(if selected {
                     Colors::text_secondary()
                 } else {
                     Colors::text_faint()
                 })
-                .child(detail)
+                .child(meta)
         }));
 
     plate = plate.on_click(move |event, window, cx| {
@@ -1091,16 +1269,32 @@ fn browser_icon_path(icon: BrowserIcon, expanded: bool) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
-// Details pane
+// Preview card
 // ---------------------------------------------------------------------------
 
-/// Everything known about the current selection: name, size, and — for audio —
-/// the decoded peaks, the audition window, and a real Stop control.
-///
-/// Size and duration live here rather than in a row column: at 272 px with a
-/// 12 px indent per level, a reserved right-hand column starves the name from
-/// depth 4 down, and the name is what the user is actually scanning.
-fn details_pane(
+/// "0:04.0 · 48 kHz · Stereo" from decoded peaks.
+fn audio_facts(preview: &waveform_cache::WaveformPreview) -> Vec<String> {
+    let secs = preview.duration_seconds.max(0.0);
+    let khz = preview.sample_rate as f32 / 1000.0;
+    vec![
+        format!("{}:{:04.1}", (secs as u64) / 60, secs % 60.0),
+        if khz.fract() == 0.0 {
+            format!("{khz:.0} kHz")
+        } else {
+            format!("{khz:.1} kHz")
+        },
+        match preview.channels {
+            1 => "Mono".to_string(),
+            2 => "Stereo".to_string(),
+            n => format!("{n} ch"),
+        },
+    ]
+}
+
+/// Everything known about the current selection: name and facts, for audio
+/// the decoded waveform with play / stop, and the one action a double-click
+/// would take.
+fn preview_card(
     state: &FileBrowserState,
     node: &BrowserVisibleNode,
     callbacks: &BrowserCallbacks,
@@ -1112,103 +1306,101 @@ fn details_pane(
         .path
         .as_deref()
         .and_then(|path| state.instrument_for(path));
+    let preview = audio_path
+        .as_ref()
+        .and_then(|p| waveform_cache::get_preview_arc(&p.to_string_lossy()));
+    let failed = audio_path
+        .as_deref()
+        .is_some_and(|p| state.waveform_failed(p));
+    let playing = audio_path.is_some() && state.preview_playing.as_deref() == audio_path.as_deref();
+    let playhead = audio_path
+        .as_deref()
+        .and_then(|p| state.preview_position_for(p));
 
-    let mut meta: Vec<String> = Vec::new();
-    if instrument.is_none() {
-        if !node.extension.is_empty() {
-            meta.push(node.extension.to_uppercase());
+    let mut facts: Vec<String> = Vec::new();
+    if let Some(instrument) = instrument {
+        facts.extend(
+            [
+                instrument.vendor.as_str(),
+                instrument.format.as_str(),
+                instrument.category.as_str(),
+            ]
+            .into_iter()
+            .filter(|part| !part.trim().is_empty())
+            .map(str::to_string),
+        );
+    } else {
+        match preview.as_ref() {
+            Some(p) => facts.extend(audio_facts(p)),
+            // The extension is in the name; it is only worth repeating when
+            // nothing was decoded.
+            None if !node.extension.is_empty() => facts.push(node.extension.to_uppercase()),
+            None => {}
         }
         if let Some(bytes) = node.size_bytes {
-            meta.push(format_size(bytes));
+            facts.push(format_size(bytes));
         }
     }
-    let instrument_section = instrument.map(|instrument| {
-        let about = [
-            instrument.vendor.as_str(),
-            instrument.format.as_str(),
-            instrument.category.as_str(),
-        ]
-        .into_iter()
-        .filter(|part| !part.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join(" · ");
+
+    // Play / stop for audio. Stop ends this file's audition; play starts it
+    // whether or not auto-preview is on.
+    let play = audio_path.clone().map(|path| {
+        let audition = callbacks.on_audition.clone();
+        let stop = callbacks.on_stop_preview.clone();
+        let tip = if playing {
+            i18n.tr_or("browser.preview.stop", "Stop preview")
+        } else {
+            i18n.tr_or("browser.preview.play", "Play preview")
+        };
+        let rest = if playing {
+            Colors::accent_primary()
+        } else {
+            Colors::surface_raised()
+        };
+        let hover = Colors::composite(rest, Colors::state_hover());
         div()
+            .id("browser-preview-play")
+            .role(Role::Button)
+            .aria_label(tip.clone())
             .flex()
-            .flex_col()
-            .gap(px(space::HAIR))
+            .items_center()
+            .justify_center()
+            .flex_shrink_0()
+            .w(px(size::PROMINENT))
+            .h(px(size::PROMINENT))
+            .rounded(px(radius::PILL))
+            .bg(rest)
+            .border(px(1.0))
+            .border_color(Colors::border_subtle())
+            .cursor(gpui::CursorStyle::PointingHand)
+            .hover(move |s| s.bg(hover))
+            .tooltip(fb_tooltip(tip))
+            .on_click(move |_e, w, cx| {
+                if playing {
+                    stop(w, cx);
+                } else {
+                    audition(&path, w, cx);
+                }
+            })
             .child(
-                div()
-                    .truncate()
-                    .text_size(px(typography::DENSE_CAPTION))
-                    .text_color(Colors::text_muted())
-                    .child(about),
-            )
-            .child(
-                div()
-                    .text_size(px(typography::DENSE_CAPTION))
-                    .text_color(Colors::text_faint())
-                    .child(i18n.tr_or(
-                        "browser.instruments.hint",
-                        "Double-click, or drag onto the arrangement, to add it on a new track.",
-                    )),
+                svg()
+                    .path(if playing {
+                        assets::ICON_SQUARE_PATH
+                    } else {
+                        assets::ICON_PLAY_PATH
+                    })
+                    .w(px(12.0))
+                    .h(px(12.0))
+                    .text_color(if playing {
+                        Colors::on_accent()
+                    } else {
+                        Colors::text_primary()
+                    }),
             )
     });
 
-    let header = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(space::SNUG))
-        .h(px(size::DENSE))
-        .child(
-            svg()
-                .path(browser_icon_path(node.icon, node.expanded))
-                .flex_shrink_0()
-                .w(px(GLYPH))
-                .h(px(GLYPH))
-                .text_color(Colors::text_muted()),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.0))
-                .overflow_hidden()
-                .truncate()
-                .text_size(px(typography::DENSE_LABEL))
-                .text_color(Colors::text_secondary())
-                .child(label),
-        )
-        .children((!meta.is_empty()).then(|| {
-            div()
-                .flex_shrink_0()
-                .font_features(tabular_figures())
-                .text_size(px(typography::DENSE_CAPTION))
-                .text_color(Colors::text_faint())
-                .child(meta.join(" · "))
-        }));
-
-    let audio_section = audio_path.map(|path| {
-        let key = path.to_string_lossy().to_string();
-        let preview = waveform_cache::get_preview_arc(&key);
-        let playhead = state.preview_position_for(&path);
-        let failed = state.waveform_failed(&path);
-        let playing = state.preview_playing.is_some();
-        let stop_cb = callbacks.on_stop_preview.clone();
-
-        // Format / duration readout, tabular so it does not reflow.
-        let transport_text = match preview.as_ref() {
-            Some(p) => {
-                let secs = p.duration_seconds.max(0.0);
-                let mins = (secs as u64) / 60;
-                let rem = secs - (mins * 60) as f64;
-                let sr = p.sample_rate as f32 / 1000.0;
-                format!("{mins}:{rem:04.1} · {sr:.1} kHz · {} ch", p.channels)
-            }
-            None if failed => i18n.tr_or("browser.preview.failed", "Could not decode audio"),
-            None => i18n.tr_or("browser.preview.decoding", "Decoding waveform…"),
-        };
-
-        let canvas_body: gpui::AnyElement = match preview {
+    let waveform = audio_path.as_ref().map(|_| {
+        let body: gpui::AnyElement = match preview.clone() {
             Some(preview) => mini_waveform_canvas(preview, playhead).into_any_element(),
             None => div()
                 .flex()
@@ -1228,67 +1420,141 @@ fn details_pane(
                 })
                 .into_any_element(),
         };
-
+        // Square: a waveform's content mask is an axis-aligned rect.
         div()
-            .flex()
-            .flex_col()
-            .gap(px(space::TIGHT))
-            .child(
-                // Square: a waveform's content mask is an axis-aligned rect.
-                div()
-                    .relative()
-                    .h(px(WAVEFORM_H))
-                    .w_full()
-                    .overflow_hidden()
-                    .bg(Colors::surface_input())
-                    .child(canvas_body),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(space::SNUG))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .overflow_hidden()
-                            .truncate()
-                            .font_features(tabular_figures())
-                            .text_size(px(typography::DENSE_CAPTION))
-                            .text_color(if failed {
-                                Colors::status_error()
-                            } else {
-                                Colors::text_faint()
-                            })
-                            .child(transport_text),
-                    )
-                    .child(browser_icon_button(
-                        "browser-preview-stop",
-                        assets::ICON_SQUARE_PATH,
-                        i18n.tr_or("browser.preview.stop", "Stop preview"),
-                        Colors::surface_panel_alt(),
-                        None,
-                        playing,
-                        move |_e, w, cx| stop_cb(w, cx),
-                    )),
-            )
+            .relative()
+            .h(px(WAVEFORM_H))
+            .w_full()
+            .overflow_hidden()
+            .bg(Colors::surface_input())
+            .child(body)
     });
+
+    // What a double-click does, offered as a button — and only where it does
+    // something (audio onto a track, a plug-in preset loaded); a drag-only
+    // file says so instead.
+    let is_file = node.kind == BrowserNodeKind::File;
+    let path = node.path.clone();
+    let action: Option<(String, String)> = if !is_file {
+        None
+    } else if audio_path.is_some() {
+        Some((
+            i18n.tr_or("browser.preview.add-hint", "Double-click or drag to add"),
+            i18n.tr_or("browser.preview.add-to-track", "Add to track"),
+        ))
+    } else if node.is_plugin_preset() {
+        Some((
+            if instrument.is_some() {
+                i18n.tr_or("browser.instruments.hint.short", "Adds on a new track")
+            } else {
+                i18n.tr_or("browser.preview.add-hint", "Double-click or drag to add")
+            },
+            i18n.tr_or("browser.preview.add-plugin", "Add plug-in"),
+        ))
+    } else {
+        None
+    };
+    let drag_only = is_file
+        && action.is_none()
+        && path
+            .as_deref()
+            .is_some_and(|p| drag_kind(node, p).is_some());
+    let footer = if let (Some((hint, button)), Some(path)) = (action, path) {
+        let activate = callbacks.on_activate_file.clone();
+        Some(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(px(space::SNUG))
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .text_size(px(typography::DENSE_CAPTION))
+                        .text_color(Colors::text_faint())
+                        .child(hint),
+                )
+                .child(div().flex_shrink_0().child(fb_button(
+                    "browser-preview-add",
+                    button,
+                    FbButtonKind::Default,
+                    true,
+                    move |_e, w, cx| activate(&path, w, cx),
+                )))
+                .into_any_element(),
+        )
+    } else if drag_only {
+        Some(
+            div()
+                .text_size(px(typography::DENSE_CAPTION))
+                .text_color(Colors::text_faint())
+                .child(i18n.tr_or(
+                    "browser.preview.drag-hint",
+                    "Drag onto the arrangement to add",
+                ))
+                .into_any_element(),
+        )
+    } else {
+        None
+    };
 
     div()
         .flex_shrink_0()
+        .m(px(space::BASE))
         .flex()
         .flex_col()
-        .gap(px(space::TIGHT))
-        .px(px(space::BASE))
-        .py(px(space::SNUG))
-        .border_t(px(1.0))
-        .border_color(Colors::border_subtle())
+        .gap(px(space::BASE))
+        .p(px(space::BASE))
+        .rounded(px(radius::SURFACE))
         .bg(Colors::surface_panel_alt())
-        .child(header)
-        .children(instrument_section)
-        .children(audio_section)
+        .border(px(1.0))
+        .border_color(Colors::border_subtle())
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(space::BASE))
+                .children(play)
+                .when(audio_path.is_none(), |row| {
+                    row.child(
+                        svg()
+                            .path(browser_icon_path(node.icon, node.expanded))
+                            .flex_shrink_0()
+                            .w(px(GLYPH))
+                            .h(px(GLYPH))
+                            .text_color(Colors::text_muted()),
+                    )
+                })
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .min_w(px(0.0))
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(typography::UI_SM))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(Colors::text_primary())
+                                .child(label),
+                        )
+                        .when(!facts.is_empty(), |col| {
+                            col.child(
+                                div()
+                                    .truncate()
+                                    .font_features(tabular_figures())
+                                    .text_size(px(typography::DENSE_LABEL))
+                                    .text_color(Colors::text_muted())
+                                    .child(facts.join(" · ")),
+                            )
+                        }),
+                ),
+        )
+        .children(waveform)
+        .children(footer)
 }
 
 /// Draw a peak-rendered waveform filling the canvas. Columns are computed from

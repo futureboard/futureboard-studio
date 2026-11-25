@@ -88,7 +88,9 @@ fn bundle_crashpad_handler() {
 const ORT_DEFAULT_VERSION: &str = "1.23.2";
 
 /// Download the ONNX Runtime shared library from the microsoft/onnxruntime
-/// GitHub release and place it next to the built binary, so the Stem Extractor
+/// GitHub release (or, when that is unreachable, the pinned
+/// `Microsoft.ML.OnnxRuntime` NuGet package) and place it next to the built
+/// binary, so the Stem Extractor
 /// can load it at runtime (`{appdir}/onnxruntime.dll` · `libonnxruntime.so` ·
 /// `libonnxruntime.dylib`).
 ///
@@ -236,20 +238,61 @@ fn download_onnxruntime() {
         let Some(lib) = extracted else {
             panic!("ONNX Runtime archive {asset} does not contain {lib_name}");
         };
-        std::fs::write(&dest, lib)
-            .unwrap_or_else(|err| panic!("could not write {}: {err}", dest.display()));
-        std::fs::write(&version_marker, format!("{version}\n{expected}"))
-            .unwrap_or_else(|err| panic!("could not write {}: {err}", version_marker.display()));
-        // Rerun when the staged library is replaced or removed (xtask removes
-        // it before a package build). Cargo compares against the time this run
-        // started, so date the file just written before that, or every build
-        // would rerun this script.
-        for path in [&dest, &version_marker] {
-            backdate(path, started);
-            println!("cargo:rerun-if-changed={}", path.display());
-        }
-        println!("cargo:warning=ONNX Runtime staged at {}", dest.display());
+        stage_ort_library(&dest, &version_marker, &lib, &version, &expected, started);
         return;
+    }
+
+    // The GitHub release assets are unreachable (the microsoft/onnxruntime
+    // repository returned 404 from 2026-11-17). Microsoft also publishes the
+    // CPU build as the `Microsoft.ML.OnnxRuntime` NuGet package, which carries
+    // every desktop platform's library; its win-x64 `onnxruntime.dll` is
+    // byte-identical to the one in the GitHub zip. The package is pinned by its
+    // own SHA-256, so this is the same trust as the archives above.
+    if let Some(expected) = ort_nuget_sha256(&version) {
+        if let Some(entry) = ort_nuget_entry(&target_os, &target_arch) {
+            let package = format!("microsoft.ml.onnxruntime.{version}.nupkg");
+            let cached_package = archive_cache.join(&package);
+            let cached = std::fs::read(&cached_package)
+                .ok()
+                .filter(|bytes| sha256_hex(bytes) == expected);
+            let bytes = match cached {
+                Some(bytes) => Some(bytes),
+                None => {
+                    let url = format!(
+                        "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/{version}/{package}"
+                    );
+                    println!("cargo:warning=Downloading ONNX Runtime {version} from NuGet ({package})...");
+                    match http_get(&url) {
+                        Ok(bytes) => {
+                            let actual = sha256_hex(&bytes);
+                            if actual != expected {
+                                panic!(
+                                    "ONNX Runtime package {package} SHA-256 mismatch: expected {expected}, got {actual}"
+                                );
+                            }
+                            std::fs::create_dir_all(&archive_cache).unwrap_or_else(|err| {
+                                panic!("could not create {}: {err}", archive_cache.display())
+                            });
+                            std::fs::write(&cached_package, &bytes).unwrap_or_else(|err| {
+                                panic!("could not write {}: {err}", cached_package.display())
+                            });
+                            Some(bytes)
+                        }
+                        Err(err) => {
+                            println!("cargo:warning=  {package} unavailable ({err})");
+                            None
+                        }
+                    }
+                }
+            };
+            if let Some(bytes) = bytes {
+                let Some(lib) = extract_zip_entry(&bytes, &entry) else {
+                    panic!("ONNX Runtime package {package} does not contain {entry}");
+                };
+                stage_ort_library(&dest, &version_marker, &lib, &version, expected, started);
+                return;
+            }
+        }
     }
 
     let skipped = if skipped_unpinned.is_empty() {
@@ -295,6 +338,65 @@ fn ort_archive_sha256(asset: &str) -> Option<&'static str> {
         }
         _ => None,
     }
+}
+
+/// SHA-256 of the `Microsoft.ML.OnnxRuntime` NuGet package, the CPU build's
+/// second source when the GitHub release is unreachable.
+fn ort_nuget_sha256(version: &str) -> Option<&'static str> {
+    match version {
+        "1.23.2" => Some("25fe172f7fcdf34f2b5b02c8b997f6b88abc282956849d4af4335af23d0c4e4a"),
+        _ => None,
+    }
+}
+
+/// The library's path inside the NuGet package for this target. The package
+/// has per-architecture macOS libraries rather than the GitHub universal2 one;
+/// a universal package is still produced by `merge-universal-macos.sh`.
+fn ort_nuget_entry(target_os: &str, target_arch: &str) -> Option<String> {
+    let (rid, file) = match (target_os, target_arch) {
+        ("windows", "x86_64") => ("win-x64", "onnxruntime.dll"),
+        ("windows", "aarch64") => ("win-arm64", "onnxruntime.dll"),
+        ("linux", "x86_64") => ("linux-x64", "libonnxruntime.so"),
+        ("linux", "aarch64") => ("linux-arm64", "libonnxruntime.so"),
+        ("macos", "x86_64") => ("osx-x64", "libonnxruntime.dylib"),
+        ("macos", "aarch64") => ("osx-arm64", "libonnxruntime.dylib"),
+        _ => return None,
+    };
+    Some(format!("runtimes/{rid}/native/{file}"))
+}
+
+/// Write the verified library and its version marker next to the binary.
+fn stage_ort_library(
+    dest: &Path,
+    version_marker: &Path,
+    lib: &[u8],
+    version: &str,
+    expected: &str,
+    started: std::time::SystemTime,
+) {
+    std::fs::write(dest, lib)
+        .unwrap_or_else(|err| panic!("could not write {}: {err}", dest.display()));
+    std::fs::write(version_marker, format!("{version}\n{expected}"))
+        .unwrap_or_else(|err| panic!("could not write {}: {err}", version_marker.display()));
+    // Rerun when the staged library is replaced or removed (xtask removes it
+    // before a package build). Cargo compares against the time this run
+    // started, so date the file just written before that, or every build would
+    // rerun this script.
+    for path in [dest, version_marker] {
+        backdate(path, started);
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+    println!("cargo:warning=ONNX Runtime staged at {}", dest.display());
+}
+
+/// Read one file, by its exact path, out of a zip archive.
+fn extract_zip_entry(bytes: &[u8], path: &str) -> Option<Vec<u8>> {
+    use std::io::{Cursor, Read};
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).ok()?;
+    let mut file = archive.by_name(path).ok()?;
+    let mut out = Vec::with_capacity(file.size() as usize);
+    file.read_to_end(&mut out).ok()?;
+    Some(out)
 }
 
 /// Set `path`'s mtime a minute before `started`, so a file this run wrote does
@@ -447,27 +549,12 @@ fn stage_professional_sources() {
     stage_professional_source(&source_dir, &output_dir, "eula_dialog.rs");
     stage_professional_source(&source_dir, &output_dir, "updates.rs");
 
-    // The notation engine and the MIDI editor's Score view: every file in
-    // `src/notation`, staged under `notation/` for `professional_edition.rs`.
-    let notation_dir = source_dir.join("notation");
-    println!("cargo:rerun-if-changed={}", notation_dir.display());
-    std::fs::create_dir_all(output_dir.join("notation"))
-        .expect("failed to create the staged notation dir");
-    let mut notation_files: Vec<String> = std::fs::read_dir(&notation_dir)
-        .unwrap_or_else(|error| {
-            panic!(
-                "Professional Edition notation sources are required for --features professional: {}: {error}",
-                notation_dir.display()
-            )
-        })
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| name.ends_with(".rs"))
-        .collect();
-    notation_files.sort();
-    for name in notation_files {
-        stage_professional_source(&source_dir, &output_dir, &format!("notation/{name}"));
-    }
+    // The notation engine and the MIDI editor's Score view, and the
+    // audio-to-MIDI engine: every file in `src/notation` and
+    // `src/audio_to_midi`, staged under the same folder names for
+    // `professional_edition.rs`.
+    stage_professional_dir(&source_dir, &output_dir, "notation");
+    stage_professional_dir(&source_dir, &output_dir, "audio_to_midi");
 
     // The EULA text is embedded into the binary. Copy it beside the staged
     // source so `include_str!(concat!(env!("OUT_DIR"), ...))` finds it.
@@ -726,6 +813,29 @@ fn read_dotenv(path: &Path) -> Vec<(String, String)> {
             Some((key.trim().to_string(), value.trim().to_string()))
         })
         .collect()
+}
+
+/// Stages every `.rs` file in the private `src/<dir>` under `<dir>/`.
+fn stage_professional_dir(source_dir: &Path, output_dir: &Path, dir: &str) {
+    let from = source_dir.join(dir);
+    println!("cargo:rerun-if-changed={}", from.display());
+    std::fs::create_dir_all(output_dir.join(dir))
+        .unwrap_or_else(|error| panic!("failed to create the staged {dir} dir: {error}"));
+    let mut files: Vec<String> = std::fs::read_dir(&from)
+        .unwrap_or_else(|error| {
+            panic!(
+                "Professional Edition {dir} sources are required for --features professional: {}: {error}",
+                from.display()
+            )
+        })
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".rs"))
+        .collect();
+    files.sort();
+    for name in files {
+        stage_professional_source(source_dir, output_dir, &format!("{dir}/{name}"));
+    }
 }
 
 fn stage_professional_source(source_dir: &Path, output_dir: &Path, file_name: &str) {

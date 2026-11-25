@@ -800,7 +800,15 @@ pub fn drain_commands(
                 runtime.all_notes_off("project_load");
                 std::mem::swap(runtime, &mut *next_runtime);
                 let mut old = next_runtime;
+                let built_rate = runtime.sample_rate;
                 runtime.sample_rate = output_sample_rate;
+                // The compensated tracks keep playing what their delay lines
+                // held, instead of a delay's worth of silence after every edit
+                // made during playback. Not across a change of rate: the
+                // history is counted in the old rate's samples.
+                if built_rate == output_sample_rate {
+                    runtime.inherit_pdc_delay_lines(&old);
+                }
                 // The plugin-bridge sinks (Stage 3b) are carried across the
                 // reload by `EngineInner::load_project`, which copies its
                 // control-thread mirror into the graph and resolves the
@@ -1169,8 +1177,17 @@ pub fn drain_commands(
                     );
                 }
             }
+            EngineCommand::SetTrackVcaGain { track_index, value } => {
+                runtime.update_track_vca_gain_at(track_index, value);
+            }
             EngineCommand::SetTrackPan { track_index, value } => {
                 runtime.update_track_pan_at(track_index, value);
+            }
+            EngineCommand::SetTrackDualPan {
+                track_index,
+                dual_pan,
+            } => {
+                runtime.update_track_dual_pan_at(track_index, dual_pan);
             }
             EngineCommand::SetTrackMute { track_index, muted } => {
                 if callback_debug_enabled() {
@@ -1345,6 +1362,7 @@ pub fn drain_commands(
         .store(local.count_in_remaining, Ordering::Relaxed);
     let playing = local.playing_local;
     local.follow_record_pdc_bypass(runtime, shared, playing);
+    runtime.apply_low_latency_monitoring(shared.low_latency_limit_samples.load(Ordering::Relaxed));
     false
 }
 
@@ -1372,6 +1390,12 @@ pub fn fill_output_f32(
 ) -> u64 {
     let started = std::time::Instant::now();
     let frames = fill_output_f32_inner(data, channels, runtime, shared, local);
+    if runtime.pdc_rings_short {
+        // Raised once per replan that came up short; the control thread
+        // takes it and swaps in a graph with lines long enough.
+        runtime.pdc_rings_short = false;
+        shared.pdc_rings_short.store(true, Ordering::Relaxed);
+    }
     let elapsed_us = started.elapsed().as_micros().min(u32::MAX as u128) as u32;
     // Publish last/max/deadline + classify dropout-risk against the active
     // protection mode (shared with the legacy callback so both paths agree).

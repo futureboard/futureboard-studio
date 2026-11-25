@@ -184,54 +184,114 @@ struct ClipView {
     import_label: Option<String>,
 }
 
-/// The playhead sits outside the dock so invalidating it leaves the cached
-/// editor, overview and waveforms out of the playback render path.
-pub(crate) struct EditorPlayhead {
-    x: Rc<Cell<Option<f32>>>,
-    lane_bounds: PlayheadBounds,
+/// Where the playhead line goes, written by the editor and read by the layer
+/// that paints it.
+#[derive(Default)]
+struct PlayheadSpot {
+    /// Line x relative to the lanes; `None` when it is off screen.
+    x: Cell<Option<f32>>,
+    /// The lanes' visible window bounds, recorded as they are laid out.
+    clip: Cell<Bounds<Pixels>>,
+    /// The editor is on screen. Cleared when the panel shows something else.
+    shown: Cell<bool>,
+    /// The open Tools menu, which the line must not paint over.
+    occluder: Cell<Option<Bounds<Pixels>>>,
+}
+
+/// The playhead line, repainted on transport ticks without re-rendering the
+/// editor (see [`AudioEditorHost::publish_playhead`]).
+///
+/// The studio root renders it beside the cached bottom panel, not inside the
+/// editor: GPUI dirties every ancestor of a notified view, and a cached view
+/// that re-renders rebuilds its whole subtree, so a line inside the editor
+/// rebuilt the dock — toolbar, overview, ruler and waveform — on every pixel
+/// the playhead moved. Here a tick re-renders the root (which the arrangement
+/// playhead already does each frame) and this layer, and the dock is reused.
+pub struct EditorPlayhead {
+    spot: Rc<PlayheadSpot>,
 }
 
 impl Render for EditorPlayhead {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let x = self.x.clone();
-        let lane_bounds = self.lane_bounds.clone();
+        let spot = self.spot.clone();
+        // Read at paint, after the lanes beside this layer recorded where they
+        // are in this same frame.
         canvas(
             |_, _, _| {},
             move |_, _, window, _| {
-                let (Some(x), Some((lane, clip))) = (x.get(), lane_bounds.get()) else {
+                if !spot.shown.get() {
+                    return;
+                }
+                let Some(x) = spot.x.get() else {
                     return;
                 };
-                // The editor measures its lanes during prepaint, including
-                // bounds from the same frame as a resize or a dock move.
+                let clip = spot.clip.get();
+                let Some((left, top, bottom)) = playhead_line_span(x, clip, spot.occluder.get())
+                else {
+                    return;
+                };
+                let _scope = crate::perf::PerfScope::enter("AudioEditorPlayhead");
                 window.with_content_mask(Some(gpui::ContentMask { bounds: clip }), |window| {
                     crate::components::timeline::playhead::paint_playhead_line(
-                        window,
-                        f32::from(lane.origin.x) + x - 0.5,
-                        f32::from(lane.origin.y),
-                        f32::from(lane.bottom()),
-                        1.0,
+                        window, left, top, bottom, 1.0,
                     );
                 });
             },
         )
         .absolute()
-        .inset_0()
+        .top_0()
+        .left_0()
+        .size_full()
     }
 }
 
-/// The editor lane and its visible intersection with the dock.
-type PlayheadBounds = Rc<Cell<Option<(Bounds<Pixels>, Bounds<Pixels>)>>>;
-
-fn publish_playhead_x(x: &Cell<Option<f32>>, next: Option<f32>) -> bool {
-    match (x.get(), next) {
-        (Some(a), Some(b)) if (a - b).abs() < 0.5 => return false,
-        (None, None) => return false,
-        _ => {}
+/// Window-space left edge, top and bottom of the playhead line at lanes x
+/// `x`, inside the lanes' visible bounds `clip` and below `occluder` where the
+/// two overlap. `None` when nothing of it is visible.
+fn playhead_line_span(
+    x: f32,
+    clip: Bounds<Pixels>,
+    occluder: Option<Bounds<Pixels>>,
+) -> Option<(f32, f32, f32)> {
+    use crate::components::timeline::playhead::PLAYHEAD_STROKE;
+    let (cl, ct): (f32, f32) = (clip.origin.x.into(), clip.origin.y.into());
+    let (cw, ch): (f32, f32) = (clip.size.width.into(), clip.size.height.into());
+    if cw <= 0.0 || ch <= 0.0 {
+        return None;
     }
-    // Compare to the last drawn position. At a wide zoom several display
-    // ticks may pass before the line has moved enough to paint again.
-    x.set(next);
-    true
+    // The editor's own frame: the line's left edge half a pixel left of `x`.
+    let left = cl + x - 0.5;
+    let mut top = ct;
+    let bottom = ct + ch;
+    if let Some(menu) = occluder {
+        let (ml, mt): (f32, f32) = (menu.origin.x.into(), menu.origin.y.into());
+        let (mw, mh): (f32, f32) = (menu.size.width.into(), menu.size.height.into());
+        let overlaps = left + 1.0 + PLAYHEAD_STROKE > ml && left - PLAYHEAD_STROKE < ml + mw;
+        if overlaps && mt <= top && mt + mh > top {
+            top = mt + mh;
+        }
+    }
+    (top < bottom).then_some((left, top, bottom))
+}
+
+/// Lanes x of the playhead `rel` beats into a clip `duration` beats long, or
+/// `None` when it is outside the clip or the visible width.
+fn playhead_x(view: &Viewport, rel: f64, duration: f64) -> Option<f32> {
+    let width = view.width as f32;
+    (0.0..=duration)
+        .contains(&rel)
+        .then(|| view.x_at(rel) as f32)
+        .filter(|x| (0.0..=width).contains(x))
+}
+
+/// Whether a line at `next` draws differently from one at `prev`: sub-pixel
+/// motion repaints nothing.
+fn playhead_moved(prev: Option<f32>, next: Option<f32>) -> bool {
+    match (prev, next) {
+        (Some(a), Some(b)) => (a - b).abs() >= 0.5,
+        (None, None) => false,
+        _ => true,
+    }
 }
 
 pub struct AudioEditorHost {
@@ -260,11 +320,7 @@ pub struct AudioEditorHost {
     lanes_bounds: Rc<Cell<Bounds<Pixels>>>,
     overview_bounds: Rc<Cell<Bounds<Pixels>>>,
     playhead: Entity<EditorPlayhead>,
-    playhead_x: Rc<Cell<Option<f32>>>,
-    playhead_bounds: PlayheadBounds,
-    /// Clip span used for the drawn waveform. Transport ticks can use these
-    /// coordinates without looking the selected clip up in the project.
-    playhead_clip_span: Option<(f64, f64)>,
+    playhead_spot: Rc<PlayheadSpot>,
     _timeline_observer: Subscription,
 }
 
@@ -295,12 +351,10 @@ pub fn clip_type_hint_for_selection(
 impl AudioEditorHost {
     pub fn new(timeline: Entity<Timeline>, cx: &mut Context<Self>) -> Self {
         let _timeline_observer = cx.observe(&timeline, |_, _, cx| cx.notify());
-        let playhead_x = Rc::new(Cell::new(None));
-        let playhead_bounds = Rc::new(Cell::new(None));
+        let playhead_spot = Rc::new(PlayheadSpot::default());
         let playhead = {
-            let x = playhead_x.clone();
-            let lane_bounds = playhead_bounds.clone();
-            cx.new(|_| EditorPlayhead { x, lane_bounds })
+            let spot = playhead_spot.clone();
+            cx.new(|_| EditorPlayhead { spot })
         };
         Self {
             timeline,
@@ -330,11 +384,15 @@ impl AudioEditorHost {
             lanes_bounds: Rc::new(Cell::new(Bounds::default())),
             overview_bounds: Rc::new(Cell::new(Bounds::default())),
             playhead,
-            playhead_x,
-            playhead_bounds,
-            playhead_clip_span: None,
+            playhead_spot,
             _timeline_observer,
         }
+    }
+
+    /// The playhead line's layer, for the studio root to render over the
+    /// dock (see [`EditorPlayhead`]).
+    pub fn playhead_layer(&self) -> Entity<EditorPlayhead> {
+        self.playhead.clone()
     }
 
     pub fn set_callbacks(&mut self, callbacks: AudioEditorCallbacks) {
@@ -383,11 +441,7 @@ impl AudioEditorHost {
     /// place: the editor is off screen, so it no longer owns Edit commands.
     pub fn mark_hidden(&self) {
         self.focused.set(false);
-        self.playhead_bounds.set(None);
-    }
-
-    pub(crate) fn playhead_overlay(&self) -> Entity<EditorPlayhead> {
-        self.playhead.clone()
+        self.playhead_spot.shown.set(false);
     }
 
     /// The selection as a tool window target.
@@ -421,15 +475,9 @@ impl AudioEditorHost {
     }
 
     fn sync_playhead(&mut self, cx: &mut Context<Self>) {
-        if self.playhead_bounds.get().is_none() {
-            return;
-        }
-        let Some((start, duration)) = self.playhead_clip_span else {
+        let Some((rel, duration, playing)) = self.playhead_rel(cx) else {
             return;
         };
-        let transport = &self.timeline.read(cx).state.transport;
-        let rel = transport.playhead_beats as f64 - start;
-        let playing = transport.playing;
         let inside = (0.0..=duration).contains(&rel);
         if playing && inside && self.drag == Drag::None && self.view.width > 1.0 {
             let x = self.view.x_at(rel);
@@ -440,18 +488,30 @@ impl AudioEditorHost {
                 cx.notify();
             }
         }
-        let next = self.visible_playhead_x(rel, duration);
-        if publish_playhead_x(&self.playhead_x, next) {
+        if self.place_playhead(rel, duration) {
             self.playhead.update(cx, |_, cx| cx.notify());
         }
     }
 
-    fn visible_playhead_x(&self, rel: f64, duration: f64) -> Option<f32> {
-        let width = self.view.width as f32;
-        (0.0..=duration)
-            .contains(&rel)
-            .then(|| self.view.x_at(rel) as f32)
-            .filter(|x| (0.0..=width).contains(x))
+    /// Playhead relative to the clip, the clip length and whether the
+    /// transport runs. Cheap: a transport tick calls this at display rate.
+    fn playhead_rel(&self, cx: &App) -> Option<(f64, f64, bool)> {
+        let state = &self.timeline.read(cx).state;
+        let (_, clip) = state.find_clip(self.clip_id.as_deref()?)?;
+        let rel = state.transport.playhead_beats as f64 - clip.start_beat.max(0.0) as f64;
+        Some((
+            rel,
+            clip.duration_beats.max(0.0) as f64,
+            state.transport.playing,
+        ))
+    }
+
+    /// Put the playhead line at `rel`; `true` when it moved on screen.
+    fn place_playhead(&mut self, rel: f64, duration: f64) -> bool {
+        let next = playhead_x(&self.view, rel, duration);
+        let changed = playhead_moved(self.playhead_spot.x.get(), next);
+        self.playhead_spot.x.set(next);
+        changed
     }
 
     // ── Project reads ──────────────────────────────────────────────────────
@@ -477,22 +537,30 @@ impl AudioEditorHost {
         let path = source_path.clone();
         let audio = self.audio_for(path.as_deref());
         let asset_key = clip.audio_asset_key().map(str::to_string);
-        let meta = asset_key.as_deref().and_then(waveform_cache::get_file_meta);
-        let (total_frames, sample_rate, channels) = match (&audio, &meta) {
-            (Some(audio), _) => (
+        let (total_frames, sample_rate, channels) = match &audio {
+            Some(audio) => (
                 audio.pcm.frames() as u64,
                 audio.pcm.sample_rate,
                 audio.pcm.channels,
             ),
-            (None, Some(meta)) => (meta.total_frames, meta.sample_rate, meta.channels as usize),
-            (None, None) => (
-                clip.stretch.original_duration_samples,
-                clip.stretch.original_sample_rate,
-                2,
-            ),
+            // The waveform cache's metadata only stands in until the editor's
+            // own decode lands; its lock is shared with the peak builders.
+            None => match asset_key.as_deref().and_then(waveform_cache::get_file_meta) {
+                Some(meta) => (meta.total_frames, meta.sample_rate, meta.channels as usize),
+                None => (
+                    clip.stretch.original_duration_samples,
+                    clip.stretch.original_sample_rate,
+                    2,
+                ),
+            },
         };
         let bpm = state.bpm.max(1.0) as f64;
-        let map = ClipMap::build(clip, total_frames, bpm, |beat| state.seconds_at_beat(beat));
+        // Resolved once: each `seconds_at_beat` looks the cached tempo map up
+        // again (hashing every tempo point under its lock), and the map table
+        // samples it a thousand times or more — on every render and every
+        // pointer move of a gesture.
+        let tempo = state.tempo_lookup();
+        let map = ClipMap::build(clip, total_frames, bpm, |beat| tempo.seconds_at_beat(beat));
         let abs_start = clip.start_beat.max(0.0) as f64;
         let duration = clip.duration_beats.max(0.0) as f64;
         // The fades the clip plays — a crossfade's on an overlapped edge —
@@ -1688,6 +1756,7 @@ impl AudioEditorHost {
     }
 
     fn tools_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+        let spot = self.playhead_spot.clone();
         div()
             .id("audio-editor-tools-menu")
             .absolute()
@@ -1705,6 +1774,15 @@ impl AudioEditorHost {
             .flex()
             .flex_col()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            // The playhead layer paints above the dock; it stops at the menu.
+            .child(
+                canvas(
+                    move |bounds, _, _| spot.occluder.set(Some(bounds)),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
+            )
             .children(TOOL_MENU.iter().enumerate().map(|(index, kind)| {
                 let kind = *kind;
                 div()
@@ -1934,8 +2012,7 @@ impl AudioEditorHost {
             palette,
         };
         let bounds_cell = self.lanes_bounds.clone();
-        let playhead_bounds = self.playhead_bounds.clone();
-        let editor = cx.weak_entity();
+        let playhead_spot = self.playhead_spot.clone();
         let measured_width = self.view.width;
         let overlay_label = if audio.is_some() {
             None
@@ -2021,17 +2098,16 @@ impl AudioEditorHost {
             )
             .child(
                 canvas(
-                    move |bounds, window, cx| {
+                    move |bounds, window, _| {
                         bounds_cell.set(bounds);
-                        let clip = bounds.intersect(&window.content_mask().bounds);
-                        playhead_bounds.set((!clip.is_empty()).then_some((bounds, clip)));
+                        // What of the lanes is actually visible, for the
+                        // playhead layer painting outside this subtree.
+                        playhead_spot
+                            .clip
+                            .set(bounds.intersect(&window.content_mask().bounds));
                         let width: f32 = bounds.size.width.into();
                         if (width as f64 - measured_width).abs() > 0.5 {
-                            // GPUI ignores window refreshes during prepaint.
-                            // Fit and clamp using the new width on the next draw.
-                            cx.defer(move |cx| {
-                                let _ = editor.update(cx, |_, cx| cx.notify());
-                            });
+                            window.refresh();
                         }
                     },
                     move |bounds, _, window, _| {
@@ -2213,10 +2289,12 @@ impl Render for AudioEditorHost {
             .size_full()
             .bg(Colors::surface_base());
 
-        let Some(view) = self.clip_view(cx) else {
-            self.playhead_clip_span = None;
-            self.playhead_bounds.set(None);
-            self.playhead_x.set(None);
+        // On screen with lanes only when there is a clip; the open menu
+        // records its bounds again as it is laid out.
+        let view = self.clip_view(cx);
+        self.playhead_spot.shown.set(view.is_some());
+        self.playhead_spot.occluder.set(None);
+        let Some(view) = view else {
             return root
                 .items_center()
                 .justify_center()
@@ -2244,10 +2322,9 @@ impl Render for AudioEditorHost {
         self.cursor = self.cursor.clamp(0.0, view.duration);
 
         // Scrolling and zooming move the line too, not only the transport.
-        self.playhead_clip_span = Some((view.abs_start, view.duration));
-        let rel = self.timeline.read(cx).state.transport.playhead_beats as f64 - view.abs_start;
-        self.playhead_x
-            .set(self.visible_playhead_x(rel, view.duration));
+        if let Some((rel, duration, _)) = self.playhead_rel(cx) {
+            self.place_playhead(rel, duration);
+        }
 
         let grid = Arc::new(build_grid(
             &self.timeline.read(cx).state.time_signature_map,
@@ -2255,9 +2332,7 @@ impl Render for AudioEditorHost {
             self.view,
         ));
         let palette = Self::palette(view.track_color);
-        let tools_menu = self
-            .tools_menu_open
-            .then(|| gpui::deferred(self.tools_menu(cx)).with_priority(1));
+        let tools_menu = self.tools_menu_open.then(|| self.tools_menu(cx));
 
         root.on_scroll_wheel(cx.listener(Self::on_wheel))
             .on_mouse_down(
@@ -2281,144 +2356,6 @@ impl Render for AudioEditorHost {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn subpixel_playhead_steps_accumulate_between_draws() {
-        let x = Cell::new(Some(12.0));
-        assert!(!publish_playhead_x(&x, Some(12.2)));
-        assert!(!publish_playhead_x(&x, Some(12.4)));
-        assert_eq!(x.get(), Some(12.0));
-        assert!(publish_playhead_x(&x, Some(12.6)));
-        assert_eq!(x.get(), Some(12.6));
-        assert!(publish_playhead_x(&x, None));
-        assert!(!publish_playhead_x(&x, None));
-    }
-
-    #[gpui::test]
-    fn playback_ticks_leave_the_docked_waveform_cached(cx: &mut gpui::TestAppContext) {
-        struct Dock {
-            editor: Entity<AudioEditorHost>,
-            draws: Rc<Cell<usize>>,
-            nested_playhead: bool,
-        }
-
-        impl Render for Dock {
-            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-                self.draws.set(self.draws.get() + 1);
-                div()
-                    .size_full()
-                    .relative()
-                    .child(self.editor.clone())
-                    .children(
-                        self.nested_playhead
-                            .then(|| self.editor.read(cx).playhead_overlay()),
-                    )
-            }
-        }
-
-        struct PlaybackWindow {
-            timeline: Entity<Timeline>,
-            editor: Entity<AudioEditorHost>,
-            dock: Entity<Dock>,
-            nested_playhead: bool,
-        }
-
-        impl Render for PlaybackWindow {
-            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-                div()
-                    .size_full()
-                    .relative()
-                    .child(
-                        gpui::AnyView::from(self.dock.clone())
-                            .cached(gpui::StyleRefinement::default().size_full()),
-                    )
-                    .children(
-                        (!self.nested_playhead).then(|| self.editor.read(cx).playhead_overlay()),
-                    )
-            }
-        }
-
-        for nested_playhead in [true, false] {
-            let draws = Rc::new(Cell::new(0));
-            let window = cx.open_window(gpui::size(px(1200.0), px(400.0)), |_, cx| {
-                let source = "playback-test.wav";
-                let timeline = cx.new(|_| {
-                    let mut timeline = Timeline::new();
-                    let track = timeline.state.create_audio_track();
-                    let clip = timeline.state.insert_recorded_clip(
-                        &track,
-                        source.into(),
-                        "Playback".into(),
-                        0.0,
-                        2.0,
-                        120.0,
-                    );
-                    timeline.state.select_clip(&clip);
-                    timeline.state.transport.playing = true;
-                    timeline
-                });
-                let editor = cx.new(|cx| {
-                    let mut editor = AudioEditorHost::new(timeline.clone(), cx);
-                    let pcm = Pcm {
-                        sample_rate: 48_000,
-                        channels: 2,
-                        samples: (0..192_000).map(|i| (i as f32 * 0.01).sin()).collect(),
-                    };
-                    editor.remember(Arc::new(EditorAudio::new(source.into(), pcm)));
-                    editor
-                });
-                let dock = cx.new(|_| Dock {
-                    editor: editor.clone(),
-                    draws: draws.clone(),
-                    nested_playhead,
-                });
-                PlaybackWindow {
-                    timeline,
-                    editor,
-                    dock,
-                    nested_playhead,
-                }
-            });
-            cx.run_until_parked();
-            let (timeline, editor) = window
-                .update(cx, |root, _, _| {
-                    (root.timeline.clone(), root.editor.clone())
-                })
-                .expect("playback window is open");
-            let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
-            // Warm the measured lane width and fitted view before ticking.
-            visual.update(|window, cx| window.draw(cx).clear());
-            assert!(visual.update(|_, cx| {
-                let editor = editor.read(cx);
-                editor.playhead_bounds.get().is_some() && editor.view.width > 1.0
-            }));
-            let initial_draws = draws.get();
-
-            for beat in [0.05, 0.10, 0.15, 0.20] {
-                timeline.update(&mut visual, |timeline, _| {
-                    timeline.state.transport.playhead_beats = beat
-                });
-                visual.update(|_, cx| AudioEditorHost::publish_playhead(&editor, cx));
-                visual.update(|window, cx| window.draw(cx).clear());
-            }
-
-            assert!(visual.update(|_, cx| editor
-                .read(cx)
-                .playhead_x
-                .get()
-                .is_some_and(|x| x > 0.0)));
-            // Both cases draw the real editor. A playhead inside the cached
-            // dock invalidates its waveform, while its sibling only draws the line.
-            assert_eq!(
-                draws.get() - initial_draws,
-                if nested_playhead { 4 } else { 0 }
-            );
-            window
-                .update(cx, |_, window, _| window.remove_window())
-                .expect("playback window is open");
-            cx.run_until_parked();
-        }
-    }
 
     #[test]
     fn the_grid_thins_lines_and_labels_with_zoom() {
@@ -2447,6 +2384,71 @@ mod tests {
         assert!(labelled
             .windows(2)
             .all(|w| (w[1].rel - w[0].rel) * 1.0 >= 44.0));
+    }
+
+    fn bounds(x: f32, y: f32, w: f32, h: f32) -> Bounds<Pixels> {
+        Bounds::new(gpui::point(px(x), px(y)), gpui::size(px(w), px(h)))
+    }
+
+    #[test]
+    fn the_playhead_line_spans_the_visible_lanes() {
+        let lanes = bounds(100.0, 300.0, 800.0, 200.0);
+        // Same left edge the in-editor line had: half a pixel left of `x`.
+        assert_eq!(
+            playhead_line_span(40.0, lanes, None),
+            Some((139.5, 300.0, 500.0))
+        );
+        // Nothing to draw in collapsed lanes.
+        assert_eq!(
+            playhead_line_span(40.0, bounds(100.0, 300.0, 800.0, 0.0), None),
+            None
+        );
+    }
+
+    #[test]
+    fn the_playhead_line_stops_at_the_tools_menu() {
+        let lanes = bounds(0.0, 100.0, 800.0, 200.0);
+        // The menu hangs from above the lanes into them, at the right.
+        let menu = bounds(560.0, 40.0, 220.0, 160.0);
+        assert_eq!(
+            playhead_line_span(600.0, lanes, Some(menu)),
+            Some((599.5, 200.0, 300.0))
+        );
+        // Beside the menu (stroke included) the line is whole.
+        assert_eq!(
+            playhead_line_span(100.0, lanes, Some(menu)),
+            Some((99.5, 100.0, 300.0))
+        );
+        assert_eq!(
+            playhead_line_span(557.0, lanes, Some(menu)),
+            Some((556.5, 100.0, 300.0))
+        );
+        // A menu as tall as the lanes hides the line under it.
+        let tall = bounds(560.0, 40.0, 220.0, 400.0);
+        assert_eq!(playhead_line_span(600.0, lanes, Some(tall)), None);
+    }
+
+    #[test]
+    fn the_playhead_is_placed_only_inside_the_clip_and_the_view() {
+        let view = Viewport {
+            scroll: 2.0,
+            pixels_per_beat: 100.0,
+            width: 400.0,
+        };
+        assert_eq!(playhead_x(&view, 3.0, 8.0), Some(100.0));
+        // Left of the view, past the clip end, right of the view.
+        assert_eq!(playhead_x(&view, 1.0, 8.0), None);
+        assert_eq!(playhead_x(&view, 3.0, 2.5), None);
+        assert_eq!(playhead_x(&view, 7.0, 8.0), None);
+    }
+
+    #[test]
+    fn sub_pixel_playhead_motion_repaints_nothing() {
+        assert!(!playhead_moved(Some(10.0), Some(10.4)));
+        assert!(playhead_moved(Some(10.0), Some(10.5)));
+        assert!(playhead_moved(None, Some(10.0)));
+        assert!(playhead_moved(Some(10.0), None));
+        assert!(!playhead_moved(None, None));
     }
 
     #[test]

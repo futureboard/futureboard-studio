@@ -6,7 +6,9 @@ impl TimelineState {
     /// app entry point; never used by the real runtime default.
     pub fn demo_project() -> Self {
         let track1 = TrackState {
+            vca_group: None,
             spatial: Default::default(),
+            spatial_keeps_inputs: false,
             listen: ListenMode::Off,
             id: "track-1".to_string(),
             name: "Audio 1".to_string(),
@@ -20,6 +22,7 @@ impl TimelineState {
             volume_effective: volume::db_to_norm(-3.0),
             volume_automation_read: true,
             pan: 0.0,
+            dual_pan: Default::default(),
             muted: false,
             solo: false,
             armed: false,
@@ -80,6 +83,7 @@ impl TimelineState {
             }],
             lane_mode: TrackLaneMode::Clips,
             selected_automation_target: None,
+            midi_fx: Vec::new(),
             inserts: Vec::new(),
             sends: Vec::new(),
             routing: TrackRoutingState::for_track_type(TrackType::Audio),
@@ -87,6 +91,7 @@ impl TimelineState {
             takes_expanded: false,
             freeze: None,
             drum_step: false,
+            step_lanes: Vec::new(),
             instrument_plugin_instance_id: None,
             builtin_soundfont_player: false,
             soundfont_path: None,
@@ -102,7 +107,9 @@ impl TimelineState {
         };
 
         let track2 = TrackState {
+            vca_group: None,
             spatial: Default::default(),
+            spatial_keeps_inputs: false,
             listen: ListenMode::Off,
             id: "track-2".to_string(),
             name: "Audio 2".to_string(),
@@ -116,6 +123,7 @@ impl TimelineState {
             volume_effective: volume::db_to_norm(-6.0),
             volume_automation_read: true,
             pan: -0.2,
+            dual_pan: Default::default(),
             muted: false,
             solo: false,
             armed: false,
@@ -145,6 +153,7 @@ impl TimelineState {
             automation_lanes: vec![],
             lane_mode: TrackLaneMode::Clips,
             selected_automation_target: None,
+            midi_fx: Vec::new(),
             inserts: Vec::new(),
             sends: Vec::new(),
             routing: TrackRoutingState::for_track_type(TrackType::Audio),
@@ -152,6 +161,7 @@ impl TimelineState {
             takes_expanded: false,
             freeze: None,
             drum_step: false,
+            step_lanes: Vec::new(),
             instrument_plugin_instance_id: None,
             builtin_soundfont_player: false,
             soundfont_path: None,
@@ -167,7 +177,9 @@ impl TimelineState {
         };
 
         let track3 = TrackState {
+            vca_group: None,
             spatial: Default::default(),
+            spatial_keeps_inputs: false,
             listen: ListenMode::Off,
             id: "track-3".to_string(),
             name: "Synth 3".to_string(),
@@ -181,6 +193,7 @@ impl TimelineState {
             volume_effective: volume::db_to_norm(-1.5),
             volume_automation_read: true,
             pan: 0.3,
+            dual_pan: Default::default(),
             muted: false,
             solo: false,
             armed: false,
@@ -220,6 +233,7 @@ impl TimelineState {
             automation_lanes: vec![],
             lane_mode: TrackLaneMode::Clips,
             selected_automation_target: None,
+            midi_fx: Vec::new(),
             inserts: Vec::new(),
             sends: Vec::new(),
             routing: TrackRoutingState::for_track_type(TrackType::Midi),
@@ -227,6 +241,7 @@ impl TimelineState {
             takes_expanded: false,
             freeze: None,
             drum_step: false,
+            step_lanes: Vec::new(),
             instrument_plugin_instance_id: None,
             builtin_soundfont_player: false,
             soundfont_path: None,
@@ -252,6 +267,7 @@ impl TimelineState {
             spatial_mix: Default::default(),
             timecode_rate: TimecodeRate::default(),
             project_key: None,
+            project_metadata: Default::default(),
             markers: Vec::new(),
             regions: Vec::new(),
             song_text_events: Vec::new(),
@@ -293,6 +309,7 @@ impl TimelineState {
             monitor_output_connection_id: None,
             output_routing_initialized: false,
             master: MasterBusState {
+                vca_groups: Vec::new(),
                 volume: volume::db_to_norm(0.0),
                 inserts: Vec::new(),
                 meter_level_l: 0.0,

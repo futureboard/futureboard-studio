@@ -36,10 +36,10 @@
 use std::f32::consts::{FRAC_1_SQRT_2, FRAC_PI_2, PI, TAU};
 
 use biquad::{Biquad, Coefficients, DirectForm1};
-use builtin_dsp_core::delay::{smoothing_step, Allpass, DelayRing, Smoothed};
+use builtin_dsp_core::delay::{Allpass, DelayRing, Smoothed, smoothing_step};
 use builtin_dsp_core::{
-    biquad_response_db, clamp, db_to_linear, flush_denormal, make_eq_coefficients, ParamDescriptor,
-    PluginCategory, PluginDescriptor, StereoEffect,
+    ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, biquad_response_db, clamp,
+    db_to_linear, flush_denormal, make_eq_coefficients,
 };
 use serde::{Deserialize, Serialize};
 
@@ -51,8 +51,8 @@ pub mod ui;
 
 /// Editor-facing parameter id table, re-exported at the crate root so the host
 /// resolves ids the same way for every built-in (`<plugin>::ui_param_index`).
-pub use ipc::{ui_param_id, ui_param_index, UI_PARAM_IDS};
-pub use presets::{factory_presets, FactoryPreset};
+pub use ipc::{UI_PARAM_IDS, ui_param_id, ui_param_index};
+pub use presets::{FactoryPreset, factory_presets};
 
 pub const PLUGIN_ID: &str = "futureboard.verbspace";
 
@@ -231,8 +231,19 @@ impl ReverbMode {
     /// type's values, the mode label follows, and everything that is not the
     /// room — cuts, width, mix, output, wet-only, freeze, power — stays.
     pub fn starting_point(self, current: &Params) -> Params {
-        let [predelay_ms, size, decay_sec, diffusion, damping, bass_mult, bass_freq_hz, damp_freq_hz, early_late, mod_depth, mod_rate_hz] =
-            self.space();
+        let [
+            predelay_ms,
+            size,
+            decay_sec,
+            diffusion,
+            damping,
+            bass_mult,
+            bass_freq_hz,
+            damp_freq_hz,
+            early_late,
+            mod_depth,
+            mod_rate_hz,
+        ] = self.space();
         Params {
             mode: self,
             predelay_ms,

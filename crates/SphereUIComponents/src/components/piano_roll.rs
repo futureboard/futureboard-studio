@@ -47,6 +47,7 @@ pub mod advanced_tools;
 mod articulation_lane;
 mod cc_lane;
 mod cc_lane_render;
+mod chord_readout;
 mod drum_map;
 mod grid_render;
 mod native_menus;
@@ -1296,6 +1297,78 @@ pub(super) struct StepRow {
     pub track_id: String,
 }
 
+/// What the Lane Note picker needs of the edited track (see
+/// [`PianoRoll::lane_note_context`]).
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct LaneNoteContext {
+    pub track_id: String,
+    /// The track's lanes, ascending (`drum_map::track_lanes`).
+    pub lanes: Vec<u8>,
+    /// Every note the track's clips play.
+    pub hits: Vec<u8>,
+}
+
+impl LaneNoteContext {
+    /// Whether lane `from` may be given `note`: its own note is shown ticked,
+    /// a note another lane has or with hits on it is not offered.
+    pub fn offers(&self, from: u8, note: u8) -> bool {
+        note != from && !drum_map::lane_note_taken(&self.lanes, &self.hits, note)
+    }
+
+    /// The Lane Note picker's rows for lane `from`, in order: the free note a
+    /// semitone below and above (for kits mapped off the GM notes), then the
+    /// General MIDI map by group. The native and the drawn menu both list
+    /// these, so they cannot disagree.
+    pub fn choices(&self, from: u8) -> Vec<LaneNoteChoice> {
+        let mut rows = Vec::new();
+        let label = |note: u8| -> String {
+            match drum_map::gm_drum_name(note) {
+                Some(name) => format!("{name} · {}", note_name(note as i32)),
+                None => note_name(note as i32),
+            }
+        };
+        let below = (0..from).rev().find(|note| self.offers(from, *note));
+        let above = (from.saturating_add(1)..=127).find(|note| self.offers(from, *note));
+        for (prefix, note) in [("Down to", below), ("Up to", above)] {
+            if let Some(note) = note {
+                rows.push(LaneNoteChoice::Note {
+                    note,
+                    label: format!("{prefix} {}", label(note)),
+                    checked: false,
+                    enabled: true,
+                });
+            }
+        }
+        for (group, notes) in drum_map::GM_GROUPS {
+            rows.push(LaneNoteChoice::Group(group));
+            for note in notes.iter().copied() {
+                rows.push(LaneNoteChoice::Note {
+                    note,
+                    label: label(note),
+                    checked: note == from,
+                    enabled: self.offers(from, note),
+                });
+            }
+        }
+        rows
+    }
+}
+
+/// One row of the Lane Note picker.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum LaneNoteChoice {
+    /// A General MIDI group's caption.
+    Group(&'static str),
+    /// Give the lane `note`. `checked` is the lane's note now; `enabled` is
+    /// false for a note another lane has or with hits on it.
+    Note {
+        note: u8,
+        label: String,
+        checked: bool,
+        enabled: bool,
+    },
+}
+
 /// A drum lane menu row: a quick pattern action on one lane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LaneAction {
@@ -1655,6 +1728,10 @@ pub struct PianoRoll {
     /// The playhead's own entity, created on first render because it needs no
     /// geometry until there is some.
     playhead_overlay: Option<Entity<playhead::PianoRollPlayheadOverlay>>,
+    /// The chord the notes spell, shared with the footer's readout entity so
+    /// a playback tick updates the word without rebuilding the editor.
+    chord_label: chord_readout::ChordLabelCell,
+    chord_readout: Option<Entity<chord_readout::PianoRollChordReadout>>,
     /// Docked editor only: opens the floating MIDI editor window.
     on_pop_out: Option<std::sync::Arc<dyn Fn(&mut Window, &mut gpui::App) + Send + Sync>>,
     /// Floating editor only: the window's own actions, shown in the editor's
@@ -2034,6 +2111,8 @@ impl PianoRoll {
                 playhead::PianoRollPlayheadFrame::default(),
             )),
             playhead_overlay: None,
+            chord_label: Default::default(),
+            chord_readout: None,
             on_pop_out: None,
             on_export_midi: None,
             on_dock: None,
@@ -3368,7 +3447,7 @@ impl PianoRoll {
         let removed_ids: Vec<u64> = removed.iter().map(|n| n.id).collect();
         let added = added.to_vec();
         let changed = changed.to_vec();
-        self.with_timeline_silent(cx, |tl, _| {
+        self.with_timeline_silent(cx, |tl, tcx| {
             tl.state.delete_midi_notes(&clip_id, &removed_ids);
             if let Some(notes) = tl.state.midi_clip_notes_mut(&clip_id) {
                 for note in added {
@@ -3380,6 +3459,10 @@ impl PianoRoll {
             if !changed.is_empty() {
                 tl.state.overwrite_midi_notes(&clip_id, &changed);
             }
+            // Heard as it is painted: the engine takes MIDI-only updates
+            // live (one in flight, the newest state next), while the
+            // gesture still records a single undo step on release.
+            tl.mark_midi_preview_changed(tcx);
         });
     }
 
@@ -4409,18 +4492,128 @@ impl PianoRoll {
         if !self.drum_mode {
             return;
         }
-        let used: Vec<u8> = self
-            .editing_clip_id(cx)
-            .and_then(|clip_id| {
-                self.timeline
-                    .read(cx)
-                    .state
-                    .midi_clip_notes(&clip_id)
-                    .map(|notes| notes.iter().map(|note| note.pitch).collect())
+        let (used, kit) = self.drum_lane_inputs(cx);
+        self.drum_rows = drum_map::drum_rows(self.drum_lanes, self.drum_order, &used, &kit);
+        self.drum_names = self.drum_sampler_names(cx);
+    }
+
+    /// The notes the edited clip plays and its track's own lane list: what
+    /// the drum lanes are built from.
+    fn drum_lane_inputs(&self, cx: &Context<Self>) -> (Vec<u8>, Vec<u8>) {
+        let Some(clip_id) = self.editing_clip_id(cx) else {
+            return (Vec::new(), Vec::new());
+        };
+        let state = &self.timeline.read(cx).state;
+        let used = state
+            .midi_clip_notes(&clip_id)
+            .map(|notes| notes.iter().map(|note| note.pitch).collect())
+            .unwrap_or_default();
+        let kit = state
+            .find_clip(&clip_id)
+            .map(|(track, _)| track.step_lanes.clone())
+            .unwrap_or_default();
+        (used, kit)
+    }
+
+    /// Every note the clips of `track_id` play.
+    fn track_hit_notes(&self, track_id: &str, cx: &Context<Self>) -> Vec<u8> {
+        let state = &self.timeline.read(cx).state;
+        let mut hits: Vec<u8> = state
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .map(|track| {
+                track
+                    .clips
+                    .iter()
+                    .filter_map(|clip| state.midi_clip_notes(&clip.id))
+                    .flat_map(|notes| notes.iter().map(|note| note.pitch))
+                    .collect()
             })
             .unwrap_or_default();
-        self.drum_rows = drum_map::drum_rows(self.drum_lanes, self.drum_order, &used);
-        self.drum_names = self.drum_sampler_names(cx);
+        hits.sort_unstable();
+        hits.dedup();
+        hits
+    }
+
+    /// The edited track's lanes as the Lane Note picker sees them: its lane
+    /// list and every note its clips play. `None` off the drum lanes (the
+    /// Sampler Rack sets pad notes its own way).
+    pub(super) fn lane_note_context(&self, cx: &Context<Self>) -> Option<LaneNoteContext> {
+        if !self.drum_mode || self.rack_active() {
+            return None;
+        }
+        let clip_id = self.editing_clip_id(cx)?;
+        let track_id = self
+            .timeline
+            .read(cx)
+            .state
+            .find_clip(&clip_id)
+            .map(|(track, _)| track.id.clone())?;
+        let (used, kit) = self.drum_lane_inputs(cx);
+        Some(LaneNoteContext {
+            lanes: drum_map::track_lanes(&kit, &used),
+            hits: self.track_hit_notes(&track_id, cx),
+            track_id,
+        })
+    }
+
+    /// Give drum lane `from` note `to`: its hits in every clip of the track
+    /// move to `to` (keeping their ids, timing, velocity and channel) and the
+    /// track's lane list records the lane at its new note. One undo step,
+    /// saved with the project. Refused when `to` is already a lane or holds
+    /// hits.
+    pub(super) fn set_lane_note(&mut self, from: u8, to: u8, cx: &mut Context<Self>) {
+        self.open_lane_menu = None;
+        let Some(context) = self.lane_note_context(cx) else {
+            return;
+        };
+        let Some(next_lanes) = drum_map::relabeled_lanes(&context.lanes, &context.hits, from, to)
+        else {
+            return;
+        };
+        let track_id = context.track_id;
+        self.timeline.update(cx, |tl, tcx| {
+            let pending = tl.begin_track_edit(
+                crate::components::timeline::timeline_state::TrackEditScope::tracks([
+                    track_id.clone()
+                ]),
+            );
+            let clip_ids: Vec<String> = tl
+                .state
+                .tracks
+                .iter()
+                .find(|track| track.id == track_id)
+                .map(|track| track.clips.iter().map(|clip| clip.id.clone()).collect())
+                .unwrap_or_default();
+            let mut moved_any = false;
+            for clip_id in &clip_ids {
+                let Some(notes) = tl.state.midi_clip_notes(clip_id) else {
+                    continue;
+                };
+                let moved = step_grid::retargeted(notes, from, to);
+                if !moved.is_empty() {
+                    tl.state.overwrite_midi_notes(clip_id, &moved);
+                    moved_any = true;
+                }
+            }
+            if let Some(track) = tl.state.tracks.iter_mut().find(|t| t.id == track_id) {
+                track.step_lanes = next_lanes;
+            }
+            tl.commit_track_edit("Lane Note", pending, false, tcx);
+            // Moved hits reach the engine like any note edit; a lane with no
+            // hits is saved state the engine never sees.
+            if moved_any {
+                tl.mark_midi_changed(tcx);
+            } else {
+                tl.mark_control_state_changed(tcx);
+            }
+        });
+        if self.drum_hover_lane == Some(from) {
+            self.drum_hover_lane = Some(to);
+        }
+        self.refresh_drum_rows(cx);
+        cx.notify();
     }
 
     /// Pad names of the built-in Drum Sampler on the edited track, by note:
@@ -7709,6 +7902,7 @@ impl PianoRoll {
     /// borrows it, and notifying the overlay needs it mutably. Resolving
     /// everything in one scope lets the read end before the write begins.
     pub fn publish_playhead(roll: &Entity<Self>, cx: &mut gpui::App) -> bool {
+        Self::publish_chord(roll, cx);
         let (overlay, frame, next) = {
             let this = roll.read(cx);
             let Some(overlay) = this.playhead_overlay.clone() else {
@@ -7737,6 +7931,53 @@ impl PianoRoll {
         frame.set(next);
         overlay.update(cx, |_, cx| cx.notify());
         true
+    }
+
+    /// Refresh the footer's chord readout from the playback poll, notifying
+    /// only its own entity and only when the chord changed.
+    fn publish_chord(roll: &Entity<Self>, cx: &mut gpui::App) {
+        let (readout, cell, next) = {
+            let this = roll.read(cx);
+            let Some(readout) = this.chord_readout.clone() else {
+                return;
+            };
+            (readout, this.chord_label.clone(), this.chord_label_now(cx))
+        };
+        if *cell.borrow() == next {
+            return;
+        }
+        *cell.borrow_mut() = next;
+        readout.update(cx, |_, cx| cx.notify());
+    }
+
+    /// The chord the readout shows now: while playing, the notes sounding
+    /// under the playhead; stopped, the selected notes, or with none selected
+    /// the notes under the parked playhead.
+    pub(super) fn chord_label_now(&self, cx: &gpui::App) -> Option<gpui::SharedString> {
+        let state = &self.timeline.read(cx).state;
+        if !state.transport.playing && !self.selection.is_empty() {
+            let pitches: Vec<u8> = state
+                .selection
+                .selected_clip_ids
+                .first()
+                .and_then(|clip_id| state.midi_clip_notes(clip_id))
+                .into_iter()
+                .flatten()
+                .filter(|note| self.selection.contains(&note.id))
+                .map(|note| note.pitch)
+                .collect();
+            return chord_readout::chord_label(&pitches);
+        }
+        let beat = state.transport.playhead_beats;
+        let span = self.scope.owner_at(beat)?;
+        let local = span.to_local(beat);
+        let pitches: Vec<u8> = state
+            .midi_clip_notes(&span.clip_id)?
+            .iter()
+            .filter(|note| !note.muted && note.start <= local && local < note.start + note.duration)
+            .map(|note| note.pitch)
+            .collect();
+        chord_readout::chord_label(&pitches)
     }
 
     /// Continuous scrolling: while the transport plays and Follow is on, keep
@@ -10531,6 +10772,98 @@ mod step_view_gesture_tests {
         assert!(rig.lane(HAT).is_empty());
         assert!(rig.undo());
         assert_eq!(rig.lane(HAT).len(), 5);
+    }
+
+    /// Lane Note: the hat lane set to the Pedal Hi-Hat moves its hits there
+    /// (same notes), the track keeps the lane at its new note, a note with
+    /// hits is refused, and one undo/redo takes both back and forth.
+    #[gpui::test]
+    fn lane_note_moves_the_lanes_hits_and_is_one_undo_step(cx: &mut TestAppContext) {
+        const PEDAL_HAT: u8 = 44;
+        let mut rig = rig(cx, &[(KICK, 0.0, 100), (HAT, 0.5, 90), (HAT, 1.5, 70)]);
+        let read = |rig: &mut Rig| {
+            rig.window
+                .update(&mut rig.cx, |roll, _, cx| {
+                    roll.refresh_drum_rows(cx);
+                    let clip = roll.editing_clip_id(cx).expect("clip");
+                    let state = &roll.timeline.read(cx).state;
+                    let lanes = state
+                        .find_clip(&clip)
+                        .map(|(track, _)| track.step_lanes.clone())
+                        .expect("track");
+                    let ids: Vec<u64> = state
+                        .midi_clip_notes(&clip)
+                        .into_iter()
+                        .flatten()
+                        .filter(|n| n.pitch == HAT || n.pitch == PEDAL_HAT)
+                        .map(|n| n.id)
+                        .collect();
+                    (lanes, ids, roll.drum_rows.clone())
+                })
+                .expect("window")
+        };
+        rig.window
+            .update(&mut rig.cx, |roll, _, cx| {
+                roll.set_drum_lanes(DrumLanes::Used, cx)
+            })
+            .expect("window");
+        let (lanes, hat_ids, rows) = read(&mut rig);
+        assert!(lanes.is_empty(), "the default kit");
+        assert_eq!(rows, vec![KICK, HAT]);
+
+        rig.window
+            .update(&mut rig.cx, |roll, _, cx| {
+                roll.set_lane_note(HAT, PEDAL_HAT, cx)
+            })
+            .expect("window");
+        assert!(rig.lane(HAT).is_empty());
+        assert_eq!(rig.lane(PEDAL_HAT), vec![(0.5, 90), (1.5, 70)]);
+        let (lanes, moved_ids, rows) = read(&mut rig);
+        assert_eq!(lanes, vec![KICK, PEDAL_HAT]);
+        assert_eq!(moved_ids, hat_ids, "the same notes, moved");
+        assert_eq!(rows, vec![KICK, PEDAL_HAT]);
+
+        // The kick lane holds hits: the pedal hat cannot take its note.
+        rig.window
+            .update(&mut rig.cx, |roll, _, cx| {
+                roll.set_lane_note(PEDAL_HAT, KICK, cx)
+            })
+            .expect("window");
+        assert_eq!(rig.lane(PEDAL_HAT).len(), 2);
+        assert_eq!(rig.lane(KICK).len(), 1);
+
+        assert!(rig.undo());
+        assert_eq!(rig.lane(HAT), vec![(0.5, 90), (1.5, 70)]);
+        assert!(rig.lane(PEDAL_HAT).is_empty());
+        let (lanes, _, rows) = read(&mut rig);
+        assert!(lanes.is_empty());
+        assert_eq!(rows, vec![KICK, HAT]);
+
+        let redone = rig
+            .window
+            .update(&mut rig.cx, |roll, _, cx| {
+                roll.timeline.update(cx, |tl, cx| tl.redo_edit(cx))
+            })
+            .expect("window");
+        assert!(redone);
+        assert_eq!(rig.lane(PEDAL_HAT).len(), 2);
+        assert_eq!(read(&mut rig).0, vec![KICK, PEDAL_HAT]);
+    }
+
+    /// An empty lane takes a note too — a kit mapped off the GM notes — and
+    /// keeps it with no hits on it.
+    #[gpui::test]
+    fn an_empty_lane_keeps_the_note_it_is_given(cx: &mut TestAppContext) {
+        let mut rig = rig(cx, &[]);
+        rig.window
+            .update(&mut rig.cx, |roll, _, cx| {
+                roll.set_drum_lanes(DrumLanes::Used, cx);
+                roll.set_lane_note(HAT, 30, cx);
+                roll.refresh_drum_rows(cx);
+                assert_eq!(roll.drum_rows, vec![30, 36, 38, 46, 49, 51]);
+                assert_eq!(roll.drum_lane_name(30).as_ref(), note_name(30));
+            })
+            .expect("window");
     }
 
     /// Hovering a step names exactly that step's notes for the velocity lane.

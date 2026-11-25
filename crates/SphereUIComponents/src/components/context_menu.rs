@@ -177,6 +177,8 @@ pub fn popup_items(entries: Vec<ContextMenuEntry>) -> Vec<crate::native_popup_me
                 disabled,
                 danger: _,
             } => Some(PopupItem::Command {
+                icon: crate::components::command_icons::command_icon(&command)
+                    .map(crate::components::command_icons::native_menu_icon),
                 label,
                 command,
                 shortcut,
@@ -270,6 +272,27 @@ fn native_context_menu(
     )
 }
 
+/// The drawn context menu, whatever the platform (`ui-preview` only): the
+/// preview cannot show a native menu.
+#[cfg(feature = "ui-preview")]
+pub(crate) fn preview_drawn_context_menu(
+    entries: Vec<ContextMenuEntry>,
+    x: f32,
+    y: f32,
+    viewport: (f32, f32),
+) -> gpui::AnyElement {
+    drawn_context_menu(
+        entries,
+        x,
+        y,
+        viewport.0,
+        viewport.1,
+        Arc::new(|_, _, _| {}),
+        Arc::new(|_, _, _| {}),
+    )
+    .into_any_element()
+}
+
 fn drawn_context_menu(
     entries: Vec<ContextMenuEntry>,
     x: f32,
@@ -314,10 +337,25 @@ fn drawn_context_menu(
         .child(panel(entries, left, top, width, on_command))
 }
 
+/// Whether any row of `entries` has a glyph from the command icon set, so
+/// every row reserves the column and the labels stay in line.
+fn has_icons(entries: &[ContextMenuEntry]) -> bool {
+    entries.iter().any(|entry| match entry {
+        ContextMenuEntry::Item { command, .. } => {
+            crate::components::command_icons::command_icon(command).is_some()
+        }
+        _ => false,
+    })
+}
+
+/// The icon column's width and the gap after it.
+const ICON_SLOT_W: f32 = 14.0 + 6.0;
+
 fn panel_width_for_entries(entries: &[ContextMenuEntry]) -> f32 {
     let has_check = entries
         .iter()
         .any(|entry| matches!(entry, ContextMenuEntry::Item { checked: true, .. }));
+    let icon_slot = if has_icons(entries) { ICON_SLOT_W } else { 0.0 };
     let mut width = menu_style::PANEL_MIN_WIDTH;
     for entry in entries {
         let ContextMenuEntry::Item {
@@ -340,6 +378,7 @@ fn panel_width_for_entries(entries: &[ContextMenuEntry]) -> f32 {
             menu_style::PANEL_PAD * 2.0
                 + menu_style::ROW_PAD_X * 2.0
                 + left_slot
+                + icon_slot
                 + label_slot
                 + shortcut_slot,
         );
@@ -379,6 +418,7 @@ fn panel(
     let has_check = entries
         .iter()
         .any(|entry| matches!(entry, ContextMenuEntry::Item { checked: true, .. }));
+    let icon_column = has_icons(&entries);
     div()
         .absolute()
         .left(px(left))
@@ -417,6 +457,7 @@ fn panel(
                     disabled,
                     danger,
                     has_check,
+                    icon_column,
                     on_command.clone(),
                 )
                 .into_any_element(),
@@ -454,8 +495,12 @@ fn item_row(
     disabled: bool,
     danger: bool,
     panel_has_check: bool,
+    icon_column: bool,
     on_command: ContextCommandCb,
 ) -> impl IntoElement {
+    let icon = icon_column
+        .then(|| crate::components::command_icons::command_icon(&command))
+        .flatten();
     let mut text_color = if danger {
         Colors::status_error()
     } else {
@@ -502,6 +547,30 @@ fn item_row(
                         } else {
                             div().into_any_element()
                         })
+                }))
+                // The command's glyph, in the row's own colour (red on a
+                // destructive row, dimmed on a disabled one).
+                .children(icon_column.then(|| {
+                    div()
+                        .flex_none()
+                        .w(px(ICON_SLOT_W - 6.0))
+                        .h(px(menu_style::ROW_HEIGHT))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .children(icon.map(|icon| {
+                            svg()
+                                .path(icon.path)
+                                .w(px(menu_style::ICON_SIZE + 2.0))
+                                .h(px(menu_style::ICON_SIZE + 2.0))
+                                .text_color(if danger {
+                                    text_color
+                                } else {
+                                    let mut glyph = Colors::text_muted();
+                                    glyph.a *= text_color.a;
+                                    glyph
+                                })
+                        }))
                 }))
                 .child(
                     div()

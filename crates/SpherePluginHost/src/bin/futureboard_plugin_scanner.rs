@@ -210,13 +210,39 @@ fn main() {
     match serde_json::to_string(&payload) {
         Ok(json) => {
             emit_payload(stdout, &json);
-            process::exit(if payload.process_crashed { 1 } else { 0 });
+            let code = if payload.process_crashed { 1 } else { 0 };
+            if SpherePluginHost::scan_left_work_running() {
+                end_without_teardown(code);
+            }
+            process::exit(code);
         }
         Err(error) => {
             eprintln!("Failed to serialize scan result: {error}");
             process::exit(1);
         }
     }
+}
+
+/// End now, skipping every DLL's detach and every atexit handler.
+///
+/// A bus probe is still running inside a plug-in that was slow to initialize
+/// (see `sphere_vst3_scan_left_work_running`). A normal exit would run that
+/// plug-in's `DllMain` detach and C runtime teardown while its own thread is
+/// mid-initialization, which can hang the scanner until the parent's timeout
+/// discards the result that was already written. The payload is flushed, so
+/// nothing is lost.
+fn end_without_teardown(code: i32) -> ! {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+        let _ = TerminateProcess(GetCurrentProcess(), code as u32);
+    }
+    #[cfg(unix)]
+    unsafe {
+        libc::_exit(code);
+    }
+    #[allow(unreachable_code)]
+    process::exit(code)
 }
 
 fn print_help() {

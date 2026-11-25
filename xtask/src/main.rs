@@ -2,15 +2,16 @@
 //!
 //! Two responsibilities:
 //!
-//! * `build-all` / `check-all` — chain the per-edition cargo aliases from
-//!   `.cargo/config.toml` (Cargo aliases cannot chain commands, and the two
-//!   editions must build into separate target directories). The Windows-only
-//!   Professional alias is skipped unless the host or an explicit target is
-//!   Windows.
+//! * `build-all` / `check-all` — run the `build-studio` / `check-studio`
+//!   aliases from `.cargo/config.toml`, adding the Professional features when
+//!   this checkout can compile them (see [`platform::includes_professional`]),
+//!   so the workspace is checked exactly as the package is built.
 //! * `package` — build `FutureboardNative` and stage a clean, runnable
 //!   application tree into `out/`, separate from the Cargo `target/` cache.
+//!   There is one package; Studio picks Community or Professional features at
+//!   runtime from the licence.
 //! * `jam` — the same for `FutureboardJam`, the standalone Audio Jam client.
-//!   A much smaller package: one executable, no CEF, no sidecars, no editions.
+//!   A much smaller package: one executable, no CEF, no sidecars.
 //!
 //! Packaging deliberately lives here, not in `build.rs`: `build.rs` runs inside
 //! every compilation and must stay hermetic, whereas packaging is an explicit,
@@ -28,13 +29,13 @@ mod plugins;
 mod staging;
 mod toolchain;
 mod validation;
+mod visualizer;
+mod x86_bridge;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use clap::{Parser, Subcommand};
-
-use platform::Edition;
 
 #[derive(Parser)]
 #[command(
@@ -45,7 +46,7 @@ use platform::Edition;
 struct Cli {
     /// Explicit subcommand (`package`, `build-all`, `check-all`). Omit this
     /// to run `package` directly with the flags below, e.g.
-    /// `cargo xtask --package community --plugins all`.
+    /// `cargo xtask --profile release --plugins all`.
     #[command(subcommand)]
     command: Option<XtaskCommand>,
 
@@ -58,15 +59,15 @@ enum XtaskCommand {
     /// Build and stage a runnable application into `out/`.
     Package(PackageArgs),
 
-    /// Run `build-ce`, then the Windows Professional build when applicable
-    /// (extra args forwarded).
+    /// Run `build-studio`, with the Professional features when this checkout
+    /// has them (extra args forwarded).
     BuildAll {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
 
-    /// Run `check-ce`, then the Windows Professional check when applicable
-    /// (extra args forwarded).
+    /// Run `check-studio`, with the Professional features when this checkout
+    /// has them (extra args forwarded).
     CheckAll {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -130,11 +131,6 @@ struct PackageArgs {
     #[arg(long)]
     target: Option<String>,
 
-    /// Which edition to build and stage. `--package` is accepted as an
-    /// alias to match the `cargo build --package` mental model.
-    #[arg(long, alias = "package", default_value = "community")]
-    edition: Edition,
-
     /// Root output directory for staged packages.
     #[arg(long, default_value = "out")]
     out: PathBuf,
@@ -160,18 +156,18 @@ struct PackageArgs {
     /// Skip wrapping a macOS package into `Futureboard Studio.app`.
     #[arg(long)]
     no_bundle: bool,
+
+    /// Leave out the Futureboard Visualizer app (built with CMake).
+    #[arg(long)]
+    no_visualizer: bool,
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Some(XtaskCommand::Package(args)) => run_package(args),
-        Some(XtaskCommand::BuildAll { args }) => {
-            run_aliases(&["build-ce", "build-professional-win"], &args)
-        }
-        Some(XtaskCommand::CheckAll { args }) => {
-            run_aliases(&["check-ce", "check-professional-win"], &args)
-        }
+        Some(XtaskCommand::BuildAll { args }) => exit_code(run_cargo_alias("build-studio", &args)),
+        Some(XtaskCommand::CheckAll { args }) => exit_code(run_cargo_alias("check-studio", &args)),
         Some(XtaskCommand::Jam(args)) => run_jam(args),
         Some(XtaskCommand::Bundle { args }) => run_plugin_bundle(&args),
         Some(XtaskCommand::CrashpadPrebuilt { target, target_dir }) => {
@@ -287,7 +283,6 @@ fn run_package(args: PackageArgs) -> ExitCode {
     let options = package::PackageOptions {
         profile: args.profile,
         target: args.target,
-        edition: args.edition,
         out_root: args.out,
         symbols: args.symbols,
         plugins: package::PluginSelection::parse(
@@ -296,6 +291,7 @@ fn run_package(args: PackageArgs) -> ExitCode {
         ),
         stage_cef: !args.no_cef,
         bundle_macos: !args.no_bundle,
+        visualizer: !args.no_visualizer,
     };
     match package::run(&options) {
         Ok(path) => {
@@ -309,29 +305,11 @@ fn run_package(args: PackageArgs) -> ExitCode {
     }
 }
 
-fn run_aliases(aliases: &[&str], forwarded: &[String]) -> ExitCode {
-    for alias in aliases {
-        if !should_run_alias(alias, forwarded) {
-            eprintln!(
-                "[xtask] skipping {alias}: this alias is Windows-only and no Windows target was requested"
-            );
-            continue;
-        }
-        if let Err(code) = run_cargo_alias(alias, forwarded) {
-            return code;
-        }
+fn exit_code(result: Result<(), ExitCode>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(code) => code,
     }
-    ExitCode::SUCCESS
-}
-
-fn should_run_alias(alias: &str, forwarded: &[String]) -> bool {
-    if !matches!(alias, "build-professional-win" | "check-professional-win") {
-        return true;
-    }
-
-    requested_target(forwarded)
-        .map(|target| target.contains("windows"))
-        .unwrap_or(cfg!(target_os = "windows"))
 }
 
 fn requested_target(args: &[String]) -> Option<&str> {
@@ -348,45 +326,64 @@ fn run_cargo_alias(alias: &str, forwarded: &[String]) -> Result<(), ExitCode> {
     // Run from the workspace root so the aliases in .cargo/config.toml resolve
     // regardless of where `cargo xtask` was invoked.
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("xtask must live under the workspace root");
+    let target_triple = match requested_target(forwarded) {
+        Some(target) => target.to_owned(),
+        None => match platform::host_target() {
+            Ok(host) => host,
+            Err(error) => {
+                eprintln!("[xtask] {error:#}");
+                return Err(ExitCode::FAILURE);
+            }
+        },
+    };
+    let professional = platform::includes_professional(workspace, &target_triple);
+
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    eprintln!("[xtask] cargo {} {}", alias, forwarded.join(" "));
     let mut command = Command::new(&cargo);
-    command.arg(alias).args(forwarded).current_dir(root);
+    command.arg(alias).current_dir(root);
+    if professional {
+        command.args(["--features", platform::PROFESSIONAL_FEATURES]);
+    }
+    command.args(forwarded);
+    eprintln!(
+        "[xtask] cargo {alias} {}{}",
+        if professional {
+            format!("--features {} ", platform::PROFESSIONAL_FEATURES)
+        } else {
+            String::new()
+        },
+        forwarded.join(" ")
+    );
     jobs::apply(&mut command, None, forwarded);
 
     // Cargo does not expose an alias' `--target-dir` as CARGO_TARGET_DIR to
     // build scripts. Crashpad uses that variable when it places its handler,
     // so mirror the alias' target directory explicitly or the handler lands in
     // the app crate's fallback target tree instead of the tree being built.
-    if let Some(target_dir) = match alias {
-        "build-ce" | "check-ce" => Some("target/community"),
-        "build-professional-win" | "check-professional-win" => Some("target/professional"),
-        _ => None,
-    } {
-        let target_dir = Path::new(root).join(target_dir);
-        // Link the SHA-256-verified Crashpad prebuilt, not crashpad-rs-sys's
-        // own unchecked download.
-        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("xtask must live under the workspace root");
-        match crashpad::seed_for_target_dir(workspace, requested_target(forwarded), &target_dir) {
-            Ok(Some(prebuilt)) => {
-                command.env("CRASHPAD_CACHE_DIR", &prebuilt.cache_root);
-            }
-            Ok(None) => {}
-            Err(error) => {
-                eprintln!("[xtask] {error:#}");
-                return Err(ExitCode::FAILURE);
-            }
+    let target_dir = Path::new(root).join(platform::TARGET_DIR);
+    // Link the SHA-256-verified Crashpad prebuilt, not crashpad-rs-sys's own
+    // unchecked download.
+    match crashpad::seed_for_target_dir(workspace, requested_target(forwarded), &target_dir) {
+        Ok(Some(prebuilt)) => {
+            command.env("CRASHPAD_CACHE_DIR", &prebuilt.cache_root);
         }
-        command.env("CARGO_TARGET_DIR", target_dir);
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("[xtask] {error:#}");
+            return Err(ExitCode::FAILURE);
+        }
     }
+    command.env("CARGO_TARGET_DIR", target_dir);
 
-    // The professional aliases compile `asio-sys`, so they need the same SDK and
-    // libclang the packaging path resolves. Without this, `cargo xtask
+    // Windows Professional features compile `asio-sys`, so they need the same
+    // SDK and libclang the packaging path resolves. Without this, `cargo xtask
     // build-all` would still fall back to the %TEMP% download that breaks.
-    if alias.contains("professional") {
-        match toolchain::prepare_professional(Path::new(root)) {
+    // Linux compiles the Professional client without that toolchain.
+    if professional && platform::requires_asio_toolchain(&target_triple) {
+        match toolchain::prepare_professional(workspace) {
             Ok(toolchain) => toolchain.apply(&mut command),
             Err(error) => {
                 eprintln!("[xtask] {error:#}");
@@ -415,32 +412,14 @@ fn run_cargo_alias(alias: &str, forwarded: &[String]) -> Result<(), ExitCode> {
 
 #[cfg(test)]
 mod tests {
-    use super::{requested_target, should_run_alias};
+    use super::requested_target;
 
     #[test]
-    fn community_aliases_are_always_run() {
-        assert!(should_run_alias("build-ce", &[]));
-    }
-
-    #[test]
-    fn professional_windows_alias_uses_host_by_default() {
-        assert_eq!(
-            should_run_alias("build-professional-win", &[]),
-            cfg!(target_os = "windows")
-        );
-    }
-
-    #[test]
-    fn explicit_windows_target_enables_professional_alias() {
+    fn the_target_is_read_from_either_spelling() {
         let args = vec!["--target".to_owned(), "x86_64-pc-windows-msvc".to_owned()];
         assert_eq!(requested_target(&args), Some("x86_64-pc-windows-msvc"));
-        assert!(should_run_alias("check-professional-win", &args));
-    }
-
-    #[test]
-    fn explicit_non_windows_target_skips_professional_alias() {
         let args = vec!["--target=aarch64-apple-darwin".to_owned()];
         assert_eq!(requested_target(&args), Some("aarch64-apple-darwin"));
-        assert!(!should_run_alias("build-professional-win", &args));
+        assert_eq!(requested_target(&[]), None);
     }
 }

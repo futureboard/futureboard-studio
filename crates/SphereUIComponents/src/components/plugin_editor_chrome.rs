@@ -1426,6 +1426,7 @@ fn sidechain_trigger(
                             shortcut: None,
                             checked: *checked,
                             enabled: *enabled,
+                            icon: None,
                         },
                         None => PopupItem::Command {
                             label: label.clone(),
@@ -1433,6 +1434,7 @@ fn sidechain_trigger(
                             shortcut: None,
                             checked: false,
                             enabled: false,
+                            icon: None,
                         },
                     })
                     .collect();

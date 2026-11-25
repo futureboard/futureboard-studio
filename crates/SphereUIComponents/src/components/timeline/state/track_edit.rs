@@ -112,6 +112,7 @@ impl TrackEditSnapshot {
             track
                 .inserts
                 .iter()
+                .chain(track.midi_fx.iter().filter_map(|fx| fx.plugin.as_ref()))
                 .filter(|slot| !slot.is_empty())
                 .map(|slot| (track.id.clone(), slot.id.clone()))
         });
@@ -129,7 +130,12 @@ impl TrackEditSnapshot {
     pub fn slots_mut(&mut self) -> impl Iterator<Item = &mut InsertSlotState> {
         self.tracks
             .iter_mut()
-            .flat_map(|track| track.inserts.iter_mut())
+            .flat_map(|track| {
+                track
+                    .inserts
+                    .iter_mut()
+                    .chain(track.midi_fx.iter_mut().filter_map(|fx| fx.plugin.as_mut()))
+            })
             .chain(self.master.iter_mut().flat_map(|m| m.inserts.iter_mut()))
     }
 }

@@ -359,10 +359,13 @@ fn room_project(
 fn listener_track(index: usize, listener: &Listener) -> EngineTrackSnapshot {
     EngineTrackSnapshot {
         midi_programs: Vec::new(),
+        midi_fx: Vec::new(),
+        vca_gain: 1.0,
         id: format!("jam-{index}"),
         track_type: "audio".to_string(),
         volume: listener.volume,
         pan: 0.0,
+        dual_pan: Default::default(),
         muted: listener.muted,
         solo: false,
         // Never armed: this application records nothing, and an armed track
@@ -402,10 +405,13 @@ fn listener_track(index: usize, listener: &Listener) -> EngineTrackSnapshot {
 fn self_monitor_track() -> EngineTrackSnapshot {
     EngineTrackSnapshot {
         midi_programs: Vec::new(),
+        midi_fx: Vec::new(),
+        vca_gain: 1.0,
         id: "jam-self".to_string(),
         track_type: "audio".to_string(),
         volume: 1.0,
         pan: 0.0,
+        dual_pan: Default::default(),
         muted: false,
         solo: false,
         armed: false,

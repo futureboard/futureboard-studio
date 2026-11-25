@@ -20,9 +20,7 @@ use gpui::{
 
 use crate::assets;
 use crate::components::box_list_view::{
-    box_list_empty_state, box_list_group_label, box_list_icon_button, box_list_item,
-    box_list_item_badge, box_list_item_content, box_list_item_leading_icon, box_list_item_title,
-    box_list_item_trailing, box_list_toggle, box_list_view, BoxListBadgeTone,
+    box_list_empty_state, box_list_icon_button, box_list_switch, box_list_toggle,
 };
 use crate::components::combo_box::{combo_box_string_menu, combo_box_trigger};
 use crate::components::controls::{
@@ -382,6 +380,9 @@ pub struct SettingsDialogCallbacks {
     pub on_open_keyboard_shortcuts: Option<OnOpenKeyboardShortcuts>,
     /// Opens the existing Plug-in Manager for Scan / Rescan and scan status.
     pub on_open_plugin_manager: Option<OnOpenPluginManager>,
+    /// Opens the running ASIO driver's own control panel. `None` where there
+    /// is no engine to ask.
+    pub on_open_asio_control_panel: Option<OnOpenPluginManager>,
 }
 
 /// The sidebar and the page for the current state. With a search query, the
@@ -540,6 +541,9 @@ pub struct SettingsWindow {
     on_update: OnSettingUpdate,
     on_open_keyboard_shortcuts: Option<OnOpenKeyboardShortcuts>,
     on_open_plugin_manager: Option<OnOpenPluginManager>,
+    /// Opens the running ASIO driver's control panel; see
+    /// [`SettingsWindow::set_asio_control_panel`].
+    on_open_asio_control_panel: Option<OnOpenPluginManager>,
     focus_handle: FocusHandle,
 }
 

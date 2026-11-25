@@ -163,6 +163,7 @@ impl StudioLayout {
                 ContextTarget::Mixer(track_id) => state.find_track(track_id).is_some(),
                 ContextTarget::SendPicker { track_id } => state.find_track(track_id).is_some(),
                 ContextTarget::OutputPicker { track_id } => state.find_track(track_id).is_some(),
+                ContextTarget::PanMode { track_id } => state.find_track(track_id).is_some(),
                 ContextTarget::SidechainPicker {
                     track_id,
                     insert_id,

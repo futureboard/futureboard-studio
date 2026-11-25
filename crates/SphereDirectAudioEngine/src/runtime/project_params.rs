@@ -30,6 +30,28 @@ impl RuntimeProject {
         }
     }
 
+    /// Live VCA gain by resolved index; `false` when the graph has no such
+    /// track.
+    #[inline]
+    pub fn update_track_vca_gain_at(&mut self, track_index: usize, gain: f32) -> bool {
+        match self.tracks.get_mut(track_index) {
+            Some(track) => {
+                track.vca_gain = gain.clamp(0.0, 4.0);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// [`Self::update_track_vca_gain_at`] by id, for the control thread's
+    /// mirror of the graph.
+    pub fn update_track_vca_gain(&mut self, track_id: &str, gain: f32) -> bool {
+        match self.tracks.iter().position(|t| t.id == track_id) {
+            Some(index) => self.update_track_vca_gain_at(index, gain),
+            None => false,
+        }
+    }
+
     /// Live fader by resolved index; `false` when the graph has no such track.
     #[inline]
     pub fn update_track_volume_at(&mut self, track_index: usize, volume: f32) -> bool {
@@ -46,6 +68,27 @@ impl RuntimeProject {
     pub fn update_track_pan_at(&mut self, track_index: usize, pan: f32) {
         if let Some(track) = self.tracks.get_mut(track_index) {
             track.pan = pan.clamp(-1.0, 1.0);
+        }
+    }
+
+    /// Live Dual pan by resolved index. Only the settings change: the matrix
+    /// the fader last applied stays, so the next block ramps from it.
+    #[inline]
+    pub fn update_track_dual_pan_at(
+        &mut self,
+        track_index: usize,
+        dual_pan: crate::types::EngineDualPan,
+    ) {
+        if let Some(track) = self.tracks.get_mut(track_index) {
+            track.dual_pan.settings = dual_pan.sanitized();
+        }
+    }
+
+    /// [`Self::update_track_dual_pan_at`] by id, for the control thread's
+    /// mirror of the graph.
+    pub fn update_track_dual_pan(&mut self, track_id: &str, dual_pan: crate::types::EngineDualPan) {
+        if let Some(index) = self.tracks.iter().position(|t| t.id == track_id) {
+            self.update_track_dual_pan_at(index, dual_pan);
         }
     }
 
@@ -71,8 +114,10 @@ impl RuntimeProject {
         for source in &snapshot.sources {
             if let Some(track) = self.tracks.iter_mut().find(|t| t.id == source.track_id) {
                 track.spatial_params = source.params.sanitized();
+                track.spatial_state.heard = track.spatial_params;
             }
         }
+        crate::runtime::apply_spatial_keeps_inputs(&mut self.tracks, snapshot);
     }
 
     /// Give every channel that sums into the master its spatialiser for the
@@ -82,9 +127,39 @@ impl RuntimeProject {
     pub fn ensure_spatial(&mut self) {
         let format = self.spatial.format;
         let sample_rate = self.spatial.sample_rate;
-        for track in self.tracks.iter_mut() {
-            let to_master = track.track_type != "master" && track.output_track_index.is_none();
-            if !format.is_spatial() || !to_master {
+        let channels = self.spatial.bus.channels();
+        // Which channels are placed: those that sum into the master, and those
+        // routed into a bus that keeps its channels' places (placed into its
+        // field). Decided before any track is borrowed mutably.
+        let placed: Vec<bool> = (0..self.tracks.len())
+            .map(|index| {
+                let track = &self.tracks[index];
+                format.is_spatial()
+                    && track.track_type != "master"
+                    && (track.output_track_index.is_none()
+                        || crate::runtime::spatial_field_target(&self.tracks, index).is_some())
+            })
+            .collect();
+        for (index, track) in self.tracks.iter_mut().enumerate() {
+            // The field of a bus that keeps its channels' places: in the mix's
+            // own layout, sized like the master's spatial bus.
+            let wants_field = format.is_spatial()
+                && track.spatial_state.keeps_inputs
+                && track.output_track_index.is_none();
+            if !wants_field {
+                track.spatial_state.field = None;
+            } else if track
+                .spatial_state
+                .field
+                .as_ref()
+                .is_none_or(|field| field.channels() != channels)
+            {
+                track.spatial_state.field = Some(solfege_spatialaudio::SpatialBus::new(
+                    channels,
+                    DEFAULT_AUDIO_BLOCK_CAPACITY,
+                ));
+            }
+            if !placed[index] {
                 track.spatial = None;
                 continue;
             }
@@ -149,6 +224,8 @@ impl RuntimeProject {
     ) {
         if let Some(track) = self.tracks.get_mut(track_index) {
             track.spatial_params = params.sanitized();
+            // Heard at once; the next fader stage re-applies any lane on top.
+            track.spatial_state.heard = track.spatial_params;
         }
     }
 

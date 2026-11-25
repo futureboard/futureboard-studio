@@ -185,6 +185,32 @@ kernel! {
 }
 
 kernel! {
+    /// A per-sample 2×2 gain matrix ramp (Dual pan): with
+    /// `g[k] = start[k] + inc[k] * i`, sample `i` becomes
+    /// `l' = l·g[0] + r·g[2]`, `r' = l·g[1] + r·g[3]`. The matrix layout is
+    /// [`crate::dsp::gain::dual_pan_matrix`]'s.
+    pub fn ramp_matrix_stereo / ramp_matrix_stereo_on(
+        l: &mut [f32],
+        r: &mut [f32],
+        start: [f32; 4],
+        inc: [f32; 4],
+    ) {
+        let n = l.len().min(r.len());
+        let (l, r) = (&mut l[..n], &mut r[..n]);
+        for i in 0..n {
+            let step = i as f32;
+            let ll = start[0] + inc[0] * step;
+            let lr = start[1] + inc[1] * step;
+            let rl = start[2] + inc[2] * step;
+            let rr = start[3] + inc[3] * step;
+            let (in_l, in_r) = (l[i], r[i]);
+            l[i] = in_l * ll + in_r * rl;
+            r[i] = in_l * lr + in_r * rr;
+        }
+    }
+}
+
+kernel! {
     /// Fold a stereo pair to its mid (`(l + r) / 2`) on both sides.
     pub fn fold_mid / fold_mid_on(l: &mut [f32], r: &mut [f32]) {
         let n = l.len().min(r.len());

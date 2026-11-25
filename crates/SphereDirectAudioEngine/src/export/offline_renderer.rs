@@ -198,6 +198,9 @@ impl PluginBridgeSink for OfflineBridgeSink {
     fn reported_latency_samples(&self) -> u32 {
         self.live.reported_latency_samples()
     }
+    fn pop_output_midi(&self, out: &mut [crate::plugin_bridge::BridgeMidiOut]) -> usize {
+        self.live.pop_output_midi(out)
+    }
     fn set_transport(&self, ctx: &crate::vst3_processor::RuntimeTransportContext) {
         self.live.set_transport(ctx);
     }
@@ -517,6 +520,18 @@ fn render_offline_impl(
     restore_offline_plugin_states(snapshot, &mut runtime);
 
     let channels = request.channels.max(1) as usize;
+    // A surround mix written to a file of its own width goes out discretely,
+    // one speaker per channel; anything else renders the stereo pair (the
+    // fold of a surround mix, the ears of a binaural one).
+    let kernel_channels = match runtime.spatial.format {
+        solfege_spatialaudio::SpatialFormat::Surround(layout)
+            if channels > 2 && layout.channel_count() == channels =>
+        {
+            runtime.spatial.offline_discrete = true;
+            channels
+        }
+        _ => 2,
+    };
     let ts_num = snapshot.time_signature[0].max(1);
     let ts_den = snapshot.time_signature[1].max(1);
 
@@ -564,10 +579,10 @@ fn render_offline_impl(
         Vec::new()
     };
     let warmup_frames = tap_latency.iter().copied().fold(mix_latency, u64::max);
-    let mut mix_delay = StereoFrameDelay::new(warmup_frames - mix_latency);
-    let mut tap_delays: Vec<StereoFrameDelay> = tap_latency
+    let mut mix_delay = FrameDelay::new(warmup_frames - mix_latency, kernel_channels);
+    let mut tap_delays: Vec<FrameDelay> = tap_latency
         .iter()
-        .map(|&latency| StereoFrameDelay::new(warmup_frames - latency))
+        .map(|&latency| FrameDelay::new(warmup_frames - latency, 2))
         .collect();
 
     runtime.reset_midi_playback(request.start_sample);
@@ -616,9 +631,9 @@ fn render_offline_impl(
         }
     }
 
-    // The kernel renders stereo (channels >= 2). We always render into a 2-ch
-    // scratch and fold down to mono on output when requested.
-    let mut stereo = vec![0.0f32; block * 2];
+    // The kernel renders stereo (channels >= 2), or a surround layout's full
+    // width. Stereo is folded to mono on output when requested.
+    let mut stereo = vec![0.0f32; block * kernel_channels];
     let mut out = vec![0.0f32; block * channels];
     let mut track_taps = if capture_tracks {
         vec![Vec::new(); runtime.tracks.len()]
@@ -682,7 +697,7 @@ fn render_offline_impl(
             _ => produce_cap,
         };
 
-        let stereo_slice = &mut stereo[..this_block * 2];
+        let stereo_slice = &mut stereo[..this_block * kernel_channels];
         for s in stereo_slice.iter_mut() {
             *s = 0.0;
         }
@@ -695,7 +710,7 @@ fn render_offline_impl(
             pos,
             request.master_volume,
             stereo_slice,
-            2,
+            kernel_channels,
             true,
             ts_num,
             ts_den,
@@ -727,7 +742,7 @@ fn render_offline_impl(
             // Defensive: avoid an infinite loop if the kernel returns nothing.
             break;
         }
-        mix_delay.process(&mut stereo_slice[..frames * 2]);
+        mix_delay.process(&mut stereo_slice[..frames * kernel_channels]);
         for (tap, delay) in track_taps.iter_mut().zip(tap_delays.iter_mut()) {
             if let Some(block) = tap.get_mut(..frames * 2) {
                 delay.process(block);
@@ -749,6 +764,15 @@ fn render_offline_impl(
             let mut block_peak = 0.0f32;
             let out_slice = &mut out[..emit_len * channels];
             for (out_i, f) in (emit_from..emit_to).enumerate() {
+                if kernel_channels > 2 {
+                    // Every speaker as rendered, in the layout's order.
+                    for c in 0..channels {
+                        let v = stereo_slice[f * kernel_channels + c] * gain;
+                        block_peak = block_peak.max(v.abs());
+                        out_slice[out_i * channels + c] = v;
+                    }
+                    continue;
+                }
                 let l = stereo_slice[f * 2] * gain;
                 let r = stereo_slice[f * 2 + 1] * gain;
                 block_peak = block_peak.max(l.abs()).max(r.abs());
@@ -887,15 +911,19 @@ fn tap_latency_frames(
 }
 
 /// A fixed delay over interleaved stereo frames.
-struct StereoFrameDelay {
+/// A fixed delay over interleaved frames of `channels` samples.
+struct FrameDelay {
     ring: Vec<f32>,
+    channels: usize,
     pos: usize,
 }
 
-impl StereoFrameDelay {
-    fn new(frames: u64) -> Self {
+impl FrameDelay {
+    fn new(frames: u64, channels: usize) -> Self {
+        let channels = channels.max(1);
         Self {
-            ring: vec![0.0; frames as usize * 2],
+            ring: vec![0.0; frames as usize * channels],
+            channels,
             pos: 0,
         }
     }
@@ -904,13 +932,12 @@ impl StereoFrameDelay {
         if self.ring.is_empty() {
             return;
         }
-        for frame in block.as_chunks_mut::<2>().0 {
-            let slot = &mut self.ring[self.pos..self.pos + 2];
-            let (l, r) = (slot[0], slot[1]);
-            slot.copy_from_slice(frame);
-            frame[0] = l;
-            frame[1] = r;
-            self.pos = (self.pos + 2) % self.ring.len();
+        for frame in block.chunks_exact_mut(self.channels) {
+            let slot = &mut self.ring[self.pos..self.pos + self.channels];
+            for (held, sample) in slot.iter_mut().zip(frame.iter_mut()) {
+                std::mem::swap(held, sample);
+            }
+            self.pos = (self.pos + self.channels) % self.ring.len();
         }
     }
 }
@@ -992,11 +1019,13 @@ fn restore_offline_plugin_states(snapshot: &EngineProjectSnapshot, runtime: &mut
 #[cfg(test)]
 pub(crate) fn make_track_snapshot(id: &str) -> crate::types::EngineTrackSnapshot {
     crate::types::EngineTrackSnapshot {
+        vca_gain: 1.0,
         midi_programs: Vec::new(),
         id: id.to_string(),
         track_type: "audio".to_string(),
         volume: 1.0,
         pan: 0.0,
+        dual_pan: Default::default(),
         muted: false,
         solo: false,
         armed: false,
@@ -1004,6 +1033,7 @@ pub(crate) fn make_track_snapshot(id: &str) -> crate::types::EngineTrackSnapshot
         input_source: Default::default(),
         preview_mode: "stereo".to_string(),
         output_track_id: None,
+        midi_fx: Vec::new(),
         inserts: Vec::new(),
         sends: Vec::new(),
         automation_lanes: Vec::new(),
@@ -1268,18 +1298,105 @@ mod tests {
     }
 
     #[test]
-    fn stereo_frame_delay_holds_back_whole_frames() {
-        let mut delay = StereoFrameDelay::new(2);
+    fn frame_delay_holds_back_whole_frames() {
+        let mut delay = FrameDelay::new(2, 2);
         let mut a = [1.0, -1.0, 2.0, -2.0, 3.0, -3.0];
         delay.process(&mut a);
         assert_eq!(a, [0.0, 0.0, 0.0, 0.0, 1.0, -1.0]);
         let mut b = [4.0, -4.0];
         delay.process(&mut b);
         assert_eq!(b, [2.0, -2.0]);
-        let mut none = StereoFrameDelay::new(0);
+        let mut none = FrameDelay::new(0, 2);
         let mut c = [5.0, -5.0];
         none.process(&mut c);
         assert_eq!(c, [5.0, -5.0]);
+        // Three channels a frame: the whole frame moves together.
+        let mut wide = FrameDelay::new(1, 3);
+        let mut d = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        wide.process(&mut d);
+        assert_eq!(d, [0.0, 0.0, 0.0, 1.0, 2.0, 3.0]);
+    }
+
+    /// A 5.1 mix exported to a six-channel file: every speaker in its own
+    /// channel, in the layout's (WAV) order. A channel in the left-rear
+    /// corner lands in the left surround (channel 5, index 4), and asking for
+    /// two channels gives the stereo fold instead.
+    #[test]
+    fn a_surround_mix_exports_one_speaker_per_channel() {
+        use solfege_spatialaudio::{
+            MonitorFold, RoomPosition, RoomSettings, SourceParams, SpatialFormat, SpeakerLayout,
+        };
+        let render = |channels: u16| {
+            let mut snapshot = silence_snapshot(48_000);
+            let track_id = snapshot.tracks[0].id.clone();
+            snapshot.tracks[0]
+                .inserts
+                .push(crate::types::EngineInsertSnapshot {
+                    id: "echo".to_string(),
+                    kind: "external-bridge-plugin".to_string(),
+                    enabled: true,
+                    params: Default::default(),
+                    state: None,
+                });
+            snapshot.spatial = crate::types::EngineSpatialSnapshot {
+                format: SpatialFormat::Surround(SpeakerLayout::Surround51),
+                room: RoomSettings::default(),
+                fold: MonitorFold::Stereo,
+                sources: vec![crate::types::EngineSpatialSource {
+                    track_id,
+                    params: SourceParams {
+                        position: RoomPosition::new(-1.0, -1.0, 0.0),
+                        width: 0.0,
+                        ..SourceParams::default()
+                    },
+                    keeps_inputs: false,
+                }],
+            };
+            let sink: crate::plugin_bridge::SharedPluginBridgeSink =
+                std::sync::Arc::new(EchoSink::default());
+            let sinks: PluginBridgeSinkMap = [("echo".to_string(), sink)].into_iter().collect();
+            let request = OfflineRenderRequest {
+                channels,
+                ..request(0, ECHO_BURST)
+            };
+            let mut mix = Vec::new();
+            render_offline_mix_and_tracks_with_bridges(
+                &snapshot,
+                &request,
+                &ExportCancelToken::new(),
+                1.0,
+                Some(&sinks),
+                false,
+                &mut |block| {
+                    mix.extend_from_slice(block);
+                    Ok(())
+                },
+                &mut |_, _| Ok(()),
+                &mut |_| {},
+            )
+            .unwrap();
+            mix
+        };
+        let energy = |mix: &[f32], channels: usize, channel: usize| -> f32 {
+            mix.chunks(channels).map(|f| f[channel] * f[channel]).sum()
+        };
+
+        let surround = render(6);
+        assert_eq!(surround.len() % 6, 0);
+        let ls = energy(&surround, 6, 4);
+        assert!(ls > 1.0, "the left surround carries it: {ls}");
+        // The corner sits between Ls and Rs across the back, nearer Ls; the
+        // front speakers and the LFE stay quiet.
+        for other in [0usize, 1, 2, 3] {
+            assert!(
+                energy(&surround, 6, other) < ls * 0.05,
+                "channel {other} stays quiet"
+            );
+        }
+        assert!(energy(&surround, 6, 5) < ls * 0.5, "Ls leads Rs");
+
+        let folded = render(2);
+        assert!(energy(&folded, 2, 0) > energy(&folded, 2, 1) * 4.0);
     }
 
     #[test]

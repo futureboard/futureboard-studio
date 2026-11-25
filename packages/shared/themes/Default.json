@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "futureboard.default",
   "name": "Futureboard Default",
-  "version": "3.2.0",
+  "version": "3.4.0",
   "author": "Futureboard Studio",
   "appearance": "dark",
   "targets": [
@@ -72,7 +72,8 @@
       "tick": "#FFFFFF14",
       "scaleText": "#8F8F8F",
       "groove": "#0D0E11",
-      "thumbBorder": "#FFFFFF33"
+      "thumbBorder": "#FFFFFF33",
+      "sliderThumb": "#E4E6EA"
     },
     "knob": {
       "background": "#1E1E1E",
@@ -203,6 +204,11 @@
       "blackKey": "#161616",
       "keySeam": "#A6A6A6",
       "keyLabel": "#4C4C4C"
+    },
+    "harmony": {
+      "major": "#E9A86B",
+      "minor": "#7FA2F0",
+      "other": "#9AA0AC"
     },
     "track": {
       "audio": "#38C7B4",

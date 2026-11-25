@@ -398,12 +398,44 @@ impl StudioLayout {
             })
         };
 
+        let on_browser_select_kind: std::sync::Arc<
+            dyn Fn(&components::BrowserKindFilter, &mut Window, &mut gpui::App) + 'static,
+        > = {
+            let this = cx.entity().clone();
+            std::sync::Arc::new(move |kind, _w, cx| {
+                let kind = *kind;
+                let _ = this.update(cx, |this, cx| {
+                    this.file_browser.set_kind_filter(kind);
+                    this.browser_scroll
+                        .scroll_to_item(0, gpui::ScrollStrategy::Top);
+                    cx.notify();
+                });
+            })
+        };
+        // The card's play button: audition now, whether or not auto-preview
+        // is on.
+        let on_browser_audition: std::sync::Arc<
+            dyn Fn(&PathBuf, &mut Window, &mut gpui::App) + 'static,
+        > = {
+            let this = cx.entity().clone();
+            std::sync::Arc::new(move |path: &PathBuf, _w, cx| {
+                let path = path.clone();
+                let _ = this.update(cx, |this, cx| {
+                    this.ensure_browser_waveform(path.clone(), cx);
+                    let _ = this.audition_browser_file(&path);
+                    cx.notify();
+                });
+            })
+        };
+
         let browser_callbacks = components::BrowserCallbacks {
             on_select_tab: on_browser_select_tab,
+            on_select_kind: on_browser_select_kind,
             on_toggle: on_browser_toggle,
             on_select: on_browser_select,
             on_reveal: on_browser_reveal,
             on_activate_file: on_browser_activate,
+            on_audition: on_browser_audition,
             on_context_menu: on_browser_context,
             on_collapse_all: on_browser_collapse_all,
             on_rescan: on_browser_rescan,
@@ -664,49 +696,72 @@ impl Render for RightDockView {
 }
 
 impl StudioLayout {
-    /// Render-only track snapshot plus the current selection.
+    /// One track as the right dock shows it: clip-free, at the volume the
+    /// fader displays.
+    fn inspector_track_copy(
+        state: &components::timeline::timeline_state::TimelineState,
+        track: &TrackState,
+    ) -> TrackState {
+        let mut cloned = super::mixer_ops::clone_track_for_mixer(track);
+        let display_volume = state.display_track_volume(track);
+        cloned.volume = display_volume;
+        cloned.volume_effective = display_volume;
+        cloned
+    }
+
+    /// What the Inspector shows, plus the current selection.
     ///
-    /// Do not clone every clip here: MIDI clips can contain tens of thousands
-    /// of notes/controllers, and a mixer selection clears clip selection
-    /// anyway. The Inspector only needs the selected clip, so add that one back
-    /// to the otherwise clip-free track snapshot.
+    /// Copies the one track the Inspector shows, never the project: this runs
+    /// on every `Timeline` notify. Its clips are left out too (MIDI clips can
+    /// hold tens of thousands of notes) except the selected clip, put back.
     pub(super) fn inspector_track_snapshot(
         &self,
         cx: &gpui::App,
-    ) -> (Vec<TrackState>, Option<String>, Option<String>, f64) {
-        let t = self.timeline.read(cx);
-        let selected_clip_id = t.state.selection.selected_clip_ids.first().cloned();
-        let selected_clip = selected_clip_id.as_deref().and_then(|clip_id| {
-            t.state.tracks.iter().find_map(|track| {
-                track
-                    .clips
-                    .iter()
-                    .find(|clip| clip.id == clip_id)
-                    .map(|clip| (track.id.clone(), clip.clone()))
-            })
-        });
-        let mut tracks: Vec<_> = t
-            .state
-            .tracks
-            .iter()
-            .map(|track| {
-                let mut cloned = super::mixer_ops::clone_track_for_mixer(track);
-                let display_volume = t.state.display_track_volume(track);
-                cloned.volume = display_volume;
-                cloned.volume_effective = display_volume;
-                cloned
-            })
-            .collect();
-        if let Some((track_id, clip)) = selected_clip {
-            if let Some(track) = tracks.iter_mut().find(|track| track.id == track_id) {
-                track.clips.push(clip);
+    ) -> (
+        crate::components::panel::InspectorTracks,
+        Option<String>,
+        Option<String>,
+        f64,
+    ) {
+        let state = &self.timeline.read(cx).state;
+        let selected_track_id = state.selection.selected_track_id.clone();
+        let selected_clip_id = state.selection.selected_clip_ids.first().cloned();
+        let selected_clip = selected_clip_id
+            .as_deref()
+            .and_then(|clip_id| state.find_clip(clip_id))
+            .map(|(track, clip)| (track.id.clone(), clip.clone()));
+        let shown_id = selected_clip
+            .as_ref()
+            .map(|(track_id, _)| track_id.as_str())
+            .or(selected_track_id.as_deref());
+        let mut tracks =
+            crate::components::panel::InspectorTracks::of(&state.tracks, shown_id, |track| {
+                Self::inspector_track_copy(state, track)
+            });
+        if let (Some((_, shown)), Some((track_id, clip))) = (tracks.shown.as_mut(), selected_clip) {
+            if shown.id == track_id {
+                shown.clips.push(clip);
             }
         }
         (
             tracks,
-            t.state.selection.selected_track_id.clone(),
+            selected_track_id,
             selected_clip_id,
-            t.state.bpm as f64,
+            state.bpm as f64,
+        )
+    }
+
+    /// Every track, clip-free, for the routing combo. Only while a combo is
+    /// open: its Input menu has to say which track a loopback would feed.
+    fn routing_combo_track_snapshot(&self, cx: &gpui::App) -> (Vec<TrackState>, Option<String>) {
+        let state = &self.timeline.read(cx).state;
+        (
+            state
+                .tracks
+                .iter()
+                .map(|track| Self::inspector_track_copy(state, track))
+                .collect(),
+            state.selection.selected_track_id.clone(),
         )
     }
 
@@ -726,9 +781,9 @@ impl StudioLayout {
         ) else {
             return None;
         };
-        let (tracks, selected_track_id, _selected_clip_id, _project_bpm) =
-            self.inspector_track_snapshot(cx);
-        let inspector_callbacks = self.build_inspector_callbacks(cx.entity().clone());
+        let (tracks, selected_track_id) = self.routing_combo_track_snapshot(cx);
+        let inspector_callbacks =
+            self.build_inspector_callbacks(cx.entity().clone(), crate::i18n::I18n::from_app(cx));
         // The audio-input combo lists logical connections, so no device
         // enumeration happens for it at all. The port inventory is read only
         // while the combo is open, and only to describe the selected bus.
@@ -890,23 +945,28 @@ impl StudioLayout {
         let active_panel = self.active_panel;
         let (tracks, selected_track_id, selected_clip_id, project_bpm) =
             self.inspector_track_snapshot(cx);
-        crate::perf::count("tracks", tracks.len() as u64);
-        let inspector_callbacks = self.build_inspector_callbacks(cx.entity().clone());
+        crate::perf::count("tracks", tracks.track_count as u64);
+        // The name field binds to the selected track, which is not always the
+        // track the panes show (a clip on another track can be selected).
+        let selected_track_name = selected_track_id.as_deref().and_then(|tid| {
+            self.timeline
+                .read(cx)
+                .state
+                .find_track(tid)
+                .map(|t| (t.id.clone(), t.name.clone()))
+        });
+        let inspector_callbacks =
+            self.build_inspector_callbacks(cx.entity().clone(), crate::i18n::I18n::from_app(cx));
 
         // Reconcile the Inspector name field with the current track selection.
         // Only reload when the bound track actually changes, so typing into the
         // field for the *selected* track is never clobbered mid-edit.
         if self.inspector_name_edit.name_bound.as_deref() != selected_track_id.as_deref() {
-            match selected_track_id
-                .as_deref()
-                .and_then(|tid| tracks.iter().find(|t| t.id == tid))
-            {
-                Some(t) => {
-                    self.inspector_name_edit
-                        .name_input
-                        .set_value(t.name.clone());
-                    self.inspector_name_edit.name_bound = Some(t.id.clone());
-                    self.inspector_name_edit.name_synced = Some(t.name.clone());
+            match &selected_track_name {
+                Some((id, name)) => {
+                    self.inspector_name_edit.name_input.set_value(name.clone());
+                    self.inspector_name_edit.name_bound = Some(id.clone());
+                    self.inspector_name_edit.name_synced = Some(name.clone());
                 }
                 None => {
                     self.inspector_name_edit.name_input.set_value("");
@@ -926,7 +986,7 @@ impl StudioLayout {
                 .inspector_name_edit
                 .name_bound
                 .as_deref()
-                .and_then(|tid| tracks.iter().find(|t| t.id == tid))
+                .and_then(|tid| self.timeline.read(cx).state.find_track(tid))
                 .map(|t| t.name.clone());
             match bound_name {
                 Some(name)
@@ -950,8 +1010,8 @@ impl StudioLayout {
         if self.inspector_name_edit.clip_name_bound.as_deref() != selected_clip_id.as_deref() {
             match selected_clip_id.as_deref().and_then(|cid| {
                 tracks
-                    .iter()
-                    .find_map(|t| t.clips.iter().find(|c| c.id == cid))
+                    .shown_track()
+                    .and_then(|t| t.clips.iter().find(|c| c.id == cid))
             }) {
                 Some(c) => {
                     self.inspector_name_edit
@@ -1068,7 +1128,7 @@ impl StudioLayout {
                     selected_track_id.as_deref(),
                     selected_clip_id.as_deref(),
                     find_clip_summary(
-                        &tracks,
+                        tracks.shown_slice(),
                         selected_clip_id.as_deref(),
                         project_bpm,
                         selection_duration_beats,
@@ -1094,19 +1154,51 @@ impl StudioLayout {
                         callbacks: inspector_color_callbacks,
                     },
                     active_panel == WorkspaceActivePanel::Inspector,
-                    self.timeline.read(cx).state.spatial_mix.format,
+                    {
+                        let state = &self.timeline.read(cx).state;
+                        let shown = tracks.shown.as_ref().map(|(_, track)| track);
+                        crate::components::panel::InspectorSpatial {
+                            format: state.spatial_mix.heard_here().format,
+                            placed: shown.is_some_and(|track| state.spatially_placed(track)),
+                            keeps_inputs: shown.is_some_and(|track| track.spatial_keeps_inputs),
+                            can_keep_inputs: shown.is_some_and(|track| {
+                                track.track_type.is_routing()
+                                    && matches!(
+                                        track.routing.output,
+                                        crate::components::timeline::timeline_state::TrackOutputRouting::Main
+                                    )
+                            }),
+                            in_kept_bus: shown.is_some_and(|track| {
+                                state.spatially_placed(track)
+                                    && matches!(
+                                        track.routing.output,
+                                        crate::components::timeline::timeline_state::TrackOutputRouting::Bus { .. }
+                                    )
+                            }),
+                        }
+                    },
                     &inspector_callbacks,
                     i18n,
                 )
                 .into_any_element()
             }
-            RightDockTab::Solfege => crate::components::panel::solfege_panel(
-                &tracks,
-                selected_track_id.as_deref(),
-                active_panel == WorkspaceActivePanel::Solfege,
-                self.solfege_editor.read(cx).selected_pitch_summary(cx),
-            )
-            .into_any_element(),
+            RightDockTab::Solfege => {
+                // The selected track, which the Inspector's shown track is not
+                // when a clip on another track is selected.
+                let selected = selected_track_id.as_deref().and_then(|tid| {
+                    let state = &self.timeline.read(cx).state;
+                    state
+                        .find_track(tid)
+                        .map(|track| Self::inspector_track_copy(state, track))
+                });
+                crate::components::panel::solfege_panel(
+                    selected.as_slice(),
+                    selected_track_id.as_deref(),
+                    active_panel == WorkspaceActivePanel::Solfege,
+                    self.solfege_editor.read(cx).selected_pitch_summary(cx),
+                )
+                .into_any_element()
+            }
             RightDockTab::ChordDisplay => self.chord_display_panel.clone().into_any_element(),
             RightDockTab::LyricDisplay => self.lyric_display_panel.clone().into_any_element(),
             RightDockTab::LyricEditor => self.lyric_editor_panel.clone().into_any_element(),

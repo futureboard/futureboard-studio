@@ -12,8 +12,8 @@
 //! ```text
 //! cargo build -p sphere_ui_components --features builtin-plugin-editor \
 //!     --example osr_editor_probe
-//! cp target/debug/examples/osr_editor_probe out/release/community/linux-x64/
-//! cd out/release/community/linux-x64 && FUTUREBOARD_PLUGIN_VIEW_DEBUG=1 ./osr_editor_probe
+//! cp target/debug/examples/osr_editor_probe out/release/linux-x64/
+//! cd out/release/linux-x64 &&FUTUREBOARD_PLUGIN_VIEW_DEBUG=1 ./osr_editor_probe
 //! ```
 //!
 //! `FUTUREBOARD_PLUGIN_VIEW_DEBUG=1` turns on page console forwarding, which is

@@ -624,9 +624,15 @@ pub struct EditingSettings {
     #[serde(default)]
     pub history: HistoryEditingSettings,
     /// Bring up the Mixer tab, scrolled to the new track, whenever a track
-    /// is added and selected. Off keeps the dock on whatever tab it shows.
-    #[serde(default = "default_true")]
-    pub show_mixer_on_add_track: bool,
+    /// is added and selected — by a command or by dropping an audio file.
+    /// Off (the default) keeps the dock on whatever tab it shows.
+    ///
+    /// Replaces `show_mixer_on_add_track`, which defaulted to on. Settings
+    /// files store every value, so an untouched `true` could not be told from
+    /// a chosen one; the new key starts everyone off, and the old key is
+    /// ignored.
+    #[serde(default)]
+    pub open_mixer_on_add_track: bool,
 }
 
 impl Default for EditingSettings {
@@ -635,7 +641,7 @@ impl Default for EditingSettings {
             mouse: MouseEditingSettings::default(),
             snap: SnapEditingSettings::default(),
             history: HistoryEditingSettings::default(),
-            show_mixer_on_add_track: true,
+            open_mixer_on_add_track: false,
         }
     }
 }
@@ -645,8 +651,13 @@ pub struct AudioRecordingSettings {
     pub format: String,
     pub bit_depth: u32,
     pub recording_path: String,
+    /// The Recording Delay: real time every take moves by on top of the
+    /// measured round trip, positive later. Set in samples on the Audio page;
+    /// kept as milliseconds (fractional, so a sample is exact) so it holds
+    /// across sample rates. Older settings stored whole milliseconds, which
+    /// read as the same value.
     #[serde(default)]
-    pub recording_offset_ms: i32,
+    pub recording_offset_ms: f64,
     /// While a jam session is connected, pull each take earlier by the measured
     /// arrival latency of the remote streams the performer played along to
     /// (`jam::recording_offset_ms`). Layered under `recording_offset_ms`.
@@ -661,6 +672,12 @@ pub struct AudioRecordingSettings {
     /// behind the slowest plug-in while the performer plays along.
     #[serde(default = "default_true")]
     pub bypass_pdc_while_recording: bool,
+    /// Move a finished take earlier by the round trip through the interface:
+    /// what the backend measured during the take, else what the driver
+    /// reports. Off, the take is placed by the Recording Delay alone, for an
+    /// interface whose reported latency is known to be wrong.
+    #[serde(default = "default_true")]
+    pub correct_interface_latency: bool,
 }
 
 impl Default for AudioRecordingSettings {
@@ -669,14 +686,31 @@ impl Default for AudioRecordingSettings {
             format: "wav".to_string(),
             bit_depth: 24,
             recording_path: String::new(),
-            recording_offset_ms: 0,
+            recording_offset_ms: 0.0,
             auto_offset_from_jam: true,
             save_before_recording: true,
             generate_waveform_after_record: true,
             bypass_pdc_while_recording: true,
+            correct_interface_latency: true,
         }
     }
 }
+
+/// What Record does when no track is armed.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ArmOnRecord {
+    /// Arm the selected track, if it can record, and record on it.
+    #[default]
+    SelectedTrack,
+    /// Ask first whether to arm the selected track.
+    Ask,
+    /// Arm nothing: Record says that no track is armed.
+    Off,
+}
+
+/// Low-latency monitoring's limit choices, in samples. `0` is off.
+pub const LOW_LATENCY_LIMITS: [u32; 5] = [0, 64, 128, 256, 512];
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -777,6 +811,18 @@ pub struct RecordingSettings {
     pub default_monitor_mode: DefaultMonitorMode,
     #[serde(default)]
     pub metronome: MetronomeSettings,
+    /// What Record does when no track is armed.
+    #[serde(default)]
+    pub arm_on_record: ArmOnRecord,
+    /// Disarm every armed track once a take has been kept, so the next
+    /// Record does not record over them by accident.
+    #[serde(default)]
+    pub disarm_after_recording: bool,
+    /// Low-latency monitoring: while a track is armed or monitoring its
+    /// input, effects on its path to the master that report more latency
+    /// than this many samples are taken out. `0` is off.
+    #[serde(default)]
+    pub low_latency_limit_samples: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -996,6 +1042,17 @@ pub struct ExperimentalSettings {
     /// The Voxtune vocal tuner as a tab of the bottom Editor panel.
     #[serde(default)]
     pub voxtune: bool,
+    /// The loopback API server (`api_server`): loudness and visualizer data
+    /// over HTTP + WebSocket, and the web page that shows it.
+    #[serde(default)]
+    pub api_server: bool,
+    /// Its port on 127.0.0.1. `0` (an older settings file) is the default.
+    #[serde(default = "default_api_server_port")]
+    pub api_server_port: u16,
+}
+
+fn default_api_server_port() -> u16 {
+    crate::api_server::DEFAULT_PORT
 }
 
 /// Whether the Voxtune tab is turned on in Settings → Experimental. Off when
@@ -1971,16 +2028,26 @@ mod text_rendering_settings_tests {
         )
         .expect("deserialize");
         assert!(parsed.auto_offset_from_jam);
-        assert_eq!(parsed.recording_offset_ms, -3);
+        assert_eq!(parsed.recording_offset_ms, -3.0);
         assert!(AudioRecordingSettings::default().auto_offset_from_jam);
     }
 
     #[test]
-    fn showing_the_mixer_on_add_track_is_on_for_older_settings() {
+    fn adding_a_track_leaves_the_mixer_closed_by_default() {
         let parsed: EditingSettings = serde_json::from_str("{}").expect("deserialize");
-        assert!(parsed.show_mixer_on_add_track);
-        assert!(EditingSettings::default().show_mixer_on_add_track);
-        assert!(SettingsSchema::default().editing.show_mixer_on_add_track);
+        assert!(!parsed.open_mixer_on_add_track);
+        assert!(!EditingSettings::default().open_mixer_on_add_track);
+        assert!(!SettingsSchema::default().editing.open_mixer_on_add_track);
+    }
+
+    /// The old key defaulted to on and was saved by every settings write, so
+    /// it says nothing about a choice: an existing file must not reopen the
+    /// Mixer on every dropped file.
+    #[test]
+    fn the_old_show_mixer_key_no_longer_opens_the_mixer() {
+        let parsed: EditingSettings =
+            serde_json::from_str(r#"{"show_mixer_on_add_track": true}"#).expect("deserialize");
+        assert!(!parsed.open_mixer_on_add_track);
     }
 }
 
@@ -2058,5 +2125,30 @@ mod audioguard_setting_tests {
             let parsed: PlaybackSettings = serde_json::from_str(&text).expect("parse");
             assert_eq!(parsed.audioguard, level);
         }
+    }
+
+    /// Settings saved before the arming and latency choices load with what
+    /// Studio did before them: Record arms the selected track, nothing is
+    /// disarmed, nothing bypassed, takes corrected for the interface.
+    #[test]
+    fn older_recording_settings_keep_the_previous_behaviour() {
+        let older: RecordingSettings = serde_json::from_str(
+            r#"{"audio":{"format":"wav","bit_depth":24,"recording_path":""}}"#,
+        )
+        .expect("parse");
+        assert_eq!(older.arm_on_record, ArmOnRecord::SelectedTrack);
+        assert!(!older.disarm_after_recording);
+        assert_eq!(older.low_latency_limit_samples, 0);
+        assert!(older.audio.correct_interface_latency);
+
+        let mut changed = older.clone();
+        changed.arm_on_record = ArmOnRecord::Ask;
+        changed.disarm_after_recording = true;
+        changed.low_latency_limit_samples = 128;
+        changed.audio.correct_interface_latency = false;
+        let text = serde_json::to_string(&changed).expect("serialize");
+        assert!(text.contains(r#""arm_on_record":"ask""#), "{text}");
+        let back: RecordingSettings = serde_json::from_str(&text).expect("parse");
+        assert_eq!(back, changed);
     }
 }

@@ -1,6 +1,6 @@
 use crate::assets;
 use crate::components::timeline::automation_lane::{
-    AUTOMATION_CONTENT_X, AUTOMATION_SUBLANE_RAIL_X, AUTOMATION_TRACK_STRIP_W,
+    automation_tab_column, AUTOMATION_CONTENT_X, AUTOMATION_SUBLANE_RAIL_X,
 };
 use crate::components::timeline::timeline_state::{
     LastTouchedPluginParam, TimelineState, AUTOMATION_CONTROL_LANE_HEIGHT, HEADER_WIDTH,
@@ -135,19 +135,18 @@ fn control_header(
         .child(
             div()
                 .truncate()
-                .text_size(px(typography::UI_SM))
+                .text_size(px(typography::UI_XS))
                 .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(Colors::text_primary())
+                .text_color(Colors::text_secondary())
                 .child(if is_master {
                     "Master Automation"
                 } else {
                     "Automation"
                 }),
         )
-        // The count as a badge in the section's hue, so a collapsed section
-        // still says how much is under it.
+        // The count as a neutral badge, so a collapsed section still says how
+        // much is under it without a second spot of the section's hue.
         .when(lane_count > 0, |row| {
-            let hue = Colors::state_automation();
             row.child(
                 div()
                     .flex_none()
@@ -158,10 +157,10 @@ fn control_header(
                     .h(px(16.0))
                     .px(px(space::TIGHT))
                     .rounded(px(crate::theme::radius::PILL))
-                    .bg(Colors::with_alpha(hue, 0.16))
-                    .text_size(px(typography::UI_XS))
+                    .bg(Colors::surface_badge())
+                    .text_size(px(typography::DENSE_CAPTION))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(hue)
+                    .text_color(Colors::text_muted())
                     .child(lane_count.to_string()),
             )
         });
@@ -224,17 +223,9 @@ fn control_header(
         .bg(Colors::automation_lane_header_bg())
         .border_r(px(1.0))
         .border_color(Colors::border_subtle())
-        // The track's colour strip, carried down from its header.
+        // The track's tab column, carried down from its header.
         .when(!is_master, |header| {
-            header.child(
-                div()
-                    .absolute()
-                    .left_0()
-                    .top_0()
-                    .bottom_0()
-                    .w(px(AUTOMATION_TRACK_STRIP_W))
-                    .bg(Colors::with_alpha(track_color, 0.6)),
-            )
+            header.child(automation_tab_column(track_color))
         })
         // The guide every lane row continues, hanging from the section glyph
         // so the lanes read as what it holds.

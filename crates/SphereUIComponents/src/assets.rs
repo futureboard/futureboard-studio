@@ -85,6 +85,12 @@ pub mod icons {
         include_str!("../../../packages/shared/lucide/icons/chevron-right.svg");
     pub const CHEVRON_DOWN: &str = r#"<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><path d="m6 9 6 6 6-6"/></svg>"#;
     pub const CHECK: &str = include_str!("../../../packages/shared/lucide/icons/check.svg");
+    pub const CIRCLE_CHECK: &str =
+        include_str!("../../../packages/shared/lucide/icons/circle-check.svg");
+    pub const TRIANGLE_ALERT: &str =
+        include_str!("../../../packages/shared/lucide/icons/triangle-alert.svg");
+    pub const DOWNLOAD: &str = include_str!("../../../packages/shared/lucide/icons/download.svg");
+    pub const GUITAR: &str = include_str!("../../../packages/shared/lucide/icons/guitar.svg");
     pub const STAR: &str = include_str!("../../../packages/shared/lucide/icons/star.svg");
     pub const NEWSPAPER: &str = include_str!("../../../packages/shared/lucide/icons/newspaper.svg");
     pub const PEN_LINE: &str = include_str!("../../../packages/shared/lucide/icons/pen-line.svg");
@@ -194,6 +200,10 @@ pub const ICON_FILE_PATH: &str = "icons/file.svg";
 pub const ICON_CHEVRON_RIGHT_PATH: &str = "icons/chevron-right.svg";
 pub const ICON_CHEVRON_DOWN_PATH: &str = "icons/chevron-down.svg";
 pub const ICON_CHECK_PATH: &str = "icons/check.svg";
+pub const ICON_CIRCLE_CHECK_PATH: &str = "icons/circle-check.svg";
+pub const ICON_TRIANGLE_ALERT_PATH: &str = "icons/triangle-alert.svg";
+pub const ICON_DOWNLOAD_PATH: &str = "icons/download.svg";
+pub const ICON_GUITAR_PATH: &str = "icons/guitar.svg";
 pub const ICON_STAR_PATH: &str = "icons/star.svg";
 pub const ICON_NEWSPAPER_PATH: &str = "icons/newspaper.svg";
 pub const ICON_PLAYHEAD_HANDLE_PATH: &str = "icons/playhead_handle.svg";

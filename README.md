@@ -9,7 +9,6 @@
 [![License](https://img.shields.io/badge/license-MIT-22c55e?style=for-the-badge&labelColor=0f172a)](LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-38bdf8?style=for-the-badge&labelColor=0f172a)](CONTRIBUTING.md)
 [![Join our Discord](https://img.shields.io/badge/Join%20our-Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/Mx2BWRmwSA)
-[![Translate on Crowdin](https://img.shields.io/badge/Translate-Crowdin-2e3340?style=for-the-badge&logo=crowdin&logoColor=white&labelColor=0f172a)](https://crowdin.com/project/futureboard-studio)
 
 [![Rust](https://img.shields.io/badge/Rust-2024-f97316?style=for-the-badge&logo=rust&logoColor=white&labelColor=0f172a)](https://rustup.rs)
 [![GPUI](https://img.shields.io/badge/UI-GPUI-06b6d4?style=for-the-badge&labelColor=0f172a)](https://www.gpui.rs)
@@ -186,9 +185,14 @@ uses web technology.
 ## Community and Professional Editions
 
 This public repository contains **Futureboard Community Edition** source code,
-licensed under the [MIT License](LICENSE). A normal Community build does not
+licensed under the [MIT License](LICENSE). A build from this repository does not
 contain the private Professional Edition crate, ASIO provider, license activation
 client, or other separately licensed commercial components.
+
+There is one package. Studio decides at runtime, from the licence, whether
+Community or Professional features are available; the Professional code is
+compiled in only when the private sources are present, so a build from this
+repository has the Community features only.
 
 Authorized private checkouts add the Git-ignored `crates/ExclusiveEdition`
 source, which carries the Professional build scripts and its own documentation.
@@ -198,8 +202,8 @@ Professional Edition.
 
 The ASIO build toolchain — Steinberg SDK provisioning, its licence gate, and the
 libclang lookup `asio-sys` needs — is part of that private tree. This repository
-contains none of it: `xtask/src/toolchain.rs` is a stub here, and a Community
-build never compiles ASIO support.
+contains none of it: `xtask/src/toolchain.rs` is a stub here, and a build from
+this repository never compiles ASIO support.
 
 Professional build and release instructions live in
 `crates/ExclusiveEdition/docs/RELEASE.md`, in the private checkout.
@@ -253,12 +257,12 @@ cargo run -p SphereWebView --example install_cef --features installer
 stages a runnable tree with the CEF runtime beside it.
 
 ```bash
-# out/release/community/<platform>
-cargo run -p xtask -- package --profile release --edition community --plugin all
+# out/release/<platform>
+cargo run -p xtask -- package --profile release --plugin all
 # = bun run build:native
 
 # out/dev/<platform>
-cargo run -p xtask -- package --profile dev --edition community --plugin all
+cargo run -p xtask -- package --profile dev --plugin all
 # = bun run build:native:debug
 ```
 
@@ -303,14 +307,14 @@ rustup target add x86_64-apple-darwin aarch64-apple-darwin
 cargo run -p SphereWebView --example install_cef --features installer -- --target universal-macos
 
 for triple in x86_64-apple-darwin aarch64-apple-darwin; do
-  cargo run -p xtask -- package --profile release --edition community --plugin all --target "$triple"
+  cargo run -p xtask -- package --profile release --plugin all --target "$triple"
 done
 
 bash packaging/native/merge-universal-macos.sh \
-  out/release/community/macos-x64 out/release/community/macos-arm64 \
-  out/release/community/macos-universal
+  out/release/macos-x64 out/release/macos-arm64 \
+  out/release/macos-universal
 
-bash packaging/native/bundle-macos.sh out/release/community/macos-universal
+bash packaging/native/bundle-macos.sh out/release/macos-universal
 bash packaging/native/bundle-macos-dmg.sh
 ```
 
@@ -337,7 +341,7 @@ ASIO is available in Professional Edition only.
 | Script                                                                          | Runs                                                     |
 | ------------------------------------------------------------------------------- | -------------------------------------------------------- |
 | `dev:native`                                                                    | `cargo build -p futureboard_native && cargo run -p futureboard_native` |
-| `build:native` · `build:native:debug`                                           | `xtask package` (release / dev, Community, all plug-ins) |
+| `build:native` · `build:native:debug`                                           | `xtask package` (release / dev, all plug-ins)            |
 | `bundle:native:win` · `bundle:native:mac[:dmg]` · `installer:native:win`        | Package distributables                                   |
 | `cargo:check` · `cargo:build` · `cargo:release` · `cargo:test` · `cargo:clippy` | Rust workspace passthroughs                              |
 | `cargo:fmt[:check]` · `check` · `lint` · `fmt`                                  | Formatting and combined checks                           |
@@ -417,10 +421,10 @@ stream, latency, callback load and dropouts.
 
 ## Translations
 
-Help translate Futureboard Studio through the
-[Futureboard Studio project on Crowdin](https://crowdin.com/project/futureboard-studio).
-The English source catalog and the locale files (`en-US`, `th-TH`, `ja-JP`,
-`zh-CN`, `lo-LA`) live under `packages/shared/locales`; see the
+Translations are plain text files maintained in this repository: improve one by
+editing its catalog and opening a merge request. The English source catalog and
+the locale files (`en-US`, `th-TH`, `ja-JP`, `zh-CN`, `lo-LA`) live under
+`packages/shared/locales`; see the
 [translation guide](packages/shared/locales/translation.md) for the catalog
 format and maintainer workflow.
 

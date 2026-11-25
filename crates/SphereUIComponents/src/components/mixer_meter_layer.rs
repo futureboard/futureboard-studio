@@ -89,6 +89,9 @@ enum SlotKind {
 #[derive(Default)]
 pub struct MeterLayout {
     slots: HashMap<(SlotKind, String), (MeterSource, Bounds<Pixels>)>,
+    /// Gain-reduction meters, by their strip's [`MeterSource::key`]: whether
+    /// the strip is pinned, the dynamics inserts it adds up, and where it is.
+    reductions: HashMap<String, ReductionSlot>,
     /// The channel strips' scroll viewport. A strip scrolled half out of it
     /// must not paint its meter over the Master beside it.
     strip_clip: Option<Bounds<Pixels>>,
@@ -102,17 +105,20 @@ impl MeterLayout {
     /// its own schedule (see [`Self::begin_pinned_build`]).
     pub(crate) fn begin_strips_build(&mut self) {
         self.slots.retain(|_, (source, _)| source.is_pinned());
+        self.reductions.retain(|_, slot| slot.pinned);
         self.strip_clip = None;
         self.body_clip = None;
     }
 
     pub(crate) fn begin_pinned_build(&mut self) {
         self.slots.retain(|_, (source, _)| !source.is_pinned());
+        self.reductions.retain(|_, slot| !slot.pinned);
     }
 
     /// The mixer is not on screen: paint nothing until it is laid out again.
     pub(crate) fn clear(&mut self) {
         self.slots.clear();
+        self.reductions.clear();
         self.strip_clip = None;
         self.body_clip = None;
     }
@@ -136,6 +142,65 @@ pub(crate) fn meter_slot(layout: &SharedMeterLayout, source: MeterSource) -> imp
         )
         .size_full(),
     )
+}
+
+/// A strip's gain-reduction meter, as laid out.
+struct ReductionSlot {
+    pinned: bool,
+    inserts: Vec<String>,
+    bounds: Bounds<Pixels>,
+}
+
+/// Width of the gain-reduction meter beside a strip's level meter.
+pub(crate) const REDUCTION_METER_WIDTH: f32 = 3.0;
+
+/// Reduction the meter reads full at, in dB.
+const REDUCTION_METER_RANGE_DB: f32 = 24.0;
+
+/// The place a strip's gain-reduction meter goes, beside its level meter:
+/// what `inserts` (its dynamics processors, in chain order) take off
+/// together, painted down from the top by the overlay.
+pub(crate) fn reduction_slot(
+    layout: &SharedMeterLayout,
+    source: MeterSource,
+    inserts: Vec<String>,
+) -> impl IntoElement {
+    let layout = layout.clone();
+    div()
+        .flex_none()
+        .w(px(REDUCTION_METER_WIDTH))
+        .h_full()
+        .child(
+            canvas(
+                move |bounds, _window, _cx| {
+                    layout.borrow_mut().reductions.insert(
+                        source.key(),
+                        ReductionSlot {
+                            pinned: source.is_pinned(),
+                            inserts: inserts.clone(),
+                            bounds,
+                        },
+                    );
+                },
+                |_bounds, _state, _window, _cx| {},
+            )
+            .size_full(),
+        )
+}
+
+/// Paint a gain-reduction meter: a rail, and the reduction hanging down from
+/// the top, `REDUCTION_METER_RANGE_DB` full. Down from the top is the
+/// convention that tells it apart from the level beside it at a glance.
+fn paint_reduction_meter(bounds: Bounds<Pixels>, reduction_db: f32, window: &mut Window) {
+    use crate::theme::Colors;
+    window.paint_quad(gpui::fill(bounds, Colors::meter_rail()));
+    let fraction = (reduction_db / REDUCTION_METER_RANGE_DB).clamp(0.0, 1.0);
+    if fraction <= 0.0 {
+        return;
+    }
+    let mut bar = bounds;
+    bar.size.height = bounds.size.height * fraction;
+    window.paint_quad(gpui::fill(bar, Colors::meter_mid()));
 }
 
 /// Where a strip's peak readout prints its value: the readout's box, empty.
@@ -261,7 +326,7 @@ fn paint_meter_layer(
     window: &mut Window,
     cx: &mut gpui::App,
 ) {
-    let (strip_clip, body_clip, meters) = {
+    let (strip_clip, body_clip, meters, reductions) = {
         let layout = layout.borrow();
         let state = &timeline.read(cx).state;
         let vsti_meters = owner.read(cx).mixer_vsti_output_meters();
@@ -308,7 +373,23 @@ fn paint_meter_layer(
                 (*kind, source.is_pinned(), *bounds, levels)
             })
             .collect();
-        (layout.strip_clip, layout.body_clip, meters)
+        let reductions: Vec<(bool, Bounds<Pixels>, f32)> = if layout.reductions.is_empty() {
+            Vec::new()
+        } else {
+            let owner = owner.read(cx);
+            layout
+                .reductions
+                .values()
+                .map(|slot| {
+                    (
+                        slot.pinned,
+                        slot.bounds,
+                        owner.mixer_gain_reduction_db(&slot.inserts),
+                    )
+                })
+                .collect()
+        };
+        (layout.strip_clip, layout.body_clip, meters, reductions)
     };
     let Some(body) = body_clip else {
         return;
@@ -327,6 +408,19 @@ fn paint_meter_layer(
                 *slot, m.level_l, m.level_r, m.hold_l, m.hold_r, m.clip, window,
             ),
             SlotKind::Peak => paint_peak_readout(*slot, m, window, cx),
+        });
+    }
+    for (pinned, slot, reduction_db) in &reductions {
+        let clip = if *pinned {
+            body
+        } else {
+            match strip_clip {
+                Some(strips) => strips.intersect(&body),
+                None => continue,
+            }
+        };
+        window.with_content_mask(Some(ContentMask { bounds: clip }), |window| {
+            paint_reduction_meter(*slot, *reduction_db, window)
         });
     }
 }

@@ -58,11 +58,13 @@ mod tests {
             time_signature: [4, 4],
             sample_rate: 48_000,
             tracks: vec![EngineTrackSnapshot {
+                vca_gain: 1.0,
                 midi_programs: Vec::new(),
                 id: "track-1".to_string(),
                 track_type: "audio".to_string(),
                 volume: 1.0,
                 pan: 0.0,
+                dual_pan: Default::default(),
                 muted: false,
                 solo: false,
                 armed: false,
@@ -70,6 +72,7 @@ mod tests {
                 input_source: Default::default(),
                 preview_mode: "stereo".to_string(),
                 output_track_id: None,
+                midi_fx: Vec::new(),
                 inserts: Vec::new(),
                 sends: Vec::new(),
                 automation_lanes: Vec::new(),
@@ -100,6 +103,7 @@ mod tests {
 
     fn defaults() -> ExportProjectDefaults {
         ExportProjectDefaults {
+            surround_layout: None,
             project_sample_rate: 48_000,
             master_volume: 1.0,
             content_end_beat: 4.0,
@@ -108,6 +112,7 @@ mod tests {
             opus_available: false,
             track_targets: Vec::new(),
             live_sample_rate: 48_000,
+            metadata: Default::default(),
         }
     }
 
@@ -302,6 +307,56 @@ mod tests {
         assert_eq!(AudioFileFormat::from_id("mp3"), Some(AudioFileFormat::Opus));
     }
 
+    /// A surround mix exports as one WAV a speaker wide, naming its
+    /// speakers; anything a stereo render would have to give is refused with
+    /// the reason, and nothing is offered without a surround mix here.
+    #[test]
+    fn a_surround_mixdown_is_one_wav_a_speaker_per_channel() {
+        use solfege_spatialaudio::SpeakerLayout;
+        let snapshot = snapshot_with_content(4.0);
+        let surround = ExportProjectDefaults {
+            surround_layout: Some(SpeakerLayout::Surround714),
+            track_targets: vec![target("t1", "Drums", true)],
+            ..defaults()
+        };
+        let mut s = valid_wav();
+        s.channels = ExportChannelMode::Surround;
+        let req = s.to_request(&snapshot, &surround).unwrap();
+        assert_eq!(req.render.channels, 12);
+        assert_eq!(
+            req.encode_options.wav.channel_mask,
+            Some(SpeakerLayout::Surround714.wav_channel_mask())
+        );
+
+        assert_eq!(
+            s.validate(&defaults()),
+            Err(ExportSettingsError::SurroundUnavailable)
+        );
+        let mut flac = s.clone();
+        flac.format = AudioFileFormat::Flac;
+        assert_eq!(
+            flac.validate(&surround),
+            Err(ExportSettingsError::SurroundMixdownOnly)
+        );
+        let mut stems = s.clone();
+        stems.toggle_track("t1");
+        assert_eq!(
+            stems.validate(&surround),
+            Err(ExportSettingsError::SurroundMixdownOnly)
+        );
+        let mut live = s.clone();
+        live.render_mode = ExportRenderMode::Realtime;
+        assert_eq!(
+            live.validate(&surround),
+            Err(ExportSettingsError::SurroundMixdownOnly)
+        );
+
+        // Stereo stays a plain two-channel file with no speaker mask.
+        let stereo = valid_wav().to_request(&snapshot, &surround).unwrap();
+        assert_eq!(stereo.render.channels, 2);
+        assert_eq!(stereo.encode_options.wav.channel_mask, None);
+    }
+
     #[test]
     fn extension_follows_format_deterministically() {
         let mut s = valid_wav();
@@ -342,6 +397,43 @@ mod tests {
         assert!(s.dither_applies(), "FLAC");
         s.format = sphere_encoder::AudioFileFormat::Opus;
         assert!(!s.dither_applies(), "Opus");
+    }
+
+    /// The project's metadata reaches the encoder of the mixdown and of every
+    /// stem, unchanged (no stem-specific title).
+    #[test]
+    fn project_metadata_reaches_every_exported_file() {
+        let snapshot = snapshot_with_content(4.0);
+        let mut defaults = defaults();
+        defaults.track_targets = vec![target("track-1", "Lead", true)];
+        let project = crate::project::ProjectMetadata {
+            title: "Song".into(),
+            artist: " Band ".into(),
+            year: "2026".into(),
+            isrc: "GBAYE2600001".into(),
+            ..Default::default()
+        };
+        defaults.metadata = project.to_audio_metadata();
+        assert_eq!(defaults.metadata.artist.as_deref(), Some("Band"));
+        assert_eq!(defaults.metadata.date.as_deref(), Some("2026"));
+        assert_eq!(defaults.metadata.album, None, "empty fields stay unset");
+
+        let mut settings = valid_wav();
+        settings.apply_channel_preset(ExportChannelPreset::All, &defaults);
+        let job = settings.to_job(&snapshot, &defaults, "Song").unwrap();
+        let mixdown = job.mixdown.unwrap();
+        assert_eq!(mixdown.encode_options.metadata, defaults.metadata);
+        assert_eq!(job.tracks.len(), 1);
+        assert_eq!(
+            job.tracks[0].request.encode_options.metadata,
+            defaults.metadata
+        );
+
+        // No metadata: nothing to write.
+        let req = valid_wav()
+            .to_request(&snapshot, &self::defaults())
+            .unwrap();
+        assert!(req.encode_options.metadata.is_empty());
     }
 
     #[test]

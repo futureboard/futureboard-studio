@@ -10,11 +10,12 @@ use gpui::{
 
 use crate::assets;
 use crate::components::color_picker::{
-    color_picker_field, ColorPickerCallbacks, ColorPickerPlacement, ColorPickerState,
+    color_picker_auto_swatch_field, ColorPickerCallbacks, ColorPickerPlacement, ColorPickerState,
     ColorPickerValue,
 };
 use crate::components::controls::{
-    fb_button, fb_checkbox, fb_form_row, fb_stepper_button, FbButtonKind,
+    fb_button, fb_checkbox, fb_form_row, fb_icon_button, fb_icon_segment, fb_section_header,
+    fb_segment, fb_segmented_track, fb_tooltip, FbButtonKind, FbSegment,
 };
 use crate::components::form::{
     select_dismiss_backdrop, select_with_menu, select_with_placement, SelectMenuPlacement,
@@ -40,31 +41,33 @@ use instrument_tree::{
 };
 
 const MAX_TRACK_COUNT: u32 = 128;
-/// Measured width of the form's label column — a layout constant, not spacing.
-/// Every row's control starts on this line so the dialog reads as one form
-/// rather than a stack of independent fields.
+/// Width of the form's label column — `fb_field_label`'s, so a note under a
+/// row can start on the same line as the controls above it.
 const FORM_LABEL_WIDTH: f32 = 86.0;
-/// Vertical rhythm between form rows and between the panels that hold them.
-const FORM_GAP: f32 = space::BASE;
-/// Horizontal inset shared by the header, the tab strip, the scrolling body and
-/// the footer, so every band in the dialog starts on the same line.
+/// Air between two stacked form rows. `fb_form_row` is already a 32 px row
+/// around a 28 px control, so a hair more is enough to separate them.
+const ROW_GAP: f32 = space::HAIR;
+/// Gap between the groups of the form (identity, instrument, routing).
+const SECTION_GAP: f32 = space::LOOSE;
+/// Horizontal inset shared by the type picker, the body and the footer, so
+/// every band in the dialog starts on the same line.
 const BODY_PAD_X: f32 = space::LOOSE;
 /// Footer band: one primary button plus its breathing room, top and bottom.
 const FOOTER_HEIGHT: f32 = size::PROMINENT + 2.0 * space::BASE;
-/// Numeric field wide enough for three digits plus the drag affordance.
-const COUNT_FIELD_WIDTH: f32 = 54.0;
-/// Reserved width for the count field's unit label, so the row does not reflow
-/// as it flips between "track" and "tracks".
-const COUNT_UNIT_WIDTH: f32 = 44.0;
-
-/// The two glyph sizes this dialog uses. A third would be the point at which a
-/// compact form starts looking assembled from spare parts.
-const ICON_SM: f32 = 10.0;
-const ICON_MD: f32 = 12.0;
+/// Numeric field wide enough for three tabular digits.
+const COUNT_FIELD_WIDTH: f32 = 40.0;
+/// Reserved width for the count field's unit label, so the footer does not
+/// reflow as it flips between "track" and "tracks".
+const COUNT_UNIT_WIDTH: f32 = 36.0;
 
 /// Colour swatch inside the Auto chip. Under `radius::MIN_SIDE`, so it takes
 /// `radius::MICRO` rather than a control radius.
 const SWATCH_SM: f32 = 11.0;
+
+/// Tabular figures for the count, so the field does not shimmer as it scrubs.
+fn tabular_figures() -> gpui::FontFeatures {
+    gpui::FontFeatures(Arc::new(vec![("tnum".to_string(), 1)]))
+}
 
 /// Vertical drag sensitivity for the Count field: one track per this many
 /// pixels dragged. Dragging up increases, down decreases (DAW convention),
@@ -171,6 +174,17 @@ impl InstrumentMode {
             Self::SoundfontPlayer => "Soundfont Player",
             Self::SoundfontMulti => "Soundfont Multi",
             Self::SolfegeEngine => "Solfege Engine",
+        }
+    }
+
+    /// Short name for the engine segment, where four share one row. The
+    /// Instrument row under it spells the choice out.
+    pub fn segment_label(self) -> &'static str {
+        match self {
+            Self::Vsti => "VSTi",
+            Self::SoundfontPlayer => "Soundfont",
+            Self::SoundfontMulti => "Multi-Part",
+            Self::SolfegeEngine => "Solfege",
         }
     }
 }
@@ -666,8 +680,13 @@ fn color_picker_value_for(state: &AddTrackDialogState) -> ColorPickerValue {
     }
 }
 
+/// Whether the type picker lets `kind` be chosen. Automation creates no track
+/// — it opens a lane on one that exists, which the confirm path handles — so
+/// it is a real choice even without a native track type. It used to be drawn
+/// disabled for that reason, which left its working form unreachable.
 fn kind_supported(kind: AddTrackKind, state: &AddTrackDialogState) -> bool {
-    kind.native_track_type().is_some() && kind_singleton_available(kind, state)
+    (kind == AddTrackKind::Automation || kind.native_track_type().is_some())
+        && kind_singleton_available(kind, state)
 }
 
 /// `false` when `kind` is a one-per-project track type the project already has.
@@ -680,30 +699,6 @@ fn kind_singleton_available(kind: AddTrackKind, state: &AddTrackDialogState) -> 
 
 fn icon(path: &'static str, size: f32, color: gpui::Rgba) -> impl IntoElement {
     svg().path(path).w(px(size)).h(px(size)).text_color(color)
-}
-
-fn select_box(text: impl Into<String>) -> impl IntoElement {
-    let text = text.into();
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .justify_between()
-        .w_full()
-        .h(px(size::COMFORTABLE))
-        .rounded(px(radius::CONTROL))
-        .border(px(1.0))
-        .border_color(Colors::border_subtle())
-        .bg(Colors::surface_input())
-        .px(px(space::BASE))
-        .text_size(px(typography::UI_XS))
-        .text_color(Colors::text_secondary())
-        .child(text)
-        .child(icon(
-            assets::ICON_CHEVRON_DOWN_PATH,
-            ICON_SM,
-            Colors::text_faint(),
-        ))
 }
 
 /// A field whose value is fixed for this track kind — an FX chain slot with no
@@ -864,6 +859,8 @@ fn count_field(
     let count = state.count;
     let on_begin_edit = callbacks.on_count_begin_edit.clone();
     let on_drag_move = callbacks.on_count_drag.clone();
+    let rest = Colors::surface_input();
+    let hover = Colors::composite(rest, Colors::state_hover());
     div()
         .id("add-track-count-field")
         .w(px(COUNT_FIELD_WIDTH))
@@ -874,12 +871,14 @@ fn count_field(
         .rounded(px(radius::CONTROL))
         .border(px(1.0))
         .border_color(Colors::border_subtle())
-        .bg(Colors::surface_input())
+        .bg(rest)
         .text_size(px(typography::UI_SM))
         .font_weight(gpui::FontWeight::SEMIBOLD)
+        .font_features(tabular_figures())
         .text_color(Colors::text_primary())
         .cursor(gpui::CursorStyle::ResizeUpDown)
-        .hover(|s| s.bg(Colors::surface_control_hover()))
+        .hover(move |s| s.bg(hover))
+        .tooltip(fb_tooltip("Drag up or down, or click to type"))
         .occlude()
         .child(count.to_string())
         // Click (no drag) enters inline edit; a drag scrubs the value instead.
@@ -910,6 +909,9 @@ fn count_field(
         .into_any_element()
 }
 
+/// How many tracks Add creates. It lives in the footer beside the button it
+/// multiplies ("Add 4 Tracks"), as a quiet ghost −/+ pair around the number,
+/// instead of a full form row of three boxed controls.
 fn count_stepper(
     state: &AddTrackDialogState,
     count_input: &TextInputState,
@@ -923,10 +925,13 @@ fn count_stepper(
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(space::SNUG))
-        .child(fb_stepper_button(
+        .gap(px(space::TIGHT))
+        .child(fb_icon_button(
             "add-track-count-minus",
-            "-",
+            assets::ICON_MINUS_PATH,
+            "Fewer tracks",
+            size::DEFAULT,
+            None,
             move |_, w, cx| down(&-1, w, cx),
         ))
         .child(count_field(
@@ -936,177 +941,158 @@ fn count_stepper(
             count_callbacks,
             callbacks,
         ))
-        .child(fb_stepper_button(
+        .child(fb_icon_button(
             "add-track-count-plus",
-            "+",
+            assets::ICON_PLUS_PATH,
+            "More tracks",
+            size::DEFAULT,
+            None,
             move |_, w, cx| up(&1, w, cx),
         ))
         .child(
             div()
                 .min_w(px(COUNT_UNIT_WIDTH))
-                .text_size(px(typography::DENSE_LABEL))
+                .text_size(px(typography::UI_XS))
                 .text_color(Colors::text_faint())
                 .child(if state.count == 1 { "track" } else { "tracks" }),
         )
+}
+
+/// The instrument select's label: what was picked, or — on a DrumStep track,
+/// where nothing picked means the built-in Drum Sampler — that.
+fn drum_step_instrument_label(
+    drum_step: bool,
+    plugins: &[RegistryPlugin],
+    selected: Option<&str>,
+) -> String {
+    match selected.filter(|id| !id.is_empty()) {
+        None if drum_step => "Built-in Drum Sampler".to_string(),
+        selected => selected_instrument_label(plugins, selected),
+    }
+}
+
+/// Where segment `index` of `len` sits in its group, so only the group's
+/// outer corners round.
+fn segment_position(index: usize, len: usize) -> FbSegment {
+    match (index, len) {
+        (_, 1) => FbSegment::Only,
+        (0, _) => FbSegment::First,
+        (i, n) if i + 1 == n => FbSegment::Last,
+        _ => FbSegment::Middle,
+    }
 }
 
 fn instrument_mode_selector(
     selected: InstrumentMode,
     callbacks: &AddTrackDialogCallbacks,
 ) -> impl IntoElement {
-    let mut row = div()
-        .flex()
-        .flex_row()
-        .gap(px(space::TIGHT))
-        .w_full()
-        .h(px(size::COMFORTABLE));
-
-    for (index, mode) in [
+    const MODES: [InstrumentMode; 4] = [
         InstrumentMode::Vsti,
         InstrumentMode::SoundfontPlayer,
         InstrumentMode::SoundfontMulti,
         InstrumentMode::SolfegeEngine,
+    ];
+    let mut track = fb_segmented_track().w_full();
+    for (index, mode) in MODES.into_iter().enumerate() {
+        let cb = callbacks.on_instrument_mode.clone();
+        track = track.child(fb_segment(
+            ("add-track-instrument-mode", index),
+            mode.segment_label(),
+            selected == mode,
+            segment_position(index, MODES.len()),
+            move |_, w, cx| cb(&mode, w, cx),
+        ));
+    }
+    track
+}
+
+/// Mono / Stereo as the two-way choice it is, rather than a menu of two.
+fn audio_format_selector(
+    format: AudioFormat,
+    callbacks: &AddTrackDialogCallbacks,
+    i18n: I18n,
+) -> impl IntoElement {
+    let mut track = fb_segmented_track().w_full();
+    for (index, (value, key)) in [
+        (AudioFormat::Mono, "add-track.channel.mono"),
+        (AudioFormat::Stereo, "add-track.channel.stereo"),
     ]
     .into_iter()
     .enumerate()
     {
-        let active = selected == mode;
-        let cb = callbacks.on_instrument_mode.clone();
-        row = row.child(
-            div()
-                .id(("add-track-instrument-mode", index))
-                .flex()
-                .items_center()
-                .justify_center()
-                .h_full()
-                .flex_1()
-                .px(px(space::BASE))
-                .rounded(px(radius::CONTROL))
-                .border(px(1.0))
-                .border_color(if active {
-                    Colors::border_accent()
-                } else {
-                    Colors::border_subtle()
-                })
-                .bg(if active {
-                    Colors::accent_muted()
-                } else {
-                    Colors::surface_input()
-                })
-                .text_size(px(typography::UI_XS))
-                .font_weight(if active {
-                    gpui::FontWeight::SEMIBOLD
-                } else {
-                    gpui::FontWeight::NORMAL
-                })
-                .text_color(if active {
-                    Colors::text_primary()
-                } else {
-                    Colors::text_muted()
-                })
-                .cursor(gpui::CursorStyle::PointingHand)
-                .hover(|s| s.bg(Colors::surface_hover()))
-                .on_click(move |_, w, cx| cb(&mode, w, cx))
-                .child(mode.label()),
-        );
+        let cb = callbacks.on_audio_format.clone();
+        track = track.child(fb_segment(
+            ("add-track-format", index),
+            i18n.tr(key),
+            format == value,
+            segment_position(index, 2),
+            move |_, w, cx| cb(&value, w, cx),
+        ));
     }
-
-    row
+    track
 }
 
-fn type_tabs(
+/// The track-type picker: one segmented row of glyph tiles, and under it the
+/// chosen type's name and what it is for, so the choice reads before the form
+/// it changes.
+fn type_picker(
     state: &AddTrackDialogState,
     callbacks: &AddTrackDialogCallbacks,
     i18n: I18n,
 ) -> impl IntoElement {
     let tabs = AddTrackKind::visible_tabs(state.selected_kind);
-    let mut row = div()
-        .id("add-track-type-tabs")
-        .flex()
-        .flex_row()
-        .items_center()
-        .w_full()
-        .gap(px(space::HAIR))
-        .px(px(BODY_PAD_X))
-        .py(px(space::SNUG));
-    for (i, kind) in tabs.iter().enumerate() {
-        let active = state.selected_kind == *kind;
-        let supported = kind_supported(*kind, state);
+    let mut track = fb_segmented_track().w_full();
+    for (index, kind) in tabs.iter().copied().enumerate() {
         let cb = callbacks.on_select_kind.clone();
-        let k = *kind;
-        let mut tab = div()
-            .id(("add-track-tab", i))
-            .flex()
-            .flex_1()
-            .flex_row()
-            .items_center()
-            .justify_center()
-            .gap(px(space::TIGHT))
-            .h(px(size::COMFORTABLE))
-            .min_w(px(0.0))
-            .px(px(space::SNUG))
-            .overflow_hidden()
-            .rounded(px(radius::CONTROL))
-            .border(px(1.0))
-            .border_color(if active {
-                Colors::border_accent()
-            } else {
-                Colors::border_subtle()
-            })
-            .bg(if active {
-                Colors::accent_muted()
-            } else {
-                Colors::surface_input()
-            })
-            .opacity(if supported { 1.0 } else { 0.42 })
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w(px(ICON_MD))
-                    .h(px(ICON_MD))
-                    .child(icon(
-                        kind.icon(),
-                        ICON_MD,
-                        if active {
-                            Colors::accent_primary()
-                        } else {
-                            Colors::text_muted()
-                        },
-                    )),
-            )
-            .child(
-                div()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .truncate()
-                    .text_size(px(typography::DENSE_LABEL))
-                    .font_weight(if active {
-                        gpui::FontWeight::SEMIBOLD
-                    } else {
-                        gpui::FontWeight::NORMAL
-                    })
-                    .text_color(if active {
-                        Colors::text_primary()
-                    } else {
-                        Colors::text_muted()
-                    })
-                    .child(i18n.tr(kind.tab_label_key())),
-            );
-        if supported {
-            tab = tab
-                .cursor(gpui::CursorStyle::PointingHand)
-                .hover(|s| s.bg(Colors::surface_hover()))
-                .on_click(move |_, w, cx| cb(&k, w, cx));
-        }
-        row = row.child(tab);
+        track = track.child(fb_icon_segment(
+            ("add-track-tab", index),
+            kind.icon(),
+            i18n.tr(kind.tab_label_key()),
+            state.selected_kind == kind,
+            kind_supported(kind, state),
+            segment_position(index, tabs.len()),
+            move |_, w, cx| cb(&kind, w, cx),
+        ));
     }
-    row
+    let kind = state.selected_kind;
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(space::SNUG))
+        .px(px(BODY_PAD_X))
+        .pt(px(space::LOOSE))
+        .pb(px(space::BASE))
+        .border_b(px(1.0))
+        .border_color(Colors::divider())
+        .child(track)
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(space::SNUG))
+                .min_w_0()
+                .px(px(space::TIGHT))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(typography::UI_SM))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(Colors::text_primary())
+                        .child(i18n.tr(kind.label_key())),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(typography::UI_XS))
+                        .text_color(Colors::text_muted())
+                        .child(i18n.tr(kind.description_key())),
+                ),
+        )
 }
 
-/// Everything needed to render the color picker inside the Add Track color row.
+/// Everything needed to render the color picker inside the Add Track form.
 /// Bundled so the (already large) body signature stays readable.
 pub struct AddTrackColorUi<'a> {
     pub picker: &'a ColorPickerState,
@@ -1116,24 +1102,30 @@ pub struct AddTrackColorUi<'a> {
     pub callbacks: ColorPickerCallbacks,
 }
 
-/// A single bordered color box: an integrated Auto option, the full DAW palette
-/// as a swatch grid, and a "Customโ€ฆ" trigger for arbitrary hex/RGB colors.
-/// Selecting a manual swatch turns Auto off (via `on_pick`); selecting Auto
-/// re-enables automatic color assignment and previews the computed color.
-fn color_row(
+/// The palette row: an Auto option and the DAW palette as one line of
+/// swatches, with no box around it. A custom hex/RGB colour is picked from
+/// the swatch beside the name, which shows the colour the track will get.
+/// Selecting a swatch turns Auto off (via `on_pick`); Auto re-enables
+/// automatic assignment and previews the computed colour.
+fn color_palette(
     state: &AddTrackDialogState,
     callbacks: &AddTrackDialogCallbacks,
-    color_ui: AddTrackColorUi,
+    presets: &[gpui::Rgba],
+    on_pick: Arc<dyn Fn(gpui::Rgba, &mut Window, &mut App) + 'static>,
     i18n: I18n,
 ) -> impl IntoElement {
     let auto_cb = callbacks.on_auto_color.clone();
     let auto_on = state.auto_color;
     let selected_hex = crate::color::rgba_to_hex(state.selected_color());
-    // Color previewed while Auto is on (index-derived, matches track creation).
+    // Colour previewed while Auto is on (index-derived, matches track creation).
     let computed_auto = track_color(state.color_index);
+    let chip_rest = if auto_on {
+        Colors::composite(Colors::surface_input(), Colors::state_selected())
+    } else {
+        Colors::surface_input()
+    };
+    let chip_hover = Colors::composite(chip_rest, Colors::state_hover());
 
-    // Auto option โ€” integrated into the box, left of the palette. Clicking it
-    // enables automatic color assignment; the chip previews the computed color.
     let auto_chip = div()
         .id("add-track-auto-color")
         .flex()
@@ -1141,10 +1133,9 @@ fn color_row(
         .items_center()
         .gap(px(space::SNUG))
         .flex_shrink_0()
-        .h(px(size::ROW_DENSE))
+        .h(px(size::DENSE))
         .px(px(space::SNUG))
-        // A 22 px chip is in the small tier, like every other sub-24 control in
-        // this dialog.
+        // A 20 px chip is in the small tier.
         .rounded(px(radius::CONTROL_SM))
         .border(px(1.0))
         .border_color(if auto_on {
@@ -1152,33 +1143,26 @@ fn color_row(
         } else {
             Colors::border_subtle()
         })
-        .bg(if auto_on {
-            Colors::accent_muted()
-        } else {
-            Colors::surface_card()
-        })
+        .bg(chip_rest)
         .cursor(gpui::CursorStyle::PointingHand)
-        .hover(|s| s.bg(Colors::surface_control_hover()))
+        .hover(move |s| s.bg(chip_hover))
         .on_click(move |_, w, cx| auto_cb(&true, w, cx))
         .child(
             div()
                 .w(px(SWATCH_SM))
                 .h(px(SWATCH_SM))
-                // Under `radius::MIN_SIDE` a 6 px corner merges into a lozenge;
-                // an 11 px swatch takes the micro radius the contract reserves
-                // for exactly this.
+                // Under `radius::MIN_SIDE` a control radius merges into a
+                // lozenge; an 11 px swatch takes the micro radius.
                 .rounded(px(radius::MICRO))
-                .border(px(1.0))
-                .border_color(Colors::with_alpha(Colors::text_primary(), 0.22))
                 .bg(computed_auto),
         )
         .child(
             div()
-                .text_size(px(typography::DENSE_LABEL))
+                .text_size(px(typography::UI_XS))
                 .font_weight(if auto_on {
                     gpui::FontWeight::SEMIBOLD
                 } else {
-                    gpui::FontWeight::MEDIUM
+                    gpui::FontWeight::NORMAL
                 })
                 .text_color(if auto_on {
                     Colors::text_primary()
@@ -1188,21 +1172,27 @@ fn color_row(
                 .child(i18n.tr("add-track.option.auto-color")),
         );
 
-    // Palette grid โ€” square swatches inside the box. Selecting one turns Auto
-    // off (shared `on_pick` keeps the custom-picker preview in sync).
-    let mut grid = div()
+    let mut row = div()
         .flex()
         .flex_row()
         .flex_wrap()
         .items_center()
-        .gap(px(space::SNUG));
-    for (i, preset) in color_ui.presets.iter().enumerate() {
-        let preset = *preset;
-        let on_pick = color_ui.callbacks.on_pick.clone();
+        .gap(px(space::SNUG))
+        .child(auto_chip)
+        .child(
+            div()
+                .w(px(1.0))
+                .h(px(size::MICRO))
+                .flex_shrink_0()
+                .bg(Colors::divider()),
+        );
+    for (i, preset) in presets.iter().copied().enumerate() {
+        let on_pick = on_pick.clone();
         let active = !auto_on && crate::color::rgba_to_hex(preset) == selected_hex;
-        grid = grid.child(
+        row = row.child(
             div()
                 .id(("add-track-color", i))
+                .flex_shrink_0()
                 .w(px(size::MICRO))
                 .h(px(size::MICRO))
                 // Same reason as the Auto chip's swatch: below `MIN_SIDE`.
@@ -1211,7 +1201,7 @@ fn color_row(
                 .border_color(if active {
                     Colors::text_primary()
                 } else {
-                    Colors::with_alpha(Colors::text_primary(), 0.22)
+                    Colors::with_alpha(Colors::text_primary(), 0.14)
                 })
                 .bg(preset)
                 .cursor(gpui::CursorStyle::PointingHand)
@@ -1219,155 +1209,144 @@ fn color_row(
                 .on_click(move |_, w, cx| on_pick(preset, w, cx)),
         );
     }
+    row
+}
 
-    // Custom color popover (hex + RGB). Auto lives in the chip above, so the
-    // popover does not render its own Auto toggle (avoids a duplicate control).
-    let picker = color_picker_field(
+/// Name and colour — what the new track is called and how it looks. The
+/// swatch beside the name is the track's colour and opens the custom picker,
+/// the way the Inspector's identity header does.
+fn identity_rows(
+    state: &AddTrackDialogState,
+    name_field: gpui::AnyElement,
+    callbacks: &AddTrackDialogCallbacks,
+    color_ui: AddTrackColorUi,
+    i18n: I18n,
+) -> impl IntoElement {
+    let presets = color_ui.presets.clone();
+    let on_pick = color_ui.callbacks.on_pick.clone();
+    let swatch = color_picker_auto_swatch_field(
         "add-track-color-picker",
+        size::COMFORTABLE,
+        Some(state.selected_kind.icon()),
+        track_color(state.color_index),
         color_ui.picker,
         &color_ui.presets,
-        false,
         ColorPickerPlacement::Below,
         color_ui.hex_focused,
         color_ui.hex_callbacks,
         color_ui.callbacks,
     );
-
-    let color_box = div()
+    div()
         .flex()
         .flex_col()
-        .gap(px(space::BASE))
-        .rounded(px(radius::CONTROL))
-        .border(px(1.0))
-        .border_color(Colors::border_subtle())
-        .bg(Colors::surface_input())
-        .p(px(space::BASE))
-        .child(
+        .gap(px(ROW_GAP))
+        .child(fb_form_row(
+            i18n.tr("add-track.field.name"),
             div()
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(space::BASE))
-                .child(auto_chip)
-                .child(
-                    div()
-                        .w(px(1.0))
-                        .h(px(size::MICRO))
-                        .flex_shrink_0()
-                        .bg(Colors::divider()),
-                )
-                .child(div().flex_1().min_w_0().child(grid)),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap(px(space::BASE))
-                .pt(px(space::SNUG))
-                .border_t(px(1.0))
-                .border_color(Colors::border_subtle())
-                .child(
-                    div()
-                        .text_size(px(typography::DENSE_CAPTION))
-                        .font_weight(gpui::FontWeight::BOLD)
-                        .text_color(Colors::text_faint())
-                        .child("CUSTOM"),
-                )
-                .child(picker),
-        );
-
-    div().child(fb_form_row(i18n.tr("add-track.field.color"), color_box))
+                .gap(px(space::SNUG))
+                .child(swatch)
+                .child(div().flex_1().min_w_0().child(name_field)),
+        ))
+        .child(fb_form_row(
+            i18n.tr("add-track.field.color"),
+            color_palette(state, callbacks, &presets, on_pick, i18n),
+        ))
 }
 
-fn dialog_intro(state: &AddTrackDialogState, i18n: I18n) -> impl IntoElement {
+/// A titled group of form rows.
+fn form_section(title: &'static str) -> gpui::Div {
     div()
         .flex()
-        .flex_row()
-        .items_center()
-        .justify_between()
-        .gap(px(space::BASE))
-        .px(px(BODY_PAD_X))
-        .py(px(space::SNUG))
-        .border_b(px(1.0))
-        .border_color(Colors::divider())
-        .bg(Colors::surface_panel_alt())
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(space::BASE))
-                .min_w_0()
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(1.0))
-                        .min_w_0()
-                        .child(
-                            div()
-                                .truncate()
-                                .text_size(px(typography::UI_SM))
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(Colors::text_primary())
-                                .child(i18n.tr(state.selected_kind.label_key())),
-                        )
-                        .child(
-                            div()
-                                .truncate()
-                                .text_size(px(typography::DENSE_LABEL))
-                                .text_color(Colors::text_faint())
-                                .child(i18n.tr(state.selected_kind.description_key())),
-                        ),
-                ),
-        )
-        .child(
-            div()
-                .flex_shrink_0()
-                .px(px(space::BASE))
-                .h(px(size::DENSE))
-                .flex()
-                .items_center()
-                // A 20 px chip takes the small tier — at `CONTROL` it reads as a
-                // lozenge next to the 28 px controls below it.
-                .rounded(px(radius::CONTROL_SM))
-                .border(px(1.0))
-                .border_color(Colors::border_subtle())
-                .bg(Colors::surface_input())
-                .text_size(px(typography::DENSE_LABEL))
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(Colors::text_secondary())
-                .child(if state.count == 1 {
-                    "1 track".to_string()
-                } else {
-                    format!("{} tracks", state.count)
-                }),
-        )
+        .flex_col()
+        .gap(px(ROW_GAP))
+        .child(div().pb(px(space::HAIR)).child(fb_section_header(title)))
 }
 
-fn form_panel(child: impl IntoElement) -> impl IntoElement {
+/// A line of explanation under a row, started on the control column so it
+/// reads as belonging to the field above it.
+fn field_note(text: impl Into<gpui::SharedString>) -> impl IntoElement {
     div()
-        .rounded(px(radius::SURFACE))
-        .border(px(1.0))
-        .border_color(Colors::border_subtle())
-        .bg(Colors::surface_panel_alt())
-        .p(px(space::BASE))
-        .child(child)
+        .pl(px(FORM_LABEL_WIDTH + space::BASE))
+        .pb(px(space::TIGHT))
+        .text_size(px(typography::UI_XS))
+        .text_color(Colors::text_muted())
+        .child(text.into())
 }
 
-fn disabled_hint(text: &'static str) -> impl IntoElement {
+/// A row that only says something — an empty state or a type with no
+/// fields — set against the full width of the body.
+fn body_note(text: impl Into<gpui::SharedString>) -> impl IntoElement {
     div()
-        .rounded(px(radius::CONTROL))
-        .border(px(1.0))
-        .border_color(Colors::border_subtle())
-        .bg(Colors::surface_input())
-        .px(px(space::BASE))
-        .py(px(space::SNUG))
-        .text_size(px(typography::DENSE_LABEL))
-        .text_color(Colors::text_faint())
-        .child(text)
+        .py(px(space::TIGHT))
+        .text_size(px(typography::UI_XS))
+        .text_color(Colors::text_muted())
+        .child(text.into())
+}
+
+fn output_row(
+    state: &AddTrackDialogState,
+    callbacks: &AddTrackDialogCallbacks,
+    open_select: Option<AddTrackSelectId>,
+    id: &'static str,
+    i18n: I18n,
+) -> impl IntoElement {
+    let toggle = callbacks.on_toggle_select.clone();
+    let output_cb = callbacks.on_output_label.clone();
+    fb_form_row(
+        i18n.tr("add-track.routing.output"),
+        add_track_select(
+            id,
+            Some(state.output_label.as_str()),
+            "Select output...",
+            audio_output_select_options(&state.audio_output_targets),
+            add_track_select_open(open_select, AddTrackSelectId::Output),
+            SelectMenuPlacement::Above,
+            Arc::new(move |_, w, cx| toggle(&AddTrackSelectId::Output, w, cx)),
+            Arc::new(move |value, w, cx| output_cb(value, w, cx)),
+        ),
+    )
+}
+
+fn midi_input_row(
+    state: &AddTrackDialogState,
+    callbacks: &AddTrackDialogCallbacks,
+    open_select: Option<AddTrackSelectId>,
+    midi_input_devices: &[String],
+    id: &'static str,
+    i18n: I18n,
+) -> impl IntoElement {
+    let toggle = callbacks.on_toggle_select.clone();
+    let input_cb = callbacks.on_input_label.clone();
+    fb_form_row(
+        i18n.tr("add-track.routing.midi-in"),
+        add_track_select(
+            id,
+            Some(state.input_label.as_str()),
+            "Select MIDI input...",
+            midi_input_select_options(midi_input_devices),
+            add_track_select_open(open_select, AddTrackSelectId::Input),
+            SelectMenuPlacement::Below,
+            Arc::new(move |_, w, cx| toggle(&AddTrackSelectId::Input, w, cx)),
+            Arc::new(move |value, w, cx| input_cb(value, w, cx)),
+        ),
+    )
+}
+
+/// The insert chain the track starts with. There is no chain preset store to
+/// pick from yet, so the field states the value and promises no menu.
+fn fx_chain_row(state: &AddTrackDialogState) -> impl IntoElement {
+    fb_form_row(
+        "FX Chain",
+        locked_select_box(
+            state
+                .fx_chain
+                .clone()
+                .unwrap_or_else(|| "No Preset".to_string()),
+        ),
+    )
 }
 
 fn type_fields(
@@ -1379,61 +1358,18 @@ fn type_fields(
     midi_input_devices: &[String],
     i18n: I18n,
 ) -> gpui::AnyElement {
-    let show_asc = state.count > 1;
     match state.selected_kind {
         AddTrackKind::Audio => {
-            let fmt_cb = callbacks.on_audio_format.clone();
-            let toggle_format = callbacks.on_toggle_select.clone();
             let input_cb = callbacks.on_input_label.clone();
-            let output_cb = callbacks.on_output_label.clone();
             let toggle_input = callbacks.on_toggle_select.clone();
-            let toggle_output = callbacks.on_toggle_select.clone();
-            let asc_in = callbacks.on_ascending_input.clone();
-            let asc_out = callbacks.on_ascending_output.clone();
             let arm_cb = callbacks.on_arm.clone();
-            let asc_in_on = state.ascending_input;
-            let asc_out_on = state.ascending_output;
             let arm_on = state.arm_track;
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(space::SNUG))
+            // Rows follow the signal: what comes in, how it is processed,
+            // where it goes.
+            form_section("ROUTING")
                 .child(fb_form_row(
                     "Format",
-                    add_track_select(
-                        "add-track-format-select",
-                        Some(match state.audio_format {
-                            AudioFormat::Mono => "mono",
-                            AudioFormat::Stereo => "stereo",
-                        }),
-                        "Select format...",
-                        vec![
-                            SelectOption::new("mono", i18n.tr("add-track.channel.mono")),
-                            SelectOption::new("stereo", i18n.tr("add-track.channel.stereo")),
-                        ],
-                        add_track_select_open(open_select, AddTrackSelectId::AudioFormat),
-                        SelectMenuPlacement::Below,
-                        Arc::new(move |_, w, cx| {
-                            toggle_format(&AddTrackSelectId::AudioFormat, w, cx)
-                        }),
-                        Arc::new(move |value, w, cx| {
-                            let format = if value == "mono" {
-                                AudioFormat::Mono
-                            } else {
-                                AudioFormat::Stereo
-                            };
-                            fmt_cb(&format, w, cx);
-                        }),
-                    ),
-                ))
-                .child(fb_form_row(
-                    "FX Chain",
-                    locked_select_box(
-                        state
-                            .fx_chain
-                            .clone()
-                            .unwrap_or_else(|| "No Preset".to_string()),
-                    ),
+                    audio_format_selector(state.audio_format, callbacks, i18n),
                 ))
                 .child(fb_form_row(
                     i18n.tr("add-track.routing.input"),
@@ -1449,251 +1385,150 @@ fn type_fields(
                     ),
                 ))
                 .child(fb_form_row(
-                    i18n.tr("add-track.routing.output"),
-                    add_track_select(
-                        "add-track-output-select",
-                        Some(state.output_label.as_str()),
-                        "Select output...",
-                        audio_output_select_options(&state.audio_output_targets),
-                        add_track_select_open(open_select, AddTrackSelectId::Output),
-                        SelectMenuPlacement::Above,
-                        Arc::new(move |_, w, cx| toggle_output(&AddTrackSelectId::Output, w, cx)),
-                        Arc::new(move |value, w, cx| output_cb(value, w, cx)),
+                    "",
+                    fb_checkbox(
+                        "add-track-arm",
+                        i18n.tr("add-track.arm"),
+                        arm_on,
+                        true,
+                        move |_, w, cx| arm_cb(&!arm_on, w, cx),
                     ),
                 ))
-                .when(show_asc, |col| {
-                    col.child(fb_checkbox(
-                        "add-track-asc-in",
-                        "Ascending Input",
-                        asc_in_on,
-                        true,
-                        move |_, w, cx| asc_in(&!asc_in_on, w, cx),
-                    ))
-                    .child(fb_checkbox(
-                        "add-track-asc-out",
-                        "Ascending Output",
-                        asc_out_on,
-                        true,
-                        move |_, w, cx| asc_out(&!asc_out_on, w, cx),
-                    ))
-                })
-                .child(fb_checkbox(
-                    "add-track-arm",
-                    i18n.tr("add-track.arm"),
-                    arm_on,
-                    true,
-                    move |_, w, cx| arm_cb(&!arm_on, w, cx),
+                .child(fx_chain_row(state))
+                .child(output_row(
+                    state,
+                    callbacks,
+                    open_select,
+                    "add-track-output-select",
+                    i18n,
                 ))
                 .into_any_element()
         }
         AddTrackKind::Instrument | AddTrackKind::DrumStep => {
-            // A DrumStep track is an Instrument track whose instrument is
-            // always the built-in Drum Sampler: the same form, the instrument
-            // fixed and no mode to pick.
+            // A DrumStep track is an Instrument track made for the step
+            // sequencer: the same form with no engine to pick. Its instrument
+            // is the built-in Drum Sampler unless a VSTi is picked — the
+            // steps are notes, so any drum instrument plays them.
             let drum_step = state.selected_kind == AddTrackKind::DrumStep;
-            let asc_in = callbacks.on_ascending_input.clone();
+            let solfege = !drum_step && state.instrument_mode == InstrumentMode::SolfegeEngine;
             let solfege_cb = callbacks.on_solfege_model.clone();
             let toggle_instrument = callbacks.on_toggle_select.clone();
             let toggle_solfege = callbacks.on_toggle_select.clone();
-            let input_cb = callbacks.on_input_label.clone();
-            let output_cb = callbacks.on_output_label.clone();
-            let toggle_input = callbacks.on_toggle_select.clone();
-            let toggle_output = callbacks.on_toggle_select.clone();
-            let asc_in_on = state.ascending_input;
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(space::SNUG))
-                .when(!drum_step, |col| {
-                    col.child(fb_form_row(
-                        "Mode",
-                        instrument_mode_selector(state.instrument_mode, callbacks),
-                    ))
-                })
-                .child(fb_form_row(
-                    "Instrument",
-                    if drum_step {
-                        locked_select_box("Built-in Drum Sampler · step sequencer".to_string())
-                            .into_any_element()
-                    } else if state.instrument_mode == InstrumentMode::Vsti {
-                        // Search, Vendor/Name/Format grouping and the tree are
-                        // built by the window, which owns their state; the
-                        // shared select supplies the trigger and anchoring.
-                        select_with_menu(
-                            "add-track-instrument-plugin-select",
-                            selected_instrument_label(
-                                instrument_plugins,
-                                state.instrument_plugin_id.as_deref(),
-                            ),
-                            add_track_select_open(open_select, AddTrackSelectId::InstrumentPlugin),
-                            false,
-                            SelectMenuPlacement::Below,
-                            move || {
-                                instrument_menu.unwrap_or_else(|| Empty.into_any_element())
-                            },
-                            Arc::new(move |_, w, cx| {
-                                toggle_instrument(&AddTrackSelectId::InstrumentPlugin, w, cx)
-                            }),
-                        )
-                        .into_any_element()
-                    } else if state.instrument_mode == InstrumentMode::SoundfontPlayer {
-                        locked_select_box("Built-in Soundfont Player".to_string())
-                            .into_any_element()
-                    } else if state.instrument_mode == InstrumentMode::SoundfontMulti {
-                        locked_select_box(
-                            "Built-in Soundfont Player · 16 MIDI channels".to_string(),
-                        )
-                        .into_any_element()
-                    } else {
-                        add_track_select(
-                            "add-track-solfege-model-select",
-                            Some(state.solfege_model_path.as_deref().unwrap_or("")),
-                            "Select Solfege model...",
-                            solfege_model_options(),
-                            add_track_select_open(open_select, AddTrackSelectId::SolfegeModel),
-                            SelectMenuPlacement::Below,
-                            Arc::new(move |_, w, cx| {
-                                toggle_solfege(&AddTrackSelectId::SolfegeModel, w, cx)
-                            }),
-                            Arc::new(move |value, w, cx| solfege_cb(value, w, cx)),
-                        )
-                        .into_any_element()
-                    },
-                ))
-                .when(
-                    !drum_step && state.instrument_mode == InstrumentMode::SolfegeEngine,
-                    |col| {
-                    col.child(disabled_hint(
-                        "SFM and FBMX models are loaded from Documents/Futureboard Studio/Utilities/Model/Solfage.",
-                    ))
-                    },
+            let instrument_field = if drum_step || state.instrument_mode == InstrumentMode::Vsti {
+                // Search, Vendor/Name/Format grouping and the tree are built
+                // by the window, which owns their state; the shared select
+                // supplies the trigger and anchoring.
+                select_with_menu(
+                    "add-track-instrument-plugin-select",
+                    drum_step_instrument_label(
+                        drum_step,
+                        instrument_plugins,
+                        state.instrument_plugin_id.as_deref(),
+                    ),
+                    add_track_select_open(open_select, AddTrackSelectId::InstrumentPlugin),
+                    false,
+                    SelectMenuPlacement::Below,
+                    move || instrument_menu.unwrap_or_else(|| Empty.into_any_element()),
+                    Arc::new(move |_, w, cx| {
+                        toggle_instrument(&AddTrackSelectId::InstrumentPlugin, w, cx)
+                    }),
                 )
-                .child(fb_form_row(
-                    i18n.tr("add-track.routing.midi-in"),
-                    add_track_select(
-                        "add-track-instrument-input-select",
-                        Some(state.input_label.as_str()),
-                        "Select MIDI input...",
-                        midi_input_select_options(midi_input_devices),
-                        add_track_select_open(open_select, AddTrackSelectId::Input),
-                        SelectMenuPlacement::Below,
-                        Arc::new(move |_, w, cx| toggle_input(&AddTrackSelectId::Input, w, cx)),
-                        Arc::new(move |value, w, cx| input_cb(value, w, cx)),
-                    ),
-                ))
-                .child(fb_form_row(
-                    i18n.tr("add-track.routing.output"),
-                    add_track_select(
-                        "add-track-instrument-output-select",
-                        Some(state.output_label.as_str()),
-                        "Select output...",
-                        audio_output_select_options(&state.audio_output_targets),
-                        add_track_select_open(open_select, AddTrackSelectId::Output),
-                        SelectMenuPlacement::Above,
-                        Arc::new(move |_, w, cx| toggle_output(&AddTrackSelectId::Output, w, cx)),
-                        Arc::new(move |value, w, cx| output_cb(value, w, cx)),
-                    ),
-                ))
-                .child(fb_form_row("FX Chain", select_box("No Preset".to_string())))
-                .when(show_asc, |col| {
-                    col.child(fb_checkbox(
-                        "add-track-asc-in",
-                        "Ascending MIDI Input",
-                        asc_in_on,
-                        true,
-                        move |_, w, cx| asc_in(&!asc_in_on, w, cx),
-                    ))
-                })
                 .into_any_element()
-        }
-        AddTrackKind::Midi => {
-            let asc_in = callbacks.on_ascending_input.clone();
-            let input_cb = callbacks.on_input_label.clone();
-            let output_cb = callbacks.on_output_label.clone();
-            let midi_channel_cb = callbacks.on_midi_channel_label.clone();
-            let toggle_input = callbacks.on_toggle_select.clone();
-            let toggle_output = callbacks.on_toggle_select.clone();
-            let toggle_channel = callbacks.on_toggle_select.clone();
-            let asc_in_on = state.ascending_input;
+            } else if state.instrument_mode == InstrumentMode::SoundfontPlayer {
+                locked_select_box("Built-in Soundfont Player").into_any_element()
+            } else if state.instrument_mode == InstrumentMode::SoundfontMulti {
+                locked_select_box("Built-in Soundfont Player · 16 MIDI channels").into_any_element()
+            } else {
+                add_track_select(
+                    "add-track-solfege-model-select",
+                    Some(state.solfege_model_path.as_deref().unwrap_or("")),
+                    "Select Solfege model...",
+                    solfege_model_options(),
+                    add_track_select_open(open_select, AddTrackSelectId::SolfegeModel),
+                    SelectMenuPlacement::Below,
+                    Arc::new(move |_, w, cx| {
+                        toggle_solfege(&AddTrackSelectId::SolfegeModel, w, cx)
+                    }),
+                    Arc::new(move |value, w, cx| solfege_cb(value, w, cx)),
+                )
+                .into_any_element()
+            };
             div()
                 .flex()
                 .flex_col()
-                .gap(px(space::SNUG))
-                .child(fb_form_row(
-                    i18n.tr("add-track.routing.midi-in"),
-                    add_track_select(
-                        "add-track-midi-input-select",
-                        Some(state.input_label.as_str()),
-                        "Select MIDI input...",
-                        midi_input_select_options(midi_input_devices),
-                        add_track_select_open(open_select, AddTrackSelectId::Input),
-                        SelectMenuPlacement::Below,
-                        Arc::new(move |_, w, cx| toggle_input(&AddTrackSelectId::Input, w, cx)),
-                        Arc::new(move |value, w, cx| input_cb(value, w, cx)),
-                    ),
-                ))
-                .child(fb_form_row(
-                    "MIDI Output",
-                    locked_select_box("None".to_string()),
-                ))
-                .child(fb_form_row(
-                    i18n.tr("add-track.routing.channel"),
-                    add_track_select(
-                        "add-track-midi-channel-select",
-                        Some(state.midi_channel_label.as_str()),
-                        "Select channel...",
-                        select_options(&[
-                            "All Channels",
-                            "Channel 1",
-                            "Channel 2",
-                            "Channel 3",
-                            "Channel 4",
-                            "Channel 5",
-                            "Channel 6",
-                            "Channel 7",
-                            "Channel 8",
-                            "Channel 9",
-                            "Channel 10",
-                            "Channel 11",
-                            "Channel 12",
-                            "Channel 13",
-                            "Channel 14",
-                            "Channel 15",
-                            "Channel 16",
-                        ]),
-                        add_track_select_open(open_select, AddTrackSelectId::MidiChannel),
-                        SelectMenuPlacement::Above,
-                        Arc::new(move |_, w, cx| {
-                            toggle_channel(&AddTrackSelectId::MidiChannel, w, cx)
+                .gap(px(SECTION_GAP))
+                .child(
+                    form_section("INSTRUMENT")
+                        .when(!drum_step, |section| {
+                            section.child(fb_form_row(
+                                "Engine",
+                                instrument_mode_selector(state.instrument_mode, callbacks),
+                            ))
+                        })
+                        .child(fb_form_row(
+                            if solfege { "Model" } else { "Instrument" },
+                            instrument_field,
+                        ))
+                        .when(solfege, |section| {
+                            section.child(field_note(
+                                "SFM and FBMX models load from Documents/Futureboard Studio/Utilities/Model/Solfage.",
+                            ))
                         }),
-                        Arc::new(move |value, w, cx| midi_channel_cb(value, w, cx)),
-                    ),
-                ))
-                .child(fb_form_row(
-                    i18n.tr("add-track.routing.output"),
-                    add_track_select(
-                        "add-track-midi-output-select",
-                        Some(state.output_label.as_str()),
-                        "Select output...",
-                        audio_output_select_options(&state.audio_output_targets),
-                        add_track_select_open(open_select, AddTrackSelectId::Output),
-                        SelectMenuPlacement::Above,
-                        Arc::new(move |_, w, cx| toggle_output(&AddTrackSelectId::Output, w, cx)),
-                        Arc::new(move |value, w, cx| output_cb(value, w, cx)),
-                    ),
-                ))
-                .when(show_asc, |col| {
-                    col.child(fb_checkbox(
-                        "add-track-asc-in",
-                        "Ascending Input",
-                        asc_in_on,
-                        true,
-                        move |_, w, cx| asc_in(&!asc_in_on, w, cx),
-                    ))
-                })
+                )
+                .child(
+                    form_section("ROUTING")
+                        .child(midi_input_row(
+                            state,
+                            callbacks,
+                            open_select,
+                            midi_input_devices,
+                            "add-track-instrument-input-select",
+                            i18n,
+                        ))
+                        .child(fx_chain_row(state))
+                        .child(output_row(
+                            state,
+                            callbacks,
+                            open_select,
+                            "add-track-instrument-output-select",
+                            i18n,
+                        )),
+                )
                 .into_any_element()
         }
+        AddTrackKind::Midi => form_section("ROUTING")
+            .child(midi_input_row(
+                state,
+                callbacks,
+                open_select,
+                midi_input_devices,
+                "add-track-midi-input-select",
+                i18n,
+            ))
+            // A new track listens on every channel and has no MIDI output;
+            // both are set on the track afterwards. Shown as values, not as
+            // menus whose choice track creation would ignore.
+            .child(fb_form_row(
+                i18n.tr("add-track.routing.channel"),
+                locked_select_box(i18n.tr("add-track.routing.all-channels")),
+            ))
+            .child(fb_form_row("MIDI Out", locked_select_box("None")))
+            .child(output_row(
+                state,
+                callbacks,
+                open_select,
+                "add-track-midi-output-select",
+                i18n,
+            ))
+            .into_any_element(),
         AddTrackKind::Automation => {
+            if state.automation_choices.is_empty() {
+                return form_section("LANE")
+                    .child(body_note(
+                        "No tracks yet. Add a track first, then add automation to it.",
+                    ))
+                    .into_any_element();
+            }
             let toggle_track = callbacks.on_toggle_select.clone();
             let toggle_target = callbacks.on_toggle_select.clone();
             let track_cb = callbacks.on_automation_track.clone();
@@ -1722,20 +1557,7 @@ fn type_fields(
                         .collect()
                 })
                 .unwrap_or_default();
-            if state.automation_choices.is_empty() {
-                return div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(space::SNUG))
-                    .child(disabled_hint(
-                        "No tracks yet. Add a track first, then add automation to it.",
-                    ))
-                    .into_any_element();
-            }
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(space::SNUG))
+            form_section("LANE")
                 .child(fb_form_row(
                     "Track",
                     add_track_select(
@@ -1766,52 +1588,34 @@ fn type_fields(
                         Arc::new(move |value, w, cx| target_cb(value, w, cx)),
                     ),
                 ))
-                .child(disabled_hint(
+                .child(field_note(
                     "Opens an automation lane for this parameter on the chosen track.",
                 ))
                 .into_any_element()
         }
-        AddTrackKind::Folder => div()
-            .flex()
-            .flex_col()
-            .gap(px(space::SNUG))
-            .child(
-                div()
-                    .text_size(px(typography::DENSE_LABEL))
-                    .text_color(Colors::text_secondary())
-                    .child(
-                        "Creates an arrangement folder. Drag track headers onto it to group them.",
-                    ),
-            )
-            .into_any_element(),
-        AddTrackKind::Bus | AddTrackKind::Return => div()
-            .flex()
-            .flex_col()
-            .gap(px(space::SNUG))
+        AddTrackKind::Folder => {
+            field_note("Creates an arrangement folder. Drag track headers onto it to group them.")
+                .into_any_element()
+        }
+        AddTrackKind::Bus | AddTrackKind::Return => form_section("ROUTING")
+            // A new bus or return always sums into Main; it is re-routed on
+            // the track afterwards.
             .child(fb_form_row(
                 i18n.tr("add-track.routing.output"),
-                select_box("Main".to_string()),
+                locked_select_box("Main"),
             ))
-            .child(
-                div()
-                    .text_size(px(typography::DENSE_LABEL))
-                    .text_color(Colors::text_faint())
-                    .child(if state.selected_kind == AddTrackKind::Bus {
-                        i18n.tr("add-track.hint.bus-route-selected")
-                    } else {
-                        i18n.tr("add-track.hint.return-output")
-                    }),
-            )
+            .child(field_note(if state.selected_kind == AddTrackKind::Bus {
+                i18n.tr("add-track.hint.bus-route-selected")
+            } else {
+                i18n.tr("add-track.hint.return-output")
+            }))
             .into_any_element(),
-        _ => div()
-            .text_size(px(typography::DENSE_LABEL))
-            .text_color(Colors::text_faint())
-            .child("This track type is not available in Native yet.")
-            .into_any_element(),
+        _ => body_note("This track type is not available in Native yet.").into_any_element(),
     }
 }
 
-/// Compact DAW-style Add Tracks form (external window body).
+/// The Add Track form (external window body): type picker, the fields that
+/// type has, and the action footer with the track count.
 #[allow(clippy::too_many_arguments)]
 pub fn add_track_dialog_body(
     state: &AddTrackDialogState,
@@ -1844,6 +1648,31 @@ pub fn add_track_dialog_body(
             &[("count", state.count.to_string())],
         )
     };
+    // A lane goes on a track that exists: no name, colour or count.
+    let identity = (!automation).then(|| {
+        identity_rows(
+            state,
+            text_field_with_callbacks_and_ime(
+                track_name_input,
+                track_name_focused,
+                track_name_callbacks,
+                track_name_ime_target,
+            )
+            .into_any_element(),
+            &callbacks,
+            color_ui,
+            i18n,
+        )
+    });
+    let count = (!automation).then(|| {
+        count_stepper(
+            state,
+            count_input,
+            count_focused,
+            count_callbacks,
+            &callbacks,
+        )
+    });
 
     div()
         .flex()
@@ -1851,11 +1680,10 @@ pub fn add_track_dialog_body(
         .flex_1()
         .min_h_0()
         .bg(Colors::surface_base())
-        .child(div().flex_shrink_0().child(dialog_intro(state, i18n)))
         .child(
             div()
                 .flex_shrink_0()
-                .child(type_tabs(state, &callbacks, i18n)),
+                .child(type_picker(state, &callbacks, i18n)),
         )
         .child(
             div()
@@ -1866,38 +1694,10 @@ pub fn add_track_dialog_body(
                 .min_h_0()
                 .overflow_y_scroll()
                 .px(px(BODY_PAD_X))
-                .pb(px(space::LOOSE))
-                .gap(px(FORM_GAP))
-                // A lane goes on a track that exists: no name, count or color.
-                .when(!automation, |body| {
-                    body.child(form_panel(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(FORM_GAP))
-                            .child(fb_form_row(
-                                i18n.tr("add-track.field.name"),
-                                text_field_with_callbacks_and_ime(
-                                    track_name_input,
-                                    track_name_focused,
-                                    track_name_callbacks,
-                                    track_name_ime_target,
-                                ),
-                            ))
-                            .child(fb_form_row(
-                                i18n.tr("add-track.field.count"),
-                                count_stepper(
-                                    state,
-                                    count_input,
-                                    count_focused,
-                                    count_callbacks,
-                                    &callbacks,
-                                ),
-                            ))
-                            .child(color_row(state, &callbacks, color_ui, i18n)),
-                    ))
-                })
-                .child(form_panel(type_fields(
+                .py(px(space::LOOSE))
+                .gap(px(SECTION_GAP))
+                .children(identity)
+                .child(type_fields(
                     state,
                     &callbacks,
                     open_select,
@@ -1905,7 +1705,7 @@ pub fn add_track_dialog_body(
                     instrument_menu,
                     midi_input_devices,
                     i18n,
-                ))),
+                )),
         )
         .child(
             div()
@@ -1913,18 +1713,14 @@ pub fn add_track_dialog_body(
                 .flex()
                 .flex_row()
                 .items_center()
-                // The footer is the action band, so its actions sit at the end
-                // of it. It used to also carry a half-opacity "Load Track
-                // Preset..." label on the left: not a button, not disabled, not
-                // wired to anything — a promise the dialog could not keep. It
-                // comes back when there is a preset store to open.
-                .justify_end()
+                .justify_between()
                 .gap(px(space::BASE))
                 .h(px(FOOTER_HEIGHT))
                 .px(px(BODY_PAD_X))
                 .border_t(px(1.0))
                 .border_color(Colors::border_subtle())
                 .bg(Colors::surface_titlebar())
+                .child(div().flex().flex_row().items_center().children(count))
                 .child(
                     div()
                         .flex()
@@ -1952,10 +1748,16 @@ pub fn add_track_dialog_body(
                 ),
         )
 }
-pub const ADD_TRACK_WINDOW_WIDTH: f32 = 560.0;
-pub const ADD_TRACK_WINDOW_HEIGHT: f32 = 520.0;
-pub const ADD_TRACK_WINDOW_MIN_WIDTH: f32 = 480.0;
-pub const ADD_TRACK_WINDOW_MIN_HEIGHT: f32 = 500.0;
+
+/// Wide enough for seven type tiles with whole labels.
+pub const ADD_TRACK_WINDOW_WIDTH: f32 = 520.0;
+/// Fits the tallest standard form — an Instrument track on a VSTi — with no
+/// scrolling; shorter forms leave the footer where it is.
+pub const ADD_TRACK_WINDOW_HEIGHT: f32 = 512.0;
+/// The narrowest width at which every English type label is still whole.
+pub const ADD_TRACK_WINDOW_MIN_WIDTH: f32 = 500.0;
+/// Type picker, the name row and the footer stay in view; the form scrolls.
+pub const ADD_TRACK_WINDOW_MIN_HEIGHT: f32 = 360.0;
 
 /// Text field inside the dialog that an open context menu belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3143,7 +2945,8 @@ impl Render for AddTrackWindow {
 
         // The instrument popover body, built only while it is open.
         let instrument_menu = (self.open_select == Some(AddTrackSelectId::InstrumentPlugin)
-            && self.state.instrument_mode == InstrumentMode::Vsti)
+            && (self.state.instrument_mode == InstrumentMode::Vsti
+                || self.state.selected_kind == AddTrackKind::DrumStep))
             .then(|| {
                 let search_field = text_field_with_callbacks_and_ime(
                     &self.instrument_search_input,
@@ -3296,6 +3099,17 @@ impl AddTrackWindow {
         self.open_select = Some(AddTrackSelectId::InstrumentPlugin);
         self.instrument_search_input.set_value(query);
         self.sync_instrument_search_query();
+    }
+
+    /// Preview only: open the custom colour popover from the name swatch.
+    pub(crate) fn preview_open_color_picker(&mut self) {
+        self.open_select = None;
+        self.color_picker.open();
+    }
+
+    /// Preview only: put an Instrument track on `mode`.
+    pub(crate) fn preview_instrument_mode(&mut self, mode: InstrumentMode) {
+        self.state.instrument_mode = mode;
     }
 }
 

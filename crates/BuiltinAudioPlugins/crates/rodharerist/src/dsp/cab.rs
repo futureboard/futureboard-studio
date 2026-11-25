@@ -4,14 +4,14 @@
 //! than pretending a four-filter chain is an IR. Each cabinet family selects a
 //! distinct acoustic topology (open-back cancellation, small-box mode,
 //! multi-cone closed box, oversized low modes, or bass clean-low radiation).
-//! A separate mic stage models capsule type, cone position, proximity, air
-//! absorption and a subtle early reflection. Delay storage is allocated only
+//! A separate mic stage models capsule type, cone position, off-axis angle,
+//! proximity, air absorption and a subtle early reflection. Delay storage is allocated only
 //! in construction/sample-rate preparation, never in `process`.
 
 use super::smooth::Smoothed;
 use super::{CabModel, MicModel};
 
-const CONTROL_SMOOTH_SECONDS: f32 = 0.015;
+const CONTROL_SMOOTH_SECONDS: f32 = 0.030;
 const MODEL_FADE_SECONDS: f32 = 0.015;
 const MAX_DELAY_SECONDS: f32 = 0.035;
 
@@ -1281,6 +1281,9 @@ struct CabChannel {
     rear_low: f32,
     /// High band used to pull the plastic 5 kHz edge down.
     presence: f32,
+    /// Off-axis lowpass state. Tracks the on-axis signal even at axis 0 so
+    /// moving the angle does not step.
+    axis_lp: f32,
 }
 
 impl Default for CabChannel {
@@ -1303,6 +1306,7 @@ impl Default for CabChannel {
             closed_lp: 0.0,
             rear_low: 0.0,
             presence: 0.0,
+            axis_lp: 0.0,
         }
     }
 }
@@ -1376,24 +1380,28 @@ struct CabLane {
     condenser_alpha: f32,
     position: Smoothed,
     distance: Smoothed,
+    axis: Smoothed,
     mic_kind: Smoothed,
     speaker_lpf_alpha: Smoothed,
     air_alpha: Smoothed,
     room_delay: Smoothed,
     room_mix: Smoothed,
     level: Smoothed,
+    axis_alpha: Smoothed,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct CabControls {
     position: f32,
     distance: f32,
+    axis: f32,
     mic_kind: f32,
     speaker_lpf_alpha: f32,
     air_alpha: f32,
     room_delay: f32,
     room_mix: f32,
     level: f32,
+    axis_alpha: f32,
     mode1_f: f32,
     mode2_f: f32,
     breakup_f: f32,
@@ -1428,14 +1436,16 @@ impl CabLane {
             condenser_alpha: 0.0,
             position: Smoothed::new(sr, CONTROL_SMOOTH_SECONDS, 0.2),
             distance: Smoothed::new(sr, CONTROL_SMOOTH_SECONDS, 0.4),
+            axis: Smoothed::new(sr, CONTROL_SMOOTH_SECONDS, 0.0),
             mic_kind: Smoothed::new(sr, CONTROL_SMOOTH_SECONDS, 0.0),
             speaker_lpf_alpha: Smoothed::new(sr, CONTROL_SMOOTH_SECONDS, alpha(5_000.0, sr)),
             air_alpha: Smoothed::new(sr, CONTROL_SMOOTH_SECONDS, alpha(8_000.0, sr)),
             room_delay: Smoothed::new(sr, CONTROL_SMOOTH_SECONDS, sr * 0.008),
             room_mix: Smoothed::new(sr, CONTROL_SMOOTH_SECONDS, 0.04),
             level: Smoothed::new(sr, CONTROL_SMOOTH_SECONDS, 1.0),
+            axis_alpha: Smoothed::new(sr, CONTROL_SMOOTH_SECONDS, alpha(17_600.0, sr)),
         };
-        lane.configure(model, MicModel::Dynamic, 20.0, 40.0);
+        lane.configure(model, MicModel::Dynamic, 20.0, 40.0, 0.0);
         lane.snap_controls();
         lane
     }
@@ -1447,12 +1457,14 @@ impl CabLane {
         for value in [
             &mut self.position,
             &mut self.distance,
+            &mut self.axis,
             &mut self.mic_kind,
             &mut self.speaker_lpf_alpha,
             &mut self.air_alpha,
             &mut self.room_delay,
             &mut self.room_mix,
             &mut self.level,
+            &mut self.axis_alpha,
         ] {
             value.set_time(self.sample_rate, CONTROL_SMOOTH_SECONDS);
         }
@@ -1475,48 +1487,85 @@ impl CabLane {
         self.condenser_alpha = alpha(7_600.0, self.sample_rate);
     }
 
-    fn configure(&mut self, model: CabModel, mic: MicModel, position: f32, distance: f32) {
+    fn configure(
+        &mut self,
+        model: CabModel,
+        mic: MicModel,
+        position: f32,
+        distance: f32,
+        axis: f32,
+    ) {
         self.model = model;
         self.profile = CabProfile::for_model(model);
         self.prepare_coefficients();
         let p = (position / 100.0).clamp(0.0, 1.0);
         let d = (distance / 100.0).clamp(0.0, 1.0);
+        let axis = (axis / 100.0).clamp(0.0, 1.0);
         self.position.set_target(p);
         self.distance.set_target(d);
+        self.axis.set_target(axis);
         self.mic_kind.set_target(mic.index() as f32);
 
-        // Edge placement changes the breakup contribution, radiation cutoff
-        // and cancellation depth together. Distance additionally adds air
-        // absorption and early-room energy.
+        // Anchored on the historical mic law at and inside the default
+        // (position 20, distance 40, on axis), including a mic on the dust
+        // cap. That corner already sits on the speaker's fizz limit, so it
+        // is not opened further. Past the default the rim darkens, and
+        // distance loses more air than the old straight line.
         let capsule_extension = match mic {
             MicModel::Dynamic => 0.90,
             MicModel::Ribbon => 0.68,
             MicModel::Condenser => 1.16,
         };
-        let speaker_cutoff = self.profile.cutoff_hz * (1.12 - p * 0.32);
+        let base = 1.12 - p * 0.32;
+        let edge = ((p - 0.2).max(0.0) / 0.8) * 0.22;
+        let speaker_cutoff =
+            (self.profile.cutoff_hz * (base - edge)).clamp(700.0, self.sample_rate * 0.45);
         self.speaker_lpf_alpha
             .set_target(alpha(speaker_cutoff, self.sample_rate));
-        let air_cutoff = (speaker_cutoff * capsule_extension * (1.0 - d * 0.58))
-            .clamp(2_200.0, self.sample_rate * 0.45);
+        // Up to the default distance this is the previous air law
+        // (`1 - distance * 0.58`). Farther than that, absorption keeps
+        // falling instead of stopping at 42% of the cutoff.
+        let old_air = 1.0 - d * 0.58;
+        let air_factor = if d <= 0.4 {
+            old_air
+        } else {
+            (old_air - ((d - 0.4) / 0.6) * 0.30).max(0.14)
+        };
+        let air_cutoff =
+            (speaker_cutoff * capsule_extension * air_factor).clamp(900.0, self.sample_rate * 0.45);
         self.air_alpha
             .set_target(alpha(air_cutoff, self.sample_rate));
+        // On axis this sits near Nyquist and the process blend ignores it, so
+        // the saved on-axis tone does not gain a pole. The coefficient still
+        // tracks, so turning the knob does not step the filter.
+        let axis_hz = 1_500.0 + (1.0 - axis).powf(1.65) * 16_000.0;
+        self.axis_alpha.set_target(alpha(
+            axis_hz.min(self.sample_rate * 0.45),
+            self.sample_rate,
+        ));
+        let extra_far = (d - 0.4).max(0.0);
         self.room_delay
-            .set_target(self.sample_rate * (0.0065 + d * 0.014));
-        self.room_mix.set_target(0.018 + d * 0.095);
+            .set_target(self.sample_rate * (0.0065 + d * 0.014 + extra_far * 0.008));
+        self.room_mix
+            .set_target(0.018 + d * 0.095 + extra_far * 0.12);
+        let distance_gain = 10f32.powf((0.4 - d) * 11.0 / 20.0);
+        let axis_gain = 1.0 - axis * 0.20;
         self.level
-            .set_target((1.0 - d * 0.13) * self.profile.output_gain);
+            .set_target((1.0 - d * 0.13) * distance_gain * axis_gain * self.profile.output_gain);
     }
 
     fn snap_controls(&mut self) {
         for value in [
             &mut self.position,
             &mut self.distance,
+            &mut self.axis,
             &mut self.mic_kind,
             &mut self.speaker_lpf_alpha,
             &mut self.air_alpha,
             &mut self.room_delay,
             &mut self.room_mix,
             &mut self.level,
+            &mut self.axis_alpha,
         ] {
             value.snap();
         }
@@ -1535,12 +1584,14 @@ impl CabLane {
         CabControls {
             position: self.position.tick(),
             distance: self.distance.tick(),
+            axis: self.axis.tick(),
             mic_kind: self.mic_kind.tick(),
             speaker_lpf_alpha: self.speaker_lpf_alpha.tick(),
             air_alpha: self.air_alpha.tick(),
             room_delay: self.room_delay.tick(),
             room_mix: self.room_mix.tick(),
             level: self.level.tick(),
+            axis_alpha: self.axis_alpha.tick(),
             mode1_f: self.mode1_f,
             mode2_f: self.mode2_f,
             breakup_f: self.breakup_f,
@@ -1679,14 +1730,26 @@ impl CabLane {
         channel.presence = finite(channel.presence + presence * (acoustic - channel.presence));
         acoustic -= (acoustic - channel.presence) * 0.18;
 
-        // Position changes proximity and cone breakup as well as high
-        // radiation. Distance reduces proximity and introduces a softened,
-        // delayed early-room reflection.
+        // Path difference across the cone. Zero at and inside the historical
+        // default (20% toward the rim), so a saved position of 20 does not
+        // grow a comb it did not have. Further out, the delayed copy hollows
+        // the rim the way an edge mic does.
+        let edge = ((controls.position - 0.20) * (1.0 / 0.80)).clamp(0.0, 1.0);
+        if edge > 1.0e-4 {
+            let tap = delay.read(sample_rate * (0.00016 + edge * 0.00062));
+            acoustic += (tap - acoustic) * edge * 0.30;
+        }
+
+        // Proximity is the old distance law everywhere, plus an extra bass
+        // lift only in the closest fifth of the knob (a mic on the cloth).
+        // At the default 40% the extra term is zero.
         channel.proximity_low = finite(
             channel.proximity_low + controls.proximity_alpha * (acoustic - channel.proximity_low),
         );
+        let proximity_base = (1.0 - controls.distance) * (0.36 - controls.position * 0.10);
+        let close_to_cloth = ((0.22 - controls.distance) / 0.22).clamp(0.0, 1.0);
         let proximity =
-            channel.proximity_low * (1.0 - controls.distance) * (0.36 - controls.position * 0.10);
+            channel.proximity_low * (proximity_base + close_to_cloth * close_to_cloth * 0.85);
         let close = acoustic + proximity;
 
         // Three capsule topologies, continuously crossfaded for automation.
@@ -1709,12 +1772,21 @@ impl CabLane {
             ribbon * (1.0 - blend) + condenser * blend
         };
 
-        channel.room_low = finite(channel.room_low + controls.air_alpha * (mic - channel.room_low));
+        // Axis 0 returns `mic` exactly. The lowpass keeps following so a move
+        // toward off-axis fades into a darker aim instead of stepping.
+        channel.axis_lp = finite(channel.axis_lp + controls.axis_alpha * (mic - channel.axis_lp));
+        let aimed = mic + (channel.axis_lp - mic) * controls.axis;
+
+        channel.room_low =
+            finite(channel.room_low + controls.air_alpha * (aimed - channel.room_low));
         let direct = channel.room_low;
         let reflection = delay.read(controls.room_delay);
+        // Off axis the capsule hears a little more of the early bounce and a
+        // little less of the direct beam. Axis 0 leaves the mix untouched.
+        let room_mix = controls.room_mix * (1.0 + controls.axis * 0.75);
         let softened_reflection = reflection * (1.0 - controls.position * 0.18);
         delay.write(finite(acoustic));
-        finite((direct + softened_reflection * controls.room_mix) * controls.level)
+        finite((direct + softened_reflection * room_mix) * controls.level)
     }
 
     #[inline]
@@ -1787,21 +1859,25 @@ impl Cabinet {
         self.switch_position = 0.0;
     }
 
-    /// Position and distance retain their existing 0..100 wire semantics:
-    /// position 0=center / 100=edge, distance 0=close / 100=far.
+    /// Position, distance and axis are 0..100. Position 0 is the dust cap and
+    /// 100 the rim. Distance 0 is on the cloth and 100 is far. Axis 0 is on
+    /// the cap axis and 100 is fully off it. The response is anchored at
+    /// position 20, distance 40, axis 0 — the values older projects already
+    /// store — and widens to either side of that.
     pub(super) fn configure(
         &mut self,
         model: CabModel,
         mic: MicModel,
         position: f32,
         distance: f32,
+        axis: f32,
     ) {
         if model == self.active.model && !self.switching {
-            self.active.configure(model, mic, position, distance);
+            self.active.configure(model, mic, position, distance, axis);
         } else if self.switching && model == self.standby.model {
-            self.standby.configure(model, mic, position, distance);
+            self.standby.configure(model, mic, position, distance, axis);
         } else {
-            self.standby.configure(model, mic, position, distance);
+            self.standby.configure(model, mic, position, distance, axis);
             self.standby.reset();
             self.switching = true;
             self.switch_position = 0.0;
@@ -1837,8 +1913,19 @@ mod tests {
     use super::*;
 
     fn sine_level(model: CabModel, mic: MicModel, position: f32, distance: f32, hz: f32) -> f32 {
+        sine_axis(model, mic, position, distance, 0.0, hz)
+    }
+
+    fn sine_axis(
+        model: CabModel,
+        mic: MicModel,
+        position: f32,
+        distance: f32,
+        axis: f32,
+        hz: f32,
+    ) -> f32 {
         let mut cab = Cabinet::new(48_000.0);
-        cab.configure(model, mic, position, distance);
+        cab.configure(model, mic, position, distance, axis);
         cab.reset();
         let mut energy = 0.0;
         for n in 0..16_000 {
@@ -1854,7 +1941,7 @@ mod tests {
 
     fn render(model: CabModel, mic: MicModel, position: f32, distance: f32) -> Vec<f32> {
         let mut cab = Cabinet::new(48_000.0);
-        cab.configure(model, mic, position, distance);
+        cab.configure(model, mic, position, distance, 0.0);
         cab.reset();
         (0..16_000)
             .map(|n| {
@@ -1961,7 +2048,7 @@ mod tests {
         let mut max_step = 0.0f32;
         for n in 0..24_000 {
             if n == 8_000 {
-                switched.configure(CabModel::BassCabinet, MicModel::Condenser, 85.0, 75.0);
+                switched.configure(CabModel::BassCabinet, MicModel::Condenser, 85.0, 75.0, 40.0);
             }
             let x = (n as f32 * 0.051).sin() * 0.3;
             let y = switched.process(x, x).0;
@@ -1974,5 +2061,52 @@ mod tests {
             previous = y;
         }
         assert!(max_step < 0.30, "cab switch clicked: {max_step}");
+    }
+
+    #[test]
+    fn off_axis_darkens_and_close_distance_adds_low_end() {
+        let on = sine_axis(
+            CabModel::Modern4x12,
+            MicModel::Dynamic,
+            30.0,
+            30.0,
+            0.0,
+            5_000.0,
+        );
+        let off = sine_axis(
+            CabModel::Modern4x12,
+            MicModel::Dynamic,
+            30.0,
+            30.0,
+            100.0,
+            5_000.0,
+        );
+        assert!(on > off * 1.25, "on-axis={on} off-axis={off}");
+
+        let close = sine_level(CabModel::Vintage4x12, MicModel::Dynamic, 20.0, 0.0, 140.0);
+        let far = sine_level(CabModel::Vintage4x12, MicModel::Dynamic, 20.0, 100.0, 140.0);
+        assert!(close > far * 1.6, "close={close} far={far}");
+    }
+
+    #[test]
+    fn mic_placement_moves_do_not_click() {
+        let mut cab = Cabinet::new(48_000.0);
+        cab.configure(CabModel::Modern4x12, MicModel::Dynamic, 0.0, 0.0, 0.0);
+        cab.reset();
+        let mut previous = 0.0f32;
+        let mut max_step = 0.0f32;
+        for n in 0..16_000 {
+            if n == 4_000 {
+                cab.configure(CabModel::Modern4x12, MicModel::Dynamic, 100.0, 100.0, 100.0);
+            }
+            let x = (n as f32 * 0.047).sin() * 0.35;
+            let y = cab.process(x, x).0;
+            assert!(y.is_finite());
+            if n > 200 {
+                max_step = max_step.max((y - previous).abs());
+            }
+            previous = y;
+        }
+        assert!(max_step < 0.20, "mic move clicked: {max_step}");
     }
 }

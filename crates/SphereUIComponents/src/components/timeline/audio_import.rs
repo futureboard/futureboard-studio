@@ -1134,11 +1134,13 @@ mod tests {
             color_hex: "#000000".into(),
             volume_norm: 0.75,
             pan: 0.0,
+            dual_pan: Default::default(),
             muted: false,
             solo: false,
             record_arm: false,
             input_monitor: Default::default(),
             routing: Default::default(),
+            midi_fx: Vec::new(),
             inserts: Vec::new(),
             automation_lanes: Vec::new(),
             clips: vec![audio_clip("a1", Some(media.clone()))],
@@ -1150,6 +1152,7 @@ mod tests {
             takes_expanded: false,
             freeze: None,
             drum_step: false,
+            step_lanes: Vec::new(),
         });
 
         let entries = collect_waveform_restore_entries(&project, Path::new("/tmp/unused"));
@@ -1177,11 +1180,13 @@ mod tests {
             color_hex: "#000000".into(),
             volume_norm: 0.75,
             pan: 0.0,
+            dual_pan: Default::default(),
             muted: false,
             solo: false,
             record_arm: false,
             input_monitor: Default::default(),
             routing: Default::default(),
+            midi_fx: Vec::new(),
             inserts: Vec::new(),
             automation_lanes: Vec::new(),
             clips: vec![audio_clip("a1", Some(PathBuf::from("/elsewhere/kick.wav")))],
@@ -1193,6 +1198,7 @@ mod tests {
             takes_expanded: false,
             freeze: None,
             drum_step: false,
+            step_lanes: Vec::new(),
         });
 
         let root = PathBuf::from("/proj");
@@ -1220,11 +1226,13 @@ mod tests {
             color_hex: "#000000".into(),
             volume_norm: 0.75,
             pan: 0.0,
+            dual_pan: Default::default(),
             muted: false,
             solo: false,
             record_arm: false,
             input_monitor: Default::default(),
             routing: Default::default(),
+            midi_fx: Vec::new(),
             inserts: Vec::new(),
             automation_lanes: Vec::new(),
             clips: vec![audio_clip("a1", Some(media.clone()))],
@@ -1236,6 +1244,7 @@ mod tests {
             takes_expanded: false,
             freeze: None,
             drum_step: false,
+            step_lanes: Vec::new(),
         });
 
         let entries = collect_waveform_restore_entries(&project, Path::new("/tmp"));

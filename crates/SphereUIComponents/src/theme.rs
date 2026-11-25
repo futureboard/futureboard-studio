@@ -965,6 +965,20 @@ impl Colors {
     theme_color!(accent_danger, "accent.danger", "#F2645F");
     theme_color!(accent_purple, "accent.purple", "#A78BFA");
 
+    // Chord families (`harmony.*`): content colour for chords in palettes and
+    // progressions — warm for the major family, cool for the minor, neutral
+    // for diminished, augmented and suspended. Always shown with the chord's
+    // name, never as hue alone.
+    pub fn harmony_major() -> Rgba {
+        Self::resolve_for_appearance("harmony.major", "#E9A86B", "#B4651C")
+    }
+    pub fn harmony_minor() -> Rgba {
+        Self::resolve_for_appearance("harmony.minor", "#7FA2F0", "#3A64C8")
+    }
+    pub fn harmony_other() -> Rgba {
+        Self::resolve_for_appearance("harmony.other", "#9AA0AC", "#6A707B")
+    }
+
     // Workspace tab / focused panel tokens.
     theme_color!(tab_text, "tab.text", "#B9BDC6");
     theme_color!(tab_text_muted, "tab.text_muted", "#8F949F");
@@ -1200,6 +1214,9 @@ impl Colors {
     // Fader
     theme_color!(fader_groove, "fader.groove", "#0E1015");
     theme_color!(fader_thumb_border, "fader.thumbBorder", "#FFFFFF33");
+    // The round slider thumb: light on every theme, so it reads as the grab
+    // point against both the groove and the fill.
+    theme_color!(slider_thumb, "fader.sliderThumb", "#E6E8EC");
 
     // Meters
     theme_color!(meter_rail, "meter.rail", "#00000024");

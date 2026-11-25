@@ -192,6 +192,10 @@ pub trait KitModel: Copy + PartialEq + 'static {
     ) {
     }
     fn mouse_up(_editor: &mut KitEditor<Self>, _cx: &mut Context<KitEditor<Self>>) {}
+    /// After the params were read from the mirror (on open, rebind, undo,
+    /// preset or reload): for a family that keeps state beside its params —
+    /// a sample's waveform — to catch up.
+    fn synced(_editor: &mut KitEditor<Self>, _cx: &mut Context<KitEditor<Self>>) {}
     /// The entries of the family's menu `n`.
     fn own_menu(_editor: &KitEditor<Self>, _menu: u8) -> Vec<ContextMenuEntry> {
         Vec::new()
@@ -282,7 +286,19 @@ impl<M: KitModel> KitEditor<M> {
             .from_mirror(&self.key.insert_id)
             .unwrap_or_else(|| self.model.defaults());
         self.preset = self.matching_preset();
+        M::synced(self, cx);
         cx.notify();
+    }
+
+    /// The insert this editor edits.
+    pub fn insert(&self) -> &PluginInstanceKey {
+        &self.key
+    }
+
+    /// What the editor can do against the live host: a family that loads
+    /// files sends them with these.
+    pub fn host_ops(&self) -> &BuiltinEditorHostOps {
+        &self.host_ops
     }
 
     fn rebind(

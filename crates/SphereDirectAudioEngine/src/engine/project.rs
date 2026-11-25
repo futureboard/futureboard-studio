@@ -44,7 +44,33 @@ pub(super) fn project_structure_key(
         .iter_mut()
         .map(|track| std::mem::take(&mut track.automation_lanes))
         .collect();
+    // Nor are MIDI FX settings (see `AudioEngine::apply_midi_fx_changes`):
+    // only which devices sit in which slots is structure. A knob turned on an
+    // arpeggiator must not rebuild the graph and cut every note in the song.
+    type SlotSettings = (bool, Vec<(String, f32)>);
+    let midi_fx_settings: Vec<Vec<SlotSettings>> = snapshot
+        .tracks
+        .iter_mut()
+        .map(|track| {
+            track
+                .midi_fx
+                .iter_mut()
+                .map(|fx| {
+                    (
+                        std::mem::replace(&mut fx.enabled, true),
+                        std::mem::take(&mut fx.params),
+                    )
+                })
+                .collect()
+        })
+        .collect();
     let value = serde_json::to_value(&*snapshot);
+    for (track, settings) in snapshot.tracks.iter_mut().zip(midi_fx_settings) {
+        for (fx, (enabled, params)) in track.midi_fx.iter_mut().zip(settings) {
+            fx.enabled = enabled;
+            fx.params = params;
+        }
+    }
     snapshot.midi_clips = midi;
     for (track, parts) in snapshot.tracks.iter_mut().zip(parts) {
         track.soundfont_channels = parts;
@@ -92,6 +118,32 @@ pub(super) fn write_canonical_json(value: &serde_json::Value, out: &mut String) 
 }
 
 impl EngineInner {
+    /// A MIDI edit, live: the loaded project with its MIDI clips replaced by
+    /// `midi_clips`, swapped in as [`Self::replace_midi_schedule`] does —
+    /// without the structure key, the per-track diffs or the state change a
+    /// whole [`Self::load_project`] runs for the same edit.
+    ///
+    /// `Ok(false)` when there is nothing to edit (no project loaded, or a full
+    /// build in flight), so the caller falls back to a full load.
+    pub(crate) fn replace_midi_clips(
+        &self,
+        midi_clips: Vec<std::sync::Arc<crate::types::EngineMidiClipSnapshot>>,
+    ) -> Result<bool, SphereAudioError> {
+        if self.structure_key.lock().is_none() {
+            return Ok(false);
+        }
+        let snapshot = {
+            let project = self.project.lock();
+            let Some(project) = project.as_ref() else {
+                return Ok(false);
+            };
+            let mut snapshot = project.clone();
+            snapshot.midi_clips = midi_clips;
+            snapshot
+        };
+        self.replace_midi_schedule(snapshot).map(|()| true)
+    }
+
     /// The MIDI-only half of [`Self::load_project`]: build the new schedule
     /// against the running graph's tracks and swap it in on the audio thread.
     pub(super) fn replace_midi_schedule(
@@ -249,6 +301,30 @@ impl EngineInner {
         }
     }
 
+    /// Rebuild the playing graph once its delay compensation has outgrown
+    /// the delay lines reserved for it. Control thread; the status poll calls
+    /// it.
+    ///
+    /// The lines are reserved when a graph is built, for the latency known
+    /// then. A plug-in that reports more afterwards — one just attached, or
+    /// one whose lookahead was raised — needs longer lines than the audio
+    /// thread may allocate, and the tracks it should delay played undelayed
+    /// until something else happened to rebuild the graph. An unchanged sync
+    /// does not, so that could be the rest of the session.
+    pub(super) fn service_short_pdc_rings(&self) {
+        if !self.shared.pdc_rings_short.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        let Some(snapshot) = self.project.lock().clone() else {
+            return;
+        };
+        // The structure is unchanged; force the full build.
+        *self.structure_key.lock() = None;
+        if let Err(error) = self.load_project(snapshot) {
+            eprintln!("[pdc] rebuild for longer delay lines failed: {error}");
+        }
+    }
+
     pub fn load_project(&self, snapshot: EngineProjectSnapshot) -> Result<(), SphereAudioError> {
         let insert_param_revision = self.insert_param_revision();
         self.load_project_as_of(snapshot, insert_param_revision)
@@ -278,6 +354,23 @@ impl EngineInner {
         output_sample_rate: u32,
     ) -> Result<(), SphereAudioError> {
         let input_state_revision_at_start = self.input_state_revision.load(Ordering::Acquire);
+        // A note edit changes the MIDI and nothing else. Rebuilding the whole
+        // graph for it re-read every SoundFont from disk and, at the swap,
+        // silenced every sounding note and restarted every stretcher and PDC
+        // line -- once per note drawn. Swap the schedule instead. Checked
+        // before the engine enters LoadingProject (and says so in the log):
+        // a content-only edit loads nothing.
+        let mut structure_key =
+            project_structure_key(&mut snapshot, output_sample_rate, self.pdc_enabled());
+        if structure_key.is_some() && *self.structure_key.lock() == structure_key {
+            self.apply_soundfont_channel_changes(&snapshot);
+            self.apply_clip_gain_changes(&snapshot);
+            self.apply_automation_changes(&snapshot);
+            self.apply_midi_fx_changes(&snapshot, output_sample_rate);
+            return self.replace_midi_schedule(snapshot);
+        }
+        // A full build from here on; until it lands, nothing matches.
+        *self.structure_key.lock() = None;
         let old_state = AudioEngineState::from_u8(
             self.shared
                 .engine_state
@@ -287,23 +380,6 @@ impl EngineInner {
             "[AudioEngineState] old={old_state:?} new=LoadingProject source=load_project playing={}",
             self.shared.playing.load(Ordering::Relaxed)
         );
-        // A note edit changes the MIDI and nothing else. Rebuilding the whole
-        // graph for it re-read every SoundFont from disk and, at the swap,
-        // silenced every sounding note and restarted every stretcher and PDC
-        // line -- once per note drawn. Swap the schedule instead.
-        let mut structure_key =
-            project_structure_key(&mut snapshot, output_sample_rate, self.pdc_enabled());
-        if structure_key.is_some() && *self.structure_key.lock() == structure_key {
-            self.shared
-                .engine_state
-                .store(old_state as u8, Ordering::Relaxed);
-            self.apply_soundfont_channel_changes(&snapshot);
-            self.apply_clip_gain_changes(&snapshot);
-            self.apply_automation_changes(&snapshot);
-            return self.replace_midi_schedule(snapshot);
-        }
-        // A full build from here on; until it lands, nothing matches.
-        *self.structure_key.lock() = None;
         let previously_active_paths: Vec<String> = self
             .project
             .lock()
@@ -584,6 +660,14 @@ impl EngineInner {
         // below is stored, or that mirror loses the sinks.
         runtime.plugin_bridge_sinks = self.plugin_bridge_sinks.lock().clone();
         runtime.resolve_bridge_sinks();
+        // `build` planned delay compensation before the sinks were attached,
+        // with every bridged insert at zero latency. Plan with what they
+        // report now, at the open stream's period, so the swap does not move
+        // every compensated track and the rings are reserved for the real
+        // path.
+        runtime.plan_latency_with_attached_plugins(
+            self.shared.bridge_period_frames.load(Ordering::Relaxed),
+        );
         // The same for the Control Room: a rebuilt graph starts from a default
         // monitor, and nothing re-sends the configuration after a sync — so
         // every sync used to put Master back on the default output pair and
@@ -609,6 +693,11 @@ impl EngineInner {
         // callback does not grow them on the first blocks after the swap.
         let device_block = self.status.lock().buffer_size as usize;
         runtime.reserve_track_blocks(device_block.max(1024));
+        // Hand every running MIDI FX chain to the rebuilt graph (see
+        // `RuntimeMidiFx`): the old and new graphs share it, so an arpeggio
+        // keeps its notes and position across the swap. A chain whose track
+        // lost its MIDI FX still goes over once, to end what it was playing.
+        self.hand_over_midi_fx(&mut runtime, &snapshot, output_sample_rate);
         // Plug-in parameter edits made since the snapshot was taken went to
         // the running graph; carry them into this one. The journal lock is
         // held until the graph is queued, so a concurrent edit either lands

@@ -28,6 +28,7 @@ impl StudioLayout {
             };
             track.inserts[track.clone_insert_range(with_fx)]
                 .iter()
+                .chain(track.midi_fx.iter().filter_map(|fx| fx.plugin.as_ref()))
                 .map(|slot| slot.id.clone())
                 .collect()
         };
@@ -196,7 +197,7 @@ impl StudioLayout {
             if !matches!(track.track_type, TrackType::Video | TrackType::Group) {
                 entries.push(ContextMenuEntry::Separator);
                 entries.push(ContextMenuEntry::Header("Automation".into()));
-                for target in TimelineState::mixer_automation_targets(track) {
+                for target in state.mixer_automation_targets_for(track) {
                     let label = TimelineState::automation_target_label_for(track, &target);
                     let shown = track
                         .automation_lanes

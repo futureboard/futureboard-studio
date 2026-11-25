@@ -107,6 +107,11 @@
     "view:waveform-zoom-reset": "Alt+0",
 
     "clip:split-at-playhead": "S",
+    "clip:merge": "J",
+    "clip:nudge-left": "ArrowLeft",
+    "clip:nudge-right": "ArrowRight",
+    "clip:nudge-bar-left": "Shift+ArrowLeft",
+    "clip:nudge-bar-right": "Shift+ArrowRight",
     "clip:rename": "F2",
     "clip:properties": "Alt+Enter",
 

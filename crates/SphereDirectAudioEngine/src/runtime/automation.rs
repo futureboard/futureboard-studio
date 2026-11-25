@@ -39,6 +39,11 @@ pub enum RuntimeAutomationTarget {
     TrackVolume,
     TrackPan,
     TrackMute,
+    /// Dual pan's left-input position (tag 7). Heard only while the channel
+    /// is in Dual mode.
+    TrackPanLeft,
+    /// Dual pan's right-input position (tag 8).
+    TrackPanRight,
     PluginParameter {
         insert_id: String,
         parameter_id: String,
@@ -59,6 +64,11 @@ pub enum RuntimeAutomationTarget {
     InsertBypass {
         insert_id: String,
     },
+    /// One of a channel's placement parameters in a spatial mix (tags 9-14:
+    /// left/right, front/back, height, spread, width, LFE), `0..=1` as
+    /// [`solfege_spatialaudio::SourceParam`] maps it. Heard only while the
+    /// channel is placed in the room.
+    Spatial(solfege_spatialaudio::SourceParam),
     Unresolved,
 }
 
@@ -68,6 +78,11 @@ impl RuntimeAutomationTarget {
             0 => Self::TrackVolume,
             1 => Self::TrackPan,
             2 => Self::TrackMute,
+            7 => Self::TrackPanLeft,
+            8 => Self::TrackPanRight,
+            tag @ 9..=14 => solfege_spatialaudio::SourceParam::from_index(usize::from(tag - 9))
+                .map(Self::Spatial)
+                .unwrap_or(Self::Unresolved),
             3 if !lane.target.insert_id.is_empty() && !lane.target.parameter_id.is_empty() => {
                 Self::PluginParameter {
                     insert_id: lane.target.insert_id.clone(),
@@ -98,10 +113,15 @@ impl RuntimeAutomationTarget {
             Self::TrackVolume => volume_db_to_norm(0.0),
             Self::TrackPan => 0.5,
             Self::TrackMute => 0.0,
+            Self::TrackPanLeft => 0.0,
+            Self::TrackPanRight => 1.0,
             Self::PluginParameter { .. } => 0.5,
             Self::SendGain { .. } => volume_db_to_norm(0.0),
             Self::SendEnabled { .. } => 1.0,
             Self::InsertBypass { .. } => 0.0,
+            Self::Spatial(param) => {
+                param.normalized(&solfege_spatialaudio::SourceParams::default())
+            }
             Self::Unresolved => 0.0,
         }
     }
@@ -129,7 +149,12 @@ pub struct RuntimeAutomationLane {
 pub struct RuntimeTrackAutomationValues {
     pub volume: Option<f32>,
     pub pan: Option<f32>,
+    /// Dual pan positions, `-1.0..=1.0`, from `TrackPanLeft` / `TrackPanRight`.
+    pub pan_left: Option<f32>,
+    pub pan_right: Option<f32>,
     pub muted: Option<bool>,
+    /// Spatial placement lanes, `0..=1`, by [`solfege_spatialaudio::SourceParam::index`].
+    pub spatial: [Option<f32>; 6],
 }
 
 /// One resolved plugin-parameter automation route, built off the audio thread

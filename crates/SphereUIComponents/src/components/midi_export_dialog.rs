@@ -409,7 +409,7 @@ pub fn open_midi_export_dialog(
     options.window_background = WindowBackgroundAppearance::Transparent;
     crate::window_position::apply_owner_display(&mut options, owner_bounds, cx);
 
-    cx.open_window(options, move |_window, cx| {
+    crate::dialog_frame::open_dialog_window(cx, options, move |_window, cx| {
         cx.new(|_cx| MidiExportDialog::new(setup, on_export, on_close))
     })
     .map_err(|e| e.to_string())

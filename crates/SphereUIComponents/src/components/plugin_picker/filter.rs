@@ -35,6 +35,11 @@ pub struct FilterCounts {
     pub vendors: Vec<usize>,
     /// Per entry of `FilterResult::categories`.
     pub categories: Vec<usize>,
+    /// Per entry of `FilterResult::categories`: what each category chip would
+    /// list — every other filter and the search applied, the category not.
+    pub category_facets: Vec<usize>,
+    /// What the list would hold with no category chip — the "All" chip.
+    pub category_facet_total: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +81,7 @@ pub fn compute_filter_result(
     let mut counts = FilterCounts {
         vendors: vec![0; index.sidebar_vendors().len()],
         categories: vec![0; index.sidebar_categories().len()],
+        category_facets: vec![0; index.sidebar_categories().len()],
         ..FilterCounts::default()
     };
     let mut indices = Vec::new();
@@ -106,18 +112,29 @@ pub fn compute_filter_result(
                 continue;
             }
         }
+        if let Some(source) = filters.source {
+            if !source.matches(plugin) {
+                continue;
+            }
+        }
         if let Some(vendor) = vendor_filter.as_deref() {
             if index.vendor_lower(idx) != vendor {
                 continue;
             }
         }
+        if !q.is_empty() && !index.search_text(idx).contains(&q) {
+            continue;
+        }
+        // The category chips count here, before the category itself applies,
+        // so each chip says what clicking it would list.
+        counts.category_facet_total += 1;
+        if let Some(slot) = index.category_slot(idx) {
+            counts.category_facets[slot] += 1;
+        }
         if let Some(category) = category_filter.as_deref() {
             if index.category_lower(idx) != category {
                 continue;
             }
-        }
-        if !q.is_empty() && !index.search_text(idx).contains(&q) {
-            continue;
         }
         indices.push(idx);
     }
@@ -323,6 +340,7 @@ mod perf_tests {
                 },
                 category: cats[i % cats.len()].to_string(),
                 is_ara: false,
+                midi_output: false,
                 raw_category: Some("Fx|Analyzer".to_string()),
                 sub_categories: Some("Fx|Analyzer".to_string()),
                 kind: if i % 7 == 0 {
@@ -401,6 +419,7 @@ mod kind_tab_tests {
             format: PluginFormat::Vst3,
             category: "EQ".to_string(),
             is_ara: false,
+            midi_output: false,
             raw_category: None,
             sub_categories: None,
             kind,
@@ -467,5 +486,44 @@ mod kind_tab_tests {
             .map(|&i| index.plugin_at(i).unwrap().name.as_str())
             .collect();
         assert_eq!(names, vec!["synth"]);
+    }
+
+    /// The source and category chips narrow the list together with the rail
+    /// and the search, and each category chip counts what it would list.
+    #[test]
+    fn the_chips_compose_with_the_rail_and_count_their_own_rows() {
+        use crate::components::plugin_picker::state::PluginSource;
+        let mut reverb = plugin("verb", "Zeta", PluginKind::Effect);
+        reverb.category = "Reverb".to_string();
+        let mut clap = plugin("clapeq", "Zeta", PluginKind::Effect);
+        clap.format = PluginFormat::Clap;
+        let index = PluginSearchIndex::from_plugins(vec![
+            plugin("eq", "Acme", PluginKind::Effect),
+            plugin("comp", "Zeta", PluginKind::Effect),
+            reverb,
+            clap,
+        ]);
+        let prefs = PluginPickerPrefs::default_with_size();
+        let filters = PluginFilterState {
+            sidebar: PickerFilter::Vendor("Zeta".to_string()),
+            source: Some(PluginSource::Format(PluginFormat::Vst3)),
+            category: Some("Reverb".to_string()),
+            ..Default::default()
+        };
+        let result = compute_filter_result(&index, "", &filters, &prefs, false);
+        let names: Vec<&str> = result
+            .indices
+            .iter()
+            .map(|&i| index.plugin_at(i).unwrap().name.as_str())
+            .collect();
+        assert_eq!(names, vec!["verb"]);
+        // Zeta's VST3 plug-ins, whatever their category: comp and verb.
+        assert_eq!(result.counts.category_facet_total, 2);
+        let reverb_slot = result
+            .categories
+            .iter()
+            .position(|c| c == "Reverb")
+            .unwrap();
+        assert_eq!(result.counts.category_facets[reverb_slot], 1);
     }
 }
